@@ -70,6 +70,7 @@
   import {
     createEventsStore,
   } from "./stores/events.svelte.js";
+  import type { ActivitySettings, ConfigRepo } from "./api/types.js";
 
   interface Props {
     client: MiddlemanClient;
@@ -194,6 +195,54 @@
     }
     const diffStore = createDiffStore(diffOpts);
 
+    function hydrateSettings(
+      repos: ConfigRepo[],
+      activity: ActivitySettings,
+      terminal: { font_family: string; renderer: string },
+    ): void {
+      settingsStore.setConfiguredRepos(repos);
+      settingsStore.setTerminalFontFamily(terminal.font_family);
+      settingsStore.setTerminalRenderer(
+        terminal.renderer === "ghostty-web" ? "ghostty-web" : "xterm",
+      );
+      activityStore.hydrateDefaults(activity);
+    }
+
+    async function reloadSettingsAfterConfigChange(): Promise<void> {
+      const { data } = await cl.GET("/settings");
+      if (!data) return;
+      hydrateSettings(
+        data.repos ?? [],
+        {
+          view_mode: data.activity.view_mode === "threaded"
+            ? "threaded"
+            : "flat",
+          time_range: (
+            data.activity.time_range === "24h" ||
+            data.activity.time_range === "30d" ||
+            data.activity.time_range === "90d"
+          )
+            ? data.activity.time_range
+            : "7d",
+          hide_closed: data.activity.hide_closed,
+          hide_bots: data.activity.hide_bots,
+        },
+        data.terminal,
+      );
+    }
+
+    async function handleConfigChanged(
+      event: { valid: boolean },
+    ): Promise<void> {
+      if (!event.valid) return;
+      await reloadSettingsAfterConfigChange();
+      await Promise.all([
+        pullsStore.loadPulls(),
+        issuesStore.loadIssues(),
+        activityStore.loadActivity(),
+      ]);
+    }
+
     const eventsStore = createEventsStore({
       ...(cfg.basePath != null && {
         getBasePath: () => cfg.basePath as string,
@@ -205,6 +254,9 @@
       },
       onSyncStatus: (status) => {
         syncStore.setSyncStatus(status);
+      },
+      onConfigChanged: (event) => {
+        void handleConfigChanged(event);
       },
       onReconnectStale: () => {
         // The replay ring rolled past the client's cursor while it

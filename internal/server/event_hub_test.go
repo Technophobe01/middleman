@@ -147,6 +147,28 @@ func TestEventHub_CacheUpdatedOnLatestSyncStatus(t *testing.T) {
 	assert.Equal(t, "t2", ev.Event.Data, "new subscriber should get the latest cached status")
 }
 
+func TestEventHub_CachedStatusesPreserveIDOrder(t *testing.T) {
+	assert := assert.New(t)
+
+	hub := NewEventHub()
+	defer hub.Close()
+
+	configID := hub.Broadcast(Event{
+		Type: "config.changed",
+		Data: map[string]any{"valid": true},
+	})
+	syncID := hub.Broadcast(Event{Type: "sync_status", Data: "running"})
+
+	ch, _ := hub.Subscribe(t.Context(), true)
+
+	first := <-ch
+	second := <-ch
+	assert.Equal(configID, first.ID)
+	assert.Equal("config.changed", first.Event.Type)
+	assert.Equal(syncID, second.ID)
+	assert.Equal("sync_status", second.Event.Type)
+}
+
 func TestEventHub_SubscribeOrderingWithBroadcast(t *testing.T) {
 	assert := assert.New(t)
 
@@ -187,6 +209,49 @@ func TestEventHub_CloseUnsubscribesAll(t *testing.T) {
 	assert.False(t, ok1)
 	_, ok2 := <-ch2
 	assert.False(t, ok2)
+}
+
+func TestEventHub_ConfigChangedCachedForNewSubscribers(t *testing.T) {
+	hub := NewEventHub()
+	defer hub.Close()
+
+	hub.Broadcast(Event{
+		Type: "config.changed",
+		Data: map[string]any{"valid": true},
+	})
+
+	ch, _ := hub.Subscribe(t.Context(), true)
+
+	select {
+	case ev := <-ch:
+		assert.Equal(t, "config.changed", ev.Event.Type)
+	case <-time.After(time.Second):
+		require.FailNow(t, "expected cached config.changed event")
+	}
+}
+
+func TestEventHub_LatestConfigStatusReplayedToLateSubscriber(t *testing.T) {
+	assert := assert.New(t)
+
+	hub := NewEventHub()
+	defer hub.Close()
+
+	hub.Broadcast(Event{
+		Type: "config.changed",
+		Data: map[string]any{"valid": false, "error": "first"},
+	})
+	hub.Broadcast(Event{
+		Type: "config.changed",
+		Data: map[string]any{"valid": true},
+	})
+
+	ch, _ := hub.Subscribe(t.Context(), true)
+
+	ev := <-ch
+	assert.Equal("config.changed", ev.Event.Type)
+	data, ok := ev.Event.Data.(map[string]any)
+	require.True(t, ok)
+	assert.Equal(true, data["valid"], "subscriber should see the most recent config status")
 }
 
 func TestEventHub_BroadcastAfterSlowConsumerEviction(t *testing.T) {
