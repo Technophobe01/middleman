@@ -82,7 +82,9 @@ func gracefulShutdown(t *testing.T, srv interface{ Shutdown(context.Context) err
 type mockGH struct {
 	getRepositoryFn           func(context.Context, string, string) (*gh.Repository, error)
 	getPullRequestFn          func(context.Context, string, string, int) (*gh.PullRequest, error)
+	getPullRequestIfChangedFn func(context.Context, string, string, int, string) (*gh.PullRequest, string, bool, error)
 	getIssueFn                func(context.Context, string, string, int) (*gh.Issue, error)
+	getIssueIfChangedFn       func(context.Context, string, string, int, string) (*gh.Issue, string, bool, error)
 	createIssueFn             func(context.Context, string, string, string, string) (*gh.Issue, error)
 	getUserFn                 func(context.Context, string) (*gh.User, error)
 	markReadyForReviewFn      func(context.Context, string, string, int) (*gh.PullRequest, error)
@@ -131,6 +133,19 @@ func (m *mockGH) GetIssue(ctx context.Context, owner, repo string, number int) (
 		return m.getIssueFn(ctx, owner, repo, number)
 	}
 	return nil, nil
+}
+
+func (m *mockGH) GetIssueIfChanged(
+	ctx context.Context,
+	owner, repo string,
+	number int,
+	etag string,
+) (*gh.Issue, string, bool, error) {
+	if m.getIssueIfChangedFn != nil {
+		return m.getIssueIfChangedFn(ctx, owner, repo, number, etag)
+	}
+	issue, err := m.GetIssue(ctx, owner, repo, number)
+	return issue, "", false, err
 }
 
 func (m *mockGH) CreateIssue(
@@ -195,6 +210,19 @@ func (m *mockGH) GetPullRequest(ctx context.Context, owner, repo string, number 
 		return m.getPullRequestFn(ctx, owner, repo, number)
 	}
 	return nil, nil
+}
+
+func (m *mockGH) GetPullRequestIfChanged(
+	ctx context.Context,
+	owner, repo string,
+	number int,
+	etag string,
+) (*gh.PullRequest, string, bool, error) {
+	if m.getPullRequestIfChangedFn != nil {
+		return m.getPullRequestIfChangedFn(ctx, owner, repo, number, etag)
+	}
+	pr, err := m.GetPullRequest(ctx, owner, repo, number)
+	return pr, "", false, err
 }
 
 func (m *mockGH) ListIssueComments(
@@ -6313,6 +6341,334 @@ func TestE2EGraphQLIssueSyncThroughAPI(t *testing.T) {
 	require.NotNil(detailResp.JSON200)
 	assert.Equal("Synced through the HTTP API", detailResp.JSON200.Issue.Body)
 	assert.Equal(int64(1), detailResp.JSON200.Issue.CommentCount)
+}
+
+func TestE2ELargeRepoSkipsGraphQLAndUsesConditionalPRDetail(t *testing.T) {
+	require := require.New(t)
+	assert := Assert.New(t)
+	ctx := t.Context()
+
+	unchangedAt := time.Date(2026, 4, 12, 10, 0, 0, 0, time.UTC)
+	detailFetchedAt := time.Date(2026, 4, 12, 11, 0, 0, 0, time.UTC)
+	changedAt := time.Date(2026, 4, 12, 12, 0, 0, 0, time.UTC)
+
+	buildPR := func(number int, updatedAt time.Time, title string) *gh.PullRequest {
+		id := int64(number * 1000)
+		state := "open"
+		url := fmt.Sprintf("https://github.com/acme/widget/pull/%d", number)
+		author := "alice"
+		headSHA := fmt.Sprintf("head-%d", number)
+		headRef := fmt.Sprintf("feature-%d", number)
+		baseRef := "main"
+		created := gh.Timestamp{Time: unchangedAt}
+		updated := gh.Timestamp{Time: updatedAt}
+		comments := 1
+		return &gh.PullRequest{
+			ID:        &id,
+			Number:    &number,
+			State:     &state,
+			Title:     &title,
+			HTMLURL:   &url,
+			User:      &gh.User{Login: &author},
+			CreatedAt: &created,
+			UpdatedAt: &updated,
+			Comments:  &comments,
+			Head:      &gh.PullRequestBranch{SHA: &headSHA, Ref: &headRef},
+			Base:      &gh.PullRequestBranch{Ref: &baseRef},
+		}
+	}
+
+	openPRs := make([]*gh.PullRequest, 0, 100)
+	for number := 1; number <= 100; number++ {
+		updatedAt := unchangedAt
+		title := fmt.Sprintf("existing PR %d", number)
+		if number == 1 {
+			updatedAt = changedAt
+			title = "changed PR from list"
+		}
+		openPRs = append(openPRs, buildPR(number, updatedAt, title))
+	}
+
+	var conditionalCalls atomic.Int32
+	var graphQLPRCalls atomic.Int32
+	mock := &mockGH{
+		listOpenPullRequestsFn: func(_ context.Context, _, _ string) ([]*gh.PullRequest, error) {
+			return openPRs, nil
+		},
+		listOpenIssuesFn: func(_ context.Context, _, _ string) ([]*gh.Issue, error) {
+			return nil, &gh.ErrorResponse{
+				Response: &http.Response{StatusCode: http.StatusNotModified},
+			}
+		},
+		getPullRequestIfChangedFn: func(_ context.Context, _, _ string, number int, etag string) (*gh.PullRequest, string, bool, error) {
+			conditionalCalls.Add(1)
+			require.Equal(1, number)
+			require.Equal(`"etag-v1"`, etag)
+			return buildPR(number, changedAt, "changed PR detail"), `"etag-v2"`, false, nil
+		},
+		listIssueCommentsFn: func(_ context.Context, _, _ string, number int) ([]*gh.IssueComment, error) {
+			if number != 1 {
+				return nil, nil
+			}
+			id := int64(9001)
+			body := "detail comment"
+			author := "reviewer"
+			created := gh.Timestamp{Time: changedAt}
+			return []*gh.IssueComment{{
+				ID:        &id,
+				Body:      &body,
+				User:      &gh.User{Login: &author},
+				CreatedAt: &created,
+				UpdatedAt: &created,
+			}}, nil
+		},
+	}
+
+	gqlSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if bytes.Contains(body, []byte("pullRequests")) {
+			graphQLPRCalls.Add(1)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"errors":[{"message":"bulk PR fetch should be skipped"}]}`))
+	}))
+	defer gqlSrv.Close()
+
+	database := dbtest.Open(t)
+	repoID, err := database.UpsertRepo(ctx, db.GitHubRepoIdentity("github.com", "acme", "widget"))
+	require.NoError(err)
+	for number := 1; number <= 100; number++ {
+		_, err := database.UpsertMergeRequest(ctx, &db.MergeRequest{
+			RepoID:          repoID,
+			PlatformID:      int64(number * 1000),
+			Number:          number,
+			URL:             fmt.Sprintf("https://github.com/acme/widget/pull/%d", number),
+			Title:           fmt.Sprintf("existing PR %d", number),
+			Author:          "alice",
+			State:           "open",
+			HeadBranch:      fmt.Sprintf("feature-%d", number),
+			BaseBranch:      "main",
+			PlatformHeadSHA: fmt.Sprintf("head-%d", number),
+			CreatedAt:       unchangedAt,
+			UpdatedAt:       unchangedAt,
+			LastActivityAt:  unchangedAt,
+			DetailFetchedAt: &detailFetchedAt,
+		})
+		require.NoError(err)
+	}
+	require.NoError(database.UpsertHTTPEtag(
+		ctx, "github", "github.com", "acme", "widget",
+		"pull_request", 1, `"etag-v1"`,
+	))
+
+	syncer := ghclient.NewSyncer(
+		map[string]ghclient.Client{"github.com": mock},
+		database,
+		nil,
+		defaultTestRepos,
+		time.Minute,
+		nil,
+		map[string]*ghclient.SyncBudget{"github.com": ghclient.NewSyncBudget(10000)},
+	)
+	t.Cleanup(syncer.Stop)
+	syncer.SetFetchers(map[string]*ghclient.GraphQLFetcher{
+		"github.com": ghclient.NewGraphQLFetcherWithClient(
+			githubv4.NewEnterpriseClient(gqlSrv.URL, gqlSrv.Client()),
+			nil,
+		),
+	})
+
+	srv := New(database, syncer, nil, "/", nil, ServerOptions{})
+	t.Cleanup(func() { gracefulShutdown(t, srv) })
+
+	srv.syncer.RunOnce(ctx)
+
+	assert.Zero(int(graphQLPRCalls.Load()),
+		"large existing repo refresh should not bulk-fetch PRs through GraphQL")
+	assert.Equal(int32(1), conditionalCalls.Load(),
+		"only the changed PR should run a conditional detail fetch")
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/pulls/gh/acme/widget/1", nil)
+	rr := httptest.NewRecorder()
+	srv.ServeHTTP(rr, req)
+	require.Equal(http.StatusOK, rr.Code)
+
+	var detailResp mergeRequestDetailResponse
+	require.NoError(json.Unmarshal(rr.Body.Bytes(), &detailResp))
+	require.NotNil(detailResp.MergeRequest)
+	assert.Equal("changed PR detail", detailResp.MergeRequest.Title)
+	assert.Equal(1, detailResp.MergeRequest.CommentCount)
+	require.Len(detailResp.Events, 1)
+	assert.Equal("detail comment", detailResp.Events[0].Body)
+
+	etag, err := database.GetHTTPEtag(
+		ctx, "github", "github.com", "acme", "widget",
+		"pull_request", 1,
+	)
+	require.NoError(err)
+	assert.Equal(`"etag-v2"`, etag)
+}
+
+func TestE2ELargeRepoSkipsGraphQLAndUsesConditionalIssueDetail(t *testing.T) {
+	require := require.New(t)
+	assert := Assert.New(t)
+	ctx := t.Context()
+
+	unchangedAt := time.Date(2026, 4, 12, 10, 0, 0, 0, time.UTC)
+	detailFetchedAt := time.Date(2026, 4, 12, 11, 0, 0, 0, time.UTC)
+	changedAt := time.Date(2026, 4, 12, 12, 0, 0, 0, time.UTC)
+
+	buildIssue := func(number int, updatedAt time.Time, title string) *gh.Issue {
+		id := int64(number * 1000)
+		state := "open"
+		url := fmt.Sprintf("https://github.com/acme/widget/issues/%d", number)
+		author := "alice"
+		body := fmt.Sprintf("issue body %d", number)
+		comments := 1
+		created := gh.Timestamp{Time: unchangedAt}
+		updated := gh.Timestamp{Time: updatedAt}
+		return &gh.Issue{
+			ID:        &id,
+			Number:    &number,
+			State:     &state,
+			Title:     &title,
+			Body:      &body,
+			HTMLURL:   &url,
+			User:      &gh.User{Login: &author},
+			Comments:  &comments,
+			CreatedAt: &created,
+			UpdatedAt: &updated,
+		}
+	}
+
+	openIssues := make([]*gh.Issue, 0, 100)
+	for number := 1; number <= 100; number++ {
+		openIssues = append(openIssues,
+			buildIssue(number, unchangedAt, fmt.Sprintf("existing issue %d", number)),
+		)
+	}
+
+	var conditionalCalls atomic.Int32
+	var graphQLIssueCalls atomic.Int32
+	mock := &mockGH{
+		listOpenPullRequestsFn: func(_ context.Context, _, _ string) ([]*gh.PullRequest, error) {
+			return nil, &gh.ErrorResponse{
+				Response: &http.Response{StatusCode: http.StatusNotModified},
+			}
+		},
+		listOpenIssuesFn: func(_ context.Context, _, _ string) ([]*gh.Issue, error) {
+			return openIssues, nil
+		},
+		getIssueIfChangedFn: func(_ context.Context, _, _ string, number int, etag string) (*gh.Issue, string, bool, error) {
+			conditionalCalls.Add(1)
+			require.Equal(1, number)
+			require.Equal(`"issue-etag-v1"`, etag)
+			return buildIssue(number, changedAt, "changed issue detail"), `"issue-etag-v2"`, false, nil
+		},
+		listIssueCommentsFn: func(_ context.Context, _, _ string, number int) ([]*gh.IssueComment, error) {
+			if number != 1 {
+				return nil, nil
+			}
+			id := int64(9101)
+			body := "issue detail comment"
+			author := "reviewer"
+			created := gh.Timestamp{Time: changedAt}
+			return []*gh.IssueComment{{
+				ID:        &id,
+				Body:      &body,
+				User:      &gh.User{Login: &author},
+				CreatedAt: &created,
+				UpdatedAt: &created,
+			}}, nil
+		},
+	}
+
+	gqlSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if bytes.Contains(body, []byte("issues")) {
+			graphQLIssueCalls.Add(1)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"errors":[{"message":"bulk issue fetch should be skipped"}]}`))
+	}))
+	defer gqlSrv.Close()
+
+	database := dbtest.Open(t)
+	repoID, err := database.UpsertRepo(ctx, db.GitHubRepoIdentity("github.com", "acme", "widget"))
+	require.NoError(err)
+	for number := 1; number <= 100; number++ {
+		var fetchedAt *time.Time
+		if number != 1 {
+			fetchedAt = &detailFetchedAt
+		}
+		_, err := database.UpsertIssue(ctx, &db.Issue{
+			RepoID:          repoID,
+			PlatformID:      int64(number * 1000),
+			Number:          number,
+			URL:             fmt.Sprintf("https://github.com/acme/widget/issues/%d", number),
+			Title:           fmt.Sprintf("existing issue %d", number),
+			Author:          "alice",
+			State:           "open",
+			CreatedAt:       unchangedAt,
+			UpdatedAt:       unchangedAt,
+			LastActivityAt:  unchangedAt,
+			DetailFetchedAt: fetchedAt,
+		})
+		require.NoError(err)
+	}
+	require.NoError(database.UpsertHTTPEtag(
+		ctx, "github", "github.com", "acme", "widget",
+		"issue", 1, `"issue-etag-v1"`,
+	))
+
+	syncer := ghclient.NewSyncer(
+		map[string]ghclient.Client{"github.com": mock},
+		database,
+		nil,
+		defaultTestRepos,
+		time.Minute,
+		nil,
+		map[string]*ghclient.SyncBudget{"github.com": ghclient.NewSyncBudget(10000)},
+	)
+	t.Cleanup(syncer.Stop)
+	syncer.SetFetchers(map[string]*ghclient.GraphQLFetcher{
+		"github.com": ghclient.NewGraphQLFetcherWithClient(
+			githubv4.NewEnterpriseClient(gqlSrv.URL, gqlSrv.Client()),
+			nil,
+		),
+	})
+
+	srv := New(database, syncer, nil, "/", nil, ServerOptions{})
+	t.Cleanup(func() { gracefulShutdown(t, srv) })
+
+	srv.syncer.RunOnce(ctx)
+
+	assert.Zero(int(graphQLIssueCalls.Load()),
+		"large existing repo refresh should not bulk-fetch issues through GraphQL")
+	assert.Equal(int32(1), conditionalCalls.Load(),
+		"only the missing-detail issue should run a conditional detail fetch")
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/issues/gh/acme/widget/1", nil)
+	rr := httptest.NewRecorder()
+	srv.ServeHTTP(rr, req)
+	require.Equal(http.StatusOK, rr.Code)
+
+	var detailResp issueDetailResponse
+	require.NoError(json.Unmarshal(rr.Body.Bytes(), &detailResp))
+	require.NotNil(detailResp.Issue)
+	assert.Equal("changed issue detail", detailResp.Issue.Title)
+	assert.Equal(1, detailResp.Issue.CommentCount)
+	require.Len(detailResp.Events, 1)
+	assert.Equal("issue detail comment", detailResp.Events[0].Body)
+
+	etag, err := database.GetHTTPEtag(
+		ctx, "github", "github.com", "acme", "widget",
+		"issue", 1,
+	)
+	require.NoError(err)
+	assert.Equal(`"issue-etag-v2"`, etag)
 }
 
 // TestE2EGraphQLIssueSyncTrustsTotalCount pre-seeds an issue with a

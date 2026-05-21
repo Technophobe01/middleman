@@ -149,7 +149,7 @@ func TestETagTransport_EmptyETagEvictsCachedEntry(t *testing.T) {
 	assert.False(t, ok, "200 without ETag must evict cached entry")
 }
 
-func TestETagTransport_MultiPageEvictsCachedETag(t *testing.T) {
+func TestETagTransport_MultiPageEvictsPageOneETag(t *testing.T) {
 	// First request: single page, cache ETag
 	et := &etagTransport{base: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		rec := httptest.NewRecorder()
@@ -164,7 +164,9 @@ func TestETagTransport_MultiPageEvictsCachedETag(t *testing.T) {
 	_, ok := et.cache.Load(url)
 	assert.True(t, ok, "single-page ETag should be cached")
 
-	// Second request: multi-page (Link: next), should evict
+	// Second request: multi-page (Link: next), should evict the
+	// previous validator so future syncs cannot treat page 1's 304
+	// as proof that later pages are unchanged.
 	et.base = roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		rec := httptest.NewRecorder()
 		rec.Header().Set("ETag", `"multi"`)
@@ -176,7 +178,44 @@ func TestETagTransport_MultiPageEvictsCachedETag(t *testing.T) {
 	req2, _ := http.NewRequest("GET", url, nil)
 	_, _ = et.RoundTrip(req2)
 	_, ok = et.cache.Load(url)
-	assert.False(t, ok, "multi-page response should evict cached ETag")
+	assert.False(t, ok, "multi-page page 1 ETag should not be cached")
+}
+
+func TestETagTransport_MultiHeaderLinkEvictsETag(t *testing.T) {
+	et := &etagTransport{base: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		rec := httptest.NewRecorder()
+		rec.Header().Set("ETag", `"multi-header"`)
+		rec.Header().Add("Link", `<https://api.github.com/repos/o/n/pulls?page=1>; rel="prev"`)
+		rec.Header().Add("Link", `<https://api.github.com/repos/o/n/pulls?page=3>; rel="next"`)
+		rec.WriteHeader(200)
+		return rec.Result(), nil
+	})}
+
+	url := "https://api.github.com/repos/o/n/pulls?page=2"
+	req, _ := http.NewRequest("GET", url, nil)
+	_, err := et.RoundTrip(req)
+	require.NoError(t, err)
+
+	_, ok := et.cache.Load(url)
+	assert.False(t, ok, "any paginated Link header should prevent caching")
+}
+
+func TestETagTransport_FinalPageLinkEvictsETag(t *testing.T) {
+	et := &etagTransport{base: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		rec := httptest.NewRecorder()
+		rec.Header().Set("ETag", `"final-page"`)
+		rec.Header().Set("Link", `<https://api.github.com/repos/o/n/pulls?page=1>; rel="prev"`)
+		rec.WriteHeader(200)
+		return rec.Result(), nil
+	})}
+
+	url := "https://api.github.com/repos/o/n/pulls?page=2"
+	req, _ := http.NewRequest("GET", url, nil)
+	_, err := et.RoundTrip(req)
+	require.NoError(t, err)
+
+	_, ok := et.cache.Load(url)
+	assert.False(t, ok, "final paginated pages should not cache validators")
 }
 
 func TestETagTransport_NonGETBypassesCache(t *testing.T) {
@@ -262,12 +301,12 @@ func TestETagTransport_SingleMultiSingleTransition(t *testing.T) {
 	_, ok := et.cache.Load(url)
 	assert.True(ok, "phase 0: single-page should cache")
 
-	// Phase 1: multi-page, should evict
+	// Phase 1: multi-page, should evict page 1's validator.
 	phase = 1
 	req, _ = http.NewRequest("GET", url, nil)
 	_, _ = et.RoundTrip(req)
 	_, ok = et.cache.Load(url)
-	assert.False(ok, "phase 1: multi-page should evict")
+	assert.False(ok, "phase 1: multi-page should not cache page 1")
 
 	// Phase 2: back to single-page, should re-cache
 	phase = 2
@@ -279,6 +318,9 @@ func TestETagTransport_SingleMultiSingleTransition(t *testing.T) {
 }
 
 func TestETagTransport_TTLDrivenMultiPageDetection(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+
 	url := "https://api.github.com/repos/o/n/pulls"
 	requestCount := 0
 	et := &etagTransport{base: roundTripFunc(func(r *http.Request) (*http.Response, error) {
@@ -306,7 +348,7 @@ func TestETagTransport_TTLDrivenMultiPageDetection(t *testing.T) {
 	// Request with valid cache — sends If-None-Match, gets 304
 	req, _ := http.NewRequest("GET", url, nil)
 	resp, _ := et.RoundTrip(req)
-	assert.Equal(t, 304, resp.StatusCode)
+	assert.Equal(304, resp.StatusCode)
 
 	// Now expire the cache
 	et.cache.Store(url, etagEntry{
@@ -317,11 +359,12 @@ func TestETagTransport_TTLDrivenMultiPageDetection(t *testing.T) {
 	// Request with expired cache — no If-None-Match, gets 200 multi-page
 	req, _ = http.NewRequest("GET", url, nil)
 	resp, _ = et.RoundTrip(req)
-	assert.Equal(t, 200, resp.StatusCode)
+	assert.Equal(200, resp.StatusCode)
 
-	// Cache should be evicted (multi-page detected)
+	// Cache should now be empty because a page 1 validator is not enough
+	// to prove the complete paginated collection is unchanged.
 	_, ok := et.cache.Load(url)
-	assert.False(t, ok, "multi-page detection after TTL should evict")
+	require.False(ok, "multi-page detection after TTL should evict page 1")
 }
 
 func TestETagTransport_ExpiredEntryTreatedAsUncached(t *testing.T) {

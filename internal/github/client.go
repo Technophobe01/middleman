@@ -95,6 +95,24 @@ type Client interface {
 	InvalidateListETagsForRepo(owner, repo string, endpoints ...string)
 }
 
+type conditionalPullRequestGetter interface {
+	GetPullRequestIfChanged(
+		ctx context.Context,
+		owner, repo string,
+		number int,
+		etag string,
+	) (*gh.PullRequest, string, bool, error)
+}
+
+type conditionalIssueGetter interface {
+	GetIssueIfChanged(
+		ctx context.Context,
+		owner, repo string,
+		number int,
+		etag string,
+	) (*gh.Issue, string, bool, error)
+}
+
 func graphQLEndpointForHost(platformHost string) string {
 	if platformHost == "" || platformHost == "github.com" {
 		return "https://api.github.com/graphql"
@@ -144,6 +162,7 @@ func NewClient(
 		gh:              ghClient,
 		httpClient:      tc,
 		rateTracker:     rateTracker,
+		platformHost:    platformHost,
 		graphQLEndpoint: graphQLEndpointForHost(platformHost),
 		etag:            et,
 	}, nil
@@ -153,6 +172,7 @@ type liveClient struct {
 	gh              *gh.Client
 	httpClient      *http.Client
 	rateTracker     *RateTracker
+	platformHost    string
 	graphQLEndpoint string
 	etag            *etagTransport
 	viewerMu        sync.Mutex
@@ -456,17 +476,23 @@ func (c *liveClient) ListOpenPullRequests(ctx context.Context, owner, repo strin
 		State:       "open",
 		ListOptions: gh.ListOptions{PerPage: 100},
 	}
-	all, err := collectPages(ctx, func(pageOpts *gh.ListOptions) ([]*gh.PullRequest, *gh.Response, error) {
+	progress := newMergeRequestListFetchProgressLogger(RepoRef{
+		Owner:        owner,
+		Name:         repo,
+		PlatformHost: c.platformHost,
+	}, "rest")
+	all, err := collectPagesWithProgress(ctx, func(pageOpts *gh.ListOptions) ([]*gh.PullRequest, *gh.Response, error) {
 		opts.ListOptions = *pageOpts
 		page, resp, err := c.gh.PullRequests.List(ctx, owner, repo, opts)
 		if err != nil {
 			return nil, nil, fmt.Errorf("listing open pull requests for %s/%s: %w", owner, repo, err)
 		}
 		return page, resp, nil
-	}, c.trackRate)
+	}, c.trackRate, progress.recordPage)
 	if err != nil {
 		return nil, err
 	}
+	progress.done()
 	return all, nil
 }
 
@@ -479,7 +505,12 @@ func (c *liveClient) ListOpenIssues(
 		Direction:   "desc",
 		ListOptions: gh.ListOptions{PerPage: 100},
 	}
-	issues, err := collectPages(ctx, func(pageOpts *gh.ListOptions) ([]*gh.Issue, *gh.Response, error) {
+	progress := newIssueListFetchProgressLogger(RepoRef{
+		Owner:        owner,
+		Name:         repo,
+		PlatformHost: c.platformHost,
+	}, "rest")
+	issues, err := collectPagesWithProgress(ctx, func(pageOpts *gh.ListOptions) ([]*gh.Issue, *gh.Response, error) {
 		opts.ListOptions = *pageOpts
 		issues, resp, err := c.gh.Issues.ListByRepo(
 			ctx, owner, repo, opts,
@@ -490,10 +521,11 @@ func (c *liveClient) ListOpenIssues(
 			)
 		}
 		return issues, resp, nil
-	}, c.trackRate)
+	}, c.trackRate, progress.recordPage)
 	if err != nil {
 		return nil, err
 	}
+	progress.done()
 
 	var all []*gh.Issue
 	// GitHub's Issues API returns PRs too — filter them out.
@@ -612,6 +644,38 @@ func (c *liveClient) GetIssue(
 	return issue, nil
 }
 
+func (c *liveClient) GetIssueIfChanged(
+	ctx context.Context,
+	owner, repo string,
+	number int,
+	etag string,
+) (*gh.Issue, string, bool, error) {
+	u := fmt.Sprintf("repos/%v/%v/issues/%v", owner, repo, number)
+	req, err := c.gh.NewRequest(http.MethodGet, u, nil)
+	if err != nil {
+		return nil, "", false, err
+	}
+	if etag != "" {
+		req.Header.Set("If-None-Match", etag)
+	}
+
+	issue := new(gh.Issue)
+	resp, err := c.gh.Do(ctx, req, issue)
+	c.trackRate(resp)
+	if err != nil {
+		if IsNotModified(err) {
+			return nil, etag, true, nil
+		}
+		return nil, "", false, fmt.Errorf(
+			"getting issue %s/%s#%d: %w", owner, repo, number, err,
+		)
+	}
+	if resp != nil && resp.Response != nil {
+		etag = resp.Header.Get("ETag")
+	}
+	return issue, etag, false, nil
+}
+
 func (c *liveClient) GetPullRequest(ctx context.Context, owner, repo string, number int) (*gh.PullRequest, error) {
 	pr, resp, err := c.gh.PullRequests.Get(ctx, owner, repo, number)
 	c.trackRate(resp)
@@ -619,6 +683,36 @@ func (c *liveClient) GetPullRequest(ctx context.Context, owner, repo string, num
 		return nil, fmt.Errorf("getting pull request %s/%s#%d: %w", owner, repo, number, err)
 	}
 	return pr, nil
+}
+
+func (c *liveClient) GetPullRequestIfChanged(
+	ctx context.Context,
+	owner, repo string,
+	number int,
+	etag string,
+) (*gh.PullRequest, string, bool, error) {
+	u := fmt.Sprintf("repos/%v/%v/pulls/%v", owner, repo, number)
+	req, err := c.gh.NewRequest(http.MethodGet, u, nil)
+	if err != nil {
+		return nil, "", false, err
+	}
+	if etag != "" {
+		req.Header.Set("If-None-Match", etag)
+	}
+
+	pr := new(gh.PullRequest)
+	resp, err := c.gh.Do(ctx, req, pr)
+	c.trackRate(resp)
+	if err != nil {
+		if IsNotModified(err) {
+			return nil, etag, true, nil
+		}
+		return nil, "", false, fmt.Errorf("getting pull request %s/%s#%d: %w", owner, repo, number, err)
+	}
+	if resp != nil && resp.Response != nil {
+		etag = resp.Header.Get("ETag")
+	}
+	return pr, etag, false, nil
 }
 
 func (c *liveClient) GetUser(ctx context.Context, login string) (*gh.User, error) {

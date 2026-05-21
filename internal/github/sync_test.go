@@ -658,6 +658,24 @@ func buildOpenPR(number int, updatedAt time.Time) *gh.PullRequest {
 	}
 }
 
+func buildOpenIssue(number int, updatedAt time.Time) *gh.Issue {
+	state := "open"
+	title := fmt.Sprintf("test issue %d", number)
+	url := fmt.Sprintf("https://github.com/owner/repo/issues/%d", number)
+	id := int64(number) * 1000
+	author := "alice"
+	return &gh.Issue{
+		ID:        &id,
+		Number:    &number,
+		Title:     &title,
+		HTMLURL:   &url,
+		State:     &state,
+		User:      &gh.User{Login: &author},
+		UpdatedAt: makeTimestamp(updatedAt),
+		CreatedAt: makeTimestamp(updatedAt),
+	}
+}
+
 func buildGitHubLabel(id int64, name, description, color string, isDefault bool) *gh.Label {
 	return &gh.Label{
 		ID:          &id,
@@ -4110,6 +4128,53 @@ func (c *detailTrackingClient) GetPullRequest(
 	return c.mockClient.GetPullRequest(ctx, owner, repo, number)
 }
 
+type conditionalPRTrackingClient struct {
+	detailTrackingClient
+	receivedETag     string
+	conditionalCalls atomic.Int32
+	notModified      bool
+	nextETag         string
+}
+
+func (c *conditionalPRTrackingClient) GetPullRequestIfChanged(
+	ctx context.Context,
+	owner, repo string,
+	number int,
+	etag string,
+) (*gh.PullRequest, string, bool, error) {
+	c.conditionalCalls.Add(1)
+	c.receivedETag = etag
+	if c.notModified {
+		return nil, etag, true, nil
+	}
+	c.getPRCalls.Add(1)
+	pr, err := c.mockClient.GetPullRequest(ctx, owner, repo, number)
+	return pr, c.nextETag, false, err
+}
+
+type conditionalIssueTrackingClient struct {
+	mockClient
+	receivedETag     string
+	conditionalCalls atomic.Int32
+	notModified      bool
+	nextETag         string
+}
+
+func (c *conditionalIssueTrackingClient) GetIssueIfChanged(
+	ctx context.Context,
+	owner, repo string,
+	number int,
+	etag string,
+) (*gh.Issue, string, bool, error) {
+	c.conditionalCalls.Add(1)
+	c.receivedETag = etag
+	if c.notModified {
+		return nil, etag, true, nil
+	}
+	issue, err := c.GetIssue(ctx, owner, repo, number)
+	return issue, c.nextETag, false, err
+}
+
 func TestRunOnceIndexOnly(t *testing.T) {
 	assert := Assert.New(t)
 	require := require.New(t)
@@ -4213,6 +4278,427 @@ func TestRunOnceDetailDrain(t *testing.T) {
 	require.NotNil(pr2)
 	assert.NotNil(pr2.DetailFetchedAt,
 		"detail_fetched_at should be set after detail drain")
+}
+
+func TestFetchMRDetailUsesPersistedPullRequestETag(t *testing.T) {
+	assert := Assert.New(t)
+	require := require.New(t)
+	ctx := t.Context()
+	d := openTestDB(t)
+
+	repo := RepoRef{Owner: "owner", Name: "repo", PlatformHost: "github.com"}
+	repoID, err := d.UpsertRepo(ctx, db.GitHubRepoIdentity("github.com", repo.Owner, repo.Name))
+	require.NoError(err)
+	updatedAt := time.Date(2024, 6, 1, 10, 0, 0, 0, time.UTC)
+	detailFetchedAt := time.Date(2024, 6, 1, 9, 0, 0, 0, time.UTC)
+	_, err = d.UpsertMergeRequest(ctx, &db.MergeRequest{
+		RepoID:          repoID,
+		PlatformID:      1000,
+		Number:          1,
+		URL:             "https://github.com/owner/repo/pull/1",
+		Title:           "test PR",
+		Author:          "alice",
+		State:           "open",
+		HeadBranch:      "feature-branch",
+		BaseBranch:      "main",
+		PlatformHeadSHA: "abc123def456",
+		CreatedAt:       updatedAt,
+		UpdatedAt:       updatedAt,
+		LastActivityAt:  updatedAt,
+		DetailFetchedAt: &detailFetchedAt,
+	})
+	require.NoError(err)
+	require.NoError(d.UpsertHTTPEtag(
+		ctx, "github", "github.com", "owner", "repo",
+		"pull_request", 1, `"etag-v1"`,
+	))
+
+	mc := &conditionalPRTrackingClient{notModified: true}
+	mc.comments = []*gh.IssueComment{{ID: new(int64)}}
+	mc.reviews = []*gh.PullRequestReview{{ID: new(int64)}}
+	mc.commits = []*gh.RepositoryCommit{{SHA: new(string)}}
+	syncer := NewSyncer(
+		map[string]Client{"github.com": mc}, d, nil,
+		[]RepoRef{repo},
+		time.Minute, nil, testBudget(1000),
+	)
+
+	_, err = syncer.fetchMRDetail(ctx, repo, repoID, 1, false)
+	require.NoError(err)
+
+	assert.Equal(int32(1), mc.conditionalCalls.Load())
+	assert.Equal(`"etag-v1"`, mc.receivedETag)
+	assert.Zero(int(mc.getPRCalls.Load()),
+		"304 should skip the unconditional PR detail fetch")
+	assert.Zero(int(mc.listIssueCommentsCalled.Load()),
+		"304 should skip timeline/comment refresh")
+}
+
+func TestFetchMRDetailPersistsPullRequestETag(t *testing.T) {
+	assert := Assert.New(t)
+	require := require.New(t)
+	ctx := t.Context()
+	d := openTestDB(t)
+
+	repo := RepoRef{Owner: "owner", Name: "repo", PlatformHost: "github.com"}
+	repoID, err := d.UpsertRepo(ctx, db.GitHubRepoIdentity("github.com", repo.Owner, repo.Name))
+	require.NoError(err)
+	updatedAt := time.Date(2024, 6, 1, 10, 0, 0, 0, time.UTC)
+
+	mc := &conditionalPRTrackingClient{nextETag: `"etag-v2"`}
+	mc.singlePR = buildOpenPR(1, updatedAt)
+	mc.comments = []*gh.IssueComment{}
+	mc.reviews = []*gh.PullRequestReview{}
+	mc.commits = []*gh.RepositoryCommit{}
+	mc.ciStatus = &gh.CombinedStatus{State: new(string)}
+	syncer := NewSyncer(
+		map[string]Client{"github.com": mc}, d, nil,
+		[]RepoRef{repo},
+		time.Minute, nil, testBudget(1000),
+	)
+
+	_, err = syncer.fetchMRDetail(ctx, repo, repoID, 1, false)
+	require.NoError(err)
+
+	etag, err := d.GetHTTPEtag(
+		ctx, "github", "github.com", "owner", "repo",
+		"pull_request", 1,
+	)
+	require.NoError(err)
+	assert.Equal(`"etag-v2"`, etag)
+}
+
+func TestFetchMRDetailDoesNotPersistPullRequestETagWhenDetailRefreshFails(t *testing.T) {
+	assert := Assert.New(t)
+	require := require.New(t)
+	ctx := t.Context()
+	d := openTestDB(t)
+
+	repo := RepoRef{Owner: "owner", Name: "repo", PlatformHost: "github.com"}
+	repoID, err := d.UpsertRepo(ctx, db.GitHubRepoIdentity("github.com", repo.Owner, repo.Name))
+	require.NoError(err)
+	require.NoError(d.UpsertHTTPEtag(
+		ctx, "github", "github.com", "owner", "repo",
+		"pull_request", 1, `"etag-v1"`,
+	))
+
+	updatedAt := time.Date(2024, 6, 1, 10, 0, 0, 0, time.UTC)
+	mc := &conditionalPRTrackingClient{nextETag: `"etag-v2"`}
+	mc.singlePR = buildOpenPR(1, updatedAt)
+	mc.listIssueCommentsErr = fmt.Errorf("transient comments failure")
+	syncer := NewSyncer(
+		map[string]Client{"github.com": mc}, d, nil,
+		[]RepoRef{repo},
+		time.Minute, nil, testBudget(1000),
+	)
+
+	_, err = syncer.fetchMRDetail(ctx, repo, repoID, 1, false)
+	require.Error(err)
+
+	etag, err := d.GetHTTPEtag(
+		ctx, "github", "github.com", "owner", "repo",
+		"pull_request", 1,
+	)
+	require.NoError(err)
+	assert.Equal(`"etag-v1"`, etag)
+}
+
+func TestFetchIssueDetailUsesPersistedIssueETag(t *testing.T) {
+	assert := Assert.New(t)
+	require := require.New(t)
+	ctx := t.Context()
+	d := openTestDB(t)
+
+	repo := RepoRef{Owner: "owner", Name: "repo", PlatformHost: "github.com"}
+	repoID, err := d.UpsertRepo(ctx, db.GitHubRepoIdentity("github.com", repo.Owner, repo.Name))
+	require.NoError(err)
+	updatedAt := time.Date(2024, 6, 1, 10, 0, 0, 0, time.UTC)
+	detailFetchedAt := time.Date(2024, 6, 1, 9, 0, 0, 0, time.UTC)
+	_, err = d.UpsertIssue(ctx, &db.Issue{
+		RepoID:          repoID,
+		PlatformID:      1000,
+		Number:          1,
+		URL:             "https://github.com/owner/repo/issues/1",
+		Title:           "test issue",
+		Author:          "alice",
+		State:           "open",
+		CreatedAt:       updatedAt,
+		UpdatedAt:       updatedAt,
+		LastActivityAt:  updatedAt,
+		DetailFetchedAt: &detailFetchedAt,
+	})
+	require.NoError(err)
+	require.NoError(d.UpsertHTTPEtag(
+		ctx, "github", "github.com", "owner", "repo",
+		"issue", 1, `"issue-etag-v1"`,
+	))
+
+	mc := &conditionalIssueTrackingClient{notModified: true}
+	mc.comments = []*gh.IssueComment{{ID: new(int64)}}
+	syncer := NewSyncer(
+		map[string]Client{"github.com": mc}, d, nil,
+		[]RepoRef{repo},
+		time.Minute, nil, testBudget(1000),
+	)
+
+	_, err = syncer.fetchIssueDetail(ctx, repo, repoID, 1)
+	require.NoError(err)
+
+	assert.Equal(int32(1), mc.conditionalCalls.Load())
+	assert.Equal(`"issue-etag-v1"`, mc.receivedETag)
+	assert.Zero(int(mc.listIssueCommentsCalled.Load()),
+		"304 should skip issue comment refresh")
+}
+
+func TestFetchIssueDetailPersistsIssueETag(t *testing.T) {
+	assert := Assert.New(t)
+	require := require.New(t)
+	ctx := t.Context()
+	d := openTestDB(t)
+
+	repo := RepoRef{Owner: "owner", Name: "repo", PlatformHost: "github.com"}
+	repoID, err := d.UpsertRepo(ctx, db.GitHubRepoIdentity("github.com", repo.Owner, repo.Name))
+	require.NoError(err)
+	updatedAt := time.Date(2024, 6, 1, 10, 0, 0, 0, time.UTC)
+	issueID := int64(1000)
+	issueNumber := 1
+	issueTitle := "test issue"
+	issueState := "open"
+	issueURL := "https://github.com/owner/repo/issues/1"
+
+	mc := &conditionalIssueTrackingClient{nextETag: `"issue-etag-v2"`}
+	mc.getIssueFn = func(context.Context, string, string, int) (*gh.Issue, error) {
+		return &gh.Issue{
+			ID:        &issueID,
+			Number:    &issueNumber,
+			Title:     &issueTitle,
+			State:     &issueState,
+			HTMLURL:   &issueURL,
+			CreatedAt: makeTimestamp(updatedAt),
+			UpdatedAt: makeTimestamp(updatedAt),
+		}, nil
+	}
+	mc.comments = []*gh.IssueComment{}
+	syncer := NewSyncer(
+		map[string]Client{"github.com": mc}, d, nil,
+		[]RepoRef{repo},
+		time.Minute, nil, testBudget(1000),
+	)
+
+	_, err = syncer.fetchIssueDetail(ctx, repo, repoID, 1)
+	require.NoError(err)
+
+	etag, err := d.GetHTTPEtag(
+		ctx, "github", "github.com", "owner", "repo",
+		"issue", 1,
+	)
+	require.NoError(err)
+	assert.Equal(`"issue-etag-v2"`, etag)
+}
+
+func TestFetchIssueDetailDoesNotPersistIssueETagWhenDetailRefreshFails(t *testing.T) {
+	assert := Assert.New(t)
+	require := require.New(t)
+	ctx := t.Context()
+	d := openTestDB(t)
+
+	repo := RepoRef{Owner: "owner", Name: "repo", PlatformHost: "github.com"}
+	repoID, err := d.UpsertRepo(ctx, db.GitHubRepoIdentity("github.com", repo.Owner, repo.Name))
+	require.NoError(err)
+	require.NoError(d.UpsertHTTPEtag(
+		ctx, "github", "github.com", "owner", "repo",
+		"issue", 1, `"issue-etag-v1"`,
+	))
+
+	updatedAt := time.Date(2024, 6, 1, 10, 0, 0, 0, time.UTC)
+	issueID := int64(1000)
+	issueNumber := 1
+	issueTitle := "test issue"
+	issueState := "open"
+	issueURL := "https://github.com/owner/repo/issues/1"
+
+	mc := &conditionalIssueTrackingClient{nextETag: `"issue-etag-v2"`}
+	mc.getIssueFn = func(context.Context, string, string, int) (*gh.Issue, error) {
+		return &gh.Issue{
+			ID:        &issueID,
+			Number:    &issueNumber,
+			Title:     &issueTitle,
+			State:     &issueState,
+			HTMLURL:   &issueURL,
+			CreatedAt: makeTimestamp(updatedAt),
+			UpdatedAt: makeTimestamp(updatedAt),
+		}, nil
+	}
+	mc.listIssueCommentsErr = fmt.Errorf("transient comments failure")
+	syncer := NewSyncer(
+		map[string]Client{"github.com": mc}, d, nil,
+		[]RepoRef{repo},
+		time.Minute, nil, testBudget(1000),
+	)
+
+	_, err = syncer.fetchIssueDetail(ctx, repo, repoID, 1)
+	require.Error(err)
+
+	etag, err := d.GetHTTPEtag(
+		ctx, "github", "github.com", "owner", "repo",
+		"issue", 1,
+	)
+	require.NoError(err)
+	assert.Equal(`"issue-etag-v1"`, etag)
+}
+
+func TestBulkGraphQLGateUsesLocalMergeRequestCount(t *testing.T) {
+	assert := Assert.New(t)
+	require := require.New(t)
+	ctx := t.Context()
+	d := openTestDB(t)
+
+	repo := RepoRef{Owner: "owner", Name: "repo", PlatformHost: "github.com"}
+	repoID, err := d.UpsertRepo(ctx, db.GitHubRepoIdentity("github.com", repo.Owner, repo.Name))
+	require.NoError(err)
+
+	now := time.Date(2024, 6, 1, 10, 0, 0, 0, time.UTC)
+	for number := 1; number <= largeRepoBulkGraphQLThreshold; number++ {
+		_, err := d.UpsertMergeRequest(ctx, &db.MergeRequest{
+			RepoID:         repoID,
+			PlatformID:     int64(number * 1000),
+			Number:         number,
+			URL:            fmt.Sprintf("https://github.com/owner/repo/pull/%d", number),
+			Title:          fmt.Sprintf("test PR %d", number),
+			Author:         "alice",
+			State:          "open",
+			CreatedAt:      now,
+			UpdatedAt:      now,
+			LastActivityAt: now,
+		})
+		require.NoError(err)
+	}
+
+	syncer := NewSyncer(nil, d, nil, []RepoRef{repo}, time.Minute, nil, nil)
+
+	assert.False(syncer.shouldUseBulkGraphQLForMRs(ctx, repo, repoID, 1),
+		"local open count should gate large-repo bulk behavior even when the fetched set is small")
+}
+
+func TestBulkGraphQLGateUsesLocalIssueCount(t *testing.T) {
+	assert := Assert.New(t)
+	require := require.New(t)
+	ctx := t.Context()
+	d := openTestDB(t)
+
+	repo := RepoRef{Owner: "owner", Name: "repo", PlatformHost: "github.com"}
+	repoID, err := d.UpsertRepo(ctx, db.GitHubRepoIdentity("github.com", repo.Owner, repo.Name))
+	require.NoError(err)
+
+	now := time.Date(2024, 6, 1, 10, 0, 0, 0, time.UTC)
+	for number := 1; number <= largeRepoBulkGraphQLThreshold; number++ {
+		_, err := d.UpsertIssue(ctx, &db.Issue{
+			RepoID:         repoID,
+			PlatformID:     int64(number * 1000),
+			Number:         number,
+			URL:            fmt.Sprintf("https://github.com/owner/repo/issues/%d", number),
+			Title:          fmt.Sprintf("test issue %d", number),
+			Author:         "alice",
+			State:          "open",
+			CreatedAt:      now,
+			UpdatedAt:      now,
+			LastActivityAt: now,
+		})
+		require.NoError(err)
+	}
+
+	syncer := NewSyncer(nil, d, nil, []RepoRef{repo}, time.Minute, nil, nil)
+
+	assert.False(syncer.shouldUseBulkGraphQLForIssues(ctx, repo, repoID, 1),
+		"local open count should gate large-repo bulk behavior even when the fetched set is small")
+}
+
+func TestRunOnceLargeExistingRepoSkipsBulkGraphQLAndFetchesChangedPRDetail(t *testing.T) {
+	assert := Assert.New(t)
+	require := require.New(t)
+	ctx := t.Context()
+	d := openTestDB(t)
+
+	repo := RepoRef{
+		Owner:        "owner",
+		Name:         "repo",
+		PlatformHost: "github.com",
+	}
+	repoID, err := d.UpsertRepo(ctx, db.GitHubRepoIdentity("github.com", repo.Owner, repo.Name))
+	require.NoError(err)
+
+	unchangedAt := time.Date(2024, 6, 1, 10, 0, 0, 0, time.UTC)
+	changedAt := time.Date(2024, 6, 1, 12, 0, 0, 0, time.UTC)
+	detailFetchedAt := time.Date(2024, 6, 1, 11, 0, 0, 0, time.UTC)
+	openPRs := make([]*gh.PullRequest, 0, syncProgressLogInterval+1)
+	for number := 1; number <= syncProgressLogInterval+1; number++ {
+		updatedAt := unchangedAt
+		if number == 1 {
+			updatedAt = changedAt
+		}
+		openPRs = append(openPRs, buildOpenPR(number, updatedAt))
+		_, err := d.UpsertMergeRequest(ctx, &db.MergeRequest{
+			RepoID:          repoID,
+			PlatformID:      int64(number * 1000),
+			Number:          number,
+			URL:             fmt.Sprintf("https://github.com/owner/repo/pull/%d", number),
+			Title:           fmt.Sprintf("test PR %d", number),
+			Author:          "alice",
+			State:           "open",
+			HeadBranch:      "feature-branch",
+			BaseBranch:      "main",
+			PlatformHeadSHA: "abc123def456",
+			CreatedAt:       unchangedAt,
+			UpdatedAt:       unchangedAt,
+			LastActivityAt:  unchangedAt,
+			DetailFetchedAt: &detailFetchedAt,
+		})
+		require.NoError(err)
+	}
+
+	mc := &detailTrackingClient{}
+	mc.openPRs = openPRs
+	mc.listOpenIssuesErr = notModifiedErr()
+	mc.comments = []*gh.IssueComment{}
+	mc.reviews = []*gh.PullRequestReview{}
+	mc.commits = []*gh.RepositoryCommit{}
+	mc.ciStatus = &gh.CombinedStatus{State: new(string)}
+
+	var graphQLPRCalls atomic.Int32
+	gqlSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(body), "pullRequests") {
+			graphQLPRCalls.Add(1)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"errors":[{"message":"bulk PR fetch should be skipped"}]}`))
+	}))
+	defer gqlSrv.Close()
+
+	syncer := NewSyncer(
+		map[string]Client{"github.com": mc}, d, nil,
+		[]RepoRef{repo},
+		time.Minute, nil, testBudget(10000),
+	)
+	syncer.SetFetchers(map[string]*GraphQLFetcher{
+		"github.com": NewGraphQLFetcherWithClient(
+			githubv4.NewEnterpriseClient(gqlSrv.URL, gqlSrv.Client()),
+			nil,
+		),
+	})
+
+	syncer.RunOnce(ctx)
+
+	assert.True(mc.listOpenPRsCalled,
+		"large repo refresh should still read the open PR index")
+	assert.Zero(int(graphQLPRCalls.Load()),
+		"large existing repo refresh should not bulk-fetch every PR through GraphQL")
+	assert.Equal(int32(1), mc.getPRCalls.Load(),
+		"only the changed PR should be fetched by the detail drain")
+	pr, err := d.GetMergeRequest(ctx, "owner", "repo", 1)
+	require.NoError(err)
+	require.NotNil(pr)
+	assert.True(pr.UpdatedAt.Equal(changedAt))
 }
 
 func TestDetailDrainUsesProviderReadersForNonGitHub(t *testing.T) {
@@ -7022,6 +7508,52 @@ func TestSyncOpenIssueFromBulkRemovesDeletedCommentsWhenCommentsAreComplete(t *t
 	events, err = d.ListIssueEvents(ctx, issue.ID)
 	require.NoError(err)
 	assert.Empty(events)
+}
+
+func TestSyncIssuesFromListLogsProgressForLargeIssueSets(t *testing.T) {
+	require := require.New(t)
+	assert := Assert.New(t)
+	ctx := t.Context()
+	d := openTestDB(t)
+
+	repo := RepoRef{Owner: "owner", Name: "repo", PlatformHost: "github.com"}
+	repoID, err := d.UpsertRepo(ctx, db.GitHubRepoIdentity("github.com", repo.Owner, repo.Name))
+	require.NoError(err)
+
+	now := time.Now().UTC().Truncate(time.Second)
+	issues := make([]*gh.Issue, 0, 201)
+	for number := 1; number <= 201; number++ {
+		issues = append(issues, buildOpenIssue(number, now))
+	}
+
+	var buf bytes.Buffer
+	sw := &syncedWriter{w: &buf}
+	h := slog.NewTextHandler(sw, &slog.HandlerOptions{Level: slog.LevelInfo})
+	orig := slog.Default()
+	slog.SetDefault(slog.New(h))
+	t.Cleanup(func() { slog.SetDefault(orig) })
+
+	client := &mockClient{}
+	syncer := NewSyncer(
+		map[string]Client{"github.com": client},
+		d, nil, []RepoRef{repo}, time.Minute, nil, nil,
+	)
+
+	err = syncer.syncIssuesFromList(ctx, client, repo, repoID, issues, false)
+	require.NoError(err)
+
+	logs := buf.String()
+	assert.Contains(logs, `msg="issue sync started"`)
+	assert.Contains(logs, "repo=owner/repo")
+	assert.Contains(logs, "platform=github")
+	assert.Contains(logs, "host=github.com")
+	assert.Contains(logs, "source=rest")
+	assert.Contains(logs, "total=201")
+	assert.Contains(logs, `msg="issue sync progress"`)
+	assert.Contains(logs, "processed=100")
+	assert.Contains(logs, "processed=200")
+	assert.Contains(logs, `msg="issue sync completed"`)
+	assert.Contains(logs, "processed=201")
 }
 
 func TestSyncRepoGraphQLIssues(t *testing.T) {
