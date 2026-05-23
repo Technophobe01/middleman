@@ -55,7 +55,27 @@ import (
 	"go.kenn.io/middleman/internal/testutil/dbtest"
 	"go.kenn.io/middleman/internal/workspace"
 	"go.kenn.io/middleman/internal/workspace/localruntime"
+	"golang.org/x/sync/semaphore"
 )
+
+const serverRuntimeHelperMarker = "middleman-runtime-helper"
+
+var ptyE2ESemaphore = semaphore.NewWeighted(4)
+
+func runParallelPTYE2E(t *testing.T) {
+	t.Helper()
+	t.Parallel()
+	releasePTYSlot := acquirePTYE2ESlot(t)
+	t.Cleanup(releasePTYSlot)
+}
+
+func acquirePTYE2ESlot(t *testing.T) func() {
+	t.Helper()
+	require.NoError(t, ptyE2ESemaphore.Acquire(t.Context(), 1))
+	return func() {
+		ptyE2ESemaphore.Release(1)
+	}
+}
 
 func requirePTYAvailable(t *testing.T) {
 	t.Helper()
@@ -13906,6 +13926,8 @@ func TestCleanupWorkspaceServerFixtureArtifactsKeepsDeletingAfterError(
 }
 
 func TestWorkspaceRuntimeTargetsRefreshAfterSettingsUpdateE2E(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	assert := Assert.New(t)
 
@@ -13972,6 +13994,8 @@ func TestWorkspaceRuntimeTargetsRefreshAfterSettingsUpdateE2E(t *testing.T) {
 }
 
 func TestWorkspaceCreatesPtyOwnerSessionWhenTmuxUnavailableE2E(t *testing.T) {
+	runParallelPTYE2E(t)
+
 	require := require.New(t)
 	assert := Assert.New(t)
 
@@ -14058,6 +14082,8 @@ func TestWorkspacePtyOwnerTitleMarksWorkspaceWorkingE2E(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("workspace clone fixture uses Unix-style local remotes")
 	}
+	runParallelPTYE2E(t)
+
 	require := require.New(t)
 	assert := Assert.New(t)
 
@@ -14103,6 +14129,8 @@ func TestWorkspaceCreatesRustPtyManagerSessionE2E(t *testing.T) {
 	if runtime.GOOS != "windows" {
 		requirePTYAvailable(t)
 	}
+	runParallelPTYE2E(t)
+
 	require := require.New(t)
 	assert := Assert.New(t)
 
@@ -14169,7 +14197,8 @@ func TestWorkspaceRuntimeLaunchesRustPtyManagerSessionE2E(t *testing.T) {
 	if runtime.GOOS != "windows" {
 		requirePTYAvailable(t)
 	}
-	t.Setenv("MIDDLEMAN_SERVER_RUNTIME_HELPER", "1")
+	runParallelPTYE2E(t)
+
 	require := require.New(t)
 	assert := Assert.New(t)
 
@@ -14229,6 +14258,8 @@ func TestRustPtyManagerRejectsConcurrentAttachmentsE2E(t *testing.T) {
 		t.Skip("concurrent attach coverage is exercised by the Rust owner tests on Windows")
 	}
 	requirePTYAvailable(t)
+	runParallelPTYE2E(t)
+
 	require := require.New(t)
 	assert := Assert.New(t)
 
@@ -14243,7 +14274,6 @@ func TestRustPtyManagerRejectsConcurrentAttachmentsE2E(t *testing.T) {
 	firstNeedle := "got:before-second"
 	thirdNeedle := "got:after-close"
 	if runtime.GOOS == "windows" {
-		t.Setenv("MIDDLEMAN_SERVER_RUNTIME_HELPER", "1")
 		command = serverRuntimeHelperCommand("echo")
 		readyNeedle = ""
 		firstNeedle = "echo:before-second"
@@ -14325,6 +14355,8 @@ func readPtyOwnerOutputUntil(
 }
 
 func TestWorkspacePtyOwnerTerminalRejectsConcurrentAttachmentsE2E(t *testing.T) {
+	runParallelPTYE2E(t)
+
 	require := require.New(t)
 	assert := Assert.New(t)
 
@@ -14360,6 +14392,8 @@ func TestWorkspacePtyOwnerTerminalRejectsConcurrentAttachmentsE2E(t *testing.T) 
 }
 
 func TestWorkspacePtyOwnerTerminalFlushesFinalOutputOnExitE2E(t *testing.T) {
+	runParallelPTYE2E(t)
+
 	require := require.New(t)
 
 	fixture, _, ptyOwnerDir := setupPtyOwnerWorkspaceFixture(t)
@@ -14406,8 +14440,6 @@ func setupPtyOwnerWorkspaceFixture(
 	cfg := &config.Config{Tmux: config.Tmux{
 		Command: []string{filepath.Join(dir, "missing-tmux")},
 	}}
-	t.Setenv("SHELL", "/bin/sh")
-	t.Setenv("MIDDLEMAN_SERVER_PTY_OWNER_HELPER", "1")
 	return setupWorkspaceServerFixtureWithOptions(
 		t, cfg, ptyOwnerServerOptions(ptyOwnerDir),
 	), dir, ptyOwnerDir
@@ -14421,6 +14453,7 @@ func ptyOwnerServerOptions(ptyOwnerDir string) ServerOptions {
 			"-test.run=TestServerPtyOwnerHelperProcess",
 			"--",
 		},
+		PtyOwnerCommand: []string{"/bin/sh"},
 	}
 }
 
@@ -14438,7 +14471,6 @@ func gitLocalRemoteURL(path string) string {
 func rustPtyManagerShellCommandForTest(t *testing.T) []string {
 	t.Helper()
 	if runtime.GOOS == "windows" {
-		t.Setenv("MIDDLEMAN_SERVER_RUNTIME_HELPER", "1")
 		return serverRuntimeHelperCommand("echo")
 	}
 	return []string{"/bin/sh"}
@@ -14495,6 +14527,8 @@ func cleanupPtyOwnerWorkspace(
 }
 
 func TestWorkspaceRuntimeLaunchUnavailableTargetE2E(t *testing.T) {
+	t.Parallel()
+
 	disabled := false
 	cfg := &config.Config{Agents: []config.Agent{{
 		Key:     "disabled",
@@ -14518,6 +14552,8 @@ func TestWorkspaceRuntimeLaunchUnavailableTargetE2E(t *testing.T) {
 }
 
 func TestWorkspaceRuntimeLaunchPlainShellUsesShellSessionE2E(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	assert := Assert.New(t)
 
@@ -14550,7 +14586,7 @@ func TestWorkspaceRuntimeLaunchPlainShellUsesShellSessionE2E(t *testing.T) {
 }
 
 func TestWorkspaceRuntimeLaunchSingletonAndStopE2E(t *testing.T) {
-	t.Setenv("MIDDLEMAN_SERVER_RUNTIME_HELPER", "1")
+	runParallelPTYE2E(t)
 
 	require := require.New(t)
 	assert := Assert.New(t)
@@ -14615,7 +14651,7 @@ func TestWorkspaceRuntimeLaunchSingletonAndStopE2E(t *testing.T) {
 }
 
 func TestWorkspaceRuntimeNaturalAgentExitRemovesSessionE2E(t *testing.T) {
-	t.Setenv("MIDDLEMAN_SERVER_RUNTIME_HELPER", "1")
+	runParallelPTYE2E(t)
 
 	require := require.New(t)
 	assert := Assert.New(t)
@@ -15550,7 +15586,7 @@ exit 0
 }
 
 func TestWorkspaceDeleteStopsRuntimeSessionsE2E(t *testing.T) {
-	t.Setenv("MIDDLEMAN_SERVER_RUNTIME_HELPER", "1")
+	runParallelPTYE2E(t)
 
 	require := require.New(t)
 	assert := Assert.New(t)
@@ -15600,7 +15636,7 @@ func TestWorkspaceDeleteStopsRuntimeSessionsE2E(t *testing.T) {
 // survive — killing them on a delete that didn't actually happen would leave
 // the user with a workspace whose agent and shell were silently terminated.
 func TestWorkspaceDeleteDirtyKeepsRuntimeSessionsE2E(t *testing.T) {
-	t.Setenv("MIDDLEMAN_SERVER_RUNTIME_HELPER", "1")
+	runParallelPTYE2E(t)
 
 	require := require.New(t)
 	assert := Assert.New(t)
@@ -15668,6 +15704,8 @@ func TestWorkspaceDeleteDirtyKeepsRuntimeSessionsE2E(t *testing.T) {
 // on these fields, so a regression here would silently turn the pills
 // off without any test failure at the unit-test layer.
 func TestWorkspaceListReportsCommitsAheadBehindE2E(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	assert := Assert.New(t)
 
@@ -15724,6 +15762,8 @@ func TestWorkspaceListReportsCommitsAheadBehindE2E(t *testing.T) {
 }
 
 func TestWorkspaceDiffEndpointsReportHeadAndPushedE2E(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	assert := Assert.New(t)
 
@@ -15797,6 +15837,8 @@ func TestWorkspaceDiffEndpointsReportHeadAndPushedE2E(t *testing.T) {
 }
 
 func TestWorkspaceCommitsEndpointListsBranchCommitsE2E(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	assert := Assert.New(t)
 
@@ -15828,6 +15870,8 @@ func TestWorkspaceCommitsEndpointListsBranchCommitsE2E(t *testing.T) {
 }
 
 func TestWorkspaceDiffEndpointsAcceptCommitAndRangeScopesE2E(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 
 	client, _, _, _, srv := setupTestServerWithWorkspacesServer(t, nil)
@@ -15899,6 +15943,8 @@ func TestWorkspaceDiffEndpointsAcceptCommitAndRangeScopesE2E(t *testing.T) {
 }
 
 func TestWorkspaceDiffEndpointReportsMergeTargetE2E(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	assert := Assert.New(t)
 
@@ -15950,6 +15996,8 @@ func TestWorkspaceDiffEndpointReportsMergeTargetE2E(t *testing.T) {
 }
 
 func TestWorkspaceDiffEndpointRejectsOriginBaseE2E(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 
 	client, _, _, _, srv := setupTestServerWithWorkspacesServer(t, nil)
@@ -15974,6 +16022,8 @@ func TestWorkspaceDiffEndpointRejectsOriginBaseE2E(t *testing.T) {
 }
 
 func TestWorkspaceDiffEndpointHandlesUntrackedSymlinkAndLargeFileE2E(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	assert := Assert.New(t)
 
@@ -16018,6 +16068,8 @@ func TestWorkspaceDiffEndpointHandlesUntrackedSymlinkAndLargeFileE2E(t *testing.
 }
 
 func TestWorkspaceDiffEndpointMarksGeneratedFilesE2E(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	assert := Assert.New(t)
 
@@ -16057,6 +16109,8 @@ func TestWorkspaceDiffEndpointMarksGeneratedFilesE2E(t *testing.T) {
 }
 
 func TestWorkspaceDiffEndpointScopesPatchByPathE2E(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	assert := Assert.New(t)
 
@@ -16382,7 +16436,7 @@ func TestWorkspaceRuntimeEnsureShellE2E(t *testing.T) {
 // filter; this test guards both the websocket route and the
 // config.Shell.Command -> manager.Options.ShellCommand wiring.
 func TestWorkspaceRuntimeShellTerminalWebSocketE2E(t *testing.T) {
-	t.Setenv("MIDDLEMAN_SERVER_RUNTIME_HELPER", "1")
+	runParallelPTYE2E(t)
 
 	require := require.New(t)
 	cfg := &config.Config{
@@ -16445,7 +16499,7 @@ func TestWorkspaceRuntimeShellTerminalWebSocketE2E(t *testing.T) {
 // 100ms timeout fires before attachment.Done — exactly the systemd-
 // run-wrapped shell case the user hit.
 func TestWorkspaceRuntimeShellTerminalDeliversExitFrameE2E(t *testing.T) {
-	t.Setenv("MIDDLEMAN_SERVER_RUNTIME_HELPER", "1")
+	runParallelPTYE2E(t)
 
 	require := require.New(t)
 	cfg := &config.Config{
@@ -16534,7 +16588,7 @@ func TestWorkspaceRuntimeShellTerminalDeliversExitFrameE2E(t *testing.T) {
 // deterministic (~750ms) and the second EnsureShell is guaranteed to
 // land inside it.
 func TestWorkspaceRuntimeEnsureShellAfterExitStartsFreshE2E(t *testing.T) {
-	t.Setenv("MIDDLEMAN_SERVER_RUNTIME_HELPER", "1")
+	runParallelPTYE2E(t)
 
 	require := require.New(t)
 	assert := Assert.New(t)
@@ -16673,7 +16727,7 @@ func TestBridgeRuntimeAttachmentSubscriberDropDoesNotEmitExitFrame(t *testing.T)
 }
 
 func TestWorkspaceRuntimeSessionTerminalWebSocketE2E(t *testing.T) {
-	t.Setenv("MIDDLEMAN_SERVER_RUNTIME_HELPER", "1")
+	runParallelPTYE2E(t)
 
 	require := require.New(t)
 	disableTmuxAgentSessions := false
@@ -16729,7 +16783,7 @@ func TestWorkspaceRuntimeSessionTerminalWebSocketE2E(t *testing.T) {
 }
 
 func TestWorkspaceRuntimeSessionTerminalWebSocketBasePathE2E(t *testing.T) {
-	t.Setenv("MIDDLEMAN_SERVER_RUNTIME_HELPER", "1")
+	runParallelPTYE2E(t)
 
 	require := require.New(t)
 	disableTmuxAgentSessions := false
@@ -16888,7 +16942,7 @@ func workspaceTerminalDialWithQuery(
 }
 
 func TestWorkspaceRuntimeSessionTerminalSkipsAltScreenReplayE2E(t *testing.T) {
-	t.Setenv("MIDDLEMAN_SERVER_RUNTIME_HELPER", "1")
+	runParallelPTYE2E(t)
 
 	require := require.New(t)
 	assert := Assert.New(t)
@@ -16990,7 +17044,7 @@ func TestWorkspaceRuntimeSessionTerminalSkipsAltScreenReplayE2E(t *testing.T) {
 }
 
 func TestWorkspaceRuntimeSessionTerminalAppliesInitialSizeE2E(t *testing.T) {
-	t.Setenv("MIDDLEMAN_SERVER_RUNTIME_HELPER", "1")
+	runParallelPTYE2E(t)
 
 	require := require.New(t)
 	// This intentionally goes through the generated HTTP client, the real
@@ -17058,6 +17112,7 @@ func TestWorkspaceRuntimeSessionTerminalTmuxBackedWebSocketE2E(
 	if err != nil {
 		t.Skip("tmux not available")
 	}
+	runParallelPTYE2E(t)
 
 	require := require.New(t)
 	assert := Assert.New(t)
@@ -17176,16 +17231,25 @@ func serverRuntimeHelperCommand(mode string) []string {
 		os.Args[0],
 		"-test.run=TestServerRuntimeHelperProcess",
 		"--",
+		serverRuntimeHelperMarker,
 		mode,
 	}
 }
 
 func TestServerRuntimeHelperProcess(t *testing.T) {
-	if os.Getenv("MIDDLEMAN_SERVER_RUNTIME_HELPER") != "1" {
+	args := os.Args
+	if sep := slices.Index(args, "--"); sep >= 0 {
+		args = args[sep+1:]
+	}
+	if len(args) > 0 && args[0] == serverRuntimeHelperMarker {
+		args = args[1:]
+	} else if os.Getenv("MIDDLEMAN_SERVER_RUNTIME_HELPER") != "1" {
 		return
 	}
-	args := os.Args
-	mode := args[len(args)-1]
+	if len(args) == 0 {
+		os.Exit(2)
+	}
+	mode := args[0]
 	switch mode {
 	case "sleep":
 		blockServerRuntimeHelper()
@@ -17243,13 +17307,14 @@ func blockServerRuntimeHelper() {
 }
 
 func TestServerPtyOwnerHelperProcess(t *testing.T) {
-	if os.Getenv("MIDDLEMAN_SERVER_PTY_OWNER_HELPER") != "1" {
-		return
-	}
 	args := os.Args
 	sep := slices.Index(args, "--")
 	if sep >= 0 {
 		args = args[sep+1:]
+	}
+	if os.Getenv("MIDDLEMAN_SERVER_PTY_OWNER_HELPER") != "1" &&
+		(len(args) == 0 || args[0] != "pty-owner") {
+		return
 	}
 	if len(args) > 0 && args[0] == "pty-owner" {
 		args = args[1:]
@@ -17342,6 +17407,8 @@ type rawProblemDetail struct {
 }
 
 func TestWorkspaceCRUDE2E(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	assert := Assert.New(t)
 
@@ -17417,6 +17484,8 @@ func TestWorkspaceCRUDE2E(t *testing.T) {
 }
 
 func TestWorkspaceRetryErroredWorkspaceE2E(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	assert := Assert.New(t)
 
@@ -17457,6 +17526,8 @@ func TestWorkspaceRetryErroredWorkspaceE2E(t *testing.T) {
 }
 
 func TestWorkspaceRetryReadyWorkspaceConflictE2E(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	assert := Assert.New(t)
 
@@ -17505,6 +17576,8 @@ func TestWorkspaceRetryReadyWorkspaceConflictE2E(t *testing.T) {
 }
 
 func TestWorkspaceCreateNotFound(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 
 	client, _, _, _ := setupTestServerWithWorkspaces(t)
@@ -17538,6 +17611,8 @@ func TestWorkspaceCreateNotFound(t *testing.T) {
 }
 
 func TestWorkspaceMRDetailHasWorkspace(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	assert := Assert.New(t)
 
@@ -17583,6 +17658,8 @@ func TestWorkspaceMRDetailHasWorkspace(t *testing.T) {
 }
 
 func TestWorkspaceCreateDuplicate(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 
 	client, _, _, _ := setupTestServerWithWorkspaces(t)
@@ -17607,6 +17684,8 @@ func TestWorkspaceCreateDuplicate(t *testing.T) {
 }
 
 func TestWorkspaceCreateFetchesCloneThroughAPI(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	assert := Assert.New(t)
 
@@ -17646,6 +17725,8 @@ func TestWorkspaceCreateFetchesCloneThroughAPI(t *testing.T) {
 }
 
 func TestWorkspaceCreateIssueE2E(t *testing.T) {
+	t.Parallel()
+
 	assert := Assert.New(t)
 	require := require.New(t)
 
@@ -17698,6 +17779,8 @@ func TestWorkspaceCreateIssueE2E(t *testing.T) {
 }
 
 func TestWorkspaceCreateIssueUsesTitleSlugInBranch(t *testing.T) {
+	t.Parallel()
+
 	assert := Assert.New(t)
 	require := require.New(t)
 
@@ -17732,6 +17815,8 @@ func TestWorkspaceCreateIssueUsesTitleSlugInBranch(t *testing.T) {
 }
 
 func TestWorkspaceCreateIssueBareStyleConfigOptOut(t *testing.T) {
+	t.Parallel()
+
 	assert := Assert.New(t)
 	require := require.New(t)
 
@@ -17767,6 +17852,8 @@ func TestWorkspaceCreateIssueBareStyleConfigOptOut(t *testing.T) {
 }
 
 func TestWorkspaceCreateIssueIsIdempotent(t *testing.T) {
+	t.Parallel()
+
 	assert := Assert.New(t)
 	require := require.New(t)
 
@@ -17800,6 +17887,8 @@ func TestWorkspaceCreateIssueIsIdempotent(t *testing.T) {
 }
 
 func TestWorkspaceCreateIssueAfterDeleteRecreatesBranch(t *testing.T) {
+	t.Parallel()
+
 	assert := Assert.New(t)
 	require := require.New(t)
 
@@ -17853,6 +17942,8 @@ func TestWorkspaceCreateIssueAfterDeleteRecreatesBranch(t *testing.T) {
 }
 
 func TestWorkspaceCreatePRAndIssueCanCoexistForSameRepoNumber(t *testing.T) {
+	t.Parallel()
+
 	assert := Assert.New(t)
 	require := require.New(t)
 
@@ -17900,6 +17991,8 @@ func TestWorkspaceCreatePRAndIssueCanCoexistForSameRepoNumber(t *testing.T) {
 }
 
 func TestWorkspaceCreateIssueBranchConflictReturnsTyped409(t *testing.T) {
+	t.Parallel()
+
 	assert := Assert.New(t)
 	require := require.New(t)
 
@@ -18043,6 +18136,8 @@ func prepareIssueWorkspaceAssociationFixture(
 }
 
 func TestWorkspaceIssueMonitorAssociatesPRAndKeepsIssueOwnership(t *testing.T) {
+	t.Parallel()
+
 	assert := Assert.New(t)
 	require := require.New(t)
 	ctx := context.Background()
@@ -18087,6 +18182,8 @@ func TestWorkspaceIssueMonitorAssociatesPRAndKeepsIssueOwnership(t *testing.T) {
 }
 
 func TestWorkspaceMonitorPassBroadcastsInvalidationEvents(t *testing.T) {
+	t.Parallel()
+
 	assert := Assert.New(t)
 	ctx := t.Context()
 
@@ -18128,6 +18225,8 @@ func readEventMatching(
 }
 
 func TestWorkspaceCreateUsesPRBranchAndFallbackBranch(t *testing.T) {
+	t.Parallel()
+
 	assert := Assert.New(t)
 	require := require.New(t)
 
@@ -18195,6 +18294,8 @@ func TestWorkspaceCreateUsesPRBranchAndFallbackBranch(t *testing.T) {
 }
 
 func TestWorkspaceCreateSameRepoHeadCloneURLTracksOriginBranchE2E(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	assert := Assert.New(t)
 
@@ -18249,6 +18350,8 @@ func TestWorkspaceCreateSameRepoHeadCloneURLTracksOriginBranchE2E(t *testing.T) 
 }
 
 func TestWorkspaceCreatePortQualifiedHostTracksOriginBranchE2E(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	assert := Assert.New(t)
 
@@ -18297,6 +18400,8 @@ func TestWorkspaceCreatePortQualifiedHostTracksOriginBranchE2E(t *testing.T) {
 }
 
 func TestWorkspaceDeleteRecreatesForkBranchName(t *testing.T) {
+	t.Parallel()
+
 	assert := Assert.New(t)
 	require := require.New(t)
 
@@ -18385,6 +18490,8 @@ func TestWorkspaceDeleteRecreatesForkBranchName(t *testing.T) {
 }
 
 func TestWorkspaceDeletePreservesUserCreatedBranch(t *testing.T) {
+	t.Parallel()
+
 	assert := Assert.New(t)
 	require := require.New(t)
 
@@ -18423,6 +18530,8 @@ func TestWorkspaceDeletePreservesUserCreatedBranch(t *testing.T) {
 }
 
 func TestWorkspaceCreatePreservesExistingLocalPreferredBranch(t *testing.T) {
+	t.Parallel()
+
 	assert := Assert.New(t)
 	require := require.New(t)
 
@@ -18481,6 +18590,8 @@ func TestWorkspaceCreatePreservesExistingLocalPreferredBranch(t *testing.T) {
 }
 
 func TestWorkspaceDeleteLegacySyntheticBranchAllowsRecreate(t *testing.T) {
+	t.Parallel()
+
 	assert := Assert.New(t)
 	require := require.New(t)
 
@@ -18670,6 +18781,8 @@ func seedPROnHost(
 }
 
 func TestWorkspaceDeleteDirty(t *testing.T) {
+	t.Parallel()
+
 	require := require.New(t)
 	assert := Assert.New(t)
 
