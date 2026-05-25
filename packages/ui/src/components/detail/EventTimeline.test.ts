@@ -201,6 +201,15 @@ describe("EventTimeline", () => {
       props: {
         events: [
           makeEvent({
+            ID: 1,
+            EventType: "comment_deleted",
+            Author: "maintainer",
+            Summary: "deleted a comment from reviewer",
+            MetadataJSON: JSON.stringify({
+              deleted_comment_author: "reviewer",
+            }),
+          }),
+          makeEvent({
             ID: 2,
             EventType: "renamed_title",
             Summary: `"Old" -> "New"`,
@@ -234,14 +243,27 @@ describe("EventTimeline", () => {
       },
     });
 
+    expect(screen.queryByText("Comment deleted")).toBeNull();
+    expect(screen.getByText("maintainer")).toBeTruthy();
+    expect(screen.getByText("deleted a comment from reviewer")).toBeTruthy();
+    const deletedHeader = document.querySelector(".event-header--compact");
+    const deletedChildren = Array.from(deletedHeader?.children ?? []);
+    expect(deletedChildren).toHaveLength(3);
+    expect(deletedChildren[0]?.classList.contains("event-author")).toBe(true);
+    expect(deletedChildren[1]?.classList.contains("system-event-summary")).toBe(true);
+    expect(deletedChildren[1]?.classList.contains("system-event-summary--sentence")).toBe(true);
+    expect(deletedChildren[2]?.classList.contains("event-time")).toBe(true);
     expect(screen.getByText("Title changed")).toBeTruthy();
     expect(screen.getByText("Base changed")).toBeTruthy();
     expect(screen.getByText("Referenced")).toBeTruthy();
     expect(screen.getByText("Related bug")).toBeTruthy();
-    expect(document.querySelectorAll(".event--compact").length).toBe(3);
+    expect(document.querySelectorAll(".event--compact").length).toBe(4);
   });
 
   it("renders cross-repository events as internal item references when metadata identifies the source item", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2024-06-01T16:00:00Z"));
+
     render(EventTimeline, {
       props: {
         events: [
@@ -249,6 +271,7 @@ describe("EventTimeline", () => {
             ID: 4,
             EventType: "cross_referenced",
             Summary: "Referenced from kenn-io/kit#1",
+            CreatedAt: "2024-06-01T14:00:00Z",
             MetadataJSON: JSON.stringify({
               source_type: "PullRequest",
               source_owner: "kenn-io",
@@ -282,6 +305,7 @@ describe("EventTimeline", () => {
     assert(link.getAttribute("data-repo-path")).toBe("kenn-io/kit");
     assert(link.getAttribute("data-number")).toBe("1");
     assert(link.getAttribute("data-external-url")).toBe("https://github.com/kenn-io/kit/pull/1");
+    assert(screen.getByText("2h ago")).toBeTruthy();
   });
 
   it("keeps external cross-reference links when item metadata is incomplete", () => {
