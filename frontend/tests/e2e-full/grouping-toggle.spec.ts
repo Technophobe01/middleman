@@ -58,6 +58,7 @@ test.describe("grouping toggle", () => {
       }
       localStorage.removeItem("middleman:groupingMode");
       localStorage.removeItem("middleman:groupByRepo");
+      localStorage.removeItem("middleman:hideOrgName");
       sessionStorage.setItem("middleman:test:grouping:init", "1");
     });
     await page.goto("/pulls");
@@ -179,6 +180,73 @@ test.describe("grouping toggle", () => {
     dropdown = await openActivityViewDropdown(page);
     await expect(dropdown.locator(".filter-item", { hasText: /By repo/i }))
       .toBeVisible();
+  });
+
+  test("activity flat table rows respect hide org name", async ({ page }) => {
+    await page.goto("/?view=flat");
+
+    const row = page.locator(".activity-table .activity-row", {
+      has: page.locator(".item-title", { hasText: "Add widget caching layer" }),
+    }).first();
+    await expect(row).toBeVisible({ timeout: 10_000 });
+
+    const repoLabel = row.locator(".col-repo");
+    await expect(repoLabel).toHaveText("acme/widgets");
+
+    await selectActivityViewItem(page, "Hide org name");
+
+    await expect(repoLabel).toHaveText("widgets");
+    await expect(repoLabel).not.toHaveText("acme/widgets");
+  });
+
+  test("activity threaded grouped headers respect hide org name", async ({ page }) => {
+    await page.goto("/");
+
+    await selectActivityViewItem(page, "Threaded");
+    await page.locator(".threaded-view .repo-header").first()
+      .waitFor({ state: "visible", timeout: 10_000 });
+
+    await expect(
+      page.locator(".threaded-view .repo-header .repo-name", {
+        hasText: "acme/widgets",
+      }),
+    ).toBeVisible();
+
+    await selectActivityViewItem(page, "Hide org name");
+
+    await expect(
+      page.locator(".threaded-view .repo-header .repo-name", {
+        hasText: /^widgets$/,
+      }),
+    ).toBeVisible();
+    await expect(
+      page.locator(".threaded-view .repo-header .repo-name", {
+        hasText: "acme/widgets",
+      }),
+    ).toHaveCount(0);
+  });
+
+  test("activity threaded ungrouped rows show latest author and hide org repo chips", async ({ page }) => {
+    await page.goto("/");
+
+    await selectActivityViewItem(page, "Threaded");
+    await page.locator(".threaded-view .item-row").first()
+      .waitFor({ state: "visible", timeout: 10_000 });
+    await selectActivityViewItem(page, "All");
+
+    const row = page.locator(".threaded-view .item-row", {
+      has: page.locator(".item-title", { hasText: "Add widget caching layer" }),
+    }).first();
+    await expect(row).toBeVisible();
+    await expect(row.locator(".cell--author")).toHaveText("bob");
+
+    const repoLabel = row.locator(".repo-chip__label");
+    await expect(repoLabel).toHaveText("acme/widgets");
+
+    await selectActivityViewItem(page, "Hide org name");
+
+    await expect(repoLabel).toHaveText("widgets");
+    await expect(repoLabel).not.toHaveText("acme/widgets");
   });
 
   test("threaded ungrouped empty state shows message", async ({ page }) => {

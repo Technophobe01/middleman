@@ -347,7 +347,7 @@ function isGheIssueRoute(url: URL, suffix = ""): boolean {
 }
 
 async function waitForActivityTable(page: Page): Promise<void> {
-  await page.locator(".activity-table tbody .activity-row").first()
+  await page.locator(".activity-table .activity-row").first()
     .waitFor({ state: "visible", timeout: 10_000 });
 }
 
@@ -523,6 +523,32 @@ test.describe("activity split view and detail drawers", () => {
     // before teardown so pending route.fetch calls don't leak "Test
     // ended" rejections into the next test.
     await page.unrouteAll({ behavior: "ignoreErrors" });
+  });
+
+  test("compact flat activity rows respect hide org name", async ({ page }) => {
+    await page.addInitScript(() => {
+      localStorage.removeItem("middleman:hideOrgName");
+    });
+    await page.goto("/?view=flat");
+    await waitForActivityTable(page);
+
+    await openActivityPRSplit(page);
+
+    const row = page.locator(".activity-compact-row", {
+      has: page.locator(".compact-title", { hasText: "Add widget caching layer" }),
+    }).first();
+    await expect(row).toBeVisible();
+
+    const repoLabel = row.locator(".compact-meta > span").first();
+    await expect(repoLabel).toHaveText("acme/widgets");
+
+    await page.locator(".activity-feed .filter-btn", { hasText: "View" }).click();
+    await page.locator(".activity-feed .filter-dropdown .filter-item", {
+      hasText: "Hide org name",
+    }).click();
+
+    await expect(repoLabel).toHaveText("widgets");
+    await expect(repoLabel).not.toHaveText("acme/widgets");
   });
 
   test("Activity PR switching uses background sync without foreground fanout", async ({ page }) => {

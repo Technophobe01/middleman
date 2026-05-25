@@ -22,6 +22,7 @@
 
   const { grouping, activity } = getStores();
   import { repoColor } from "../utils/repo-color.js";
+  import ArrowUpRightIcon from "@lucide/svelte/icons/arrow-up-right";
   import ChevronDownIcon from "@lucide/svelte/icons/chevron-down";
   import ChevronRightIcon from "@lucide/svelte/icons/chevron-right";
 
@@ -76,6 +77,7 @@
     repoPath: string;
     platformHost: string;
     latestTime: string;
+    latestAuthor: string;
     events: ActivityItem[];
     displayEvents: ReturnType<
       typeof collapseActivityCommitRuns
@@ -169,6 +171,7 @@
           repoPath: first.repo.repo_path,
           platformHost: first.repo.platform_host,
           latestTime: first.created_at,
+          latestAuthor: eventAuthor(first),
           events,
           displayEvents: collapseActivityCommitRuns(events),
         },
@@ -206,7 +209,7 @@
         owner: entryRepoOwner(entry),
         name: entryRepoName(entry),
       });
-      repoLabels.set(repoKey, `${entryRepoOwner(entry)}/${entryRepoName(entry)}`);
+      repoLabels.set(repoKey, repoLabel(entryRepoOwner(entry), entryRepoName(entry)));
       let bucket = repoMap.get(repoKey);
       if (!bucket) {
         bucket = [];
@@ -423,6 +426,16 @@
     return event.author_name || event.author;
   }
 
+  function repoLabel(owner: string, name: string): string {
+    return grouping.getHideOrgName() ? name : `${owner}/${name}`;
+  }
+
+  function branchRowAuthor(row: ActivityRow): string {
+    return isCollapsedActivityRow(row)
+      ? row.author
+      : eventAuthor(row);
+  }
+
   function eventSummary(event: ActivityItem): string {
     if (!isDefaultBranchActivity(event)) return "";
     if (isDefaultBranchForcePushActivity(event)) {
@@ -445,9 +458,35 @@
     if (isCollapsedActivityRow(row)) return `${row.count} commits`;
     return eventSummary(row) || eventLabel(row.activity_type);
   }
+
+  function rowLinkUrl(item: ActivityItem): string {
+    return item.activity_url || item.item_url;
+  }
+
+  function handleLinkClick(e: Event, url: string): void {
+    e.stopPropagation();
+    if (url) window.open(url, "_blank", "noopener");
+  }
 </script>
 
-<div class="threaded-view" class:threaded-view--compact={compact}>
+<div
+  class="threaded-view"
+  class:threaded-view--compact={compact}
+  class:threaded-view--grouped={grouping.getGroupByRepo()}
+  aria-label="Activity items"
+>
+  <div class="activity-column-headers">
+    <span class="cell cell--caret" aria-hidden="true"></span>
+    <span class="cell cell--type">Type</span>
+    {#if !grouping.getGroupByRepo()}
+      <span class="cell cell--repo">Repo</span>
+    {/if}
+    <span class="cell cell--author">Author</span>
+    <span class="cell cell--title">Item</span>
+    <span class="cell cell--time">When</span>
+    <span class="cell cell--link" aria-hidden="true"></span>
+  </div>
+
   {#each grouped as repoGroup (repoGroup.key)}
     <div class="repo-section">
       {#if grouping.getGroupByRepo()}
@@ -468,23 +507,41 @@
             class:selected={isSelectedBranchRow(row)}
             onclick={() => handleBranchRowClick(row)}
           >
-            <span class="thread-caret-spacer" aria-hidden="true"></span>
-            <span class="branch-event-type {eventClass(item.activity_type)}">
+            <span class="thread-caret-spacer cell cell--caret" aria-hidden="true"></span>
+            <span class="branch-event-type cell cell--type {eventClass(item.activity_type)}">
               {isDefaultBranchCommitActivity(item) ? "Commit" : eventLabel(item.activity_type)}
             </span>
             {#if !grouping.getGroupByRepo()}
-              <Chip
-                size="xs"
-                uppercase={false}
-                class="repo-chip repo-tag"
-                style="color: {repoColor(`${entry.repoOwner}/${entry.repoName}`)}; background: color-mix(in srgb, {repoColor(`${entry.repoOwner}/${entry.repoName}`)} 15%, transparent);"
-              >
-                <span class="repo-chip__label">{entry.repoOwner}/{entry.repoName}</span>
-              </Chip>
+              <span class="cell cell--repo">
+                <Chip
+                  size="xs"
+                  uppercase={false}
+                  class="repo-chip repo-tag"
+                  style="color: {repoColor(`${entry.repoOwner}/${entry.repoName}`)}; background: color-mix(in srgb, {repoColor(`${entry.repoOwner}/${entry.repoName}`)} 15%, transparent);"
+                >
+                  <span class="repo-chip__label">{repoLabel(entry.repoOwner, entry.repoName)}</span>
+                </Chip>
+              </span>
             {/if}
-            <span class="item-ref">{branchName(item)}</span>
-            <span class="item-title">{branchRowTitle(row)}</span>
-            <span class="item-time">{relativeTime(entry.latestTime)}</span>
+            <span class="cell cell--author">{branchRowAuthor(row)}</span>
+            <span class="cell cell--title">
+              <span class="item-ref">{branchName(item)}</span>
+              <span class="item-title">{branchRowTitle(row)}</span>
+            </span>
+            <span class="cell cell--time">{relativeTime(entry.latestTime)}</span>
+            <span class="cell cell--link">
+              {#if rowLinkUrl(item)}
+                <button
+                  class="link-btn"
+                  type="button"
+                  aria-label="Open activity in provider"
+                  title="Open activity"
+                  onclick={(e) => handleLinkClick(e, rowLinkUrl(item))}
+                >
+                  <ArrowUpRightIcon size="14" strokeWidth="2" aria-hidden="true" />
+                </button>
+              {/if}
+            </span>
           </div>
         {:else}
           {@const itemGroup = entry.group}
@@ -497,7 +554,7 @@
           onclick={() => handleItemClick(itemGroup)}
         >
           <button
-            class="thread-caret"
+            class="thread-caret cell cell--caret"
             type="button"
             aria-label={activity.isThreadItemExpanded(key)
               ? "Collapse item activity"
@@ -514,27 +571,47 @@
               <ChevronRightIcon size="14" strokeWidth="2" aria-hidden="true" />
             {/if}
           </button>
-          <ItemKindChip
-            kind={itemGroup.itemType === "pr" ? "pr" : "issue"}
-          />
+          <span class="cell cell--type">
+            <ItemKindChip
+              kind={itemGroup.itemType === "pr" ? "pr" : "issue"}
+            />
+          </span>
           {#if !grouping.getGroupByRepo()}
-            <Chip
-              size="xs"
-              uppercase={false}
-              class="repo-chip repo-tag"
-              style="color: {repoColor(`${itemGroup.repoOwner}/${itemGroup.repoName}`)}; background: color-mix(in srgb, {repoColor(`${itemGroup.repoOwner}/${itemGroup.repoName}`)} 15%, transparent);"
-            >
-              <span class="repo-chip__label">{itemGroup.repoOwner}/{itemGroup.repoName}</span>
-            </Chip>
+            <span class="cell cell--repo">
+              <Chip
+                size="xs"
+                uppercase={false}
+                class="repo-chip repo-tag"
+                style="color: {repoColor(`${itemGroup.repoOwner}/${itemGroup.repoName}`)}; background: color-mix(in srgb, {repoColor(`${itemGroup.repoOwner}/${itemGroup.repoName}`)} 15%, transparent);"
+              >
+                <span class="repo-chip__label">{repoLabel(itemGroup.repoOwner, itemGroup.repoName)}</span>
+              </Chip>
+            </span>
           {/if}
-          {#if itemGroup.itemState === "merged"}
-            <ItemStateChip state="merged" />
-          {:else if itemGroup.itemState === "closed"}
-            <ItemStateChip state="closed" />
-          {/if}
-          <span class="item-ref">#{itemGroup.itemNumber}</span>
-          <span class="item-title">{itemGroup.itemTitle}</span>
-          <span class="item-time">{relativeTime(itemGroup.latestTime)}</span>
+          <span class="cell cell--author">{itemGroup.latestAuthor}</span>
+          <span class="cell cell--title">
+            {#if itemGroup.itemState === "merged"}
+              <ItemStateChip state="merged" />
+            {:else if itemGroup.itemState === "closed"}
+              <ItemStateChip state="closed" />
+            {/if}
+            <span class="item-ref">#{itemGroup.itemNumber}</span>
+            <span class="item-title">{itemGroup.itemTitle}</span>
+          </span>
+          <span class="cell cell--time">{relativeTime(itemGroup.latestTime)}</span>
+          <span class="cell cell--link">
+            {#if itemGroup.itemUrl}
+              <button
+                class="link-btn"
+                type="button"
+                aria-label="Open item in provider"
+                title="Open item"
+                onclick={(e) => handleLinkClick(e, itemGroup.itemUrl)}
+              >
+                <ArrowUpRightIcon size="14" strokeWidth="2" aria-hidden="true" />
+              </button>
+            {/if}
+          </span>
         </div>
 
         {#if activity.isThreadItemExpanded(key)}
@@ -570,25 +647,70 @@
 </div>
 
 <style>
+  /* The threaded view is one grid so every row — column headers, item
+   * rows, and event rows alike — shares the same column widths. Each
+   * .repo-section is a subgrid that spans 1 / -1 (see its rule below),
+   * so its rows inherit the view's tracks while the section's box
+   * still bounds its sticky repo header. fit-content keeps each
+   * non-fixed column sized to its widest cell content, capped to a
+   * sensible maximum; the cap means hiding the org name automatically
+   * shrinks the repo column because cell content is shorter. */
   .threaded-view {
     flex: 1;
     overflow-y: auto;
     padding: 0 16px;
+    --threaded-col-repo-max: 220px;
+    --threaded-col-author-max: 140px;
+    display: grid;
+    grid-template-columns:
+      18px
+      fit-content(120px)
+      fit-content(var(--threaded-col-repo-max))
+      fit-content(var(--threaded-col-author-max))
+      minmax(0, 1fr)
+      auto
+      24px;
+    column-gap: 6px;
+    align-content: start;
   }
 
+  .threaded-view--grouped {
+    grid-template-columns:
+      18px
+      fit-content(120px)
+      fit-content(var(--threaded-col-author-max))
+      minmax(0, 1fr)
+      auto
+      24px;
+  }
+
+  .threaded-view--compact {
+    --threaded-col-repo-max: 140px;
+    --threaded-col-author-max: 96px;
+  }
+
+  /* Sections are subgrids of the view so all sections share one column
+   * track set (so the column headers' widths line up with every section),
+   * and each section is a real box so its sticky repo header is bounded
+   * by section contents instead of competing with other sections' sticky
+   * headers for the same top: 26px slot. */
   .repo-section {
-    margin-bottom: 4px;
+    display: grid;
+    grid-template-columns: subgrid;
+    grid-column: 1 / -1;
   }
 
   .repo-header {
+    grid-column: 1 / -1;
     display: flex;
     align-items: center;
     gap: 8px;
     padding: 8px 0 4px;
+    margin-top: 4px;
     position: sticky;
-    top: 0;
+    top: 26px;
     background: var(--bg-primary);
-    z-index: 2;
+    z-index: 1;
     border-bottom: 1px solid var(--border-default);
   }
 
@@ -604,13 +726,32 @@
   }
 
   .item-row {
-    display: flex;
+    display: grid;
+    grid-template-columns: subgrid;
+    grid-column: 1 / -1;
     align-items: center;
-    gap: 6px;
-    padding: 5px 0 5px 24px;
+    padding: 5px 0;
     cursor: pointer;
     border-bottom: 1px solid var(--border-muted);
     transition: background 0.1s;
+  }
+
+  .activity-column-headers {
+    display: grid;
+    grid-template-columns: subgrid;
+    grid-column: 1 / -1;
+    align-items: center;
+    padding: 6px 0 4px;
+    font-size: var(--font-size-2xs);
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-muted);
+    border-bottom: 1px solid var(--border-default);
+    position: sticky;
+    top: 0;
+    background: var(--bg-primary);
+    z-index: 2;
   }
 
   .item-row:hover {
@@ -622,6 +763,14 @@
     box-shadow: inset 3px 0 0 var(--accent-blue);
   }
 
+  .cell {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .cell--caret,
   .thread-caret {
     display: inline-flex;
     align-items: center;
@@ -629,6 +778,10 @@
     width: 18px;
     height: 18px;
     flex-shrink: 0;
+    overflow: visible;
+  }
+
+  .thread-caret {
     color: var(--text-muted);
     background: none;
     border-radius: var(--radius-sm);
@@ -645,10 +798,29 @@
     outline-offset: 1px;
   }
 
-  .thread-caret-spacer {
-    width: 18px;
-    height: 18px;
-    flex-shrink: 0;
+  .cell--type {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    overflow: visible;
+  }
+
+  .cell--repo {
+    display: inline-flex;
+    align-items: center;
+    min-width: 0;
+  }
+
+  .cell--author {
+    font-size: var(--font-size-xs);
+    color: var(--text-secondary);
+  }
+
+  .cell--title {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
   }
 
   .item-ref {
@@ -663,18 +835,47 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    flex: 1;
     min-width: 0;
   }
 
-  .item-time {
+  .cell--time {
     font-size: var(--font-size-xs);
     color: var(--text-muted);
-    flex-shrink: 0;
-    margin-left: auto;
+    text-align: right;
+  }
+
+  .cell--link {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    overflow: visible;
+  }
+
+  .link-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-muted);
+    background: none;
+    border: 0;
+    padding: 2px;
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    transition: color 0.1s, background 0.1s;
+  }
+
+  .link-btn:hover {
+    color: var(--accent-blue);
+    background: var(--bg-surface-hover);
+  }
+
+  .link-btn:focus-visible {
+    outline: 2px solid var(--accent-blue);
+    outline-offset: 1px;
   }
 
   .event-row {
+    grid-column: 1 / -1;
     display: flex;
     align-items: center;
     gap: 8px;
@@ -738,19 +939,19 @@
   }
 
   .empty-state {
+    grid-column: 1 / -1;
     padding: 40px;
     text-align: center;
     color: var(--text-muted);
     font-size: var(--font-size-md);
   }
 
-  :global(.repo-chip) {
-    flex-shrink: 1;
-    max-width: 40%;
+  .cell--repo :global(.repo-chip) {
     min-width: 0;
+    max-width: 100%;
   }
 
-  :global(.repo-chip) .repo-chip__label {
+  .cell--repo :global(.repo-chip .repo-chip__label) {
     display: block;
     min-width: 0;
     overflow: hidden;
@@ -768,6 +969,10 @@
 
   .threaded-view--compact .item-row {
     padding: 7px 10px;
+  }
+
+  .threaded-view--compact.threaded-view--grouped .item-row {
+    padding-left: 24px;
   }
 
   .threaded-view--compact .event-row {
