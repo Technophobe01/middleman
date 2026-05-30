@@ -7,45 +7,15 @@ import {
 
 import { apiErrorMessage, client } from "./runtime.js";
 
-type SettingsResponse = components["schemas"]["SettingsResponse"];
-type RepoPreviewGeneratedResponse =
-  components["schemas"]["RepoPreviewResponse"];
-type UpdateSettingsRequest =
-  components["schemas"]["UpdateSettingsRequest"];
+type UpdateSettingsRequest = components["schemas"]["UpdateSettingsRequest"];
+export type RepoPreviewResponse = components["schemas"]["RepoPreviewResponse"];
+export type RepoPreviewRow = components["schemas"]["RepoPreviewRow"];
 
 function requestErrorMessage(
   error: { detail?: string; title?: string } | undefined,
   fallback: string,
 ): string {
   return apiErrorMessage(error, fallback);
-}
-
-function normalizeSettings(data: SettingsResponse): Settings {
-  return {
-    ...data,
-    repos: data.repos ?? [],
-  } as Settings;
-}
-
-export interface RepoPreviewRow {
-  provider: string;
-  platform_host: string;
-  owner: string;
-  name: string;
-  repo_path: string;
-  description: string | null;
-  private: boolean;
-  fork: boolean;
-  pushed_at: string | null;
-  already_configured: boolean;
-}
-
-export interface RepoPreviewResponse {
-  provider: string;
-  platform_host: string;
-  owner: string;
-  pattern: string;
-  repos: RepoPreviewRow[];
 }
 
 export interface RepoRequestOptions {
@@ -59,22 +29,11 @@ export interface RepoInput extends RepoRequestOptions {
   repo_path?: string;
 }
 
-function normalizePreviewResponse(
-  data: RepoPreviewGeneratedResponse,
-): RepoPreviewResponse {
-  return {
-    ...data,
-    repos: data.repos ?? [],
-  } as RepoPreviewResponse;
-}
-
-function normalizeUpdateRequest(
-  settings: {
-    activity?: Settings["activity"];
-    terminal?: Settings["terminal"];
-    agents?: Settings["agents"];
-  },
-): UpdateSettingsRequest {
+function normalizeUpdateRequest(settings: {
+  activity?: Settings["activity"];
+  terminal?: Settings["terminal"];
+  agents?: Settings["agents"];
+}): UpdateSettingsRequest {
   const request: UpdateSettingsRequest = {};
   if (settings.activity) {
     request.activity = settings.activity;
@@ -83,10 +42,7 @@ function normalizeUpdateRequest(
     request.terminal = settings.terminal;
   }
   if (settings.agents) {
-    request.agents = settings.agents.map((agent) => ({
-      ...agent,
-      command: agent.command ?? null,
-    }));
+    request.agents = settings.agents;
   }
   return request;
 }
@@ -95,34 +51,26 @@ export async function getSettings(): Promise<Settings> {
   const { data, error, response } = await client.GET("/settings");
   if (!data) {
     throw new Error(
-      requestErrorMessage(
-        error,
-        `GET /settings -> ${response.status}`,
-      ),
+      requestErrorMessage(error, `GET /settings -> ${response.status}`),
     );
   }
-  return normalizeSettings(data);
+  return data;
 }
 
-export async function updateSettings(
-  settings: {
-    activity?: Settings["activity"];
-    terminal?: Settings["terminal"];
-    agents?: Settings["agents"];
-  },
-): Promise<Settings> {
+export async function updateSettings(settings: {
+  activity?: Settings["activity"];
+  terminal?: Settings["terminal"];
+  agents?: Settings["agents"];
+}): Promise<Settings> {
   const { data, error, response } = await client.PUT("/settings", {
     body: normalizeUpdateRequest(settings),
   });
   if (!data) {
     throw new Error(
-      requestErrorMessage(
-        error,
-        `PUT /settings -> ${response.status}`,
-      ),
+      requestErrorMessage(error, `PUT /settings -> ${response.status}`),
     );
   }
-  return normalizeSettings(data);
+  return data;
 }
 
 export async function addRepo(
@@ -138,7 +86,7 @@ export async function addRepo(
       requestErrorMessage(error, `POST /repos -> ${response.status}`),
     );
   }
-  return normalizeSettings(data);
+  return data;
 }
 
 export async function removeRepo(
@@ -153,12 +101,9 @@ export async function removeRepo(
     name,
     repoPath: `${owner}/${name}`,
   };
-  const { error, response } = await client.DELETE(
-    providerRepoPath(ref),
-    {
-      params: { path: providerRouteParams(ref) },
-    },
-  );
+  const { error, response } = await client.DELETE(providerRepoPath(ref), {
+    params: { path: providerRouteParams(ref) },
+  });
   if (!response.ok) {
     throw new Error(
       requestErrorMessage(
@@ -195,7 +140,7 @@ export async function refreshRepo(
       ),
     );
   }
-  return normalizeSettings(data);
+  return data;
 }
 
 export async function previewRepos(
@@ -211,7 +156,7 @@ export async function previewRepos(
       requestErrorMessage(error, `POST /repos/preview -> ${response.status}`),
     );
   }
-  return normalizePreviewResponse(data);
+  return data;
 }
 
 export async function bulkAddRepos(repos: RepoInput[]): Promise<Settings> {
@@ -225,5 +170,5 @@ export async function bulkAddRepos(repos: RepoInput[]): Promise<Settings> {
       requestErrorMessage(error, `POST /repos/bulk -> ${response.status}`),
     );
   }
-  return normalizeSettings(data);
+  return data;
 }
