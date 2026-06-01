@@ -3,6 +3,18 @@
   import { getStores } from "@middleman/ui";
   import { client } from "../api/runtime.js";
   import type { ConfigRepo, Repo } from "@middleman/ui/api/types";
+  import { canonicalProvider } from "@middleman/ui/api/provider-routes";
+  import type { RepoTreeOption } from "./repoTree.js";
+  import RepoTreeNode from "./RepoTreeNode.svelte";
+  import TreeCheckbox from "./TreeCheckbox.svelte";
+  import {
+    buildRepoTree,
+    visibleRows,
+    nodeSelectionState,
+    toggleSubtree,
+    type VisibleRow,
+  } from "./repoTree.js";
+  import { createRepoTreeExpansionStore } from "../stores/repoTreeExpansion.svelte.js";
   import { ChevronDownIcon } from "../icons.ts";
   import {
     parseRepoFilterValue,
@@ -33,6 +45,18 @@
         binding: { key: "ArrowUp" },
         scope: "view-pulls",
       },
+      {
+        id: "repo-typeahead.expand",
+        label: "Expand / collapse group",
+        binding: { key: "ArrowRight" },
+        scope: "view-pulls",
+      },
+      {
+        id: "repo-typeahead.toggle-select",
+        label: "Select / deselect",
+        binding: { key: " " },
+        scope: "view-pulls",
+      },
     ]),
   );
 
@@ -46,7 +70,7 @@
   let repoFetchVersion = 0;
   let latestRepoFetchKey = "";
 
-  type RepoOption = { value: string; owner: string; name: string };
+  type RepoOption = RepoTreeOption;
 
   $effect(() => {
     const configuredRepoKey = configuredRepos
@@ -78,6 +102,8 @@
       value: `${repo.PlatformHost}/${repo.Owner}/${repo.Name}`,
       owner: repo.Owner,
       name: repo.Name,
+      provider: canonicalProvider(repo.Platform),
+      platformHost: repo.PlatformHost,
     };
   }
 
@@ -87,6 +113,8 @@
       value: `${repo.platform_host}/${path}`,
       owner: repo.owner,
       name: repo.name,
+      provider: canonicalProvider(repo.provider),
+      platformHost: repo.platform_host,
     };
   }
 
@@ -120,14 +148,6 @@
     return fetchedRepos.map(optionFromRepo);
   });
 
-  const filtered = $derived.by(() => {
-    if (!query) return options;
-    const q = query.toLowerCase();
-    return options.filter(
-      (o) => o.value.toLowerCase().includes(q),
-    );
-  });
-
   const selectedValues = $derived(parseRepoFilterValue(selected));
   const selectedSet = $derived(new Set(selectedValues));
   const displayValue = $derived.by(() => {
@@ -135,6 +155,26 @@
     if (selectedValues.length === 1) return selectedValues[0];
     return `${selectedValues.length} repos`;
   });
+
+  const expansion = createRepoTreeExpansionStore();
+
+  const tree = $derived(buildRepoTree(options));
+
+  const rows = $derived(
+    visibleRows(tree, { isCollapsed: expansion.isCollapsed, query }),
+  );
+
+  function rowAriaLabel(row: VisibleRow): string {
+    return row.node.kind === "host" ? row.node.platformHost : row.node.id;
+  }
+
+  function toggleRowSelect(row: VisibleRow) {
+    onchange(serializeRepoFilterValue(toggleSubtree(row.node, selectedValues)));
+  }
+
+  function toggleRowExpand(row: VisibleRow) {
+    if (row.hasChildren) expansion.toggle(row.node.id);
+  }
 
   $effect(() => {
     if (selectedValues.length === 0 || reposLoading) return;
@@ -161,36 +201,53 @@
     onchange(undefined);
   }
 
-  function toggleRepo(value: string) {
-    const next = selectedSet.has(value)
-      ? selectedValues.filter((repo) => repo !== value)
-      : [...selectedValues, value];
-    onchange(serializeRepoFilterValue(next));
-  }
-
   function handleKeydown(e: KeyboardEvent) {
-    const total = filtered.length + 1;
+    const total = rows.length + 1; // +1 for the "All repos" row at index 0
     if (e.key === "ArrowDown") {
       e.preventDefault();
       highlightIndex = Math.min(highlightIndex + 1, total - 1);
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
       highlightIndex = Math.max(highlightIndex - 1, 0);
+    } else if (e.key === "ArrowRight") {
+      e.preventDefault();
+      const row = rows[highlightIndex - 1];
+      if (row?.hasChildren && !row.expanded) expansion.toggle(row.node.id);
+    } else if (e.key === "ArrowLeft") {
+      e.preventDefault();
+      const idx = highlightIndex - 1;
+      const row = rows[idx];
+      if (row?.hasChildren && row.expanded) {
+        expansion.toggle(row.node.id);
+      } else if (row) {
+        // On a leaf (or an already-collapsed group), move focus to the parent:
+        // the nearest preceding visible row at a shallower depth.
+        for (let i = idx - 1; i >= 0; i -= 1) {
+          const candidate = rows[i];
+          if (candidate && candidate.depth < row.depth) {
+            highlightIndex = i + 1;
+            break;
+          }
+        }
+      }
     } else if (e.key === "Enter") {
       e.preventDefault();
       if (highlightIndex === 0) {
         clearSelection();
-      } else {
-        const item = filtered[highlightIndex - 1];
-        if (item) toggleRepo(item.value);
+        return;
       }
+      const row = rows[highlightIndex - 1];
+      if (!row) return;
+      if (row.hasChildren) expansion.toggle(row.node.id);
+      else toggleRowSelect(row);
     } else if (e.key === " ") {
       e.preventDefault();
-      if (highlightIndex === 0) clearSelection();
-      else {
-        const item = filtered[highlightIndex - 1];
-        if (item) toggleRepo(item.value);
+      if (highlightIndex === 0) {
+        clearSelection();
+        return;
       }
+      const row = rows[highlightIndex - 1];
+      if (row) toggleRowSelect(row);
     } else if (e.key === "Escape") {
       closeDropdown();
     }
@@ -254,36 +311,30 @@
         onmousedown={clearSelection}
         onmouseenter={() => (highlightIndex = 0)}
       >
-        <input
-          class="typeahead-checkbox"
-          type="checkbox"
-          checked={selectedValues.length === 0}
-          tabindex="-1"
-          aria-hidden="true"
+        <TreeCheckbox
+          value={selectedValues.length === 0 ? "checked" : "unchecked"}
+          decorative
         />
         <span>All repos</span>
       </li>
-      {#each filtered as option, i (option.value)}
-        <li
-          class="typeahead-option"
-          class:highlighted={i + 1 === highlightIndex}
-          class:selected={selectedSet.has(option.value)}
-          role="option"
-          aria-selected={selectedSet.has(option.value)}
-          onmousedown={() => toggleRepo(option.value)}
-          onmouseenter={() => (highlightIndex = i + 1)}
-        >
-          <input
-            class="typeahead-checkbox"
-            type="checkbox"
-            checked={selectedSet.has(option.value)}
-            tabindex="-1"
-            aria-hidden="true"
-          />
-          <span class="typeahead-option-label">
-            {#each highlightSegments(option.value, query) as seg, segIndex (`${option.value}-${segIndex}-${seg.text}-${seg.match}`)}{#if seg.match}<mark class="match">{seg.text}</mark>{:else}{seg.text}{/if}{/each}
-          </span>
-        </li>
+      {#each rows as row, i (row.node.id)}
+        <RepoTreeNode
+          kind={row.node.kind}
+          label={row.displayLabel ?? row.node.label}
+          ariaLabel={rowAriaLabel(row)}
+          provider={row.node.kind === "host" ? row.node.provider : undefined}
+          depth={row.depth}
+          hasChildren={row.hasChildren}
+          expanded={row.expanded}
+          selectionState={nodeSelectionState(row.node, selectedSet)}
+          highlighted={i + 1 === highlightIndex}
+          segments={query !== "" && row.node.kind === "repo"
+            ? highlightSegments(row.displayLabel ?? row.node.label, query)
+            : undefined}
+          onToggleExpand={() => toggleRowExpand(row)}
+          onToggleSelect={() => toggleRowSelect(row)}
+          onHover={() => (highlightIndex = i + 1)}
+        />
       {:else}
         <li class="typeahead-empty">No matching repos</li>
       {/each}
@@ -378,7 +429,11 @@
     padding: 2px;
   }
 
-  .typeahead-option {
+  /* RepoTreeNode renders rows as a child component, so the shared row, */
+  /* checkbox, and match-highlight rules are scoped to descendants of */
+  /* the RepoTypeahead-owned .typeahead-list rather than this component */
+  /* alone. The :global() escape keeps them off the rest of the app. */
+  .typeahead-list :global(.typeahead-option) {
     display: flex;
     align-items: center;
     gap: 6px;
@@ -392,32 +447,17 @@
     text-overflow: ellipsis;
   }
 
-  .typeahead-checkbox {
-    width: 12px;
-    height: 12px;
-    margin: 0;
-    flex-shrink: 0;
-    accent-color: var(--accent-blue);
-    pointer-events: none;
-  }
-
-  .typeahead-option-label {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-
-  .typeahead-option.highlighted {
+  .typeahead-list :global(.typeahead-option.highlighted) {
     background: var(--bg-surface-hover);
     color: var(--text-primary);
   }
 
-  .typeahead-option.selected {
+  .typeahead-list :global(.typeahead-option.selected) {
     color: var(--accent-blue);
     font-weight: 600;
   }
 
-  .match {
+  .typeahead-list :global(.match) {
     background: color-mix(in srgb, var(--accent-blue) 40%, transparent);
     color: var(--accent-blue);
     font-weight: 600;
