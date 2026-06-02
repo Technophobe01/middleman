@@ -1372,6 +1372,98 @@ func TestAPIListItemsIncludeWorkspaceRefs(t *testing.T) {
 	assert.Equal("ws-issue-2", workspaceByItem["issue:2"])
 }
 
+func TestAPIListPullsOrdersByLastActivityDescending(t *testing.T) {
+	require := require.New(t)
+	srv, database := setupTestServer(t)
+	base := time.Date(2026, 5, 20, 12, 0, 0, 0, time.UTC)
+	seedPR(t, database, "acme", "widget", 1,
+		withSeedPRTimes(base, base, base.Add(time.Hour)),
+	)
+	seedPR(t, database, "acme", "widget", 2,
+		withSeedPRTimes(base, base, base.Add(3*time.Hour)),
+	)
+	seedPR(t, database, "acme", "widget", 3,
+		withSeedPRTimes(base, base, base.Add(2*time.Hour)),
+	)
+	client := setupTestClient(t, srv)
+
+	resp, err := client.HTTP.ListPullsWithResponse(t.Context(), nil)
+	require.NoError(err)
+	require.Equal(http.StatusOK, resp.StatusCode())
+	require.NotNil(resp.JSON200)
+	require.Len(*resp.JSON200, 3)
+	assert := Assert.New(t)
+	assert.Equal(int64(2), (*resp.JSON200)[0].Number)
+	assert.Equal(int64(3), (*resp.JSON200)[1].Number)
+	assert.Equal(int64(1), (*resp.JSON200)[2].Number)
+}
+
+func TestAPIListPullsPreservesNewerActivityAfterIndexSync(t *testing.T) {
+	assert := Assert.New(t)
+	require := require.New(t)
+	ctx := t.Context()
+	base := time.Date(2026, 5, 20, 12, 0, 0, 0, time.UTC)
+	preservedActivity := base.Add(2 * time.Hour)
+	otherActivity := base.Add(time.Hour)
+
+	str := func(v string) *string { return &v }
+	mock := &mockGH{
+		listOpenPullRequestsFn: func(_ context.Context, _, _ string) ([]*gh.PullRequest, error) {
+			firstNumber := 1
+			firstID := int64(1001)
+			secondNumber := 2
+			secondID := int64(1002)
+			return []*gh.PullRequest{
+				{
+					ID:        &firstID,
+					Number:    &firstNumber,
+					Title:     str("Preserve activity"),
+					State:     str("open"),
+					HTMLURL:   str("https://github.com/acme/widget/pull/1"),
+					User:      &gh.User{Login: str("octocat")},
+					CreatedAt: &gh.Timestamp{Time: base},
+					UpdatedAt: &gh.Timestamp{Time: base},
+					Head:      &gh.PullRequestBranch{Ref: str("feature-one"), SHA: str("head-one")},
+					Base:      &gh.PullRequestBranch{Ref: str("main"), SHA: str("base-one")},
+				},
+				{
+					ID:        &secondID,
+					Number:    &secondNumber,
+					Title:     str("Other activity"),
+					State:     str("open"),
+					HTMLURL:   str("https://github.com/acme/widget/pull/2"),
+					User:      &gh.User{Login: str("octocat")},
+					CreatedAt: &gh.Timestamp{Time: base},
+					UpdatedAt: &gh.Timestamp{Time: otherActivity},
+					Head:      &gh.PullRequestBranch{Ref: str("feature-two"), SHA: str("head-two")},
+					Base:      &gh.PullRequestBranch{Ref: str("main"), SHA: str("base-two")},
+				},
+			}, nil
+		},
+	}
+	srv, database := setupTestServerWithMock(t, mock)
+	seedPR(t, database, "acme", "widget", 1,
+		withSeedPRTitle("Preserve activity"),
+		withSeedPRTimes(base, base, preservedActivity),
+	)
+	seedPR(t, database, "acme", "widget", 2,
+		withSeedPRTitle("Other activity"),
+		withSeedPRTimes(base, otherActivity, otherActivity),
+	)
+	client := setupTestClient(t, srv)
+
+	srv.syncer.RunOnce(ctx)
+
+	resp, err := client.HTTP.ListPullsWithResponse(ctx, nil)
+	require.NoError(err)
+	require.Equal(http.StatusOK, resp.StatusCode())
+	require.NotNil(resp.JSON200)
+	require.Len(*resp.JSON200, 2)
+	assert.Equal(int64(1), (*resp.JSON200)[0].Number)
+	assert.Equal(preservedActivity, (*resp.JSON200)[0].LastActivityAt.UTC())
+	assert.Equal(int64(2), (*resp.JSON200)[1].Number)
+}
+
 func TestAPIListPullsKeepsCachedCIDecorationsAfterIndexSync(t *testing.T) {
 	assert := Assert.New(t)
 	require := require.New(t)
