@@ -1,4 +1,8 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Browser, type Page } from "@playwright/test";
+import {
+  startIsolatedE2EServer,
+  type IsolatedE2EServer,
+} from "./support/e2eServer";
 
 // Seeded data summary:
 //   open PRs (8): widgets#1, #2, #6, #7, tools#1, tools#10, #11, #12 (last three form a stack)
@@ -96,6 +100,32 @@ async function expectRepoChipToClipSafely(
   expect(labelOverflow.scrollWidth).toBeGreaterThan(labelOverflow.clientWidth);
 }
 
+async function primeKanbanStateRows(
+  browser: Browser,
+  baseURL: string,
+): Promise<void> {
+  const page = await browser.newPage({ baseURL });
+  try {
+    await page.goto("/pulls");
+    await waitForPullList(page);
+    await page.locator(".pull-item").first().click();
+    await page
+      .locator(".pull-detail")
+      .waitFor({ state: "visible", timeout: 5_000 });
+  } finally {
+    await page.close();
+  }
+}
+
+async function expectPullReviewIndicator(
+  page: Page,
+  title: string,
+  label: string,
+): Promise<void> {
+  const item = page.locator(".pull-item", { hasText: title });
+  await expect(item.locator(`[aria-label='${label}']`)).toBeVisible();
+}
+
 test.describe("PR list view", () => {
   test.beforeEach(async ({ page }) => {
     await page.goto("/pulls");
@@ -105,36 +135,6 @@ test.describe("PR list view", () => {
   test("renders open PRs by default with correct count", async ({ page }) => {
     const countBadge = page.locator(".filter-bar .list-count-chip");
     await expect(countBadge).toHaveText(/^8 PRs$/);
-  });
-
-  test("sidebar status pills use the shared chip component", async ({
-    page,
-  }) => {
-    await expect(page.locator(".filter-bar .list-count-chip")).toHaveText(
-      /^8 PRs$/,
-    );
-
-    // Seeded fixtures have no kanban_state rows; visiting a PR detail
-    // creates the row server-side via EnsureKanbanState. Without this,
-    // .status-chip never renders because PullItem hides it for empty
-    // KanbanStatus.
-    await page.locator(".pull-item").first().click();
-    await page
-      .locator(".pull-detail")
-      .waitFor({ state: "visible", timeout: 5_000 });
-    await page.goto("/pulls");
-    await waitForPullList(page);
-
-    await mockLongPullRepoSlug(page);
-    await page.goto("/pulls");
-    await waitForPullList(page);
-
-    await selectPullGrouping(page, "All");
-    const firstItem = page.locator(".pull-item").first();
-    const repoChip = firstItem.locator(".repo-chip");
-    await expect(repoChip).toBeVisible();
-    await expectRepoChipToClipSafely(firstItem, repoChip, longRepoPath);
-    await expect(firstItem.locator(".status-chip")).toBeVisible();
   });
 
   test("closed state shows closed and merged PRs with correct count", async ({
@@ -237,5 +237,50 @@ test.describe("PR list view", () => {
       expect(Math.abs(headerCenter - scrollportCenter)).toBeLessThan(2);
       expect(headerBox.width).toBeLessThanOrEqual(800);
     }
+  });
+});
+
+test.describe("PR list sidebar", () => {
+  let server: IsolatedE2EServer | undefined;
+
+  test.beforeAll(async ({ browser }) => {
+    server = await startIsolatedE2EServer();
+    await primeKanbanStateRows(browser, server.info.base_url);
+  });
+
+  test.afterAll(async () => {
+    await server?.stop();
+  });
+
+  test("sidebar status pills use the shared chip component", async ({
+    page,
+  }) => {
+    if (!server) {
+      throw new Error("PR list sidebar e2e server was not started");
+    }
+    await mockLongPullRepoSlug(page);
+    await page.goto(`${server.info.base_url}/pulls`);
+    await waitForPullList(page);
+
+    await expect(page.locator(".filter-bar .list-count-chip")).toHaveText(
+      /^8 PRs$/,
+    );
+    await selectPullGrouping(page, "All");
+    await expectPullReviewIndicator(
+      page,
+      "Add widget caching layer",
+      "PR approved",
+    );
+    await expectPullReviewIndicator(
+      page,
+      "Fix race condition in event loop",
+      "Changes requested",
+    );
+
+    const firstItem = page.locator(".pull-item").first();
+    const repoChip = firstItem.locator(".repo-chip");
+    await expect(repoChip).toBeVisible();
+    await expectRepoChipToClipSafely(firstItem, repoChip, longRepoPath);
+    await expect(firstItem.locator(".status-chip")).toBeVisible();
   });
 });
