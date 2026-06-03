@@ -388,6 +388,52 @@ describe("DiffFile", () => {
     });
   }
 
+  async function clickLineCommentButton(
+    line: number,
+    side: "left" | "right",
+    options: { shiftKey?: boolean } = {},
+  ): Promise<void> {
+    const button = await findLineCommentButton(line, side);
+    button.dispatchEvent(new MouseEvent("pointerdown", {
+      bubbles: true,
+      button: 0,
+      shiftKey: options.shiftKey,
+    }));
+    await fireEvent.mouseDown(button, { button: 0, shiftKey: options.shiftKey });
+    await fireEvent.pointerUp(button, {
+      pointerId: 1,
+      pointerType: "mouse",
+      shiftKey: options.shiftKey,
+    });
+    await fireEvent.click(button, { shiftKey: options.shiftKey });
+  }
+
+  async function keyboardActivateLineCommentButton(
+    line: number,
+    side: "left" | "right",
+  ): Promise<void> {
+    const button = await findLineCommentButton(line, side);
+    button.focus();
+    await fireEvent.click(button);
+  }
+
+  async function findLineCommentButton(
+    line: number,
+    side: "left" | "right",
+  ): Promise<HTMLButtonElement> {
+    const sideLabel = side === "left" ? "old" : "new";
+    return await waitFor(() => {
+      const element = document
+        .querySelector(".pierre-diff")
+        ?.shadowRoot
+        ?.querySelector<HTMLButtonElement>(
+          `[data-middleman-line-comment-button][aria-label="Comment on ${sideLabel} line ${line}"]`,
+        );
+      expect(element).toBeTruthy();
+      return element!;
+    });
+  }
+
   function selectedPierreLines(): NodeListOf<Element> | undefined {
     return document
       .querySelector(".pierre-diff")
@@ -418,6 +464,84 @@ describe("DiffFile", () => {
     await selectPierreLine(2, "right", { shiftKey: true });
 
     expect(selectedPierreLines()).toHaveLength(4);
+  });
+
+  it("toggles an empty inline composer from the line comment button", async () => {
+    renderDiffFile(makeFile(), {
+      reviewEnabled: true,
+      diffHeadSHA: "diff-head",
+    });
+
+    await clickLineCommentButton(2, "right");
+    expect(screen.getByPlaceholderText("Leave a comment")).toBeTruthy();
+    await waitFor(() => {
+      expect(selectedPierreLines()).toHaveLength(4);
+    });
+
+    await clickLineCommentButton(2, "right");
+
+    expect(screen.queryByPlaceholderText("Leave a comment")).toBeNull();
+    expect(selectedPierreLines()).toHaveLength(0);
+  });
+
+  it("toggles an empty inline composer from keyboard line comment button activation", async () => {
+    renderDiffFile(makeFile(), {
+      reviewEnabled: true,
+      diffHeadSHA: "diff-head",
+    });
+
+    await clickLineCommentButton(2, "right");
+    expect(screen.getByPlaceholderText("Leave a comment")).toBeTruthy();
+    await waitFor(() => {
+      expect(selectedPierreLines()).toHaveLength(4);
+    });
+
+    await keyboardActivateLineCommentButton(2, "right");
+
+    expect(screen.queryByPlaceholderText("Leave a comment")).toBeNull();
+    expect(selectedPierreLines()).toHaveLength(0);
+  });
+
+  it("keeps shift-click line comment button selection from collapsing active ranges", async () => {
+    renderDiffFile(makeFile(), {
+      reviewEnabled: true,
+      diffHeadSHA: "diff-head",
+      nativeMultilineRanges: true,
+    });
+
+    await selectPierreLine(1, "right");
+    await clickLineCommentButton(2, "right", { shiftKey: true });
+
+    await waitFor(() => {
+      expect(screen.getByPlaceholderText("Leave a comment")).toBeTruthy();
+      expect(selectedPierreLines()?.length).toBeGreaterThanOrEqual(2);
+    });
+
+    await clickLineCommentButton(2, "right", { shiftKey: true });
+
+    expect(screen.getByPlaceholderText("Leave a comment")).toBeTruthy();
+    expect(selectedPierreLines()?.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("toggles an active multiline composer from keyboard line comment button activation", async () => {
+    renderDiffFile(makeFile(), {
+      reviewEnabled: true,
+      diffHeadSHA: "diff-head",
+      nativeMultilineRanges: true,
+    });
+
+    await selectPierreLine(1, "right");
+    await selectPierreLine(2, "right", { shiftKey: true });
+
+    await waitFor(() => {
+      expect(screen.getByPlaceholderText("Leave a comment")).toBeTruthy();
+      expect(selectedPierreLines()?.length).toBeGreaterThanOrEqual(2);
+    });
+
+    await keyboardActivateLineCommentButton(2, "right");
+
+    expect(screen.queryByPlaceholderText("Leave a comment")).toBeNull();
+    expect(selectedPierreLines()).toHaveLength(0);
   });
 
   it("does not create multiline review ranges across separate hunks", async () => {
@@ -491,6 +615,41 @@ describe("DiffFile", () => {
       expect(screen.getByText("Follow up here")).toBeTruthy();
       expect(selectedPierreLines()?.length).toBeGreaterThanOrEqual(4);
     });
+  });
+
+  it("opens a new inline composer on a line that already has a saved draft", async () => {
+    renderDiffFile(makeFile(), {
+      reviewEnabled: true,
+      diffHeadSHA: "diff-head",
+      draftComments: [{
+        id: "draft-existing",
+        body: "Existing draft on this line",
+        path: "src/foo.ts",
+        side: "right",
+        line: 2,
+        new_line: 2,
+        line_type: "add",
+        diff_head_sha: "diff-head",
+        created_at: "2026-03-30T14:01:00Z",
+        updated_at: "2026-03-30T14:01:00Z",
+      }],
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText("Existing draft on this line")).toBeTruthy();
+      const selectedDraftLine = document
+        .querySelector(".pierre-diff")
+        ?.shadowRoot
+        ?.querySelector('[data-selected-line][data-diff-new-line="2"]');
+      expect(selectedDraftLine).toBeTruthy();
+    });
+
+    await clickLineCommentButton(2, "right");
+
+    await waitFor(() => {
+      expect(screen.getByPlaceholderText("Leave a comment")).toBeTruthy();
+    });
+    expect(screen.getByText("Existing draft on this line")).toBeTruthy();
   });
 
   it("renders published review threads under their matching diff line", async () => {
