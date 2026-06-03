@@ -3,6 +3,7 @@ package localruntime
 import (
 	"bytes"
 	"context"
+	cryptorand "crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -32,8 +33,11 @@ const (
 )
 
 var (
-	errManagerShutdown   = errors.New("runtime manager is shut down")
-	ErrSessionNotFound   = errors.New("runtime session not found")
+	errManagerShutdown    = errors.New("runtime manager is shut down")
+	ErrSessionNotFound    = errors.New("runtime session not found")
+	ErrSessionUnavailable = errors.New(
+		"runtime session is temporarily unavailable",
+	)
 	errWorkspaceStopping = errors.New(
 		"workspace is being stopped",
 	)
@@ -56,10 +60,14 @@ func (s SessionInfo) Compare(other SessionInfo) int {
 	return s.CreatedAt.Compare(other.CreatedAt)
 }
 
-type RestoredTmuxSession struct {
+type RestoredRuntimeSession struct {
 	WorkspaceID string
-	SessionName string
+	SessionKey  string
 	TargetKey   string
+	Label       string
+	Kind        LaunchTargetKind
+	TmuxSession string
+	CWD         string
 	CreatedAt   time.Time
 }
 
@@ -72,40 +80,43 @@ type Options struct {
 	// before their durable DB row was written.
 	TmuxOwnerMarker string
 	// WrapAgentSessionsInTmux starts agent targets under tmux when
-	// the tmux launch target is available. When tmux is unavailable
-	// or this is false, agents run directly in the runtime PTY.
+	// the tmux launch target is available. Other sessions are started
+	// through PtyOwnerRuntime.
 	WrapAgentSessionsInTmux bool
 	// StripEnvVars names additional env vars to strip beyond the
 	// built-in credential prefixes (e.g. a configured token env).
 	StripEnvVars []string
-	// OnSessionExit is called after a launched runtime session or shell exits
-	// naturally and is removed from the manager's active session maps.
+	// OnSessionExit is called after a launched runtime session exits naturally
+	// and is removed from the manager's active session map.
 	OnSessionExit func(SessionInfo)
-	// PtyOwnerRuntime starts direct runtime PTYs through the durable PTY owner
-	// instead of github.com/creack/pty. This is required on Windows, where
-	// creack/pty does not provide a local PTY implementation.
+	// PtyOwnerRuntime starts non-tmux runtime PTYs through the durable PTY
+	// owner so server restarts can detach and reconnect later.
 	PtyOwnerRuntime ptyownerruntime.Owner
+	// KnownPtyOwnerSessionKeys returns durable session keys that may no longer
+	// have an in-memory attachment after a server restart.
+	KnownPtyOwnerSessionKeys func(context.Context, string) ([]string, error)
 }
 
 type Manager struct {
-	mu               sync.Mutex
-	targets          map[string]LaunchTarget
-	targetsList      []LaunchTarget
-	sessions         map[string]*session
-	shells           map[string]*session
-	shellCommand     []string
-	tmuxCommand      []string
-	tmuxOwnerMarker  string
-	wrapAgentsInTmux bool
-	stripEnvVars     []string
-	onSessionExit    func(SessionInfo)
-	ptyOwnerRuntime  ptyownerruntime.Owner
-	startLocks       map[string]*sync.Mutex
-	stoppingWS       map[string]int
-	inflightWS       map[string]int
-	inflightCh       map[string]chan struct{}
-	startWG          sync.WaitGroup
-	closed           bool
+	mu                sync.Mutex
+	targets           map[string]LaunchTarget
+	targetsList       []LaunchTarget
+	sessions          map[string]*session
+	labelReservations map[string]map[string]int
+	shellCommand      []string
+	tmuxCommand       []string
+	tmuxOwnerMarker   string
+	wrapAgentsInTmux  bool
+	stripEnvVars      []string
+	onSessionExit     func(SessionInfo)
+	ptyOwnerRuntime   ptyownerruntime.Owner
+	knownSessionKeys  func(context.Context, string) ([]string, error)
+	startLocks        map[string]*sync.Mutex
+	stoppingWS        map[string]int
+	inflightWS        map[string]int
+	inflightCh        map[string]chan struct{}
+	startWG           sync.WaitGroup
+	closed            bool
 }
 
 // maxSessionOutputReplay caps how many bytes of recent PTY output
@@ -144,10 +155,9 @@ type session struct {
 	mu                    sync.Mutex
 	info                  SessionInfo
 	cmd                   *exec.Cmd
-	cancel                context.CancelFunc
 	ptmx                  *os.File
-	ptyOwner              ptyownerruntime.Owner
 	pty                   ptyownerruntime.PTY
+	lifecycle             sessionLifecycle
 	tmuxSession           string
 	done                  chan struct{}
 	outputDone            chan struct{}
@@ -156,7 +166,8 @@ type session struct {
 	outputClosed          bool
 	alternateScreenActive bool
 	alternateScreenTail   []byte
-	stopOnce              sync.Once
+	lifecycleMu           sync.Mutex
+	lifecycleClosed       bool
 	stopRequested         bool
 }
 
@@ -187,21 +198,22 @@ func NewManager(options Options) *Manager {
 		targetsList = append(targetsList, cloneTarget(cloned))
 	}
 	return &Manager{
-		targets:          targets,
-		targetsList:      targetsList,
-		sessions:         make(map[string]*session),
-		shells:           make(map[string]*session),
-		shellCommand:     slices.Clone(options.ShellCommand),
-		tmuxCommand:      slices.Clone(options.TmuxCommand),
-		tmuxOwnerMarker:  options.TmuxOwnerMarker,
-		wrapAgentsInTmux: options.WrapAgentSessionsInTmux,
-		stripEnvVars:     dedupeStrings(options.StripEnvVars),
-		onSessionExit:    options.OnSessionExit,
-		ptyOwnerRuntime:  options.PtyOwnerRuntime,
-		startLocks:       make(map[string]*sync.Mutex),
-		stoppingWS:       make(map[string]int),
-		inflightWS:       make(map[string]int),
-		inflightCh:       make(map[string]chan struct{}),
+		targets:           targets,
+		targetsList:       targetsList,
+		sessions:          make(map[string]*session),
+		labelReservations: make(map[string]map[string]int),
+		shellCommand:      slices.Clone(options.ShellCommand),
+		tmuxCommand:       slices.Clone(options.TmuxCommand),
+		tmuxOwnerMarker:   options.TmuxOwnerMarker,
+		wrapAgentsInTmux:  options.WrapAgentSessionsInTmux,
+		stripEnvVars:      dedupeStrings(options.StripEnvVars),
+		onSessionExit:     options.OnSessionExit,
+		ptyOwnerRuntime:   options.PtyOwnerRuntime,
+		knownSessionKeys:  options.KnownPtyOwnerSessionKeys,
+		startLocks:        make(map[string]*sync.Mutex),
+		stoppingWS:        make(map[string]int),
+		inflightWS:        make(map[string]int),
+		inflightCh:        make(map[string]chan struct{}),
 	}
 }
 
@@ -263,30 +275,21 @@ func (m *Manager) Launch(
 			"target %q not available: %s", targetKey, reason,
 		)
 	}
+	if target.Kind == LaunchTargetPlainShell && len(target.Command) == 0 {
+		target.Command = slices.Clone(m.shellCommand)
+		if len(target.Command) == 0 {
+			target.Command = defaultShellCommand()
+		}
+	}
 	if len(target.Command) == 0 || target.Command[0] == "" {
 		return SessionInfo{}, fmt.Errorf(
 			"target %q has no command", targetKey,
 		)
 	}
 
-	key := sessionKey(workspaceID, targetKey)
-	startMu := m.startLock(key)
-	startMu.Lock()
-	defer startMu.Unlock()
-
 	if err := m.ensureOpen(); err != nil {
 		return SessionInfo{}, err
 	}
-	if existing := m.runningSession(m.sessions, key); existing != nil {
-		slog.Debug(
-			"runtime launch reused existing session",
-			"workspace_id", workspaceID,
-			"session_key", key,
-			"target_key", targetKey,
-		)
-		return existing.snapshot(), nil
-	}
-
 	if err := m.beginStart(); err != nil {
 		return SessionInfo{}, err
 	}
@@ -297,7 +300,17 @@ func (m *Manager) Launch(
 	}
 	defer m.releaseInflight(workspaceID)
 
-	launch, err := m.launchCommand(target, workspaceID, cwd)
+	key, err := m.newSessionKey(workspaceID)
+	if err != nil {
+		return SessionInfo{}, err
+	}
+	label, releaseLabel := m.reserveSessionLabel(
+		workspaceID,
+		fallbackSessionLabel(target.Label, targetKey),
+	)
+	defer releaseLabel()
+
+	launch, err := m.launchCommand(ctx, target, workspaceID, key, cwd)
 	if err != nil {
 		slog.Debug(
 			"runtime launch command failed",
@@ -317,16 +330,20 @@ func (m *Manager) Launch(
 		"tmux_session", launch.TmuxSession,
 	)
 
-	started, err := m.startSession(ctx, SessionInfo{
+	started, err := m.startOwnedSession(ctx, SessionInfo{
 		Key:         key,
 		WorkspaceID: workspaceID,
 		TargetKey:   targetKey,
-		Label:       target.Label,
+		Label:       label,
 		Kind:        target.Kind,
 		Status:      SessionStatusStarting,
 		CreatedAt:   time.Now().UTC(),
+		TmuxSession: launch.TmuxSession,
 	}, launch.Command, cwd, m.stripEnvVars)
 	if err != nil {
+		if launch.TmuxCreated {
+			_ = m.killTmuxSession(ctx, launch.TmuxSession)
+		}
 		slog.Debug(
 			"runtime launch start failed",
 			"workspace_id", workspaceID,
@@ -341,7 +358,7 @@ func (m *Manager) Launch(
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
-		go m.watchSession(started, false)
+		go m.watchSession(started)
 		_ = m.stopSession(ctx, started)
 		waitSessionDone(started)
 		slog.Debug(
@@ -353,7 +370,7 @@ func (m *Manager) Launch(
 	}
 	m.sessions[key] = started
 	m.mu.Unlock()
-	go m.watchSession(started, false)
+	go m.watchSession(started)
 	slog.Debug(
 		"runtime launch session stored",
 		"workspace_id", workspaceID,
@@ -364,30 +381,69 @@ func (m *Manager) Launch(
 	return started.snapshot(), nil
 }
 
-func (m *Manager) RestoreTmuxSessions(
+func (m *Manager) RenameSession(
+	workspaceID string,
+	sessionKey string,
+	label string,
+) (SessionInfo, error) {
+	label = strings.TrimSpace(label)
+	if label == "" {
+		return SessionInfo{}, errors.New("session label is required")
+	}
+
+	m.mu.Lock()
+	s := m.sessions[sessionKey]
+	m.mu.Unlock()
+	if s == nil {
+		return SessionInfo{}, ErrSessionNotFound
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.info.WorkspaceID != workspaceID {
+		return SessionInfo{}, ErrSessionNotFound
+	}
+	s.info.Label = label
+	info := s.info
+	info.TmuxSession = s.tmuxSession
+	if s.info.ExitedAt != nil {
+		exitedAt := *s.info.ExitedAt
+		info.ExitedAt = &exitedAt
+	}
+	if s.info.ExitCode != nil {
+		exitCode := *s.info.ExitCode
+		info.ExitCode = &exitCode
+	}
+	return info, nil
+}
+
+func (m *Manager) RestoreRuntimeSessions(
 	ctx context.Context,
-	sessions []RestoredTmuxSession,
+	sessions []RestoredRuntimeSession,
 ) error {
 	for _, restored := range sessions {
-		if err := m.restoreTmuxSession(ctx, restored); err != nil {
+		if err := m.restoreRuntimeSession(ctx, restored); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (m *Manager) restoreTmuxSession(
+func (m *Manager) restoreRuntimeSession(
 	ctx context.Context,
-	restored RestoredTmuxSession,
+	restored RestoredRuntimeSession,
 ) error {
 	workspaceID := strings.TrimSpace(restored.WorkspaceID)
 	targetKey := strings.TrimSpace(restored.TargetKey)
-	tmuxSession := strings.TrimSpace(restored.SessionName)
-	if workspaceID == "" || targetKey == "" || tmuxSession == "" {
+	tmuxSession := strings.TrimSpace(restored.TmuxSession)
+	if workspaceID == "" || targetKey == "" {
 		return nil
 	}
 
-	key := sessionKey(workspaceID, targetKey)
+	key := strings.TrimSpace(restored.SessionKey)
+	if key == "" {
+		return nil
+	}
 	startMu := m.startLock(key)
 	startMu.Lock()
 	defer startMu.Unlock()
@@ -405,6 +461,17 @@ func (m *Manager) restoreTmuxSession(
 		)
 		return nil
 	}
+	if tmuxSession == "" && m.ptyOwnerRuntime == nil {
+		return fmt.Errorf(
+			"%w: %q: pty owner runtime unavailable",
+			ErrSessionUnavailable, key,
+		)
+	} else if tmuxSession == "" && !m.ptyOwnerRuntime.HasState(key) {
+		return fmt.Errorf(
+			"%w: %q: pty owner state missing",
+			ErrSessionUnavailable, key,
+		)
+	}
 
 	target, err := m.target(targetKey)
 	if err != nil {
@@ -421,16 +488,29 @@ func (m *Manager) restoreTmuxSession(
 	if target.Kind == "" {
 		target.Kind = LaunchTargetAgent
 	}
+	if restored.Label != "" {
+		target.Label = restored.Label
+	}
+	if restored.Kind != "" {
+		target.Kind = restored.Kind
+	}
+	if targetKey == string(LaunchTargetPlainShell) || target.Kind == LaunchTargetPlainShell {
+		label := restored.Label
+		if label == "" {
+			label = "Shell"
+		}
+		target = LaunchTarget{
+			Key:    string(LaunchTargetPlainShell),
+			Label:  label,
+			Kind:   LaunchTargetPlainShell,
+			Source: "stored",
+		}
+	}
 
 	createdAt := restored.CreatedAt
 	if createdAt.IsZero() {
 		createdAt = time.Now().UTC()
 	}
-	command := slices.Clone(m.tmuxCommand)
-	if len(command) == 0 {
-		command = []string{"tmux"}
-	}
-	command = append(command, "attach-session", "-t", tmuxSession)
 
 	if err := m.beginStart(); err != nil {
 		return err
@@ -444,7 +524,7 @@ func (m *Manager) restoreTmuxSession(
 		"target_key", targetKey,
 		"tmux_session", tmuxSession,
 	)
-	started, err := m.startSession(ctx, SessionInfo{
+	info := SessionInfo{
 		Key:         key,
 		WorkspaceID: workspaceID,
 		TargetKey:   targetKey,
@@ -453,8 +533,26 @@ func (m *Manager) restoreTmuxSession(
 		Status:      SessionStatusStarting,
 		CreatedAt:   createdAt,
 		TmuxSession: tmuxSession,
-	}, command, "", m.stripEnvVars)
+	}
+	var started *session
+	if tmuxSession == "" {
+		started, err = attachPtyOwnerSession(ctx, m.ptyOwnerRuntime, info)
+	} else {
+		command, commandErr := m.restoredRuntimeCommand(restored)
+		if commandErr != nil {
+			return commandErr
+		}
+		started, err = m.startOwnedSession(
+			ctx, info, command, "", m.stripEnvVars,
+		)
+	}
 	if err != nil {
+		if tmuxSession != "" && isTmuxCommandUnavailable(err) {
+			return fmt.Errorf(
+				"%w: restored tmux attach unavailable for %q: %v",
+				ErrSessionUnavailable, key, err,
+			)
+		}
 		return err
 	}
 	started.tmuxSession = tmuxSession
@@ -462,7 +560,7 @@ func (m *Manager) restoreTmuxSession(
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
-		go m.watchSession(started, false)
+		go m.watchSession(started)
 		_ = m.stopSession(ctx, started)
 		waitSessionDone(started)
 		return errManagerShutdown
@@ -471,7 +569,7 @@ func (m *Manager) restoreTmuxSession(
 	m.mu.Unlock()
 	// startSession already starts drainOutput; restored tmux attach
 	// sessions only need the process watcher here.
-	go m.watchSession(started, false)
+	go m.watchSession(started)
 	slog.Debug(
 		"runtime tmux restore session stored",
 		"workspace_id", workspaceID,
@@ -480,6 +578,25 @@ func (m *Manager) restoreTmuxSession(
 		"tmux_session", tmuxSession,
 	)
 	return nil
+}
+
+func (m *Manager) restoredRuntimeCommand(
+	restored RestoredRuntimeSession,
+) ([]string, error) {
+	if restored.TmuxSession == "" {
+		return nil, errors.New("restored command requires a tmux session")
+	}
+	command := slices.Clone(m.tmuxCommand)
+	if len(command) == 0 {
+		command = []string{"tmux"}
+	}
+	return append(command, "attach-session", "-t", restored.TmuxSession), nil
+}
+
+func isTmuxCommandUnavailable(err error) bool {
+	return procutil.IsResourceExhausted(err) ||
+		errors.Is(err, os.ErrNotExist) ||
+		errors.Is(err, os.ErrPermission)
 }
 
 func (m *Manager) LaunchTargets() []LaunchTarget {
@@ -554,6 +671,9 @@ func (m *Manager) Stop(
 
 	cleanupErr := m.stopSession(ctx, s)
 	if cleanupErr != nil {
+		if s.snapshot().TmuxSession != "" {
+			m.removeIfSame(workspaceID, sessionKey, s)
+		}
 		return cleanupErr
 	}
 	m.removeIfSame(workspaceID, sessionKey, s)
@@ -565,7 +685,19 @@ func (m *Manager) Stop(
 	}
 }
 
-// StopWorkspace stops every running agent session and shell that
+// Detach removes an in-memory runtime session attachment without stopping the
+// owned backend.
+func (m *Manager) Detach(workspaceID string, sessionKey string) error {
+	s, ok := m.session(workspaceID, sessionKey)
+	if !ok {
+		return fmt.Errorf("%w: %q", ErrSessionNotFound, sessionKey)
+	}
+	m.removeIfSame(workspaceID, sessionKey, s)
+	s.detach()
+	return nil
+}
+
+// StopWorkspace stops every running runtime session that
 // belongs to workspaceID. It is intended to be called when a
 // workspace is deleted so launched processes do not survive the
 // worktree they were started in.
@@ -574,7 +706,7 @@ func (m *Manager) StopWorkspace(
 	workspaceID string,
 ) {
 	// 1. Mark the workspace as stopping under the manager mutex.
-	//    New Launch/EnsureShell calls that observe this marker bail
+	//    New Launch calls that observe this marker bail
 	//    out via claimInflight before spawning a process.
 	m.mu.Lock()
 	m.stoppingWS[workspaceID]++
@@ -588,9 +720,9 @@ func (m *Manager) StopWorkspace(
 		m.mu.Unlock()
 	}()
 
-	// 2. Drain any Launch/EnsureShell calls that passed claimInflight
+	// 2. Drain any Launch calls that passed claimInflight
 	//    before the marker was set. They are mid-startSession; once
-	//    they finish, their processes are in m.sessions/m.shells and
+	//    they finish, their processes are in m.sessions and
 	//    will be picked up by the snapshot below. Without this drain
 	//    a launch in flight at step 1 can insert after the snapshot
 	//    and leave a process alive for the deleted worktree.
@@ -598,18 +730,12 @@ func (m *Manager) StopWorkspace(
 		return
 	}
 
-	// 3. Snapshot and remove all sessions/shells for the workspace.
+	// 3. Snapshot and remove all sessions for the workspace.
 	m.mu.Lock()
 	stopping := make([]*session, 0)
 	for key, s := range m.sessions {
 		if s.snapshot().WorkspaceID == workspaceID {
 			delete(m.sessions, key)
-			stopping = append(stopping, s)
-		}
-	}
-	for key, s := range m.shells {
-		if s.snapshot().WorkspaceID == workspaceID {
-			delete(m.shells, key)
 			stopping = append(stopping, s)
 		}
 	}
@@ -625,6 +751,7 @@ func (m *Manager) StopWorkspace(
 			)
 		}
 	}
+	m.stopKnownPtyOwnerSessions(ctx, workspaceID, stopping)
 	for _, s := range stopping {
 		select {
 		case <-s.done:
@@ -638,17 +765,69 @@ func (m *Manager) stopSession(ctx context.Context, s *session) error {
 	if s == nil {
 		return nil
 	}
+	s.markStopRequested()
 	if s.tmuxSession != "" {
 		if err := m.killTmuxSession(ctx, s.tmuxSession); err != nil {
-			s.stop()
+			_ = s.stop(ctx)
 			return fmt.Errorf(
 				"kill tmux session %q: %w", s.tmuxSession, err,
 			)
 		}
 	}
-	s.markStopRequested()
-	s.stop()
-	return nil
+	return s.stop(ctx)
+}
+
+func (m *Manager) stopKnownPtyOwnerSessions(
+	ctx context.Context,
+	workspaceID string,
+	stopping []*session,
+) {
+	if m.ptyOwnerRuntime == nil {
+		return
+	}
+	stopped := make(map[string]struct{}, len(stopping))
+	for _, s := range stopping {
+		if s == nil {
+			continue
+		}
+		stopped[s.snapshot().Key] = struct{}{}
+	}
+	for _, key := range m.knownPtyOwnerSessionKeys(workspaceID) {
+		if _, ok := stopped[key]; ok {
+			continue
+		}
+		if err := m.ptyOwnerRuntime.Stop(ctx, key); err != nil {
+			slog.Warn(
+				"stop stored ptyowner runtime session",
+				"workspace_id", workspaceID,
+				"session_key", key,
+				"err", err,
+			)
+		}
+	}
+}
+
+func (m *Manager) knownPtyOwnerSessionKeys(workspaceID string) []string {
+	m.mu.Lock()
+	knownSessionKeys := m.knownSessionKeys
+	m.mu.Unlock()
+
+	var keys []string
+	if knownSessionKeys != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		stored, err := knownSessionKeys(ctx, workspaceID)
+		cancel()
+		if err != nil {
+			slog.Warn(
+				"list stored ptyowner runtime sessions",
+				"workspace_id", workspaceID,
+				"err", err,
+			)
+		}
+		keys = append(keys, stored...)
+	}
+	slices.Sort(keys)
+	return slices.Compact(keys)
 }
 
 func (m *Manager) killTmuxSession(
@@ -665,11 +844,16 @@ func (m *Manager) killTmuxSession(
 	if len(command) == 0 || command[0] == "" {
 		return nil
 	}
+	var err error
+	command, err = resolveTmuxCommand(command)
+	if err != nil {
+		return err
+	}
 	args := append(command[1:], "kill-session", "-t", session)
 	cmd := procutil.CommandContext(ctx, command[0], args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
-	err := procutil.Run(ctx, cmd, "tmux subprocess capacity")
+	err = procutil.Run(ctx, cmd, "tmux subprocess capacity")
 	if err == nil || isTmuxSessionAbsent(stderr.Bytes(), err) {
 		return nil
 	}
@@ -789,7 +973,7 @@ func (m *Manager) EndStopping(workspaceID string) {
 	m.mu.Unlock()
 }
 
-// claimInflight registers a starting Launch/EnsureShell so a
+// claimInflight registers a starting Launch so a
 // concurrent StopWorkspace can wait for it to finish inserting
 // before snapshotting. Rejects if the workspace is already being
 // stopped.
@@ -874,127 +1058,6 @@ func (m *Manager) AttachSession(
 	return attachment, nil
 }
 
-func (m *Manager) AttachShell(
-	workspaceID string,
-) (*Attachment, error) {
-	key := sessionKey(workspaceID, "shell")
-	slog.Debug(
-		"runtime shell attach requested",
-		"workspace_id", workspaceID,
-		"session_key", key,
-	)
-	m.mu.Lock()
-	s := m.shells[key]
-	m.mu.Unlock()
-	attachment, err := attachToSession(
-		s, workspaceID, key, m.refreshSession,
-	)
-	if err != nil {
-		slog.Debug(
-			"runtime shell attach rejected",
-			"workspace_id", workspaceID,
-			"session_key", key,
-			"err", err,
-		)
-		return nil, err
-	}
-	slog.Debug(
-		"runtime shell attach accepted",
-		"workspace_id", workspaceID,
-		"session_key", key,
-	)
-	return attachment, nil
-}
-
-func (m *Manager) EnsureShell(
-	ctx context.Context,
-	workspaceID string,
-	cwd string,
-) (SessionInfo, error) {
-	slog.Debug(
-		"runtime shell ensure requested",
-		"workspace_id", workspaceID,
-		"cwd", cwd,
-	)
-	if err := ctx.Err(); err != nil {
-		return SessionInfo{}, err
-	}
-
-	key := sessionKey(workspaceID, "shell")
-	startMu := m.startLock(key)
-	startMu.Lock()
-	defer startMu.Unlock()
-
-	if err := m.ensureOpen(); err != nil {
-		return SessionInfo{}, err
-	}
-	if existing := m.runningSession(m.shells, key); existing != nil {
-		slog.Debug(
-			"runtime shell ensure reused existing session",
-			"workspace_id", workspaceID,
-			"session_key", key,
-		)
-		return existing.snapshot(), nil
-	}
-
-	command := slices.Clone(m.shellCommand)
-	if len(command) == 0 {
-		command = defaultShellCommand()
-	}
-	if err := m.beginStart(); err != nil {
-		return SessionInfo{}, err
-	}
-	defer m.finishStart()
-
-	if err := m.claimInflight(workspaceID); err != nil {
-		return SessionInfo{}, err
-	}
-	defer m.releaseInflight(workspaceID)
-
-	started, err := m.startSession(ctx, SessionInfo{
-		Key:         key,
-		WorkspaceID: workspaceID,
-		TargetKey:   "plain_shell",
-		Label:       "Shell",
-		Kind:        LaunchTargetPlainShell,
-		Status:      SessionStatusStarting,
-		CreatedAt:   time.Now().UTC(),
-	}, command, cwd, m.stripEnvVars)
-	if err != nil {
-		slog.Debug(
-			"runtime shell start failed",
-			"workspace_id", workspaceID,
-			"session_key", key,
-			"err", err,
-		)
-		return SessionInfo{}, err
-	}
-
-	m.mu.Lock()
-	if m.closed {
-		m.mu.Unlock()
-		go m.watchSession(started, true)
-		_ = m.stopSession(ctx, started)
-		waitSessionDone(started)
-		slog.Debug(
-			"runtime shell discarded session after shutdown",
-			"workspace_id", workspaceID,
-			"session_key", key,
-		)
-		return SessionInfo{}, errManagerShutdown
-	}
-	m.shells[key] = started
-	m.mu.Unlock()
-	go m.watchSession(started, true)
-	slog.Debug(
-		"runtime shell session stored",
-		"workspace_id", workspaceID,
-		"session_key", key,
-	)
-
-	return started.snapshot(), nil
-}
-
 func (a *Attachment) Write(data []byte) error {
 	if a == nil || a.write == nil {
 		return errors.New("attachment is closed")
@@ -1042,17 +1105,127 @@ func (a *Attachment) SessionOutputClosed() bool {
 	return a.sessionOutputClosed()
 }
 
-func (m *Manager) ShellSession(workspaceID string) *SessionInfo {
+func fallbackSessionLabel(label string, fallback string) string {
+	label = strings.TrimSpace(label)
+	if label != "" {
+		return label
+	}
+	fallback = strings.TrimSpace(fallback)
+	if fallback != "" {
+		return fallback
+	}
+	return "Session"
+}
+
+func (m *Manager) reserveSessionLabel(
+	workspaceID string,
+	baseLabel string,
+) (string, func()) {
+	baseLabel = fallbackSessionLabel(baseLabel, "Session")
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	for _, s := range m.shells {
+	label := m.nextSessionLabelLocked(workspaceID, baseLabel)
+	if m.labelReservations[workspaceID] == nil {
+		m.labelReservations[workspaceID] = make(map[string]int)
+	}
+	m.labelReservations[workspaceID][label]++
+
+	var once sync.Once
+	return label, func() {
+		once.Do(func() {
+			m.mu.Lock()
+			defer m.mu.Unlock()
+			reservations := m.labelReservations[workspaceID]
+			if reservations == nil {
+				return
+			}
+			reservations[label]--
+			if reservations[label] <= 0 {
+				delete(reservations, label)
+			}
+			if len(reservations) == 0 {
+				delete(m.labelReservations, workspaceID)
+			}
+		})
+	}
+}
+
+func (m *Manager) nextSessionLabelLocked(workspaceID string, baseLabel string) string {
+	used := map[string]bool{}
+	for _, s := range m.sessions {
 		info := s.snapshot()
-		if info.WorkspaceID == workspaceID {
-			return &info
+		if info.WorkspaceID == workspaceID && strings.TrimSpace(info.Label) != "" {
+			used[info.Label] = true
 		}
 	}
-	return nil
+	for label, count := range m.labelReservations[workspaceID] {
+		if count > 0 && strings.TrimSpace(label) != "" {
+			used[label] = true
+		}
+	}
+	if !used[baseLabel] {
+		return baseLabel
+	}
+	for i := 2; ; i++ {
+		candidate := fmt.Sprintf("%s %d", baseLabel, i)
+		if !used[candidate] {
+			return candidate
+		}
+	}
+}
+
+func (m *Manager) shellLaunchCommand(
+	ctx context.Context,
+	command []string,
+	workspaceID string,
+	sessionKey string,
+	cwd string,
+) (launchCommand, error) {
+	if len(command) == 0 || command[0] == "" {
+		return launchCommand{}, errors.New("session command is empty")
+	}
+	tmux, err := m.target(string(LaunchTargetShell))
+	if err != nil || !tmux.Available {
+		return launchCommand{Command: command}, nil
+	}
+	tmuxCommand := slices.Clone(m.tmuxCommand)
+	if len(tmuxCommand) == 0 {
+		tmuxCommand = slices.Clone(tmux.Command)
+	}
+	if len(tmuxCommand) == 0 {
+		tmuxCommand = []string{"tmux"}
+	}
+	tmuxCommand, err = resolveTmuxCommand(tmuxCommand)
+	if err != nil {
+		return launchCommand{}, err
+	}
+	resolvedCommand := slices.Clone(command)
+	resolvedPath, err := resolveExecutable(resolvedCommand[0])
+	if err != nil {
+		return launchCommand{}, err
+	}
+	resolvedCommand[0] = resolvedPath
+
+	tmuxSession := tmuxSessionName(workspaceID, sessionKey)
+	paneEnv := tmuxShellEnvPolicy.paneEnvironment(
+		os.Environ(), resolvedCommand, m.stripEnvVars,
+	)
+	prepared, err := tmuxLauncher{
+		TmuxCommand: tmuxCommand,
+		Session:     tmuxSession,
+		CWD:         cwd,
+		Pane:        paneEnv,
+		OwnerMarker: m.tmuxOwnerMarker,
+	}.prepare(ctx)
+	if err != nil {
+		return launchCommand{}, err
+	}
+	return launchCommand{
+		Command:     prepared.AttachCommand,
+		TmuxSession: tmuxSession,
+		TmuxCreated: prepared.Created,
+	}, nil
 }
 
 func (m *Manager) Shutdown() {
@@ -1066,28 +1239,17 @@ func (m *Manager) Shutdown() {
 	m.startWG.Wait()
 
 	m.mu.Lock()
-	sessions := make([]*session, 0, len(m.sessions)+len(m.shells))
+	sessions := make([]*session, 0, len(m.sessions))
 	for _, s := range m.sessions {
 		sessions = append(sessions, s)
 	}
-	for _, s := range m.shells {
-		sessions = append(sessions, s)
-	}
 	m.sessions = make(map[string]*session)
-	m.shells = make(map[string]*session)
 	m.mu.Unlock()
 
-	waiting := make([]*session, 0, len(sessions))
 	for _, s := range sessions {
-		if s.tmuxSession != "" {
-			s.detach()
-			waiting = append(waiting, s)
-			continue
-		}
-		s.stop()
-		waiting = append(waiting, s)
+		s.detach()
 	}
-	for _, s := range waiting {
+	for _, s := range sessions {
 		select {
 		case <-s.done:
 		case <-ctx.Done():
@@ -1145,19 +1307,37 @@ func (m *Manager) target(key string) (LaunchTarget, error) {
 type launchCommand struct {
 	Command     []string
 	TmuxSession string
+	TmuxCreated bool
 }
 
 func (m *Manager) launchCommand(
+	ctx context.Context,
 	target LaunchTarget,
 	workspaceID string,
-	cwd string,
+	sessionKeyOrCWD string,
+	optionalCWD ...string,
 ) (launchCommand, error) {
+	sessionKey := target.Key
+	cwd := sessionKeyOrCWD
+	if len(optionalCWD) > 0 {
+		sessionKey = sessionKeyOrCWD
+		cwd = optionalCWD[0]
+	}
 	command := slices.Clone(target.Command)
+	if target.Kind == LaunchTargetPlainShell {
+		if len(command) == 0 {
+			command = slices.Clone(m.shellCommand)
+		}
+		if len(command) == 0 {
+			command = defaultShellCommand()
+		}
+		return m.shellLaunchCommand(ctx, command, workspaceID, sessionKey, cwd)
+	}
 	if target.Kind != LaunchTargetAgent || !m.wrapAgentsInTmux {
 		return launchCommand{Command: command}, nil
 	}
 
-	tmux, err := m.target(string(LaunchTargetTmux))
+	tmux, err := m.target(string(LaunchTargetShell))
 	if err != nil || !tmux.Available {
 		return launchCommand{Command: command}, nil
 	}
@@ -1168,6 +1348,10 @@ func (m *Manager) launchCommand(
 	if len(tmuxCommand) == 0 {
 		tmuxCommand = []string{"tmux"}
 	}
+	tmuxCommand, err = resolveTmuxCommand(tmuxCommand)
+	if err != nil {
+		return launchCommand{}, err
+	}
 	resolvedAgentCommand := slices.Clone(command)
 	resolvedPath, err := resolveExecutable(resolvedAgentCommand[0])
 	if err != nil {
@@ -1175,94 +1359,26 @@ func (m *Manager) launchCommand(
 	}
 	resolvedAgentCommand[0] = resolvedPath
 
-	tmuxSession := tmuxSessionName(workspaceID, target.Key)
+	tmuxSession := tmuxSessionName(workspaceID, sessionKey)
 
-	agentEnv := append(
-		sessionEnvironment(tmuxAgentEnvironment(os.Environ()), m.stripEnvVars),
-		"TERM=xterm-256color",
+	paneEnv := tmuxAgentEnvPolicy.paneEnvironment(
+		os.Environ(), resolvedAgentCommand, m.stripEnvVars,
 	)
-	agentCommand := "exec " + shellEnvCommand(agentEnv, resolvedAgentCommand)
-	if m.tmuxOwnerMarker != "" {
-		return launchCommand{
-			Command: m.launchTmuxOwnedCommand(
-				tmuxCommand, tmuxSession, cwd, agentCommand,
-			),
-			TmuxSession: tmuxSession,
-		}, nil
+	prepared, err := tmuxLauncher{
+		TmuxCommand: tmuxCommand,
+		Session:     tmuxSession,
+		CWD:         cwd,
+		Pane:        paneEnv,
+		OwnerMarker: m.tmuxOwnerMarker,
+	}.prepare(ctx)
+	if err != nil {
+		return launchCommand{}, err
 	}
-
-	wrapped := append(
-		tmuxCommand,
-		"new-session",
-		"-A",
-		"-s",
-		tmuxSession,
-	)
-	if cwd != "" {
-		wrapped = append(wrapped, "-c", cwd)
-	}
-	wrapped = append(wrapped, agentCommand)
-	return launchCommand{Command: wrapped, TmuxSession: tmuxSession}, nil
-}
-
-func (m *Manager) launchTmuxOwnedCommand(
-	tmuxCommand []string,
-	tmuxSession string,
-	cwd string,
-	agentCommand string,
-) []string {
-	hasSession := shellCommand(append(
-		slices.Clone(tmuxCommand),
-		"has-session", "-t", tmuxSession,
-	))
-	newSessionArgs := append(
-		slices.Clone(tmuxCommand),
-		"new-session", "-d", "-s", tmuxSession,
-	)
-	if cwd != "" {
-		newSessionArgs = append(newSessionArgs, "-c", cwd)
-	}
-	newSessionArgs = append(
-		newSessionArgs,
-		agentCommand,
-		";",
-		"set-option", "-q", "-t", tmuxSession,
-		"@middleman_owner", m.tmuxOwnerMarker,
-	)
-	newSession := shellCommand(newSessionArgs)
-	setOwner := shellCommand(append(
-		slices.Clone(tmuxCommand),
-		"set-option", "-q", "-t", tmuxSession,
-		"@middleman_owner", m.tmuxOwnerMarker,
-	))
-	killSession := shellCommand(append(
-		slices.Clone(tmuxCommand),
-		"kill-session", "-t", tmuxSession,
-	))
-	attachSession := shellCommand(append(
-		slices.Clone(tmuxCommand),
-		"attach-session", "-t", tmuxSession,
-	))
-	script := fmt.Sprintf(
-		"created=0\n"+
-			"if ! %s >/dev/null 2>&1; then\n"+
-			"  created=1\n"+
-			"  if ! %s; then\n"+
-			"    %s >/dev/null 2>&1 || true\n"+
-			"    exit 1\n"+
-			"  fi\n"+
-			"fi\n"+
-			"if ! %s; then\n"+
-			"  if [ \"$created\" = \"1\" ]; then\n"+
-			"    %s >/dev/null 2>&1 || true\n"+
-			"  fi\n"+
-			"  exit 1\n"+
-			"fi\n"+
-			"exec %s",
-		hasSession, newSession, killSession, setOwner, killSession,
-		attachSession,
-	)
-	return []string{"/bin/sh", "-lc", script}
+	return launchCommand{
+		Command:     prepared.AttachCommand,
+		TmuxSession: tmuxSession,
+		TmuxCreated: prepared.Created,
+	}, nil
 }
 
 func tmuxSessionName(workspaceID string, targetKey string) string {
@@ -1293,58 +1409,6 @@ func tmuxSessionSafeComponent(value string) string {
 	return strings.Trim(b.String(), "-")
 }
 
-func shellCommand(command []string) string {
-	parts := make([]string, 0, len(command)+1)
-	for _, arg := range command {
-		parts = append(parts, shellQuote(arg))
-	}
-	return strings.Join(parts, " ")
-}
-
-func shellEnvCommand(env []string, command []string) string {
-	args := make([]string, 0, len(env)+len(command))
-	for _, kv := range env {
-		if strings.Contains(kv, "=") {
-			args = append(args, kv)
-		}
-	}
-	args = append(args, command...)
-	return "env -i " + shellCommand(args)
-}
-
-func tmuxAgentEnvironment(env []string) []string {
-	out := make([]string, 0, len(env))
-	for _, kv := range env {
-		eq := strings.IndexByte(kv, '=')
-		if eq <= 0 {
-			continue
-		}
-		key := kv[:eq]
-		if isTmuxAgentEnvironmentKey(key) {
-			out = append(out, kv)
-		}
-	}
-	return out
-}
-
-func isTmuxAgentEnvironmentKey(key string) bool {
-	switch key {
-	case "HOME", "PATH", "SHELL", "USER", "LOGNAME", "LANG",
-		"LC_ALL", "LC_CTYPE", "TMPDIR", "SSH_AUTH_SOCK",
-		"XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME":
-		return true
-	default:
-		return strings.HasPrefix(key, "LC_")
-	}
-}
-
-func shellQuote(s string) string {
-	if s == "" {
-		return "''"
-	}
-	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
-}
-
 func (m *Manager) runningSession(
 	sessions map[string]*session,
 	key string,
@@ -1368,7 +1432,7 @@ func (m *Manager) runningSession(
 	// (systemd-run --wait, etc.). Treating those output-dead
 	// sessions as still "running" hands callers a zombie they can
 	// attach to but never receive any bytes from. Reject the zombie
-	// so EnsureShell/Launch start a fresh session.
+	// so Launch starts a fresh session.
 	//
 	// The caller will overwrite our map entry with the new session,
 	// which means we are about to lose our only handle to the old
@@ -1383,7 +1447,9 @@ func (m *Manager) runningSession(
 	outputClosed := s.outputClosed
 	s.mu.Unlock()
 	if outputClosed {
-		s.stop()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = s.stop(ctx)
+		cancel()
 		return nil
 	}
 	return s
@@ -1397,10 +1463,6 @@ func (m *Manager) session(
 	defer m.mu.Unlock()
 
 	if s, ok := m.sessions[key]; ok &&
-		s.snapshot().WorkspaceID == workspaceID {
-		return s, true
-	}
-	if s, ok := m.shells[key]; ok &&
 		s.snapshot().WorkspaceID == workspaceID {
 		return s, true
 	}
@@ -1419,24 +1481,17 @@ func (m *Manager) removeIfSame(
 		current == s &&
 		current.snapshot().WorkspaceID == workspaceID {
 		delete(m.sessions, key)
-		return
-	}
-	if current, ok := m.shells[key]; ok &&
-		current == s &&
-		current.snapshot().WorkspaceID == workspaceID {
-		delete(m.shells, key)
 	}
 }
 
 func (m *Manager) watchSession(
 	s *session,
-	shell bool,
 ) {
 	info := s.watch()
 	if s.wasStopRequested() {
 		return
 	}
-	if m.removeExitedSession(info, s, shell) && m.onSessionExit != nil {
+	if m.removeExitedSession(info, s) && m.onSessionExit != nil {
 		m.onSessionExit(info)
 	}
 }
@@ -1444,155 +1499,34 @@ func (m *Manager) watchSession(
 func (m *Manager) removeExitedSession(
 	info SessionInfo,
 	s *session,
-	shell bool,
 ) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	sessions := m.sessions
-	if shell {
-		sessions = m.shells
-	}
-	current, ok := sessions[info.Key]
+	current, ok := m.sessions[info.Key]
 	if !ok || current != s {
 		return false
 	}
-	delete(sessions, info.Key)
+	delete(m.sessions, info.Key)
 	return true
 }
 
-func (m *Manager) startSession(
+func (m *Manager) startOwnedSession(
 	ctx context.Context,
 	info SessionInfo,
 	command []string,
 	cwd string,
 	extraStripVars []string,
 ) (*session, error) {
+	if info.TmuxSession != "" {
+		return startTmuxAttachSession(info, command, cwd, extraStripVars)
+	}
 	if m.ptyOwnerRuntime != nil {
 		return startPtyOwnerSession(
 			ctx, m.ptyOwnerRuntime, info, command, cwd, extraStripVars,
 		)
 	}
-	return startSession(info, command, cwd, extraStripVars)
-}
-
-func startPtyOwnerSession(
-	ctx context.Context,
-	owner ptyownerruntime.Owner,
-	info SessionInfo,
-	command []string,
-	cwd string,
-	extraStripVars []string,
-) (*session, error) {
-	if len(command) == 0 || command[0] == "" {
-		return nil, errors.New("session command is empty")
-	}
-	ptySession, err := owner.Start(ctx, info.Key, cwd, command, extraStripVars)
-	if err != nil {
-		return nil, fmt.Errorf("start pty owner: %w", err)
-	}
-	slog.Debug(
-		"runtime session pty owner started",
-		"workspace_id", info.WorkspaceID,
-		"session_key", info.Key,
-		"target_key", info.TargetKey,
-	)
-	info.Status = SessionStatusRunning
-	s := &session{
-		info:        info,
-		ptyOwner:    owner,
-		pty:         ptySession,
-		done:        make(chan struct{}),
-		outputDone:  make(chan struct{}),
-		subscribers: make(map[chan []byte]struct{}),
-	}
-	go s.drainOutput()
-	return s, nil
-}
-
-func startSession(
-	info SessionInfo,
-	command []string,
-	cwd string,
-	extraStripVars []string,
-) (*session, error) {
-	if len(command) == 0 || command[0] == "" {
-		return nil, errors.New("session command is empty")
-	}
-
-	// Resolve the executable to an absolute path BEFORE setting
-	// cmd.Dir to the workspace worktree. procutil.Command treats names
-	// without separators as PATH lookups but treats names like
-	// "./agent" or "scripts/codex" as paths relative to cmd.Dir,
-	// which would let a malicious PR drop an executable into the
-	// worktree and gain code execution when the maintainer launches
-	// the agent. Reject relative paths and require all other names
-	// to resolve via PATH.
-	resolvedPath, err := resolveExecutable(command[0])
-	if err != nil {
-		return nil, err
-	}
-	slog.Debug(
-		"runtime session resolving command",
-		"workspace_id", info.WorkspaceID,
-		"session_key", info.Key,
-		"target_key", info.TargetKey,
-		"program", resolvedPath,
-		"argc", len(command),
-		"cwd", cwd,
-	)
-
-	// Runtime sessions outlive the launch request, so they get their own
-	// lifecycle context. Shutdown cancels this to stop the local PTY client
-	// without running tmux kill-session against tmux-backed agents.
-	sessionCtx, cancelSession := context.WithCancel(context.Background())
-	cmd := procutil.CommandContext(sessionCtx, resolvedPath, command[1:]...)
-	cmd.Cancel = func() error {
-		if cmd.Process == nil {
-			return os.ErrProcessDone
-		}
-		return terminateSessionProcess(cmd.Process)
-	}
-	cmd.WaitDelay = 2 * time.Second
-	if cwd != "" {
-		cmd.Dir = cwd
-	}
-	// Pass through a sanitized environment so launched shells and
-	// agents do not inherit middleman's GitHub credentials. See
-	// sessionEnvironment for the allow/deny rules.
-	cmd.Env = append(
-		sessionEnvironment(os.Environ(), extraStripVars),
-		"TERM=xterm-256color",
-	)
-
-	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{
-		Rows: 30,
-		Cols: 120,
-	})
-	if err != nil {
-		cancelSession()
-		return nil, fmt.Errorf("start pty: %w", err)
-	}
-	slog.Debug(
-		"runtime session pty started",
-		"workspace_id", info.WorkspaceID,
-		"session_key", info.Key,
-		"target_key", info.TargetKey,
-		"pid", cmd.Process.Pid,
-	)
-
-	info.Status = SessionStatusRunning
-	s := &session{
-		info:        info,
-		cmd:         cmd,
-		cancel:      cancelSession,
-		ptmx:        ptmx,
-		done:        make(chan struct{}),
-		outputDone:  make(chan struct{}),
-		subscribers: make(map[chan []byte]struct{}),
-	}
-	go s.drainOutput()
-	return s, nil
+	return nil, errors.New("runtime sessions require tmux or ptyowner")
 }
 
 func (s *session) snapshot() SessionInfo {
@@ -1617,9 +1551,6 @@ func (s *session) watch() SessionInfo {
 		return s.watchPtyOwner()
 	}
 	exitCode := waitExitCode(s.cmd.Wait())
-	if s.cancel != nil {
-		s.cancel()
-	}
 	now := time.Now().UTC()
 
 	s.mu.Lock()
@@ -1880,28 +1811,28 @@ func (s *session) closeSubscribers() {
 	}
 }
 
-func (s *session) stop() {
-	s.stopOnce.Do(func() {
-		if s.cancel != nil {
-			s.cancel()
+func (s *session) stop(ctx context.Context) error {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+
+	s.mu.Lock()
+	if s.lifecycleClosed {
+		s.mu.Unlock()
+		return nil
+	}
+	lifecycle := s.lifecycle
+	s.mu.Unlock()
+
+	if lifecycle != nil {
+		if err := lifecycle.Stop(ctx); err != nil {
+			return err
 		}
-		if s.pty != nil {
-			if s.ptyOwner != nil {
-				ctx, cancel := context.WithTimeout(
-					context.Background(), 2*time.Second,
-				)
-				_ = s.ptyOwner.Stop(ctx, s.info.Key)
-				cancel()
-			}
-			s.pty.Close()
-		}
-		if s.cmd != nil && s.cmd.Process != nil {
-			_ = killSessionProcess(s.cmd.Process)
-		}
-		if s.ptmx != nil {
-			_ = s.ptmx.Close()
-		}
-	})
+	}
+
+	s.mu.Lock()
+	s.lifecycleClosed = true
+	s.mu.Unlock()
+	return nil
 }
 
 func (s *session) markStopRequested() {
@@ -1917,17 +1848,21 @@ func (s *session) wasStopRequested() bool {
 }
 
 func (s *session) detach() {
-	s.stopOnce.Do(func() {
-		if s.cancel != nil {
-			s.cancel()
-		}
-		if s.pty != nil {
-			s.pty.Close()
-		}
-		if s.ptmx != nil {
-			_ = s.ptmx.Close()
-		}
-	})
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+
+	s.mu.Lock()
+	if s.lifecycleClosed {
+		s.mu.Unlock()
+		return
+	}
+	lifecycle := s.lifecycle
+	s.lifecycleClosed = true
+	s.mu.Unlock()
+
+	if lifecycle != nil {
+		lifecycle.Detach()
+	}
 }
 
 func waitSessionDone(s *session) {
@@ -1937,13 +1872,28 @@ func waitSessionDone(s *session) {
 	}
 }
 
-func SessionKey(workspaceID string, targetKey string) string {
-	sum := sha256.Sum256([]byte(workspaceID + "\x00" + targetKey))
-	return "session-" + hex.EncodeToString(sum[:8])
+func (m *Manager) newSessionKey(workspaceID string) (string, error) {
+	for range 16 {
+		key, err := NewSessionKey(workspaceID)
+		if err != nil {
+			return "", err
+		}
+		m.mu.Lock()
+		_, sessionExists := m.sessions[key]
+		m.mu.Unlock()
+		if !sessionExists {
+			return key, nil
+		}
+	}
+	return "", errors.New("generate unique runtime session key")
 }
 
-func sessionKey(workspaceID string, targetKey string) string {
-	return SessionKey(workspaceID, targetKey)
+func NewSessionKey(workspaceID string) (string, error) {
+	var data [8]byte
+	if _, err := cryptorand.Read(data[:]); err != nil {
+		return "", fmt.Errorf("generate runtime session id: %w", err)
+	}
+	return workspaceID + "_" + hex.EncodeToString(data[:]), nil
 }
 
 // resolveExecutable returns an absolute path for name. Names that
@@ -1999,6 +1949,19 @@ func resolveExecutable(name string) (string, error) {
 			"the workspace worktree, which is untrusted",
 		name,
 	)
+}
+
+func resolveTmuxCommand(command []string) ([]string, error) {
+	if len(command) == 0 || command[0] == "" {
+		return nil, errors.New("tmux command is empty")
+	}
+	resolved := slices.Clone(command)
+	path, err := resolveExecutable(resolved[0])
+	if err != nil {
+		return nil, fmt.Errorf("resolve tmux command: %w", err)
+	}
+	resolved[0] = path
+	return resolved, nil
 }
 
 // sessionVarPrefixes name prefixes whose env vars are stripped from

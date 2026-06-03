@@ -571,23 +571,25 @@ func newServer(
 		if cfg != nil {
 			agents = cfg.Agents
 		}
-		var runtimePtyOwner ptyownerruntime.Owner
-		if !tmuxAvailable {
-			runtimePtyOwner = ptyownerruntime.New(ptyOwnerClient, nil)
-		}
+		// Runtime sessions that are not tmux-backed must still be owned
+		// outside the middleman server process so restarts do not tear down
+		// workspace terminal state. Tmux-backed sessions still attach via
+		// tmux; the runtime manager only uses this owner for non-tmux starts.
+		runtimePtyOwner := ptyownerruntime.New(ptyOwnerClient, nil)
 		s.runtime = localruntime.NewManager(localruntime.Options{
 			Targets: localruntime.ResolveLaunchTargets(
 				agents, tmuxCmd, nil,
 			),
-			TmuxCommand:             tmuxCmd,
-			TmuxOwnerMarker:         s.workspaces.TmuxOwnerMarker(),
-			WrapAgentSessionsInTmux: cfg.TmuxAgentSessionsEnabled(),
-			StripEnvVars:            cfg.TokenEnvNames(),
-			ShellCommand:            cfg.ShellCommand(),
-			OnSessionExit:           s.handleRuntimeSessionExit,
-			PtyOwnerRuntime:         runtimePtyOwner,
+			TmuxCommand:              tmuxCmd,
+			TmuxOwnerMarker:          s.workspaces.TmuxOwnerMarker(),
+			WrapAgentSessionsInTmux:  cfg.TmuxAgentSessionsEnabled(),
+			StripEnvVars:             cfg.TokenEnvNames(),
+			ShellCommand:             cfg.ShellCommand(),
+			OnSessionExit:            s.handleRuntimeSessionExit,
+			PtyOwnerRuntime:          runtimePtyOwner,
+			KnownPtyOwnerSessionKeys: s.workspaces.RuntimeSessionKeysForWorkspace,
 		})
-		if err := s.restoreRuntimeTmuxSessions(context.Background()); err != nil {
+		if err := s.restoreRuntimeSessions(context.Background()); err != nil {
 			slog.Warn("restore runtime tmux sessions", "err", err)
 		}
 	}
@@ -700,33 +702,66 @@ func newServer(
 	return s
 }
 
-func (s *Server) restoreRuntimeTmuxSessions(ctx context.Context) error {
-	if s.db == nil || s.runtime == nil {
+func (s *Server) restoreRuntimeSessions(ctx context.Context) error {
+	if s.db == nil || s.runtime == nil || s.workspaces == nil {
 		return nil
 	}
-	stored, err := s.db.ListAllWorkspaceTmuxSessions(ctx)
+	stored, err := s.db.ListAllWorkspaceRuntimeSessions(ctx)
 	if err != nil {
 		return err
 	}
-	if len(stored) == 0 {
-		return nil
+	for _, session := range stored {
+		summary, err := s.workspaces.GetSummary(ctx, session.WorkspaceID)
+		if err != nil {
+			return err
+		}
+		if summary == nil {
+			continue
+		}
+		restored := localruntime.RestoredRuntimeSession{
+			WorkspaceID: session.WorkspaceID,
+			SessionKey:  session.SessionKey,
+			TargetKey:   session.TargetKey,
+			Label:       session.Label,
+			Kind:        localruntime.LaunchTargetKind(session.Kind),
+			TmuxSession: session.TmuxSession,
+			CWD:         summary.WorktreePath,
+			CreatedAt:   session.CreatedAt,
+		}
+		err = s.runtime.RestoreRuntimeSessions(
+			ctx, []localruntime.RestoredRuntimeSession{restored},
+		)
+		if err == nil {
+			continue
+		}
+		if errors.Is(err, localruntime.ErrSessionNotFound) {
+			if _, forgetErr := s.workspaces.ForgetRuntimeSessionCreatedAt(
+				ctx, session.WorkspaceID, session.SessionKey, session.CreatedAt,
+			); forgetErr != nil {
+				return forgetErr
+			}
+			continue
+		}
+		if errors.Is(err, localruntime.ErrSessionUnavailable) {
+			slog.Warn(
+				"runtime session unavailable after restore",
+				"workspace_id", session.WorkspaceID,
+				"session_key", session.SessionKey,
+				"target_key", session.TargetKey,
+				"tmux_session", session.TmuxSession,
+				"err", err,
+			)
+			continue
+		}
+		return err
 	}
 
-	sessions := make([]localruntime.RestoredTmuxSession, 0, len(stored))
-	for _, session := range stored {
-		sessions = append(sessions, localruntime.RestoredTmuxSession{
-			WorkspaceID: session.WorkspaceID,
-			SessionName: session.SessionName,
-			TargetKey:   session.TargetKey,
-			CreatedAt:   session.CreatedAt,
-		})
-	}
-	slog.Debug("restoring runtime tmux sessions", "count", len(sessions))
-	return s.runtime.RestoreTmuxSessions(ctx, sessions)
+	slog.Debug("restored runtime sessions", "count", len(stored))
+	return nil
 }
 
 func (s *Server) handleRuntimeSessionExit(info localruntime.SessionInfo) {
-	if info.TmuxSession == "" || s.workspaces == nil {
+	if s.workspaces == nil {
 		return
 	}
 	s.runBackground(func(ctx context.Context) {
@@ -734,15 +769,14 @@ func (s *Server) handleRuntimeSessionExit(info localruntime.SessionInfo) {
 			ctx, runtimeSessionCleanupTimeout,
 		)
 		defer cancel()
-		if _, err := s.workspaces.ForgetMissingRuntimeTmuxSession(
-			cleanupCtx, info.WorkspaceID, info.TmuxSession,
-			info.CreatedAt,
+		if _, err := s.workspaces.ForgetRuntimeSessionAfterExit(
+			cleanupCtx, info.WorkspaceID, info.Key, info.CreatedAt,
+			info.TmuxSession,
 		); err != nil {
 			slog.Warn(
-				"forget missing runtime tmux session",
+				"forget exited runtime session",
 				"workspace_id", info.WorkspaceID,
 				"session_key", info.Key,
-				"tmux_session", info.TmuxSession,
 				"err", err,
 			)
 		}

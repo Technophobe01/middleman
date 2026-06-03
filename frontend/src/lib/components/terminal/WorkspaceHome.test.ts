@@ -38,6 +38,13 @@ describe("WorkspaceHome", () => {
             disabled_reason: "missing not found on PATH",
           },
           {
+            key: "shell",
+            label: "Shell",
+            kind: "shell",
+            source: "system",
+            available: true,
+          },
+          {
             key: "plain_shell",
             label: "Plain shell",
             kind: "plain_shell",
@@ -54,6 +61,15 @@ describe("WorkspaceHome", () => {
             kind: "agent",
             status: "running",
             created_at: "2026-04-25T00:00:00Z",
+          },
+          {
+            key: "ws-1:shell",
+            workspace_id: "ws-1",
+            target_key: "plain_shell",
+            label: "Shell",
+            kind: "plain_shell",
+            status: "running",
+            created_at: "2026-04-25T00:00:01Z",
           },
         ],
         onLaunch,
@@ -74,11 +90,16 @@ describe("WorkspaceHome", () => {
     expect(
       screen.queryByRole("button", { name: "Plain shell" }),
     ).toBeNull();
+    expect(screen.queryByRole("button", { name: "shell" })).toBeNull();
 
     await fireEvent.click(screen.getByRole("button", { name: "Codex" }));
     expect(onLaunch).toHaveBeenCalledWith("codex");
+    await fireEvent.click(screen.getByRole("button", { name: "Shell" }));
+    expect(onLaunch).toHaveBeenCalledWith("shell");
 
     await fireEvent.click(screen.getByRole("button", { name: /Codex\s+Running/ }));
     expect(onOpenSession).toHaveBeenCalledWith("ws-1:codex");
+    await fireEvent.click(screen.getByRole("button", { name: /Shell\s+Running/ }));
+    expect(onOpenSession).toHaveBeenCalledWith("ws-1:shell");
   });
 });

@@ -46,6 +46,9 @@ func ResolveLaunchTargets(
 	seen := make(map[string]struct{}, len(agents)+len(builtinAgents))
 
 	for _, agent := range agents {
+		if isSystemLaunchTargetKey(agent.Key) {
+			continue
+		}
 		target := LaunchTarget{
 			Key:     agent.Key,
 			Label:   agent.Label,
@@ -79,10 +82,10 @@ func ResolveLaunchTargets(
 		seen[target.Key] = struct{}{}
 	}
 
-	targets = append(targets, tmuxTarget(tmuxCommand, lookPath))
+	targets = append(targets, shellTarget(tmuxCommand, lookPath))
 	targets = append(targets, LaunchTarget{
 		Key:       "plain_shell",
-		Label:     "Plain shell",
+		Label:     "Shell",
 		Kind:      LaunchTargetPlainShell,
 		Source:    "system",
 		Available: true,
@@ -90,7 +93,7 @@ func ResolveLaunchTargets(
 	return targets
 }
 
-func tmuxTarget(
+func shellTarget(
 	tmuxCommand []string,
 	lookPath lookPathFunc,
 ) LaunchTarget {
@@ -99,7 +102,7 @@ func tmuxTarget(
 		command = []string{"tmux"}
 	}
 	target := LaunchTarget{
-		Key: "tmux", Label: "tmux", Kind: LaunchTargetTmux,
+		Key: "shell", Label: "Shell", Kind: LaunchTargetShell,
 		Source: "system", Command: command,
 	}
 	if command[0] == "" {
@@ -114,6 +117,12 @@ func tmuxTarget(
 	}
 	target.Available = true
 	return target
+}
+
+func isSystemLaunchTargetKey(key string) bool {
+	return key == string(LaunchTargetShell) ||
+		key == string(LaunchTargetPlainShell) ||
+		key == "tmux"
 }
 
 func cloneTarget(target LaunchTarget) LaunchTarget {

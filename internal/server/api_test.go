@@ -34,6 +34,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/creack/pty/v2"
 	gh "github.com/google/go-github/v84/github"
+	shellquote "github.com/kballard/go-shellquote"
 	"github.com/shurcooL/githubv4"
 	Assert "github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -62,6 +63,42 @@ import (
 const serverRuntimeHelperMarker = "middleman-runtime-helper"
 
 var ptyE2ESemaphore = semaphore.NewWeighted(1)
+
+func TestMain(m *testing.M) {
+	if isServerHelperProcess() {
+		os.Exit(m.Run())
+	}
+	envDir, envDirErr := os.MkdirTemp("", "middleman-server-tmux-env-*")
+	if envDirErr == nil {
+		_ = os.Setenv("MIDDLEMAN_TMUX_ENV_DIR", envDir)
+	}
+	code := m.Run()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if err := cleanupMiddlemanTestTmuxSessionsWithContext(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "cleanup middleman test tmux sessions: %v\n", err)
+		if code == 0 {
+			code = 1
+		}
+	}
+	cancel()
+	if envDirErr == nil {
+		_ = os.RemoveAll(envDir)
+	}
+	os.Exit(code)
+}
+
+func isServerHelperProcess() bool {
+	if os.Getenv("MIDDLEMAN_SERVER_RUNTIME_HELPER") == "1" ||
+		os.Getenv("MIDDLEMAN_SERVER_PTY_OWNER_HELPER") == "1" {
+		return true
+	}
+	args := os.Args
+	if sep := slices.Index(args, "--"); sep >= 0 {
+		args = args[sep+1:]
+	}
+	return len(args) > 0 &&
+		(args[0] == serverRuntimeHelperMarker || args[0] == "pty-owner")
+}
 
 func runParallelPTYE2E(t *testing.T) {
 	t.Helper()
@@ -98,6 +135,51 @@ func gracefulShutdown(t *testing.T, srv interface{ Shutdown(context.Context) err
 	ctx, cancel := cleanupContext(t)
 	defer cancel()
 	require.NoError(t, srv.Shutdown(ctx))
+}
+
+func recordRuntimeTmuxSessionForServerTest(
+	t *testing.T,
+	database *db.DB,
+	workspaceID string,
+	sessionKey string,
+	targetKey string,
+	tmuxSession string,
+	createdAt time.Time,
+) {
+	t.Helper()
+	if sessionKey == "" {
+		sessionKey = runtimeSessionKeyForTest(
+			workspaceID, targetKey, tmuxSession,
+		)
+	}
+	label := targetKey
+	kind := string(localruntime.LaunchTargetAgent)
+	if targetKey == string(localruntime.LaunchTargetPlainShell) {
+		label = "Shell"
+		kind = string(localruntime.LaunchTargetPlainShell)
+	}
+	require.NoError(t, database.UpsertWorkspaceRuntimeSession(
+		t.Context(),
+		&db.WorkspaceRuntimeSession{
+			WorkspaceID: workspaceID,
+			SessionKey:  sessionKey,
+			TargetKey:   targetKey,
+			Label:       label,
+			Kind:        kind,
+			Scope:       "session",
+			TmuxSession: tmuxSession,
+			CreatedAt:   createdAt,
+		},
+	))
+}
+
+func runtimeSessionKeyForTest(
+	workspaceID string,
+	targetKey string,
+	tmuxSession string,
+) string {
+	sum := sha256.Sum256([]byte(targetKey + "\x00" + tmuxSession))
+	return workspaceID + "_" + hex.EncodeToString(sum[:8])
 }
 
 // mockGH implements ghclient.Client for testing.
@@ -811,6 +893,26 @@ func setupTestClientWithBaseURL(
 	require.NoError(t, err)
 
 	return client
+}
+
+func launchPlainShellRuntimeSession(
+	t *testing.T,
+	ctx context.Context,
+	client *apiclient.Client,
+	workspaceID string,
+) *generated.SessionInfo {
+	t.Helper()
+
+	resp, err := client.HTTP.LaunchWorkspaceRuntimeSessionWithResponse(
+		ctx, workspaceID,
+		generated.LaunchWorkspaceRuntimeSessionInputBody{
+			TargetKey: string(localruntime.LaunchTargetPlainShell),
+		},
+	)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode(), string(resp.Body))
+	require.NotNil(t, resp.JSON200)
+	return resp.JSON200
 }
 
 func assertRFC3339UTC(t *testing.T, got string, want time.Time) {
@@ -16825,7 +16927,9 @@ func setupWorkspaceServerFixture(
 	t *testing.T,
 	cfg *config.Config,
 ) workspaceServerFixture {
-	return setupWorkspaceServerFixtureWithOptions(t, cfg, ServerOptions{})
+	return setupWorkspaceServerFixtureWithOptions(
+		t, cfg, ServerOptions{PtyOwnerInProcess: true},
+	)
 }
 
 func setupWorkspaceServerFixtureWithOptions(
@@ -16846,7 +16950,7 @@ func setupWorkspaceServerFixtureWithHost(
 ) workspaceServerFixture {
 	t.Helper()
 	return setupWorkspaceServerFixtureWithHostAndOptions(
-		t, cfg, platformHost, ServerOptions{},
+		t, cfg, platformHost, ServerOptions{PtyOwnerInProcess: true},
 	)
 }
 
@@ -16920,6 +17024,7 @@ func setupWorkspaceServerFixtureWithHostAndOptions(
 	options.Clones = clones
 	options.WorktreeDir = worktreeDir
 	srv := New(database, syncer, nil, basePath, cfg, options)
+	t.Cleanup(func() { cleanupWorkspaceServerFixtureTmuxSessions(t, dir) })
 	// Cleanup callbacks run LIFO. Drain the server first so async
 	// workspace setup cannot create a tmux session after fixture
 	// artifact cleanup has listed workspaces. The DB cleanup was
@@ -17002,6 +17107,167 @@ func cleanupWorkspaceServerFixtureArtifactsWithContext(
 	return errors.Join(errs...)
 }
 
+func cleanupWorkspaceServerFixtureTmuxSessions(t *testing.T, root string) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	require.NoError(t, cleanupWorkspaceServerFixtureTmuxSessionsWithContext(
+		ctx, root,
+	))
+}
+
+func cleanupWorkspaceServerFixtureTmuxSessionsWithContext(
+	ctx context.Context,
+	root string,
+) error {
+	tmuxPath, err := exec.LookPath("tmux")
+	if err != nil {
+		return nil
+	}
+	sessions, err := middlemanTmuxSessions(ctx, tmuxPath, func(path string) bool {
+		return pathIsWithin(root, path)
+	})
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, session := range sessions {
+		cmd := procutil.CommandContext(
+			ctx, tmuxPath, "kill-session", "-t", session,
+		)
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		if err := procutil.Run(ctx, cmd, "test tmux cleanup"); err != nil {
+			errs = append(
+				errs,
+				fmt.Errorf(
+					"kill leaked tmux session %s: %w: %s",
+					session, err, strings.TrimSpace(stderr.String()),
+				),
+			)
+		}
+	}
+	remaining, err := middlemanTmuxSessions(ctx, tmuxPath, func(path string) bool {
+		return pathIsWithin(root, path)
+	})
+	if err != nil {
+		errs = append(errs, err)
+	}
+	if len(remaining) > 0 {
+		errs = append(errs, fmt.Errorf(
+			"workspace fixture leaked tmux sessions under %s: %s",
+			root, strings.Join(remaining, ", "),
+		))
+	}
+	return errors.Join(errs...)
+}
+
+func cleanupMiddlemanTestTmuxSessionsWithContext(ctx context.Context) error {
+	tmuxPath, err := exec.LookPath("tmux")
+	if err != nil {
+		return nil
+	}
+	sessions, err := middlemanTmuxSessions(
+		ctx, tmuxPath, pathIsGoTestTempPath,
+	)
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, session := range sessions {
+		cmd := procutil.CommandContext(
+			ctx, tmuxPath, "kill-session", "-t", session,
+		)
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		if err := procutil.Run(ctx, cmd, "test tmux cleanup"); err != nil {
+			errs = append(
+				errs,
+				fmt.Errorf(
+					"kill leaked tmux session %s: %w: %s",
+					session, err, strings.TrimSpace(stderr.String()),
+				),
+			)
+		}
+	}
+	remaining, err := middlemanTmuxSessions(
+		ctx, tmuxPath, pathIsGoTestTempPath,
+	)
+	if err != nil {
+		errs = append(errs, err)
+	}
+	if len(remaining) > 0 {
+		errs = append(errs, fmt.Errorf(
+			"server tests leaked tmux sessions: %s",
+			strings.Join(remaining, ", "),
+		))
+	}
+	return errors.Join(errs...)
+}
+
+func middlemanTmuxSessions(
+	ctx context.Context,
+	tmuxPath string,
+	includePath func(string) bool,
+) ([]string, error) {
+	cmd := procutil.CommandContext(
+		ctx, tmuxPath, "list-sessions", "-F", "#{session_name}\t#{session_path}",
+	)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := procutil.Run(ctx, cmd, "test tmux cleanup list"); err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if isTmuxServerAbsentMessage(msg) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("list tmux sessions: %w: %s", err, msg)
+	}
+
+	var sessions []string
+	for line := range strings.SplitSeq(stdout.String(), "\n") {
+		name, path, ok := strings.Cut(line, "\t")
+		if !ok || !strings.HasPrefix(name, "middleman-") {
+			continue
+		}
+		if includePath != nil && !includePath(path) {
+			continue
+		}
+		sessions = append(sessions, name)
+	}
+	slices.Sort(sessions)
+	return sessions, nil
+}
+
+func isTmuxServerAbsentMessage(msg string) bool {
+	return strings.Contains(msg, "no server running") ||
+		(strings.Contains(msg, "error connecting to") &&
+			strings.Contains(msg, "No such file or directory"))
+}
+
+func pathIsWithin(root string, path string) bool {
+	if root == "" || path == "" {
+		return false
+	}
+	rel, err := filepath.Rel(filepath.Clean(root), filepath.Clean(path))
+	return err == nil && rel != ".." && !strings.HasPrefix(
+		rel, ".."+string(os.PathSeparator),
+	)
+}
+
+func pathIsGoTestTempPath(path string) bool {
+	rel, err := filepath.Rel(filepath.Clean(os.TempDir()), filepath.Clean(path))
+	if err != nil ||
+		rel == ".." ||
+		strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return false
+	}
+	first, _, _ := strings.Cut(rel, string(os.PathSeparator))
+	return strings.HasPrefix(first, "Test")
+}
+
 func waitForWorkspaceReady(
 	t *testing.T,
 	ctx context.Context,
@@ -17021,7 +17287,7 @@ func waitForWorkspaceStatus(
 ) *generated.WorkspaceResponse {
 	t.Helper()
 
-	waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	waitCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
 	ticker := time.NewTicker(25 * time.Millisecond)
@@ -17168,6 +17434,27 @@ func TestCleanupWorkspaceServerFixtureArtifactsKeepsDeletingAfterError(
 		killedSessions["middleman-succeeds"],
 		"cleanup stopped before later workspace tmux session",
 	)
+}
+
+func TestMiddlemanTmuxSessionsTreatsMissingTmuxSocketAsEmpty(t *testing.T) {
+	require := require.New(t)
+
+	dir := t.TempDir()
+	script := filepath.Join(dir, "fake-tmux")
+	body := "#!/bin/sh\n" +
+		`if [ "$1" = "list-sessions" ]; then` + "\n" +
+		`  echo "error connecting to /tmp/tmux-1001/default (No such file or directory)" >&2` + "\n" +
+		`  exit 1` + "\n" +
+		`fi` + "\n" +
+		"exit 2\n"
+	require.NoError(os.WriteFile(script, []byte(body), 0o755))
+
+	sessions, err := middlemanTmuxSessions(
+		context.Background(), script, pathIsGoTestTempPath,
+	)
+
+	require.NoError(err)
+	require.Empty(sessions)
 }
 
 func TestWorkspaceRuntimeTargetsRefreshAfterSettingsUpdateE2E(t *testing.T) {
@@ -17477,7 +17764,7 @@ func TestWorkspaceRuntimeLaunchesRustPtyManagerSessionE2E(t *testing.T) {
 		generated.LaunchWorkspaceRuntimeSessionInputBody{TargetKey: "helper"},
 	)
 	require.NoError(err)
-	require.Equal(http.StatusOK, launchResp.StatusCode())
+	require.Equal(http.StatusOK, launchResp.StatusCode(), string(launchResp.Body))
 	require.NotNil(launchResp.JSON200)
 	session := launchResp.JSON200
 	cleanupPtyOwnerWorkspace(t, ptyOwnerDir, session.Key)
@@ -17500,6 +17787,316 @@ func TestWorkspaceRuntimeLaunchesRustPtyManagerSessionE2E(t *testing.T) {
 	)
 	require.NoError(err)
 	require.Equal(http.StatusNoContent, stopResp.StatusCode())
+}
+
+func TestWorkspaceRuntimePlainShellUsesPtyOwnerWhenTmuxUnavailableE2E(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test fixture uses /bin/sh")
+	}
+	runParallelPTYE2E(t)
+
+	require := require.New(t)
+	assert := Assert.New(t)
+
+	fixture, _, ptyOwnerDir := setupPtyOwnerWorkspaceFixture(t)
+	ctx := context.Background()
+	ws := createReadyWorkspace(t, ctx, fixture.client)
+
+	session := launchPlainShellRuntimeSession(t, ctx, fixture.client, ws.Id)
+	cleanupPtyOwnerWorkspace(t, ptyOwnerDir, session.Key)
+	assert.Equal(string(localruntime.LaunchTargetPlainShell), session.TargetKey)
+	assert.Equal(string(localruntime.SessionStatusRunning), session.Status)
+
+	paths, err := ptyowner.NewSessionPaths(ptyOwnerDir, session.Key)
+	require.NoError(err)
+	_, err = os.Stat(paths.StatePath)
+	require.NoError(err)
+
+	storedTmux, err := fixture.database.ListWorkspaceRuntimeTmuxSessions(ctx, ws.Id)
+	require.NoError(err)
+	assert.Empty(storedTmux)
+
+	ts := httptest.NewServer(fixture.server)
+	t.Cleanup(ts.Close)
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") +
+		"/ws/v1/workspaces/" + ws.Id +
+		"/runtime/sessions/" + session.Key + "/terminal?cols=80&rows=24"
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	require.NoError(err)
+	defer conn.Close(websocket.StatusNormalClosure, "done")
+
+	workspaceTerminalConnWriteRead(
+		t, ctx, conn, "printf 'pty-owner-shell\\n'\r", "pty-owner-shell",
+	)
+}
+
+func TestWorkspaceRuntimePtyOwnerShellReattachesAfterServerRestartE2E(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test fixture uses /bin/sh")
+	}
+	runParallelPTYE2E(t)
+
+	require := require.New(t)
+	assert := Assert.New(t)
+
+	fixture, dir, ptyOwnerDir := setupPtyOwnerWorkspaceFixture(t)
+	ctx := context.Background()
+	ws := createReadyWorkspace(t, ctx, fixture.client)
+
+	originalShell := launchPlainShellRuntimeSession(t, ctx, fixture.client, ws.Id)
+	cleanupPtyOwnerWorkspace(t, ptyOwnerDir, originalShell.Key)
+	staleTmuxKey := ws.Id + "_stale-tmux"
+	require.NoError(fixture.database.UpsertWorkspaceRuntimeSession(
+		ctx,
+		&db.WorkspaceRuntimeSession{
+			WorkspaceID: ws.Id,
+			SessionKey:  staleTmuxKey,
+			TargetKey:   "helper",
+			Label:       "Helper",
+			Kind:        string(localruntime.LaunchTargetAgent),
+			Scope:       "session",
+			TmuxSession: "middleman-stale-runtime-tmux",
+			CreatedAt:   originalShell.CreatedAt.Add(-time.Minute),
+		},
+	))
+	t.Cleanup(func() {
+		_ = fixture.database.DeleteWorkspaceRuntimeSession(
+			context.Background(), ws.Id, staleTmuxKey,
+		)
+	})
+
+	ts := httptest.NewServer(fixture.server)
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") +
+		"/ws/v1/workspaces/" + ws.Id +
+		"/runtime/sessions/" + originalShell.Key + "/terminal?cols=80&rows=24"
+	conn := dialWebSocketForTest(t, ctx, wsURL, "pty-owner shell before restart")
+	workspaceTerminalConnWriteRead(
+		t, ctx, conn,
+		"export MIDDLEMAN_RESTART_MARK=still-here\r"+
+			"printf 'before-restart:%s\\n' \"$MIDDLEMAN_RESTART_MARK\"\r",
+		"before-restart:still-here",
+	)
+	require.NoError(conn.Close(websocket.StatusNormalClosure, "restart"))
+	ts.Close()
+
+	gracefulShutdown(t, fixture.server)
+
+	cfg := &config.Config{Tmux: config.Tmux{
+		Command: []string{filepath.Join(dir, "missing-tmux")},
+	}}
+	options := ptyOwnerServerOptions(ptyOwnerDir)
+	options.Clones = fixture.clones
+	options.WorktreeDir = fixture.worktrees
+	restarted := New(
+		fixture.database, fixture.server.syncer, nil, "/", cfg, options,
+	)
+	t.Cleanup(func() { gracefulShutdown(t, restarted) })
+	restartedClient := setupTestClient(t, restarted)
+
+	runtimeResp, err := restartedClient.HTTP.GetWorkspaceRuntimeWithResponse(
+		ctx, ws.Id,
+	)
+	require.NoError(err)
+	require.Equal(http.StatusOK, runtimeResp.StatusCode())
+	require.NotNil(runtimeResp.JSON200)
+	require.NotNil(runtimeResp.JSON200.Sessions)
+	require.Len(*runtimeResp.JSON200.Sessions, 2)
+	var restoredShell *generated.SessionInfo
+	var unavailableTmux *generated.SessionInfo
+	for i := range *runtimeResp.JSON200.Sessions {
+		session := &(*runtimeResp.JSON200.Sessions)[i]
+		switch session.Key {
+		case originalShell.Key:
+			restoredShell = session
+		case staleTmuxKey:
+			unavailableTmux = session
+		}
+	}
+	require.NotNil(restoredShell)
+	assert.Equal(string(localruntime.SessionStatusRunning), restoredShell.Status)
+	require.NotNil(unavailableTmux)
+	assert.Equal(string(localruntime.SessionStatusError), unavailableTmux.Status)
+
+	restartedTS := httptest.NewServer(restarted)
+	t.Cleanup(restartedTS.Close)
+	restartedURL := "ws" + strings.TrimPrefix(restartedTS.URL, "http") +
+		"/ws/v1/workspaces/" + ws.Id +
+		"/runtime/sessions/" + originalShell.Key + "/terminal?cols=80&rows=24"
+	restartedConn := dialWebSocketForTest(
+		t, ctx, restartedURL, "pty-owner shell after restart",
+	)
+	defer restartedConn.Close(websocket.StatusNormalClosure, "done")
+
+	workspaceTerminalConnWriteRead(
+		t, ctx, restartedConn,
+		"printf 'after-restart:%s\\n' \"$MIDDLEMAN_RESTART_MARK\"\r",
+		"after-restart:still-here",
+	)
+	require.NoError(restartedConn.Close(websocket.StatusNormalClosure, "stop"))
+
+	stopResp, err := restartedClient.HTTP.StopWorkspaceRuntimeSessionWithResponse(
+		ctx, ws.Id, originalShell.Key,
+	)
+	require.NoError(err)
+	require.Equal(http.StatusNoContent, stopResp.StatusCode())
+	_, err = os.Stat(filepath.Join(ptyOwnerDir, originalShell.Key))
+	assert.True(os.IsNotExist(err))
+}
+
+func TestWorkspaceRuntimeUnavailablePtyOwnerSessionStaysUntilUserStopE2E(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test fixture uses /bin/sh")
+	}
+	runParallelPTYE2E(t)
+
+	require := require.New(t)
+	assert := Assert.New(t)
+
+	fixture, dir, ptyOwnerDir := setupPtyOwnerWorkspaceFixture(t)
+	ctx := context.Background()
+	ws := createReadyWorkspace(t, ctx, fixture.client)
+	sessionKey := ws.Id + "_stale-shell"
+	createdAt := time.Date(2026, 6, 3, 12, 0, 0, 0, time.UTC)
+	require.NoError(fixture.server.workspaces.RecordRuntimeSession(
+		ctx,
+		db.WorkspaceRuntimeSession{
+			WorkspaceID: ws.Id,
+			SessionKey:  sessionKey,
+			TargetKey:   string(localruntime.LaunchTargetPlainShell),
+			Label:       "Shell",
+			Kind:        string(localruntime.LaunchTargetPlainShell),
+			Scope:       "session",
+			CreatedAt:   createdAt,
+		},
+	))
+
+	gracefulShutdown(t, fixture.server)
+
+	cfg := &config.Config{Tmux: config.Tmux{
+		Command: []string{filepath.Join(dir, "missing-tmux")},
+	}}
+	options := ptyOwnerServerOptions(ptyOwnerDir)
+	options.Clones = fixture.clones
+	options.WorktreeDir = fixture.worktrees
+	restarted := New(
+		fixture.database, fixture.server.syncer, nil, "/", cfg, options,
+	)
+	t.Cleanup(func() { gracefulShutdown(t, restarted) })
+	restartedClient := setupTestClient(t, restarted)
+
+	runtimeResp, err := restartedClient.HTTP.GetWorkspaceRuntimeWithResponse(
+		ctx, ws.Id,
+	)
+	require.NoError(err)
+	require.Equal(http.StatusOK, runtimeResp.StatusCode())
+	require.NotNil(runtimeResp.JSON200)
+	require.NotNil(runtimeResp.JSON200.Sessions)
+	require.Len(*runtimeResp.JSON200.Sessions, 1)
+	session := (*runtimeResp.JSON200.Sessions)[0]
+	assert.Equal(sessionKey, session.Key)
+	assert.Equal("Shell", session.Label)
+	assert.Equal(string(localruntime.SessionStatusError), session.Status)
+	assert.Equal(string(localruntime.LaunchTargetPlainShell), session.TargetKey)
+
+	renameResp, err := restartedClient.HTTP.RenameWorkspaceRuntimeSessionWithResponse(
+		ctx,
+		ws.Id,
+		sessionKey,
+		generated.RenameWorkspaceRuntimeSessionInputBody{
+			Label: "Recovered shell",
+		},
+	)
+	require.NoError(err)
+	require.Equal(http.StatusOK, renameResp.StatusCode())
+	require.NotNil(renameResp.JSON200)
+	assert.Equal(sessionKey, renameResp.JSON200.Key)
+	assert.Equal("Recovered shell", renameResp.JSON200.Label)
+	assert.Equal(string(localruntime.SessionStatusError), renameResp.JSON200.Status)
+
+	runtimeResp, err = restartedClient.HTTP.GetWorkspaceRuntimeWithResponse(
+		ctx, ws.Id,
+	)
+	require.NoError(err)
+	require.Equal(http.StatusOK, runtimeResp.StatusCode())
+	require.NotNil(runtimeResp.JSON200)
+	require.NotNil(runtimeResp.JSON200.Sessions)
+	require.Len(*runtimeResp.JSON200.Sessions, 1)
+	assert.Equal("Recovered shell", (*runtimeResp.JSON200.Sessions)[0].Label)
+
+	stored, err := fixture.database.ListWorkspaceRuntimeSessions(ctx, ws.Id)
+	require.NoError(err)
+	require.Len(stored, 1)
+	assert.Equal(sessionKey, stored[0].SessionKey)
+	assert.Equal("Recovered shell", stored[0].Label)
+
+	stopResp, err := restartedClient.HTTP.StopWorkspaceRuntimeSessionWithResponse(
+		ctx, ws.Id, sessionKey,
+	)
+	require.NoError(err)
+	require.Equal(http.StatusNoContent, stopResp.StatusCode())
+	stored, err = fixture.database.ListWorkspaceRuntimeSessions(ctx, ws.Id)
+	require.NoError(err)
+	assert.Empty(stored)
+}
+
+func TestWorkspaceDeleteStopsPtyOwnerAgentAfterServerRestartE2E(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test fixture uses /bin/sh")
+	}
+	runParallelPTYE2E(t)
+
+	require := require.New(t)
+	assert := Assert.New(t)
+
+	dir := t.TempDir()
+	ptyOwnerDir := filepath.Join(dir, "pty-owner")
+	cfg := &config.Config{
+		Agents: []config.Agent{{
+			Key:     "helper",
+			Label:   "Helper",
+			Command: serverRuntimeHelperCommand("sleep"),
+		}},
+		Tmux: config.Tmux{Command: []string{filepath.Join(dir, "missing-tmux")}},
+	}
+	fixture := setupWorkspaceServerFixtureWithOptions(
+		t, cfg, ptyOwnerServerOptions(ptyOwnerDir),
+	)
+	ctx := context.Background()
+	ws := createReadyWorkspace(t, ctx, fixture.client)
+
+	launchResp, err := fixture.client.HTTP.LaunchWorkspaceRuntimeSessionWithResponse(
+		ctx, ws.Id,
+		generated.LaunchWorkspaceRuntimeSessionInputBody{TargetKey: "helper"},
+	)
+	require.NoError(err)
+	require.Equal(http.StatusOK, launchResp.StatusCode(), string(launchResp.Body))
+	require.NotNil(launchResp.JSON200)
+	sessionKey := launchResp.JSON200.Key
+	cleanupPtyOwnerWorkspace(t, ptyOwnerDir, sessionKey)
+
+	_, err = os.Stat(filepath.Join(ptyOwnerDir, sessionKey))
+	require.NoError(err)
+	gracefulShutdown(t, fixture.server)
+
+	options := ptyOwnerServerOptions(ptyOwnerDir)
+	options.Clones = fixture.clones
+	options.WorktreeDir = fixture.worktrees
+	restarted := New(
+		fixture.database, fixture.server.syncer, nil, "/", cfg, options,
+	)
+	t.Cleanup(func() { gracefulShutdown(t, restarted) })
+	restartedClient := setupTestClient(t, restarted)
+
+	force := true
+	delResp, err := restartedClient.HTTP.DeleteWorkspaceWithResponse(
+		ctx, ws.Id,
+		&generated.DeleteWorkspaceParams{Force: &force},
+	)
+	require.NoError(err)
+	require.Equal(http.StatusNoContent, delResp.StatusCode(), string(delResp.Body))
+
+	_, err = os.Stat(filepath.Join(ptyOwnerDir, sessionKey))
+	assert.True(os.IsNotExist(err))
 }
 
 func TestRustPtyManagerRejectsConcurrentAttachmentsE2E(t *testing.T) {
@@ -17810,7 +18407,7 @@ func TestWorkspaceRuntimeLaunchUnavailableTargetE2E(t *testing.T) {
 	require.Contains(t, string(resp.Body), "not available")
 }
 
-func TestWorkspaceRuntimeLaunchPlainShellUsesShellSessionE2E(t *testing.T) {
+func TestWorkspaceRuntimeLaunchPlainShellCreatesRuntimeSessionE2E(t *testing.T) {
 	t.Parallel()
 
 	require := require.New(t)
@@ -17830,6 +18427,7 @@ func TestWorkspaceRuntimeLaunchPlainShellUsesShellSessionE2E(t *testing.T) {
 	require.Equal(http.StatusOK, resp.StatusCode())
 	require.NotNil(resp.JSON200)
 	shell := resp.JSON200
+	assert.True(isRuntimeSessionKeyForWorkspace(ws.Id, shell.Key))
 	assert.Equal("plain_shell", shell.TargetKey)
 	assert.Equal(string(localruntime.LaunchTargetPlainShell), shell.Kind)
 	assert.Equal(string(localruntime.SessionStatusRunning), shell.Status)
@@ -17838,13 +18436,12 @@ func TestWorkspaceRuntimeLaunchPlainShellUsesShellSessionE2E(t *testing.T) {
 	require.NoError(err)
 	require.Equal(http.StatusOK, getResp.StatusCode())
 	require.NotNil(getResp.JSON200)
-	require.NotNil(getResp.JSON200.ShellSession)
 	require.NotNil(getResp.JSON200.Sessions)
-	assert.Equal(shell.Key, getResp.JSON200.ShellSession.Key)
-	assert.Empty(*getResp.JSON200.Sessions)
+	require.Len(*getResp.JSON200.Sessions, 1)
+	assert.Equal(shell.Key, (*getResp.JSON200.Sessions)[0].Key)
 }
 
-func TestWorkspaceRuntimeLaunchSingletonAndStopE2E(t *testing.T) {
+func TestWorkspaceRuntimeLaunchMultipleAndStopOneE2E(t *testing.T) {
 	runParallelPTYE2E(t)
 
 	require := require.New(t)
@@ -17855,7 +18452,7 @@ func TestWorkspaceRuntimeLaunchSingletonAndStopE2E(t *testing.T) {
 		Label:   "Helper",
 		Command: serverRuntimeHelperCommand("sleep"),
 	}}, Tmux: config.Tmux{AgentSessions: &disableTmuxAgentSessions}}
-	client, _, _, _, _ := setupTestServerWithWorkspacesServer(t, cfg)
+	client, _, _, _, srv := setupTestServerWithWorkspacesServer(t, cfg)
 	ctx := context.Background()
 	ws := createReadyWorkspace(t, ctx, client)
 
@@ -17880,8 +18477,25 @@ func TestWorkspaceRuntimeLaunchSingletonAndStopE2E(t *testing.T) {
 	require.Equal(http.StatusOK, secondResp.StatusCode())
 	require.NotNil(secondResp.JSON200)
 	second := secondResp.JSON200
-	assert.Equal(first.Key, second.Key)
+	assert.NotEqual(first.Key, second.Key)
+	assert.True(isRuntimeSessionKeyForWorkspace(ws.Id, first.Key))
+	assert.True(isRuntimeSessionKeyForWorkspace(ws.Id, second.Key))
+	assert.Equal("Helper", first.Label)
+	assert.Equal("Helper 2", second.Label)
 	assert.Equal(string(localruntime.SessionStatusRunning), first.Status)
+
+	renameRR := doJSON(
+		t,
+		srv,
+		http.MethodPatch,
+		"/api/v1/workspaces/"+ws.Id+"/runtime/sessions/"+url.PathEscape(second.Key),
+		map[string]string{"label": "Review helper"},
+	)
+	require.Equal(http.StatusOK, renameRR.Code, renameRR.Body.String())
+	var renamed generated.SessionInfo
+	require.NoError(json.NewDecoder(renameRR.Body).Decode(&renamed))
+	assert.Equal(second.Key, renamed.Key)
+	assert.Equal("Review helper", renamed.Label)
 
 	listResp, err := client.HTTP.GetWorkspaceRuntimeWithResponse(
 		ctx, ws.Id,
@@ -17890,8 +18504,10 @@ func TestWorkspaceRuntimeLaunchSingletonAndStopE2E(t *testing.T) {
 	require.Equal(http.StatusOK, listResp.StatusCode())
 	require.NotNil(listResp.JSON200)
 	require.NotNil(listResp.JSON200.Sessions)
-	require.Len(*listResp.JSON200.Sessions, 1)
+	require.Len(*listResp.JSON200.Sessions, 2)
 	assert.Equal(first.Key, (*listResp.JSON200.Sessions)[0].Key)
+	assert.Equal("Helper", (*listResp.JSON200.Sessions)[0].Label)
+	assert.Equal("Review helper", (*listResp.JSON200.Sessions)[1].Label)
 
 	stopResp, err := client.HTTP.StopWorkspaceRuntimeSessionWithResponse(
 		ctx, ws.Id, first.Key,
@@ -17906,7 +18522,8 @@ func TestWorkspaceRuntimeLaunchSingletonAndStopE2E(t *testing.T) {
 	require.Equal(http.StatusOK, afterStopResp.StatusCode())
 	require.NotNil(afterStopResp.JSON200)
 	require.NotNil(afterStopResp.JSON200.Sessions)
-	assert.Empty(*afterStopResp.JSON200.Sessions)
+	require.Len(*afterStopResp.JSON200.Sessions, 1)
+	assert.Equal(second.Key, (*afterStopResp.JSON200.Sessions)[0].Key)
 }
 
 func TestWorkspaceRuntimeNaturalAgentExitRemovesSessionE2E(t *testing.T) {
@@ -17920,7 +18537,7 @@ func TestWorkspaceRuntimeNaturalAgentExitRemovesSessionE2E(t *testing.T) {
 		Label:   "Helper",
 		Command: serverRuntimeHelperCommand("exit"),
 	}}, Tmux: config.Tmux{AgentSessions: &disableTmuxAgentSessions}}
-	client, _, _, _, _ := setupTestServerWithWorkspacesServer(t, cfg)
+	client, database, _, _, _ := setupTestServerWithWorkspacesServer(t, cfg)
 	ctx := context.Background()
 	ws := createReadyWorkspace(t, ctx, client)
 
@@ -17931,7 +18548,7 @@ func TestWorkspaceRuntimeNaturalAgentExitRemovesSessionE2E(t *testing.T) {
 		},
 	)
 	require.NoError(err)
-	require.Equal(http.StatusOK, launchResp.StatusCode())
+	require.Equal(http.StatusOK, launchResp.StatusCode(), string(launchResp.Body))
 	require.NotNil(launchResp.JSON200)
 
 	require.Eventually(func() bool {
@@ -17946,7 +18563,53 @@ func TestWorkspaceRuntimeNaturalAgentExitRemovesSessionE2E(t *testing.T) {
 		}
 		return len(*runtimeResp.JSON200.Sessions) == 0
 	}, 2*time.Second, 20*time.Millisecond)
+	stored, err := database.ListWorkspaceRuntimeSessions(ctx, ws.Id)
+	require.NoError(err)
+	assert.Empty(stored)
 	assert.NotEmpty(launchResp.JSON200.Key)
+}
+
+func TestWorkspaceRuntimePtyOwnerQuickExitLaunchSucceedsE2E(t *testing.T) {
+	runParallelPTYE2E(t)
+
+	require := require.New(t)
+	assert := Assert.New(t)
+	disableTmuxAgentSessions := false
+	cfg := &config.Config{Agents: []config.Agent{{
+		Key:     "helper",
+		Label:   "Helper",
+		Command: serverRuntimeHelperCommand("print-exit"),
+	}}, Tmux: config.Tmux{AgentSessions: &disableTmuxAgentSessions}}
+	client, database, _, _, _ := setupTestServerWithWorkspacesServer(t, cfg)
+	ctx := context.Background()
+	ws := createReadyWorkspace(t, ctx, client)
+
+	launchResp, err := client.HTTP.LaunchWorkspaceRuntimeSessionWithResponse(
+		ctx, ws.Id,
+		generated.LaunchWorkspaceRuntimeSessionInputBody{
+			TargetKey: "helper",
+		},
+	)
+	require.NoError(err)
+	require.Equal(http.StatusOK, launchResp.StatusCode(), string(launchResp.Body))
+	require.NotNil(launchResp.JSON200)
+	assert.NotEmpty(launchResp.JSON200.Key)
+
+	require.Eventually(func() bool {
+		runtimeResp, runtimeErr := client.HTTP.GetWorkspaceRuntimeWithResponse(
+			ctx, ws.Id,
+		)
+		if runtimeErr != nil ||
+			runtimeResp.StatusCode() != http.StatusOK ||
+			runtimeResp.JSON200 == nil ||
+			runtimeResp.JSON200.Sessions == nil {
+			return false
+		}
+		return len(*runtimeResp.JSON200.Sessions) == 0
+	}, 2*time.Second, 20*time.Millisecond)
+	stored, err := database.ListWorkspaceRuntimeSessions(ctx, ws.Id)
+	require.NoError(err)
+	assert.Empty(stored)
 }
 
 func TestWorkspaceRuntimeNaturalTmuxAgentExitForgetsStoredSessionE2E(
@@ -18008,13 +18671,13 @@ exit 0
 	}, 2*time.Second, 20*time.Millisecond)
 
 	require.Eventually(func() bool {
-		stored, storedErr := database.ListWorkspaceTmuxSessions(ctx, ws.Id)
+		stored, storedErr := database.ListWorkspaceRuntimeTmuxSessions(ctx, ws.Id)
 		return storedErr == nil && len(stored) == 0
 	}, 2*time.Second, 20*time.Millisecond)
 	assert.NotEmpty(launchResp.JSON200.Key)
 }
 
-func TestWorkspaceRuntimeIncludesStoredTmuxSessionsAfterReloadE2E(t *testing.T) {
+func TestWorkspaceRuntimeIncludesStoredRuntimeSessionsAfterReloadE2E(t *testing.T) {
 	requirePTYAvailable(t)
 	require := require.New(t)
 	assert := Assert.New(t)
@@ -18031,6 +18694,10 @@ case "$1" in
     sleep 30
     exit 0
     ;;
+  show-options)
+    printf '%s\n' "$MIDDLEMAN_TMUX_OWNER"
+    exit 0
+    ;;
   kill-session)
     exit 0
     ;;
@@ -18041,6 +18708,8 @@ exit 0
 	database := dbtest.Open(t)
 	seedPR(t, database, "acme", "widget", 1)
 	worktreeDir := filepath.Join(dir, "worktrees")
+	ownerMarker := workspace.NewManager(database, worktreeDir).TmuxOwnerMarker()
+	t.Setenv("MIDDLEMAN_TMUX_OWNER", ownerMarker)
 	cfg := &config.Config{Agents: []config.Agent{{
 		Key:     "helper",
 		Label:   "Helper",
@@ -18062,13 +18731,20 @@ exit 0
 	}
 	require.NoError(database.InsertWorkspace(ctx, ws))
 	tmuxSession := runtimeTmuxSessionNameForTest(ws.ID, "helper")
+	sessionKey := ws.ID + "_restoredhelper01"
 	t.Setenv("RESTORED_TMUX_SESSION", tmuxSession)
-	require.NoError(database.UpsertWorkspaceTmuxSession(
+	createdAt := time.Now().UTC().Add(-time.Minute)
+	require.NoError(database.UpsertWorkspaceRuntimeSession(
 		ctx,
-		&db.WorkspaceTmuxSession{
+		&db.WorkspaceRuntimeSession{
 			WorkspaceID: ws.ID,
-			SessionName: tmuxSession,
+			SessionKey:  sessionKey,
 			TargetKey:   "helper",
+			Label:       "Helper",
+			Kind:        string(localruntime.LaunchTargetAgent),
+			Scope:       "session",
+			TmuxSession: tmuxSession,
+			CreatedAt:   createdAt,
 		},
 	))
 	srv := New(database, nil, nil, "/", cfg, ServerOptions{
@@ -18087,8 +18763,7 @@ exit 0
 	require.Len(*resp.JSON200.Sessions, 1)
 
 	session := (*resp.JSON200.Sessions)[0]
-	assert.NotEmpty(session.Key)
-	assert.NotContains(session.Key, ":")
+	assert.Equal(sessionKey, session.Key)
 	assert.Equal(ws.ID, session.WorkspaceId)
 	assert.Equal("helper", session.TargetKey)
 	assert.Equal("Helper", session.Label)
@@ -18106,9 +18781,9 @@ func TestWorkspaceRuntimeLaunchAgentCreatesProbeableTmuxSessionE2E(t *testing.T)
 	tmuxPath := filepath.Join(dir, "fake-tmux")
 	agentPath := filepath.Join(dir, "helper-agent")
 	require.NoError(os.WriteFile(agentPath, []byte("#!/bin/sh\nexit 0\n"), 0o755))
-	require.NoError(os.WriteFile(tmuxPath, []byte(`#!/bin/sh
-printf '%s\0' "$#" "$@" >> "$TMUX_RECORD"
-session_file="${TMUX_RECORD}.sessions"
+	require.NoError(os.WriteFile(tmuxPath, fmt.Appendf(nil, `#!/bin/sh
+printf '%%s\0' "$#" "$@" >> %s
+session_file=%s.sessions
 target=""
 mode=""
 new_session=""
@@ -18136,6 +18811,7 @@ if [ "$mode" = "capture-pane" ]; then
   exit 0
 fi
 if [ "$1" = "has-session" ]; then
+  echo "can't find session: $3" >&2
   exit 1
 fi
 if [ "$1" = "attach-session" ]; then
@@ -18143,11 +18819,10 @@ if [ "$1" = "attach-session" ]; then
   exit 0
 fi
 if [ -n "$new_session" ]; then
-  printf '%s\n' "$new_session" >> "$session_file"
+  printf '%%s\n' "$new_session" >> "$session_file"
 fi
 exit 0
-`), 0o755))
-	t.Setenv("TMUX_RECORD", record)
+`, shellquote.Join(record), shellquote.Join(record)), 0o755))
 	cfg := &config.Config{
 		Agents: []config.Agent{{
 			Key:     "helper",
@@ -18185,11 +18860,15 @@ exit 0
 
 	session, ok := argAfter(newSession, "-s")
 	require.True(ok, "new-session should name a tmux session")
-	assert.Equal(runtimeTmuxSessionNameForTest(ws.Id, "helper"), session)
+	assert.True(isRuntimeTmuxSessionNameForWorkspace(ws.Id, session))
 	assert.Contains(newSession, "-d")
 	assert.Contains(newSession, "-c")
 	assert.Contains(strings.Join(newSession, "\n"), agentPath)
 	assert.Contains(strings.Join(newSession, "\n"), "--flag")
+	assert.Contains(newSession, ";")
+	assert.Contains(newSession, "set-option")
+	assert.Contains(newSession, "-t")
+	assert.Contains(newSession, session)
 	assert.Contains(newSession, "@middleman_owner")
 	assert.Contains(newSession, srv.workspaces.TmuxOwnerMarker())
 
@@ -18214,10 +18893,10 @@ exit 0
 	assert.Contains(readTmuxRecord(t, record), []string{
 		"display-message", "-p", "-t", session, "#{pane_title}",
 	})
-	stored, err := database.ListWorkspaceTmuxSessions(ctx, ws.Id)
+	stored, err := database.ListWorkspaceRuntimeTmuxSessions(ctx, ws.Id)
 	require.NoError(err)
 	require.Len(stored, 1)
-	assert.Equal(session, stored[0].SessionName)
+	assert.Equal(session, stored[0].TmuxSession)
 	assert.Equal("helper", stored[0].TargetKey)
 }
 
@@ -18231,8 +18910,8 @@ func TestServerStartupReapsUnrecordedRuntimeTmuxSessionE2E(t *testing.T) {
 	dir := t.TempDir()
 	record := filepath.Join(dir, "record")
 	tmuxPath := filepath.Join(dir, "fake-tmux")
-	require.NoError(os.WriteFile(tmuxPath, []byte(`#!/bin/sh
-printf '%s\0' "$#" "$@" >> "$TMUX_RECORD"
+	require.NoError(os.WriteFile(tmuxPath, fmt.Appendf(nil, `#!/bin/sh
+printf '%%s\0' "$#" "$@" >> %s
 target=""
 prev=""
 for a in "$@"; do
@@ -18241,11 +18920,8 @@ for a in "$@"; do
 done
 case "$1" in
   list-sessions)
-    printf 'middleman-0000000000000001\nmiddleman-0000000000000001-0123456789abcdef\n'
-    exit 0
-    ;;
-  show-options)
-    printf '%s\n' "$MIDDLEMAN_TMUX_OWNER"
+    printf 'middleman-0000000000000001\t%%s\n' "$MIDDLEMAN_TMUX_OWNER"
+    printf 'middleman-0000000000000001-0123456789abcdef\t%%s\n' "$MIDDLEMAN_TMUX_OWNER"
     exit 0
     ;;
   kill-session)
@@ -18253,8 +18929,7 @@ case "$1" in
     ;;
 esac
 exit 0
-`), 0o755))
-	t.Setenv("TMUX_RECORD", record)
+`, shellquote.Join(record)), 0o755))
 
 	database := dbtest.Open(t)
 	seedPR(t, database, "acme", "widget", 1)
@@ -18324,6 +18999,10 @@ case "$1" in
     printf '%s\n' 'middleman-0000000000000001-e81d3b0e9d82feaa'
     exit 0
     ;;
+  show-options)
+    printf '%s\n' "$MIDDLEMAN_TMUX_OWNER"
+    exit 0
+    ;;
   attach-session)
     cat >/dev/null
     exit 0
@@ -18348,6 +19027,8 @@ exit 0
 	seedPR(t, database, "acme", "widget", 1)
 
 	worktreeDir := filepath.Join(dir, "worktrees")
+	ownerMarker := workspace.NewManager(database, worktreeDir).TmuxOwnerMarker()
+	t.Setenv("MIDDLEMAN_TMUX_OWNER", ownerMarker)
 	ws := &workspace.Workspace{
 		ID:              "0000000000000001",
 		PlatformHost:    "github.com",
@@ -18361,17 +19042,10 @@ exit 0
 		Status:          "ready",
 	}
 	require.NoError(database.InsertWorkspace(t.Context(), ws))
-	require.NoError(database.UpsertWorkspaceTmuxSession(
-		t.Context(),
-		&db.WorkspaceTmuxSession{
-			WorkspaceID: ws.ID,
-			SessionName: runtimeTmuxSessionNameForTest(
-				"0000000000000001", "helper",
-			),
-			TargetKey: "helper",
-		},
-	))
 	sessionName := runtimeTmuxSessionNameForTest("0000000000000001", "helper")
+	recordRuntimeTmuxSessionForServerTest(
+		t, database, ws.ID, "", "helper", sessionName, time.Time{},
+	)
 
 	cfg := &config.Config{Tmux: config.Tmux{Command: []string{tmuxPath}}}
 	srv := New(database, nil, nil, "/", cfg, ServerOptions{
@@ -18393,7 +19067,7 @@ exit 0
 	})
 }
 
-func TestWorkspaceRuntimeLaunchTmuxOwnerMarkerFailureCleansSessionE2E(
+func TestWorkspaceRuntimeLaunchTmuxOwnerMarkerFailureRejectsSessionE2E(
 	t *testing.T,
 ) {
 	require := require.New(t)
@@ -18403,8 +19077,8 @@ func TestWorkspaceRuntimeLaunchTmuxOwnerMarkerFailureCleansSessionE2E(
 	tmuxPath := filepath.Join(dir, "fake-tmux")
 	agentPath := filepath.Join(dir, "helper-agent")
 	require.NoError(os.WriteFile(agentPath, []byte("#!/bin/sh\nexit 0\n"), 0o755))
-	require.NoError(os.WriteFile(tmuxPath, []byte(`#!/bin/sh
-printf '%s\0' "$#" "$@" >> "$TMUX_RECORD"
+	require.NoError(os.WriteFile(tmuxPath, fmt.Appendf(nil, `#!/bin/sh
+printf '%%s\0' "$#" "$@" >> %s
 target=""
 prev=""
 for a in "$@"; do
@@ -18439,8 +19113,7 @@ case "$1" in
     ;;
 esac
 exit 0
-`), 0o755))
-	t.Setenv("TMUX_RECORD", record)
+`, shellquote.Join(record)), 0o755))
 	cfg := &config.Config{
 		Agents: []config.Agent{{
 			Key:     "helper",
@@ -18449,7 +19122,7 @@ exit 0
 		}},
 		Tmux: config.Tmux{Command: []string{tmuxPath}},
 	}
-	client, database, _, _, srv := setupTestServerWithWorkspacesServer(t, cfg)
+	client, database, _, _, _ := setupTestServerWithWorkspacesServer(t, cfg)
 	ctx := context.Background()
 	ws := createReadyWorkspace(t, ctx, client)
 
@@ -18460,14 +19133,17 @@ exit 0
 		},
 	)
 	require.NoError(err)
-	require.Equal(http.StatusOK, launchResp.StatusCode())
-	require.NotNil(launchResp.JSON200)
-	sessionName := runtimeTmuxSessionNameForTest(ws.Id, "helper")
+	require.Equal(http.StatusInternalServerError, launchResp.StatusCode())
 
+	var sessionName string
 	require.Eventually(func() bool {
-		return tmuxRecordContains(readTmuxRecord(t, record), []string{
-			"kill-session", "-t", sessionName,
-		})
+		name, ok := findRuntimeTmuxNewSessionName(
+			readTmuxRecord(t, record), ws.Id, agentPath,
+		)
+		if ok {
+			sessionName = name
+		}
+		return sessionName != ""
 	}, 2*time.Second, 20*time.Millisecond)
 	var runtimeNewSession []string
 	for _, argv := range readTmuxRecord(t, record) {
@@ -18480,7 +19156,17 @@ exit 0
 	}
 	require.NotNil(runtimeNewSession)
 	assert.Contains(runtimeNewSession, "@middleman_owner")
-	assert.Contains(runtimeNewSession, srv.workspaces.TmuxOwnerMarker())
+	assert.False(slices.ContainsFunc(
+		readTmuxRecord(t, record),
+		func(argv []string) bool {
+			return len(argv) > 0 &&
+				argv[0] == "set-option" &&
+				slices.Contains(argv, sessionName)
+		},
+	))
+	assert.NotContains(readTmuxRecord(t, record), []string{
+		"kill-session", "-t", sessionName,
+	})
 
 	require.Eventually(func() bool {
 		runtimeResp, err := client.HTTP.GetWorkspaceRuntimeWithResponse(ctx, ws.Id)
@@ -18494,26 +19180,54 @@ exit 0
 	}, 2*time.Second, 20*time.Millisecond)
 
 	require.Eventually(func() bool {
-		stored, err := database.ListWorkspaceTmuxSessions(ctx, ws.Id)
+		stored, err := database.ListWorkspaceRuntimeTmuxSessions(ctx, ws.Id)
 		return err == nil && len(stored) == 0
 	}, 2*time.Second, 20*time.Millisecond)
-
-	stopResp, err := client.HTTP.StopWorkspaceRuntimeSessionWithResponse(
-		ctx, ws.Id, launchResp.JSON200.Key,
-	)
-	require.NoError(err)
-	require.Equal(http.StatusNotFound, stopResp.StatusCode())
-}
-
-func tmuxRecordContains(argvs [][]string, want []string) bool {
-	return slices.ContainsFunc(argvs, func(argv []string) bool {
-		return slices.Equal(argv, want)
-	})
 }
 
 func runtimeTmuxSessionNameForTest(workspaceID string, targetKey string) string {
 	sum := sha256.Sum256([]byte(targetKey))
 	return "middleman-" + workspaceID + "-" + hex.EncodeToString(sum[:8])
+}
+
+func isRuntimeTmuxSessionNameForWorkspace(
+	workspaceID string,
+	sessionName string,
+) bool {
+	suffix := strings.TrimPrefix(sessionName, "middleman-"+workspaceID+"-")
+	return suffix != sessionName &&
+		len(suffix) == 16 &&
+		strings.IndexFunc(suffix, func(r rune) bool {
+			return !strings.ContainsRune("0123456789abcdef", r)
+		}) == -1
+}
+
+func findRuntimeTmuxNewSessionName(
+	argvs [][]string,
+	workspaceID string,
+	commandPath string,
+) (string, bool) {
+	for _, argv := range argvs {
+		if len(argv) == 0 ||
+			argv[0] != "new-session" ||
+			!strings.Contains(strings.Join(argv, "\n"), commandPath) {
+			continue
+		}
+		name, ok := argAfter(argv, "-s")
+		if ok && isRuntimeTmuxSessionNameForWorkspace(workspaceID, name) {
+			return name, true
+		}
+	}
+	return "", false
+}
+
+func isRuntimeSessionKeyForWorkspace(workspaceID string, key string) bool {
+	suffix := strings.TrimPrefix(key, workspaceID+"_")
+	return suffix != key &&
+		len(suffix) == 16 &&
+		strings.IndexFunc(suffix, func(r rune) bool {
+			return !strings.ContainsRune("0123456789abcdef", r)
+		}) == -1
 }
 
 func TestWorkspaceRuntimeTmuxSessionsHashUnsafeTargetKeysE2E(
@@ -18523,26 +19237,9 @@ func TestWorkspaceRuntimeTmuxSessionsHashUnsafeTargetKeysE2E(
 	assert := Assert.New(t)
 	dir := t.TempDir()
 	record := filepath.Join(dir, "record")
-	tmuxPath := filepath.Join(dir, "fake-tmux")
+	tmuxPath := writeRuntimeTmuxLifecycleRecorder(t, dir, record)
 	agentPath := filepath.Join(dir, "helper-agent")
 	require.NoError(os.WriteFile(agentPath, []byte("#!/bin/sh\nexit 0\n"), 0o755))
-	require.NoError(os.WriteFile(tmuxPath, []byte(`#!/bin/sh
-printf '%s\0' "$#" "$@" >> "$TMUX_RECORD"
-case "$1" in
-  has-session)
-    exit 1
-    ;;
-  attach-session)
-    cat >/dev/null
-    exit 0
-    ;;
-  new-session|set-option|kill-session)
-    exit 0
-    ;;
-esac
-exit 0
-`), 0o755))
-	t.Setenv("TMUX_RECORD", record)
 	cfg := &config.Config{
 		Agents: []config.Agent{
 			{Key: "foo/bar", Label: "Foo Slash", Command: []string{agentPath}},
@@ -18568,19 +19265,20 @@ exit 0
 		launched = append(launched, *resp.JSON200)
 	}
 
-	stored, err := database.ListWorkspaceTmuxSessions(ctx, ws.Id)
+	stored, err := database.ListWorkspaceRuntimeTmuxSessions(ctx, ws.Id)
 	require.NoError(err)
 	require.Len(stored, 2)
 	sessionsByTarget := map[string]string{}
 	for _, session := range stored {
-		sessionsByTarget[session.TargetKey] = session.SessionName
+		sessionsByTarget[session.TargetKey] = session.TmuxSession
 	}
-	slashSession := runtimeTmuxSessionNameForTest(ws.Id, "foo/bar")
-	colonSession := runtimeTmuxSessionNameForTest(ws.Id, "foo:bar")
-	assert.Equal(slashSession, sessionsByTarget["foo/bar"])
-	assert.Equal(colonSession, sessionsByTarget["foo:bar"])
+	slashSession := sessionsByTarget["foo/bar"]
+	colonSession := sessionsByTarget["foo:bar"]
+	require.NotEmpty(slashSession)
+	require.NotEmpty(colonSession)
 	assert.NotEqual(slashSession, colonSession)
 	for _, sessionName := range []string{slashSession, colonSession} {
+		assert.True(isRuntimeTmuxSessionNameForWorkspace(ws.Id, sessionName))
 		assert.NotContains(sessionName, "foo")
 		assert.NotContains(sessionName, "/")
 		assert.NotContains(sessionName, ":")
@@ -18593,7 +19291,7 @@ exit 0
 		require.NoError(err)
 		require.Equal(http.StatusNoContent, stopResp.StatusCode())
 	}
-	stored, err = database.ListWorkspaceTmuxSessions(ctx, ws.Id)
+	stored, err = database.ListWorkspaceRuntimeTmuxSessions(ctx, ws.Id)
 	require.NoError(err)
 	assert.Empty(stored)
 	assert.Contains(readTmuxRecord(t, record), []string{
@@ -18604,37 +19302,20 @@ exit 0
 	})
 }
 
-func TestWorkspaceRuntimeStopClearsStoredShellKeyTmuxSessionAfterRuntimeForgetE2E(
+func TestWorkspaceRuntimeStopClearsStoredWrappedAgentSessionAfterRuntimeForgetE2E(
 	t *testing.T,
 ) {
 	require := require.New(t)
 	assert := Assert.New(t)
 	dir := t.TempDir()
 	record := filepath.Join(dir, "record")
-	tmuxPath := filepath.Join(dir, "fake-tmux")
+	tmuxPath := writeRuntimeTmuxLifecycleRecorder(t, dir, record)
 	agentPath := filepath.Join(dir, "helper-agent")
 	require.NoError(os.WriteFile(agentPath, []byte("#!/bin/sh\nexit 0\n"), 0o755))
-	require.NoError(os.WriteFile(tmuxPath, []byte(`#!/bin/sh
-printf '%s\0' "$#" "$@" >> "$TMUX_RECORD"
-case "$1" in
-  has-session)
-    exit 1
-    ;;
-  attach-session)
-    cat >/dev/null
-    exit 0
-    ;;
-  new-session|set-option|kill-session)
-    exit 0
-    ;;
-esac
-exit 0
-`), 0o755))
-	t.Setenv("TMUX_RECORD", record)
 	cfg := &config.Config{
 		Agents: []config.Agent{{
-			Key:     "shell",
-			Label:   "Shell Agent",
+			Key:     "helper",
+			Label:   "Helper",
 			Command: []string{agentPath},
 		}},
 		Tmux: config.Tmux{Command: []string{tmuxPath}},
@@ -18646,21 +19327,21 @@ exit 0
 	launchResp, err := client.HTTP.LaunchWorkspaceRuntimeSessionWithResponse(
 		ctx, ws.Id,
 		generated.LaunchWorkspaceRuntimeSessionInputBody{
-			TargetKey: "shell",
+			TargetKey: "helper",
 		},
 	)
 	require.NoError(err)
 	require.Equal(http.StatusOK, launchResp.StatusCode())
 	require.NotNil(launchResp.JSON200)
-	sessionName := runtimeTmuxSessionNameForTest(ws.Id, "shell")
 
-	stored, err := database.ListWorkspaceTmuxSessions(ctx, ws.Id)
+	stored, err := database.ListWorkspaceRuntimeTmuxSessions(ctx, ws.Id)
 	require.NoError(err)
 	require.Len(stored, 1)
-	assert.Equal(sessionName, stored[0].SessionName)
+	sessionName := stored[0].TmuxSession
+	assert.True(isRuntimeTmuxSessionNameForWorkspace(ws.Id, sessionName))
 
 	require.NoError(srv.runtime.Stop(ctx, ws.Id, launchResp.JSON200.Key))
-	stored, err = database.ListWorkspaceTmuxSessions(ctx, ws.Id)
+	stored, err = database.ListWorkspaceRuntimeTmuxSessions(ctx, ws.Id)
 	require.NoError(err)
 	require.Len(stored, 1)
 
@@ -18669,7 +19350,7 @@ exit 0
 	)
 	require.NoError(err)
 	require.Equal(http.StatusNoContent, stopResp.StatusCode())
-	stored, err = database.ListWorkspaceTmuxSessions(ctx, ws.Id)
+	stored, err = database.ListWorkspaceRuntimeTmuxSessions(ctx, ws.Id)
 	require.NoError(err)
 	assert.Empty(stored)
 	assert.Contains(readTmuxRecord(t, record), []string{
@@ -18677,7 +19358,7 @@ exit 0
 	})
 }
 
-func TestWorkspaceRuntimeStopTmuxCleanupFailureCleansExitedSessionE2E(
+func TestWorkspaceRuntimeStopTmuxCleanupFailureRetainsStoredSessionE2E(
 	t *testing.T,
 ) {
 	require := require.New(t)
@@ -18697,6 +19378,13 @@ if [ "$1" = "attach-session" ]; then
   cat >/dev/null
   exit 0
 fi
+if [ "$1" = "has-session" ]; then
+  echo "can't find session: $target" >&2
+  exit 1
+fi
+if [ "$1" = "show-option" ]; then
+  exit 0
+fi
 if [ "$1" = "kill-session" ]; then
   case "$target" in
     middleman-????????????????-*)
@@ -18704,6 +19392,9 @@ if [ "$1" = "kill-session" ]; then
       exit 42
       ;;
   esac
+fi
+if [ "$1" = "new-session" ] || [ "$1" = "set-option" ]; then
+  exit 0
 fi
 exit 0
 `), 0o755))
@@ -18719,7 +19410,7 @@ exit 0
 	ctx := context.Background()
 	ws := createReadyWorkspace(t, ctx, client)
 	t.Cleanup(func() {
-		_ = database.DeleteWorkspaceTmuxSessions(context.Background(), ws.Id)
+		_ = database.DeleteWorkspaceRuntimeSessions(context.Background(), ws.Id)
 	})
 
 	launchResp, err := client.HTTP.LaunchWorkspaceRuntimeSessionWithResponse(
@@ -18748,15 +19439,19 @@ exit 0
 			getResp.JSON200.Sessions == nil {
 			return false
 		}
-		return len(*getResp.JSON200.Sessions) == 0
+		if len(*getResp.JSON200.Sessions) != 1 {
+			return false
+		}
+		session := (*getResp.JSON200.Sessions)[0]
+		return session.Key == launchResp.JSON200.Key &&
+			session.Status == string(localruntime.SessionStatusError)
 	}, 2*time.Second, 20*time.Millisecond)
 
-	stored, err := database.ListWorkspaceTmuxSessions(ctx, ws.Id)
+	stored, err := database.ListWorkspaceRuntimeTmuxSessions(ctx, ws.Id)
 	require.NoError(err)
 	require.Len(stored, 1)
-	assert.Equal(
-		runtimeTmuxSessionNameForTest(ws.Id, "helper"),
-		stored[0].SessionName,
+	assert.True(
+		isRuntimeTmuxSessionNameForWorkspace(ws.Id, stored[0].TmuxSession),
 	)
 }
 
@@ -18807,22 +19502,12 @@ exit 0
 			ws.TmuxSession + "-claude",
 		}, "\n"),
 	)
-	require.NoError(database.UpsertWorkspaceTmuxSession(
-		ctx,
-		&db.WorkspaceTmuxSession{
-			WorkspaceID: ws.Id,
-			SessionName: ws.TmuxSession + "-codex",
-			TargetKey:   "codex",
-		},
-	))
-	require.NoError(database.UpsertWorkspaceTmuxSession(
-		ctx,
-		&db.WorkspaceTmuxSession{
-			WorkspaceID: ws.Id,
-			SessionName: ws.TmuxSession + "-claude",
-			TargetKey:   "claude",
-		},
-	))
+	recordRuntimeTmuxSessionForServerTest(
+		t, database, ws.Id, "", "codex", ws.TmuxSession+"-codex", time.Time{},
+	)
+	recordRuntimeTmuxSessionForServerTest(
+		t, database, ws.Id, "", "claude", ws.TmuxSession+"-claude", time.Time{},
+	)
 
 	listResp, err := client.HTTP.ListWorkspacesWithResponse(ctx)
 	require.NoError(err)
@@ -18869,14 +19554,9 @@ func TestWorkspaceDeleteStopsRuntimeSessionsE2E(t *testing.T) {
 	require.Equal(http.StatusOK, launchResp.StatusCode())
 	require.NotNil(launchResp.JSON200)
 
-	shellResp, err := client.HTTP.EnsureWorkspaceRuntimeShellWithResponse(
-		ctx, ws.Id,
-	)
-	require.NoError(err)
-	require.Equal(http.StatusOK, shellResp.StatusCode())
+	_ = launchPlainShellRuntimeSession(t, ctx, client, ws.Id)
 
-	require.Len(srv.runtime.ListSessions(ws.Id), 1)
-	require.NotNil(srv.runtime.ShellSession(ws.Id))
+	require.Len(srv.runtime.ListSessions(ws.Id), 2)
 
 	force := true
 	delResp, err := client.HTTP.DeleteWorkspaceWithResponse(
@@ -18887,7 +19567,6 @@ func TestWorkspaceDeleteStopsRuntimeSessionsE2E(t *testing.T) {
 	require.Equal(http.StatusNoContent, delResp.StatusCode())
 
 	assert.Empty(srv.runtime.ListSessions(ws.Id))
-	assert.Nil(srv.runtime.ShellSession(ws.Id))
 }
 
 // TestWorkspaceDeleteDirtyKeepsRuntimeSessionsE2E covers the case where the
@@ -18917,13 +19596,8 @@ func TestWorkspaceDeleteDirtyKeepsRuntimeSessionsE2E(t *testing.T) {
 	)
 	require.NoError(err)
 	require.Equal(http.StatusOK, launchResp.StatusCode())
-	shellResp, err := client.HTTP.EnsureWorkspaceRuntimeShellWithResponse(
-		ctx, ws.Id,
-	)
-	require.NoError(err)
-	require.Equal(http.StatusOK, shellResp.StatusCode())
-	require.Len(srv.runtime.ListSessions(ws.Id), 1)
-	require.NotNil(srv.runtime.ShellSession(ws.Id))
+	_ = launchPlainShellRuntimeSession(t, ctx, client, ws.Id)
+	require.Len(srv.runtime.ListSessions(ws.Id), 2)
 
 	// Make the worktree dirty so a non-forced delete will be rejected.
 	require.NoError(os.WriteFile(
@@ -18938,8 +19612,7 @@ func TestWorkspaceDeleteDirtyKeepsRuntimeSessionsE2E(t *testing.T) {
 	require.Equal(http.StatusConflict, delResp.StatusCode())
 
 	// The 409 must not have killed the runtime sessions.
-	assert.Len(srv.runtime.ListSessions(ws.Id), 1)
-	assert.NotNil(srv.runtime.ShellSession(ws.Id))
+	assert.Len(srv.runtime.ListSessions(ws.Id), 2)
 
 	stopResp, err := client.HTTP.StopWorkspaceRuntimeSessionWithResponse(
 		ctx, ws.Id, launchResp.JSON200.Key,
@@ -18953,7 +19626,7 @@ func TestWorkspaceDeleteDirtyKeepsRuntimeSessionsE2E(t *testing.T) {
 	)
 	require.NoError(err)
 	require.Equal(http.StatusOK, launchAfterRejectResp.StatusCode())
-	assert.Len(srv.runtime.ListSessions(ws.Id), 1)
+	assert.Len(srv.runtime.ListSessions(ws.Id), 2)
 }
 
 // TestWorkspaceListReportsCommitsAheadBehindE2E verifies that the
@@ -19805,14 +20478,10 @@ func TestWorkspaceListPrunesMissingTmuxSessionsE2E(t *testing.T) {
 	runtimeSession := runtimeTmuxSessionNameForTest(
 		"0000000000000002", "helper",
 	)
-	require.NoError(database.UpsertWorkspaceTmuxSession(
-		ctx,
-		&db.WorkspaceTmuxSession{
-			WorkspaceID: "0000000000000002",
-			SessionName: runtimeSession,
-			TargetKey:   "helper",
-		},
-	))
+	recordRuntimeTmuxSessionForServerTest(
+		t, database, "0000000000000002", "", "helper", runtimeSession,
+		time.Time{},
+	)
 
 	listResp, err := client.HTTP.ListWorkspacesWithResponse(ctx)
 	require.NoError(err)
@@ -19830,55 +20499,273 @@ func TestWorkspaceListPrunesMissingTmuxSessionsE2E(t *testing.T) {
 	require.NoError(err)
 	require.NotNil(stored)
 	assert.Equal("error", stored.Status)
-	runtimeRows, err := database.ListWorkspaceTmuxSessions(
+	runtimeRows, err := database.ListWorkspaceRuntimeTmuxSessions(
 		ctx, "0000000000000002",
 	)
 	require.NoError(err)
 	require.Len(runtimeRows, 1)
-	assert.Equal(runtimeSession, runtimeRows[0].SessionName)
+	assert.Equal(runtimeSession, runtimeRows[0].TmuxSession)
 }
 
-func TestWorkspaceRuntimeEnsureShellE2E(t *testing.T) {
+func TestWorkspaceRuntimePlainShellRecordsTmuxSessionE2E(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake tmux fixture uses Unix shell semantics")
+	}
 	require := require.New(t)
 	assert := Assert.New(t)
 
-	client, _, _, _, _ := setupTestServerWithWorkspacesServer(t, nil)
+	tmuxPath := writeFakeWorkspaceRuntimeTmux(t)
+	cfg := &config.Config{
+		Tmux: config.Tmux{Command: []string{tmuxPath}},
+		Shell: config.Shell{
+			Command: serverRuntimeHelperCommand("sleep"),
+		},
+	}
+	client, database, _, _, _ := setupTestServerWithWorkspacesServer(t, cfg)
 	ctx := context.Background()
 	ws := createReadyWorkspace(t, ctx, client)
 
-	shellResp, err := client.HTTP.EnsureWorkspaceRuntimeShellWithResponse(
+	shell := launchPlainShellRuntimeSession(t, ctx, client, ws.Id)
+	assert.Equal("plain_shell", shell.TargetKey)
+
+	stored, err := database.ListWorkspaceRuntimeTmuxSessions(ctx, ws.Id)
+	require.NoError(err)
+	require.Len(stored, 1)
+	assert.Equal(string(localruntime.LaunchTargetPlainShell), stored[0].TargetKey)
+	assert.NotEmpty(stored[0].TmuxSession)
+
+	stopResp, err := client.HTTP.StopWorkspaceRuntimeSessionWithResponse(
+		ctx, ws.Id, shell.Key,
+	)
+	require.NoError(err)
+	require.Equal(http.StatusNoContent, stopResp.StatusCode())
+	stored, err = database.ListWorkspaceRuntimeTmuxSessions(ctx, ws.Id)
+	require.NoError(err)
+	assert.Empty(stored)
+}
+
+func TestWorkspaceRuntimePlainShellRecordFailureCleansCreatedTmuxShellE2E(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake tmux fixture uses Unix shell semantics")
+	}
+	require := require.New(t)
+
+	tmuxPath := writeFakeWorkspaceRuntimeTmux(t)
+	cfg := &config.Config{
+		Tmux: config.Tmux{Command: []string{tmuxPath}},
+		Shell: config.Shell{
+			Command: serverRuntimeHelperCommand("sleep"),
+		},
+	}
+	fixture := setupWorkspaceServerFixture(t, cfg)
+	ctx := context.Background()
+	ws := createReadyWorkspace(t, ctx, fixture.client)
+	stateDir := os.Getenv("MIDDLEMAN_FAKE_TMUX_STATE")
+	initialStateEntries, err := os.ReadDir(stateDir)
+	require.NoError(err)
+	initialState := make(map[string]bool, len(initialStateEntries))
+	for _, entry := range initialStateEntries {
+		initialState[entry.Name()] = true
+	}
+
+	tx, err := fixture.database.WriteDB().BeginTx(ctx, &sql.TxOptions{})
+	require.NoError(err)
+	defer func() { _ = tx.Rollback() }()
+	recordCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	failedResp, err := fixture.client.HTTP.LaunchWorkspaceRuntimeSessionWithResponse(
+		recordCtx, ws.Id,
+		generated.LaunchWorkspaceRuntimeSessionInputBody{
+			TargetKey: string(localruntime.LaunchTargetPlainShell),
+		},
+	)
+	require.NoError(err)
+	require.Equal(http.StatusInternalServerError, failedResp.StatusCode())
+	require.NoError(tx.Rollback())
+
+	require.Eventually(func() bool {
+		runtimeResp, runtimeErr := fixture.client.HTTP.GetWorkspaceRuntimeWithResponse(
+			ctx, ws.Id,
+		)
+		return runtimeErr == nil &&
+			runtimeResp.StatusCode() == http.StatusOK &&
+			runtimeResp.JSON200 != nil &&
+			runtimeResp.JSON200.Sessions != nil &&
+			len(*runtimeResp.JSON200.Sessions) == 0
+	}, 2*time.Second, 20*time.Millisecond)
+	require.Eventually(func() bool {
+		entries, readErr := os.ReadDir(stateDir)
+		if readErr != nil {
+			return false
+		}
+		currentState := make(map[string]bool, len(entries))
+		for _, entry := range entries {
+			currentState[entry.Name()] = true
+		}
+		if len(currentState) != len(initialState) {
+			return false
+		}
+		for name := range initialState {
+			if !currentState[name] {
+				return false
+			}
+		}
+		return true
+	}, 2*time.Second, 20*time.Millisecond)
+}
+
+func TestWorkspaceRuntimeRestoresTmuxShellAfterRestartE2E(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake tmux fixture uses Unix shell semantics")
+	}
+	require := require.New(t)
+	assert := Assert.New(t)
+
+	tmuxPath := writeFakeWorkspaceRuntimeTmux(t)
+	cfg := &config.Config{
+		Tmux: config.Tmux{Command: []string{tmuxPath}},
+		Shell: config.Shell{
+			Command: serverRuntimeHelperCommand("sleep"),
+		},
+	}
+	fixture := setupWorkspaceServerFixture(t, cfg)
+	ctx := context.Background()
+	ws := createReadyWorkspace(t, ctx, fixture.client)
+
+	originalShell := launchPlainShellRuntimeSession(t, ctx, fixture.client, ws.Id)
+	stored, err := fixture.database.ListWorkspaceRuntimeTmuxSessions(ctx, ws.Id)
+	require.NoError(err)
+	require.Len(stored, 1)
+	runtimeRows, err := fixture.database.ListWorkspaceRuntimeSessions(ctx, ws.Id)
+	require.NoError(err)
+	require.Len(runtimeRows, 1)
+	assert.Equal("session", runtimeRows[0].Scope)
+	require.Eventually(func() bool {
+		_, statErr := os.Stat(filepath.Join(
+			os.Getenv("MIDDLEMAN_FAKE_TMUX_STATE"),
+			stored[0].TmuxSession,
+		))
+		return statErr == nil
+	}, 2*time.Second, 20*time.Millisecond)
+
+	gracefulShutdown(t, fixture.server)
+	stored, err = fixture.database.ListWorkspaceRuntimeTmuxSessions(ctx, ws.Id)
+	require.NoError(err)
+	require.Len(stored, 1)
+	restarted := New(
+		fixture.database, fixture.server.syncer, nil, "/", cfg,
+		ServerOptions{
+			Clones:      fixture.clones,
+			WorktreeDir: fixture.worktrees,
+		},
+	)
+	t.Cleanup(func() { gracefulShutdown(t, restarted) })
+	restartedClient := setupTestClient(t, restarted)
+	stored, err = fixture.database.ListWorkspaceRuntimeTmuxSessions(ctx, ws.Id)
+	require.NoError(err)
+	require.Len(stored, 1)
+
+	runtimeResp, err := restartedClient.HTTP.GetWorkspaceRuntimeWithResponse(
 		ctx, ws.Id,
 	)
 	require.NoError(err)
-	require.Equal(http.StatusOK, shellResp.StatusCode())
-	require.NotNil(shellResp.JSON200)
-	shell := shellResp.JSON200
-	assert.Equal("plain_shell", shell.TargetKey)
-	assert.Equal(string(localruntime.LaunchTargetPlainShell), shell.Kind)
-	assert.Equal(string(localruntime.SessionStatusRunning), shell.Status)
-
-	getResp, err := client.HTTP.GetWorkspaceRuntimeWithResponse(ctx, ws.Id)
+	require.Equal(http.StatusOK, runtimeResp.StatusCode())
+	require.NotNil(runtimeResp.JSON200)
+	require.NotNil(runtimeResp.JSON200.Sessions)
+	require.Len(*runtimeResp.JSON200.Sessions, 1)
+	assert.Equal(originalShell.Key, (*runtimeResp.JSON200.Sessions)[0].Key)
+	assert.Equal(
+		originalShell.CreatedAt,
+		(*runtimeResp.JSON200.Sessions)[0].CreatedAt,
+	)
+	runtimeRows, err = fixture.database.ListWorkspaceRuntimeSessions(ctx, ws.Id)
 	require.NoError(err)
-	require.Equal(http.StatusOK, getResp.StatusCode())
-	require.NotNil(getResp.JSON200)
-	require.NotNil(getResp.JSON200.ShellSession)
-	require.NotNil(getResp.JSON200.Sessions)
-	assert.Equal(shell.Key, getResp.JSON200.ShellSession.Key)
-	assert.Empty(*getResp.JSON200.Sessions)
+	require.Len(runtimeRows, 1)
+	assert.Equal("session", runtimeRows[0].Scope)
+
+	ts := httptest.NewServer(restarted)
+	t.Cleanup(ts.Close)
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") +
+		"/ws/v1/workspaces/" + ws.Id +
+		"/runtime/sessions/" + originalShell.Key + "/terminal?cols=80&rows=24"
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	require.NoError(err)
+	defer conn.Close(websocket.StatusNormalClosure, "done")
+
+	workspaceTerminalConnWriteRead(
+		t, ctx, conn, "restored-shell\r", "fake-tmux:restored-shell",
+	)
 }
 
-// TestWorkspaceRuntimeShellTerminalWebSocketE2E exercises the
-// /ws/v1/.../runtime/shell/terminal upgrade path end-to-end with a
-// custom Shell.Command. Hardened deployments (e.g. systemd services
-// with SystemCallFilter=~@privileged) need the override so that
-// zsh's startup setresuid is not SIGSYS'd by the parent's seccomp
-// filter; this test guards both the websocket route and the
+func TestWorkspaceRuntimeRestoreKeepsStoredTmuxShellWithDifferentOwnerMarkerE2E(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake tmux fixture uses Unix shell semantics")
+	}
+	require := require.New(t)
+	assert := Assert.New(t)
+
+	tmuxPath := writeFakeWorkspaceRuntimeTmux(t)
+	cfg := &config.Config{
+		Tmux: config.Tmux{Command: []string{tmuxPath}},
+		Shell: config.Shell{
+			Command: serverRuntimeHelperCommand("sleep"),
+		},
+	}
+	fixture := setupWorkspaceServerFixture(t, cfg)
+	ctx := context.Background()
+	ws := createReadyWorkspace(t, ctx, fixture.client)
+
+	_ = launchPlainShellRuntimeSession(t, ctx, fixture.client, ws.Id)
+	stored, err := fixture.database.ListWorkspaceRuntimeTmuxSessions(ctx, ws.Id)
+	require.NoError(err)
+	require.Len(stored, 1)
+	stateDir := os.Getenv("MIDDLEMAN_FAKE_TMUX_STATE")
+	sessionPath := filepath.Join(stateDir, stored[0].TmuxSession)
+	ownerPath := sessionPath + ".owner"
+	require.NoError(os.WriteFile(ownerPath, []byte("attacker-owner\n"), 0o644))
+
+	gracefulShutdown(t, fixture.server)
+	restarted := New(
+		fixture.database, fixture.server.syncer, nil, "/", cfg,
+		ServerOptions{
+			Clones:      fixture.clones,
+			WorktreeDir: fixture.worktrees,
+		},
+	)
+	t.Cleanup(func() { gracefulShutdown(t, restarted) })
+	restartedClient := setupTestClient(t, restarted)
+
+	stored, err = fixture.database.ListWorkspaceRuntimeTmuxSessions(ctx, ws.Id)
+	require.NoError(err)
+	require.Len(stored, 1)
+	_, err = os.Stat(sessionPath)
+	require.NoError(err, "stored tmux session should not be killed")
+
+	runtimeResp, err := restartedClient.HTTP.GetWorkspaceRuntimeWithResponse(
+		ctx, ws.Id,
+	)
+	require.NoError(err)
+	require.Equal(http.StatusOK, runtimeResp.StatusCode())
+	require.NotNil(runtimeResp.JSON200)
+	require.NotNil(runtimeResp.JSON200.Sessions)
+	require.Len(*runtimeResp.JSON200.Sessions, 1)
+	assert.Equal(stored[0].SessionKey, (*runtimeResp.JSON200.Sessions)[0].Key)
+	assert.Equal(string(localruntime.SessionStatusRunning), (*runtimeResp.JSON200.Sessions)[0].Status)
+}
+
+// TestWorkspaceRuntimePlainShellTerminalWebSocketE2E exercises the runtime
+// session websocket path end-to-end with a custom Shell.Command. Hardened
+// deployments (e.g. systemd services with SystemCallFilter=~@privileged) need
+// the override so that zsh's startup setresuid is not SIGSYS'd by the parent's
+// seccomp filter; this test guards both the websocket route and the
 // config.Shell.Command -> manager.Options.ShellCommand wiring.
-func TestWorkspaceRuntimeShellTerminalWebSocketE2E(t *testing.T) {
+func TestWorkspaceRuntimePlainShellTerminalWebSocketE2E(t *testing.T) {
 	runParallelPTYE2E(t)
 
 	require := require.New(t)
+	tmuxCommand := isolatedRealTmuxCommandIfAvailable(t)
 	cfg := &config.Config{
+		Tmux: config.Tmux{Command: tmuxCommand},
 		Shell: config.Shell{
 			Command: serverRuntimeHelperCommand("echo"),
 		},
@@ -19887,17 +20774,13 @@ func TestWorkspaceRuntimeShellTerminalWebSocketE2E(t *testing.T) {
 	ctx := context.Background()
 	ws := createReadyWorkspace(t, ctx, client)
 
-	shellResp, err := client.HTTP.EnsureWorkspaceRuntimeShellWithResponse(
-		ctx, ws.Id,
-	)
-	require.NoError(err)
-	require.Equal(http.StatusOK, shellResp.StatusCode())
+	shell := launchPlainShellRuntimeSession(t, ctx, client, ws.Id)
 
 	ts := httptest.NewServer(srv)
 	t.Cleanup(ts.Close)
 	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") +
 		"/ws/v1/workspaces/" + ws.Id +
-		"/runtime/shell/terminal?cols=80&rows=24"
+		"/runtime/sessions/" + shell.Key + "/terminal?cols=80&rows=24"
 	conn, _, err := websocket.Dial(ctx, wsURL, nil)
 	require.NoError(err)
 	defer conn.Close(websocket.StatusNormalClosure, "done")
@@ -19931,48 +20814,47 @@ func TestWorkspaceRuntimeShellTerminalWebSocketE2E(t *testing.T) {
 // session (TerminalPane reconnect-loops on a still-listed-but-
 // output-dead session, which looks like a hang).
 //
-// Uses the "pty-close-then-sleep" helper to deterministically open the
-// race window where drainOutput's PTY EOF precedes watchSession's
+// Uses the "pty-close-on-input-then-sleep" helper to deterministically
+// open the race window where drainOutput's PTY EOF precedes watchSession's
 // cmd.Wait return by hundreds of milliseconds. Without the bridge fix
 // (always send exit frame on outputDone), this test fails because the
 // 100ms timeout fires before attachment.Done — exactly the systemd-
 // run-wrapped shell case the user hit.
-func TestWorkspaceRuntimeShellTerminalDeliversExitFrameE2E(t *testing.T) {
+func TestWorkspaceRuntimePlainShellTerminalDeliversExitFrameE2E(t *testing.T) {
 	runParallelPTYE2E(t)
 
 	require := require.New(t)
+	tmuxCommand := isolatedRealTmuxCommandOrSkip(t)
 	cfg := &config.Config{
+		Tmux: config.Tmux{Command: tmuxCommand},
 		Shell: config.Shell{
-			Command: serverRuntimeHelperCommand("pty-close-then-sleep"),
+			Command: serverRuntimeHelperCommand("pty-close-on-input-then-sleep"),
 		},
 	}
 	client, _, _, _, srv := setupTestServerWithWorkspacesServer(t, cfg)
 	ctx := context.Background()
 	ws := createReadyWorkspace(t, ctx, client)
 
-	shellResp, err := client.HTTP.EnsureWorkspaceRuntimeShellWithResponse(
-		ctx, ws.Id,
-	)
-	require.NoError(err)
-	require.Equal(http.StatusOK, shellResp.StatusCode())
+	shell := launchPlainShellRuntimeSession(t, ctx, client, ws.Id)
 
 	ts := httptest.NewServer(srv)
 	t.Cleanup(ts.Close)
 	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") +
 		"/ws/v1/workspaces/" + ws.Id +
-		"/runtime/shell/terminal?cols=80&rows=24"
-	conn, _, err := websocket.Dial(ctx, wsURL, nil)
-	require.NoError(err)
+		"/runtime/sessions/" + shell.Key + "/terminal?cols=80&rows=24"
+	conn := dialWebSocketForTest(t, ctx, wsURL, "shell")
 	defer conn.Close(websocket.StatusNormalClosure, "done")
 
-	// Helper closes its PTY end immediately, then sleeps long enough
-	// before exiting that a regression which gates the exit frame on
-	// cmd.Wait would push delivery well past our promptness budget.
-	// The bridge's outputDone path must deliver the frame within a
-	// few hundred ms of attach; cmd.Wait can only return when the
-	// helper finishes its sleep, so the gap between "right" and
-	// "wrong" is the helper's sleep duration. Helper sleeps 2 s; we
-	// allow up to 800 ms for the PTY-EOF path even on slow CI.
+	// Trigger after attach so the session cannot naturally exit before
+	// the websocket connects. The helper then closes its PTY end and
+	// sleeps long enough before process exit that a regression which gates
+	// the exit frame on cmd.Wait would push delivery well past our
+	// promptness budget. The bridge's outputDone path must deliver the
+	// frame within a few hundred ms of PTY EOF; cmd.Wait can only return
+	// when the helper finishes its sleep, so the gap between "right" and
+	// "wrong" is the helper's sleep duration. Helper sleeps 2 s; we allow
+	// up to 800 ms for the PTY-EOF path even on slow CI.
+	require.NoError(conn.Write(ctx, websocket.MessageBinary, []byte("close\n")))
 	readCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	const exitFrameBudget = 800 * time.Millisecond
@@ -20007,82 +20889,90 @@ func TestWorkspaceRuntimeShellTerminalDeliversExitFrameE2E(t *testing.T) {
 		// before watchSession populated ExitCode). Both are "the
 		// session ended" signals the frontend treats identically;
 		// pinning a specific value would be timing-dependent. Reject
-		// 0 (success) — that would mean the frame leaked from a
-		// successful exit path that doesn't apply here.
-		require.NotEqual(0, msg.Code, "non-success exit must report non-zero (or -1)")
+		// 0 only on the direct-PTY fallback path — a tmux-backed shell
+		// can report the attach client's clean detach rather than the
+		// pane command's non-zero exit status.
+		if !tmuxCommandAvailable(cfg.TmuxCommand()) {
+			require.NotEqual(0, msg.Code,
+				"non-success exit must report non-zero (or -1)")
+		}
 		return
 	}
 }
 
-// TestWorkspaceRuntimeEnsureShellAfterExitStartsFreshE2E pins the
-// behavior that an EnsureShell call hitting the post-PTY-EOF /
-// pre-cmd.Wait-return window returns a fresh session, never the
-// zombie. Without the runningSession outputClosed check, EnsureShell
-// would hand the next caller a Status=Running snapshot whose Output
-// channel was already closed; the frontend would mount a TerminalPane
-// against it, immediately receive the exit frame (per the bridge
-// fix), auto-close — and on the next click do it all over again.
-//
-// Uses the "pty-close-then-sleep" helper so the zombie window is
-// deterministic (~750ms) and the second EnsureShell is guaranteed to
-// land inside it.
-func TestWorkspaceRuntimeEnsureShellAfterExitStartsFreshE2E(t *testing.T) {
+// TestWorkspaceRuntimePlainShellAfterExitStartsFreshE2E pins the user-visible
+// no-tmux behavior that launching a shell after the terminal has reported exit
+// returns a fresh ptyowner-backed session, never the dead shell record the
+// frontend just auto-closed.
+func TestWorkspaceRuntimePlainShellAfterExitStartsFreshE2E(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test fixture uses /bin/sh")
+	}
 	runParallelPTYE2E(t)
 
 	require := require.New(t)
 	assert := Assert.New(t)
 	cfg := &config.Config{
+		Tmux: config.Tmux{
+			Command: []string{filepath.Join(t.TempDir(), "missing-tmux")},
+		},
 		Shell: config.Shell{
 			Command: serverRuntimeHelperCommand("pty-close-then-sleep"),
 		},
 	}
-	client, _, _, _, srv := setupTestServerWithWorkspacesServer(t, cfg)
+	ptyOwnerDir := filepath.Join(t.TempDir(), "pty-owner")
+	fixture := setupWorkspaceServerFixtureWithOptions(
+		t, cfg, ptyOwnerServerOptions(ptyOwnerDir),
+	)
+	client := fixture.client
+	srv := fixture.server
 	ctx := context.Background()
 	ws := createReadyWorkspace(t, ctx, client)
 
-	first, err := client.HTTP.EnsureWorkspaceRuntimeShellWithResponse(
-		ctx, ws.Id,
-	)
-	require.NoError(err)
-	require.Equal(http.StatusOK, first.StatusCode())
-	require.NotNil(first.JSON200)
-	firstCreatedAt := first.JSON200.CreatedAt
+	first := launchPlainShellRuntimeSession(t, ctx, client, ws.Id)
+	firstCreatedAt := first.CreatedAt
+	cleanupPtyOwnerWorkspace(t, ptyOwnerDir, first.Key)
 
-	// Attach + drain to drive the helper through its PTY-close. The
-	// helper then sleeps ~750 ms before exiting; we want EnsureShell
-	// to fire inside that sleep, when m.shells[key] still holds the
-	// zombie (Status=Running, outputClosed=true).
+	// Attach + drain to drive the helper through exit, then ensure
+	// the next shell open does not reuse the session that just
+	// reported an exit frame to the frontend.
 	ts := httptest.NewServer(srv)
 	t.Cleanup(ts.Close)
 	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") +
 		"/ws/v1/workspaces/" + ws.Id +
-		"/runtime/shell/terminal?cols=80&rows=24"
+		"/runtime/sessions/" + first.Key + "/terminal?cols=80&rows=24"
 	conn, _, err := websocket.Dial(ctx, wsURL, nil)
 	require.NoError(err)
-	// Read until WS closes (server sends exit frame and drops conn).
+	readCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
 	for {
-		readCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-		_, _, readErr := conn.Read(readCtx)
-		cancel()
+		typ, data, readErr := conn.Read(readCtx)
 		if readErr != nil {
-			break
+			require.Failf(
+				"never received exit frame",
+				"read err before exit frame: %v", readErr,
+			)
 		}
+		if typ != websocket.MessageText {
+			continue
+		}
+		var msg struct {
+			Type string `json:"type"`
+		}
+		require.NoError(json.Unmarshal(data, &msg))
+		require.Equal("exited", msg.Type)
+		break
 	}
 	conn.Close(websocket.StatusNormalClosure, "done")
 
 	// Inside the zombie window: helper still sleeping, so cmd.Wait
 	// hasn't returned and watchSession hasn't run.
-	second, err := client.HTTP.EnsureWorkspaceRuntimeShellWithResponse(
-		ctx, ws.Id,
-	)
-	require.NoError(err)
-	require.Equal(http.StatusOK, second.StatusCode())
-	require.NotNil(second.JSON200)
+	second := launchPlainShellRuntimeSession(t, ctx, client, ws.Id)
 	assert.NotEqual(
-		firstCreatedAt, second.JSON200.CreatedAt,
-		"second EnsureShell must return a fresh session, not the zombie",
+		firstCreatedAt, second.CreatedAt,
+		"second shell launch must return a fresh session, not the zombie",
 	)
-	assert.Equal(string(localruntime.SessionStatusRunning), second.JSON200.Status)
+	assert.Equal(string(localruntime.SessionStatusRunning), second.Status)
 }
 
 // TestBridgeRuntimeAttachmentSubscriberDropDoesNotEmitExitFrame
@@ -20412,25 +21302,14 @@ func TestWorkspaceRuntimeSessionTerminalSkipsAltScreenReplayE2E(t *testing.T) {
 		"/ws/v1/workspaces/" + ws.Id +
 		"/runtime/sessions/" + session.Key + "/terminal"
 
-	primingConn, _, err := websocket.Dial(ctx, wsURL, nil)
-	require.NoError(err)
-	var primed strings.Builder
-	primingCtx, primingCancel := context.WithTimeout(ctx, 2*time.Second)
-	defer primingCancel()
-	for {
-		typ, data, readErr := primingConn.Read(primingCtx)
-		require.NoError(readErr)
-		if typ == websocket.MessageBinary {
-			primed.WriteString(string(data))
-		}
-		if strings.Contains(primed.String(), "codex screen") {
-			break
-		}
-	}
+	primingConn := dialWebSocketForTest(t, ctx, wsURL, "priming")
+	require.NoError(primingConn.Write(
+		ctx, websocket.MessageBinary, []byte("prime\n"),
+	))
+	readWebSocketBinaryUntil(t, ctx, primingConn, 2*time.Second, "codex screen")
 	require.NoError(primingConn.Close(websocket.StatusNormalClosure, "primed"))
 
-	conn, _, err := websocket.Dial(ctx, wsURL, nil)
-	require.NoError(err)
+	conn := dialWebSocketForTest(t, ctx, wsURL, "late")
 	defer conn.Close(websocket.StatusNormalClosure, "done")
 
 	type terminalRead struct {
@@ -20551,11 +21430,13 @@ func TestWorkspaceRuntimeSessionTerminalTmuxBackedWebSocketE2E(
 	if err != nil {
 		t.Skip("tmux not available")
 	}
-	runParallelPTYE2E(t)
+	releasePTYSlot := acquirePTYE2ESlot(t)
+	t.Cleanup(releasePTYSlot)
 
 	require := require.New(t)
 	assert := Assert.New(t)
 	dir := t.TempDir()
+	tmuxCommand := isolatedRealTmuxCommand(t, tmuxPath)
 	agentPath := filepath.Join(dir, "size-agent")
 	require.NoError(os.WriteFile(agentPath, []byte(`#!/bin/sh
 attempt=0
@@ -20576,7 +21457,7 @@ exit 1
 			Label:   "Helper",
 			Command: []string{agentPath},
 		}},
-		Tmux: config.Tmux{Command: []string{tmuxPath}},
+		Tmux: config.Tmux{Command: tmuxCommand},
 	}
 	client, database, _, _, srv := setupTestServerWithWorkspacesServer(t, cfg)
 	ctx := context.Background()
@@ -20592,12 +21473,11 @@ exit 1
 	require.Equal(http.StatusOK, launchResp.StatusCode())
 	require.NotNil(launchResp.JSON200)
 	session := launchResp.JSON200
-	stored, err := database.ListWorkspaceTmuxSessions(ctx, ws.Id)
+	stored, err := database.ListWorkspaceRuntimeTmuxSessions(ctx, ws.Id)
 	require.NoError(err)
 	require.Len(stored, 1)
-	assert.Equal(
-		runtimeTmuxSessionNameForTest(ws.Id, "helper"),
-		stored[0].SessionName,
+	assert.True(
+		isRuntimeTmuxSessionNameForWorkspace(ws.Id, stored[0].TmuxSession),
 	)
 
 	ts := httptest.NewServer(srv)
@@ -20671,6 +21551,148 @@ func createReadyWorkspace(
 	return waitForWorkspaceReady(t, ctx, client, createResp.JSON202.Id)
 }
 
+func writeFakeWorkspaceRuntimeTmux(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	stateDir := filepath.Join(dir, "sessions")
+	require.NoError(t, os.MkdirAll(stateDir, 0o755))
+	t.Setenv("MIDDLEMAN_FAKE_TMUX_STATE", stateDir)
+	path := filepath.Join(dir, "tmux")
+	require.NoError(t, os.WriteFile(path, []byte(`#!/bin/sh
+set -eu
+state_dir="${MIDDLEMAN_FAKE_TMUX_STATE:?}"
+mkdir -p "$state_dir"
+session_arg() {
+  session=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -s|-t)
+        shift
+        session="${1:-}"
+        ;;
+    esac
+    [ "$#" -gt 0 ] && shift || true
+  done
+  printf '%s' "$session"
+}
+owner_arg() {
+  owner=""
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = "@middleman_owner" ]; then
+      shift
+      owner="${1:-}"
+      break
+    fi
+    [ "$#" -gt 0 ] && shift || true
+  done
+  printf '%s' "$owner"
+}
+cmd="${1:-}"
+[ "$#" -gt 0 ] && shift || true
+case "$cmd" in
+  list-sessions)
+    for session in "$state_dir"/*; do
+      [ -e "$session" ] || continue
+      basename "$session"
+    done
+    ;;
+  has-session)
+    session="$(session_arg "$@")"
+    if [ -n "$session" ] && [ -e "$state_dir/$session" ]; then
+      exit 0
+    fi
+    printf "can't find session: %s\n" "$session" >&2
+    exit 1
+    ;;
+  new-session)
+    session="$(session_arg "$@")"
+    [ -n "$session" ] && : > "$state_dir/$session"
+    owner="$(owner_arg "$@")"
+    if [ -n "$session" ] && [ -n "$owner" ]; then
+      printf '%s\n' "$owner" > "$state_dir/$session.owner"
+    fi
+    ;;
+  set-option)
+    session="$(session_arg "$@")"
+    owner="$(owner_arg "$@")"
+    if [ -n "$session" ] && [ -n "$owner" ]; then
+      printf '%s\n' "$owner" > "$state_dir/$session.owner"
+    fi
+    ;;
+  show-option)
+    ;;
+  show-options)
+    session="$(session_arg "$@")"
+    if [ -n "$session" ] && [ -e "$state_dir/$session.owner" ]; then
+      cat "$state_dir/$session.owner"
+    else
+      printf '%s\n' "${MIDDLEMAN_FAKE_TMUX_OWNER:-middleman:test-owner}"
+    fi
+    ;;
+  attach-session)
+    session="$(session_arg "$@")"
+    if [ -z "$session" ] || [ ! -e "$state_dir/$session" ]; then
+      printf "can't find session: %s\n" "$session" >&2
+      exit 1
+    fi
+    printf 'attached:%s\n' "$session"
+    while [ -e "$state_dir/$session" ]; do
+      if IFS= read -r line; then
+        printf 'fake-tmux:%s\n' "$line"
+      else
+        sleep 0.05
+      fi
+    done
+    ;;
+  kill-session)
+    session="$(session_arg "$@")"
+    [ -n "$session" ] && rm -f "$state_dir/$session"
+    [ -n "$session" ] && rm -f "$state_dir/$session.owner"
+    ;;
+  capture-pane|list-clients|refresh-client|wait-for)
+    ;;
+  *)
+    printf 'unsupported fake tmux command: %s\n' "$cmd" >&2
+    exit 2
+    ;;
+esac
+`), 0o755))
+	return path
+}
+
+func isolatedRealTmuxCommandIfAvailable(t *testing.T) []string {
+	t.Helper()
+	tmuxPath, err := exec.LookPath("tmux")
+	if err != nil {
+		return nil
+	}
+	return isolatedRealTmuxCommand(t, tmuxPath)
+}
+
+func isolatedRealTmuxCommandOrSkip(t *testing.T) []string {
+	t.Helper()
+	tmuxPath, err := exec.LookPath("tmux")
+	if err != nil {
+		t.Skip("tmux not available")
+	}
+	return isolatedRealTmuxCommand(t, tmuxPath)
+}
+
+func isolatedRealTmuxCommand(t *testing.T, tmuxPath string) []string {
+	t.Helper()
+	require := require.New(t)
+	tmuxDir, err := os.MkdirTemp("/tmp", "middleman-test-tmux-*")
+	require.NoError(err)
+	socket := filepath.Join(tmuxDir, "tmux.sock")
+	t.Cleanup(func() {
+		_ = procutil.Command(
+			tmuxPath, "-f", "/dev/null", "-S", socket, "kill-server",
+		).Run()
+		_ = os.RemoveAll(tmuxDir)
+	})
+	return []string{tmuxPath, "-f", "/dev/null", "-S", socket}
+}
+
 func serverRuntimeHelperCommand(mode string) []string {
 	return []string{
 		os.Args[0],
@@ -20705,8 +21727,13 @@ func TestServerRuntimeHelperProcess(t *testing.T) {
 		}
 		blockServerRuntimeHelper()
 	case "altscreen":
+		reader := bufio.NewReader(os.Stdin)
+		_, err := reader.ReadString('\n')
+		if err != nil {
+			blockServerRuntimeHelper()
+		}
 		fmt.Print("\x1b[?1049h\x1b[Hcodex screen")
-		line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+		line, err := reader.ReadString('\n')
 		if err == nil {
 			fmt.Print("\x1b[Hlive:" + line)
 		}
@@ -20722,6 +21749,9 @@ func TestServerRuntimeHelperProcess(t *testing.T) {
 		return
 	case "exit":
 		os.Exit(3)
+	case "print-exit":
+		fmt.Print("quick-api-output")
+		os.Exit(7)
 	case "pty-close-then-sleep":
 		// Simulate the systemd-run-wrapper window the bridge has to
 		// survive: PTY EOF observed (drainOutput exits) well before
@@ -20734,6 +21764,17 @@ func TestServerRuntimeHelperProcess(t *testing.T) {
 		// 2 s sleep gives the exit-frame promptness assertion clear
 		// daylight: a regression that gates on cmd.Wait would deliver
 		// at ~2 s, well past the test's promptness budget.
+		signal.Ignore(syscall.SIGHUP, syscall.SIGTERM, syscall.SIGINT)
+		_ = os.Stdin.Close()
+		_ = os.Stdout.Close()
+		_ = os.Stderr.Close()
+		time.Sleep(2 * time.Second)
+		os.Exit(7)
+	case "pty-close-on-input-then-sleep":
+		_, err := bufio.NewReader(os.Stdin).ReadString('\n')
+		if err != nil {
+			os.Exit(2)
+		}
 		signal.Ignore(syscall.SIGHUP, syscall.SIGTERM, syscall.SIGINT)
 		_ = os.Stdin.Close()
 		_ = os.Stdout.Close()

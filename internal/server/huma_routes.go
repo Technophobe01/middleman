@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -501,6 +502,14 @@ type stopWorkspaceRuntimeSessionInput struct {
 	SessionKey string `path:"session_key"`
 }
 
+type renameWorkspaceRuntimeSessionInput struct {
+	ID         string `path:"id"`
+	SessionKey string `path:"session_key"`
+	Body       struct {
+		Label string `json:"label"`
+	}
+}
+
 type deleteWorkspaceInput struct {
 	ID    string `path:"id"`
 	Force bool   `query:"force"`
@@ -728,12 +737,12 @@ func (s *Server) registerAPI(api huma.API) {
 		Tags:          []string{"Workspaces"},
 	}, s.stopWorkspaceRuntimeSession)
 	huma.Register(api, huma.Operation{
-		OperationID: "ensure-workspace-runtime-shell",
-		Method:      http.MethodPost,
-		Path:        "/workspaces/{id}/runtime/shell",
-		Summary:     "Ensure workspace runtime shell",
+		OperationID: "rename-workspace-runtime-session",
+		Method:      http.MethodPatch,
+		Path:        "/workspaces/{id}/runtime/sessions/{session_key}",
+		Summary:     "Rename workspace runtime session",
 		Tags:        []string{"Workspaces"},
-	}, s.ensureWorkspaceRuntimeShell)
+	}, s.renameWorkspaceRuntimeSession)
 	huma.Register(api, huma.Operation{
 		OperationID:   "delete-workspace",
 		Method:        http.MethodDelete,
@@ -5113,14 +5122,88 @@ func (s *Server) getWorkspaceRuntime(
 	if err != nil {
 		return nil, err
 	}
+	sessions, err := s.workspaceRuntimeSessions(ctx, summary.ID)
+	if err != nil {
+		return nil, problemInternal("list runtime sessions: " + err.Error())
+	}
 
 	return &getWorkspaceRuntimeOutput{
 		Body: workspaceRuntimeResponse{
 			LaunchTargets: s.runtime.LaunchTargets(),
-			Sessions:      s.runtime.ListSessions(summary.ID),
-			ShellSession:  s.runtime.ShellSession(summary.ID),
+			Sessions:      sessions,
 		},
 	}, nil
+}
+
+func (s *Server) workspaceRuntimeSessions(
+	ctx context.Context,
+	workspaceID string,
+) ([]localruntime.SessionInfo, error) {
+	sessions := s.runtime.ListSessions(workspaceID)
+	if s.workspaces == nil {
+		return sessions, nil
+	}
+	stored, err := s.workspaces.RuntimeSessionsForWorkspace(ctx, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	return mergeStoredRuntimeSessions(sessions, stored), nil
+}
+
+func mergeStoredRuntimeSessions(
+	live []localruntime.SessionInfo,
+	stored []db.WorkspaceRuntimeSession,
+) []localruntime.SessionInfo {
+	sessions := slices.Clone(live)
+	seen := make(map[string]struct{}, len(sessions))
+	for _, session := range sessions {
+		seen[session.Key] = struct{}{}
+	}
+	for _, session := range stored {
+		if session.SessionKey == "" {
+			continue
+		}
+		if _, ok := seen[session.SessionKey]; ok {
+			continue
+		}
+		sessions = append(sessions, storedRuntimeSessionInfo(session))
+		seen[session.SessionKey] = struct{}{}
+	}
+	slices.SortFunc(sessions, localruntime.SessionInfo.Compare)
+	return sessions
+}
+
+func storedRuntimeSessionInfo(
+	session db.WorkspaceRuntimeSession,
+) localruntime.SessionInfo {
+	targetKey := strings.TrimSpace(session.TargetKey)
+	kind := localruntime.LaunchTargetKind(strings.TrimSpace(session.Kind))
+	if kind == "" {
+		kind = localruntime.LaunchTargetAgent
+	}
+	if targetKey == string(localruntime.LaunchTargetPlainShell) ||
+		kind == localruntime.LaunchTargetPlainShell {
+		targetKey = string(localruntime.LaunchTargetPlainShell)
+		kind = localruntime.LaunchTargetPlainShell
+	}
+	label := strings.TrimSpace(session.Label)
+	if label == "" {
+		if kind == localruntime.LaunchTargetPlainShell {
+			label = "Shell"
+		} else {
+			label = targetKey
+		}
+	}
+	return localruntime.SessionInfo{
+		Key:         session.SessionKey,
+		WorkspaceID: session.WorkspaceID,
+		TargetKey:   targetKey,
+		Label:       label,
+		Kind:        kind,
+		Status:      localruntime.SessionStatusError,
+		CreatedAt:   session.CreatedAt,
+		TmuxSession: session.TmuxSession,
+	}
 }
 
 func (s *Server) launchWorkspaceRuntimeSession(
@@ -5136,44 +5219,83 @@ func (s *Server) launchWorkspaceRuntimeSession(
 		return nil, problemValidation("body.target_key", "target_key is required")
 	}
 
-	if targetKey == string(localruntime.LaunchTargetPlainShell) {
-		session, err := s.runtime.EnsureShell(
-			ctx, summary.ID, summary.WorktreePath,
-		)
-		if err != nil {
-			return nil, problemInternal("ensure shell: " + err.Error())
-		}
-		return &workspaceRuntimeSessionOutput{Body: session}, nil
-	}
-
 	session, err := s.runtime.Launch(
 		ctx, summary.ID, summary.WorktreePath, targetKey,
 	)
 	if err != nil {
 		return nil, workspaceRuntimeLaunchError(err)
 	}
-	if session.TmuxSession != "" {
-		if err := s.workspaces.RecordRuntimeTmuxSession(
-			ctx, summary.ID, session.TmuxSession, session.TargetKey,
-			session.CreatedAt,
-		); err != nil {
-			_ = s.runtime.Stop(ctx, summary.ID, session.Key)
-			return nil, problemInternal("record runtime tmux session: " + err.Error())
-		}
-		if runtimeSessionTmuxSession(
-			s.runtime.ListSessions(summary.ID), session.Key,
-		) == "" {
-			if _, err := s.workspaces.ForgetMissingRuntimeTmuxSession(
-				ctx, summary.ID, session.TmuxSession,
-				session.CreatedAt,
-			); err != nil {
-				return nil, problemInternal(
-					"forget missing runtime tmux session: " + err.Error(),
-				)
-			}
+	if err := s.recordRuntimeSession(
+		ctx, summary.ID, session, "session",
+	); err != nil {
+		cleanupCtx, cancel := context.WithTimeout(
+			context.WithoutCancel(ctx), 5*time.Second,
+		)
+		defer cancel()
+		_ = s.runtime.Stop(cleanupCtx, summary.ID, session.Key)
+		return nil, err
+	}
+	s.forgetRecordedRuntimeSessionIfExited(ctx, session)
+	return &workspaceRuntimeSessionOutput{Body: session}, nil
+}
+
+func (s *Server) forgetRecordedRuntimeSessionIfExited(
+	ctx context.Context,
+	session localruntime.SessionInfo,
+) {
+	if s.workspaces == nil || s.runtime == nil || session.Key == "" {
+		return
+	}
+	for _, live := range s.runtime.ListSessions(session.WorkspaceID) {
+		if live.Key == session.Key {
+			return
 		}
 	}
-	return &workspaceRuntimeSessionOutput{Body: session}, nil
+	cleanupCtx, cancel := context.WithTimeout(
+		context.WithoutCancel(ctx), runtimeSessionCleanupTimeout,
+	)
+	defer cancel()
+	if _, err := s.workspaces.ForgetRuntimeSessionAfterExit(
+		cleanupCtx,
+		session.WorkspaceID,
+		session.Key,
+		session.CreatedAt,
+		session.TmuxSession,
+	); err != nil {
+		slog.Warn(
+			"forget runtime session that exited before record completed",
+			"workspace_id", session.WorkspaceID,
+			"session_key", session.Key,
+			"err", err,
+		)
+	}
+}
+
+func (s *Server) recordRuntimeSession(
+	ctx context.Context,
+	workspaceID string,
+	session localruntime.SessionInfo,
+	scope string,
+) error {
+	if scope == "" {
+		scope = "session"
+	}
+	if err := s.workspaces.RecordRuntimeSession(
+		ctx,
+		db.WorkspaceRuntimeSession{
+			WorkspaceID: workspaceID,
+			SessionKey:  session.Key,
+			TargetKey:   session.TargetKey,
+			Label:       session.Label,
+			Kind:        string(session.Kind),
+			Scope:       scope,
+			TmuxSession: session.TmuxSession,
+			CreatedAt:   session.CreatedAt,
+		},
+	); err != nil {
+		return problemInternal("record runtime session: " + err.Error())
+	}
+	return nil
 }
 
 func (s *Server) stopWorkspaceRuntimeSession(
@@ -5184,34 +5306,16 @@ func (s *Server) stopWorkspaceRuntimeSession(
 	if err != nil {
 		return nil, err
 	}
-	tmuxSession := runtimeSessionTmuxSession(
-		s.runtime.ListSessions(summary.ID), input.SessionKey,
-	)
 	if err := s.runtime.Stop(
 		ctx, summary.ID, input.SessionKey,
 	); err != nil {
 		if errors.Is(err, localruntime.ErrSessionNotFound) {
-			if targetKey, ok := legacyRuntimeTargetKeyFromSessionKey(
-				summary.ID, input.SessionKey,
-			); ok {
-				stopped, stopErr := s.workspaces.StopStoredRuntimeTmuxSession(
-					ctx, summary.ID, targetKey,
-				)
-				if stopErr != nil {
-					return nil, problemInternal(
-						"stop stored runtime tmux session: " + stopErr.Error(),
-					)
-				}
-				if stopped {
-					return nil, nil
-				}
-			}
-			stopped, stopErr := s.workspaces.StopStoredRuntimeTmuxSessionByKey(
+			stopped, stopErr := s.workspaces.StopStoredRuntimeSessionByKey(
 				ctx, summary.ID, input.SessionKey,
 			)
 			if stopErr != nil {
 				return nil, problemInternal(
-					"stop stored runtime tmux session: " + stopErr.Error(),
+					"stop stored runtime session: " + stopErr.Error(),
 				)
 			}
 			if stopped {
@@ -5221,52 +5325,84 @@ func (s *Server) stopWorkspaceRuntimeSession(
 		}
 		return nil, problemInternal("stop runtime session: " + err.Error())
 	}
-	if tmuxSession != "" {
-		if err := s.workspaces.ForgetRuntimeTmuxSession(
-			ctx, summary.ID, tmuxSession,
-		); err != nil {
-			return nil, problemInternal("forget runtime tmux session: " + err.Error())
-		}
+	if err := s.workspaces.ForgetRuntimeSession(
+		ctx, summary.ID, input.SessionKey,
+	); err != nil {
+		return nil, problemInternal("forget runtime session: " + err.Error())
 	}
 	return nil, nil
 }
 
-func runtimeSessionTmuxSession(
-	sessions []localruntime.SessionInfo,
-	key string,
-) string {
-	for _, session := range sessions {
-		if session.Key == key {
-			return session.TmuxSession
-		}
-	}
-	return ""
-}
-
-func legacyRuntimeTargetKeyFromSessionKey(
-	workspaceID string,
-	key string,
-) (string, bool) {
-	targetKey, ok := strings.CutPrefix(key, workspaceID+":")
-	return targetKey, ok && targetKey != ""
-}
-
-func (s *Server) ensureWorkspaceRuntimeShell(
+func (s *Server) renameWorkspaceRuntimeSession(
 	ctx context.Context,
-	input *getWorkspaceRuntimeInput,
+	input *renameWorkspaceRuntimeSessionInput,
 ) (*workspaceRuntimeSessionOutput, error) {
 	summary, err := s.getReadyRuntimeWorkspace(ctx, input.ID)
 	if err != nil {
 		return nil, err
 	}
+	label := strings.TrimSpace(input.Body.Label)
+	if label == "" {
+		return nil, problemValidation("body.label", "label is required")
+	}
 
-	session, err := s.runtime.EnsureShell(
-		ctx, summary.ID, summary.WorktreePath,
+	session, err := s.runtime.RenameSession(
+		summary.ID, input.SessionKey, label,
 	)
 	if err != nil {
-		return nil, problemInternal("ensure shell: " + err.Error())
+		if errors.Is(err, localruntime.ErrSessionNotFound) {
+			stored, renamed, renameErr := s.renameStoredRuntimeSession(
+				ctx, summary.ID, input.SessionKey, label,
+			)
+			if renameErr != nil {
+				return nil, problemInternal(
+					"rename stored runtime session: " + renameErr.Error(),
+				)
+			}
+			if renamed {
+				return &workspaceRuntimeSessionOutput{Body: stored}, nil
+			}
+			return nil, problemNotFound(CodeNotFound, err.Error(), nil)
+		}
+		return nil, problemInternal("rename runtime session: " + err.Error())
+	}
+
+	updated, err := s.workspaces.UpdateRuntimeSessionLabel(
+		ctx, summary.ID, input.SessionKey, session.Label,
+	)
+	if err != nil {
+		return nil, problemInternal("update runtime session label: " + err.Error())
+	}
+	if !updated {
+		if err := s.recordRuntimeSession(ctx, summary.ID, session, "session"); err != nil {
+			return nil, err
+		}
 	}
 	return &workspaceRuntimeSessionOutput{Body: session}, nil
+}
+
+func (s *Server) renameStoredRuntimeSession(
+	ctx context.Context,
+	workspaceID string,
+	sessionKey string,
+	label string,
+) (localruntime.SessionInfo, bool, error) {
+	updated, err := s.workspaces.UpdateRuntimeSessionLabel(
+		ctx, workspaceID, sessionKey, label,
+	)
+	if err != nil || !updated {
+		return localruntime.SessionInfo{}, false, err
+	}
+	stored, err := s.workspaces.RuntimeSessionsForWorkspace(ctx, workspaceID)
+	if err != nil {
+		return localruntime.SessionInfo{}, false, err
+	}
+	for _, session := range stored {
+		if session.SessionKey == sessionKey {
+			return storedRuntimeSessionInfo(session), true, nil
+		}
+	}
+	return localruntime.SessionInfo{}, false, nil
 }
 
 func (s *Server) getReadyRuntimeWorkspace(
