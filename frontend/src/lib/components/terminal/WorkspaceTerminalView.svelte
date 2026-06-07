@@ -2815,6 +2815,7 @@
     padding: 0 10px;
     background: var(--bg-surface);
     border-bottom: 1px solid var(--border-default);
+    border-left: 1px solid var(--border-default);
     gap: 10px;
     flex-shrink: 0;
   }
@@ -2902,6 +2903,7 @@
     height: 30px;
     padding: 0 6px 0 0;
     border-bottom: 1px solid var(--border-default);
+    border-left: 1px solid var(--border-default);
     background: var(--bg-inset);
     flex-shrink: 0;
   }
@@ -2939,7 +2941,6 @@
     flex: 1;
     min-height: 0;
     overflow: hidden;
-    padding: 6px;
     background: var(--bg-primary);
   }
 

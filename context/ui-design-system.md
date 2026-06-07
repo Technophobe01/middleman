@@ -96,6 +96,39 @@ Intent:
 
 Use it between resizable panes. Pass a specific accessible label such as `Resize Activity rail` or `Resize file tree`.
 
+### TabbedPanelTree
+
+Use `TabbedPanelTree` for VS Code-like panel workspaces: tab groups that can
+reorder tabs, drag tabs into another group, split a group horizontally or
+vertically, and resize split panes.
+
+Intent:
+
+- one shared interaction model for draggable, tabbed, splittable panel groups
+- let callers provide arbitrary panel content, tab icons, and tab action buttons
+- keep dedicated sidebar resizing on `SplitResizeHandle` instead of forcing
+  every two-pane layout into a tabbed workspace model
+
+Use it when a surface needs multiple interchangeable panels or future panes
+inside a draggable workspace. Do not use it for simple fixed sidebars,
+single-purpose drawers, or file-tree/content splits where `SplitResizeHandle`
+or a narrower layout primitive is enough.
+
+Use neutral `tabbed-panel-*` DOM classes/selectors for tests and consumers.
+Do not add workflow-specific aliases or compatibility selectors when moving
+this primitive into new surfaces.
+
+Pass the mutation callbacks that match the interactions you expose:
+`onMoveTabBefore`/`onAppendTabToLeaf` for tab sorting and cross-group moves,
+`onSplitTab` for edge drops, and `onRatioChange` for divider resizing. Omitted
+callbacks make that interaction read-only instead of rendering a visual drop
+target that cannot apply.
+
+The current accessibility scope is labeled tab groups, focusable tabs and tab
+actions, and labeled pointer resize handles. Keyboard tab reordering, keyboard
+splitting, and keyboard resizing are not implemented here; extend
+`TabbedPanelTree` first if a consumer needs those interactions.
+
 ### SelectDropdown
 
 Use `SelectDropdown` for single-value selection controls in the UI.

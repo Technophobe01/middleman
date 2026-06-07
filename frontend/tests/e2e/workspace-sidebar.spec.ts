@@ -1291,7 +1291,7 @@ test.describe("workspace launch home", () => {
     await workflow.getByRole("button", { name: "Move Codex to terminal" }).click();
 
     await expect(workflow.getByRole("tab", { name: "Terminal" })).toHaveAttribute("aria-selected", "true");
-    await expect(page.locator(".workflow-leaf .terminal-container")).toBeVisible();
+    await expect(page.locator(".tabbed-panel-leaf .terminal-container")).toBeVisible();
   });
 
   test("keeps a closed top-docked terminal reachable when terminal sessions exist", async ({ page }) => {
@@ -1326,12 +1326,12 @@ test.describe("workspace launch home", () => {
     });
     await expect(terminalTab).toBeVisible();
     await expect(terminalTab).toHaveAttribute("aria-selected", "false");
-    await expect(page.locator(".workflow-leaf .terminal-container")).toHaveCount(0);
+    await expect(page.locator(".tabbed-panel-leaf .terminal-container")).toHaveCount(0);
 
     await terminalTab.click();
 
     await expect(terminalTab).toHaveAttribute("aria-selected", "true");
-    await expect(page.locator(".workflow-leaf .terminal-container")).toBeVisible();
+    await expect(page.locator(".tabbed-panel-leaf .terminal-container")).toBeVisible();
   });
 
   test("applies a workflow preset that restores the Shell workflow tab", async ({ page }) => {
@@ -1354,7 +1354,84 @@ test.describe("workspace launch home", () => {
       name: "Workflow panes",
     });
     await expect(workflow.getByRole("tab", { name: "Shell" })).toHaveAttribute("aria-selected", "true");
-    await expect(page.locator(".workflow-leaf .terminal-container")).toBeVisible();
+    await expect(page.locator(".tabbed-panel-leaf .terminal-container")).toBeVisible();
+  });
+
+  test("renders workflow panes flush with the workspace stage", async ({ page }) => {
+    await setupTerminalMocks(page, {
+      runtime: workflowDragRuntime(),
+    });
+    await page.addInitScript((layout) => {
+      localStorage.setItem("middleman-workspace-terminal-layout:ws-123", JSON.stringify(layout));
+    }, workflowDragLayout());
+
+    await page.goto("/terminal/ws-123");
+    await expect(page.locator(".tabbed-panel-split")).toBeVisible();
+
+    const metrics = await page.evaluate(() => {
+      const titleBar = document.querySelector(".header-bar");
+      const toolbar = document.querySelector(".workspace-toolbar");
+      const stage = document.querySelector(".workspace-stage");
+      const split = document.querySelector(".workspace-stage .tabbed-panel-split");
+      const firstLeaf = document.querySelector(".workspace-stage .tabbed-panel-leaf");
+      if (!titleBar || !toolbar || !stage || !split || !firstLeaf) {
+        throw new Error("Missing workflow header, stage, or split panel");
+      }
+
+      const titleBarRect = titleBar.getBoundingClientRect();
+      const toolbarRect = toolbar.getBoundingClientRect();
+      const stageRect = stage.getBoundingClientRect();
+      const splitRect = split.getBoundingClientRect();
+      const firstLeafRect = firstLeaf.getBoundingClientRect();
+      const titleBarStyles = getComputedStyle(titleBar);
+      const toolbarStyles = getComputedStyle(toolbar);
+      const stageStyles = getComputedStyle(stage);
+
+      return {
+        titleBorderLeft: titleBarStyles.borderLeftWidth,
+        toolbarBorderLeft: toolbarStyles.borderLeftWidth,
+        titleToToolbarLeft: toolbarRect.left - titleBarRect.left,
+        toolbarToFirstLeafLeft: firstLeafRect.left - toolbarRect.left,
+        padding: [stageStyles.paddingTop, stageStyles.paddingRight, stageStyles.paddingBottom, stageStyles.paddingLeft],
+        delta: {
+          left: splitRect.left - stageRect.left,
+          top: splitRect.top - stageRect.top,
+          right: stageRect.right - splitRect.right,
+          bottom: stageRect.bottom - splitRect.bottom,
+        },
+      };
+    });
+
+    expect(metrics.titleBorderLeft).toBe("1px");
+    expect(metrics.toolbarBorderLeft).toBe("1px");
+    expect(Math.abs(metrics.titleToToolbarLeft)).toBeLessThanOrEqual(0.5);
+    expect(Math.abs(metrics.toolbarToFirstLeafLeft)).toBeLessThanOrEqual(0.5);
+    expect(metrics.padding).toEqual(["0px", "0px", "0px", "0px"]);
+    expect(Math.abs(metrics.delta.left)).toBeLessThanOrEqual(0.5);
+    expect(Math.abs(metrics.delta.top)).toBeLessThanOrEqual(0.5);
+    expect(Math.abs(metrics.delta.right)).toBeLessThanOrEqual(0.5);
+    expect(Math.abs(metrics.delta.bottom)).toBeLessThanOrEqual(0.5);
+  });
+
+  test("shows one Workspaces option in the compact page menu on terminal routes", async ({ page }) => {
+    await page.setViewportSize({ width: 1000, height: 720 });
+    await setupTerminalMocks(page, {
+      runtime: workflowDragRuntime(),
+    });
+
+    await page.goto("/terminal/ws-123");
+
+    const pageSelect = page.getByRole("combobox", {
+      name: "Page: Workspaces",
+    });
+    await expect(pageSelect).toBeVisible();
+    await pageSelect.click();
+
+    const workspaceOption = page.getByRole("option", {
+      name: "Workspaces",
+    });
+    await expect(workspaceOption).toHaveCount(1);
+    await expect(workspaceOption).toHaveAttribute("aria-selected", "true");
   });
 
   test("workflow pane drops append in the center and split at the edge", async ({ page }) => {
@@ -1367,12 +1444,12 @@ test.describe("workspace launch home", () => {
 
     await page.goto("/terminal/ws-123");
 
-    await expect(page.locator(".workflow-leaf")).toHaveCount(2);
+    await expect(page.locator(".tabbed-panel-leaf")).toHaveCount(2);
     await dragWorkflowTabToGroup(page, "Reviewer", 0, "center");
-    await expect(page.locator(".workflow-leaf")).toHaveCount(1);
+    await expect(page.locator(".tabbed-panel-leaf")).toHaveCount(1);
     await expect(
       page
-        .locator(".workflow-leaf")
+        .locator(".tabbed-panel-leaf")
         .first()
         .getByRole("tab", { name: /Reviewer/ }),
     ).toBeVisible();
@@ -1382,12 +1459,12 @@ test.describe("workspace launch home", () => {
     }, workflowDragLayout());
     await page.reload();
 
-    await expect(page.locator(".workflow-leaf")).toHaveCount(2);
+    await expect(page.locator(".tabbed-panel-leaf")).toHaveCount(2);
     await dragWorkflowTabToGroup(page, "Reviewer", 0, "left-edge");
-    await expect(page.locator(".workflow-leaf")).toHaveCount(2);
+    await expect(page.locator(".tabbed-panel-leaf")).toHaveCount(2);
     await expect(
       page
-        .locator(".workflow-leaf")
+        .locator(".tabbed-panel-leaf")
         .first()
         .getByRole("tab", { name: /Reviewer/ }),
     ).toBeVisible();
@@ -1784,6 +1861,35 @@ test.describe("workspace launch home", () => {
       .click();
 
     await expect(page.locator(".terminal-panel.open .terminal-container")).toBeVisible();
+    const dividerMetrics = await page.evaluate(() => {
+      const panel = document.querySelector(".terminal-panel.bottom.open");
+      const resizer = document.querySelector(".terminal-panel.bottom.open .panel-resizer");
+      const stage = document.querySelector(".workspace-stage");
+      if (!panel || !resizer || !stage) {
+        throw new Error("Missing bottom dock panel, resizer, or workspace stage");
+      }
+
+      const panelRect = panel.getBoundingClientRect();
+      const resizerRect = resizer.getBoundingClientRect();
+      const stageRect = stage.getBoundingClientRect();
+      const panelStyles = getComputedStyle(panel);
+      const resizerStyles = getComputedStyle(resizer);
+      const stripeStyles = getComputedStyle(resizer, "::before");
+      return {
+        panelBorderTop: panelStyles.borderTopWidth,
+        resizerCursor: resizerStyles.cursor,
+        resizerHeight: Math.round(resizerRect.height),
+        stageToPanel: Math.round(panelRect.top - stageRect.bottom),
+        stripeHeight: stripeStyles.height,
+      };
+    });
+    expect(dividerMetrics).toEqual({
+      panelBorderTop: "0px",
+      resizerCursor: "row-resize",
+      resizerHeight: 7,
+      stageToPanel: 0,
+      stripeHeight: "3px",
+    });
     await expect
       .poll(() => terminalSockets.some((url) => url.includes("/runtime/sessions/ws-123%3Aplain_shell/terminal")))
       .toBe(true);
@@ -1823,6 +1929,226 @@ test.describe("workspace launch home", () => {
 
     await expect.poll(() => shellEnsures.length).toBe(1);
     await expect(page.locator(".terminal-panel.open .terminal-container")).toBeVisible();
+  });
+
+  test("renders bottom terminal split panes flush with consistent dividers", async ({ page }) => {
+    const splitTree = {
+      type: "split",
+      id: "terminal-split-root",
+      direction: "horizontal",
+      ratio: 0.5,
+      first: {
+        type: "leaf",
+        id: "terminal-left",
+        sessionKey: "ws-123:plain_shell",
+      },
+      second: {
+        type: "leaf",
+        id: "terminal-right",
+        sessionKey: "ws-123:shell_2",
+      },
+    };
+    await setupTerminalMocks(page, {
+      runtime: {
+        ...workspaceRuntime,
+        sessions: [
+          {
+            key: "ws-123:plain_shell",
+            workspace_id: "ws-123",
+            target_key: "plain_shell",
+            label: "Shell",
+            kind: "plain_shell",
+            status: "running",
+            created_at: "2026-04-10T12:00:00Z",
+          },
+          {
+            key: "ws-123:shell_2",
+            workspace_id: "ws-123",
+            target_key: "plain_shell",
+            label: "Shell 2",
+            kind: "plain_shell",
+            status: "running",
+            created_at: "2026-04-10T12:00:00Z",
+          },
+        ],
+      },
+    });
+    await page.addInitScript((tree) => {
+      localStorage.setItem(
+        "middleman-workspace-terminal-layout:ws-123",
+        JSON.stringify({
+          version: 1,
+          open: true,
+          dock: "bottom",
+          height: 300,
+          activeSessionKey: "ws-123:shell_2",
+          tree,
+          terminalGroups: [
+            {
+              id: "terminal-group",
+              activeSessionKey: "ws-123:shell_2",
+              tree,
+            },
+          ],
+          activeTerminalGroupID: "terminal-group",
+          sessionRegions: {
+            "ws-123:plain_shell": "terminal",
+            "ws-123:shell_2": "terminal",
+          },
+          workflowMode: "tabs",
+          workflowTree: {
+            type: "leaf",
+            id: "workflow-root",
+            tabs: ["home"],
+            activeTabKey: "home",
+          },
+          activeWorkflowLeafID: "workflow-root",
+          recentWorkflowLeafIDs: ["workflow-root"],
+          customSessionLabels: {},
+        }),
+      );
+    }, splitTree);
+
+    await page.goto("/terminal/ws-123");
+    await expect(page.locator(".terminal-panel.open .terminal-leaf")).toHaveCount(2);
+    await expect(page.locator(".terminal-panel.open .xterm-viewport")).toHaveCount(2);
+
+    const splitMetrics = await page.evaluate(() => {
+      const body = document.querySelector(".terminal-panel.bottom.open .panel-body");
+      const tree = document.querySelector(".terminal-panel.bottom.open .terminal-tree");
+      const selector = document.querySelector(".terminal-panel.bottom.open .terminal-selector");
+      const split = document.querySelector(".terminal-panel.bottom.open .terminal-split");
+      const activeHeader = document.querySelector(".terminal-panel.bottom.open .terminal-leaf.active .leaf-header");
+      const activeLeaf = activeHeader?.closest(".terminal-leaf");
+      const firstLeaf = document.querySelector(".terminal-panel.bottom.open .terminal-leaf");
+      const firstViewport = firstLeaf?.querySelector(".xterm-viewport");
+      const secondLeaf = document.querySelector(
+        ".terminal-panel.bottom.open .terminal-split.horizontal > .split-child.second > .terminal-leaf",
+      );
+      const divider = document.querySelector(".terminal-panel.bottom.open .terminal-split.horizontal > .split-divider");
+      if (
+        !body ||
+        !tree ||
+        !selector ||
+        !split ||
+        !activeHeader ||
+        !activeLeaf ||
+        !firstLeaf ||
+        !firstViewport ||
+        !secondLeaf ||
+        !divider
+      ) {
+        throw new Error("Missing bottom terminal split layout");
+      }
+
+      const bodyRect = body.getBoundingClientRect();
+      const treeRect = tree.getBoundingClientRect();
+      const selectorRect = selector.getBoundingClientRect();
+      const splitRect = split.getBoundingClientRect();
+      const firstLeafRect = firstLeaf.getBoundingClientRect();
+      const firstViewportRect = firstViewport.getBoundingClientRect();
+      const dividerRect = divider.getBoundingClientRect();
+      const treeStyles = getComputedStyle(tree);
+      const firstLeafStyles = getComputedStyle(firstLeaf);
+      const firstViewportStyles = getComputedStyle(firstViewport);
+      const secondLeafStyles = getComputedStyle(secondLeaf);
+      const dividerStyles = getComputedStyle(divider);
+      const activeLeafStyles = getComputedStyle(activeLeaf);
+      const activeHeaderStyles = getComputedStyle(activeHeader);
+      return {
+        activeHeaderBoxShadow: activeHeaderStyles.boxShadow,
+        activeLeftBorderUsesAccent: activeLeafStyles.borderLeftColor === "rgb(37, 99, 235)",
+        activeLeafBorderTopWidth: activeLeafStyles.borderTopWidth,
+        firstLeafBorderRight: firstLeafStyles.borderRightWidth,
+        firstLeafToSplitLeft: Math.round(firstLeafRect.left - splitRect.left),
+        firstLeafToSplitTop: Math.round(firstLeafRect.top - splitRect.top),
+        firstViewportBackground: firstViewportStyles.backgroundColor,
+        firstViewportToLeafRight: Math.round(firstLeafRect.right - firstViewportRect.right),
+        secondLeafBorderLeft: secondLeafStyles.borderLeftWidth,
+        splitToTreeBottom: Math.round(treeRect.bottom - splitRect.bottom),
+        splitToTreeLeft: Math.round(splitRect.left - treeRect.left),
+        splitToTreeTop: Math.round(splitRect.top - treeRect.top),
+        splitterBackgroundVisible: dividerStyles.backgroundColor !== "rgba(0, 0, 0, 0)",
+        splitterHitWidth: Math.round(dividerRect.width),
+        treePadding: [treeStyles.paddingTop, treeStyles.paddingRight, treeStyles.paddingBottom, treeStyles.paddingLeft],
+        treeToBodyLeft: Math.round(treeRect.left - bodyRect.left),
+        treeToBodyTop: Math.round(treeRect.top - bodyRect.top),
+        treeToSelector: Math.round(selectorRect.left - treeRect.right),
+      };
+    });
+    expect(splitMetrics).toEqual({
+      activeHeaderBoxShadow: "rgb(37, 99, 235) 0px 2px 0px 0px inset",
+      activeLeafBorderTopWidth: "0px",
+      activeLeftBorderUsesAccent: false,
+      firstLeafBorderRight: "0px",
+      firstLeafToSplitLeft: 0,
+      firstLeafToSplitTop: 0,
+      firstViewportBackground: "rgb(13, 17, 23)",
+      firstViewportToLeafRight: 0,
+      secondLeafBorderLeft: "0px",
+      splitToTreeBottom: 0,
+      splitToTreeLeft: 0,
+      splitToTreeTop: 0,
+      splitterBackgroundVisible: true,
+      splitterHitWidth: 3,
+      treePadding: ["0px", "0px", "0px", "0px"],
+      treeToBodyLeft: 0,
+      treeToBodyTop: 0,
+      treeToSelector: 0,
+    });
+
+    const readHeaderMetrics = () =>
+      page.evaluate(() =>
+        Array.from(document.querySelectorAll(".terminal-panel.bottom.open .terminal-leaf")).map((leaf) => {
+          const header = leaf.querySelector(".leaf-header");
+          const label = leaf.querySelector(".leaf-label")?.textContent ?? "";
+          if (!header) {
+            throw new Error("Missing terminal leaf header");
+          }
+          const headerRect = header.getBoundingClientRect();
+          const leafRect = leaf.getBoundingClientRect();
+          return {
+            active: leaf.classList.contains("active"),
+            headerBoxShadow: getComputedStyle(header).boxShadow,
+            headerHeight: Math.round(headerRect.height),
+            headerTop: Math.round(headerRect.top),
+            label,
+            leafTop: Math.round(leafRect.top),
+          };
+        }),
+      );
+    const beforeSwitch = await readHeaderMetrics();
+    const inactiveTitle = page.locator(".terminal-panel.bottom.open .terminal-leaf:not(.active) .leaf-title");
+    await expect(inactiveTitle).toHaveCount(1);
+    await inactiveTitle.click();
+    const afterSwitch = await readHeaderMetrics();
+    expect(
+      afterSwitch.map(({ headerHeight, headerTop, label, leafTop }) => ({
+        headerHeight,
+        headerTop,
+        label,
+        leafTop,
+      })),
+    ).toEqual(
+      beforeSwitch.map(({ headerHeight, headerTop, label, leafTop }) => ({
+        headerHeight,
+        headerTop,
+        label,
+        leafTop,
+      })),
+    );
+    expect(afterSwitch).toMatchObject([
+      {
+        active: true,
+        headerBoxShadow: "rgb(37, 99, 235) 0px 2px 0px 0px inset",
+        label: "Shell",
+      },
+      {
+        active: false,
+        headerBoxShadow: "none",
+        label: "Shell 2",
+      },
+    ]);
   });
 });
 
@@ -1948,6 +2274,31 @@ test.describe("sidebar toggle behavior", () => {
 
     // Sidebar should now be visible
     await expect(page.locator(".right-sidebar")).toBeVisible();
+    const workflowPanelMetrics = await page.evaluate(() => {
+      const handle = document.querySelector(".sidebar-resize-handle");
+      const tabPanel = document.querySelector(".workspace-stage .tabbed-panel-tab-panel.active");
+      const workspaceHome = document.querySelector(".workspace-stage .workspace-home");
+      if (!handle || !tabPanel || !workspaceHome) {
+        throw new Error("Missing handle, active panel, or workspace home");
+      }
+
+      const handleRect = handle.getBoundingClientRect();
+      const panelRect = tabPanel.getBoundingClientRect();
+      const homeRect = workspaceHome.getBoundingClientRect();
+      const panelStyles = getComputedStyle(tabPanel);
+      return {
+        handleWidth: Math.round(handleRect.width),
+        homeToPanelRight: Math.round(panelRect.right - homeRect.right),
+        homeToSplitter: Math.round(handleRect.left - homeRect.right),
+        panelOverflowY: panelStyles.overflowY,
+      };
+    });
+    expect(workflowPanelMetrics).toEqual({
+      handleWidth: 4,
+      homeToPanelRight: 0,
+      homeToSplitter: 1,
+      panelOverflowY: "hidden",
+    });
     // PR button should be active
     await expect(prBtn).toHaveClass(/active/);
   });
@@ -2828,7 +3179,7 @@ test.describe("delayed-response navigation", () => {
 
     await page.goto(`/terminal/${wsA.id}`);
     // A's session tab should be visible.
-    await expect(page.locator(".workspace-stage .group-tab-panel")).not.toHaveCount(0);
+    await expect(page.locator(".workspace-stage .tabbed-panel-tab-panel")).not.toHaveCount(0);
 
     await page
       .locator(".workspace-list-sidebar .ws-row", {
