@@ -303,13 +303,15 @@ func (s *Server) defaultPlatformHost() string {
 }
 
 // classifyResolveProblem maps a configured-repo resolve error to its wire
-// problem. Archived repos are caller-side validation; everything else is
-// an upstream provider failure.
+// problem. Archived repos are caller-side validation; everything else goes
+// through the shared provider mapping so a missing token during token-file
+// rotation surfaces as 400 badRequest like the sync and runtime paths,
+// not a 502 upstream error.
 func classifyResolveProblem(err error) huma.StatusError {
 	if errors.Is(err, ghclient.ErrConfiguredRepoArchived) {
 		return problemBadRequest(CodeBadRequest, err.Error(), nil)
 	}
-	return problemUpstream("GitHub API error: "+err.Error(), "github", "")
+	return providerCallProblem(err, "github", "")
 }
 
 func (s *Server) getSettings(
@@ -392,9 +394,15 @@ func (s *Server) refreshRuntimeTargetsLocked() {
 		return
 	}
 	tmuxCmd := s.cfg.TmuxCommand()
-	s.runtime.UpdateTargets(localruntime.ResolveLaunchTargets(
-		s.cfg.Agents, tmuxCmd, nil,
-	))
+	targets := localruntime.ResolveLaunchTargets(s.cfg.Agents, tmuxCmd, nil)
+	s.runtime.UpdateTargetsAndStripEnvVars(targets, s.cfg.TokenEnvNames())
+}
+
+func (s *Server) updateRuntimeStripEnvVars(cfg *config.Config) {
+	if s.runtime == nil || cfg == nil {
+		return
+	}
+	s.runtime.UpdateStripEnvVars(cfg.TokenEnvNames())
 }
 
 func (s *Server) addConfiguredRepo(

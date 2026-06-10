@@ -16,7 +16,9 @@ import (
 	gh "github.com/google/go-github/v84/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/middleman/internal/config"
 	ghclient "go.kenn.io/middleman/internal/github"
+	"go.kenn.io/middleman/internal/tokenauth"
 )
 
 // waitForConfigWatcher blocks until the server's config watcher has
@@ -185,6 +187,50 @@ name = "widget"
 token_env = "MIDDLEMAN_REPO_TOKEN"
 `
 
+const validReloadConfigChangedGitHubTokenEnv = `
+sync_interval = "5m"
+github_token_env = "MIDDLEMAN_NEW_GITHUB_TOKEN"
+host = "127.0.0.1"
+port = 8091
+
+[[repos]]
+owner = "acme"
+name = "widget"
+`
+
+const validReloadConfigPlatformTokenEnv = `
+sync_interval = "5m"
+github_token_env = "MIDDLEMAN_GITHUB_TOKEN"
+host = "127.0.0.1"
+port = 8091
+
+[[platforms]]
+type = "github"
+host = "github.com"
+token_env = "MIDDLEMAN_PLATFORM_TOKEN"
+
+[[repos]]
+owner = "acme"
+name = "widget"
+`
+
+const validReloadConfigPlatformAndRepoTokenEnv = `
+sync_interval = "5m"
+github_token_env = "MIDDLEMAN_GITHUB_TOKEN"
+host = "127.0.0.1"
+port = 8091
+
+[[platforms]]
+type = "github"
+host = "github.com"
+token_env = "MIDDLEMAN_PLATFORM_TOKEN"
+
+[[repos]]
+owner = "acme"
+name = "widget"
+token_env = "MIDDLEMAN_REPO_TOKEN"
+`
+
 const validReloadConfigGlobRepo = `
 sync_interval = "5m"
 github_token_env = "MIDDLEMAN_GITHUB_TOKEN"
@@ -328,12 +374,25 @@ func TestConfigReload_RestartRequiredOnStartupFieldChange(t *testing.T) {
 	assert.True(ev.RestartRequired, "sync_interval change should mark restart_required")
 }
 
-func TestConfigReload_RestartRequiredOnRepoTokenEnvChange(t *testing.T) {
+func TestConfigReload_TokenSourceChangeForExistingHostUpdatesSource(t *testing.T) {
 	assert := assert.New(t)
+	require := require.New(t)
+	t.Setenv("MIDDLEMAN_GITHUB_TOKEN", "old")
+	t.Setenv("MIDDLEMAN_REPO_TOKEN", "new")
 
 	srv, _, cfgPath := setupTestServerWithConfigContent(
 		t, validReloadConfig, &mockGH{},
 	)
+	sourceSet := tokenauth.NewSourceSet(tokenauth.Options{})
+	srv.cfgMu.Lock()
+	desc := srv.cfg.ResolveRepoTokenSource(srv.cfg.Repos[0])
+	srv.cfgMu.Unlock()
+	src := sourceSet.Upsert(desc)
+	srv.tokenSources = sourceSet
+	oldToken, err := src.Token(t.Context())
+	require.NoError(err)
+	assert.Equal("old", oldToken)
+
 	waitForConfigWatcher(t, srv, 2*time.Second)
 	stream := streamConfigEvents(t, srv)
 	defer stream.Close()
@@ -342,8 +401,474 @@ func TestConfigReload_RestartRequiredOnRepoTokenEnvChange(t *testing.T) {
 
 	ev := waitForConfigEvent(t, stream, 2*time.Second)
 	assert.True(ev.Valid)
-	assert.True(ev.RestartRequired,
-		"repo token_env change should mark restart_required")
+	assert.False(ev.RestartRequired,
+		"repo token_env change for a known provider host should hot-update")
+	newToken, err := src.Token(t.Context())
+	require.NoError(err)
+	assert.Equal("new", newToken)
+}
+
+func TestConfigReload_GitHubTokenEnvChangeUpdatesConfigSnapshot(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	t.Setenv("MIDDLEMAN_GITHUB_TOKEN", "old")
+	t.Setenv("MIDDLEMAN_NEW_GITHUB_TOKEN", "new")
+
+	srv, _, cfgPath := setupTestServerWithConfigContent(
+		t, validReloadConfig, &mockGH{},
+	)
+	sourceSet := tokenauth.NewSourceSet(tokenauth.Options{})
+	srv.cfgMu.Lock()
+	desc := srv.cfg.ResolveRepoTokenSource(srv.cfg.Repos[0])
+	srv.cfgMu.Unlock()
+	src := sourceSet.Upsert(desc)
+	srv.tokenSources = sourceSet
+	oldToken, err := src.Token(t.Context())
+	require.NoError(err)
+	assert.Equal("old", oldToken)
+
+	waitForConfigWatcher(t, srv, 2*time.Second)
+	stream := streamConfigEvents(t, srv)
+	defer stream.Close()
+
+	writeConfigToml(t, cfgPath, validReloadConfigChangedGitHubTokenEnv)
+
+	ev := waitForConfigEvent(t, stream, 2*time.Second)
+	assert.True(ev.Valid)
+	assert.False(ev.RestartRequired)
+	newToken, err := src.Token(t.Context())
+	require.NoError(err)
+	assert.Equal("new", newToken)
+
+	srv.cfgMu.Lock()
+	currentTokenEnv := srv.cfg.GitHubTokenEnv
+	savePath := filepath.Join(t.TempDir(), "saved.toml")
+	saveErr := srv.cfg.Save(savePath)
+	srv.cfgMu.Unlock()
+	require.NoError(saveErr)
+	assert.Equal("MIDDLEMAN_NEW_GITHUB_TOKEN", currentTokenEnv)
+
+	saved, err := config.Load(savePath)
+	require.NoError(err)
+	assert.Equal("MIDDLEMAN_NEW_GITHUB_TOKEN", saved.GitHubTokenEnv)
+}
+
+func TestConfigReload_InvalidTokenSourceKeepsLastKnownGoodSource(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	t.Setenv("MIDDLEMAN_GITHUB_TOKEN", "")
+	t.Setenv("MIDDLEMAN_REPO_TOKEN", "old")
+
+	srv, _, cfgPath := setupTestServerWithConfigContent(
+		t, validReloadConfigRepoTokenEnv, &mockGH{},
+	)
+	sourceSet := tokenauth.NewSourceSet(tokenauth.Options{})
+	srv.cfgMu.Lock()
+	desc := srv.cfg.ResolveRepoTokenSource(srv.cfg.Repos[0])
+	srv.cfgMu.Unlock()
+	src := sourceSet.Upsert(desc)
+	srv.tokenSources = sourceSet
+	oldToken, err := src.Token(t.Context())
+	require.NoError(err)
+	assert.Equal("old", oldToken)
+
+	waitForConfigWatcher(t, srv, 2*time.Second)
+	stream := streamConfigEvents(t, srv)
+	defer stream.Close()
+
+	writeConfigToml(t, cfgPath, `
+sync_interval = "5m"
+github_token_env = "MIDDLEMAN_GITHUB_TOKEN"
+host = "127.0.0.1"
+port = 8091
+
+[[repos]]
+owner = "acme"
+name = "widget"
+token_env = "MIDDLEMAN_MISSING_REPO_TOKEN"
+`)
+
+	ev := waitForConfigEvent(t, stream, 2*time.Second)
+	assert.False(ev.Valid)
+	assert.NotEmpty(ev.Error)
+
+	currentToken, err := src.Token(t.Context())
+	require.NoError(err)
+	assert.Equal("old", currentToken)
+
+	srv.cfgMu.Lock()
+	currentTokenEnv := srv.cfg.Repos[0].TokenEnv
+	srv.cfgMu.Unlock()
+	assert.Equal("MIDDLEMAN_REPO_TOKEN", currentTokenEnv)
+}
+
+func TestValidateReloadCloneTokenSourcesUsesRepoDescriptorForProviderHost(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "config.toml")
+	writeConfigToml(t, cfgPath, `
+github_token_env = "MIDDLEMAN_GITHUB_TOKEN"
+
+[[platforms]]
+type = "github"
+host = "github.com"
+token_env = "PLATFORM_TOKEN"
+
+[[repos]]
+owner = "acme"
+name = "widget"
+platform = "github"
+platform_host = "github.com"
+token_env = "REPO_TOKEN"
+`)
+	cfg, err := config.Load(cfgPath)
+	require.NoError(t, err)
+
+	require.NoError(t, validateReloadCloneTokenSources(cfg))
+}
+
+func TestValidateReloadCloneTokenSourcesAllowsEquivalentChainsOnSameHost(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "config.toml")
+	// Two providers share a self-hosted host. The forgejo repo's token_env
+	// repeats its platform fallback, producing the chain env:SHARED ->
+	// env:SHARED, while gitlab resolves to a plain env:SHARED. They name the
+	// same token, so the per-host clone-token check must compare canonical
+	// chains and accept the reload rather than flag a conflict.
+	writeConfigToml(t, cfgPath, `
+[[platforms]]
+type = "forgejo"
+host = "code.example.com"
+token_env = "SHARED"
+
+[[platforms]]
+type = "gitlab"
+host = "code.example.com"
+token_env = "SHARED"
+
+[[repos]]
+owner = "acme"
+name = "widget"
+platform = "forgejo"
+platform_host = "code.example.com"
+token_env = "SHARED"
+`)
+	cfg, err := config.Load(cfgPath)
+	require.NoError(t, err)
+
+	require.NoError(t, validateReloadCloneTokenSources(cfg))
+}
+
+func TestValidateReloadCloneTokenSourcesIgnoresCredentiallessPlatformHosts(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "config.toml")
+	// The forgejo entry has no token config and a non-default host, so its
+	// candidate chain is empty. It imposes no clone credential and must not
+	// conflict with the tokened gitlab entry on the same host.
+	writeConfigToml(t, cfgPath, `
+[[platforms]]
+type = "forgejo"
+host = "code.example.com"
+
+[[platforms]]
+type = "gitlab"
+host = "code.example.com"
+token_env = "SHARED"
+`)
+	cfg, err := config.Load(cfgPath)
+	require.NoError(t, err)
+
+	require.NoError(t, validateReloadCloneTokenSources(cfg))
+}
+
+// reloadTestTokenSources registers every provider token plan of the config
+// at cfgPath into a fresh SourceSet, mirroring startup registration, and
+// returns the set plus the source for the given key. Hosts whose plans
+// resolve a token also get the host-level clone source under
+// tokenauth.CloneKey, as buildProviderStartup registers at boot.
+func reloadTestTokenSources(
+	t *testing.T,
+	cfgPath string,
+	key tokenauth.Key,
+) (*tokenauth.SourceSet, tokenauth.Source) {
+	t.Helper()
+	cfg, err := config.Load(cfgPath)
+	require.NoError(t, err)
+	sourceSet := tokenauth.NewSourceSet(tokenauth.Options{})
+	resolvedHosts := make(map[string]struct{})
+	for _, plan := range cfg.ProviderTokenSources() {
+		src := sourceSet.Upsert(plan.Descriptor)
+		if _, err := src.Token(t.Context()); err == nil {
+			resolvedHosts[plan.Descriptor.Key.Host] = struct{}{}
+		}
+	}
+	for _, desc := range cfg.CloneTokenDescriptors() {
+		if _, ok := resolvedHosts[desc.Key.Host]; !ok {
+			continue
+		}
+		sourceSet.Upsert(desc)
+	}
+	src, ok := sourceSet.Get(key)
+	require.True(t, ok, "no source registered for %v", key)
+	return sourceSet, src
+}
+
+const reloadPlatformTokenConfig = `
+sync_interval = "5m"
+github_token_env = "MIDDLEMAN_GITHUB_TOKEN"
+host = "127.0.0.1"
+port = 8091
+
+[[platforms]]
+type = "gitlab"
+host = "gitlab.example.com"
+token_env = "MIDDLEMAN_PLATFORM_TOKEN"
+
+[[repos]]
+owner = "acme"
+name = "widget"
+`
+
+const reloadPlatformTokenlessConfig = `
+sync_interval = "5m"
+github_token_env = "MIDDLEMAN_GITHUB_TOKEN"
+host = "127.0.0.1"
+port = 8091
+
+[[platforms]]
+type = "gitlab"
+host = "gitlab.example.com"
+
+[[repos]]
+owner = "acme"
+name = "widget"
+`
+
+func TestConfigReload_RemovingPlatformTokenClearsLiveSource(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	t.Setenv("MIDDLEMAN_GITHUB_TOKEN", "github-token")
+	t.Setenv("MIDDLEMAN_PLATFORM_TOKEN", "platform-token")
+
+	srv, _, cfgPath := setupTestServerWithConfigContent(
+		t, reloadPlatformTokenConfig, &mockGH{},
+	)
+	sourceSet, src := reloadTestTokenSources(t, cfgPath, tokenauth.Key{
+		Platform: "gitlab", Host: "gitlab.example.com",
+	})
+	srv.tokenSources = sourceSet
+	bootToken, err := src.Token(t.Context())
+	require.NoError(err)
+	require.Equal("platform-token", bootToken)
+
+	waitForConfigWatcher(t, srv, 2*time.Second)
+	stream := streamConfigEvents(t, srv)
+	defer stream.Close()
+
+	writeConfigToml(t, cfgPath, reloadPlatformTokenlessConfig)
+
+	ev := waitForConfigEvent(t, stream, 2*time.Second)
+	assert.True(ev.Valid, "reload error: %s", ev.Error)
+	assert.False(ev.RestartRequired)
+	// The removal is hot-applied: the live source no longer resolves the
+	// credential that was deleted from the config file.
+	_, err = src.Token(t.Context())
+	require.ErrorIs(err, tokenauth.ErrMissingToken)
+}
+
+func TestConfigReload_TokenAddedForUnbuiltClientRequiresRestart(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	t.Setenv("MIDDLEMAN_GITHUB_TOKEN", "github-token")
+	t.Setenv("MIDDLEMAN_PLATFORM_TOKEN", "platform-token")
+
+	srv, _, cfgPath := setupTestServerWithConfigContent(
+		t, reloadPlatformTokenlessConfig, &mockGH{},
+	)
+	sourceSet, src := reloadTestTokenSources(t, cfgPath, tokenauth.Key{
+		Platform: "gitlab", Host: "gitlab.example.com",
+	})
+	srv.tokenSources = sourceSet
+	_, err := src.Token(t.Context())
+	require.ErrorIs(err, tokenauth.ErrMissingToken)
+
+	waitForConfigWatcher(t, srv, 2*time.Second)
+	stream := streamConfigEvents(t, srv)
+	defer stream.Close()
+
+	writeConfigToml(t, cfgPath, reloadPlatformTokenConfig)
+
+	ev := waitForConfigEvent(t, stream, 2*time.Second)
+	assert.True(ev.Valid, "reload error: %s", ev.Error)
+	// The token now resolves, but the gitlab host booted without a
+	// provider client and the reload cannot construct one — the event
+	// must say a restart is needed rather than report a clean hot apply.
+	assert.True(ev.RestartRequired)
+	newToken, err := src.Token(t.Context())
+	require.NoError(err)
+	assert.Equal("platform-token", newToken)
+}
+
+// Two providers share one host with the same credential chain — the only
+// multi-provider-per-host layout clone-token validation accepts.
+const reloadSharedHostBothTokensConfig = `
+sync_interval = "5m"
+github_token_env = "MIDDLEMAN_GITHUB_TOKEN"
+host = "127.0.0.1"
+port = 8091
+
+[[platforms]]
+type = "forgejo"
+host = "code.example.com"
+token_env = "MIDDLEMAN_SHARED_TOKEN"
+
+[[platforms]]
+type = "gitea"
+host = "code.example.com"
+token_env = "MIDDLEMAN_SHARED_TOKEN"
+
+[[repos]]
+owner = "acme"
+name = "widget"
+`
+
+// The forgejo entry went credential-less while gitea rotated to a new env
+// var, so the host's effective clone chain is gitea's surviving chain.
+const reloadSharedHostSurvivorRotatedConfig = `
+sync_interval = "5m"
+github_token_env = "MIDDLEMAN_GITHUB_TOKEN"
+host = "127.0.0.1"
+port = 8091
+
+[[platforms]]
+type = "forgejo"
+host = "code.example.com"
+
+[[platforms]]
+type = "gitea"
+host = "code.example.com"
+token_env = "MIDDLEMAN_ROTATED_TOKEN"
+
+[[repos]]
+owner = "acme"
+name = "widget"
+`
+
+const reloadSharedHostAllTokenlessConfig = `
+sync_interval = "5m"
+github_token_env = "MIDDLEMAN_GITHUB_TOKEN"
+host = "127.0.0.1"
+port = 8091
+
+[[platforms]]
+type = "forgejo"
+host = "code.example.com"
+
+[[platforms]]
+type = "gitea"
+host = "code.example.com"
+
+[[repos]]
+owner = "acme"
+name = "widget"
+`
+
+func TestConfigReload_SharedHostCloneSourceFollowsSurvivingProviderChain(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	t.Setenv("MIDDLEMAN_GITHUB_TOKEN", "github-token")
+	t.Setenv("MIDDLEMAN_SHARED_TOKEN", "shared-token")
+	t.Setenv("MIDDLEMAN_ROTATED_TOKEN", "rotated-token")
+
+	srv, _, cfgPath := setupTestServerWithConfigContent(
+		t, reloadSharedHostBothTokensConfig, &mockGH{},
+	)
+	sourceSet, cloneSrc := reloadTestTokenSources(
+		t, cfgPath, tokenauth.CloneKey("code.example.com"),
+	)
+	srv.tokenSources = sourceSet
+	bootToken, err := cloneSrc.Token(t.Context())
+	require.NoError(err)
+	require.Equal("shared-token", bootToken)
+
+	waitForConfigWatcher(t, srv, 2*time.Second)
+	stream := streamConfigEvents(t, srv)
+	defer stream.Close()
+
+	writeConfigToml(t, cfgPath, reloadSharedHostSurvivorRotatedConfig)
+
+	// RestartRequired is not asserted: this fixture's syncer has no
+	// readers for code.example.com, so the resolving gitea token trips
+	// the client-rebuild flag. The shared-host e2e covers the flag with
+	// live provider clients.
+	ev := waitForConfigEvent(t, stream, 2*time.Second)
+	assert.True(ev.Valid, "reload error: %s", ev.Error)
+	// Clone auth must follow the host's surviving effective chain, not
+	// stay pinned to the forgejo entry that lost its token.
+	newToken, err := cloneSrc.Token(t.Context())
+	require.NoError(err)
+	assert.Equal("rotated-token", newToken)
+}
+
+func TestConfigReload_SharedHostCloneSourceClearsWhenAllTokensRemoved(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	t.Setenv("MIDDLEMAN_GITHUB_TOKEN", "github-token")
+	t.Setenv("MIDDLEMAN_SHARED_TOKEN", "shared-token")
+
+	srv, _, cfgPath := setupTestServerWithConfigContent(
+		t, reloadSharedHostBothTokensConfig, &mockGH{},
+	)
+	sourceSet, cloneSrc := reloadTestTokenSources(
+		t, cfgPath, tokenauth.CloneKey("code.example.com"),
+	)
+	srv.tokenSources = sourceSet
+	bootToken, err := cloneSrc.Token(t.Context())
+	require.NoError(err)
+	require.Equal("shared-token", bootToken)
+
+	waitForConfigWatcher(t, srv, 2*time.Second)
+	stream := streamConfigEvents(t, srv)
+	defer stream.Close()
+
+	writeConfigToml(t, cfgPath, reloadSharedHostAllTokenlessConfig)
+
+	ev := waitForConfigEvent(t, stream, 2*time.Second)
+	assert.True(ev.Valid, "reload error: %s", ev.Error)
+	assert.False(ev.RestartRequired)
+	// Every provider on the host went credential-less, so clone auth
+	// fails closed instead of keeping the removed credential.
+	_, err = cloneSrc.Token(t.Context())
+	require.ErrorIs(err, tokenauth.ErrMissingToken)
+}
+
+func TestConfigReload_RepoTokenOverrideWithPlatformFallbackUpdatesSource(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	t.Setenv("MIDDLEMAN_PLATFORM_TOKEN", "platform-token")
+	t.Setenv("MIDDLEMAN_REPO_TOKEN", "repo-token")
+
+	srv, _, cfgPath := setupTestServerWithConfigContent(
+		t, validReloadConfigPlatformTokenEnv, &mockGH{},
+	)
+	sourceSet := tokenauth.NewSourceSet(tokenauth.Options{})
+	srv.cfgMu.Lock()
+	desc := srv.cfg.ResolveRepoTokenSource(srv.cfg.Repos[0])
+	srv.cfgMu.Unlock()
+	src := sourceSet.Upsert(desc)
+	srv.tokenSources = sourceSet
+	oldToken, err := src.Token(t.Context())
+	require.NoError(err)
+	assert.Equal("platform-token", oldToken)
+
+	waitForConfigWatcher(t, srv, 2*time.Second)
+	stream := streamConfigEvents(t, srv)
+	defer stream.Close()
+
+	writeConfigToml(t, cfgPath, validReloadConfigPlatformAndRepoTokenEnv)
+
+	ev := waitForConfigEvent(t, stream, 2*time.Second)
+	assert.True(ev.Valid)
+	assert.False(ev.RestartRequired)
+	newToken, err := src.Token(t.Context())
+	require.NoError(err)
+	assert.Equal("repo-token", newToken)
 }
 
 func TestConfigReload_InvalidConfigKeepsLastKnownGood(t *testing.T) {
@@ -393,6 +918,20 @@ func TestConfigReload_MalformedTomlDoesNotCrash(t *testing.T) {
 	assert.False(ev.Valid)
 	assert.Contains(strings.ToLower(ev.Error), "config.toml",
 		"parse error should reference the sanitized config path")
+}
+
+func TestSanitizeConfigErrorRedactsTokenMaterial(t *testing.T) {
+	assert := assert.New(t)
+
+	got := sanitizeConfigError(
+		errors.New("open /home/me/.config/middleman/config.toml: https://x-access-token:ghp_config_secret@github.com/acme/widgets.git failed"),
+		"/home/me/.config/middleman/config.toml",
+	)
+
+	assert.Contains(got, "config.toml")
+	assert.Contains(got, "[REDACTED]")
+	assert.NotContains(got, "ghp_config_secret")
+	assert.NotContains(got, "x-access-token")
 }
 
 func TestConfigReload_NewRepoEntersSyncerTrackedSet(t *testing.T) {
