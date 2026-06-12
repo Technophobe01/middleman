@@ -221,6 +221,86 @@ local = true
 	assert.Contains(body.Daemons[0].Hint, "kata daemon start")
 }
 
+func TestKataDaemonsEndpointDoesNotReportAuthRequiredForLocalNoAuthDaemon(t *testing.T) {
+	assert := Assert.New(t)
+
+	daemon := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer daemon.Close()
+
+	home := t.TempDir()
+	t.Setenv("KATA_HOME", home)
+	t.Setenv("KATA_DB", "")
+	writeKataServerCatalog(t, home, `
+[[daemon]]
+name = "local"
+local = true
+`)
+	writeKataProxyRuntimeRecord(t, daemon.URL)
+	srv, _ := setupTestServer(t)
+
+	got := requestKataDaemonsByID(t, srv)
+
+	assert.Equal("none", got["local"].Auth)
+	assert.Equal("down", got["local"].Health)
+}
+
+func TestKataDaemonsEndpointLocalDaemonDoesNotUseTokenAuth(t *testing.T) {
+	assert := Assert.New(t)
+
+	daemon := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Empty(r.Header.Get("Authorization"))
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer daemon.Close()
+
+	home := t.TempDir()
+	t.Setenv("KATA_HOME", home)
+	t.Setenv("KATA_DB", "")
+	writeKataServerCatalog(t, home, `
+[[daemon]]
+name = "local"
+local = true
+token = "local-secret"
+`)
+	writeKataProxyRuntimeRecord(t, daemon.URL)
+	srv, _ := setupTestServer(t)
+
+	got := requestKataDaemonsByID(t, srv)
+
+	assert.Equal("none", got["local"].Auth)
+	assert.Equal("connected", got["local"].Health)
+}
+
+func TestKataDaemonsEndpointLocalDaemonIgnoresTokenEnv(t *testing.T) {
+	assert := Assert.New(t)
+
+	daemon := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Empty(r.Header.Get("Authorization"))
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer daemon.Close()
+
+	home := t.TempDir()
+	t.Setenv("KATA_HOME", home)
+	t.Setenv("KATA_DB", "")
+	t.Setenv("MIDDLEMAN_KATA_MISSING_TOKEN", "")
+	writeKataServerCatalog(t, home, `
+[[daemon]]
+name = "local"
+local = true
+token_env = "MIDDLEMAN_KATA_MISSING_TOKEN"
+`)
+	writeKataProxyRuntimeRecord(t, daemon.URL)
+	srv, _ := setupTestServer(t)
+
+	got := requestKataDaemonsByID(t, srv)
+
+	assert.Equal("none", got["local"].Auth)
+	assert.Equal("connected", got["local"].Health)
+}
+
 func TestKataDaemonsEndpointRedactsMalformedTargetErrors(t *testing.T) {
 	assert := Assert.New(t)
 	require := require.New(t)
@@ -360,6 +440,84 @@ url = "`+upstream.URL+`"
 	requestKataDaemons(t, srv)
 
 	assert.Equal(int32(1), probes.Load())
+}
+
+func TestKataDaemonsEndpointHealthCacheSeparatesLocalAndRemoteMode(t *testing.T) {
+	assert := Assert.New(t)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer upstream.Close()
+
+	home := t.TempDir()
+	t.Setenv("KATA_HOME", home)
+	t.Setenv("KATA_DB", "")
+	writeKataServerCatalog(t, home, `
+[[daemon]]
+name = "home"
+url = "`+upstream.URL+`"
+`)
+	srv, _ := setupTestServer(t)
+
+	got := requestKataDaemonsByID(t, srv)
+	assert.Equal("auth_required", got["home"].Health)
+
+	writeKataServerCatalog(t, home, `
+[[daemon]]
+name = "home"
+local = true
+`)
+	writeKataProxyRuntimeRecord(t, upstream.URL)
+
+	got = requestKataDaemonsByID(t, srv)
+	assert.Equal("down", got["home"].Health)
+}
+
+func TestKataDaemonsEndpointHealthCacheSeparatesRemoteTokens(t *testing.T) {
+	assert := Assert.New(t)
+
+	var mu sync.Mutex
+	authorizations := []string{}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		mu.Lock()
+		authorizations = append(authorizations, auth)
+		mu.Unlock()
+		if auth == "Bearer first-secret" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer upstream.Close()
+
+	home := t.TempDir()
+	t.Setenv("KATA_HOME", home)
+	writeKataServerCatalog(t, home, `
+[[daemon]]
+name = "home"
+url = "`+upstream.URL+`"
+token = "first-secret"
+`)
+	srv, _ := setupTestServer(t)
+
+	got := requestKataDaemonsByID(t, srv)
+	assert.Equal("connected", got["home"].Health)
+
+	writeKataServerCatalog(t, home, `
+[[daemon]]
+name = "home"
+url = "`+upstream.URL+`"
+token = "second-secret"
+`)
+
+	got = requestKataDaemonsByID(t, srv)
+	assert.Equal("auth_required", got["home"].Health)
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal([]string{"Bearer first-secret", "Bearer second-secret"}, authorizations)
 }
 
 func TestKataDaemonsEndpointHealthOverTrailingSlashURL(t *testing.T) {

@@ -62,7 +62,7 @@
   }
 
   type SplitOrientation = "vertical" | "horizontal";
-  type KataConnectionTone = "offline" | "connecting" | "online" | "error";
+  type FailureSurface = "request" | "daemon" | "none";
 
   let {
     api = undefined,
@@ -78,6 +78,8 @@
   let viewLoading = $state(false);
   let viewLoadingGeneration = 0;
   let error = $state<string | null>(null);
+  let requestError = $state<string | null>(null);
+  let lastTaskError: string | null = null;
   let unlinkBusyIds = $state<ReadonlySet<number>>(new Set());
   let unlinkError = $state<string | null>(null);
   let daemonInfos = $state.raw<KataDaemonInfo[]>([]);
@@ -152,9 +154,31 @@
     viewLoading = false;
   }
 
-  async function runViewTask(task: () => Promise<void | boolean>): Promise<boolean> {
-    const loadingGeneration = beginViewLoading();
+  function kataRequestErrorMessage(err: unknown): string {
+    return err instanceof Error ? err.message : "Kata request failed.";
+  }
+
+  function clearTaskErrors(): void {
     error = null;
+    requestError = null;
+    lastTaskError = null;
+  }
+
+  function surfaceTaskError(message: string, surface: FailureSurface): void {
+    lastTaskError = message;
+    if (surface === "request") {
+      requestError = message;
+    } else if (surface === "daemon") {
+      error = message;
+    }
+  }
+
+  async function runViewTask(
+    task: () => Promise<void | boolean>,
+    failureSurface: FailureSurface = "request",
+  ): Promise<boolean> {
+    const loadingGeneration = beginViewLoading();
+    clearTaskErrors();
     const expansionSignature = currentExpansionSignature();
     try {
       const ok = (await task()) ?? true;
@@ -163,20 +187,23 @@
       }
       return ok;
     } catch (err) {
-      error = err instanceof Error ? err.message : "Kata request failed.";
+      surfaceTaskError(kataRequestErrorMessage(err), failureSurface);
       return false;
     } finally {
       endViewLoading(loadingGeneration);
     }
   }
 
-  async function runViewTaskOrThrow(task: () => Promise<void>): Promise<void> {
+  async function runViewTaskOrThrow(
+    task: () => Promise<void>,
+    failureSurface: FailureSurface = "request",
+  ): Promise<void> {
     const loadingGeneration = beginViewLoading();
-    error = null;
+    clearTaskErrors();
     try {
       await task();
     } catch (err) {
-      error = err instanceof Error ? err.message : "Kata request failed.";
+      surfaceTaskError(kataRequestErrorMessage(err), failureSurface);
       throw err;
     } finally {
       endViewLoading(loadingGeneration);
@@ -363,34 +390,10 @@
     return selectedProjectName() ?? systemViews.find((view) => view.name === store.currentView.name)?.label ?? "Kata";
   }
 
-  function activeDaemonLabel(): string {
-    return activeKataDaemonId ?? "Kata daemon";
-  }
-
-  function connectionLabel(): string {
+  function activeDaemonStatusLabel(): string | undefined {
     if (error) return error;
-    if (store.connection.status === "error") return store.connection.message ?? "Connection failed";
-    if (loading || store.connection.status === "connecting") return `Connecting - ${activeDaemonLabel()}`;
-    return "Connected";
-  }
-
-  function connectionTitle(): string {
-    if (error) return error;
-    if (store.connection.status === "error") return store.connection.message ?? "Connection failed";
-    if (store.connection.status === "online") return `Connected - ${activeDaemonLabel()}`;
-    if (loading || store.connection.status === "connecting") return `Connecting - ${activeDaemonLabel()}`;
-    return activeDaemonLabel();
-  }
-
-  function showVisibleConnectionStatus(): boolean {
-    const tone = connectionTone();
-    return tone === "connecting" || tone === "error";
-  }
-
-  function connectionTone(): KataConnectionTone {
-    if (error) return "error";
-    if (loading && store.connection.status !== "error") return "connecting";
-    return store.connection.status;
+    if (store.connection.status !== "error") return undefined;
+    return store.connection.message ?? "Connection failed";
   }
 
   function resetIssueExpansion(): void {
@@ -572,7 +575,7 @@
       const ok = await runViewTask(async () => {
         await store.bootstrap(previousView);
         store.resetSearchFilters();
-      });
+      }, "daemon");
       if (!ok) {
         setActiveKataDaemon(previousExplicitDaemon);
         const restored = await runViewTask(async () => {
@@ -585,7 +588,7 @@
           if (previousIssueUID && store.selectedIssue?.issue.uid !== previousIssueUID) {
             await store.selectIssue(previousIssueUID);
           }
-        });
+        }, "daemon");
         if (restored) {
           await store.syncEventCursor();
         }
@@ -672,13 +675,13 @@
   async function createRecurrence(projectID: number, input: KataCreateRecurrenceInput): Promise<void> {
     await runViewTaskOrThrow(async () => {
       await store.createRecurrence(projectID, input);
-    });
+    }, "none");
   }
 
   async function patchRecurrence(id: number, input: KataPatchRecurrenceInput, etag: string): Promise<void> {
     await runViewTaskOrThrow(async () => {
       await store.patchRecurrence(id, input, etag);
-    });
+    }, "none");
   }
 
   async function deleteRecurrence(recurrence: KataRecurrence): Promise<boolean> {
@@ -722,9 +725,9 @@
     unlinkBusyIds = new Set(links.map((item) => item.message_id));
     unlinkError = null;
     try {
-      const ok = await runViewTask(() => store.patchMetadata(uid, actor, metadataPatch));
+      const ok = await runViewTask(() => store.patchMetadata(uid, actor, metadataPatch), "none");
       if (!ok) {
-        unlinkError = error || "Could not unlink message.";
+        unlinkError = lastTaskError || "Could not unlink message.";
       }
     } finally {
       unlinkBusyIds = new Set();
@@ -736,29 +739,18 @@
   <header class="kata-header">
     <div class="kata-header-title">
       <h1 id="kata-title">Kata</h1>
-      {#if daemonInfos.length > 1}
+      {#if daemonInfos.length > 0}
         <KataDaemonSwitcher
           daemons={daemonInfos}
           activeId={activeKataDaemonId}
+          activeStatusLabel={activeDaemonStatusLabel()}
+          activeStatusTone={activeDaemonStatusLabel() ? "error" : undefined}
           onSelect={(id) => {
             void switchKataDaemon(id);
           }}
         />
-      {/if}
-      {#if showVisibleConnectionStatus()}
-        <span
-          class="daemon-status"
-          role="status"
-          title={connectionTitle()}
-          aria-label={`Connection: ${connectionTone()}`}
-        >
-          <span class={`daemon-status-dot daemon-status-dot--${connectionTone()}`} aria-hidden="true"></span>
-          <span class="daemon-status-label">{connectionLabel()}</span>
-        </span>
-      {:else}
-        <span class="daemon-status-sr" role="status" aria-label={`Connection: ${connectionTone()}`}>
-          {connectionLabel()}
-        </span>
+      {:else if activeDaemonStatusLabel()}
+        <span class="daemon-fallback-status" role="alert">{activeDaemonStatusLabel()}</span>
       {/if}
     </div>
     <div class="kata-header-actions">
@@ -783,6 +775,10 @@
       </button>
     </div>
   </header>
+
+  {#if requestError}
+    <p class="kata-request-error" role="alert">{requestError}</p>
+  {/if}
 
   <div class="kata-layout">
     <KataSidebar
@@ -942,11 +938,33 @@
     line-height: 1.2;
   }
 
+  .daemon-fallback-status {
+    min-width: 0;
+    max-width: min(420px, 48vw);
+    color: var(--accent-red);
+    font-size: var(--font-size-sm);
+    line-height: 1.3;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
   .kata-header-actions {
     display: flex;
     align-items: center;
     gap: 10px;
     flex: 0 0 auto;
+  }
+
+  .kata-request-error {
+    margin: 10px 20px 0;
+    padding: 8px 10px;
+    border: 1px solid color-mix(in srgb, var(--accent-red) 42%, var(--border-default));
+    border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--accent-red) 9%, var(--bg-primary));
+    color: var(--accent-red);
+    font-size: var(--font-size-sm);
+    line-height: 1.35;
   }
 
   .header-action {
@@ -975,59 +993,6 @@
     background: var(--bg-surface-hover);
     color: var(--text-primary);
     outline: none;
-  }
-
-  .daemon-status {
-    min-width: 0;
-    max-width: min(42vw, 460px);
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    color: var(--text-muted);
-    font-size: var(--font-size-sm);
-  }
-
-  .daemon-status-dot {
-    width: 8px;
-    height: 8px;
-    border-radius: var(--radius-pill);
-    background: var(--text-faint);
-    flex: 0 0 auto;
-  }
-
-  .daemon-status-dot--online {
-    background: var(--accent-green);
-  }
-
-  .daemon-status-dot--connecting {
-    background: var(--accent-amber);
-  }
-
-  .daemon-status-dot--error {
-    background: var(--accent-red);
-  }
-
-  .daemon-status-label {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .daemon-status-dot--error + .daemon-status-label {
-    color: var(--accent-red);
-  }
-
-  .daemon-status-sr {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    padding: 0;
-    margin: -1px;
-    overflow: hidden;
-    clip: rect(0, 0, 0, 0);
-    white-space: nowrap;
-    border: 0;
   }
 
   .kata-layout {
