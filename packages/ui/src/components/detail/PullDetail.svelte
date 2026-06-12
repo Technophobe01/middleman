@@ -42,10 +42,13 @@
   import PackagePlusIcon from "@lucide/svelte/icons/package-plus";
   import RefreshCwIcon from "@lucide/svelte/icons/refresh-cw";
   import TagsIcon from "@lucide/svelte/icons/tags";
+  import UserCheckIcon from "@lucide/svelte/icons/user-check";
+  import UsersIcon from "@lucide/svelte/icons/users";
   import XIcon from "@lucide/svelte/icons/x";
   import Chip from "../shared/Chip.svelte";
   import GitHubLabels from "../shared/GitHubLabels.svelte";
   import LabelPicker from "./LabelPicker.svelte";
+  import UserListEditor from "./UserListEditor.svelte";
   import { loadLabelCatalogWithRefresh } from "./labelCatalogRefresh.js";
   import {
     labelPickerCommandMatches,
@@ -106,6 +109,8 @@
     ready_for_review: true,
     issue_mutation: true,
     label_mutation: false,
+    assignee_mutation: false,
+    reviewer_mutation: false,
     thread_reply: false,
     thread_resolve: false,
     review_draft_mutation: false,
@@ -741,6 +746,8 @@
     ),
   );
   const labels = $derived(detailStore.getDetail()?.merge_request?.labels ?? []);
+  const prAssignees = $derived(detailStore.getDetail()?.merge_request?.assignees ?? []);
+  const prReviewers = $derived(detailStore.getDetail()?.merge_request?.requested_reviewers ?? []);
   let labelPickerOpen = $state(false);
   let labelCatalog = $state<Label[]>([]);
   let labelCatalogSyncing = $state(false);
@@ -905,6 +912,22 @@
     } finally {
       pendingLabel = null;
     }
+  }
+
+  async function loadUserCandidates(query: string): Promise<string[]> {
+    const { data, error } = await client.GET(
+      providerRepoPath(routeRef, "/comment-autocomplete"),
+      {
+        params: {
+          path: providerRouteParams(routeRef),
+          query: { trigger: "@", q: query, limit: 25 },
+        },
+      },
+    );
+    if (error) {
+      throw new Error(error.detail ?? error.title ?? "failed to load users");
+    }
+    return data?.users ?? [];
   }
 
   function onActionMenuKeydown(e: KeyboardEvent): void {
@@ -1480,6 +1503,31 @@
             {@render labelActionButton()}
           </div>
         {/if}
+        <UserListEditor
+          label="Assignees"
+          users={prAssignees}
+          canEdit={capabilities.assignee_mutation}
+          disabled={stalePR}
+          loadCandidates={loadUserCandidates}
+          onchange={(next) => detailStore.setPullAssignees(owner, name, number, next)}
+        >
+          {#snippet icon()}
+            <UsersIcon size={12} aria-hidden="true" />
+          {/snippet}
+        </UserListEditor>
+        <UserListEditor
+          label="Reviewers"
+          users={prReviewers}
+          canEdit={capabilities.reviewer_mutation}
+          disabled={stalePR}
+          tooltipNote="User review requests only; team requests are not shown"
+          loadCandidates={loadUserCandidates}
+          onchange={(next) => detailStore.setPullReviewers(owner, name, number, next)}
+        >
+          {#snippet icon()}
+            <UserCheckIcon size={12} aria-hidden="true" />
+          {/snippet}
+        </UserListEditor>
         {#if labelPickerOpen}
           {#if labelPickerLaunchedFromActionMenu}
             <div class="label-editor-backdrop" aria-hidden="true"></div>

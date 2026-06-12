@@ -105,6 +105,27 @@ type LabelMutator interface {
 	SetIssueLabels(ctx context.Context, ref RepoRef, number int, names []string) ([]Label, error)
 }
 
+// AssigneeMutator replaces the full assignee username set on a merge
+// request or issue and returns the provider-normalized assignee list.
+type AssigneeMutator interface {
+	SetMergeRequestAssignees(ctx context.Context, ref RepoRef, number int, usernames []string) ([]string, error)
+	SetIssueAssignees(ctx context.Context, ref RepoRef, number int, usernames []string) ([]string, error)
+}
+
+// ReviewerMutator requests reviews from users on a merge request and
+// removes pending review requests. Both calls return the full updated
+// requested-reviewer username list after the mutation. Requesting an
+// empty username list is a read: it mutates nothing and returns the
+// provider's current requested-reviewer set, so callers can diff a
+// desired set against live provider state instead of cached state.
+// All usernames, in both directions, are individual user logins;
+// implementations must exclude team or group reviewer identities so a
+// caller-computed removal diff never targets an unsupported identity.
+type ReviewerMutator interface {
+	RequestMergeRequestReviewers(ctx context.Context, ref RepoRef, number int, usernames []string) ([]string, error)
+	RemoveMergeRequestReviewers(ctx context.Context, ref RepoRef, number int, usernames []string) ([]string, error)
+}
+
 type ReviewMutator interface {
 	ApproveMergeRequest(ctx context.Context, ref RepoRef, number int, body string) (MergeRequestEvent, error)
 }
