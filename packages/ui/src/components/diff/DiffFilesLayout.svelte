@@ -1,7 +1,8 @@
 <script lang="ts">
   import SplitResizeHandle from "../shared/SplitResizeHandle.svelte";
-  import type { ProviderCapabilities } from "../../api/types.js";
+  import type { ProviderCapabilities, RepoOperations } from "../../api/types.js";
   import type { SplitResizeEvent } from "../shared/split-resize.js";
+  import { operationGate } from "../detail/operation-gates.js";
   import DiffSidebar from "./DiffSidebar.svelte";
   import DiffToolbar from "./DiffToolbar.svelte";
   import DiffView from "./DiffView.svelte";
@@ -16,6 +17,10 @@
     number: number;
     diffHeadSHA?: string | undefined;
     capabilities?: ProviderCapabilities | undefined;
+    /** Per-operation mutation availability from the detail payload;
+     * gates review publishing and thread replies alongside the
+     * capability flags. Absent entries gate nothing. */
+    operations?: RepoOperations | undefined;
     reviewThreads?: ReviewThread[];
     initialScrollTop?: number;
     onScrollTopChange?: ((scrollTop: number) => void) | undefined;
@@ -30,10 +35,23 @@
     number,
     diffHeadSHA = undefined,
     capabilities = undefined,
+    operations = undefined,
     reviewThreads = [],
     initialScrollTop = 0,
     onScrollTopChange,
   }: Props = $props();
+
+  const reviewDraftGate = $derived(operationGate(operations?.review_draft));
+  const replyThreadGate = $derived(operationGate(operations?.reply_review_thread));
+  // When the provider supports review authoring but the operation is
+  // unavailable (missing write credential, rate limit), the authoring
+  // affordances disappear — surface why instead of leaving the user
+  // guessing.
+  const reviewUnavailableReason = $derived(
+    (capabilities?.review_draft_mutation ?? false) && reviewDraftGate.unavailable
+      ? reviewDraftGate.reason
+      : undefined,
+  );
 
   const storageKey = "diff-file-tree-width";
   const defaultFileTreeWidth = 280;
@@ -172,8 +190,11 @@
         {number}
         {diffHeadSHA}
         {reviewThreads}
-        reviewDraftMutation={capabilities?.review_draft_mutation ?? false}
-        canReplyToThreads={capabilities?.thread_reply ?? false}
+        reviewDraftMutation={(capabilities?.review_draft_mutation ?? false)
+          && !reviewDraftGate.unavailable}
+        canReplyToThreads={(capabilities?.thread_reply ?? false)
+          && !replyThreadGate.unavailable}
+        {reviewUnavailableReason}
         supportedReviewActions={capabilities?.supported_review_actions ?? []}
         nativeMultilineRanges={capabilities?.native_multiline_ranges ?? false}
         {initialScrollTop}

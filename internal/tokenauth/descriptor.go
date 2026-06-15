@@ -12,6 +12,7 @@ const (
 	SourceKindEnv       SourceKind = "env"
 	SourceKindFile      SourceKind = "file"
 	SourceKindGitHubCLI SourceKind = "github_cli"
+	SourceKindGitHubApp SourceKind = "github_app"
 )
 
 type Key struct {
@@ -43,6 +44,11 @@ type Candidate struct {
 	EnvName  string
 	FilePath string
 	Host     string
+
+	// GitHub App installation token minting (SourceKindGitHubApp).
+	// Host carries the platform host; FilePath the private key path.
+	AppID          int64
+	InstallationID int64
 }
 
 func (c Candidate) SafeString() string {
@@ -53,6 +59,8 @@ func (c Candidate) SafeString() string {
 		return fmt.Sprintf("file:%s", c.FilePath)
 	case SourceKindGitHubCLI:
 		return fmt.Sprintf("github_cli:%s", c.Host)
+	case SourceKindGitHubApp:
+		return fmt.Sprintf("github_app:%d@%s", c.AppID, c.Host)
 	default:
 		return string(c.Kind)
 	}
@@ -73,6 +81,21 @@ func (d Descriptor) EqualSource(other Descriptor) bool {
 
 func (d Descriptor) SafeString() string {
 	return joinCandidateStrings(d.Candidates)
+}
+
+// HasActiveGitHubApp reports whether this chain resolves reads through
+// a GitHub App installation token. Consumers use it to decide
+// split-credential behavior (separate write credential, viewer
+// permission overlays); deriving it from the descriptor rather than
+// static config keeps the answer correct when a reload re-points the
+// chain or when repo-level overrides exclude the app candidate.
+func (d Descriptor) HasActiveGitHubApp() bool {
+	for _, candidate := range d.Candidates {
+		if candidate.Kind == SourceKindGitHubApp && candidate.InstallationID != 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // CanonicalSourceString returns a stable identifier for the descriptor's
@@ -122,6 +145,14 @@ func canonicalCandidate(candidate Candidate) Candidate {
 		return Candidate{Kind: candidate.Kind, FilePath: candidate.FilePath}
 	case SourceKindGitHubCLI:
 		return Candidate{Kind: candidate.Kind, Host: candidate.Host}
+	case SourceKindGitHubApp:
+		return Candidate{
+			Kind:           candidate.Kind,
+			Host:           candidate.Host,
+			FilePath:       candidate.FilePath,
+			AppID:          candidate.AppID,
+			InstallationID: candidate.InstallationID,
+		}
 	default:
 		return candidate
 	}

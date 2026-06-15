@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -177,6 +178,24 @@ func graphQLEndpointForHost(platformHost string) string {
 
 }
 
+// ClientOption adjusts NewClient construction.
+type ClientOption func(*clientOptions)
+
+type clientOptions struct {
+	baseURLOverride string
+}
+
+// WithBaseURLForTesting points the client's REST and GraphQL traffic
+// at a local fake server (GHES-shaped /api/v3 and /api/graphql
+// paths). Wire-level tests use it to exercise the real transport
+// stack, including the read/write credential split, against an
+// httptest server.
+func WithBaseURLForTesting(base string) ClientOption {
+	return func(o *clientOptions) {
+		o.baseURLOverride = strings.TrimRight(base, "/")
+	}
+}
+
 // NewClient creates a GitHub Client authenticated with the given
 // token source. platformHost selects the API endpoint: "" or "github.com"
 // uses the public API; any other value creates an Enterprise
@@ -186,13 +205,22 @@ func NewClient(
 	platformHost string,
 	rateTracker *RateTracker,
 	budget *SyncBudget,
+	opts ...ClientOption,
 ) (Client, error) {
+	var options clientOptions
+	for _, opt := range opts {
+		opt(&options)
+	}
+	allowedOrigin := restAPIOriginForHost(platformHost)
+	if options.baseURLOverride != "" {
+		allowedOrigin = options.baseURLOverride
+	}
 	authRT := tokenauth.AuthTransport{
 		Source:              source,
 		Base:                http.DefaultTransport,
 		SetHeader:           tokenauth.BearerAuthHeader,
 		RetryOnUnauthorized: true,
-		AllowedOrigin:       restAPIOriginForHost(platformHost),
+		AllowedOrigin:       allowedOrigin,
 	}
 	et := &etagTransport{base: authRT}
 	var transport http.RoundTripper = et
@@ -200,31 +228,73 @@ func NewClient(
 		transport = &budgetTransport{base: transport, budget: budget}
 	}
 	httpClient := &http.Client{Transport: wrapPublicGitHubAPIGuard(transport)}
+	// Mutations resolve auth with the mutation marker so a configured
+	// GitHub App is skipped and writes stay attributed to the user's
+	// own credential. The write path is a separate gh.Client because
+	// go-github caches rate limits per client instance: sharing one
+	// client would let an exhausted PAT (reported by a write response)
+	// preemptively block app-token reads until the PAT window resets.
+	// No etag or sync-budget transports: those exist for sync reads.
+	writeHTTPClient := &http.Client{Transport: wrapPublicGitHubAPIGuard(
+		mutationAuthTransport{base: authRT},
+	)}
 
-	var ghClient *gh.Client
-	if platformHost == "" || platformHost == "github.com" {
-		ghClient = gh.NewClient(httpClient)
-	} else {
-		baseURL := "https://" + platformHost + "/api/v3/"
-		uploadURL := "https://" + platformHost +
-			"/api/uploads/"
-		var err error
-		ghClient, err = gh.NewClient(httpClient).
-			WithEnterpriseURLs(baseURL, uploadURL)
-		if err != nil {
-			return nil, fmt.Errorf(
-				"create enterprise client: %w", err,
+	newGHClient := func(hc *http.Client) (*gh.Client, error) {
+		if options.baseURLOverride != "" {
+			return gh.NewClient(hc).WithEnterpriseURLs(
+				options.baseURLOverride+"/api/v3/",
+				options.baseURLOverride+"/api/uploads/",
 			)
 		}
+		if platformHost == "" || platformHost == "github.com" {
+			return gh.NewClient(hc), nil
+		}
+		baseURL := "https://" + platformHost + "/api/v3/"
+		uploadURL := "https://" + platformHost + "/api/uploads/"
+		client, err := gh.NewClient(hc).WithEnterpriseURLs(baseURL, uploadURL)
+		if err != nil {
+			return nil, fmt.Errorf("create enterprise client: %w", err)
+		}
+		return client, nil
+	}
+	ghClient, err := newGHClient(httpClient)
+	if err != nil {
+		return nil, err
+	}
+	ghWriteClient, err := newGHClient(writeHTTPClient)
+	if err != nil {
+		return nil, err
+	}
+	graphQLEndpoint := graphQLEndpointForHost(platformHost)
+	if options.baseURLOverride != "" {
+		graphQLEndpoint = options.baseURLOverride + "/api/graphql"
 	}
 	return &liveClient{
 		gh:              ghClient,
+		ghWrite:         ghWriteClient,
+		source:          source,
 		httpClient:      httpClient,
+		httpWriteClient: writeHTTPClient,
 		rateTracker:     rateTracker,
 		platformHost:    platformHost,
-		graphQLEndpoint: graphQLEndpointForHost(platformHost),
+		graphQLEndpoint: graphQLEndpoint,
 		etag:            et,
 	}, nil
+}
+
+// mutationAuthTransport marks every request's context with
+// tokenauth.WithMutationAuth before auth resolution, steering token
+// selection away from github_app installation tokens.
+type mutationAuthTransport struct {
+	base http.RoundTripper
+}
+
+func (t mutationAuthTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	marked := req.Clone(tokenauth.WithMutationAuth(req.Context()))
+	if req.Body != nil && req.Body != http.NoBody {
+		marked.Body = req.Body
+	}
+	return t.base.RoundTrip(marked)
 }
 
 func restAPIOriginForHost(platformHost string) string {
@@ -235,21 +305,77 @@ func restAPIOriginForHost(platformHost string) string {
 }
 
 type liveClient struct {
-	gh                 *gh.Client
-	httpClient         *http.Client
-	rateTracker        *RateTracker
-	graphQLRateTracker *RateTracker
-	platformHost       string
-	graphQLEndpoint    string
-	etag               *etagTransport
-	viewerMu           sync.Mutex
-	viewerLogin        string
+	gh *gh.Client
+	// ghWrite/httpWriteClient carry mutation traffic on the user's own
+	// credential (mutation-marked auth context, own go-github rate
+	// cache). Their responses feed writeRateTracker, not rateTracker:
+	// the credentials have separate budgets when a GitHub App is
+	// configured, and mutation availability gates on the write
+	// credential's budget. Nil in hand-built test clients; accessors
+	// fall back to the read client.
+	ghWrite *gh.Client
+	// source is the credential chain reads resolve through. Split
+	// behavior (the viewer-permission overlay in GetRepository) is
+	// derived from its current descriptor on every call, so a config
+	// reload that adds or removes a GitHub App candidate takes effect
+	// without restart and repo-override chains that exclude the app
+	// keep single-credential behavior.
+	source                  tokenauth.Source
+	httpClient              *http.Client
+	httpWriteClient         *http.Client
+	rateTracker             *RateTracker
+	writeRateTracker        *RateTracker
+	graphQLRateTracker      *RateTracker
+	writeGraphQLRateTracker *RateTracker
+	platformHost            string
+	graphQLEndpoint         string
+	etag                    *etagTransport
+	viewerMu                sync.Mutex
+	viewerLogin             string
+}
+
+func (c *liveClient) writeGH() *gh.Client {
+	if c.ghWrite != nil {
+		return c.ghWrite
+	}
+	return c.gh
+}
+
+func (c *liveClient) writeHTTPClient() *http.Client {
+	if c.httpWriteClient != nil {
+		return c.httpWriteClient
+	}
+	return c.httpClient
 }
 
 // SetGraphQLRateTracker attaches the tracker used by liveClient's direct
 // GraphQL HTTP helpers.
 func (c *liveClient) SetGraphQLRateTracker(rateTracker *RateTracker) {
 	c.graphQLRateTracker = rateTracker
+}
+
+// SetWriteRateTracker attaches the tracker fed by mutation-path
+// responses (the user's own credential when a GitHub App handles
+// sync reads).
+func (c *liveClient) SetWriteRateTracker(rateTracker *RateTracker) {
+	c.writeRateTracker = rateTracker
+}
+
+// SetWriteGraphQLRateTracker attaches the tracker fed by GraphQL
+// mutation responses (ready-for-review), which consume the write
+// credential's GraphQL budget rather than its REST budget.
+func (c *liveClient) SetWriteGraphQLRateTracker(rateTracker *RateTracker) {
+	c.writeGraphQLRateTracker = rateTracker
+}
+
+// splitAuthActive reports whether reads currently resolve through a
+// GitHub App installation token while writes use the user's own
+// credential (the mutation-marked chain skips the app candidate).
+func (c *liveClient) splitAuthActive() bool {
+	if c.source == nil {
+		return false
+	}
+	return c.source.Descriptor().HasActiveGitHubApp()
 }
 
 // InvalidateListETagsForRepo evicts cached ETag entries for the repo's
@@ -319,8 +445,8 @@ func (c *liveClient) ListRepoLabels(
 func (c *liveClient) ReplaceIssueLabels(
 	ctx context.Context, owner, repo string, number int, names []string,
 ) ([]*gh.Label, error) {
-	labels, resp, err := c.gh.Issues.ReplaceLabelsForIssue(ctx, owner, repo, number, names)
-	c.trackRate(resp)
+	labels, resp, err := c.writeGH().Issues.ReplaceLabelsForIssue(ctx, owner, repo, number, names)
+	c.trackWriteRate(resp)
 	if err != nil {
 		return nil, err
 	}
@@ -335,10 +461,10 @@ func (c *liveClient) ReplaceIssueAssignees(
 	if usernames == nil {
 		usernames = []string{}
 	}
-	issue, resp, err := c.gh.Issues.Edit(ctx, owner, repo, number, &gh.IssueRequest{
+	issue, resp, err := c.writeGH().Issues.Edit(ctx, owner, repo, number, &gh.IssueRequest{
 		Assignees: &usernames,
 	})
-	c.trackRate(resp)
+	c.trackWriteRate(resp)
 	if err != nil {
 		return nil, err
 	}
@@ -350,10 +476,10 @@ func (c *liveClient) ReplaceIssueAssignees(
 func (c *liveClient) RequestPullRequestReviewers(
 	ctx context.Context, owner, repo string, number int, usernames []string,
 ) (*gh.PullRequest, error) {
-	pr, resp, err := c.gh.PullRequests.RequestReviewers(ctx, owner, repo, number, gh.ReviewersRequest{
+	pr, resp, err := c.writeGH().PullRequests.RequestReviewers(ctx, owner, repo, number, gh.ReviewersRequest{
 		Reviewers: usernames,
 	})
-	c.trackRate(resp)
+	c.trackWriteRate(resp)
 	if err != nil {
 		return nil, err
 	}
@@ -365,10 +491,10 @@ func (c *liveClient) RequestPullRequestReviewers(
 func (c *liveClient) RemovePullRequestReviewers(
 	ctx context.Context, owner, repo string, number int, usernames []string,
 ) error {
-	resp, err := c.gh.PullRequests.RemoveReviewers(ctx, owner, repo, number, gh.ReviewersRequest{
+	resp, err := c.writeGH().PullRequests.RemoveReviewers(ctx, owner, repo, number, gh.ReviewersRequest{
 		Reviewers: usernames,
 	})
-	c.trackRate(resp)
+	c.trackWriteRate(resp)
 	return err
 }
 
@@ -381,7 +507,8 @@ func (c *liveClient) CreateIssue(
 	if body != "" {
 		req.Body = &body
 	}
-	issue, _, err := c.gh.Issues.Create(ctx, owner, repo, req)
+	issue, resp, err := c.writeGH().Issues.Create(ctx, owner, repo, req)
+	c.trackWriteRate(resp)
 	if err != nil {
 		return nil, err
 	}
@@ -795,6 +922,23 @@ func (c *liveClient) trackRate(resp *gh.Response) {
 	c.rateTracker.UpdateFromRate(rateFromGitHub(resp.Rate))
 }
 
+// trackWriteRate records a write-path response against the mutation
+// credential's tracker, so PAT exhaustion disables writes without
+// pausing app-token reads. Hosts without a write tracker share one
+// credential across reads and writes; their write responses feed the
+// shared tracker, same as before the split existed.
+func (c *liveClient) trackWriteRate(resp *gh.Response) {
+	if c.writeRateTracker == nil {
+		c.trackRate(resp)
+		return
+	}
+	if resp == nil {
+		return
+	}
+	c.writeRateTracker.RecordRequest()
+	c.writeRateTracker.UpdateFromRate(rateFromGitHub(resp.Rate))
+}
+
 func (c *liveClient) GetRateLimitSnapshot(ctx context.Context) (*RateLimitSnapshot, error) {
 	limits, _, err := c.gh.RateLimit.Get(ctx)
 	if err != nil {
@@ -833,6 +977,37 @@ func (c *liveClient) trackGraphQLRateHeaders(resp *http.Response) {
 		return
 	}
 	c.graphQLRateTracker.UpdateFromRate(rateFromGitHubHeaders(
+		limit, remaining, time.Unix(resetUnix, 0).UTC(),
+	))
+}
+
+// trackWriteGraphQLRateHeaders records a GraphQL mutation response
+// against the write credential's GraphQL tracker. Hosts without one
+// share a single credential, so the shared GraphQL tracker absorbs
+// the response instead.
+func (c *liveClient) trackWriteGraphQLRateHeaders(resp *http.Response) {
+	tracker := c.writeGraphQLRateTracker
+	if tracker == nil {
+		c.trackGraphQLRateHeaders(resp)
+		return
+	}
+	if resp == nil {
+		return
+	}
+	tracker.RecordRequest()
+	remaining, err := parseRateHeaderInt(resp.Header, "X-RateLimit-Remaining")
+	if err != nil {
+		return
+	}
+	limit, err := parseRateHeaderInt(resp.Header, "X-RateLimit-Limit")
+	if err != nil {
+		return
+	}
+	resetUnix, err := strconv.ParseInt(resp.Header.Get("X-RateLimit-Reset"), 10, 64)
+	if err != nil {
+		return
+	}
+	tracker.UpdateFromRate(rateFromGitHubHeaders(
 		limit, remaining, time.Unix(resetUnix, 0).UTC(),
 	))
 }
@@ -914,6 +1089,32 @@ func (c *liveClient) ListOpenIssues(
 func (c *liveClient) ListRepositoriesByOwner(
 	ctx context.Context, owner string,
 ) ([]*gh.Repository, error) {
+	if c.splitAuthActive() {
+		repos, err := collectPages(
+			ctx,
+			func(opts *gh.ListOptions) ([]*gh.Repository, *gh.Response, error) {
+				result, resp, err := c.gh.Apps.ListRepos(ctx, opts)
+				if err != nil {
+					return nil, resp, err
+				}
+				return result.Repositories, resp, nil
+			},
+			c.trackRate,
+		)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"listing installation repositories for %s: %w", owner, err,
+			)
+		}
+		filtered := repos[:0]
+		for _, repo := range repos {
+			if strings.EqualFold(repo.GetOwner().GetLogin(), owner) {
+				filtered = append(filtered, repo)
+			}
+		}
+		return filtered, nil
+	}
+
 	viewerLogin, viewerErr := c.authenticatedLogin(ctx)
 	if viewerErr == nil && strings.EqualFold(owner, viewerLogin) {
 		repos, err := collectPages(
@@ -1875,7 +2076,7 @@ func (c *liveClient) ListWorkflowRunsForHeadSHA(
 func (c *liveClient) ApproveWorkflowRun(
 	ctx context.Context, owner, repo string, runID int64,
 ) error {
-	req, err := c.gh.NewRequest(
+	req, err := c.writeGH().NewRequest(
 		"POST",
 		fmt.Sprintf("repos/%s/%s/actions/runs/%d/approve", owner, repo, runID),
 		nil,
@@ -1887,8 +2088,8 @@ func (c *liveClient) ApproveWorkflowRun(
 		)
 	}
 
-	resp, err := c.gh.Do(ctx, req, nil)
-	c.trackRate(resp)
+	resp, err := c.writeGH().Do(ctx, req, nil)
+	c.trackWriteRate(resp)
 	if err != nil {
 		return fmt.Errorf(
 			"approving workflow run %s/%s#%d: %w",
@@ -1901,10 +2102,10 @@ func (c *liveClient) ApproveWorkflowRun(
 func (c *liveClient) CreateIssueComment(
 	ctx context.Context, owner, repo string, number int, body string,
 ) (*gh.IssueComment, error) {
-	comment, resp, err := c.gh.Issues.CreateComment(ctx, owner, repo, number, &gh.IssueComment{
+	comment, resp, err := c.writeGH().Issues.CreateComment(ctx, owner, repo, number, &gh.IssueComment{
 		Body: new(body),
 	})
-	c.trackRate(resp)
+	c.trackWriteRate(resp)
 	if err != nil {
 		return nil, fmt.Errorf("creating comment on %s/%s#%d: %w", owner, repo, number, err)
 	}
@@ -1914,10 +2115,10 @@ func (c *liveClient) CreateIssueComment(
 func (c *liveClient) EditIssueComment(
 	ctx context.Context, owner, repo string, commentID int64, body string,
 ) (*gh.IssueComment, error) {
-	comment, resp, err := c.gh.Issues.EditComment(
+	comment, resp, err := c.writeGH().Issues.EditComment(
 		ctx, owner, repo, commentID, &gh.IssueComment{Body: new(body)},
 	)
-	c.trackRate(resp)
+	c.trackWriteRate(resp)
 	if err != nil {
 		return nil, fmt.Errorf(
 			"editing comment %d on %s/%s: %w", commentID, owner, repo, err,
@@ -1929,10 +2130,10 @@ func (c *liveClient) EditIssueComment(
 func (c *liveClient) CreatePullRequestReviewCommentReply(
 	ctx context.Context, owner, repo string, number int, body string, commentID int64,
 ) (*gh.PullRequestComment, error) {
-	comment, resp, err := c.gh.PullRequests.CreateCommentInReplyTo(
+	comment, resp, err := c.writeGH().PullRequests.CreateCommentInReplyTo(
 		ctx, owner, repo, number, body, commentID,
 	)
-	c.trackRate(resp)
+	c.trackWriteRate(resp)
 	if err != nil {
 		return nil, fmt.Errorf(
 			"replying to review comment %d on %s/%s#%d: %w",
@@ -1942,6 +2143,14 @@ func (c *liveClient) CreatePullRequestReviewCommentReply(
 	return comment, nil
 }
 
+// GetRepository reads repository metadata with the sync credential so
+// app-token-only hosts keep working, then, on split-credential hosts,
+// overlays the viewer-specific permissions block from the user's
+// credential: it feeds viewer_can_merge, and the app installation
+// token would report the read-only app's permissions instead of the
+// user's. A failed overlay (missing or exhausted PAT) clears the
+// permissions to "unknown" rather than keeping the app's, and never
+// fails the metadata read sync depends on.
 func (c *liveClient) GetRepository(
 	ctx context.Context, owner, repo string,
 ) (*gh.Repository, error) {
@@ -1950,6 +2159,20 @@ func (c *liveClient) GetRepository(
 	if err != nil {
 		return nil, fmt.Errorf("getting repository %s/%s: %w", owner, repo, err)
 	}
+	if !c.splitAuthActive() {
+		return r, nil
+	}
+	viewerRepo, viewerResp, viewerErr := c.writeGH().Repositories.Get(ctx, owner, repo)
+	c.trackWriteRate(viewerResp)
+	if viewerErr != nil {
+		slog.Warn(
+			"viewer permission refresh failed; merge permission unknown until it succeeds",
+			"repo", owner+"/"+repo, "err", viewerErr,
+		)
+		r.Permissions = nil
+		return r, nil
+	}
+	r.Permissions = viewerRepo.Permissions
 	return r, nil
 }
 
@@ -1977,10 +2200,10 @@ func (c *liveClient) CreateReviewWithComments(
 	if commitID != "" {
 		request.CommitID = &commitID
 	}
-	review, resp, err := c.gh.PullRequests.CreateReview(
+	review, resp, err := c.writeGH().PullRequests.CreateReview(
 		ctx, owner, repo, number, request,
 	)
-	c.trackRate(resp)
+	c.trackWriteRate(resp)
 	if err != nil {
 		return nil, fmt.Errorf(
 			"creating review on %s/%s#%d: %w", owner, repo, number, err,
@@ -1992,11 +2215,11 @@ func (c *liveClient) CreateReviewWithComments(
 func (c *liveClient) DismissReview(
 	ctx context.Context, owner, repo string, number int, reviewID int64, message string,
 ) (*gh.PullRequestReview, error) {
-	review, resp, err := c.gh.PullRequests.DismissReview(
+	review, resp, err := c.writeGH().PullRequests.DismissReview(
 		ctx, owner, repo, number, reviewID,
 		&gh.PullRequestReviewDismissalRequest{Message: &message},
 	)
-	c.trackRate(resp)
+	c.trackWriteRate(resp)
 	if err != nil {
 		return nil, fmt.Errorf(
 			"dismissing review %d on %s/%s#%d: %w", reviewID, owner, repo, number, err,
@@ -2044,11 +2267,11 @@ func (c *liveClient) MarkPullRequestReadyForReview(
 		req.Header.Set("Accept", "application/vnd.github+json")
 		req.Header.Set("Content-Type", "application/json")
 
-		resp, err := c.httpClient.Do(req)
+		resp, err := c.writeHTTPClient().Do(req)
 		if err != nil {
 			return nil, err
 		}
-		c.trackGraphQLRateHeaders(resp)
+		c.trackWriteGraphQLRateHeaders(resp)
 		if resp.StatusCode != http.StatusOK {
 			_ = resp.Body.Close()
 			return resp, newReadyForReviewError(
@@ -2143,10 +2366,10 @@ func (c *liveClient) MergePullRequest(
 		// modified" if the PR head moved past the reviewed commit.
 		SHA: expectedHeadSHA,
 	}
-	result, resp, err := c.gh.PullRequests.Merge(
+	result, resp, err := c.writeGH().PullRequests.Merge(
 		ctx, owner, repo, number, commitMessage, opts,
 	)
-	c.trackRate(resp)
+	c.trackWriteRate(resp)
 	if err != nil {
 		return nil, fmt.Errorf(
 			"merging %s/%s#%d: %w", owner, repo, number, err,
@@ -2168,10 +2391,10 @@ func (c *liveClient) EditPullRequest(
 	if opts.Body != nil {
 		edit.Body = opts.Body
 	}
-	pr, resp, err := c.gh.PullRequests.Edit(
+	pr, resp, err := c.writeGH().PullRequests.Edit(
 		ctx, owner, repo, number, edit,
 	)
-	c.trackRate(resp)
+	c.trackWriteRate(resp)
 	if err != nil {
 		return nil, fmt.Errorf(
 			"editing pull request %s/%s#%d: %w",
@@ -2184,10 +2407,10 @@ func (c *liveClient) EditPullRequest(
 func (c *liveClient) EditIssue(
 	ctx context.Context, owner, repo string, number int, state string,
 ) (*gh.Issue, error) {
-	issue, resp, err := c.gh.Issues.Edit(
+	issue, resp, err := c.writeGH().Issues.Edit(
 		ctx, owner, repo, number, &gh.IssueRequest{State: &state},
 	)
-	c.trackRate(resp)
+	c.trackWriteRate(resp)
 	if err != nil {
 		return nil, fmt.Errorf(
 			"editing issue %s/%s#%d: %w",
@@ -2207,8 +2430,8 @@ func (c *liveClient) EditIssueContent(
 	if body != nil {
 		req.Body = body
 	}
-	issue, resp, err := c.gh.Issues.Edit(ctx, owner, repo, number, req)
-	c.trackRate(resp)
+	issue, resp, err := c.writeGH().Issues.Edit(ctx, owner, repo, number, req)
+	c.trackWriteRate(resp)
 	if err != nil {
 		return nil, fmt.Errorf(
 			"editing issue %s/%s#%d: %w",

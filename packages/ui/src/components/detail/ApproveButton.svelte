@@ -25,6 +25,8 @@
     requireHeadPin?: boolean;
     onheadconflict?: ((reason: "stale_state" | "head_unknown", context?: string) => void) | undefined;
     oncompleted?: (() => void) | undefined;
+    /** Tooltip override; pass the unavailable_reason when disabling. */
+    title?: string | undefined;
   }
 
   const {
@@ -41,6 +43,7 @@
     requireHeadPin = false,
     onheadconflict,
     oncompleted,
+    title = undefined,
   }: Props = $props();
 
   // Captured when the approval form opens: a background detail refresh
@@ -142,7 +145,7 @@
     surface="soft"
     title={expanded
         ? "Close the approval form"
-        : "Open the approval form to submit a code review on this pull request"}
+        : title ?? "Open the approval form to submit a code review on this pull request"}
     label="Approve"
     shortLabel="Approve"
     {size}

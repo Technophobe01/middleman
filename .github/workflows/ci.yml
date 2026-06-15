@@ -296,12 +296,26 @@ jobs:
       - name: Run E2E tests
         run: cd frontend && bun run playwright test --config=playwright-e2e.config.ts --project=${{ matrix.browser }}
 
+      # The GitHub App setup page suite runs Desktop Chrome only, so it
+      # rides the chromium leg of the matrix.
+      - name: Run GitHub App setup UI E2E tests
+        if: matrix.browser == 'chromium'
+        run: cd packages/github-app-ui && bun run test:e2e
+
       - name: Upload Playwright report
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: e2e-report-${{ matrix.browser }}
           path: frontend/playwright-report/
+          retention-days: 7
+
+      - name: Upload GitHub App setup UI Playwright report
+        if: failure() && matrix.browser == 'chromium'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: github-app-ui-e2e-report
+          path: packages/github-app-ui/playwright-report/
           retention-days: 7
 
   e2e-roborev:

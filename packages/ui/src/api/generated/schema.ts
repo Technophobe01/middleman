@@ -4090,14 +4090,20 @@ export interface components {
             approve_workflow: components["schemas"]["OperationAvailability"];
             close_issue: components["schemas"]["OperationAvailability"];
             close_pr: components["schemas"]["OperationAvailability"];
+            create_issue: components["schemas"]["OperationAvailability"];
+            edit_comment: components["schemas"]["OperationAvailability"];
             mark_ready_for_review: components["schemas"]["OperationAvailability"];
             merge_pr: components["schemas"]["OperationAvailability"];
             remove_label: components["schemas"]["OperationAvailability"];
             reopen_issue: components["schemas"]["OperationAvailability"];
             reopen_pr: components["schemas"]["OperationAvailability"];
+            reply_review_thread: components["schemas"]["OperationAvailability"];
+            resolve_review_thread: components["schemas"]["OperationAvailability"];
+            review_draft: components["schemas"]["OperationAvailability"];
             set_assignees: components["schemas"]["OperationAvailability"];
             set_reviewers: components["schemas"]["OperationAvailability"];
             submit_review: components["schemas"]["OperationAvailability"];
+            update_content: components["schemas"]["OperationAvailability"];
         };
         RepoPreviewRequest: {
             /**
@@ -4140,6 +4146,7 @@ export interface components {
         RepoRefResponse: {
             capabilities: components["schemas"]["ProviderCapabilitiesResponse"];
             name: string;
+            operations?: components["schemas"]["RepoOperations"];
             owner: string;
             platform_host: string;
             provider: string;

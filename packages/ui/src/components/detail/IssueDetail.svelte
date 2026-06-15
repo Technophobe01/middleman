@@ -10,6 +10,7 @@
   import type { IssueDetailSyncMode } from "../../stores/issues.svelte.js";
   import { renderMarkdown } from "../../utils/markdown.js";
   import { moveTaskListItem, toggleTaskListItem } from "../../utils/task-list.js";
+  import { firstUnavailableGate, operationGate } from "./operation-gates.js";
   import { timeAgo } from "../../utils/time.js";
   import { copyToClipboard } from "../../utils/clipboard.js";
   import EventTimeline from "./EventTimeline.svelte";
@@ -241,6 +242,7 @@
   }
 
   async function openLabelPicker(event?: MouseEvent): Promise<void> {
+    if (labelGate.unavailable) return;
     labelPickerAnchor = (event?.currentTarget as HTMLElement | null)?.closest<HTMLDivElement>(".label-editor-anchor")
       ?? labelPickerAnchor;
     if (event !== undefined && labelPickerOpen) {
@@ -301,7 +303,7 @@
   });
 
   async function toggleLabel(labelName: string): Promise<void> {
-    if (pendingLabel !== null) return;
+    if (pendingLabel !== null || labelGate.unavailable) return;
     const currentLabels = issues.getIssueDetail()?.issue.labels ?? [];
     pendingLabel = labelName;
     labelPickerError = null;
@@ -316,6 +318,7 @@
   }
 
   async function clearLabels(): Promise<void> {
+    if (labelGate.unavailable) return;
     if (pendingLabel !== null) return;
     const currentLabels = issues.getIssueDetail()?.issue.labels ?? [];
     if (currentLabels.length === 0) return;
@@ -380,6 +383,18 @@
 
   let stateSubmitting = $state(false);
   let stateError = $state<string | null>(null);
+
+  // Per-operation mutation availability from the issue detail payload.
+  const repoOperations = $derived(issues.getIssueDetail()?.repo?.operations);
+  const addCommentGate = $derived(operationGate(repoOperations?.add_comment));
+  const editCommentGate = $derived(operationGate(repoOperations?.edit_comment));
+  const labelGate = $derived(firstUnavailableGate(
+    repoOperations?.add_label, repoOperations?.remove_label,
+  ));
+  const assigneeGate = $derived(operationGate(repoOperations?.set_assignees));
+  // Body task-list writes are content edits with their own operation
+  // key, so rate limits gate them just like credential failures.
+  const contentGate = $derived(operationGate(repoOperations?.update_content));
 
   async function handleStateChange(
     newState: "open" | "closed",
@@ -654,7 +669,7 @@
     if ((target as HTMLInputElement).type !== "checkbox") return;
     const raw = target.getAttribute("data-task-index");
     if (raw === null) return;
-    if (staleIssue || !currentCapabilities().state_mutation) {
+    if (staleIssue || !currentCapabilities().state_mutation || contentGate.unavailable) {
       event.preventDefault();
       return;
     }
@@ -692,7 +707,7 @@
   }
 
   function onBodyDragStart(event: DragEvent): void {
-    if (staleIssue || !currentCapabilities().state_mutation) return;
+    if (staleIssue || !currentCapabilities().state_mutation || contentGate.unavailable) return;
     const target = event.target as HTMLElement | null;
     if (!target?.classList?.contains("task-drag-handle")) return;
     const raw = target.getAttribute("data-task-index");
@@ -754,7 +769,7 @@
     const side = dropTargetSide;
     clearDragState(body);
     if (to === null || to === from) return;
-    if (staleIssue || !currentCapabilities().state_mutation) return;
+    if (staleIssue || !currentCapabilities().state_mutation || contentGate.unavailable) return;
     const detail = issues.getIssueDetail();
     if (!detail) return;
     let target = to;
@@ -885,7 +900,8 @@
             label="Assignees"
             users={issue.assignees ?? []}
             canEdit={capabilities.assignee_mutation}
-            disabled={staleIssue}
+            disabled={staleIssue || assigneeGate.unavailable}
+            disabledReason={assigneeGate.unavailable ? assigneeGate.reason : undefined}
             loadCandidates={loadUserCandidates}
             onchange={(next) => issues.setIssueAssignees(owner, name, number, next)}
           >
@@ -914,7 +930,8 @@
                 size="sm"
                 surface="soft"
                 tone="neutral"
-                disabled={staleIssue}
+                disabled={staleIssue || labelGate.unavailable}
+                title={labelGate.unavailable ? labelGate.reason : undefined}
                 onclick={openLabelPicker}
               >
                 <TagsIcon size="16" aria-hidden="true" />
@@ -928,6 +945,8 @@
                     {pendingLabel}
                     error={labelPickerError}
                     autofocusFilter={labelPickerAutofocusFilter}
+                    disabled={labelGate.unavailable}
+                    disabledReason={labelGate.unavailable ? labelGate.reason : undefined}
                     ontoggle={toggleLabel}
                     onclear={clearLabels}
                     onclose={closeLabelPicker}
@@ -984,7 +1003,7 @@
               ondragleave={onBodyDragLeave}
               ondrop={onBodyDrop}
               ondragend={onBodyDragEnd}
-            >{@html renderMarkdown(issue.Body, { provider, platformHost, owner, name, repoPath }, { interactiveTasks: capabilities.state_mutation })}</div>
+            >{@html renderMarkdown(issue.Body, { provider, platformHost, owner, name, repoPath }, { interactiveTasks: capabilities.state_mutation && !contentGate.unavailable })}</div>
           </div>
         </div>
       {/if}
@@ -1022,11 +1041,13 @@
           </ActionButton>
         {/if}
         {#if issue.State === "open" && capabilities.state_mutation}
+          {@const closeGate = operationGate(repoOperations?.close_issue)}
           <ActionButton
             class="btn--close"
-            disabled={stateSubmitting || staleIssue}
+            disabled={stateSubmitting || staleIssue || closeGate.unavailable}
+            title={closeGate.unavailable ? closeGate.reason : undefined}
             onclick={() => {
-              if (staleIssue) return;
+              if (staleIssue || closeGate.unavailable) return;
               handleStateChange("closed");
             }}
             tone="danger"
@@ -1038,11 +1059,13 @@
             <XIcon size="14" strokeWidth="2.2" aria-hidden="true" />
           </ActionButton>
         {:else if capabilities.state_mutation}
+          {@const reopenGate = operationGate(repoOperations?.reopen_issue)}
           <ActionButton
             class="btn--reopen"
-            disabled={stateSubmitting || staleIssue}
+            disabled={stateSubmitting || staleIssue || reopenGate.unavailable}
+            title={reopenGate.unavailable ? reopenGate.reason : undefined}
             onclick={() => {
-              if (staleIssue) return;
+              if (staleIssue || reopenGate.unavailable) return;
               handleStateChange("open");
             }}
             tone="success"
@@ -1088,7 +1111,8 @@
           provider={detail.repo.provider}
           platformHost={detail.platform_host}
           repoPath={detail.repo.repo_path}
-          disabled={staleIssue || !capabilities.comment_mutation}
+          disabled={staleIssue || !capabilities.comment_mutation || addCommentGate.unavailable}
+          disabledReason={addCommentGate.unavailable ? addCommentGate.reason : undefined}
         />
       </div>
 
@@ -1103,7 +1127,7 @@
             repoOwner={owner}
             repoName={name}
             {repoPath}
-            onEditComment={capabilities.comment_mutation && !staleIssue
+            onEditComment={capabilities.comment_mutation && !staleIssue && !editCommentGate.unavailable
               ? editTimelineComment
               : undefined}
           />

@@ -763,6 +763,9 @@
   }
 
   async function submitReply(entry: TimelineEntry): Promise<void> {
+    // Re-check the gate: availability can flip (rate limit, missing
+    // write credential) while the composer is already open.
+    if (!canReplyToThread(entry)) return;
     const targetID = replyTargetID(entry);
     const body = replyDraft.trim();
     if (!targetID || !provider || !repoOwner || !repoName || !repoPath || number === undefined) return;
@@ -1309,7 +1312,7 @@
                   <button
                     class="edit-action edit-action--primary"
                     onclick={() => void submitReply(entry)}
-                    disabled={savingReplyThreadID === targetID}
+                    disabled={savingReplyThreadID === targetID || !canReplyToThread(entry)}
                   >
                     <CheckIcon size={14} />
                     {savingReplyThreadID === targetID ? "Replying..." : "Reply"}

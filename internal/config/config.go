@@ -82,6 +82,45 @@ type PlatformConfig struct {
 	TokenFile string `toml:"token_file,omitempty" json:"token_file,omitempty"`
 }
 
+// GitHubAppConfig registers a GitHub App created by the
+// middleman-github-app CLI. Installation tokens minted from the app's
+// private key carry their own rate-limit budget, taking sync traffic
+// off the host's PAT.
+//
+// Scope decision: one app per GitHub host with one recorded
+// installation, and one active credential chain per host. An
+// installation token only reaches repos the installation covers, so
+// every same-host repo must be covered by that installation — Validate
+// enforces this so uncovered repos fail loudly at load instead of
+// 404ing during sync. There is no per-repo escape hatch: repo-level
+// token_env/token_file overrides are terminal credentials that cannot
+// be mixed with an app chain on the same host (the same-host conflict
+// check rejects that), so the remedies are installing the app on the
+// owning account, extending the installation's repository selection,
+// or removing the [[github_apps]] entry. An entry without an
+// installation_id is dormant and the PAT chain stays in effect.
+type GitHubAppConfig struct {
+	Host                string `toml:"host" json:"host"`
+	AppID               int64  `toml:"app_id" json:"app_id"`
+	Slug                string `toml:"slug,omitempty" json:"slug,omitempty"`
+	Owner               string `toml:"owner,omitempty" json:"owner,omitempty"`
+	OwnerType           string `toml:"owner_type,omitempty" json:"owner_type,omitempty"`
+	PrivateKeyPath      string `toml:"private_key_path" json:"private_key_path"`
+	InstallationID      int64  `toml:"installation_id,omitempty" json:"installation_id,omitempty"`
+	InstallationAccount string `toml:"installation_account,omitempty" json:"installation_account,omitempty"`
+	// RepositorySelection records whether the installation covers
+	// "all" repositories of the account or only "selected" ones, as
+	// reported by GitHub when the CLI recorded the installation.
+	RepositorySelection string `toml:"repository_selection,omitempty" json:"repository_selection,omitempty"`
+	// SelectedRepos lists the full names (owner/name) an "Only select
+	// repositories" installation could reach when the CLI recorded it.
+	// This is a snapshot: middleman does not detect selection changes
+	// made on GitHub afterwards — an out-of-band narrowing surfaces as
+	// sync 404s until "middleman-github-app install" is re-run to
+	// refresh the recorded list.
+	SelectedRepos []string `toml:"selected_repos,omitempty" json:"selected_repos,omitempty"`
+}
+
 func (r Repo) FullName() string {
 	return r.Owner + "/" + r.Name
 }
@@ -654,18 +693,19 @@ type Config struct {
 	// Forwarded RFC 7239 host= for the Public Host validation step.
 	// The raw Host header must still pass the allowed_hosts gate
 	// before any forwarded header is read.
-	TrustReverseProxy bool             `toml:"trust_reverse_proxy"`
-	Repos             []Repo           `toml:"repos"`
-	Platforms         []PlatformConfig `toml:"platforms"`
-	Activity          Activity         `toml:"activity"`
-	Terminal          Terminal         `toml:"terminal"`
-	Modes             ModeVisibility   `toml:"modes"`
-	Agents            []Agent          `toml:"agents"`
-	DocFolders        []DocFolder      `toml:"doc_folders"`
-	Roborev           Roborev          `toml:"roborev"`
-	Msgvault          *Msgvault        `toml:"msgvault"`
-	Tmux              Tmux             `toml:"tmux"`
-	Shell             Shell            `toml:"shell"`
+	TrustReverseProxy bool              `toml:"trust_reverse_proxy"`
+	Repos             []Repo            `toml:"repos"`
+	Platforms         []PlatformConfig  `toml:"platforms"`
+	GitHubApps        []GitHubAppConfig `toml:"github_apps"`
+	Activity          Activity          `toml:"activity"`
+	Terminal          Terminal          `toml:"terminal"`
+	Modes             ModeVisibility    `toml:"modes"`
+	Agents            []Agent           `toml:"agents"`
+	DocFolders        []DocFolder       `toml:"doc_folders"`
+	Roborev           Roborev           `toml:"roborev"`
+	Msgvault          *Msgvault         `toml:"msgvault"`
+	Tmux              Tmux              `toml:"tmux"`
+	Shell             Shell             `toml:"shell"`
 
 	// parsedAllowedHosts is the canonicalised form of AllowedHosts,
 	// populated by Validate so the server constructor does not have
@@ -888,6 +928,16 @@ func writeExclusive(src, dst string) error {
 }
 
 func Load(path string) (*Config, error) {
+	cfg, err := load(path)
+	if err != nil {
+		return nil, err
+	}
+	return cfg, cfg.validate(false)
+}
+
+// load reads and normalizes path without running validation; Load and
+// LoadForGitHubAppRepair pick the validation strictness.
+func load(path string) (*Config, error) {
 	cfg := &Config{
 		SyncInterval:        defaultSyncInterval,
 		GitHubTokenEnv:      defaultGitHubTokenEnv,
@@ -963,7 +1013,20 @@ func Load(path string) (*Config, error) {
 	}
 
 	cfg.normalizeTokenFilePaths(filepath.Dir(path))
-	return cfg, cfg.Validate()
+	return cfg, nil
+}
+
+// LoadForGitHubAppRepair loads path with GitHub App installation
+// coverage validation skipped. The middleman-github-app CLI uses it so
+// a config that is invalid only because the recorded installation no
+// longer covers the configured repos can still be loaded to repair
+// exactly that; every other validation rule still applies.
+func LoadForGitHubAppRepair(path string) (*Config, error) {
+	cfg, err := load(path)
+	if err != nil {
+		return nil, err
+	}
+	return cfg, cfg.validate(true)
 }
 
 func rejectDeprecatedConfigKeys(meta toml.MetaData) error {
@@ -979,6 +1042,12 @@ func rejectDeprecatedConfigKeys(meta toml.MetaData) error {
 }
 
 func (c *Config) Validate() error {
+	return c.validate(false)
+}
+
+// validate runs every config rule; skipAppCoverage relaxes only the
+// GitHub App installation coverage check for the CLI's repair path.
+func (c *Config) validate(skipAppCoverage bool) error {
 	var err error
 	c.DefaultPlatformHost, err = normalizePlatformHost(
 		defaultPlatform, c.DefaultPlatformHost,
@@ -1004,6 +1073,9 @@ func (c *Config) Validate() error {
 		p.TokenFile = strings.TrimSpace(p.TokenFile)
 	}
 	if err := c.validatePlatforms(); err != nil {
+		return err
+	}
+	if err := c.validateGitHubApps(); err != nil {
 		return err
 	}
 	if err := c.canonicalizeDocFolders(); err != nil {
@@ -1035,6 +1107,12 @@ func (c *Config) Validate() error {
 			)
 		}
 		seen[key] = display
+	}
+
+	if !skipAppCoverage {
+		if err := c.validateGitHubAppCoverage(); err != nil {
+			return err
+		}
 	}
 
 	// Reject conflicting token source descriptors for the same host.
@@ -1323,6 +1401,163 @@ func (c *Config) validatePlatforms() error {
 	return nil
 }
 
+func (c *Config) validateGitHubApps() error {
+	seenHosts := make(map[string]struct{}, len(c.GitHubApps))
+	for i := range c.GitHubApps {
+		app := &c.GitHubApps[i]
+		app.Host = strings.TrimSpace(app.Host)
+		app.Slug = strings.TrimSpace(app.Slug)
+		app.Owner = strings.TrimSpace(app.Owner)
+		app.PrivateKeyPath = strings.TrimSpace(app.PrivateKeyPath)
+		app.InstallationAccount = strings.TrimSpace(app.InstallationAccount)
+		host, err := normalizePlatformHost(defaultPlatform, app.Host)
+		if err != nil {
+			return fmt.Errorf("config: github_apps[%d]: %w", i, err)
+		}
+		app.Host = host
+		if app.AppID <= 0 {
+			return fmt.Errorf(
+				"config: github_apps[%d]: app_id must be a positive integer", i,
+			)
+		}
+		if app.PrivateKeyPath == "" {
+			return fmt.Errorf(
+				"config: github_apps[%d]: private_key_path is required", i,
+			)
+		}
+		// An installation without its account would activate the app
+		// token source while silently skipping installation coverage
+		// validation, so miscovered repos would only fail at sync time.
+		if app.InstallationID != 0 && app.InstallationAccount == "" {
+			return fmt.Errorf(
+				"config: github_apps[%d]: installation_account is required when "+
+					"installation_id is set", i,
+			)
+		}
+		app.RepositorySelection = strings.ToLower(strings.TrimSpace(app.RepositorySelection))
+		switch app.RepositorySelection {
+		case "", "all", "selected":
+		default:
+			return fmt.Errorf(
+				"config: github_apps[%d]: repository_selection must be \"all\" or "+
+					"\"selected\" (got %q)", i, app.RepositorySelection,
+			)
+		}
+		if app.InstallationID != 0 && app.RepositorySelection == "" {
+			return fmt.Errorf(
+				"config: github_apps[%d]: repository_selection is required when "+
+					"installation_id is set", i,
+			)
+		}
+		// One app per host: the token source chain is host-scoped, so a
+		// second app for the same host could never be selected.
+		if _, ok := seenHosts[host]; ok {
+			return fmt.Errorf(
+				"config: github_apps[%d]: duplicate github app for host %q", i, host,
+			)
+		}
+		seenHosts[host] = struct{}{}
+	}
+	return nil
+}
+
+// validateGitHubAppCoverage rejects github repos that would resolve
+// to an app installation token without being reachable by it.
+// Installation tokens are scoped to the installed account, not the
+// host, so a repo owned by anyone else would 404 during sync while
+// the config looks healthy. Repos with their own token_env/token_file
+// override never reach the app candidate and are exempt. Runs after
+// repo normalization so owners are canonical.
+func (c *Config) validateGitHubAppCoverage() error {
+	for _, app := range c.GitHubApps {
+		if app.InstallationID == 0 || app.InstallationAccount == "" {
+			continue
+		}
+		for i, r := range c.Repos {
+			if r.PlatformOrDefault() != defaultPlatform ||
+				r.PlatformHostOrDefault() != app.Host {
+				continue
+			}
+			if r.TokenEnv != "" || r.TokenFile != "" {
+				continue
+			}
+			if strings.EqualFold(r.Owner, app.InstallationAccount) {
+				if err := validateSelectedRepoCoverage(i, r, app); err != nil {
+					return err
+				}
+				continue
+			}
+			// Do not suggest per-repo token overrides here: middleman
+			// resolves one credential chain per host, so an override on
+			// only this repo would be rejected by the same-host conflict
+			// check. The real options are changing where the app is
+			// installed or not using an app for this host at all.
+			return fmt.Errorf(
+				"config: repos[%d]: %s/%s is not covered by the github app for %s "+
+					"(installed on %q): installation tokens only reach repos owned by the "+
+					"installed account. Install the app on %q instead, or remove the "+
+					"[[github_apps]] entry for %s so the host uses PAT auth for every repo",
+				i, r.Owner, r.Name, app.Host, app.InstallationAccount, r.Owner, app.Host,
+			)
+		}
+	}
+	return nil
+}
+
+// validateSelectedRepoCoverage rejects a same-account repo that an
+// "Only select repositories" installation cannot reach. The reachable
+// set is recorded by middleman-github-app at install time; account
+// ownership alone is not enough because the installation token only
+// reaches the chosen repos and everything else 404s during sync.
+func validateSelectedRepoCoverage(i int, r Repo, app GitHubAppConfig) error {
+	if !strings.EqualFold(app.RepositorySelection, "selected") {
+		return nil
+	}
+	remedy := fmt.Sprintf(
+		"Add it to the installation's repository access on %s (or switch the "+
+			"installation to \"All repositories\") and re-run "+
+			"\"middleman-github-app install\" to refresh the recorded selection",
+		app.Host,
+	)
+	if r.HasNameGlob() {
+		return fmt.Errorf(
+			"config: repos[%d]: %s/%s is a glob pattern, but the github app for %s is "+
+				"installed with \"Only select repositories\": globs expand to an open-ended "+
+				"set only an \"All repositories\" install can satisfy. %s",
+			i, r.Owner, r.Name, app.Host, remedy,
+		)
+	}
+	full := strings.ToLower(r.Owner + "/" + r.Name)
+	for _, name := range app.SelectedRepos {
+		if strings.ToLower(name) == full {
+			return nil
+		}
+	}
+	return fmt.Errorf(
+		"config: repos[%d]: %s/%s is not in the \"Only select repositories\" "+
+			"installation recorded for the github app on %s, so its installation token "+
+			"would 404 during sync. %s",
+		i, r.Owner, r.Name, app.Host, remedy,
+	)
+}
+
+// GitHubAppForHost returns the configured GitHub App for host, if any.
+func (c *Config) GitHubAppForHost(host string) (GitHubAppConfig, bool) {
+	if c == nil {
+		return GitHubAppConfig{}, false
+	}
+	h, err := normalizePlatformHost(defaultPlatform, host)
+	if err != nil {
+		return GitHubAppConfig{}, false
+	}
+	for _, app := range c.GitHubApps {
+		if app.Host == h {
+			return app, true
+		}
+	}
+	return GitHubAppConfig{}, false
+}
+
 func (c *Config) validateAgents() error {
 	seen := make(map[string]struct{}, len(c.Agents))
 	for i := range c.Agents {
@@ -1582,6 +1817,24 @@ func (c *Config) TokenSourceForPlatformHost(
 			EnvName: repoTokenEnv,
 		})
 	}
+	// A configured GitHub App outranks platform and default PAT
+	// candidates: installation tokens exist to take sync traffic off
+	// the PAT budget. Repo-level overrides are terminal with respect
+	// to the app: a repo that names its own credential must never fall
+	// through to the installation token, because installation coverage
+	// validation exempts overridden repos and a fall-through would
+	// reopen the cross-account 404 hole when the override is unset.
+	if p == defaultPlatform && repoTokenEnv == "" && repoTokenFile == "" {
+		if app, ok := c.GitHubAppForHost(h); ok && app.AppID > 0 && app.PrivateKeyPath != "" {
+			desc.Candidates = append(desc.Candidates, tokenauth.Candidate{
+				Kind:           tokenauth.SourceKindGitHubApp,
+				Host:           h,
+				FilePath:       app.PrivateKeyPath,
+				AppID:          app.AppID,
+				InstallationID: app.InstallationID,
+			})
+		}
+	}
 	for _, pc := range c.Platforms {
 		if pc.Type == p && pc.Host == h {
 			if pc.TokenFile != "" {
@@ -1692,6 +1945,11 @@ func (c *Config) normalizeTokenFilePaths(configDir string) {
 	}
 	for i := range c.Repos {
 		c.Repos[i].TokenFile = normalizeTokenFilePath(configDir, c.Repos[i].TokenFile)
+	}
+	for i := range c.GitHubApps {
+		c.GitHubApps[i].PrivateKeyPath = normalizeTokenFilePath(
+			configDir, c.GitHubApps[i].PrivateKeyPath,
+		)
 	}
 }
 
@@ -1891,29 +2149,30 @@ func reposForSave(repos []Repo) []Repo {
 
 // configFile is the subset of Config written to disk.
 type configFile struct {
-	SyncInterval              string           `toml:"sync_interval"`
-	GitHubTokenEnv            string           `toml:"github_token_env"`
-	DefaultPlatformHost       string           `toml:"default_platform_host,omitempty"`
-	Host                      string           `toml:"host"`
-	Port                      int              `toml:"port"`
-	SyncBudgetPerHour         int              `toml:"sync_budget_per_hour,omitempty"`
-	SSEBufferSize             int              `toml:"sse_buffer_size,omitempty"`
-	BasePath                  string           `toml:"base_path,omitempty"`
-	DataDir                   string           `toml:"data_dir,omitempty"`
-	IssueWorkspaceBranchStyle string           `toml:"issue_workspace_branch_style,omitempty"`
-	AllowedHosts              []string         `toml:"allowed_hosts,omitempty"`
-	TrustReverseProxy         bool             `toml:"trust_reverse_proxy,omitempty"`
-	Repos                     []Repo           `toml:"repos"`
-	Platforms                 []PlatformConfig `toml:"platforms,omitempty"`
-	Activity                  Activity         `toml:"activity"`
-	Terminal                  Terminal         `toml:"terminal,omitempty"`
-	Modes                     ModeVisibility   `toml:"modes,omitempty"`
-	Agents                    []Agent          `toml:"agents,omitempty"`
-	DocFolders                []DocFolder      `toml:"doc_folders,omitempty"`
-	Roborev                   Roborev          `toml:"roborev,omitempty"`
-	Msgvault                  *Msgvault        `toml:"msgvault,omitempty"`
-	Tmux                      Tmux             `toml:"tmux,omitempty"`
-	Shell                     Shell            `toml:"shell,omitempty"`
+	SyncInterval              string            `toml:"sync_interval"`
+	GitHubTokenEnv            string            `toml:"github_token_env"`
+	DefaultPlatformHost       string            `toml:"default_platform_host,omitempty"`
+	Host                      string            `toml:"host"`
+	Port                      int               `toml:"port"`
+	SyncBudgetPerHour         int               `toml:"sync_budget_per_hour,omitempty"`
+	SSEBufferSize             int               `toml:"sse_buffer_size,omitempty"`
+	BasePath                  string            `toml:"base_path,omitempty"`
+	DataDir                   string            `toml:"data_dir,omitempty"`
+	IssueWorkspaceBranchStyle string            `toml:"issue_workspace_branch_style,omitempty"`
+	AllowedHosts              []string          `toml:"allowed_hosts,omitempty"`
+	TrustReverseProxy         bool              `toml:"trust_reverse_proxy,omitempty"`
+	Repos                     []Repo            `toml:"repos"`
+	Platforms                 []PlatformConfig  `toml:"platforms,omitempty"`
+	GitHubApps                []GitHubAppConfig `toml:"github_apps,omitempty"`
+	Activity                  Activity          `toml:"activity"`
+	Terminal                  Terminal          `toml:"terminal,omitempty"`
+	Modes                     ModeVisibility    `toml:"modes,omitempty"`
+	Agents                    []Agent           `toml:"agents,omitempty"`
+	DocFolders                []DocFolder       `toml:"doc_folders,omitempty"`
+	Roborev                   Roborev           `toml:"roborev,omitempty"`
+	Msgvault                  *Msgvault         `toml:"msgvault,omitempty"`
+	Tmux                      Tmux              `toml:"tmux,omitempty"`
+	Shell                     Shell             `toml:"shell,omitempty"`
 }
 
 // Save writes the current config to the given path.
@@ -1932,6 +2191,7 @@ func (c *Config) Save(path string) error {
 		TrustReverseProxy:   cfg.TrustReverseProxy,
 		Repos:               reposForSave(cfg.Repos),
 		Platforms:           cfg.Platforms,
+		GitHubApps:          cfg.GitHubApps,
 		Activity:            cfg.Activity,
 		Terminal:            cfg.Terminal,
 		Modes:               cfg.Modes,
@@ -2012,6 +2272,10 @@ func (c *Config) copyForSave() Config {
 	cfg.Repos = slices.Clone(c.Repos)
 	cfg.Platforms = slices.Clone(c.Platforms)
 	cfg.AllowedHosts = slices.Clone(c.AllowedHosts)
+	cfg.GitHubApps = slices.Clone(c.GitHubApps)
+	for i := range cfg.GitHubApps {
+		cfg.GitHubApps[i].SelectedRepos = slices.Clone(cfg.GitHubApps[i].SelectedRepos)
+	}
 	cfg.DocFolders = slices.Clone(c.DocFolders)
 	cfg.Agents = slices.Clone(c.Agents)
 	if cfg.SyncInterval == "" {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"maps"
 	"reflect"
 	"slices"
 	"strings"
@@ -48,6 +49,14 @@ type startupConfigSnapshot struct {
 	AllowedHosts        []config.HostKey
 	TrustReverseProxy   bool
 	ProviderHosts       []tokenauth.Key
+	// GitHubAppSplitHosts lists hosts whose effective credential chain
+	// resolves sync reads through a GitHub App installation token.
+	// Split topology is startup-bound: write rate trackers and the
+	// write-credential clients are wired in buildProviderStartup, so a
+	// reload that adds or removes an app for a host must flag a
+	// restart instead of leaving mutation availability gating on the
+	// wrong bucket.
+	GitHubAppSplitHosts []string
 	// TokenEnvNames is the boot-time baseline of provider token env
 	// names (msgvault excluded) used to accumulate runtime strip-env
 	// lists; it is not compared for restart-required drift.
@@ -72,6 +81,7 @@ func snapshotStartupConfig(cfg *config.Config) startupConfigSnapshot {
 		AllowedHosts:        startupAllowedHosts(cfg),
 		TrustReverseProxy:   cfg.TrustReverseProxy,
 		ProviderHosts:       startupProviderHosts(cfg),
+		GitHubAppSplitHosts: githubAppSplitHosts(cfg),
 		Roborev:             cfg.Roborev,
 	}
 	snap.Tmux.Command = slices.Clone(cfg.Tmux.Command)
@@ -177,6 +187,32 @@ func (s *Server) updateRuntimeStripEnvVarsLocked(cfg *config.Config) []string {
 		cfg,
 	)
 	return slices.Clone(s.runtimeStripEnvVars)
+}
+
+// githubAppSplitHosts returns the sorted GitHub hosts whose effective
+// provider credential chain carries an active github_app candidate,
+// mirroring how startup resolves one source per (platform, host):
+// the first plan per key wins, so a host fully covered by terminal
+// repo overrides does not count as split.
+func githubAppSplitHosts(cfg *config.Config) []string {
+	if cfg == nil {
+		return nil
+	}
+	seen := make(map[tokenauth.Key]struct{})
+	var hosts []string
+	for _, plan := range cfg.ProviderTokenSources() {
+		key := plan.Descriptor.Key
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		if key.Platform == string(platform.KindGitHub) &&
+			plan.Descriptor.HasActiveGitHubApp() {
+			hosts = append(hosts, key.Host)
+		}
+	}
+	slices.Sort(hosts)
+	return hosts
 }
 
 func (s startupConfigSnapshot) restartRequiredFor(cfg *config.Config) bool {
@@ -335,6 +371,13 @@ func (s *Server) applyConfigChange(ctx context.Context) configChangedEvent {
 	s.cfg.GitHubTokenEnv = newCfg.GitHubTokenEnv
 	s.cfg.Repos = slices.Clone(newCfg.Repos)
 	s.cfg.Platforms = slices.Clone(newCfg.Platforms)
+	// GitHubApps must mirror the file even though the credential
+	// topology it implies is startup-bound (restart_required is
+	// flagged separately): the middleman-github-app CLI edits the
+	// file while the server runs, and a later settings save from the
+	// stale in-memory view would silently drop the [[github_apps]]
+	// entry.
+	s.cfg.GitHubApps = slices.Clone(newCfg.GitHubApps)
 	s.cfg.Activity = newCfg.Activity
 	s.cfg.Terminal = newCfg.Terminal
 	s.cfg.Modes = cloneModeVisibility(newCfg.Modes)
@@ -408,7 +451,31 @@ func (s *Server) updateTokenSourcesForReload(cfg *config.Config) {
 	if s.tokenSources == nil || cfg == nil {
 		return
 	}
+	// Split-auth topology is startup-bound: write rate trackers and
+	// the dedicated write clients are wired in buildProviderStartup.
+	// If a reload adds or removes a GitHub App for a host, applying
+	// the new chain here would flip sync reads to or from the app
+	// token immediately while mutation gating still consults the
+	// boot-time tracker topology. Those hosts keep their boot chain
+	// until the restart the reload already flags as required.
+	frozenHosts := s.splitTopologyChangedHosts(cfg)
+	if len(frozenHosts) > 0 {
+		slog.Info(
+			"config reload: github app split topology changed; keeping boot credential chains until restart",
+			"hosts", slices.Sorted(maps.Keys(frozenHosts)),
+		)
+	}
+	// Clone credentials live under host-level keys (tokenauth.CloneKey)
+	// rather than the provider platform, but they carry the same chain
+	// — including the app candidate — so a frozen host's clone source
+	// must stay on the boot chain too, keyed by host alone.
 	updateIfKnown := func(desc tokenauth.Descriptor) {
+		if desc.Key.Platform == string(platform.KindGitHub) ||
+			desc.Key == tokenauth.CloneKey(desc.Key.Host) {
+			if _, frozen := frozenHosts[desc.Key.Host]; frozen {
+				return
+			}
+		}
 		if _, ok := s.tokenSources.Get(desc.Key); !ok {
 			return
 		}
@@ -417,13 +484,40 @@ func (s *Server) updateTokenSourcesForReload(cfg *config.Config) {
 	for _, plan := range cfg.ProviderTokenSources() {
 		updateIfKnown(plan.Descriptor)
 	}
-	// Clone credentials live under host-level keys (tokenauth.CloneKey), so
-	// when a provider entry on a shared host loses or changes its token the
-	// clone source follows the host's surviving effective chain instead of
-	// staying pinned to whichever provider source startup picked.
+	// When a provider entry on a shared host loses or changes its token
+	// the clone source follows the host's surviving effective chain
+	// instead of staying pinned to whichever provider source startup
+	// picked.
 	for _, desc := range cfg.CloneTokenDescriptors() {
 		updateIfKnown(desc)
 	}
+}
+
+// splitTopologyChangedHosts returns the GitHub hosts whose split-auth
+// classification under cfg differs from the boot snapshot — hosts
+// that would gain or lose an active GitHub App chain if the reload
+// were applied.
+func (s *Server) splitTopologyChangedHosts(cfg *config.Config) map[string]struct{} {
+	boot := make(map[string]struct{}, len(s.bootCfgSnapshot.GitHubAppSplitHosts))
+	for _, host := range s.bootCfgSnapshot.GitHubAppSplitHosts {
+		boot[host] = struct{}{}
+	}
+	next := make(map[string]struct{})
+	for _, host := range githubAppSplitHosts(cfg) {
+		next[host] = struct{}{}
+	}
+	changed := make(map[string]struct{})
+	for host := range next {
+		if _, ok := boot[host]; !ok {
+			changed[host] = struct{}{}
+		}
+	}
+	for host := range boot {
+		if _, ok := next[host]; !ok {
+			changed[host] = struct{}{}
+		}
+	}
+	return changed
 }
 
 func (s *Server) validateReloadProviderTokenSources(

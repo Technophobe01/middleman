@@ -188,6 +188,9 @@ type Server struct {
 	labelCatalogRefreshIDs map[int64]struct{}
 	detailSyncMu           sync.Mutex
 	detailSyncInFlight     map[string]struct{}
+	writeCredProbeMu       sync.Mutex
+	writeCredProbes        map[string]writeCredentialProbe
+	writeCredProbeInFlight map[string]chan struct{}
 	kataHealthMu           sync.Mutex
 	kataHealthCache        map[string]kataDaemonHealthCacheEntry
 	kataHealthInFlight     map[string]*kataDaemonInflightProbe

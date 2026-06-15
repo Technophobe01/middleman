@@ -37,6 +37,7 @@ function pullDetail(
   capabilities = baseCapabilities,
   provider = "github",
   platformHost = "github.com",
+  operations?: Record<string, unknown>,
 ) {
   return {
     merge_request: {
@@ -106,6 +107,7 @@ function pullDetail(
       owner: "acme",
       name: "widgets",
       capabilities,
+      ...(operations !== undefined && { operations }),
     },
     repo_owner: "acme",
     repo_name: "widgets",
@@ -162,6 +164,7 @@ function pullListItem(capabilities = baseCapabilities, provider = "github", plat
       owner: "acme",
       name: "widgets",
       capabilities,
+      ...(operations !== undefined && { operations }),
     },
   };
 }
@@ -335,6 +338,7 @@ type MockInlineReviewOptions = {
   detailFetchedAtSequence?: string[];
   initialDraftComments?: Array<Record<string, unknown>>;
   remainingDraftComments?: Array<Record<string, unknown>>;
+  operations?: Record<string, unknown>;
 };
 
 async function mockInlineReviewAPI(
@@ -359,7 +363,7 @@ async function mockInlineReviewAPI(
       await route.fallback();
       return;
     }
-    const detail = pullDetail(reviewThreadResolved, capabilities, provider, platformHost);
+    const detail = pullDetail(reviewThreadResolved, capabilities, provider, platformHost, options.operations);
     if (options.detailBody !== undefined) {
       detail.merge_request.Body = options.detailBody;
     }
@@ -443,6 +447,121 @@ async function firstDiffGutterRight(page: Page): Promise<number> {
 
 test.beforeEach(async ({ page }) => {
   await mockApi(page);
+});
+
+test("unavailable operations disable inline review authoring and thread replies", async ({ page }) => {
+  // A GitHub App split host with no user write credential reports
+  // submit_review and reply_review_thread unavailable; the Files tab
+  // must not offer inline review authoring or thread replies that
+  // would fail at publish/reply time.
+  const unavailableOp = {
+    available: false,
+    code: "missing_write_credential",
+    unavailable_reason: "No user credential for writes on github.com",
+  };
+  const replyCalls: string[] = [];
+  page.on("request", (request) => {
+    if (request.method() === "GET") return;
+    const path = new URL(request.url()).pathname;
+    if (/\/reply$/.test(path) || path.includes("/discussions/")) {
+      replyCalls.push(`${request.method()} ${path}`);
+    }
+  });
+  await mockInlineReviewAPI(page, baseCapabilities, "github", "github.com", diffResponse, undefined, {
+    operations: { submit_review: unavailableOp, reply_review_thread: unavailableOp },
+  });
+
+  await page.goto("/pulls/github/acme/widgets/42/files");
+  await expect(page.locator(".file-content").first()).toBeVisible();
+  await expect(page.getByRole("button", { name: /Comment on new line/ })).toHaveCount(0);
+  await expect(page.getByPlaceholder("Leave a comment")).toHaveCount(0);
+  // The existing review thread renders read-only: no reply composer
+  // or reply affordance, and no reply request can fire.
+  await expect(page.locator(".inline-review-thread").first()).toBeVisible();
+  await expect(page.getByPlaceholder("Reply to thread")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /^Reply/ })).toHaveCount(0);
+  expect(replyCalls).toEqual([]);
+});
+
+test("a loaded draft becomes unpublishable when submit_review flips unavailable", async ({ page }) => {
+  // The riskiest Files-tab path: a draft that is already loaded and
+  // publishable must lose its publish affordance when submit_review
+  // becomes unavailable while the diff stays mounted. Split view
+  // keeps the conversation pane (which polls the detail payload) and
+  // the files pane mounted together, so the flip arrives through the
+  // real in-app poll without any navigation or reload. The local
+  // draft view clearing while gated is the store's designed behavior;
+  // the draft itself persists server-side, so flipping back must
+  // restore it.
+  const rateLimitedReason = "github.com rate-limited; retry at 14:35";
+  const publishCalls: string[] = [];
+  page.on("request", (request) => {
+    if (request.method() === "GET") return;
+    const path = new URL(request.url()).pathname;
+    if (path.endsWith("/review-draft/publish")) {
+      publishCalls.push(`${request.method()} ${path}`);
+    }
+  });
+  await mockInlineReviewAPI(page, baseCapabilities, "github", "github.com", diffResponse, undefined, {
+    initialDraftComments: [
+      {
+        id: "draft-1",
+        body: "needs a test",
+        path: "internal/server/server.go",
+        side: "right",
+        line: 1,
+        new_line: 1,
+        line_type: "add",
+        diff_head_sha: "diff-head",
+        created_at: "2026-03-30T14:01:00Z",
+        updated_at: "2026-03-30T14:01:00Z",
+      },
+    ],
+  });
+  // Override the detail route (last registered wins) so the test can
+  // flip submit_review availability between detail polls.
+  let submitReviewOp: Record<string, unknown> | undefined;
+  let detailGets = 0;
+  await page.route("**/api/v1/pulls/github/acme/widgets/42", async (route) => {
+    if (route.request().method() !== "GET") {
+      await route.fallback();
+      return;
+    }
+    detailGets += 1;
+    const operations = submitReviewOp !== undefined ? { submit_review: submitReviewOp } : undefined;
+    await fulfillJson(route, pullDetail(false, baseCapabilities, "github", "github.com", operations));
+  });
+
+  await page.clock.install();
+  await page.setViewportSize({ width: 2200, height: 1000 });
+  await page.goto("/pulls/github/acme/widgets/42");
+  await page.getByRole("button", { name: "Split view", exact: true }).click();
+  await expect(page.getByText("1 draft comment")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Publish review" })).toBeVisible();
+
+  // Flip off: the next detail poll delivers the exhausted budget and
+  // the mounted diff swaps the publishable tray for the reason.
+  submitReviewOp = {
+    available: false,
+    code: "rate_limited",
+    unavailable_reason: rateLimitedReason,
+    retry_at: "2026-03-30T14:35:00Z",
+  };
+  let getsBefore = detailGets;
+  await page.clock.fastForward(61_000);
+  await expect.poll(() => detailGets).toBeGreaterThan(getsBefore);
+  await expect(page.getByRole("button", { name: "Publish review" })).toHaveCount(0);
+  await expect(page.locator(".review-warning")).toContainText(rateLimitedReason);
+
+  // Flip back: the server-side draft survived the gated window and
+  // the view restores it, publishable again.
+  submitReviewOp = undefined;
+  getsBefore = detailGets;
+  await page.clock.fastForward(61_000);
+  await expect.poll(() => detailGets).toBeGreaterThan(getsBefore);
+  await expect(page.getByText("1 draft comment")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Publish review" })).toBeVisible();
+  expect(publishCalls).toEqual([]);
 });
 
 test("adds and publishes an inline draft review comment", async ({ page }) => {
