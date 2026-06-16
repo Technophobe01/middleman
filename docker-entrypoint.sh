@@ -51,7 +51,33 @@ if [ ! -f "${CONFIG}" ]; then
     case "${MIDDLEMAN_TRUST_REVERSE_PROXY:-}" in
       1|true|TRUE|yes) echo 'trust_reverse_proxy = true' ;;
     esac
+    # Front door -> roborev proxy target (table must follow the top-level keys).
+    if [ -n "${MIDDLEMAN_ROBOREV_ENDPOINT:-}" ]; then
+      echo ''
+      echo '[roborev]'
+      echo "endpoint = \"${MIDDLEMAN_ROBOREV_ENDPOINT}\""
+    fi
   } > "${CONFIG}"
+fi
+
+# Front door -> kata proxy: middleman discovers daemons from $KATA_HOME/config.toml.
+# Seed a catalog pointing at the in-network kata when MIDDLEMAN_KATA_URL is set.
+if [ -n "${MIDDLEMAN_KATA_URL:-}" ]; then
+  : "${KATA_HOME:=${MIDDLEMAN_HOME}/kata}"
+  export KATA_HOME
+  mkdir -p "${KATA_HOME}"
+  KATA_CATALOG="${KATA_HOME}/config.toml"
+  if [ ! -f "${KATA_CATALOG}" ]; then
+    echo "middleman: seeding kata catalog at ${KATA_CATALOG} -> ${MIDDLEMAN_KATA_URL}" >&2
+    {
+      echo 'active_daemon = "kenn-stack"'
+      echo '[[daemon]]'
+      echo 'name = "kenn-stack"'
+      echo "url = \"${MIDDLEMAN_KATA_URL}\""
+      echo 'token_env = "KATA_AUTH_TOKEN"'
+      echo 'allow_insecure = true'
+    } > "${KATA_CATALOG}"
+  fi
 fi
 
 # Seed-only mode: write the config and exit (used by tests to validate the
