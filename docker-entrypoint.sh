@@ -35,9 +35,10 @@ if [ ! -f "${CONFIG}" ]; then
     # separated) for Tailscale/reverse-proxy domain access.
     allowed="\"127.0.0.1:${MIDDLEMAN_PORT}\", \"localhost:${MIDDLEMAN_PORT}\""
     if [ -n "${MIDDLEMAN_ALLOWED_HOSTS:-}" ]; then
-      # Strip quotes/backslashes so a stray value cannot break the generated TOML.
+      # Strip quotes/backslashes/newlines so a stray value cannot break the
+      # generated TOML. Values must be bare host[:port] tokens.
       extra="$(printf '%s' "${MIDDLEMAN_ALLOWED_HOSTS}" \
-        | tr -d '"\\' \
+        | tr -d '"\\\n\r' \
         | awk -v RS=, '{gsub(/^[ \t]+|[ \t]+$/,""); if($0!="") printf ", \""$0"\""}')"
       allowed="${allowed}${extra}"
     fi
