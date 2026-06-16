@@ -43,11 +43,10 @@ function branchItem(id: string, activity_type: string, author: string, branchNam
 
 describe("collapseActivityRuns", () => {
   it("collapses three consecutive commits from the same author", () => {
-    const rows = collapseActivityRuns([
-      item("7", "commit", "alice"),
-      item("6", "commit", "alice"),
-      item("5", "commit", "alice"),
-    ]);
+    const rows = collapseActivityRuns(
+      [item("7", "commit", "alice"), item("6", "commit", "alice"), item("5", "commit", "alice")],
+      { rollUpCommits: true },
+    );
 
     expect(rows).toHaveLength(1);
     expect(isCollapsedActivityRow(rows[0]!)).toBe(true);
@@ -75,6 +74,23 @@ describe("collapseActivityRuns", () => {
     expect(rows).toHaveLength(1);
     expect(isCollapsedActivityRow(rows[0]!)).toBe(true);
     expect(isCollapsedActivityRow(rows[0]!) ? rows[0].representative.activity_type : undefined).toBe("review");
+  });
+
+  it("can keep consecutive comments and reviews expanded", () => {
+    const rows = collapseActivityRuns(
+      [
+        item("9", "comment", "alice"),
+        item("8", "comment", "alice"),
+        item("7", "comment", "alice"),
+        item("6", "review", "alice"),
+        item("5", "review", "alice"),
+        item("4", "review", "alice"),
+      ],
+      { rollUpNonCommitActivity: false },
+    );
+
+    expect(rows).toHaveLength(6);
+    expect(rows.every((row) => !isCollapsedActivityRow(row))).toBe(true);
   });
 
   it("does not merge runs of different event types", () => {
@@ -106,15 +122,18 @@ describe("collapseActivityRuns", () => {
   });
 
   it("does not collapse across a force-push boundary", () => {
-    const rows = collapseActivityRuns([
-      item("9", "commit", "alice"),
-      item("8", "commit", "alice"),
-      item("7", "commit", "alice"),
-      item("6", "force_push", "alice"),
-      item("5", "commit", "alice"),
-      item("4", "commit", "alice"),
-      item("3", "commit", "alice"),
-    ]);
+    const rows = collapseActivityRuns(
+      [
+        item("9", "commit", "alice"),
+        item("8", "commit", "alice"),
+        item("7", "commit", "alice"),
+        item("6", "force_push", "alice"),
+        item("5", "commit", "alice"),
+        item("4", "commit", "alice"),
+        item("3", "commit", "alice"),
+      ],
+      { rollUpCommits: true },
+    );
 
     expect(rows).toHaveLength(3);
     expect(isCollapsedActivityRow(rows[0]!)).toBe(true);
@@ -123,26 +142,58 @@ describe("collapseActivityRuns", () => {
   });
 
   it("rolls up branch commit runs by repo branch and author", () => {
-    const rows = collapseActivityRuns([
-      branchItem("9", "default_branch_commit", "alice"),
-      branchItem("8", "default_branch_commit", "alice"),
-      branchItem("7", "default_branch_commit", "alice"),
-    ]);
+    const rows = collapseActivityRuns(
+      [
+        branchItem("9", "default_branch_commit", "alice"),
+        branchItem("8", "default_branch_commit", "alice"),
+        branchItem("7", "default_branch_commit", "alice"),
+      ],
+      { rollUpCommits: true },
+    );
 
     expect(rows).toHaveLength(1);
     expect(isCollapsedActivityRow(rows[0]!)).toBe(true);
     expect(isCollapsedActivityRow(rows[0]!) ? rows[0].representative.branch_name : undefined).toBe("main");
   });
 
+  it("keeps commit runs expanded when commit roll-up is disabled", () => {
+    const rows = collapseActivityRuns(
+      [
+        item("9", "commit", "alice"),
+        item("8", "commit", "alice"),
+        item("7", "commit", "alice"),
+        item("6", "comment", "alice"),
+        item("5", "comment", "alice"),
+        item("4", "comment", "alice"),
+        branchItem("3", "default_branch_commit", "alice"),
+        branchItem("2", "default_branch_commit", "alice"),
+        branchItem("1", "default_branch_commit", "alice"),
+      ],
+      { rollUpCommits: false },
+    );
+
+    expect(rows).toHaveLength(7);
+    expect(isCollapsedActivityRow(rows[0]!)).toBe(false);
+    expect(isCollapsedActivityRow(rows[1]!)).toBe(false);
+    expect(isCollapsedActivityRow(rows[2]!)).toBe(false);
+    expect(isCollapsedActivityRow(rows[3]!)).toBe(true);
+    expect(isCollapsedActivityRow(rows[4]!)).toBe(false);
+    expect(isCollapsedActivityRow(rows[5]!)).toBe(false);
+    expect(isCollapsedActivityRow(rows[6]!)).toBe(false);
+  });
+
   it("does not collapse branch commits across branches", () => {
-    const rows = collapseActivityRuns([
-      branchItem("9", "default_branch_commit", "alice", "main"),
-      branchItem("8", "default_branch_commit", "alice", "main"),
-      branchItem("7", "default_branch_commit", "alice", "main"),
-      branchItem("6", "default_branch_commit", "alice", "release"),
-      branchItem("5", "default_branch_commit", "alice", "release"),
-      branchItem("4", "default_branch_commit", "alice", "release"),
-    ]);
+    const rows = collapseActivityRuns(
+      [
+        branchItem("9", "default_branch_commit", "alice", "main"),
+        branchItem("8", "default_branch_commit", "alice", "main"),
+        branchItem("7", "default_branch_commit", "alice", "main"),
+        branchItem("6", "default_branch_commit", "alice", "release"),
+        branchItem("5", "default_branch_commit", "alice", "release"),
+        branchItem("4", "default_branch_commit", "alice", "release"),
+      ],
+      { rollUpCommits: true },
+    );
 
     expect(rows).toHaveLength(2);
     expect(isCollapsedActivityRow(rows[0]!)).toBe(true);

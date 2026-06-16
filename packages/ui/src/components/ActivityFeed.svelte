@@ -15,6 +15,7 @@
     isDefaultBranchCommitActivity,
     isDefaultBranchForcePushActivity,
     isCollapsedActivityRow,
+    collapseActivityRuns,
     shortSha,
   } from "./activityRows.js";
   import {
@@ -155,6 +156,11 @@
     activity.syncToURL();
   }
 
+  function handleRollUpCommitsChange(value: boolean): void {
+    activity.setRollUpCommits(value);
+    activity.syncToURL();
+  }
+
   const TIME_RANGES: { value: TimeRange; label: string }[] = [
     { value: "24h", label: "24h" },
     { value: "7d", label: "7d" },
@@ -250,7 +256,10 @@
     return result;
   });
 
-  const flatRows = $derived(displayItems);
+  const flatRows = $derived.by(() => collapseActivityRuns(displayItems, {
+    rollUpCommits: activity.getRollUpCommits(),
+    rollUpNonCommitActivity: false,
+  }));
 
   function resetFilters(): void {
     activity.setEnabledEvents(new Set(EVENT_TYPES));
@@ -360,6 +369,17 @@
         closeOnSelect: true,
         onSelect: () => handleTimeRangeChange(range.value),
       })),
+    },
+    {
+      title: "Commits",
+      items: [
+        {
+          id: "roll-up-commits",
+          label: "Roll up commits",
+          active: activity.getRollUpCommits(),
+          onSelect: () => handleRollUpCommitsChange(!activity.getRollUpCommits()),
+        },
+      ],
     },
     ...(activity.getViewMode() === "threaded"
       ? [

@@ -56,6 +56,7 @@ const viewMode = vi.hoisted(() => ({
 const collapseThreads = vi.hoisted(() => ({ value: false }));
 const collapseAllThreads = vi.hoisted(() => vi.fn());
 const expandAllThreads = vi.hoisted(() => vi.fn());
+const rollUpCommits = vi.hoisted(() => ({ value: false }));
 const hideDefaultBranchActivity = vi.hoisted(() => ({ value: false }));
 const hideOrgName = vi.hoisted(() => ({ value: false }));
 const setActivityFilterTypes = vi.hoisted(() => vi.fn());
@@ -87,6 +88,10 @@ vi.mock("../context.js", () => ({
       getCollapseThreads: () => collapseThreads.value,
       collapseAllThreads,
       expandAllThreads,
+      getRollUpCommits: () => rollUpCommits.value,
+      setRollUpCommits: vi.fn((value: boolean) => {
+        rollUpCommits.value = value;
+      }),
       isThreadItemExpanded: () => true,
       toggleThreadItem: vi.fn(),
       setActivityFilterTypes,
@@ -126,6 +131,7 @@ describe("ActivityFeed compact mode", () => {
   beforeEach(() => {
     viewMode.value = "flat";
     collapseThreads.value = false;
+    rollUpCommits.value = false;
     hideDefaultBranchActivity.value = false;
     hideOrgName.value = false;
     enabledEvents.value = new Set(["comment", "review", "commit", "force_push"]);
@@ -308,6 +314,62 @@ describe("ActivityFeed compact mode", () => {
     expect(container.textContent).not.toContain("3 commits");
   });
 
+  it("rolls up default-branch commits in the flat table when enabled", () => {
+    rollUpCommits.value = true;
+    items.value = [
+      branchActivityItem("branch-commit-1", {
+        body_preview: "Ship direct main commit 1",
+        commit_sha: "1111111111111111111111111111111111111111",
+      }),
+      branchActivityItem("branch-commit-2", {
+        body_preview: "Ship direct main commit 2",
+        commit_sha: "2222222222222222222222222222222222222222",
+      }),
+      branchActivityItem("branch-commit-3", {
+        body_preview: "Ship direct main commit 3",
+        commit_sha: "3333333333333333333333333333333333333333",
+      }),
+    ];
+
+    const { container } = render(ActivityFeed, {
+      props: { compact: false },
+    });
+
+    const rows = container.querySelectorAll(".activity-row");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.classList.contains("collapsed-row")).toBe(true);
+    expect(rows[0]?.textContent).toContain("3 commits");
+    expect(container.textContent).not.toContain("Ship direct main commit 1");
+    expect(container.textContent).not.toContain("Ship direct main commit 2");
+    expect(container.textContent).not.toContain("Ship direct main commit 3");
+  });
+
+  it("keeps consecutive comments expanded in the flat table", () => {
+    items.value = [
+      activityItem("comment-1", {
+        body_preview: "First comment",
+        created_at: "2026-04-27T12:03:00Z",
+      }),
+      activityItem("comment-2", {
+        body_preview: "Second comment",
+        created_at: "2026-04-27T12:02:00Z",
+      }),
+      activityItem("comment-3", {
+        body_preview: "Third comment",
+        created_at: "2026-04-27T12:01:00Z",
+      }),
+    ];
+
+    const { container } = render(ActivityFeed, {
+      props: { compact: false },
+    });
+
+    const rows = container.querySelectorAll(".activity-row");
+    expect(rows).toHaveLength(3);
+    expect(container.querySelectorAll(".activity-row.collapsed-row")).toHaveLength(0);
+    expect(container.textContent).not.toContain("3 commits");
+  });
+
   it("renders default-branch force-pushes in table rows", () => {
     items.value = [
       branchActivityItem("force-push", {
@@ -386,6 +448,15 @@ describe("ActivityFeed compact mode", () => {
       "commit",
       "force_push",
     ]);
+  });
+
+  it("can enable commit roll-up from the view dropdown", async () => {
+    render(ActivityFeed, { props: { compact: true } });
+
+    await fireEvent.click(screen.getByRole("button", { name: "View" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Roll up commits" }));
+
+    expect(rollUpCommits.value).toBe(true);
   });
 });
 
