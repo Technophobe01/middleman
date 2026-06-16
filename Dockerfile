@@ -59,15 +59,22 @@ RUN CGO_ENABLED=0 go build -trimpath -buildvcs=false \
 
 # ---- Stage 3: runtime -------------------------------------------------------
 FROM debian:bookworm-slim
-# socat bridges 0.0.0.0:<port> -> middleman's loopback listener (it binds
-# loopback-only by design); curl is for the healthcheck.
+# git/openssh-client: middleman shells out to git for issue workspaces, branch
+# activity, and docs publish (and SSH-backed remotes). socat bridges
+# 0.0.0.0:<port> -> middleman's loopback listener (it binds loopback-only by
+# design); curl is for the healthcheck.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl socat \
+ && apt-get install -y --no-install-recommends ca-certificates curl socat git openssh-client \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /out/middleman /usr/local/bin/middleman
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+# Run as a non-root user; the named /data volume inherits this ownership.
+RUN useradd --system --uid 10001 --home-dir /data --shell /usr/sbin/nologin middleman \
+ && mkdir -p /data && chown middleman:middleman /data
+USER middleman
 
 # Config + SQLite live under MIDDLEMAN_HOME so they persist on the volume.
 # MIDDLEMAN_PORT is the external (socat) port; middleman itself binds
@@ -78,7 +85,12 @@ ENV MIDDLEMAN_INTERNAL_PORT=8092
 EXPOSE 8091
 VOLUME ["/data"]
 
+# Send a loopback X-Forwarded-Host so the check also passes when
+# MIDDLEMAN_TRUST_REVERSE_PROXY is enabled (which otherwise requires a forwarded
+# host on every request). The host is always in the seeded allowlist; when trust
+# is off the header is ignored.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=5 \
-  CMD curl -fsS "http://127.0.0.1:${MIDDLEMAN_PORT:-8091}/healthz" || exit 1
+  CMD curl -fsS -H "X-Forwarded-Host: 127.0.0.1:${MIDDLEMAN_PORT:-8091}" \
+      "http://127.0.0.1:${MIDDLEMAN_PORT:-8091}/healthz" || exit 1
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]

@@ -35,7 +35,9 @@ if [ ! -f "${CONFIG}" ]; then
     # separated) for Tailscale/reverse-proxy domain access.
     allowed="\"127.0.0.1:${MIDDLEMAN_PORT}\", \"localhost:${MIDDLEMAN_PORT}\""
     if [ -n "${MIDDLEMAN_ALLOWED_HOSTS:-}" ]; then
+      # Strip quotes/backslashes so a stray value cannot break the generated TOML.
       extra="$(printf '%s' "${MIDDLEMAN_ALLOWED_HOSTS}" \
+        | tr -d '"\\' \
         | awk -v RS=, '{gsub(/^[ \t]+|[ \t]+$/,""); if($0!="") printf ", \""$0"\""}')"
       allowed="${allowed}${extra}"
     fi
@@ -65,8 +67,11 @@ mm_pid=$!
 terminate() { kill -TERM "${mm_pid}" "${socat_pid}" 2>/dev/null || true; }
 trap terminate INT TERM
 
+# Disable errexit around wait so a non-zero middleman exit still runs cleanup.
+set +e
 wait "${mm_pid}"
 status=$?
+set -e
 kill -TERM "${socat_pid}" 2>/dev/null || true
 wait "${socat_pid}" 2>/dev/null || true
 exit "${status}"
