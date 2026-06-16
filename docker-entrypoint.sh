@@ -17,6 +17,9 @@ set -eu
 : "${MIDDLEMAN_INTERNAL_PORT:=8092}"  # loopback port middleman binds
 CONFIG="${MIDDLEMAN_HOME}/config.toml"
 
+# Strip quotes/backslashes/newlines so a value cannot break the generated TOML.
+toml_safe() { printf '%s' "$1" | tr -d '"\\\n\r'; }
+
 mkdir -p "${MIDDLEMAN_HOME}"
 
 if [ ! -f "${CONFIG}" ]; then
@@ -55,7 +58,7 @@ if [ ! -f "${CONFIG}" ]; then
     if [ -n "${MIDDLEMAN_ROBOREV_ENDPOINT:-}" ]; then
       echo ''
       echo '[roborev]'
-      echo "endpoint = \"${MIDDLEMAN_ROBOREV_ENDPOINT}\""
+      echo "endpoint = \"$(toml_safe "${MIDDLEMAN_ROBOREV_ENDPOINT}")\""
     fi
   } > "${CONFIG}"
 fi
@@ -66,6 +69,7 @@ if [ -n "${MIDDLEMAN_KATA_URL:-}" ]; then
   : "${KATA_HOME:=${MIDDLEMAN_HOME}/kata}"
   export KATA_HOME
   mkdir -p "${KATA_HOME}"
+  [ -n "${KATA_AUTH_TOKEN:-}" ] || echo "middleman: warning: MIDDLEMAN_KATA_URL set but KATA_AUTH_TOKEN is empty; kata proxy will fail auth" >&2
   KATA_CATALOG="${KATA_HOME}/config.toml"
   if [ ! -f "${KATA_CATALOG}" ]; then
     echo "middleman: seeding kata catalog at ${KATA_CATALOG} -> ${MIDDLEMAN_KATA_URL}" >&2
@@ -73,7 +77,7 @@ if [ -n "${MIDDLEMAN_KATA_URL:-}" ]; then
       echo 'active_daemon = "kenn-stack"'
       echo '[[daemon]]'
       echo 'name = "kenn-stack"'
-      echo "url = \"${MIDDLEMAN_KATA_URL}\""
+      echo "url = \"$(toml_safe "${MIDDLEMAN_KATA_URL}")\""
       echo 'token_env = "KATA_AUTH_TOKEN"'
       echo 'allow_insecure = true'
     } > "${KATA_CATALOG}"
