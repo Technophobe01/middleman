@@ -54,6 +54,12 @@ if [ ! -f "${CONFIG}" ]; then
   } > "${CONFIG}"
 fi
 
+# Seed-only mode: write the config and exit (used by tests to validate the
+# generated config without starting the server). No middleman binary required.
+if [ "${MIDDLEMAN_SEED_ONLY:-}" = "1" ]; then
+  exit 0
+fi
+
 # Honor a hand-edited config: read the port middleman will actually bind.
 backend_port="$(middleman config read -config "${CONFIG}" port 2>/dev/null || true)"
 case "${backend_port}" in
