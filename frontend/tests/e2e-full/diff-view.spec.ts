@@ -2,7 +2,10 @@ import { expect, test, type Locator, type Page, type Request } from "@playwright
 import type { DiffFile, DiffLine, DiffResult, FilesResult } from "@middleman/ui/api/types";
 import { startIsolatedE2EServer } from "./support/e2eServer";
 
-type DiffFixtureFile = Omit<DiffFile, "patch"> & { patch?: string };
+type DiffFixtureFile = Omit<DiffFile, "patch"> & {
+  patch?: string;
+  preserveHunkCounts?: boolean;
+};
 type DiffFixture = Omit<DiffResult, "files"> & {
   files: DiffFixtureFile[];
 };
@@ -616,6 +619,94 @@ async function expectRenderedNonBlankRows(file: ReturnType<Page["locator"]>, tex
     });
 }
 
+async function expectVisibleExpandedRowContent(file: ReturnType<Page["locator"]>, expectedText: string) {
+  await expect
+    .poll(async () => {
+      return await file.locator(".pierre-diff").evaluate((host, expectedText) => {
+        const root = host.shadowRoot;
+        const gutters = Array.from(root?.querySelectorAll("[data-gutter] > [data-line-index]") ?? []);
+        const contents = Array.from(root?.querySelectorAll("[data-content] > [data-line-index]") ?? []);
+        const visibleExpanded = gutters.filter((gutter): gutter is HTMLElement => {
+          if (!(gutter instanceof HTMLElement)) return false;
+          if (gutter.getAttribute("data-line-type") !== "context-expanded") return false;
+          const rect = gutter.getBoundingClientRect();
+          return rect.bottom > 0 && rect.top < window.innerHeight;
+        });
+
+        let matched = false;
+        let missing = 0;
+        let blank = 0;
+        for (const gutter of visibleExpanded) {
+          const gutterRect = gutter.getBoundingClientRect();
+          const index = gutter.getAttribute("data-line-index");
+          const content = contents.find((candidate): candidate is HTMLElement => {
+            if (!(candidate instanceof HTMLElement)) return false;
+            if (candidate.getAttribute("data-line-index") !== index) return false;
+            const contentRect = candidate.getBoundingClientRect();
+            return Math.abs(contentRect.top - gutterRect.top) <= 1;
+          });
+          if (!content) {
+            missing += 1;
+            continue;
+          }
+          const text = content.textContent?.trim() ?? "";
+          if (text.length === 0) blank += 1;
+          if (text.includes(expectedText)) matched = true;
+        }
+
+        return {
+          blank,
+          matched,
+          missing,
+          visibleExpandedPositive: visibleExpanded.length > 0,
+        };
+      }, expectedText);
+    })
+    .toEqual({
+      blank: 0,
+      matched: true,
+      missing: 0,
+      visibleExpandedPositive: true,
+    });
+}
+
+async function expectRenderedPierreContainmentDisabled(page: Page): Promise<void> {
+  await expect
+    .poll(
+      async () => {
+        return await page.locator(".diff-file .pierre-diff").evaluateAll((hosts) => {
+          for (const host of hosts) {
+            const root = host.shadowRoot;
+            const code = root?.querySelector("code");
+            if (!(root instanceof ShadowRoot) || !(code instanceof HTMLElement)) continue;
+
+            const visibleTextRows = Array.from(root.querySelectorAll("[data-content] [data-line-type]")).filter(
+              (element): element is HTMLElement => {
+                if (!(element instanceof HTMLElement)) return false;
+                const rect = element.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0 && (element.textContent?.trim().length ?? 0) > 0;
+              },
+            ).length;
+            if (visibleTextRows === 0) continue;
+
+            const placeholderProbe = document.createElement("div");
+            placeholderProbe.dataset.placeholder = "";
+            root.append(placeholderProbe);
+            const containment = {
+              code: getComputedStyle(code).contain,
+              placeholder: getComputedStyle(placeholderProbe).contain,
+            };
+            placeholderProbe.remove();
+            return containment;
+          }
+          return null;
+        });
+      },
+      { timeout: 10_000 },
+    )
+    .toEqual({ code: "none", placeholder: "none" });
+}
+
 async function scrollDiffAreaUntilPierreText(
   page: Page,
   diffArea: Locator,
@@ -821,6 +912,7 @@ function patchForFile(file: DiffFixtureFile): string {
 }
 
 function normalizeFixtureFile(file: DiffFixtureFile): DiffFixtureFile {
+  if (file.preserveHunkCounts) return file;
   return {
     ...file,
     hunks: file.hunks.map((hunk) => ({
@@ -1598,6 +1690,7 @@ test.describe("diff view", () => {
         timeout: 10_000,
       })
       .toBe(0);
+    await expectRenderedPierreContainmentDisabled(page);
   });
 
   test("rich preview toggle renders markdown and browser images", async ({ page }) => {
@@ -2046,6 +2139,7 @@ test.describe("diff view", () => {
         {
           path: "src/components/detail/PullDetail.svelte",
           old_path: "src/components/detail/PullDetail.svelte",
+          preserveHunkCounts: true,
           status: "modified",
           is_binary: false,
           is_whitespace_only: false,
@@ -2054,9 +2148,9 @@ test.describe("diff view", () => {
           hunks: [
             {
               old_start: 949,
-              old_count: 6,
+              old_count: 48,
               new_start: 949,
-              new_count: 7,
+              new_count: 49,
               lines: [
                 {
                   type: "context",
@@ -2158,6 +2252,7 @@ test.describe("diff view", () => {
     await clickPierreContextExpander(page, detailFile, 0, "[data-expand-down]");
     await expect.poll(() => [...new Set(previewSides)].sort()).toEqual(["new", "old"]);
     await expectRenderedNonBlankRows(schemaFile, "schema response row");
+    await expectVisibleExpandedRowContent(detailFile, "function onActionMenuKeydown(e: KeyboardEvent): void {");
     await scrollDiffAreaUntilPierreText(
       page,
       diffArea,

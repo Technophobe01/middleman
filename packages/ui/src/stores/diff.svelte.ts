@@ -464,13 +464,13 @@ export function createDiffStore(opts?: DiffStoreOptions) {
   }
 
   function diffQuery(): {
-    whitespace?: string;
+    whitespace?: "hide";
     commit?: string;
     from?: string;
     to?: string;
   } {
     return {
-      ...(hideWhitespace && { whitespace: "hide" }),
+      ...(hideWhitespace && { whitespace: "hide" as const }),
       ...(scope.kind === "commit" && { commit: scope.sha }),
       ...(scope.kind === "range" && {
         from: scope.fromSha,
@@ -497,6 +497,10 @@ export function createDiffStore(opts?: DiffStoreOptions) {
     path: string,
     side?: "old" | "new",
   ): Promise<FilePreview> {
+    if (currentWorkspaceID) {
+      return loadWorkspaceFilePreview(path, side);
+    }
+
     const ref = currentRouteRef();
     const key = `${ref.provider}:${ref.platformHost ?? ""}:${ref.repoPath}#${number}:${scopeCacheKey()}:${path}:${side ?? "preview"}`;
     const cached = filePreviewCache.get(key);
@@ -532,9 +536,40 @@ export function createDiffStore(opts?: DiffStoreOptions) {
     }
   }
 
+  async function loadWorkspaceFilePreview(path: string, side?: "old" | "new"): Promise<FilePreview> {
+    const key = `workspace:${currentWorkspaceID}:${currentWorkspaceBase}:${scopeCacheKey()}:${path}:${side ?? "preview"}`;
+    const cached = filePreviewCache.get(key);
+    if (cached) return cached;
+
+    const request = (async () => {
+      const { data, error, response } = await apiClient.GET("/workspaces/{id}/file-preview", {
+        params: {
+          path: { id: currentWorkspaceID },
+          query: {
+            ...workspaceDiffQuery(currentWorkspaceBase),
+            path,
+            ...(side && { side }),
+          },
+        },
+      });
+      if (!data) {
+        throw new Error(apiErrorMessage(error, `HTTP ${response.status}`));
+      }
+      return data as FilePreview;
+    })();
+
+    filePreviewCache.set(key, request);
+    try {
+      return await request;
+    } catch (err) {
+      filePreviewCache.delete(key);
+      throw err;
+    }
+  }
+
   function workspaceDiffQuery(base: WorkspaceDiffBase): {
     base: WorkspaceDiffBase;
-    whitespace?: string;
+    whitespace?: "hide";
     commit?: string;
     from?: string;
     to?: string;
@@ -566,7 +601,6 @@ export function createDiffStore(opts?: DiffStoreOptions) {
       scope.kind === "commit" ? hasCommit(scope.sha) : hasCommit(scope.fromSha) && hasCommit(scope.toSha);
     if (scopeStillExists) return;
     scope = { kind: "head" };
-    clearFilePreviewCache();
   }
 
   function startDiffLoad(): {
@@ -718,6 +752,7 @@ export function createDiffStore(opts?: DiffStoreOptions) {
       resetScopeIfMissingFromLoadedCommits();
     }
 
+    clearFilePreviewCache();
     const { diffAc, filesAc } = startDiffLoad();
 
     try {
