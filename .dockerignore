@@ -1,0 +1,18 @@
+# Keep the build context small and reproducible.
+.git
+.github
+node_modules
+**/node_modules
+frontend/dist
+internal/web/dist
+internal/githubapp/ui/dist
+packages/*/dist
+target
+*.db
+*.db-*
+.DS_Store
+test-results
+playwright-report
+*.log
+middleman
+middleman-github-app
