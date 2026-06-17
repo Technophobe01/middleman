@@ -93,6 +93,7 @@ import type { DiffFile as DiffFileType, FilePreview } from "../../api/types.js";
 import { STORES_KEY } from "../../context.js";
 import type { DiffReviewDraftComment, DiffReviewLineRange } from "../../stores/diff-review-draft.svelte.js";
 import { createDiffStore } from "../../stores/diff.svelte.js";
+import { renderedCodeSide } from "./pierre-dom.js";
 import type { ReviewThread } from "./review-thread-context.js";
 
 function makeFile(overrides: Partial<DiffFileType> = {}): DiffFileType {
@@ -132,6 +133,41 @@ function makeFile(overrides: Partial<DiffFileType> = {}): DiffFileType {
     ],
     ...overrides,
   };
+}
+
+function makeTwoAdditionFile(): DiffFileType {
+  return makeFile({
+    additions: 2,
+    deletions: 1,
+    patch: `diff --git a/src/foo.ts b/src/foo.ts
+--- a/src/foo.ts
++++ b/src/foo.ts
+@@ -1,2 +1,3 @@
+ line 1
+-old line
++new line
++newer line
+`,
+    hunks: [
+      {
+        old_start: 1,
+        old_count: 2,
+        new_start: 1,
+        new_count: 3,
+        lines: [
+          {
+            type: "context",
+            content: "line 1",
+            old_num: 1,
+            new_num: 1,
+          },
+          { type: "delete", content: "old line", old_num: 2 },
+          { type: "add", content: "new line", new_num: 2 },
+          { type: "add", content: "newer line", new_num: 3 },
+        ],
+      },
+    ],
+  });
 }
 
 function makeReviewThread(overrides: Partial<ReviewThread> = {}): ReviewThread {
@@ -457,6 +493,11 @@ describe("DiffFile", () => {
     return document.querySelector(".pierre-diff")?.shadowRoot?.querySelectorAll("[data-selected-line]");
   }
 
+  function splitColumnSide(element: Element | null | undefined): "additions" | "deletions" | null {
+    const code = element?.closest("code");
+    return code ? (renderedCodeSide(code) ?? null) : null;
+  }
+
   function expandedContextLineTexts(): string[] {
     return Array.from(
       document
@@ -510,6 +551,46 @@ describe("DiffFile", () => {
 
     expect(screen.queryByPlaceholderText("Leave a comment")).toBeNull();
     expect(selectedPierreLines()).toHaveLength(0);
+  });
+
+  it("keeps right-side inline composers in the additions column in split mode", async () => {
+    renderDiffFile(makeTwoAdditionFile(), {
+      reviewEnabled: true,
+      diffHeadSHA: "diff-head",
+      viewMode: "split",
+    });
+
+    async function assertRightSideComposer(line: number): Promise<void> {
+      const button = await findLineCommentButton(line, "right");
+      expect(splitColumnSide(button)).toBe("additions");
+
+      await clickLineCommentButton(line, "right");
+
+      await waitFor(() => {
+        expect(screen.getByPlaceholderText("Leave a comment")).toBeTruthy();
+        const slot = document
+          .querySelector(".pierre-diff")
+          ?.shadowRoot?.querySelector<HTMLSlotElement>(`slot[name="annotation-additions-${line}"]`);
+        expect(splitColumnSide(slot)).toBe("additions");
+      });
+
+      await fireEvent.click(screen.getByText("Cancel"));
+      await waitFor(() => expect(screen.queryByPlaceholderText("Leave a comment")).toBeNull());
+    }
+
+    await assertRightSideComposer(2);
+    await assertRightSideComposer(3);
+  });
+
+  it("infers split column side from code-column order when non-code siblings are present", () => {
+    const pre = document.createElement("pre");
+    const deletions = document.createElement("code");
+    const separator = document.createElement("span");
+    const additions = document.createElement("code");
+    pre.append(deletions, separator, additions);
+
+    expect(renderedCodeSide(deletions)).toBe("deletions");
+    expect(renderedCodeSide(additions)).toBe("additions");
   });
 
   it("focuses the inline composer textarea exactly once after opening", async () => {
