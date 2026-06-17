@@ -34,18 +34,7 @@ func entrypointScript(t *testing.T) string {
 // here rather than silently breaking a container at startup.
 func seedConfig(t *testing.T, home string, env map[string]string) *config.Config {
 	t.Helper()
-	cmd := exec.Command("sh", entrypointScript(t))
-	cmd.Env = []string{
-		"PATH=" + os.Getenv("PATH"),
-		"MIDDLEMAN_SEED_ONLY=1",
-		"MIDDLEMAN_HOME=" + home,
-	}
-	for k, v := range env {
-		cmd.Env = append(cmd.Env, k+"="+v)
-	}
-	out, err := cmd.CombinedOutput()
-	require.NoErrorf(t, err, "entrypoint seed failed: %s", out)
-
+	runEntrypoint(t, home, env)
 	cfg, err := config.Load(filepath.Join(home, "config.toml"))
 	require.NoErrorf(t, err, "generated config did not load")
 	return cfg
