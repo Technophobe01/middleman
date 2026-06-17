@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/middleman/internal/config"
+	"go.kenn.io/middleman/internal/kata"
 )
 
 // entrypointScript returns the absolute path to the production docker entrypoint,
@@ -123,5 +124,86 @@ func TestDockerEntrypointSeedsLoadableConfig(t *testing.T) {
 		})
 		assert.Equal(t, 9999, cfg.Port, "entrypoint must not clobber an existing config")
 		assert.False(t, slices.Contains(cfg.AllowedHosts, "127.0.0.1:18091"))
+	})
+}
+
+// seedKataCatalog runs the entrypoint (which seeds both the middleman config and
+// the kata daemon catalog at $KATA_HOME/config.toml) and reads the catalog back
+// through the real kata loader. A bad seeded daemon entry fails here rather than
+// silently breaking the front-door kata proxy at container startup.
+func seedKataCatalog(t *testing.T, home string, env map[string]string) kata.Catalog {
+	t.Helper()
+	seedConfig(t, home, env) // also asserts the middleman config itself loads
+	t.Setenv("KATA_HOME", filepath.Join(home, "kata"))
+	cat, err := kata.LoadCatalog()
+	require.NoErrorf(t, err, "seeded kata catalog did not load")
+	return cat
+}
+
+func TestDockerEntrypointSeedsProxyTargets(t *testing.T) {
+	t.Run("roborev endpoint is seeded and loads", func(t *testing.T) {
+		assert := assert.New(t)
+		cfg := seedConfig(t, t.TempDir(), map[string]string{
+			"MIDDLEMAN_PORT":             "18091",
+			"MIDDLEMAN_INTERNAL_PORT":    "18092",
+			"MIDDLEMAN_ROBOREV_ENDPOINT": "http://roborev:7373",
+		})
+		assert.Equal("http://roborev:7373", cfg.Roborev.Endpoint)
+		assert.Equal("http://roborev:7373", cfg.RoborevEndpoint())
+	})
+
+	t.Run("no roborev endpoint leaves the panel unconfigured", func(t *testing.T) {
+		assert := assert.New(t)
+		cfg := seedConfig(t, t.TempDir(), map[string]string{
+			"MIDDLEMAN_PORT":          "18091",
+			"MIDDLEMAN_INTERNAL_PORT": "18092",
+		})
+		assert.Empty(cfg.Roborev.Endpoint)
+	})
+
+	t.Run("hostile roborev endpoint still produces valid TOML", func(t *testing.T) {
+		assert := assert.New(t)
+		// Quotes/backslashes/newlines must not break the [roborev] table;
+		// config.Load succeeding (inside seedConfig) is the core assertion.
+		cfg := seedConfig(t, t.TempDir(), map[string]string{
+			"MIDDLEMAN_PORT":             "18091",
+			"MIDDLEMAN_ROBOREV_ENDPOINT": "http://ev\"il\\:7373\nbreak",
+		})
+		assert.NotEmpty(cfg.Roborev.Endpoint)
+		assert.NotContains(cfg.Roborev.Endpoint, "\"")
+		assert.NotContains(cfg.Roborev.Endpoint, "\\")
+		assert.NotContains(cfg.Roborev.Endpoint, "\n")
+	})
+
+	t.Run("kata catalog is seeded and loads", func(t *testing.T) {
+		assert := assert.New(t)
+		cat := seedKataCatalog(t, t.TempDir(), map[string]string{
+			"MIDDLEMAN_PORT":     "18091",
+			"MIDDLEMAN_KATA_URL": "http://kata:7777",
+			"KATA_AUTH_TOKEN":    "test-token",
+		})
+		require.Len(t, cat.Daemons, 1)
+		d := cat.Daemons[0]
+		assert.Equal("http://kata:7777", d.URL)
+		assert.Equal("KATA_AUTH_TOKEN", d.TokenEnv)
+		assert.True(d.Default, "seeded daemon should be the active_daemon")
+		assert.True(d.AllowInsecure)
+		assert.Empty(d.Token, "catalog carries token_env, never the secret itself")
+	})
+
+	t.Run("hostile kata url still produces a loadable catalog", func(t *testing.T) {
+		assert := assert.New(t)
+		// LoadCatalog succeeding (inside seedKataCatalog) is the core assertion.
+		cat := seedKataCatalog(t, t.TempDir(), map[string]string{
+			"MIDDLEMAN_PORT":     "18091",
+			"MIDDLEMAN_KATA_URL": "http://ka\"ta\\:7777\nbreak",
+			"KATA_AUTH_TOKEN":    "test-token",
+		})
+		require.Len(t, cat.Daemons, 1)
+		u := cat.Daemons[0].URL
+		assert.NotEmpty(u)
+		assert.NotContains(u, "\"")
+		assert.NotContains(u, "\\")
+		assert.NotContains(u, "\n")
 	})
 }
