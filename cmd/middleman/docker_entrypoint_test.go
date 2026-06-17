@@ -140,6 +140,24 @@ func seedKataCatalog(t *testing.T, home string, env map[string]string) kata.Cata
 	return cat
 }
 
+// runEntrypoint runs docker-entrypoint.sh in seed-only mode and returns its
+// combined output, for asserting operator warnings and that files are (not) written.
+func runEntrypoint(t *testing.T, home string, env map[string]string) string {
+	t.Helper()
+	cmd := exec.Command("sh", entrypointScript(t))
+	cmd.Env = []string{
+		"PATH=" + os.Getenv("PATH"),
+		"MIDDLEMAN_SEED_ONLY=1",
+		"MIDDLEMAN_HOME=" + home,
+	}
+	for k, v := range env {
+		cmd.Env = append(cmd.Env, k+"="+v)
+	}
+	out, err := cmd.CombinedOutput()
+	require.NoErrorf(t, err, "entrypoint failed: %s", out)
+	return string(out)
+}
+
 func TestDockerEntrypointSeedsProxyTargets(t *testing.T) {
 	t.Run("roborev endpoint is seeded and loads", func(t *testing.T) {
 		assert := assert.New(t)
@@ -205,5 +223,27 @@ func TestDockerEntrypointSeedsProxyTargets(t *testing.T) {
 		assert.NotContains(u, "\"")
 		assert.NotContains(u, "\\")
 		assert.NotContains(u, "\n")
+	})
+
+	t.Run("kata url without auth token warns", func(t *testing.T) {
+		// A catalog with no usable token would fail the proxy at runtime; the
+		// entrypoint must surface that at seed time, not silently.
+		out := runEntrypoint(t, t.TempDir(), map[string]string{
+			"MIDDLEMAN_PORT":     "18091",
+			"MIDDLEMAN_KATA_URL": "http://kata:7777",
+			// KATA_AUTH_TOKEN intentionally unset
+		})
+		assert.Contains(t, out, "KATA_AUTH_TOKEN is empty")
+	})
+
+	t.Run("no kata url writes no catalog", func(t *testing.T) {
+		home := t.TempDir()
+		runEntrypoint(t, home, map[string]string{
+			"MIDDLEMAN_PORT": "18091",
+			// MIDDLEMAN_KATA_URL intentionally unset
+		})
+		_, err := os.Stat(filepath.Join(home, "kata", "config.toml"))
+		assert.Truef(t, os.IsNotExist(err),
+			"no kata catalog should be written without MIDDLEMAN_KATA_URL (stat err: %v)", err)
 	})
 }
