@@ -66,6 +66,206 @@ func TestClientLooksUpProjectByRawPathAndUsesNumericIDAfterLookup(t *testing.T) 
 	}, paths)
 }
 
+func TestClientListOpenMergeRequestsPopulatesForkHeadRepoCloneURL(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.EscapedPath())
+		switch r.URL.EscapedPath() {
+		case "/api/v4/projects/42/merge_requests":
+			writeJSON(w, `[
+				{"id": 1001, "iid": 7, "project_id": 42, "source_project_id": 77, "target_project_id": 42, "source_branch": "feature/auth", "target_branch": "main", "title": "Fork base", "state": "opened"},
+				{"id": 1002, "iid": 8, "project_id": 42, "source_project_id": 77, "target_project_id": 42, "source_branch": "feature/auth-ui", "target_branch": "feature/auth", "title": "Fork tip", "state": "opened"},
+				{"id": 1003, "iid": 9, "project_id": 42, "source_project_id": 42, "target_project_id": 42, "source_branch": "feature/local", "target_branch": "main", "title": "Local", "state": "opened"}
+			]`)
+		case "/api/v4/projects/77":
+			writeJSON(w, `{
+				"id": 77,
+				"path": "project",
+				"path_with_namespace": "fork/project",
+				"http_url_to_repo": "https://gitlab.example.com/fork/project.git"
+			}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := newTestClient(t, server.URL)
+	ref := platform.RepoRef{
+		Platform:   platform.KindGitLab,
+		Host:       "gitlab.example.com",
+		RepoPath:   "group/project",
+		PlatformID: 42,
+		CloneURL:   "https://gitlab.example.com/group/project.git",
+	}
+
+	mrs, err := client.ListOpenMergeRequests(context.Background(), ref)
+	require.NoError(err)
+	require.Len(mrs, 3)
+	assert.Equal("https://gitlab.example.com/fork/project.git", mrs[0].HeadRepoCloneURL)
+	assert.Equal("https://gitlab.example.com/fork/project.git", mrs[1].HeadRepoCloneURL)
+	assert.Equal("https://gitlab.example.com/group/project.git", mrs[2].HeadRepoCloneURL)
+	assert.Equal([]string{
+		"/api/v4/projects/42/merge_requests",
+		"/api/v4/projects/77",
+	}, paths)
+}
+
+func TestClientListOpenMergeRequestsContinuesWhenForkHeadRepoLookupFails(t *testing.T) {
+	for _, status := range []int{http.StatusForbidden, http.StatusNotFound} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.EscapedPath() {
+				case "/api/v4/projects/42/merge_requests":
+					writeJSON(w, `[
+						{"id": 1001, "iid": 7, "project_id": 42, "source_project_id": 77, "target_project_id": 42, "source_branch": "feature/auth", "target_branch": "main", "title": "Fork base", "state": "opened"}
+					]`)
+				case "/api/v4/projects/77":
+					http.Error(w, http.StatusText(status), status)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+
+			client := newTestClient(t, server.URL)
+			ref := platform.RepoRef{
+				Platform:   platform.KindGitLab,
+				Host:       "gitlab.example.com",
+				RepoPath:   "group/project",
+				PlatformID: 42,
+				CloneURL:   "https://gitlab.example.com/group/project.git",
+			}
+
+			mrs, err := client.ListOpenMergeRequests(context.Background(), ref)
+			require.NoError(err)
+			require.Len(mrs, 1)
+			assert.Equal(7, mrs[0].Number)
+			assert.Empty(mrs[0].HeadRepoCloneURL)
+		})
+	}
+}
+
+func TestClientListOpenMergeRequestsPropagatesTransientForkHeadRepoLookupFailures(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.EscapedPath() {
+		case "/api/v4/projects/42/merge_requests":
+			writeJSON(w, `[
+				{"id": 1001, "iid": 7, "project_id": 42, "source_project_id": 77, "target_project_id": 42, "source_branch": "feature/auth", "target_branch": "main", "title": "Fork base", "state": "opened"}
+			]`)
+		case "/api/v4/projects/77":
+			http.Error(w, "rate limited", http.StatusTooManyRequests)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := newTestClient(t, server.URL)
+	ref := platform.RepoRef{
+		Platform:   platform.KindGitLab,
+		Host:       "gitlab.example.com",
+		RepoPath:   "group/project",
+		PlatformID: 42,
+		CloneURL:   "https://gitlab.example.com/group/project.git",
+	}
+
+	_, err := client.ListOpenMergeRequests(context.Background(), ref)
+	require.Error(err)
+	var platformErr *platform.Error
+	require.ErrorAs(err, &platformErr)
+	assert.Equal(platform.ErrCodeRateLimited, platformErr.Code)
+	assert.Equal("get_source_project", platformErr.Capability)
+}
+
+func TestClientGetMergeRequestContinuesWhenForkHeadRepoLookupFails(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.EscapedPath() {
+		case "/api/v4/projects/42/merge_requests/7":
+			writeJSON(w, `{
+				"id": 1001,
+				"iid": 7,
+				"project_id": 42,
+				"source_project_id": 77,
+				"target_project_id": 42,
+				"source_branch": "feature/auth",
+				"target_branch": "main",
+				"title": "Fork base",
+				"state": "opened"
+			}`)
+		case "/api/v4/projects/77":
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := newTestClient(t, server.URL)
+	ref := platform.RepoRef{
+		Platform:   platform.KindGitLab,
+		Host:       "gitlab.example.com",
+		RepoPath:   "group/project",
+		PlatformID: 42,
+		CloneURL:   "https://gitlab.example.com/group/project.git",
+	}
+
+	mr, err := client.GetMergeRequest(context.Background(), ref, 7)
+	require.NoError(err)
+	assert.Equal(7, mr.Number)
+	assert.Empty(mr.HeadRepoCloneURL)
+}
+
+func TestClientGetMergeRequestPropagatesTransientForkHeadRepoLookupFailures(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.EscapedPath() {
+		case "/api/v4/projects/42/merge_requests/7":
+			writeJSON(w, `{
+				"id": 1001,
+				"iid": 7,
+				"project_id": 42,
+				"source_project_id": 77,
+				"target_project_id": 42,
+				"source_branch": "feature/auth",
+				"target_branch": "main",
+				"title": "Fork base",
+				"state": "opened"
+			}`)
+		case "/api/v4/projects/77":
+			http.Error(w, "temporary failure", http.StatusBadGateway)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := newTestClient(t, server.URL)
+	ref := platform.RepoRef{
+		Platform:   platform.KindGitLab,
+		Host:       "gitlab.example.com",
+		RepoPath:   "group/project",
+		PlatformID: 42,
+		CloneURL:   "https://gitlab.example.com/group/project.git",
+	}
+
+	_, err := client.GetMergeRequest(context.Background(), ref, 7)
+	require.Error(err)
+	var platformErr *platform.Error
+	require.ErrorAs(err, &platformErr)
+	assert.Equal(platform.ErrCodeInvalidRepoRef, platformErr.Code)
+	assert.Equal("get_source_project", platformErr.Capability)
+}
+
 func TestClientRecordsRateLimitRequests(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)

@@ -42,6 +42,9 @@ type Client struct {
 	// client lifetime (user IDs are immutable).
 	userIDMu sync.Mutex
 	userIDs  map[string]int64
+
+	projectCloneURLMu sync.Mutex
+	projectCloneURLs  map[int64]string
 }
 
 type PreviewOptions struct {
@@ -119,6 +122,7 @@ func NewClient(host string, source tokenauth.Source, options ...ClientOption) (*
 		api:               api,
 		foregroundTimeout: opts.foregroundTimeout,
 		userIDs:           make(map[string]int64),
+		projectCloneURLs:  make(map[int64]string),
 	}, nil
 }
 
@@ -311,7 +315,12 @@ func (c *Client) ListOpenMergeRequests(
 			return nil, mapGitLabError("list_merge_requests", err)
 		}
 		for _, mr := range mrs {
-			out = append(out, NormalizeMergeRequest(normalizedRef, mr, nil))
+			normalized := NormalizeMergeRequest(normalizedRef, mr, nil)
+			normalized.HeadRepoCloneURL, err = c.optionalHeadRepoCloneURL(ctx, normalizedRef, mr.ProjectID, mr.SourceProjectID)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, normalized)
 		}
 		if resp == nil || resp.NextPage == 0 {
 			return out, nil
@@ -333,7 +342,65 @@ func (c *Client) GetMergeRequest(
 	if err != nil {
 		return platform.MergeRequest{}, mapGitLabError("get_merge_request", err)
 	}
-	return NormalizeDetailedMergeRequest(normalizedRef, mr), nil
+	normalized := NormalizeDetailedMergeRequest(normalizedRef, mr)
+	normalized.HeadRepoCloneURL, err = c.optionalHeadRepoCloneURL(ctx, normalizedRef, mr.ProjectID, mr.SourceProjectID)
+	if err != nil {
+		return platform.MergeRequest{}, err
+	}
+	return normalized, nil
+}
+
+func (c *Client) optionalHeadRepoCloneURL(
+	ctx context.Context,
+	ref platform.RepoRef,
+	targetProjectID int64,
+	sourceProjectID int64,
+) (string, error) {
+	cloneURL, err := c.headRepoCloneURL(ctx, ref, targetProjectID, sourceProjectID)
+	if err == nil {
+		return cloneURL, nil
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return "", ctxErr
+	}
+	if isUnavailableSourceProjectError(err) {
+		return "", nil
+	}
+	return "", err
+}
+
+func (c *Client) headRepoCloneURL(
+	ctx context.Context,
+	ref platform.RepoRef,
+	targetProjectID int64,
+	sourceProjectID int64,
+) (string, error) {
+	if sourceProjectID == 0 || sourceProjectID == targetProjectID || sourceProjectID == ref.PlatformID {
+		return ref.CloneURL, nil
+	}
+	return c.projectCloneURL(ctx, sourceProjectID)
+}
+
+func (c *Client) projectCloneURL(ctx context.Context, projectID int64) (string, error) {
+	c.projectCloneURLMu.Lock()
+	cached, ok := c.projectCloneURLs[projectID]
+	c.projectCloneURLMu.Unlock()
+	if ok {
+		return cached, nil
+	}
+
+	project, _, err := c.api.Projects.GetProject(projectID, nil, gitlab.WithContext(ctx))
+	if err != nil || project == nil {
+		if err == nil {
+			err = errors.New("source project response was empty")
+		}
+		return "", mapGitLabError("get_source_project", err)
+	}
+	cloneURL := strings.TrimSpace(project.HTTPURLToRepo)
+	c.projectCloneURLMu.Lock()
+	c.projectCloneURLs[projectID] = cloneURL
+	c.projectCloneURLMu.Unlock()
+	return cloneURL, nil
 }
 
 func (c *Client) ListMergeRequestEvents(
@@ -821,6 +888,18 @@ func isGitLabStatus(err error, status int) bool {
 		return true
 	}
 	return strings.Contains(err.Error(), strconv.Itoa(status))
+}
+
+func isUnavailableSourceProjectError(err error) bool {
+	var platformErr *platform.Error
+	if errors.As(err, &platformErr) {
+		if platformErr.Code == platform.ErrCodePermissionDenied ||
+			platformErr.Code == platform.ErrCodeNotFound {
+			return true
+		}
+	}
+	return isGitLabStatus(err, http.StatusForbidden) ||
+		isGitLabStatus(err, http.StatusNotFound)
 }
 
 func partialError(namespace string, page int64, err error) PartialError {

@@ -846,7 +846,12 @@ func setupTestServerWithMock(t *testing.T, mock *mockGH) (*Server, *db.DB) {
 }
 
 var defaultTestRepos = []ghclient.RepoRef{
-	{Owner: "acme", Name: "widget", PlatformHost: "github.com"},
+	{
+		Owner:        "acme",
+		Name:         "widget",
+		PlatformHost: "github.com",
+		CloneURL:     "https://github.com/acme/widget.git",
+	},
 }
 
 func setupTestServerWithRepos(
@@ -18475,23 +18480,29 @@ func seedStackedPRState(
 	ctx := t.Context()
 	repoID, err := database.UpsertRepo(ctx, db.GitHubRepoIdentity("github.com", owner, name))
 	require.NoError(t, err)
+	cloneURL := fmt.Sprintf("https://github.com/%s/%s.git", owner, name)
+	require.NoError(t, database.UpdateRepoProviderMetadata(ctx, repoID, db.RepoProviderMetadata{
+		CloneURL:      cloneURL,
+		DefaultBranch: "main",
+	}))
 	now := time.Now().UTC().Truncate(time.Second)
 	pr := &db.MergeRequest{
-		RepoID:         repoID,
-		PlatformID:     int64(number) * 1000,
-		Number:         number,
-		Title:          fmt.Sprintf("PR #%d: %s", number, head),
-		Author:         "testuser",
-		State:          state,
-		IsDraft:        isDraft,
-		HeadBranch:     head,
-		BaseBranch:     base,
-		CIStatus:       ci,
-		ReviewDecision: review,
-		MergeableState: mergeableState,
-		CreatedAt:      now,
-		UpdatedAt:      now,
-		LastActivityAt: now,
+		RepoID:           repoID,
+		PlatformID:       int64(number) * 1000,
+		Number:           number,
+		Title:            fmt.Sprintf("PR #%d: %s", number, head),
+		Author:           "testuser",
+		State:            state,
+		IsDraft:          isDraft,
+		HeadBranch:       head,
+		BaseBranch:       base,
+		HeadRepoCloneURL: cloneURL,
+		CIStatus:         ci,
+		ReviewDecision:   review,
+		MergeableState:   mergeableState,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+		LastActivityAt:   now,
 	}
 	prID, err := database.UpsertMergeRequest(ctx, pr)
 	require.NoError(t, err)
@@ -18730,6 +18741,7 @@ func TestAPIStacks_DetectionViaSyncHook(t *testing.T) {
 	// into DB as open PRs forming a linear chain.
 	now := time.Now().UTC().Truncate(time.Second)
 	stringPtr := func(s string) *string { return &s }
+	repoCloneURL := "https://github.com/acme/widget.git"
 	makeGHPR := func(id int64, number int, head, base string) *gh.PullRequest {
 		sha := fmt.Sprintf("sha%d", number)
 		title := fmt.Sprintf("PR #%d: %s", number, head)
@@ -18742,11 +18754,25 @@ func TestAPIStacks_DetectionViaSyncHook(t *testing.T) {
 			User:      &gh.User{Login: stringPtr("testuser")},
 			CreatedAt: &gh.Timestamp{Time: now},
 			UpdatedAt: &gh.Timestamp{Time: now},
-			Head:      &gh.PullRequestBranch{Ref: &head, SHA: &sha},
-			Base:      &gh.PullRequestBranch{Ref: &base, SHA: stringPtr("basesha")},
+			Head: &gh.PullRequestBranch{
+				Ref:  &head,
+				SHA:  &sha,
+				Repo: &gh.Repository{CloneURL: &repoCloneURL},
+			},
+			Base: &gh.PullRequestBranch{Ref: &base, SHA: stringPtr("basesha")},
 		}
 	}
 	mock := &mockGH{
+		getRepositoryFn: func(_ context.Context, owner, repo string) (*gh.Repository, error) {
+			nodeID := "repo-" + owner + "-" + repo
+			return &gh.Repository{
+				Name:     &repo,
+				NodeID:   &nodeID,
+				Owner:    &gh.User{Login: &owner},
+				CloneURL: &repoCloneURL,
+				Archived: new(false),
+			}, nil
+		},
 		listOpenPullRequestsFn: func(_ context.Context, _, _ string) ([]*gh.PullRequest, error) {
 			return []*gh.PullRequest{
 				makeGHPR(1001, 10, "feat/hook-base", "main"),
@@ -18778,6 +18804,269 @@ func TestAPIStacks_DetectionViaSyncHook(t *testing.T) {
 	require.NotNil(ctxResp.JSON200)
 	assert.Equal("hook", ctxResp.JSON200.StackName)
 	assert.Equal(int64(2), ctxResp.JSON200.Size)
+}
+
+func TestAPIStacks_DetectionViaSyncHookIgnoresForkHeadBranchCollision(t *testing.T) {
+	assert := Assert.New(t)
+	require := require.New(t)
+	ctx := t.Context()
+
+	now := time.Now().UTC().Truncate(time.Second)
+	stringPtr := func(s string) *string { return &s }
+	repoCloneURL := "https://github.com/acme/widget.git"
+	forkCloneURL := "https://github.com/fork/widget.git"
+	makeGHPR := func(id int64, number int, head, base, headRepoCloneURL string) *gh.PullRequest {
+		sha := fmt.Sprintf("sha%d", number)
+		title := fmt.Sprintf("PR #%d: %s", number, head)
+		return &gh.PullRequest{
+			ID:        &id,
+			Number:    &number,
+			State:     stringPtr("open"),
+			Title:     &title,
+			Body:      stringPtr(""),
+			User:      &gh.User{Login: stringPtr("testuser")},
+			CreatedAt: &gh.Timestamp{Time: now},
+			UpdatedAt: &gh.Timestamp{Time: now},
+			Head: &gh.PullRequestBranch{
+				Ref:  &head,
+				SHA:  &sha,
+				Repo: &gh.Repository{CloneURL: &headRepoCloneURL},
+			},
+			Base: &gh.PullRequestBranch{Ref: &base, SHA: stringPtr("basesha")},
+		}
+	}
+	mock := &mockGH{
+		getRepositoryFn: func(_ context.Context, owner, repo string) (*gh.Repository, error) {
+			nodeID := "repo-" + owner + "-" + repo
+			return &gh.Repository{
+				Name:     &repo,
+				NodeID:   &nodeID,
+				Owner:    &gh.User{Login: &owner},
+				CloneURL: &repoCloneURL,
+				Archived: new(false),
+			}, nil
+		},
+		listOpenPullRequestsFn: func(_ context.Context, _, _ string) ([]*gh.PullRequest, error) {
+			return []*gh.PullRequest{
+				makeGHPR(9001, 90, "feature/auth", "main", forkCloneURL),
+				makeGHPR(1001, 100, "feature/auth", "main", repoCloneURL),
+				makeGHPR(1011, 101, "feature/auth-ui", "feature/auth", repoCloneURL),
+			}, nil
+		},
+	}
+	srv, database := setupTestServerWithRepos(t, mock, []ghclient.RepoRef{{
+		Owner:        "acme",
+		Name:         "widget",
+		PlatformHost: "github.com",
+		CloneURL:     repoCloneURL,
+	}})
+	client := setupTestClient(t, srv)
+
+	srv.syncer.SetOnSyncCompleted(stacks.SyncCompletedHook(ctx, database, nil))
+	srv.syncer.RunOnce(ctx)
+
+	ctxResp, err := client.HTTP.GetPullStackWithResponse(ctx, "gh", "acme", "widget", 101)
+	require.NoError(err)
+	require.Equal(http.StatusOK, ctxResp.StatusCode(), string(ctxResp.Body))
+	require.NotNil(ctxResp.JSON200)
+	require.NotNil(ctxResp.JSON200.Members)
+	assert.Equal([]int64{100, 101}, stackMemberNumbers(*ctxResp.JSON200.Members))
+
+	forkResp, err := client.HTTP.GetPullWithResponse(ctx, "gh", "acme", "widget", 90)
+	require.NoError(err)
+	require.Equal(http.StatusOK, forkResp.StatusCode(), string(forkResp.Body))
+	require.NotNil(forkResp.JSON200)
+	assert.Nil(forkResp.JSON200.Stack)
+}
+
+func TestAPIStacks_GitLabUnknownForkHeadSyncsButSkipsStackEdges(t *testing.T) {
+	assert := Assert.New(t)
+	require := require.New(t)
+	ctx := t.Context()
+
+	now := time.Now().UTC().Truncate(time.Second)
+	repoRef := platform.RepoRef{
+		Platform:           platform.KindGitLab,
+		Host:               "gitlab.example.com",
+		Owner:              "group",
+		Name:               "project",
+		RepoPath:           "group/project",
+		PlatformID:         4242,
+		PlatformExternalID: "gid://gitlab/Project/4242",
+		WebURL:             "https://gitlab.example.com/group/project",
+		CloneURL:           "https://gitlab.example.com/group/project.git",
+		DefaultBranch:      "main",
+	}
+	makeMR := func(platformID int64, number int, head, base, headRepoCloneURL string) platform.MergeRequest {
+		return platform.MergeRequest{
+			Repo:               repoRef,
+			PlatformID:         platformID,
+			PlatformExternalID: fmt.Sprintf("gid://gitlab/MergeRequest/%d", platformID),
+			Number:             number,
+			URL:                fmt.Sprintf("https://gitlab.example.com/group/project/-/merge_requests/%d", number),
+			Title:              fmt.Sprintf("MR !%d: %s", number, head),
+			Author:             "ada",
+			State:              "open",
+			HeadBranch:         head,
+			BaseBranch:         base,
+			HeadSHA:            fmt.Sprintf("sha%d", number),
+			BaseSHA:            "basesha",
+			HeadRepoCloneURL:   headRepoCloneURL,
+			CreatedAt:          now,
+			UpdatedAt:          now,
+			LastActivityAt:     now,
+		}
+	}
+	provider := &apiTestGitLabProvider{
+		ref: repoRef,
+		mergeRequests: []platform.MergeRequest{
+			makeMR(9001, 90, "feature/fork-ui", "feature/auth", ""),
+			makeMR(1001, 100, "feature/auth", "main", repoRef.CloneURL),
+			makeMR(1011, 101, "feature/auth-ui", "feature/auth", repoRef.CloneURL),
+		},
+	}
+	registry, err := platform.NewRegistry(provider)
+	require.NoError(err)
+
+	database := dbtest.Open(t)
+	syncer := ghclient.NewSyncerWithRegistry(
+		registry, database, nil, []ghclient.RepoRef{{
+			Platform:           platform.KindGitLab,
+			Owner:              "group",
+			Name:               "project",
+			PlatformHost:       "gitlab.example.com",
+			RepoPath:           "group/project",
+			PlatformRepoID:     4242,
+			PlatformExternalID: "gid://gitlab/Project/4242",
+			WebURL:             "https://gitlab.example.com/group/project",
+			CloneURL:           repoRef.CloneURL,
+			DefaultBranch:      "main",
+		}}, time.Minute, nil, nil,
+	)
+	t.Cleanup(syncer.Stop)
+	srv := New(database, syncer, nil, "/", nil, ServerOptions{})
+	t.Cleanup(func() { gracefulShutdown(t, srv) })
+	client := setupTestClient(t, srv)
+
+	syncer.SetOnSyncCompleted(stacks.SyncCompletedHook(ctx, database, nil))
+	syncer.RunOnce(ctx)
+
+	pullsResp, err := client.HTTP.ListPullsWithResponse(ctx, &generated.ListPullsParams{})
+	require.NoError(err)
+	require.Equal(http.StatusOK, pullsResp.StatusCode(), string(pullsResp.Body))
+	require.NotNil(pullsResp.JSON200)
+	pullNumbers := make([]int64, 0, len(*pullsResp.JSON200))
+	for _, pull := range *pullsResp.JSON200 {
+		pullNumbers = append(pullNumbers, pull.Number)
+	}
+	assert.ElementsMatch([]int64{90, 100, 101}, pullNumbers)
+
+	forkResp, err := client.HTTP.GetPullOnHostWithResponse(ctx, "gitlab.example.com", "gl", "group", "project", 90)
+	require.NoError(err)
+	require.Equal(http.StatusOK, forkResp.StatusCode(), string(forkResp.Body))
+	require.NotNil(forkResp.JSON200)
+	assert.Empty(forkResp.JSON200.MergeRequest.HeadRepoCloneURL)
+	assert.Nil(forkResp.JSON200.Stack)
+
+	forkStackResp, err := client.HTTP.GetPullStackOnHostWithResponse(ctx, "gitlab.example.com", "gl", "group", "project", 90)
+	require.NoError(err)
+	assert.Equal(http.StatusNotFound, forkStackResp.StatusCode(), string(forkStackResp.Body))
+
+	tipStackResp, err := client.HTTP.GetPullStackOnHostWithResponse(ctx, "gitlab.example.com", "gl", "group", "project", 101)
+	require.NoError(err)
+	require.Equal(http.StatusOK, tipStackResp.StatusCode(), string(tipStackResp.Body))
+	require.NotNil(tipStackResp.JSON200)
+	require.NotNil(tipStackResp.JSON200.Members)
+	assert.Equal(int64(2), tipStackResp.JSON200.Size)
+	assert.Equal([]int64{100, 101}, stackMemberNumbers(*tipStackResp.JSON200.Members))
+
+	stacksResp, err := client.HTTP.ListStacksWithResponse(ctx, &generated.ListStacksParams{})
+	require.NoError(err)
+	require.Equal(http.StatusOK, stacksResp.StatusCode(), string(stacksResp.Body))
+	require.NotNil(stacksResp.JSON200)
+	require.Len(*stacksResp.JSON200, 1)
+	require.NotNil((*stacksResp.JSON200)[0].Members)
+	assert.Equal([]int64{100, 101}, stackMemberNumbers(*(*stacksResp.JSON200)[0].Members))
+}
+
+func TestAPIStacks_DetectionViaSyncHookIgnoresSameRepoSelfEdge(t *testing.T) {
+	assert := Assert.New(t)
+	require := require.New(t)
+	ctx := t.Context()
+
+	now := time.Now().UTC().Truncate(time.Second)
+	stringPtr := func(s string) *string { return &s }
+	repoCloneURL := "https://github.com/acme/widget.git"
+	makeGHPR := func(id int64, number int, head, base string) *gh.PullRequest {
+		sha := fmt.Sprintf("sha%d", number)
+		title := fmt.Sprintf("PR #%d: %s", number, head)
+		return &gh.PullRequest{
+			ID:        &id,
+			Number:    &number,
+			State:     stringPtr("open"),
+			Title:     &title,
+			Body:      stringPtr(""),
+			User:      &gh.User{Login: stringPtr("testuser")},
+			CreatedAt: &gh.Timestamp{Time: now},
+			UpdatedAt: &gh.Timestamp{Time: now},
+			Head: &gh.PullRequestBranch{
+				Ref:  &head,
+				SHA:  &sha,
+				Repo: &gh.Repository{CloneURL: &repoCloneURL},
+			},
+			Base: &gh.PullRequestBranch{Ref: &base, SHA: stringPtr("basesha")},
+		}
+	}
+	mock := &mockGH{
+		getRepositoryFn: func(_ context.Context, owner, repo string) (*gh.Repository, error) {
+			nodeID := "repo-" + owner + "-" + repo
+			return &gh.Repository{
+				Name:     &repo,
+				NodeID:   &nodeID,
+				Owner:    &gh.User{Login: &owner},
+				CloneURL: &repoCloneURL,
+				Archived: new(false),
+			}, nil
+		},
+		listOpenPullRequestsFn: func(_ context.Context, _, _ string) ([]*gh.PullRequest, error) {
+			return []*gh.PullRequest{
+				makeGHPR(4491, 449, "legacy-parser-base", "legacy-parser-base"),
+				makeGHPR(7481, 748, "locate-parser-interface", "legacy-parser-base"),
+				makeGHPR(7511, 751, "provider-facade-core", "locate-parser-interface"),
+			}, nil
+		},
+	}
+	srv, database := setupTestServerWithRepos(t, mock, []ghclient.RepoRef{{
+		Owner:        "acme",
+		Name:         "widget",
+		PlatformHost: "github.com",
+		CloneURL:     repoCloneURL,
+	}})
+	client := setupTestClient(t, srv)
+
+	srv.syncer.SetOnSyncCompleted(stacks.SyncCompletedHook(ctx, database, nil))
+	srv.syncer.RunOnce(ctx)
+
+	ctxResp, err := client.HTTP.GetPullStackWithResponse(ctx, "gh", "acme", "widget", 751)
+	require.NoError(err)
+	require.Equal(http.StatusOK, ctxResp.StatusCode(), string(ctxResp.Body))
+	require.NotNil(ctxResp.JSON200)
+	require.NotNil(ctxResp.JSON200.Members)
+	assert.Equal([]int64{748, 751}, stackMemberNumbers(*ctxResp.JSON200.Members))
+
+	selfEdgeResp, err := client.HTTP.GetPullWithResponse(ctx, "gh", "acme", "widget", 449)
+	require.NoError(err)
+	require.Equal(http.StatusOK, selfEdgeResp.StatusCode(), string(selfEdgeResp.Body))
+	require.NotNil(selfEdgeResp.JSON200)
+	assert.Nil(selfEdgeResp.JSON200.Stack)
+}
+
+func stackMemberNumbers(members []generated.StackMemberResponse) []int64 {
+	numbers := make([]int64, len(members))
+	for i, member := range members {
+		numbers[i] = member.Number
+	}
+	return numbers
 }
 
 func TestAPIGetStackForPR_SingleFailingIsInProgress(t *testing.T) {
