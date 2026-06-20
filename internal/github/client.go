@@ -624,11 +624,38 @@ const issueTimelineEventsQuery = `
 query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
   repository(owner: $owner, name: $repo) {
     issue(number: $number) {
-      timelineItems(itemTypes: [ASSIGNED_EVENT, UNASSIGNED_EVENT], first: 100, after: $cursor) {
+      timelineItems(itemTypes: [ASSIGNED_EVENT, UNASSIGNED_EVENT, CROSS_REFERENCED_EVENT, CLOSED_EVENT, REOPENED_EVENT], first: 100, after: $cursor) {
         nodes {
           __typename
           ... on Node {
             id
+          }
+          ... on CrossReferencedEvent {
+            actor { login }
+            createdAt
+            isCrossRepository
+            willCloseTarget
+            source {
+              __typename
+              ... on Issue {
+                number
+                title
+                url
+                repository {
+                  owner { login }
+                  name
+                }
+              }
+              ... on PullRequest {
+                number
+                title
+                url
+                repository {
+                  owner { login }
+                  name
+                }
+              }
+            }
           }
           ... on AssignedEvent {
             actor { login }
@@ -650,6 +677,14 @@ query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
               ... on Organization { login }
               ... on User { login }
             }
+            createdAt
+          }
+          ... on ClosedEvent {
+            actor { login }
+            createdAt
+          }
+          ... on ReopenedEvent {
+            actor { login }
             createdAt
           }
         }
@@ -1870,6 +1905,20 @@ func (c *liveClient) ListIssueTimelineEvents(
 								Login    string `json:"login"`
 							} `json:"assignee"`
 							CreatedAt time.Time `json:"createdAt"`
+							Source    *struct {
+								TypeName   string `json:"__typename"`
+								Number     int    `json:"number"`
+								Title      string `json:"title"`
+								URL        string `json:"url"`
+								Repository *struct {
+									Owner *struct {
+										Login string `json:"login"`
+									} `json:"owner"`
+									Name string `json:"name"`
+								} `json:"repository"`
+							} `json:"source"`
+							IsCrossRepository bool `json:"isCrossRepository"`
+							WillCloseTarget   bool `json:"willCloseTarget"`
 						} `json:"nodes"`
 						PageInfo struct {
 							HasNextPage bool    `json:"hasNextPage"`
@@ -1964,6 +2013,12 @@ func (c *liveClient) ListIssueTimelineEvents(
 				event.EventType = "assigned"
 			case "UnassignedEvent":
 				event.EventType = "unassigned"
+			case "CrossReferencedEvent":
+				event.EventType = "cross_referenced"
+			case "ClosedEvent":
+				event.EventType = "closed"
+			case "ReopenedEvent":
+				event.EventType = "reopened"
 			default:
 				continue
 			}
@@ -1973,6 +2028,20 @@ func (c *liveClient) ListIssueTimelineEvents(
 			if node.Assignee != nil {
 				event.Assignee = node.Assignee.Login
 			}
+			if node.Source != nil {
+				event.SourceType = node.Source.TypeName
+				event.SourceNumber = node.Source.Number
+				event.SourceTitle = node.Source.Title
+				event.SourceURL = node.Source.URL
+				if node.Source.Repository != nil {
+					event.SourceRepo = node.Source.Repository.Name
+					if node.Source.Repository.Owner != nil {
+						event.SourceOwner = node.Source.Repository.Owner.Login
+					}
+				}
+			}
+			event.IsCrossRepository = node.IsCrossRepository
+			event.WillCloseTarget = node.WillCloseTarget
 			events = append(events, event)
 		}
 
