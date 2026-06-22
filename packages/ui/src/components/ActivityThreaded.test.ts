@@ -55,6 +55,7 @@ const groupByRepo = vi.hoisted(() => ({ value: false }));
 const hideOrgName = vi.hoisted(() => ({ value: false }));
 const rollUpCommits = vi.hoisted(() => ({ value: false }));
 const toggleThreadItem = vi.hoisted(() => vi.fn());
+const markNotificationSeen = vi.hoisted(() => vi.fn(async () => undefined));
 
 vi.mock("../context.js", () => ({
   getStores: () => ({
@@ -66,6 +67,7 @@ vi.mock("../context.js", () => ({
       isThreadItemExpanded: () => expanded.value,
       toggleThreadItem,
       getRollUpCommits: () => rollUpCommits.value,
+      markNotificationSeen,
     },
   }),
 }));
@@ -400,6 +402,95 @@ describe("ActivityThreaded collapse", () => {
       "_blank",
       "noopener",
     );
+    open.mockRestore();
+  });
+});
+
+describe("ActivityThreaded notification events", () => {
+  afterEach(() => {
+    cleanup();
+    expanded.value = true;
+    markNotificationSeen.mockClear();
+  });
+
+  it("labels a notification event by its reason and marks it seen", async () => {
+    const notif = activityItem("ntf:42", {
+      activity_type: "notification",
+      item_state: "unread",
+      body_preview: "review_requested",
+    });
+    const { container, getByRole } = render(ActivityThreaded, {
+      props: { items: [notif], onSelectItem: undefined },
+    });
+
+    expect(container.textContent).toContain("Review requested");
+    const btn = getByRole("button", { name: "Mark notification seen" });
+    await fireEvent.click(btn);
+    expect(markNotificationSeen).toHaveBeenCalledTimes(1);
+    expect(markNotificationSeen.mock.calls[0]![0]).toMatchObject({ id: "ntf:42" });
+  });
+
+  it("omits the seen control once a notification is read", () => {
+    const notif = activityItem("ntf:43", {
+      activity_type: "notification",
+      item_state: "read",
+      body_preview: "mention",
+    });
+    const { container, queryByRole } = render(ActivityThreaded, {
+      props: { items: [notif], onSelectItem: undefined },
+    });
+
+    expect(container.textContent).toContain("Mentioned");
+    expect(queryByRole("button", { name: "Mark notification seen" })).toBeNull();
+  });
+
+  it("opens the web URL for a notification without a PR/issue subject", async () => {
+    const onSelectItem = vi.fn();
+    const open = vi.spyOn(window, "open").mockImplementation(() => null);
+    const notif = activityItem("ntf:44", {
+      activity_type: "notification",
+      item_state: "read",
+      item_type: "release",
+      item_number: 0,
+      body_preview: "subscribed",
+      activity_url: "https://github.com/acme/widgets/releases/tag/v1.2.3",
+    });
+
+    const { container } = render(ActivityThreaded, {
+      props: { items: [notif], onSelectItem },
+    });
+    const row = container.querySelector(".event-row");
+    expect(row).not.toBeNull();
+    await fireEvent.click(row!);
+
+    expect(onSelectItem).not.toHaveBeenCalled();
+    expect(open).toHaveBeenCalledWith("https://github.com/acme/widgets/releases/tag/v1.2.3", "_blank", "noopener");
+    open.mockRestore();
+  });
+
+  it("opens the web URL when the top-level notification group row is clicked", async () => {
+    const onSelectItem = vi.fn();
+    const open = vi.spyOn(window, "open").mockImplementation(() => null);
+    const notif = activityItem("ntf:45", {
+      activity_type: "notification",
+      item_state: "read",
+      item_type: "release",
+      item_number: 0,
+      body_preview: "subscribed",
+      activity_url: "https://github.com/acme/widgets/releases/tag/v2.0.0",
+    });
+
+    const { container } = render(ActivityThreaded, {
+      props: { items: [notif], onSelectItem },
+    });
+    const row = container.querySelector(".item-row");
+    expect(row).not.toBeNull();
+    await fireEvent.click(row!);
+
+    // The top-level group row must not reopen the invalid #0 detail
+    // drawer; it follows the provider URL like the expanded event row.
+    expect(onSelectItem).not.toHaveBeenCalled();
+    expect(open).toHaveBeenCalledWith("https://github.com/acme/widgets/releases/tag/v2.0.0", "_blank", "noopener");
     open.mockRestore();
   });
 });

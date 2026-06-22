@@ -21,7 +21,7 @@ import (
 )
 
 var defaultTestRepos = []ghclient.RepoRef{
-	{Owner: "acme", Name: "widget", PlatformHost: "github.com"},
+	{Platform: "github", Owner: "acme", Name: "widget", PlatformHost: "github.com"},
 }
 
 func setupTestServer(t *testing.T) (*server.Server, *db.DB) {
@@ -112,6 +112,20 @@ func withSeedPRLabels(labels []db.Label) seedPROpt {
 
 func withSeedPRHeadSHA(headSHA string) seedPROpt {
 	return func(pr *db.MergeRequest) { pr.PlatformHeadSHA = headSHA }
+}
+
+func withSeedPRState(state db.MergeRequestState) seedPROpt {
+	return func(pr *db.MergeRequest) {
+		pr.State = state
+		if state == db.MergeRequestStateMerged || state == db.MergeRequestStateClosed {
+			closed := pr.UpdatedAt
+			pr.ClosedAt = &closed
+		}
+		if state == db.MergeRequestStateMerged {
+			merged := pr.UpdatedAt
+			pr.MergedAt = &merged
+		}
+	}
 }
 
 func seedPR(t *testing.T, database *db.DB, owner, name string, number int, opts ...seedPROpt) int64 {

@@ -37,12 +37,20 @@ function branchActivityItem(id: string, overrides: Partial<ActivityItem> = {}): 
 
 const items = vi.hoisted(() => ({ value: [] as ActivityItem[] }));
 const onSelectItem = vi.hoisted(() => vi.fn());
+const hideClosedMerged = vi.hoisted(() => ({ value: false }));
 const hideOrgName = vi.hoisted(() => ({ value: false }));
+const showNotifications = vi.hoisted(() => ({ value: true }));
 const setHideOrgName = vi.hoisted(() =>
   vi.fn((value: boolean) => {
     hideOrgName.value = value;
   }),
 );
+const setShowNotifications = vi.hoisted(() =>
+  vi.fn((value: boolean) => {
+    showNotifications.value = value;
+  }),
+);
+const markNotificationSeen = vi.hoisted(() => vi.fn(async () => undefined));
 
 vi.mock("../context.js", () => ({
   getStores: () => ({
@@ -57,7 +65,8 @@ vi.mock("../context.js", () => ({
       getTimeRange: () => "7d",
       getItemFilter: () => "all",
       getEnabledEvents: () => new Set(["comment", "review", "commit", "force_push"]),
-      getHideClosedMerged: () => false,
+      getShowNotifications: () => showNotifications.value,
+      getHideClosedMerged: () => hideClosedMerged.value,
       getHideBots: () => false,
       getHideDefaultBranchActivity: () => false,
       isActivityLoading: () => false,
@@ -66,6 +75,8 @@ vi.mock("../context.js", () => ({
       setActivitySearch: vi.fn(),
       setTimeRange: vi.fn(),
       setItemFilter: vi.fn(),
+      setShowNotifications,
+      markNotificationSeen,
       setHideBots: vi.fn(),
       setHideDefaultBranchActivity: vi.fn(),
       syncToURL: vi.fn(),
@@ -89,6 +100,7 @@ describe("MobileActivityView branch activity", () => {
   beforeEach(() => {
     items.value = [branchActivityItem("branch-commit")];
     hideOrgName.value = false;
+    hideClosedMerged.value = false;
     onSelectItem.mockClear();
     setHideOrgName.mockClear();
   });
@@ -191,5 +203,133 @@ describe("MobileActivityView branch activity", () => {
       "noopener",
     );
     open.mockRestore();
+  });
+});
+
+function notificationItem(id: string, title: string, subjectState: string): ActivityItem {
+  return {
+    id,
+    cursor: id,
+    activity_type: "notification",
+    author: "carol",
+    body_preview: "review_requested",
+    created_at: "2026-04-27T12:00:00Z",
+    // Notifications carry unread/read in item_state, never a lifecycle state;
+    // the linked PR's lifecycle rides in subject_state.
+    item_number: Number(id),
+    item_state: "unread",
+    subject_state: subjectState,
+    item_title: title,
+    item_type: "pr",
+    item_url: `https://github.com/acme/widgets/pull/${id}`,
+    platform_host: "github.com",
+    repo_owner: "acme",
+    repo_name: "widgets",
+    repo: {
+      provider: "github",
+      platform_host: "github.com",
+      owner: "acme",
+      name: "widgets",
+      repo_path: "acme/widgets",
+    },
+  } as ActivityItem;
+}
+
+describe("MobileActivityView notifications", () => {
+  beforeEach(() => {
+    hideClosedMerged.value = false;
+    showNotifications.value = true;
+    onSelectItem.mockClear();
+    setShowNotifications.mockClear();
+    markNotificationSeen.mockClear();
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  it("labels notification events by their reason, not the raw type", () => {
+    items.value = [notificationItem("1", "Review me", "open")];
+
+    const { container } = render(MobileActivityView, {
+      props: { onSelectItem },
+    });
+
+    const event = container.querySelector(".mobile-activity-event__body strong");
+    expect(event?.textContent).toBe("Review requested");
+  });
+
+  it("hides notifications through a mobile toggle wired to the store", async () => {
+    items.value = [notificationItem("1", "Review me", "open")];
+
+    const { getByRole } = render(MobileActivityView, {
+      props: { onSelectItem },
+    });
+
+    const button = getByRole("button", { name: "Hide notifications" });
+    expect(button.getAttribute("aria-pressed")).toBe("false");
+
+    await fireEvent.click(button);
+
+    expect(setShowNotifications).toHaveBeenCalledWith(false);
+  });
+
+  it("marks an unread notification seen from a touch control without navigating", async () => {
+    items.value = [notificationItem("1", "Review me", "open")];
+
+    const { getByRole } = render(MobileActivityView, {
+      props: { onSelectItem },
+    });
+
+    const seen = getByRole("button", { name: "Mark notification seen" });
+    await fireEvent.click(seen);
+
+    expect(markNotificationSeen).toHaveBeenCalledTimes(1);
+    expect(markNotificationSeen.mock.calls[0]![0]).toMatchObject({ id: "1" });
+    // The seen control is a sibling, so tapping it must not open the item.
+    expect(onSelectItem).not.toHaveBeenCalled();
+  });
+});
+
+describe("MobileActivityView hide closed/merged", () => {
+  beforeEach(() => {
+    hideClosedMerged.value = false;
+    showNotifications.value = true;
+    onSelectItem.mockClear();
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  it("hides notifications on merged/closed subjects but keeps open ones", () => {
+    hideClosedMerged.value = true;
+    items.value = [
+      notificationItem("1", "Open subject", "open"),
+      notificationItem("2", "Merged subject", "merged"),
+      notificationItem("3", "Closed subject", "closed"),
+    ];
+
+    const { container } = render(MobileActivityView, {
+      props: { onSelectItem },
+    });
+
+    // A notifications-only mobile feed has no sibling PR row, yet the
+    // merged/closed notifications are dropped because the filter reads
+    // subject_state, not the notification's unread/read item_state.
+    expect(container.textContent).toContain("Open subject");
+    expect(container.textContent).not.toContain("Merged subject");
+    expect(container.textContent).not.toContain("Closed subject");
+  });
+
+  it("keeps every notification when hide closed/merged is off", () => {
+    items.value = [notificationItem("1", "Open subject", "open"), notificationItem("2", "Merged subject", "merged")];
+
+    const { container } = render(MobileActivityView, {
+      props: { onSelectItem },
+    });
+
+    expect(container.textContent).toContain("Open subject");
+    expect(container.textContent).toContain("Merged subject");
   });
 });

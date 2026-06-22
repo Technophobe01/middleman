@@ -13,7 +13,10 @@ import { createDocsFixture } from "./support/docsFixture";
 // a process spawned after the env is set can inherit — pooled
 // servers cannot.
 async function startIsolatedE2EServer() {
-  return startIsolatedE2EServerWithOptions({ visibleImportedModes: true, freshProcess: true });
+  return startIsolatedE2EServerWithOptions({
+    visibleImportedModes: true,
+    freshProcess: true,
+  });
 }
 
 async function startDefaultIsolatedE2EServer() {

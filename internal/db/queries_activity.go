@@ -12,8 +12,9 @@ import (
 
 // ListActivity returns a unified, reverse-chronological feed of
 // activity across all repos. It merges new PRs, new issues, PR
-// events, and issue events into a single stream with cursor-based
-// keyset pagination.
+// events, issue events, default-branch commits/force-pushes, and
+// notification threads into a single stream with cursor-based keyset
+// pagination.
 func (d *DB) ListActivity(
 	ctx context.Context, opts ListActivityOpts,
 ) ([]ActivityItem, error) {
@@ -94,6 +95,50 @@ func (d *DB) ListActivity(
 		where = "WHERE " + strings.Join(whereClauses, " AND ")
 	}
 
+	// Notifications join the union as their own source, filtered to
+	// PR/issue-anchored, non-author rows. Excluding the whole branch here
+	// (only when no config is loaded) rather than after the query keeps the
+	// LIMIT window from being spent on rows the caller will not serve.
+	notificationUnion := ""
+	var notificationArgs []any
+	if !opts.ExcludeNotifications {
+		notificationScope := ""
+		if opts.NotificationRepoFilters != nil {
+			notificationScope = activityNotificationRepoFilterCondition(
+				opts.NotificationRepoFilters, &notificationArgs,
+			)
+		}
+		if notificationScope != "" {
+			notificationScope = " AND " + notificationScope
+		}
+		notificationUnion = `
+			UNION ALL
+			SELECT 'notification', 'ntf', n.id,
+			       r.platform, r.platform_host, r.owner, r.name, r.repo_path_key,
+			       n.item_type, COALESCE(n.item_number, 0), n.subject_title,
+			       n.web_url, CASE WHEN n.unread = 1 THEN 'unread' ELSE 'read' END,
+			       n.item_author, n.item_author, n.source_updated_at,
+			       substr(n.reason, 1, 200),
+			       '', '', '', '',
+			       '', '',
+			       '', '',
+			       NULL, NULL,
+			       n.web_url,
+			       COALESCE(mr.state, iss.state, '')
+			FROM middleman_notification_items n
+			JOIN middleman_repos r
+			       ON r.platform = n.platform
+			      AND r.platform_host = n.platform_host
+			      AND r.owner = n.repo_owner
+			      AND r.name = n.repo_name
+			LEFT JOIN middleman_merge_requests mr
+			       ON n.item_type = 'pr' AND mr.repo_id = r.id AND mr.number = n.item_number
+			LEFT JOIN middleman_issues iss
+			       ON n.item_type = 'issue' AND iss.repo_id = r.id AND iss.number = n.item_number
+			WHERE n.item_type IN ('pr', 'issue') AND n.item_number IS NOT NULL
+			      AND n.reason != 'author'` + notificationScope
+	}
+
 	query := fmt.Sprintf(`
 		SELECT activity_type, source, source_id, platform, platform_host,
 		       repo_owner, repo_name,
@@ -102,7 +147,8 @@ func (d *DB) ListActivity(
 		       created_at, body_preview,
 		       branch_name, commit_sha, before_sha, after_sha,
 		       author_name, author_email, committer_name, committer_email,
-		       authored_at, committed_at, activity_url
+		       authored_at, committed_at, activity_url,
+		       subject_state
 		FROM (
 			SELECT 'new_pr' AS activity_type,
 			       'pr' AS source, p.id AS source_id,
@@ -117,7 +163,8 @@ func (d *DB) ListActivity(
 			       '' AS author_name, '' AS author_email,
 			       '' AS committer_name, '' AS committer_email,
 			       NULL AS authored_at, NULL AS committed_at,
-			       '' AS activity_url
+			       '' AS activity_url,
+			       '' AS subject_state
 			FROM middleman_merge_requests p
 			JOIN middleman_repos r ON p.repo_id = r.id
 			UNION ALL
@@ -131,6 +178,7 @@ func (d *DB) ListActivity(
 			       '', '',
 			       '', '',
 			       NULL, NULL,
+			       '',
 			       ''
 			FROM middleman_issues i
 			JOIN middleman_repos r ON i.repo_id = r.id
@@ -149,6 +197,7 @@ func (d *DB) ListActivity(
 			       '', '',
 			       '', '',
 			       NULL, NULL,
+			       '',
 			       ''
 			FROM middleman_mr_events e
 			JOIN middleman_merge_requests p ON e.merge_request_id = p.id
@@ -166,6 +215,7 @@ func (d *DB) ListActivity(
 			       '', '',
 			       '', '',
 			       NULL, NULL,
+			       '',
 			       ''
 			FROM middleman_issue_events e
 			JOIN middleman_issues i ON e.issue_id = i.id
@@ -184,6 +234,7 @@ func (d *DB) ListActivity(
 			       substr(bc.committer_name, 1, %[1]d),
 			       substr(bc.committer_email, 1, %[1]d),
 			       bc.authored_at, bc.committed_at,
+			       '',
 			       ''
 			FROM middleman_branch_commits bc
 			JOIN middleman_repos r ON bc.repo_id = r.id
@@ -198,17 +249,22 @@ func (d *DB) ListActivity(
 			       '', '',
 			       '', '',
 			       NULL, NULL,
+			       '',
 			       ''
 			FROM middleman_branch_force_pushes bfp
 			JOIN middleman_repos r ON bfp.repo_id = r.id
+			%[3]s
 		) unified
 		%[2]s
 		ORDER BY created_at DESC, source DESC, source_id DESC
-		LIMIT ?`, branchCommitIdentityMaxBytes, where)
+		LIMIT ?`, branchCommitIdentityMaxBytes, where, notificationUnion)
 
-	args = append(args, limit)
+	queryArgs := make([]any, 0, len(notificationArgs)+len(args)+1)
+	queryArgs = append(queryArgs, notificationArgs...)
+	queryArgs = append(queryArgs, args...)
+	queryArgs = append(queryArgs, limit)
 
-	rows, err := d.ro.QueryContext(ctx, query, args...)
+	rows, err := d.ro.QueryContext(ctx, query, queryArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("list activity: %w", err)
 	}
@@ -230,6 +286,7 @@ func (d *DB) ListActivity(
 			&it.AuthorName, &it.AuthorEmail,
 			&it.CommitterName, &it.CommitterEmail,
 			&authoredAtStr, &committedAtStr, &it.ActivityURL,
+			&it.SubjectState,
 		); err != nil {
 			return nil, fmt.Errorf("scan activity item: %w", err)
 		}
@@ -302,6 +359,25 @@ func activityRepoFilterCondition(filters []RepoFilter, args *[]any) string {
 	}
 	if len(groups) == 0 {
 		return ""
+	}
+	return "(" + strings.Join(groups, " OR ") + ")"
+}
+
+func activityNotificationRepoFilterCondition(filters []NotificationRepoFilter, args *[]any) string {
+	var groups []string
+	for _, filter := range filters {
+		platform := strings.ToLower(strings.TrimSpace(filter.Platform))
+		host, owner, name := canonicalRepoIdentifier(
+			filter.PlatformHost, filter.RepoOwner, filter.RepoName,
+		)
+		if platform == "" || owner == "" || name == "" {
+			continue
+		}
+		groups = append(groups, "(n.platform = ? AND n.platform_host = ? AND n.repo_owner = ? AND n.repo_name = ?)")
+		*args = append(*args, platform, host, owner, name)
+	}
+	if len(groups) == 0 {
+		return "0 = 1"
 	}
 	return "(" + strings.Join(groups, " OR ") + ")"
 }

@@ -20,6 +20,12 @@ export type RateLimitHostStatus = components["schemas"]["RateLimitHostStatus"];
 export type RateLimitsResponse = components["schemas"]["RateLimitsResponse"];
 export type ActivityItem = components["schemas"]["ActivityItemResponse"];
 export type ActivityResponse = components["schemas"]["ActivityResponse"];
+export type NotificationItem = components["schemas"]["NotificationResponse"];
+export type NotificationsResponse = components["schemas"]["NotificationsResponse"];
+export type NotificationSummary = components["schemas"]["NotificationSummaryResponse"];
+export type NotificationSyncStatus = components["schemas"]["NotificationSyncStatusResponse"];
+export type NotificationBulkResponse = components["schemas"]["NotificationBulkResponse"];
+export type NotificationParams = NonNullable<operations["list-notifications"]["parameters"]["query"]>;
 export type CommentAutocompleteResponse = components["schemas"]["CommentAutocompleteResponse"];
 export type CommentAutocompleteReference = components["schemas"]["CommentAutocompleteReference"];
 export type ActivityParams = NonNullable<operations["list-activity"]["parameters"]["query"]>;
@@ -82,7 +88,10 @@ export const DEFAULT_MODE_VISIBILITY: ModeVisibility = {
 
 export type AgentSettings = components["schemas"]["Agent"];
 export type ConfigRepo = components["schemas"]["ConfiguredRepoStatus"];
-export type Settings = components["schemas"]["SettingsResponse"];
+type SettingsResponse = components["schemas"]["SettingsResponse"];
+export type Settings = Omit<SettingsResponse, "notifications"> & {
+  notifications?: SettingsResponse["notifications"];
+};
 export type FleetSettings = components["schemas"]["FleetSettingsResponse"];
 export type FleetSettingsUpdate = components["schemas"]["UpdateFleetSettingsInputBody"];
 export type FleetPeer = components["schemas"]["FleetPeer"];

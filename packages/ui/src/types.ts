@@ -27,7 +27,7 @@ export interface ActionRegistry {
 export interface NavigateEvent {
   path: string;
   route: {
-    page: "pulls" | "issues" | "activity" | "diff" | "board" | "reviews";
+    page: "pulls" | "issues" | "activity" | "diff" | "board" | "reviews" | "inbox";
     view?: string;
     tab?: string;
     presentation?: "fullLayout" | "focus";

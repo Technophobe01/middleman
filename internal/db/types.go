@@ -442,6 +442,77 @@ type StarredItem struct {
 	StarredAt time.Time
 }
 
+type Notification struct {
+	ID                       int64
+	Platform                 string
+	PlatformHost             string
+	PlatformNotificationID   string
+	RepoID                   *int64
+	RepoOwner                string
+	RepoName                 string
+	SubjectType              string
+	SubjectTitle             string
+	SubjectURL               string
+	SubjectLatestCommentURL  string
+	WebURL                   string
+	ItemNumber               *int
+	ItemType                 string
+	ItemAuthor               string
+	Reason                   string
+	Unread                   bool
+	Participating            bool
+	SourceUpdatedAt          time.Time
+	SourceLastAcknowledgedAt *time.Time
+	SyncedAt                 time.Time
+	DoneAt                   *time.Time
+	DoneReason               string
+	SourceAckQueuedAt        *time.Time
+	SourceAckSyncedAt        *time.Time
+	SourceAckGenerationAt    *time.Time
+	SourceAckError           string
+	SourceAckAttempts        int
+	SourceAckLastAttemptAt   *time.Time
+	SourceAckNextAttemptAt   *time.Time
+}
+
+type ListNotificationsOpts struct {
+	Platform     string
+	PlatformHost string
+	RepoOwner    string
+	RepoName     string
+	Repos        []NotificationRepoFilter
+	State        string
+	Reasons      []string
+	ItemTypes    []string
+	Search       string
+	Sort         string
+	Limit        int
+	Offset       int
+}
+
+type NotificationRepoFilter struct {
+	Platform     string
+	PlatformHost string
+	RepoOwner    string
+	RepoName     string
+}
+
+type NotificationSummary struct {
+	TotalActive int
+	Unread      int
+	Done        int
+	ByReason    map[string]int
+	ByRepo      map[string]int
+}
+
+type NotificationSyncWatermark struct {
+	Platform             string
+	LastSuccessfulSyncAt time.Time
+	LastFullSyncAt       *time.Time
+	SyncCursor           string
+	TrackedReposKey      string
+}
+
 // WorktreeLink associates a merge request with an external worktree.
 type WorktreeLink struct {
 	ID             int64
@@ -499,6 +570,11 @@ type ActivityItem struct {
 	AuthoredAt     *time.Time
 	CommittedAt    *time.Time
 	ActivityURL    string
+	// SubjectState is the open/closed/merged state of a notification row's
+	// linked PR/issue. Empty for non-notification rows, which carry their
+	// own state in ItemState. Lets the feed apply Hide closed/merged to
+	// notifications, whose ItemState holds unread/read instead.
+	SubjectState string
 }
 
 // Stack represents a detected chain of dependent PRs.
@@ -610,8 +686,19 @@ type ListActivityOpts struct {
 	RepoFilters []RepoFilter // one or more repository filters
 	Types       []string     // activity type filter
 	Search      string       // title/body search
-	Limit       int          // page size (default 50, max 200)
-	Since       *time.Time   // only return events created at or after this time
+	// ExcludeNotifications drops notification rows from the union before
+	// ordering/limit. Notifications are always enabled in normal operation;
+	// the server only sets this when no config is loaded (nil-config
+	// nil-safety), so the safety-capped window is never spent on rows the
+	// caller will not serve.
+	ExcludeNotifications bool
+	// NotificationRepoFilters limits notification rows to the caller's
+	// current monitored repo set before ordering/limit. nil means no
+	// additional notification scope; an empty/non-matching set means no
+	// notification rows.
+	NotificationRepoFilters []NotificationRepoFilter
+	Limit                   int        // page size (default 50, max 200)
+	Since                   *time.Time // only return events created at or after this time
 	// Cursor fields -- decoded from opaque token by the handler.
 	BeforeTime     *time.Time
 	BeforeSource   string

@@ -13,11 +13,14 @@
   import ItemStateChip from "../components/shared/ItemStateChip.svelte";
   import SelectDropdown from "../components/shared/SelectDropdown.svelte";
   import WorkspaceIndicator from "../components/shared/WorkspaceIndicator.svelte";
+  import CheckIcon from "@lucide/svelte/icons/check";
   import {
     activityBranchKey,
     activityItemKey,
+    isClosedOrMergedActivity,
     isDefaultBranchActivity,
     isDefaultBranchForcePushActivity,
+    notificationReasonLabel,
     shortSha,
   } from "../components/activityRows.js";
   import {
@@ -97,9 +100,7 @@
     }
 
     if (activity.getHideClosedMerged()) {
-      result = result.filter(
-        (item) => item.item_state !== "merged" && item.item_state !== "closed",
-      );
+      result = result.filter((item) => !isClosedOrMergedActivity(item));
     }
 
     if (activity.getHideBots()) {
@@ -180,6 +181,7 @@
       activity.getItemFilter(),
       activity.getEnabledEvents(),
       activity.getHideDefaultBranchActivity(),
+      activity.getShowNotifications(),
     ));
     activity.syncToURL();
     void activity.loadActivity();
@@ -211,6 +213,11 @@
 
   function toggleHideBots(): void {
     activity.setHideBots(!activity.getHideBots());
+    applyFilters();
+  }
+
+  function toggleHideNotifications(): void {
+    activity.setShowNotifications(!activity.getShowNotifications());
     applyFilters();
   }
 
@@ -256,8 +263,17 @@
     onSelectItem?.(event);
   }
 
-  function eventLabel(type: string): string {
-    switch (type) {
+  function isUnreadNotification(item: ActivityItem): boolean {
+    return item.activity_type === "notification" && item.item_state === "unread";
+  }
+
+  function handleMarkSeen(domEvent: Event, item: ActivityItem): void {
+    domEvent.stopPropagation();
+    void activity.markNotificationSeen(item);
+  }
+
+  function eventLabel(item: ActivityItem): string {
+    switch (item.activity_type) {
       case "new_pr":
       case "new_issue":
         return "Opened";
@@ -271,8 +287,10 @@
       case "force_push":
       case "default_branch_force_push":
         return "Force-pushed";
+      case "notification":
+        return notificationReasonLabel(item.body_preview);
       default:
-        return type;
+        return item.activity_type;
     }
   }
 
@@ -418,6 +436,14 @@
         aria-pressed={grouping.getHideOrgName()}
         onclick={toggleHideOrgName}
       >Hide org</button>
+
+      <button
+        type="button"
+        class="mobile-filter-toggle"
+        class:active={!activity.getShowNotifications()}
+        aria-pressed={!activity.getShowNotifications()}
+        onclick={toggleHideNotifications}
+      >Hide notifications</button>
     </div>
 
 
@@ -471,22 +497,35 @@
 
             <div class="mobile-activity-events">
               {#each latestEvents(group) as event (event.id)}
-                <button
-                  type="button"
-                  class="mobile-activity-event"
-                  class:event-comment={eventTone(event.activity_type) === "comment"}
-                  class:event-review={eventTone(event.activity_type) === "review"}
-                  class:event-commit={eventTone(event.activity_type) === "commit"}
-                  class:event-force-push={eventTone(event.activity_type) === "force-push"}
-                  onclick={() => handleEventClick(event)}
-                >
-                  <span class="mobile-activity-event__dot" aria-hidden="true"></span>
-                  <span class="mobile-activity-event__body">
-                    <strong>{eventLabel(event.activity_type)}</strong>
-                    <span>{eventDetail(event)}</span>
-                  </span>
-                  <time>{relativeTime(event.created_at)}</time>
-                </button>
+                <div class="mobile-activity-event-slot">
+                  <button
+                    type="button"
+                    class="mobile-activity-event"
+                    class:event-comment={eventTone(event.activity_type) === "comment"}
+                    class:event-review={eventTone(event.activity_type) === "review"}
+                    class:event-commit={eventTone(event.activity_type) === "commit"}
+                    class:event-force-push={eventTone(event.activity_type) === "force-push"}
+                    onclick={() => handleEventClick(event)}
+                  >
+                    <span class="mobile-activity-event__dot" aria-hidden="true"></span>
+                    <span class="mobile-activity-event__body">
+                      <strong>{eventLabel(event)}</strong>
+                      <span>{eventDetail(event)}</span>
+                    </span>
+                    <time>{relativeTime(event.created_at)}</time>
+                  </button>
+                  {#if isUnreadNotification(event)}
+                    <button
+                      type="button"
+                      class="mobile-activity-event-seen"
+                      aria-label="Mark notification seen"
+                      title="Mark seen"
+                      onclick={(domEvent) => handleMarkSeen(domEvent, event)}
+                    >
+                      <CheckIcon size="20" strokeWidth="2" aria-hidden="true" />
+                    </button>
+                  {/if}
+                </div>
               {/each}
             </div>
           </article>
@@ -775,6 +814,36 @@
     display: grid;
     gap: var(--mobile-space-xs);
     padding: 0 var(--mobile-space-sm) var(--mobile-space-sm);
+  }
+
+  .mobile-activity-event-slot {
+    display: flex;
+    align-items: stretch;
+    gap: var(--mobile-space-xs);
+  }
+
+  .mobile-activity-event-slot > .mobile-activity-event {
+    flex: 1;
+    min-width: 0;
+  }
+
+  /* A notification event button cannot nest the mark-seen button, so the
+     touch-sized seen control sits beside it as a sibling instead. */
+  .mobile-activity-event-seen {
+    flex: 0 0 auto;
+    min-width: var(--mobile-hit-target);
+    min-height: var(--mobile-hit-target);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: thin solid var(--border-muted);
+    border-radius: var(--radius-md);
+    color: var(--accent-blue);
+    background: var(--bg-inset);
+  }
+
+  .mobile-activity-event-seen:active {
+    background: color-mix(in srgb, var(--accent-blue) 14%, transparent);
   }
 
   .mobile-activity-event {

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	gh "github.com/google/go-github/v84/github"
+	"go.kenn.io/middleman/internal/platform"
 	"go.kenn.io/middleman/internal/tokenauth"
 )
 
@@ -79,6 +80,15 @@ type PullRequestReviewThreadComment struct {
 	UpdatedAt        time.Time
 }
 
+// Notification list options and threads are provider-neutral types;
+// the aliases keep this package's Client interface and its many
+// implementations/mocks in their historical shape while letting the
+// platform registry treat GitHub as one NotificationReader among the
+// providers.
+type NotificationListOptions = platform.NotificationListOptions
+
+type NotificationThread = platform.NotificationThread
+
 // EditPullRequestOpts holds optional fields for editing a pull request.
 // Nil pointer fields are omitted from the GitHub API call.
 type EditPullRequestOpts struct {
@@ -134,6 +144,8 @@ type Client interface {
 	EditIssueContent(ctx context.Context, owner, repo string, number int, title *string, body *string) (*gh.Issue, error)
 	ListPullRequestsPage(ctx context.Context, owner, repo, state string, page int) ([]*gh.PullRequest, bool, error)
 	ListIssuesPage(ctx context.Context, owner, repo, state string, page int) ([]*gh.Issue, bool, error)
+	ListNotifications(ctx context.Context, opts NotificationListOptions) ([]NotificationThread, bool, error)
+	MarkNotificationThreadRead(ctx context.Context, threadID string) error
 	// InvalidateListETagsForRepo drops cached conditional-GET
 	// validators for the given repo's list endpoints so the next
 	// list call issues an unconditional fetch. The endpoints
@@ -168,6 +180,13 @@ type issueTimelineLister interface {
 		owner, repo string,
 		number int,
 	) ([]PullRequestTimelineEvent, error)
+}
+
+func normalizedPlatformHost(platformHost string) string {
+	if platformHost == "" {
+		return "github.com"
+	}
+	return strings.ToLower(platformHost)
 }
 
 func graphQLEndpointForHost(platformHost string) string {
@@ -238,6 +257,17 @@ func NewClient(
 	writeHTTPClient := &http.Client{Transport: wrapPublicGitHubAPIGuard(
 		mutationAuthTransport{base: authRT},
 	)}
+	notificationTransport := mutationAuthTransport{base: authRT}
+	var notificationRoundTripper http.RoundTripper = notificationTransport
+	if budget != nil {
+		notificationRoundTripper = &budgetTransport{
+			base:   notificationRoundTripper,
+			budget: budget,
+		}
+	}
+	notificationHTTPClient := &http.Client{Transport: wrapPublicGitHubAPIGuard(
+		notificationRoundTripper,
+	)}
 
 	newGHClient := func(hc *http.Client) (*gh.Client, error) {
 		if options.baseURLOverride != "" {
@@ -265,20 +295,26 @@ func NewClient(
 	if err != nil {
 		return nil, err
 	}
+	ghNotificationClient, err := newGHClient(notificationHTTPClient)
+	if err != nil {
+		return nil, err
+	}
 	graphQLEndpoint := graphQLEndpointForHost(platformHost)
 	if options.baseURLOverride != "" {
 		graphQLEndpoint = options.baseURLOverride + "/api/graphql"
 	}
 	return &liveClient{
-		gh:              ghClient,
-		ghWrite:         ghWriteClient,
-		source:          source,
-		httpClient:      httpClient,
-		httpWriteClient: writeHTTPClient,
-		rateTracker:     rateTracker,
-		platformHost:    platformHost,
-		graphQLEndpoint: graphQLEndpoint,
-		etag:            et,
+		gh:                     ghClient,
+		ghWrite:                ghWriteClient,
+		ghNotifications:        ghNotificationClient,
+		source:                 source,
+		httpClient:             httpClient,
+		httpWriteClient:        writeHTTPClient,
+		httpNotificationClient: notificationHTTPClient,
+		rateTracker:            rateTracker,
+		platformHost:           normalizedPlatformHost(platformHost),
+		graphQLEndpoint:        graphQLEndpoint,
+		etag:                   et,
 	}, nil
 }
 
@@ -314,6 +350,12 @@ type liveClient struct {
 	// credential's budget. Nil in hand-built test clients; accessors
 	// fall back to the read client.
 	ghWrite *gh.Client
+	// ghNotifications/httpNotificationClient carry user-scoped
+	// notification APIs on the user's own credential, through the
+	// background sync budget transport. In GitHub App split-auth mode
+	// their PAT rate headers must not feed the app-token read tracker or
+	// the mutation write tracker.
+	ghNotifications *gh.Client
 	// source is the credential chain reads resolve through. Split
 	// behavior (the viewer-permission overlay in GetRepository) is
 	// derived from its current descriptor on every call, so a config
@@ -323,6 +365,7 @@ type liveClient struct {
 	source                  tokenauth.Source
 	httpClient              *http.Client
 	httpWriteClient         *http.Client
+	httpNotificationClient  *http.Client
 	rateTracker             *RateTracker
 	writeRateTracker        *RateTracker
 	graphQLRateTracker      *RateTracker
@@ -339,6 +382,13 @@ func (c *liveClient) writeGH() *gh.Client {
 		return c.ghWrite
 	}
 	return c.gh
+}
+
+func (c *liveClient) notificationGH() *gh.Client {
+	if c.ghNotifications != nil {
+		return c.ghNotifications
+	}
+	return c.writeGH()
 }
 
 func (c *liveClient) writeHTTPClient() *http.Client {
@@ -378,6 +428,10 @@ func (c *liveClient) splitAuthActive() bool {
 	return c.source.Descriptor().HasActiveGitHubApp()
 }
 
+func (c *liveClient) bypassNotificationReadRateReserve() bool {
+	return c.splitAuthActive()
+}
+
 // InvalidateListETagsForRepo evicts cached ETag entries for the repo's
 // list endpoints. Pass any combination of "pulls", "issues", and
 // "comments" to scope the invalidation; omitting endpoints clears
@@ -388,6 +442,140 @@ func (c *liveClient) InvalidateListETagsForRepo(owner, repo string, endpoints ..
 		return
 	}
 	c.etag.invalidateRepo(owner, repo, endpoints...)
+}
+
+func (c *liveClient) ListNotifications(ctx context.Context, opts NotificationListOptions) ([]NotificationThread, bool, error) {
+	page := max(opts.Page, 1)
+	ghOpts := &gh.NotificationListOptions{
+		All:           opts.All,
+		Participating: opts.Participating,
+		ListOptions:   gh.ListOptions{Page: page, PerPage: 100},
+	}
+	if opts.Since != nil {
+		ghOpts.Since = opts.Since.UTC()
+	}
+	var notifications []*gh.Notification
+	var resp *gh.Response
+	var err error
+	if opts.RepoOwner != "" && opts.RepoName != "" {
+		notifications, resp, err = c.notificationGH().Activity.ListRepositoryNotifications(ctx, opts.RepoOwner, opts.RepoName, ghOpts)
+	} else {
+		notifications, resp, err = c.notificationGH().Activity.ListNotifications(ctx, ghOpts)
+	}
+	c.trackNotificationRate(resp)
+	if err != nil {
+		return nil, false, err
+	}
+	threads := make([]NotificationThread, 0, len(notifications))
+	for _, notification := range notifications {
+		threads = append(threads, c.normalizeNotification(notification))
+	}
+	return threads, resp != nil && resp.NextPage != 0, nil
+}
+
+func (c *liveClient) GetNotificationThread(ctx context.Context, threadID string) (NotificationThread, error) {
+	notification, resp, err := c.notificationGH().Activity.GetThread(ctx, threadID)
+	c.trackNotificationRate(resp)
+	if err != nil {
+		return NotificationThread{}, err
+	}
+	return c.normalizeNotification(notification), nil
+}
+
+func (c *liveClient) MarkNotificationThreadRead(ctx context.Context, threadID string) error {
+	resp, err := c.notificationGH().Activity.MarkThreadRead(ctx, threadID)
+	c.trackNotificationRate(resp)
+	return err
+}
+
+func (c *liveClient) normalizeNotification(n *gh.Notification) NotificationThread {
+	if n == nil {
+		return NotificationThread{}
+	}
+	thread := NotificationThread{
+		ID:     n.GetID(),
+		Reason: n.GetReason(),
+		Unread: n.GetUnread(),
+	}
+	if updated := n.GetUpdatedAt(); !updated.IsZero() {
+		thread.UpdatedAt = updated.UTC()
+	}
+	if lastRead := n.GetLastReadAt(); !lastRead.IsZero() {
+		lastReadAt := lastRead.UTC()
+		thread.LastReadAt = &lastReadAt
+	}
+	if repo := n.GetRepository(); repo != nil {
+		thread.RepoName = strings.ToLower(repo.GetName())
+		if owner := repo.GetOwner(); owner != nil {
+			thread.RepoOwner = strings.ToLower(owner.GetLogin())
+		}
+	}
+	if subject := n.GetSubject(); subject != nil {
+		thread.SubjectType = subject.GetType()
+		thread.SubjectTitle = subject.GetTitle()
+		thread.SubjectURL = subject.GetURL()
+		thread.SubjectLatestCommentURL = subject.GetLatestCommentURL()
+		thread.ItemType, thread.ItemNumber, thread.WebURL = c.notificationItem(subject.GetType(), subject.GetURL(), thread.RepoOwner, thread.RepoName)
+	}
+	return thread
+}
+
+func (c *liveClient) notificationItem(subjectType, apiURL, owner, repo string) (string, *int, string) {
+	itemType := "other"
+	subjectLower := strings.ToLower(subjectType)
+	switch subjectLower {
+	case "pullrequest":
+		itemType = "pr"
+	case "issue":
+		itemType = "issue"
+	case "release":
+		itemType = "release"
+	case "commit":
+		itemType = "commit"
+	}
+
+	if owner == "" || repo == "" || apiURL == "" {
+		return itemType, nil, ""
+	}
+	segments := strings.Split(strings.TrimRight(apiURL, "/"), "/")
+	lastSegment := func(prefix string) (string, bool) {
+		for i := 0; i < len(segments)-1; i++ {
+			if segments[i] == prefix {
+				return segments[i+1], true
+			}
+		}
+		return "", false
+	}
+	host := c.platformHost
+	if host == "" {
+		host = "github.com"
+	}
+	switch itemType {
+	case "pr":
+		if value, ok := lastSegment("pulls"); ok {
+			if number, err := strconv.Atoi(value); err == nil {
+				return itemType, &number, fmt.Sprintf("https://%s/%s/%s/pull/%d", host, owner, repo, number)
+			}
+		}
+		if value, ok := lastSegment("issues"); ok {
+			if number, err := strconv.Atoi(value); err == nil {
+				return itemType, &number, fmt.Sprintf("https://%s/%s/%s/pull/%d", host, owner, repo, number)
+			}
+		}
+	case "issue":
+		if value, ok := lastSegment("issues"); ok {
+			if number, err := strconv.Atoi(value); err == nil {
+				return itemType, &number, fmt.Sprintf("https://%s/%s/%s/issues/%d", host, owner, repo, number)
+			}
+		}
+	case "commit":
+		if sha, ok := lastSegment("commits"); ok && sha != "" {
+			return itemType, nil, fmt.Sprintf("https://%s/%s/%s/commit/%s", host, owner, repo, sha)
+		}
+	case "release":
+		return itemType, nil, ""
+	}
+	return itemType, nil, ""
 }
 
 func (c *liveClient) ListReleases(
@@ -972,6 +1160,17 @@ func (c *liveClient) trackWriteRate(resp *gh.Response) {
 	}
 	c.writeRateTracker.RecordRequest()
 	c.writeRateTracker.UpdateFromRate(rateFromGitHub(resp.Rate))
+}
+
+// trackNotificationRate records notification API responses only when the
+// read client and notification client use the same credential. In GitHub App
+// split-auth mode, reads use an installation token while notifications use
+// the user's PAT, so PAT headers cannot update the installation read tracker.
+func (c *liveClient) trackNotificationRate(resp *gh.Response) {
+	if c.splitAuthActive() {
+		return
+	}
+	c.trackRate(resp)
 }
 
 func (c *liveClient) GetRateLimitSnapshot(ctx context.Context) (*RateLimitSnapshot, error) {

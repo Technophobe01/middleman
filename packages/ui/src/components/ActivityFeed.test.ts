@@ -58,11 +58,14 @@ const collapseAllThreads = vi.hoisted(() => vi.fn());
 const expandAllThreads = vi.hoisted(() => vi.fn());
 const rollUpCommits = vi.hoisted(() => ({ value: false }));
 const hideDefaultBranchActivity = vi.hoisted(() => ({ value: false }));
+const hideClosedMerged = vi.hoisted(() => ({ value: false }));
 const hideOrgName = vi.hoisted(() => ({ value: false }));
 const setActivityFilterTypes = vi.hoisted(() => vi.fn());
 const enabledEvents = vi.hoisted(() => ({
   value: new Set(["comment", "review", "commit", "force_push"]),
 }));
+const showNotifications = vi.hoisted(() => ({ value: true }));
+const markNotificationSeen = vi.hoisted(() => vi.fn(async () => undefined));
 
 vi.mock("../context.js", () => ({
   getNavigate: () => vi.fn(),
@@ -75,7 +78,8 @@ vi.mock("../context.js", () => ({
       stopActivityPolling: vi.fn(),
       getActivitySearch: () => "",
       getEnabledEvents: () => enabledEvents.value,
-      getHideClosedMerged: () => false,
+      getShowNotifications: () => showNotifications.value,
+      getHideClosedMerged: () => hideClosedMerged.value,
       getHideBots: () => false,
       getHideDefaultBranchActivity: () => hideDefaultBranchActivity.value,
       getItemFilter: () => "all",
@@ -99,6 +103,10 @@ vi.mock("../context.js", () => ({
       setEnabledEvents: vi.fn((events: Set<string>) => {
         enabledEvents.value = events;
       }),
+      setShowNotifications: vi.fn((value: boolean) => {
+        showNotifications.value = value;
+      }),
+      markNotificationSeen,
       setHideClosedMerged: vi.fn(),
       setHideBots: vi.fn(),
       setHideDefaultBranchActivity: vi.fn((value: boolean) => {
@@ -133,8 +141,10 @@ describe("ActivityFeed compact mode", () => {
     collapseThreads.value = false;
     rollUpCommits.value = false;
     hideDefaultBranchActivity.value = false;
+    hideClosedMerged.value = false;
     hideOrgName.value = false;
     enabledEvents.value = new Set(["comment", "review", "commit", "force_push"]);
+    showNotifications.value = true;
     setActivityFilterTypes.mockClear();
     items.value = [
       activityItem("selected"),
@@ -439,6 +449,7 @@ describe("ActivityFeed compact mode", () => {
       "comment",
       "review",
       "force_push",
+      "notification",
     ]);
   });
 
@@ -455,6 +466,7 @@ describe("ActivityFeed compact mode", () => {
       "comment",
       "review",
       "commit",
+      "notification",
     ]);
   });
 
@@ -476,6 +488,26 @@ describe("ActivityFeed compact mode", () => {
       "review",
       "commit",
       "force_push",
+      "notification",
+    ]);
+  });
+
+  it("deselecting Notifications drops the notification type from the request", async () => {
+    render(ActivityFeed, { props: { compact: true } });
+
+    await fireEvent.click(screen.getByRole("button", { name: "View" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Notifications" }));
+
+    expect(showNotifications.value).toBe(false);
+    expect(setActivityFilterTypes).toHaveBeenCalledWith([
+      "new_pr",
+      "new_issue",
+      "default_branch_commit",
+      "default_branch_force_push",
+      "comment",
+      "review",
+      "commit",
+      "force_push",
     ]);
   });
 
@@ -486,6 +518,49 @@ describe("ActivityFeed compact mode", () => {
     await fireEvent.click(screen.getByRole("button", { name: "Roll up commits" }));
 
     expect(rollUpCommits.value).toBe(true);
+  });
+
+  it("can deselect the last remaining event type", async () => {
+    enabledEvents.value = new Set(["comment"]);
+    render(ActivityFeed, { props: { compact: true } });
+
+    await fireEvent.click(screen.getByRole("button", { name: "View" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Comments" }));
+
+    // The last event type must be removable. With notifications still on
+    // and the item filter unscoped, that leaves a notifications-only view
+    // rather than reintroducing the PR/issue "Opened" anchor rows.
+    expect(enabledEvents.value.size).toBe(0);
+    expect(setActivityFilterTypes).toHaveBeenCalledWith(["notification"]);
+  });
+
+  it("hides notifications on merged PRs even in a notifications-only feed", () => {
+    hideClosedMerged.value = true;
+    // Notifications-only: no sibling PR rows are present, so the filter must
+    // read each notification's own subject_state (its linked PR/issue's
+    // state) rather than item_state, which holds unread/read.
+    items.value = [
+      activityItem("ntf:1", {
+        activity_type: "notification",
+        item_state: "unread",
+        subject_state: "merged",
+        item_number: 1,
+        item_title: "Merged work",
+        body_preview: "review_requested",
+      }),
+      activityItem("ntf:2", {
+        activity_type: "notification",
+        item_state: "unread",
+        subject_state: "open",
+        item_number: 2,
+        item_title: "Open work",
+        item_url: "https://github.com/acme/widgets/pull/2",
+        body_preview: "mention",
+      }),
+    ];
+    const { container } = render(ActivityFeed, { props: { compact: true } });
+    expect(container.textContent).toContain("Open work");
+    expect(container.textContent).not.toContain("Merged work");
   });
 });
 
@@ -517,5 +592,78 @@ describe("ActivityFeed collapse-all control", () => {
     await fireEvent.click(btn);
     expect(expandAllThreads).toHaveBeenCalledTimes(1);
     expect(collapseAllThreads).not.toHaveBeenCalled();
+  });
+});
+
+describe("ActivityFeed notification rows", () => {
+  beforeEach(() => {
+    viewMode.value = "flat";
+    showNotifications.value = true;
+    markNotificationSeen.mockClear();
+  });
+
+  afterEach(() => {
+    cleanup();
+    items.value = [];
+  });
+
+  it("offers Mark seen only on unread notification rows and calls the store", async () => {
+    items.value = [
+      activityItem("ntf:42", {
+        activity_type: "notification",
+        item_state: "unread",
+        body_preview: "review_requested",
+      }),
+      activityItem("comment", { activity_type: "comment" }),
+    ];
+
+    render(ActivityFeed, { props: {} });
+
+    expect(screen.getByText("Review requested")).toBeTruthy();
+    const buttons = screen.getAllByRole("button", { name: "Mark notification seen" });
+    expect(buttons).toHaveLength(1);
+
+    await fireEvent.click(buttons[0]!);
+    expect(markNotificationSeen).toHaveBeenCalledTimes(1);
+    expect(markNotificationSeen.mock.calls[0]![0]).toMatchObject({ id: "ntf:42" });
+  });
+
+  it("hides Mark seen once a notification row is read", () => {
+    items.value = [
+      activityItem("ntf:42", {
+        activity_type: "notification",
+        item_state: "read",
+        body_preview: "mention",
+      }),
+    ];
+
+    render(ActivityFeed, { props: {} });
+
+    expect(screen.getByText("Mentioned")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Mark notification seen" })).toBeNull();
+  });
+
+  it("offers Mark seen on compact unread notification rows and calls the store", async () => {
+    items.value = [
+      activityItem("ntf:42", {
+        activity_type: "notification",
+        item_state: "unread",
+        body_preview: "review_requested",
+      }),
+    ];
+
+    const { container } = render(ActivityFeed, { props: { compact: true } });
+
+    // The row body stays a real <button> so keyboard users can focus and
+    // activate it; the mark-seen control is a separate, non-nested button.
+    const rowBody = container.querySelector(".activity-compact-row");
+    expect(rowBody?.tagName).toBe("BUTTON");
+
+    const btn = screen.getByRole("button", { name: "Mark notification seen" });
+    expect(rowBody?.contains(btn)).toBe(false);
+
+    await fireEvent.click(btn);
+    expect(markNotificationSeen).toHaveBeenCalledTimes(1);
+    expect(markNotificationSeen.mock.calls[0]![0]).toMatchObject({ id: "ntf:42" });
   });
 });

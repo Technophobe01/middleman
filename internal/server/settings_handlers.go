@@ -18,12 +18,17 @@ import (
 )
 
 type settingsResponse struct {
-	Repos    []ghclient.ConfiguredRepoStatus `json:"repos" nullable:"false"`
-	Activity config.Activity                 `json:"activity"`
-	Terminal config.Terminal                 `json:"terminal"`
-	Modes    config.ModeVisibility           `json:"modes,omitzero"`
-	Agents   []config.Agent                  `json:"agents" nullable:"false"`
-	Fleet    fleetSettingsResponse           `json:"fleet"`
+	Repos         []ghclient.ConfiguredRepoStatus `json:"repos" nullable:"false"`
+	Activity      config.Activity                 `json:"activity"`
+	Notifications notificationsSettingsResponse   `json:"notifications"`
+	Terminal      config.Terminal                 `json:"terminal"`
+	Modes         config.ModeVisibility           `json:"modes,omitzero"`
+	Agents        []config.Agent                  `json:"agents" nullable:"false"`
+	Fleet         fleetSettingsResponse           `json:"fleet"`
+}
+
+type notificationsSettingsResponse struct {
+	Enabled bool `json:"enabled"`
 }
 
 type updateSettingsRequest struct {
@@ -80,12 +85,15 @@ func (s *Server) buildLocalSettingsResponse() settingsResponse {
 		}
 	}
 	return settingsResponse{
-		Repos:    configured,
-		Activity: activity,
-		Terminal: terminal,
-		Modes:    modes,
-		Agents:   agents,
-		Fleet:    fleetSettings,
+		Repos:         configured,
+		Activity:      activity,
+		// Notifications are a built-in capability with no enable/disable
+		// setting; report them as always available.
+		Notifications: notificationsSettingsResponse{Enabled: true},
+		Terminal:      terminal,
+		Modes:         modes,
+		Agents:        agents,
+		Fleet:         fleetSettings,
 	}
 }
 

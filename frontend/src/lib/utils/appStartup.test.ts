@@ -76,6 +76,7 @@ function makeSettings(): Settings {
       reviews: true,
       workspaces: true,
     },
+    notifications: { enabled: true },
     agents: [],
   };
 }

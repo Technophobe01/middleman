@@ -220,6 +220,8 @@ type mockGH struct {
 	rateLimitSnapshotFn        func(context.Context) (*ghclient.RateLimitSnapshot, error)
 	rateLimitSnapshotCalls     int
 	listIssueCommentsErr       error
+	listNotificationsFn        func(context.Context, ghclient.NotificationListOptions) ([]ghclient.NotificationThread, bool, error)
+	markNotificationReadFn     func(context.Context, string) error
 }
 
 func (m *mockGH) ListOpenPullRequests(ctx context.Context, owner, repo string) ([]*gh.PullRequest, error) {
@@ -626,6 +628,20 @@ func (m *mockGH) ListIssuesPage(
 	return nil, false, nil
 }
 
+func (m *mockGH) ListNotifications(ctx context.Context, opts ghclient.NotificationListOptions) ([]ghclient.NotificationThread, bool, error) {
+	if m.listNotificationsFn != nil {
+		return m.listNotificationsFn(ctx, opts)
+	}
+	return nil, false, nil
+}
+
+func (m *mockGH) MarkNotificationThreadRead(ctx context.Context, threadID string) error {
+	if m.markNotificationReadFn != nil {
+		return m.markNotificationReadFn(ctx, threadID)
+	}
+	return nil
+}
+
 // InvalidateListETagsForRepo is a no-op for the server test mock,
 // which has no underlying HTTP cache.
 func (m *mockGH) InvalidateListETagsForRepo(_, _ string, _ ...string) {}
@@ -825,6 +841,27 @@ func setupTestServer(t *testing.T) (*Server, *db.DB) {
 	return setupTestServerWithMock(t, &mockGH{})
 }
 
+func setupNotificationsEnabledTestServer(t *testing.T) (*Server, *db.DB) {
+	t.Helper()
+	database := dbtest.Open(t)
+	syncer := ghclient.NewSyncer(
+		map[string]ghclient.Client{"github.com": &mockGH{}},
+		database,
+		nil,
+		defaultTestRepos,
+		time.Minute,
+		nil,
+		nil,
+	)
+	t.Cleanup(syncer.Stop)
+	srv := New(
+		database, syncer, nil, "/",
+		notificationsEnabledConfig(), ServerOptions{},
+	)
+	t.Cleanup(func() { gracefulShutdown(t, srv) })
+	return srv, database
+}
+
 func setupTestServerWithDatabase(
 	t *testing.T, database *db.DB, repos []ghclient.RepoRef,
 ) *Server {
@@ -847,6 +884,7 @@ func setupTestServerWithMock(t *testing.T, mock *mockGH) (*Server, *db.DB) {
 
 var defaultTestRepos = []ghclient.RepoRef{
 	{
+		Platform:     "github",
 		Owner:        "acme",
 		Name:         "widget",
 		PlatformHost: "github.com",
@@ -1077,6 +1115,36 @@ func seedPR(t *testing.T, database *db.DB, owner, name string, number int, opts 
 	}
 	require.NoError(t, database.EnsureKanbanState(ctx, prID))
 
+	return prID
+}
+
+func insertTestActivityPR(
+	t *testing.T,
+	database *db.DB,
+	repoID int64,
+	owner string,
+	name string,
+	number int,
+	title string,
+	createdAt time.Time,
+) int64 {
+	t.Helper()
+	numberText := strconv.Itoa(number)
+	prID, err := database.UpsertMergeRequest(t.Context(), &db.MergeRequest{
+		RepoID:         repoID,
+		PlatformID:     int64(number) * 1000,
+		Number:         number,
+		URL:            "https://github.com/" + owner + "/" + name + "/pull/" + numberText,
+		Title:          title,
+		Author:         "testuser",
+		State:          db.MergeRequestStateOpen,
+		HeadBranch:     "feature",
+		BaseBranch:     "main",
+		CreatedAt:      createdAt,
+		UpdatedAt:      createdAt,
+		LastActivityAt: createdAt,
+	})
+	require.NoError(t, err)
 	return prID
 }
 
@@ -4945,9 +5013,9 @@ func TestAPIListRepoSummaries(t *testing.T) {
 	assert := Assert.New(t)
 
 	repos := []ghclient.RepoRef{
-		{Owner: "acme", Name: "widgets", PlatformHost: "github.com"},
-		{Owner: "acme", Name: "tools", PlatformHost: "github.com"},
-		{Owner: "acme", Name: "archived", PlatformHost: "github.com"},
+		{Platform: "github", Owner: "acme", Name: "widgets", PlatformHost: "github.com"},
+		{Platform: "github", Owner: "acme", Name: "tools", PlatformHost: "github.com"},
+		{Platform: "github", Owner: "acme", Name: "archived", PlatformHost: "github.com"},
 	}
 	srv, database := setupTestServerWithRepos(t, &mockGH{}, repos)
 	client := setupTestClient(t, srv)
@@ -5383,7 +5451,7 @@ func TestAPICreateIssue(t *testing.T) {
 		t,
 		mock,
 		[]ghclient.RepoRef{
-			{Owner: "acme", Name: "widgets", PlatformHost: "github.com"},
+			{Platform: "github", Owner: "acme", Name: "widgets", PlatformHost: "github.com"},
 		},
 	)
 	client := setupTestClient(t, srv)
@@ -5439,7 +5507,7 @@ func TestAPICreateIssueRejectsNilProviderPayload(t *testing.T) {
 		t,
 		mock,
 		[]ghclient.RepoRef{
-			{Owner: "acme", Name: "widgets", PlatformHost: "github.com"},
+			{Platform: "github", Owner: "acme", Name: "widgets", PlatformHost: "github.com"},
 		},
 	)
 	client := setupTestClient(t, srv)
@@ -5759,7 +5827,7 @@ func TestAPICreateIssueUsesPlatformHost(t *testing.T) {
 		},
 	}
 	repos := []ghclient.RepoRef{
-		{Owner: "acme", Name: "widgets", PlatformHost: "github.com"},
+		{Platform: "github", Owner: "acme", Name: "widgets", PlatformHost: "github.com"},
 		{Owner: "acme", Name: "widgets", PlatformHost: "ghe.example.com"},
 	}
 	syncer := ghclient.NewSyncer(
@@ -6632,11 +6700,33 @@ func seedIssueForRepo(
 
 func TestAPIClosePR(t *testing.T) {
 	require := require.New(t)
+	assert := Assert.New(t)
 
 	srv, database := setupTestServer(t)
 	handlerNow := testEDTTime(9, 15)
 	setTestServerNow(t, srv, handlerNow)
 	seedPR(t, database, "acme", "widget", 1)
+	repo, err := database.GetRepoByOwnerName(t.Context(), "acme", "widget")
+	require.NoError(err)
+	updatedAt := handlerNow.Add(-time.Hour)
+	number := 1
+	require.NoError(database.UpsertNotifications(t.Context(), []db.Notification{{
+		Platform:               "github",
+		PlatformHost:           "github.com",
+		PlatformNotificationID: "thread-pr-close",
+		RepoID:                 &repo.ID,
+		RepoOwner:              "acme",
+		RepoName:               "widget",
+		SubjectType:            "PullRequest",
+		SubjectTitle:           "Test PR #1",
+		WebURL:                 "https://github.com/acme/widget/pull/1",
+		ItemNumber:             &number,
+		ItemType:               "pr",
+		Reason:                 "mention",
+		Unread:                 true,
+		SourceUpdatedAt:        updatedAt,
+		SyncedAt:               updatedAt,
+	}}))
 	client := setupTestClient(t, srv)
 
 	resp, err := client.HTTP.SetPrGithubStateWithResponse(
@@ -6648,8 +6738,13 @@ func TestAPIClosePR(t *testing.T) {
 
 	pr, err := database.GetMergeRequest(t.Context(), "acme", "widget", 1)
 	require.NoError(err)
-	require.Equal(db.MergeRequestStateClosed, pr.State)
+	assert.Equal(db.MergeRequestStateClosed, pr.State)
 	assertTimePtrEqualsUTC(t, pr.ClosedAt, handlerNow)
+	doneNotifications, err := database.ListNotifications(t.Context(), db.ListNotificationsOpts{State: "done"})
+	require.NoError(err)
+	require.Len(doneNotifications, 1)
+	assert.Equal("thread-pr-close", doneNotifications[0].PlatformNotificationID)
+	assert.Equal("closed", doneNotifications[0].DoneReason)
 }
 
 func TestAPIReopenPR(t *testing.T) {
@@ -7942,8 +8037,8 @@ func TestAPIGetIssueUsesPlatformHostQuery(t *testing.T) {
 		database,
 		nil,
 		[]ghclient.RepoRef{
-			{Owner: "acme", Name: "widget", PlatformHost: "github.com"},
-			{Owner: "acme", Name: "widget", PlatformHost: "ghe.example.com"},
+			{Platform: "github", Owner: "acme", Name: "widget", PlatformHost: "github.com"},
+			{Platform: "github", Owner: "acme", Name: "widget", PlatformHost: "ghe.example.com"},
 		},
 		time.Minute,
 		nil,
@@ -8304,8 +8399,8 @@ func TestAPISyncIssueUsesPlatformHostQuery(t *testing.T) {
 		database,
 		nil,
 		[]ghclient.RepoRef{
-			{Owner: "acme", Name: "widget", PlatformHost: "github.com"},
-			{Owner: "acme", Name: "widget", PlatformHost: "ghe.example.com"},
+			{Platform: "github", Owner: "acme", Name: "widget", PlatformHost: "github.com"},
+			{Platform: "github", Owner: "acme", Name: "widget", PlatformHost: "ghe.example.com"},
 		},
 		time.Minute,
 		nil,
@@ -8438,8 +8533,8 @@ func TestAPISetIssueStateUsesPlatformHostBody(t *testing.T) {
 		database,
 		nil,
 		[]ghclient.RepoRef{
-			{Owner: "acme", Name: "widget", PlatformHost: "github.com"},
-			{Owner: "acme", Name: "widget", PlatformHost: "ghe.example.com"},
+			{Platform: "github", Owner: "acme", Name: "widget", PlatformHost: "github.com"},
+			{Platform: "github", Owner: "acme", Name: "widget", PlatformHost: "ghe.example.com"},
 		},
 		time.Minute,
 		nil,
@@ -17286,7 +17381,7 @@ func TestAPIRateLimitsMultiHostMixed(t *testing.T) {
 		},
 		database, nil,
 		[]ghclient.RepoRef{
-			{Owner: "acme", Name: "widget", PlatformHost: "github.com"},
+			{Platform: "github", Owner: "acme", Name: "widget", PlatformHost: "github.com"},
 			{Owner: "corp", Name: "internal", PlatformHost: "ghe.example.com"},
 		},
 		time.Minute,
@@ -17874,7 +17969,7 @@ func setupTestServerWithClonesAndServer(t *testing.T) (
 
 	clones := gitclone.New(bareDir, nil)
 	mock := &mockGH{}
-	repos := []ghclient.RepoRef{{Owner: "acme", Name: "widget", PlatformHost: "github.com"}}
+	repos := []ghclient.RepoRef{{Platform: "github", Owner: "acme", Name: "widget", PlatformHost: "github.com"}}
 	syncer := ghclient.NewSyncer(map[string]ghclient.Client{"github.com": mock}, database, nil, repos, time.Minute, nil, nil)
 	t.Cleanup(syncer.Stop)
 	srv = New(database, syncer, nil, "/", nil, ServerOptions{Clones: clones})
@@ -18296,6 +18391,126 @@ func TestAPIListActivity(t *testing.T) {
 	assert.NotEmpty(*resp.JSON200.Items,
 		"activity feed should contain PR and comment items")
 	assert.Equal("github.com", (*resp.JSON200.Items)[0].PlatformHost)
+}
+
+func TestAPIListActivityIncludesNotificationSyncedBeforeRepo(t *testing.T) {
+	assert := Assert.New(t)
+	require := require.New(t)
+	srv, database := setupNotificationsEnabledTestServer(t)
+	client := setupTestClient(t, srv)
+	ctx := t.Context()
+	base := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+	number := 7
+
+	require.NoError(database.UpsertNotifications(ctx, []db.Notification{{
+		Platform:               "github",
+		PlatformHost:           "github.com",
+		PlatformNotificationID: "thread-before-repo",
+		RepoOwner:              "acme",
+		RepoName:               "widget",
+		SubjectType:            "PullRequest",
+		SubjectTitle:           "Review before repo sync",
+		WebURL:                 "https://github.com/acme/widget/pull/7",
+		ItemNumber:             &number,
+		ItemType:               "pr",
+		ItemAuthor:             "reviewer",
+		Reason:                 "mention",
+		Unread:                 true,
+		SourceUpdatedAt:        base.Add(10 * time.Minute),
+		SyncedAt:               base.Add(10 * time.Minute),
+	}}))
+	mergedAt := base.Add(20 * time.Minute)
+	seedPR(t, database, "acme", "widget", number,
+		withSeedPRTitle("Review before repo sync"),
+		withSeedPRLifecycle(db.MergeRequestStateMerged, &mergedAt, nil),
+		withSeedPRTimes(base, mergedAt, mergedAt))
+
+	types := []string{"notification"}
+	since := base.Add(-time.Minute).Format(time.RFC3339)
+	resp, err := client.HTTP.ListActivityWithResponse(
+		ctx, &generated.ListActivityParams{Since: &since, Types: &types},
+	)
+	require.NoError(err)
+	require.Equal(http.StatusOK, resp.StatusCode())
+	require.NotNil(resp.JSON200)
+	require.NotNil(resp.JSON200.Items)
+	require.Len(*resp.JSON200.Items, 1)
+	item := (*resp.JSON200.Items)[0]
+	assert.Equal("notification", item.ActivityType)
+	assert.Equal("acme", item.RepoOwner)
+	assert.Equal("widget", item.RepoName)
+	assert.NotNil(item.SubjectState)
+	assert.Equal("merged", *item.SubjectState)
+}
+
+func TestAPIListActivityScopesNotificationsToTrackedRepos(t *testing.T) {
+	assert := Assert.New(t)
+	require := require.New(t)
+	srv, database := setupNotificationsEnabledTestServer(t)
+	client := setupTestClient(t, srv)
+	ctx := t.Context()
+	base := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+	number := 7
+
+	trackedRepoID, err := database.UpsertRepo(ctx, db.GitHubRepoIdentity("github.com", "acme", "widget"))
+	require.NoError(err)
+	removedRepoID, err := database.UpsertRepo(ctx, db.GitHubRepoIdentity("github.com", "acme", "removed"))
+	require.NoError(err)
+	insertTestActivityPR(t, database, trackedRepoID, "acme", "widget", number, "Tracked notification", base)
+	insertTestActivityPR(t, database, removedRepoID, "acme", "removed", number, "Removed notification", base)
+
+	require.NoError(database.UpsertNotifications(ctx, []db.Notification{
+		{
+			Platform:               "github",
+			PlatformHost:           "github.com",
+			PlatformNotificationID: "thread-tracked",
+			RepoOwner:              "acme",
+			RepoName:               "widget",
+			SubjectType:            "PullRequest",
+			SubjectTitle:           "Tracked notification",
+			WebURL:                 "https://github.com/acme/widget/pull/7",
+			ItemNumber:             &number,
+			ItemType:               "pr",
+			ItemAuthor:             "reviewer",
+			Reason:                 "mention",
+			Unread:                 true,
+			SourceUpdatedAt:        base.Add(10 * time.Minute),
+			SyncedAt:               base.Add(10 * time.Minute),
+		},
+		{
+			Platform:               "github",
+			PlatformHost:           "github.com",
+			PlatformNotificationID: "thread-removed",
+			RepoOwner:              "acme",
+			RepoName:               "removed",
+			SubjectType:            "PullRequest",
+			SubjectTitle:           "Removed notification",
+			WebURL:                 "https://github.com/acme/removed/pull/7",
+			ItemNumber:             &number,
+			ItemType:               "pr",
+			ItemAuthor:             "reviewer",
+			Reason:                 "mention",
+			Unread:                 true,
+			SourceUpdatedAt:        base.Add(11 * time.Minute),
+			SyncedAt:               base.Add(11 * time.Minute),
+		},
+	}))
+
+	types := []string{"notification"}
+	since := base.Add(-time.Minute).Format(time.RFC3339)
+	resp, err := client.HTTP.ListActivityWithResponse(
+		ctx, &generated.ListActivityParams{Since: &since, Types: &types},
+	)
+	require.NoError(err)
+	require.Equal(http.StatusOK, resp.StatusCode())
+	require.NotNil(resp.JSON200)
+	require.NotNil(resp.JSON200.Items)
+	require.Len(*resp.JSON200.Items, 1)
+	item := (*resp.JSON200.Items)[0]
+	assert.Equal("notification", item.ActivityType)
+	assert.Equal("acme", item.RepoOwner)
+	assert.Equal("widget", item.RepoName)
+	assert.Equal("Tracked notification", item.ItemTitle)
 }
 
 func TestAPIListActivityReturnsDefaultBranchActivity(t *testing.T) {
@@ -18870,8 +19085,8 @@ func TestAPIListStacks_RepoFilter(t *testing.T) {
 	assert := Assert.New(t)
 	require := require.New(t)
 	repos := []ghclient.RepoRef{
-		{Owner: "acme", Name: "widget", PlatformHost: "github.com"},
-		{Owner: "acme", Name: "tools", PlatformHost: "github.com"},
+		{Platform: "github", Owner: "acme", Name: "widget", PlatformHost: "github.com"},
+		{Platform: "github", Owner: "acme", Name: "tools", PlatformHost: "github.com"},
 	}
 	srv, database := setupTestServerWithRepos(t, &mockGH{}, repos)
 	client := setupTestClient(t, srv)
@@ -23932,30 +24147,38 @@ func TestWorkspaceRuntimePlainShellTerminalWebSocketE2E(t *testing.T) {
 // session (TerminalPane reconnect-loops on a still-listed-but-
 // output-dead session, which looks like a hang).
 //
-// Uses the "pty-close-on-input-then-sleep" helper to deterministically
-// open the race window where drainOutput's PTY EOF precedes watchSession's
-// cmd.Wait return by hundreds of milliseconds. Without the bridge fix
-// (always send exit frame on outputDone), this test fails because the
-// 100ms timeout fires before attachment.Done — exactly the systemd-
-// run-wrapped shell case the user hit.
+// Uses the "pty-close-on-input-then-sleep" helper on the pty-owner backend to
+// deterministically open the race window where drainOutput's PTY EOF precedes
+// watchSession's cmd.Wait return by hundreds of milliseconds. Without the
+// bridge fix (always send exit frame on outputDone), this test fails because
+// the 100ms timeout fires before attachment.Done — exactly the systemd-
+// run-wrapped shell case the user hit. Real tmux does not expose that signal:
+// while the pane process is still sleeping, the attach client remains open.
 func TestWorkspaceRuntimePlainShellTerminalDeliversExitFrameE2E(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test fixture uses /bin/sh")
+	}
 	runParallelPTYE2E(t)
 
 	require := require.New(t)
-	tmuxCommand := isolatedRealTmuxCommandOrSkip(t)
+	dir := t.TempDir()
+	ptyOwnerDir := filepath.Join(dir, "pty-owner")
 	cfg := &config.Config{
-		Tmux: config.Tmux{Command: tmuxCommand},
+		Tmux: config.Tmux{Command: []string{filepath.Join(dir, "missing-tmux")}},
 		Shell: config.Shell{
 			Command: serverRuntimeHelperCommand("pty-close-on-input-then-sleep"),
 		},
 	}
-	client, _, _, _, srv := setupTestServerWithWorkspacesServer(t, cfg)
+	fixture := setupWorkspaceServerFixtureWithOptions(
+		t, cfg, ptyOwnerServerOptions(ptyOwnerDir),
+	)
 	ctx := context.Background()
-	ws := createReadyWorkspace(t, ctx, client)
+	ws := createReadyWorkspace(t, ctx, fixture.client)
 
-	shell := launchPlainShellRuntimeSession(t, ctx, client, ws.Id)
+	shell := launchPlainShellRuntimeSession(t, ctx, fixture.client, ws.Id)
+	cleanupPtyOwnerWorkspace(t, ptyOwnerDir, shell.Key)
 
-	ts := httptest.NewServer(srv)
+	ts := httptest.NewServer(fixture.server)
 	t.Cleanup(ts.Close)
 	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") +
 		"/ws/v1/workspaces/" + ws.Id +
@@ -24007,13 +24230,8 @@ func TestWorkspaceRuntimePlainShellTerminalDeliversExitFrameE2E(t *testing.T) {
 		// before watchSession populated ExitCode). Both are "the
 		// session ended" signals the frontend treats identically;
 		// pinning a specific value would be timing-dependent. Reject
-		// 0 only on the direct-PTY fallback path — a tmux-backed shell
-		// can report the attach client's clean detach rather than the
-		// pane command's non-zero exit status.
-		if !tmuxCommandAvailable(cfg.TmuxCommand()) {
-			require.NotEqual(0, msg.Code,
-				"non-success exit must report non-zero (or -1)")
-		}
+		require.NotEqual(0, msg.Code,
+			"non-success exit must report non-zero (or -1)")
 		return
 	}
 }
@@ -24789,15 +25007,6 @@ func isolatedRealTmuxCommandIfAvailable(t *testing.T) []string {
 	tmuxPath, err := exec.LookPath("tmux")
 	if err != nil {
 		return nil
-	}
-	return isolatedRealTmuxCommand(t, tmuxPath)
-}
-
-func isolatedRealTmuxCommandOrSkip(t *testing.T) []string {
-	t.Helper()
-	tmuxPath, err := exec.LookPath("tmux")
-	if err != nil {
-		t.Skip("tmux not available")
 	}
 	return isolatedRealTmuxCommand(t, tmuxPath)
 }

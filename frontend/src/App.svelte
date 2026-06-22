@@ -79,6 +79,7 @@
     isMobilePage,
     getDetailTab,
     getSelectedPRFromRoute,
+    type RoutableItemRef,
   } from "./lib/stores/router.svelte.ts";
   import {
     buildActivitySelectionSearch,

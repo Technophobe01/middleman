@@ -877,19 +877,21 @@ func buildAppState(
 	e2eWorktreeDir := filepath.Join(tmpDir, "worktrees")
 
 	repos := []config.Repo{
-		{Owner: "acme", Name: "widgets"},
-		{Owner: "acme", Name: "tools"},
-		{Owner: "acme", Name: "archived"},
-		{Owner: "roborev-dev", Name: "*"},
+		{Platform: "github", Owner: "acme", Name: "widgets"},
+		{Platform: "github", Owner: "acme", Name: "tools"},
+		{Platform: "github", Owner: "acme", Name: "archived"},
+		{Platform: "github", Owner: "roborev-dev", Name: "*"},
 	}
 	if !strings.EqualFold(defaultPlatformHost, "github.com") {
 		repos = []config.Repo{
 			{
+				Platform:     "github",
 				Owner:        "enterprise",
 				Name:         "service",
 				PlatformHost: defaultPlatformHost,
 			},
 			{
+				Platform:     "github",
 				Owner:        "acme",
 				Name:         "widgets",
 				PlatformHost: "github.com",
@@ -1294,6 +1296,11 @@ func buildAppState(
 			HostCheckAllowLoopbackAnyPort: true,
 		},
 	)
+	// Mirror production wiring so notification syncs nudge an open activity
+	// feed to reload (the feed's incremental poll skips backfilled rows).
+	syncer.SetOnNotificationSyncComplete(func() {
+		srv.Hub().Broadcast(server.Event{Type: "data_changed", Data: struct{}{}})
+	})
 	rootHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost &&
 			r.URL.Path == "/__e2e/pr-workflow-approval/required" {
@@ -1594,6 +1601,27 @@ func buildAppState(
 				checksJSON:        string(dropdownPayload),
 				providerCheckRuns: ciChecksToCheckRuns(checks),
 			})
+			return
+		}
+		if r.Method == http.MethodPost &&
+			r.URL.Path == "/__e2e/notifications/add-synced" {
+			number := 6
+			fc.Notifications = append(fc.Notifications, ghclient.NotificationThread{
+				ID:            "notif-tools-synced-6",
+				RepoOwner:     "acme",
+				RepoName:      "tools",
+				SubjectType:   "Issue",
+				SubjectTitle:  "Synced tools notification",
+				WebURL:        "https://github.com/acme/tools/issues/6",
+				ItemNumber:    &number,
+				ItemType:      "issue",
+				ItemAuthor:    "dave",
+				Reason:        "mention",
+				Unread:        true,
+				Participating: true,
+				UpdatedAt:     time.Now().UTC(),
+			})
+			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 		if r.Method == http.MethodPost &&

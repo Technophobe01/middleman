@@ -39,16 +39,19 @@ type configChangedEvent struct {
 // startup. It is taken once in newServer and compared in applyConfigChange
 // to detect drift that the watcher cannot fix without a restart.
 type startupConfigSnapshot struct {
-	SyncInterval        string
-	DefaultPlatformHost string
-	Host                string
-	Port                int
-	BasePath            string
-	DataDir             string
-	SyncBudgetPerHour   int
-	AllowedHosts        []config.HostKey
-	TrustReverseProxy   bool
-	ProviderHosts       []tokenauth.Key
+	SyncInterval                    string
+	NotificationSyncInterval        string
+	NotificationPropagationInterval string
+	NotificationBatchSize           int
+	DefaultPlatformHost             string
+	Host                            string
+	Port                            int
+	BasePath                        string
+	DataDir                         string
+	SyncBudgetPerHour               int
+	AllowedHosts                    []config.HostKey
+	TrustReverseProxy               bool
+	ProviderHosts                   []tokenauth.Key
 	// GitHubAppSplitHosts lists hosts whose effective credential chain
 	// resolves sync reads through a GitHub App installation token.
 	// Split topology is startup-bound: write rate trackers and the
@@ -74,18 +77,21 @@ func snapshotStartupConfig(cfg *config.Config) startupConfigSnapshot {
 		return startupConfigSnapshot{}
 	}
 	snap := startupConfigSnapshot{
-		SyncInterval:        cfg.SyncInterval,
-		DefaultPlatformHost: cfg.DefaultPlatformHost,
-		Host:                cfg.Host,
-		Port:                cfg.Port,
-		BasePath:            cfg.BasePath,
-		DataDir:             cfg.DataDir,
-		SyncBudgetPerHour:   cfg.SyncBudgetPerHour,
-		AllowedHosts:        startupAllowedHosts(cfg),
-		TrustReverseProxy:   cfg.TrustReverseProxy,
-		ProviderHosts:       startupProviderHosts(cfg),
-		GitHubAppSplitHosts: githubAppSplitHosts(cfg),
-		Roborev:             cfg.Roborev,
+		SyncInterval:                    cfg.SyncInterval,
+		NotificationSyncInterval:        cfg.Notifications.SyncInterval,
+		NotificationPropagationInterval: cfg.Notifications.PropagationInterval,
+		NotificationBatchSize:           cfg.Notifications.BatchSize,
+		DefaultPlatformHost:             cfg.DefaultPlatformHost,
+		Host:                            cfg.Host,
+		Port:                            cfg.Port,
+		BasePath:                        cfg.BasePath,
+		DataDir:                         cfg.DataDir,
+		SyncBudgetPerHour:               cfg.SyncBudgetPerHour,
+		AllowedHosts:                    startupAllowedHosts(cfg),
+		TrustReverseProxy:               cfg.TrustReverseProxy,
+		ProviderHosts:                   startupProviderHosts(cfg),
+		GitHubAppSplitHosts:             githubAppSplitHosts(cfg),
+		Roborev:                         cfg.Roborev,
 	}
 	snap.Tmux.Command = slices.Clone(cfg.Tmux.Command)
 	if cfg.Tmux.AgentSessions != nil {

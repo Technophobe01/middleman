@@ -122,6 +122,72 @@ func readFakeGHArgv(t *testing.T, path string) []string {
 	return lines
 }
 
+func TestLoadRejectsNonPositiveNotificationIntervals(t *testing.T) {
+	cases := []struct {
+		name    string
+		content string
+		wantErr string
+	}{
+		{
+			name: "sync interval zero",
+			content: `
+[notifications]
+sync_interval = "0s"
+`,
+			wantErr: "notifications.sync_interval must be positive",
+		},
+		{
+			name: "propagation interval negative",
+			content: `
+[notifications]
+propagation_interval = "-1s"
+`,
+			wantErr: "notifications.propagation_interval must be positive",
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, tt.content))
+			require.Error(t, err)
+			Assert.Contains(t, err.Error(), tt.wantErr)
+		})
+	}
+}
+
+func TestSaveAppliesNotificationDefaultsForInMemoryConfig(t *testing.T) {
+	require := require.New(t)
+	assert := Assert.New(t)
+	cfg := &Config{
+		SyncInterval:        "5m",
+		GitHubTokenEnv:      "MIDDLEMAN_GITHUB_TOKEN",
+		DefaultPlatformHost: "github.com",
+		Host:                "127.0.0.1",
+		Port:                8091,
+		BasePath:            "/",
+		DataDir:             DefaultDataDir(),
+		SyncBudgetPerHour:   defaultSyncBudgetPerHour,
+		Repos: []Repo{{
+			Owner: "acme",
+			Name:  "widget",
+		}},
+		Activity: Activity{
+			ViewMode:  defaultViewMode,
+			TimeRange: defaultTimeRange,
+		},
+	}
+	path := filepath.Join(t.TempDir(), "config.toml")
+
+	require.NoError(cfg.Save(path))
+	reloaded, err := Load(path)
+	require.NoError(err)
+
+	assert.True(reloaded.NotificationsEnabled())
+	assert.Equal(defaultNotificationSyncInterval, reloaded.Notifications.SyncInterval)
+	assert.Equal(defaultNotificationPropagationInterval, reloaded.Notifications.PropagationInterval)
+	assert.Equal(25, reloaded.Notifications.BatchSize)
+}
+
 func TestLoadValid(t *testing.T) {
 	assert := Assert.New(t)
 	path := writeConfig(t, `
@@ -194,6 +260,24 @@ name = "repo"
 	require.Len(t, cfg.Repos, 1)
 	assert.Equal("github", cfg.Repos[0].Platform)
 	assert.Equal("github.com", cfg.Repos[0].PlatformHostOrDefault())
+	assert.True(cfg.NotificationsEnabled())
+}
+
+func TestNotificationsAlwaysEnabled(t *testing.T) {
+	// Notifications are a built-in capability with no enable/disable
+	// setting. A legacy config that still carries the removed
+	// [notifications] enabled key must load without error (the key is
+	// ignored) and keep notifications on.
+	cfg, err := Load(writeConfig(t, `
+[[repos]]
+owner = "test"
+name = "repo"
+
+[notifications]
+enabled = false
+`))
+	require.NoError(t, err)
+	Assert.True(t, cfg.NotificationsEnabled())
 }
 
 func TestLoadDocFoldersRoundTrips(t *testing.T) {
@@ -968,9 +1052,11 @@ func TestEnsureDefaultCreatesFile(t *testing.T) {
 
 	data, err := os.ReadFile(path)
 	require.NoError(t, err)
-	assert.Contains(string(data), "sync_interval")
-	assert.Contains(string(data), "github_token_env")
-	assert.Contains(string(data), "[[repos]]")
+	content := string(data)
+	assert.Contains(content, "sync_interval")
+	assert.Contains(content, "github_token_env")
+	assert.Contains(content, "[[repos]]")
+	assert.Contains(content, "[notifications]")
 }
 
 func TestEnsureDefaultSkipsExisting(t *testing.T) {
