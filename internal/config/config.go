@@ -24,23 +24,25 @@ import (
 )
 
 const (
-	defaultGitHubTokenEnv              = "MIDDLEMAN_GITHUB_TOKEN"
-	defaultForgejoTokenEnv             = "MIDDLEMAN_FORGEJO_TOKEN"
-	defaultGiteaTokenEnv               = "MIDDLEMAN_GITEA_TOKEN"
-	defaultSyncInterval                = "5m"
-	defaultHost                        = "127.0.0.1"
-	defaultPort                        = 8091
-	defaultViewMode                    = "threaded"
-	defaultTimeRange                   = "7d"
-	defaultBasePath                    = "/"
-	defaultSyncBudgetPerHour           = 500
-	defaultBranchActivityRetentionDays = 90
-	defaultBranchActivityMaxCommits    = 5000
-	defaultPlatform                    = "github"
-	defaultPlatformHost                = platformpkg.DefaultGitHubHost
-	defaultSSEBufferSize               = 256
-	minSSEBufferSize                   = 16
-	maxSSEBufferSize                   = 16384
+	defaultGitHubTokenEnv                  = "MIDDLEMAN_GITHUB_TOKEN"
+	defaultForgejoTokenEnv                 = "MIDDLEMAN_FORGEJO_TOKEN"
+	defaultGiteaTokenEnv                   = "MIDDLEMAN_GITEA_TOKEN"
+	defaultSyncInterval                    = "5m"
+	defaultNotificationSyncInterval        = "2m"
+	defaultNotificationPropagationInterval = "1m"
+	defaultHost                            = "127.0.0.1"
+	defaultPort                            = 8091
+	defaultViewMode                        = "threaded"
+	defaultTimeRange                       = "7d"
+	defaultBasePath                        = "/"
+	defaultSyncBudgetPerHour               = 500
+	defaultBranchActivityRetentionDays     = 90
+	defaultBranchActivityMaxCommits        = 5000
+	defaultPlatform                        = "github"
+	defaultPlatformHost                    = platformpkg.DefaultGitHubHost
+	defaultSSEBufferSize                   = 256
+	minSSEBufferSize                       = 16
+	maxSSEBufferSize                       = 16384
 )
 
 const (
@@ -56,13 +58,14 @@ const (
 )
 
 type Repo struct {
-	Owner        string `toml:"owner" json:"owner"`
-	Name         string `toml:"name" json:"name"`
-	RepoPath     string `toml:"repo_path,omitempty" json:"repo_path,omitempty"`
-	Platform     string `toml:"platform,omitempty" json:"platform,omitempty"`
-	PlatformHost string `toml:"platform_host,omitempty" json:"platform_host,omitempty"`
-	TokenEnv     string `toml:"token_env,omitempty" json:"token_env,omitempty"`
-	TokenFile    string `toml:"token_file,omitempty" json:"token_file,omitempty"`
+	Owner            string `toml:"owner" json:"owner"`
+	Name             string `toml:"name" json:"name"`
+	RepoPath         string `toml:"repo_path,omitempty" json:"repo_path,omitempty"`
+	Platform         string `toml:"platform,omitempty" json:"platform,omitempty"`
+	PlatformHost     string `toml:"platform_host,omitempty" json:"platform_host,omitempty"`
+	TokenEnv         string `toml:"token_env,omitempty" json:"token_env,omitempty"`
+	TokenFile        string `toml:"token_file,omitempty" json:"token_file,omitempty"`
+	WorktreeBasePath string `toml:"worktree_base_path,omitempty" json:"worktree_base_path,omitempty"`
 }
 
 // DocFolder names a markdown folder registered for docs mode. Path
@@ -213,6 +216,10 @@ func (r *Repo) normalize(defaultGitHubHost string) error {
 	if r.Owner == "" || r.Name == "" {
 		return errors.New("must have owner and name")
 	}
+	r.WorktreeBasePath = strings.TrimSpace(r.WorktreeBasePath)
+	if r.WorktreeBasePath != "" && r.HasNameGlob() {
+		return errors.New("worktree_base_path is only supported for exact repositories")
+	}
 	if platformpkg.LowercaseRepoNames(platformpkg.Kind(r.Platform)) {
 		r.Owner = strings.ToLower(r.Owner)
 		r.Name = strings.ToLower(r.Name)
@@ -361,17 +368,14 @@ func platformForRepoRefHost(host, configuredPlatform string) (string, bool) {
 	if configuredPlatform != defaultPlatform {
 		return configuredPlatform, true
 	}
-	if configuredPlatform == defaultPlatform {
-		if matchHost == defaultPlatformHost {
-			return defaultPlatform, true
-		}
-		if matchHost == platformpkg.DefaultForgejoHost {
-			return string(platformpkg.KindForgejo), true
-		}
-		if matchHost == platformpkg.DefaultGiteaHost {
-			return string(platformpkg.KindGitea), true
-		}
-		return "", false
+	if matchHost == defaultPlatformHost {
+		return defaultPlatform, true
+	}
+	if matchHost == platformpkg.DefaultForgejoHost {
+		return string(platformpkg.KindForgejo), true
+	}
+	if matchHost == platformpkg.DefaultGiteaHost {
+		return string(platformpkg.KindGitea), true
 	}
 	return "", false
 }
@@ -549,14 +553,15 @@ const (
 )
 
 type Terminal struct {
-	FontFamily    string  `toml:"font_family,omitempty" json:"font_family"`
-	FontSize      int     `toml:"font_size,omitempty" json:"font_size"`
-	Scrollback    int     `toml:"scrollback,omitempty" json:"scrollback"`
-	LineHeight    float64 `toml:"line_height,omitempty" json:"line_height"`
-	LetterSpacing int     `toml:"letter_spacing,omitempty" json:"letter_spacing"`
-	CursorBlink   *bool   `toml:"cursor_blink,omitempty" json:"cursor_blink" nullable:"false"`
-	FontLigatures bool    `toml:"font_ligatures,omitempty" json:"font_ligatures"`
-	Renderer      string  `toml:"renderer,omitempty" json:"renderer" enum:"xterm,ghostty-web"`
+	FontFamily     string  `toml:"font_family,omitempty" json:"font_family"`
+	FontSize       int     `toml:"font_size,omitempty" json:"font_size"`
+	Scrollback     int     `toml:"scrollback,omitempty" json:"scrollback"`
+	LineHeight     float64 `toml:"line_height,omitempty" json:"line_height"`
+	LetterSpacing  int     `toml:"letter_spacing,omitempty" json:"letter_spacing"`
+	CursorBlink    *bool   `toml:"cursor_blink,omitempty" json:"cursor_blink" nullable:"false"`
+	FontLigatures  bool    `toml:"font_ligatures,omitempty" json:"font_ligatures"`
+	Renderer       string  `toml:"renderer,omitempty" json:"renderer" enum:"xterm,ghostty-web"`
+	HideTmuxStatus bool    `toml:"hide_tmux_status,omitempty" json:"hide_tmux_status"`
 }
 
 type Agent struct {
@@ -660,6 +665,70 @@ type Tmux struct {
 	AgentSessions *bool    `toml:"agent_sessions,omitempty"`
 }
 
+// FleetPeer is a remote middleman daemon this hub federates with over HTTP.
+type FleetPeer struct {
+	Key     string `toml:"key" json:"key"`
+	Name    string `toml:"name,omitempty" json:"name,omitempty"`
+	BaseURL string `toml:"base_url" json:"base_url"`
+}
+
+type FleetSessions struct {
+	IncludeUnmanagedDetails bool `toml:"include_unmanaged_details,omitempty" json:"include_unmanaged_details,omitempty"`
+}
+
+// FleetSSHPeer is a fleet peer reached over ssh(1) instead of HTTP:
+// the hub holds a ControlMaster to Destination and relays API
+// exchanges by executing the peer's CLI api verb, so the remote
+// listener never leaves its host.
+type FleetSSHPeer struct {
+	Key         string `toml:"key" json:"key"`
+	Name        string `toml:"name,omitempty" json:"name,omitempty"`
+	Destination string `toml:"destination" json:"destination"`
+	Platform    string `toml:"platform,omitempty" json:"platform,omitempty"`
+	// RemoteCommand invokes the peer's CLI; defaults to "middleman".
+	// Must be a bare executable name or path — no flags, since CLI
+	// subcommands are appended right after it. A custom remote config
+	// location is set via MIDDLEMAN_HOME in the remote shell profile.
+	RemoteCommand string `toml:"remote_command,omitempty" json:"remote_command,omitempty"`
+}
+
+// RemoteCommandOrDefault returns the CLI invocation for the peer.
+func (p FleetSSHPeer) RemoteCommandOrDefault() string {
+	if strings.TrimSpace(p.RemoteCommand) == "" {
+		return "middleman"
+	}
+	return p.RemoteCommand
+}
+
+// Fleet configures this daemon's federation: an optional local host key
+// and the peers whose snapshots the hub fans out to.
+type Fleet struct {
+	Enabled     bool           `toml:"enabled,omitempty" json:"enabled"`
+	Key         string         `toml:"key,omitempty" json:"key,omitempty"`
+	PeerTimeout string         `toml:"peer_timeout,omitempty" json:"peer_timeout,omitempty"`
+	Sessions    FleetSessions  `toml:"sessions" json:"sessions"`
+	Peers       []FleetPeer    `toml:"peers,omitempty" json:"peers,omitempty"`
+	SSHPeers    []FleetSSHPeer `toml:"ssh_peers,omitempty" json:"ssh_peers,omitempty"`
+}
+
+// PeerTimeoutOrDefault returns the per-peer fetch timeout, defaulting to
+// 2s when unset or unparseable.
+func (f Fleet) PeerTimeoutOrDefault() time.Duration {
+	if f.PeerTimeout == "" {
+		return 2 * time.Second
+	}
+	if d, err := time.ParseDuration(f.PeerTimeout); err == nil {
+		return d
+	}
+	return 2 * time.Second
+}
+
+type Notifications struct {
+	SyncInterval        string `toml:"sync_interval" json:"sync_interval"`
+	PropagationInterval string `toml:"propagation_interval" json:"propagation_interval"`
+	BatchSize           int    `toml:"batch_size" json:"batch_size"`
+}
+
 // Shell configures the command middleman runs when ensuring the
 // per-workspace plain shell session. Hardened middleman deployments
 // (e.g. systemd services with SystemCallFilter=~@privileged) must
@@ -698,6 +767,7 @@ type Config struct {
 	Platforms         []PlatformConfig  `toml:"platforms"`
 	GitHubApps        []GitHubAppConfig `toml:"github_apps"`
 	Activity          Activity          `toml:"activity"`
+	Notifications     Notifications     `toml:"notifications"`
 	Terminal          Terminal          `toml:"terminal"`
 	Modes             ModeVisibility    `toml:"modes"`
 	Agents            []Agent           `toml:"agents"`
@@ -706,6 +776,8 @@ type Config struct {
 	Msgvault          *Msgvault         `toml:"msgvault"`
 	Tmux              Tmux              `toml:"tmux"`
 	Shell             Shell             `toml:"shell"`
+	Fleet             Fleet             `toml:"fleet"`
+	API               API               `toml:"api"`
 
 	// parsedAllowedHosts is the canonicalised form of AllowedHosts,
 	// populated by Validate so the server constructor does not have
@@ -715,6 +787,97 @@ type Config struct {
 	// parsedBindKey is the canonical (Host, Port) key for the bind
 	// address, populated by Validate.
 	parsedBindKey HostKey
+}
+
+// API configures the HTTP API surface.
+type API struct {
+	// RequireAuth enforces bearer-token auth on /api routes. The
+	// token is minted under data_dir (auth_token, 0600) at serve
+	// start; browsers bootstrap a session cookie via the tokenized
+	// URL recorded in the runtime metadata. Health probes stay open.
+	RequireAuth bool `toml:"require_auth,omitempty" json:"require_auth,omitempty"`
+}
+
+// isBareExecutable reports whether s is safe to embed unquoted in a
+// shell fragment as a command name or path: a conservative whitelist
+// rather than a blocklist of metacharacters.
+func isBareExecutable(s string) bool {
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z',
+			r >= '0' && r <= '9':
+		case r == '_', r == '-', r == '.', r == '/', r == '+':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// validateFleetSSHPeers rejects ssh peers that would later produce
+// unroutable hosts or merge collisions: empty keys/destinations,
+// duplicate keys, the reserved self alias, and keys colliding with
+// HTTP peers or the local fleet key.
+func (c *Config) validateFleetSSHPeers() error {
+	seen := make(map[string]string, len(c.Fleet.Peers))
+	for _, p := range c.Fleet.Peers {
+		seen[p.Key] = "fleet.peers"
+	}
+	for i, p := range c.Fleet.SSHPeers {
+		key := strings.TrimSpace(p.Key)
+		if key == "" {
+			return fmt.Errorf(
+				"config: fleet.ssh_peers[%d]: key is required", i,
+			)
+		}
+		if key == "self" {
+			return fmt.Errorf(
+				"config: fleet.ssh_peers[%d]: key %q is reserved for local self routing",
+				i, key,
+			)
+		}
+		// Destination is passed to ssh(1) as a single positional
+		// argument (never through a shell), so unlike remote_command
+		// it needs no metacharacter whitelist — only presence.
+		if strings.TrimSpace(p.Destination) == "" {
+			return fmt.Errorf(
+				"config: fleet.ssh_peers[%d] (%s): destination is required",
+				i, key,
+			)
+		}
+		if key == strings.TrimSpace(c.Fleet.Key) {
+			return fmt.Errorf(
+				"config: fleet.ssh_peers[%d] (%s): key collides with fleet.key",
+				i, key,
+			)
+		}
+		if origin, dup := seen[key]; dup {
+			return fmt.Errorf(
+				"config: fleet.ssh_peers[%d] (%s): key collides with %s",
+				i, key, origin,
+			)
+		}
+		// The relay embeds this value unquoted in a remote shell
+		// fragment and appends CLI subcommands directly after it, and
+		// the CLI only dispatches a subcommand in argv[0] position —
+		// so flags, whitespace, or shell metacharacters would change
+		// meaning. Custom remote config goes through MIDDLEMAN_HOME
+		// in the remote login profile instead.
+		// Validate the RAW value: the relay embeds it untrimmed, so
+		// even leading/trailing whitespace changes the remote shell
+		// fragment.
+		if p.RemoteCommand != "" && !isBareExecutable(p.RemoteCommand) {
+			return fmt.Errorf(
+				"config: fleet.ssh_peers[%d] (%s): remote_command must be"+
+					" a bare executable name or path (no flags or shell"+
+					" metacharacters); set MIDDLEMAN_HOME in the remote"+
+					" shell profile for a custom config location",
+				i, key,
+			)
+		}
+		seen[key] = "fleet.ssh_peers"
+	}
+	return nil
 }
 
 // SSEBufferSizeOrDefault returns the configured SSE replay ring size,
@@ -839,6 +1002,28 @@ default_platform_host = "github.com"
 host = "127.0.0.1"
 port = 8091
 
+# Per-peer snapshot fetch timeout for fleet fan-out (default "2s").
+# A peer that does not answer in time degrades (reachable=false)
+# instead of stalling the snapshot.
+# [fleet]
+# enabled = false
+# peer_timeout = "2s"
+
+# Federate with fleet peers reached over SSH: the daemon holds a
+# ControlMaster per peer and relays API calls by executing the
+# peer's own CLI remotely, so the peer's listener stays private.
+# [[fleet.ssh_peers]]
+# key = "studio"
+# destination = "user@studio.local"
+# # remote_command = "middleman"   # bare executable, no flags; use MIDDLEMAN_HOME remotely for custom config
+
+# Gate the HTTP API behind a bearer token (minted to
+# <data_dir>/auth_token; browsers bootstrap a session cookie via the
+# tokenized URL from the runtime metadata). Recommended when other
+# local users share the machine.
+# [api]
+# require_auth = true
+
 # Add additional provider hosts when needed.
 # [[platforms]]
 # type = "gitlab"
@@ -871,6 +1056,11 @@ issues = true
 board = true
 reviews = true
 workspaces = true
+
+[notifications]
+sync_interval = "2m"
+propagation_interval = "1m"
+batch_size = 25
 
 [tmux]
 agent_sessions = true
@@ -989,6 +1179,15 @@ func load(path string) (*Config, error) {
 	if cfg.Activity.DefaultBranchMaxCommits == 0 {
 		cfg.Activity.DefaultBranchMaxCommits = defaultBranchActivityMaxCommits
 	}
+	if cfg.Notifications.SyncInterval == "" {
+		cfg.Notifications.SyncInterval = defaultNotificationSyncInterval
+	}
+	if cfg.Notifications.PropagationInterval == "" {
+		cfg.Notifications.PropagationInterval = defaultNotificationPropagationInterval
+	}
+	if cfg.Notifications.BatchSize == 0 {
+		cfg.Notifications.BatchSize = 25
+	}
 
 	if cfg.SyncBudgetPerHour == 0 {
 		cfg.SyncBudgetPerHour = defaultSyncBudgetPerHour
@@ -1049,6 +1248,12 @@ func (c *Config) Validate() error {
 // GitHub App installation coverage check for the CLI's repair path.
 func (c *Config) validate(skipAppCoverage bool) error {
 	var err error
+	if err := c.Fleet.Validate(); err != nil {
+		return err
+	}
+	if err := c.validateFleetSSHPeers(); err != nil {
+		return err
+	}
 	c.DefaultPlatformHost, err = normalizePlatformHost(
 		defaultPlatform, c.DefaultPlatformHost,
 	)
@@ -1136,11 +1341,38 @@ func (c *Config) validate(skipAppCoverage bool) error {
 	if _, err := time.ParseDuration(c.SyncInterval); err != nil {
 		return fmt.Errorf("config: invalid sync_interval %q: %w", c.SyncInterval, err)
 	}
+	if c.Notifications.SyncInterval == "" {
+		c.Notifications.SyncInterval = defaultNotificationSyncInterval
+	}
+	if c.Notifications.PropagationInterval == "" {
+		c.Notifications.PropagationInterval = defaultNotificationPropagationInterval
+	}
+	if c.Notifications.BatchSize == 0 {
+		c.Notifications.BatchSize = 25
+	}
+	if d, err := time.ParseDuration(c.Notifications.SyncInterval); err != nil {
+		return fmt.Errorf("config: invalid notifications.sync_interval %q: %w", c.Notifications.SyncInterval, err)
+	} else if d <= 0 {
+		return fmt.Errorf("config: notifications.sync_interval must be positive, got %q", c.Notifications.SyncInterval)
+	}
+	if d, err := time.ParseDuration(c.Notifications.PropagationInterval); err != nil {
+		return fmt.Errorf("config: invalid notifications.propagation_interval %q: %w", c.Notifications.PropagationInterval, err)
+	} else if d <= 0 {
+		return fmt.Errorf("config: notifications.propagation_interval must be positive, got %q", c.Notifications.PropagationInterval)
+	}
+	if c.Notifications.BatchSize < 1 || c.Notifications.BatchSize > 200 {
+		return fmt.Errorf("config: notifications.batch_size must be between 1 and 200, got %d", c.Notifications.BatchSize)
+	}
 
 	if ip := net.ParseIP(c.Host); ip == nil {
-		return fmt.Errorf("config: invalid host %q", c.Host)
-	} else if !ip.IsLoopback() {
-		return fmt.Errorf("config: host %q is not loopback; only loopback addresses are supported", c.Host)
+		return fmt.Errorf("config: invalid host %q (must be an IP address)", c.Host)
+	} else if ip.IsUnspecified() {
+		return fmt.Errorf(
+			"config: host %q is unspecified; bind a specific address"+
+				" (loopback, or one interface such as a tailnet IP) so"+
+				" the unauthenticated API is only exposed on a network"+
+				" you trust", c.Host,
+		)
 	}
 
 	if c.Port < 1 || c.Port > 65535 {
@@ -1308,6 +1540,54 @@ func (c *Config) validate(skipAppCoverage bool) error {
 		)
 	}
 
+	return nil
+}
+
+// Validate checks and canonicalizes the fleet section: peer keys must be
+// unique, non-empty, distinct from the local fleet key, and not shadow the
+// reserved self alias; base URLs must be absolute http(s); peer_timeout must
+// parse when set. Embedders that supply peers through Options share this
+// validation with the config-file path.
+func (f *Fleet) Validate() error {
+	const reservedSelfKey = "self"
+	f.Key = strings.TrimSpace(f.Key)
+	for i := range f.Peers {
+		f.Peers[i].Key = strings.TrimSpace(f.Peers[i].Key)
+	}
+	for i := range f.SSHPeers {
+		f.SSHPeers[i].Key = strings.TrimSpace(f.SSHPeers[i].Key)
+	}
+	if f.Key == reservedSelfKey {
+		return fmt.Errorf("fleet.key %q is reserved for local self routing", reservedSelfKey)
+	}
+	seenFleetPeers := map[string]bool{}
+	for i, p := range f.Peers {
+		if p.Key == "" {
+			return fmt.Errorf("fleet.peers[%d]: key is required", i)
+		}
+		if strings.TrimSpace(p.Key) == reservedSelfKey {
+			return fmt.Errorf("fleet.peers[%d]: key %q is reserved for local self routing", i, reservedSelfKey)
+		}
+		if seenFleetPeers[p.Key] {
+			return fmt.Errorf("fleet.peers: duplicate key %q", p.Key)
+		}
+		seenFleetPeers[p.Key] = true
+		if p.BaseURL == "" {
+			return fmt.Errorf("fleet.peers[%d]: base_url is required", i)
+		}
+		u, err := url.Parse(p.BaseURL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("fleet.peers[%d]: base_url must be an absolute http(s) URL, got %q", i, p.BaseURL)
+		}
+		if f.Key != "" && p.Key == f.Key {
+			return fmt.Errorf("fleet.peers[%d]: key %q collides with fleet.key", i, p.Key)
+		}
+	}
+	if f.PeerTimeout != "" {
+		if _, err := time.ParseDuration(f.PeerTimeout); err != nil {
+			return fmt.Errorf("fleet.peer_timeout %q: %w", f.PeerTimeout, err)
+		}
+	}
 	return nil
 }
 
@@ -1649,6 +1929,31 @@ func (c *Config) BranchActivityRetention() time.Duration {
 		return time.Duration(defaultBranchActivityRetentionDays) * 24 * time.Hour
 	}
 	return time.Duration(c.Activity.DefaultBranchRetentionDays) * 24 * time.Hour
+}
+
+// NotificationsEnabled reports whether notification sync and the
+// notification API are active. Notifications are a built-in capability with
+// no enable/disable setting; the only "off" state is the absence of any
+// loaded config (nil), which the callers use for nil-safety.
+func (c *Config) NotificationsEnabled() bool {
+	return c != nil
+}
+
+func (c *Config) NotificationSyncDuration() time.Duration {
+	d, _ := time.ParseDuration(c.Notifications.SyncInterval)
+	return d
+}
+
+func (c *Config) NotificationPropagationDuration() time.Duration {
+	d, _ := time.ParseDuration(c.Notifications.PropagationInterval)
+	return d
+}
+
+func (c *Config) NotificationBatchSize() int {
+	if c.Notifications.BatchSize <= 0 {
+		return 25
+	}
+	return c.Notifications.BatchSize
 }
 
 func (c *Config) GitHubToken() string {
@@ -2052,7 +2357,7 @@ func (c *Config) BudgetPerHour() int {
 }
 
 func (c *Config) ListenAddr() string {
-	return fmt.Sprintf("%s:%d", c.Host, c.Port)
+	return net.JoinHostPort(c.Host, strconv.Itoa(c.Port))
 }
 
 // BindHostKey returns the canonical (Host, Port) key for the bind
@@ -2165,6 +2470,7 @@ type configFile struct {
 	Platforms                 []PlatformConfig  `toml:"platforms,omitempty"`
 	GitHubApps                []GitHubAppConfig `toml:"github_apps,omitempty"`
 	Activity                  Activity          `toml:"activity"`
+	Notifications             Notifications     `toml:"notifications,omitempty"`
 	Terminal                  Terminal          `toml:"terminal,omitempty"`
 	Modes                     ModeVisibility    `toml:"modes,omitempty"`
 	Agents                    []Agent           `toml:"agents,omitempty"`
@@ -2173,6 +2479,8 @@ type configFile struct {
 	Msgvault                  *Msgvault         `toml:"msgvault,omitempty"`
 	Tmux                      Tmux              `toml:"tmux,omitempty"`
 	Shell                     Shell             `toml:"shell,omitempty"`
+	Fleet                     Fleet             `toml:"fleet,omitempty"`
+	API                       API               `toml:"api,omitempty"`
 }
 
 // Save writes the current config to the given path.
@@ -2193,6 +2501,7 @@ func (c *Config) Save(path string) error {
 		Platforms:           cfg.Platforms,
 		GitHubApps:          cfg.GitHubApps,
 		Activity:            cfg.Activity,
+		Notifications:       cfg.Notifications,
 		Terminal:            cfg.Terminal,
 		Modes:               cfg.Modes,
 		Agents:              cfg.Agents,
@@ -2201,6 +2510,8 @@ func (c *Config) Save(path string) error {
 		Msgvault:            cfg.Msgvault,
 		Tmux:                cfg.Tmux,
 		Shell:               cfg.Shell,
+		Fleet:               cfg.Fleet,
+		API:                 cfg.API,
 	}
 	if cfg.DefaultPlatformHost == defaultPlatformHost {
 		f.DefaultPlatformHost = ""

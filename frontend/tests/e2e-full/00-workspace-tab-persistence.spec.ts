@@ -5,7 +5,14 @@
 import { execFileSync } from "node:child_process";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { expect, request as playwrightRequest, test, type APIRequestContext } from "@playwright/test";
+import {
+  expect,
+  request as playwrightRequest,
+  test,
+  type APIRequestContext,
+  type Locator,
+  type Page,
+} from "@playwright/test";
 import { startIsolatedWorkspaceE2EServer, type IsolatedE2EServer } from "./support/e2eServer";
 
 type WorkspaceStatusResponse = {
@@ -24,6 +31,10 @@ function hasCommand(command: string, args: string[] = ["--version"]): boolean {
   } catch {
     return false;
   }
+}
+
+function runGit(worktreePath: string, args: string[]): void {
+  execFileSync("git", args, { cwd: worktreePath, stdio: "ignore" });
 }
 
 async function waitForWorkspaceReady(api: APIRequestContext, workspaceId: string): Promise<void> {
@@ -53,13 +64,57 @@ async function createIssueWorkspace(api: APIRequestContext, issueNumber: number)
   return createdWorkspace;
 }
 
+async function clickPierreExpander(file: Locator, separatorIndex: number): Promise<void> {
+  const expander = file
+    .locator(".pierre-diff [data-separator][data-expand-index]")
+    .filter({ visible: true })
+    .nth(separatorIndex)
+    .locator("[data-expand-button]")
+    .filter({ visible: true })
+    .first();
+  await expect(expander).toBeVisible();
+  await expander.evaluate((button: HTMLElement) => {
+    button.dispatchEvent(
+      new MouseEvent("click", {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        shiftKey: true,
+      }),
+    );
+  });
+}
+
+async function expandedContextStats(file: Locator): Promise<{ blank: number; texts: string[] }> {
+  return await file.locator(".pierre-diff").evaluate((host) => {
+    const rows = Array.from(
+      host.shadowRoot?.querySelectorAll("[data-content] [data-line-type='context-expanded']") ?? [],
+    ).map((element) => element.textContent?.trim() ?? "");
+    return {
+      blank: rows.filter((text) => text.length === 0).length,
+      texts: rows.filter((text) => text.length > 0),
+    };
+  });
+}
+
+async function pierreDiffText(file: Locator): Promise<string> {
+  return await file.locator(".pierre-diff").evaluate((host) => host.shadowRoot?.textContent ?? "");
+}
+
+async function openTerminalWorkflowTab(page: Page): Promise<void> {
+  const terminalPanel = page.getByRole("region", { name: "Terminal panel" });
+  await terminalPanel.getByRole("button", { name: "New terminal" }).click();
+  await expect(terminalPanel.getByRole("button", { name: "Move terminal panel to workflow" })).toBeVisible();
+  await terminalPanel.getByRole("button", { name: "Move terminal panel to workflow" }).click();
+}
+
 test.describe("workspace tab persistence", () => {
   test.describe.configure({
     mode: "serial",
     timeout: lockedWorkspaceTestTimeoutMs,
   });
 
-  test("opening shell tab keeps Home pane mounted across tab switches", async ({ page }) => {
+  test("opening terminal tab keeps Home pane mounted across tab switches", async ({ page }) => {
     test.skip(
       !hasCommand("git") || !hasCommand("tmux", ["-V"]),
       "git and tmux are required for the real workspace flow",
@@ -85,41 +140,39 @@ test.describe("workspace tab persistence", () => {
       const workflow = page.getByRole("region", { name: "Workflow panes" });
       const panes = workflow.locator(".tabbed-panel-tab-panel");
       const homeTab = workflow.getByRole("tab", { name: "Home" });
-      const tmuxTab = workflow.getByRole("tab", { name: "Shell" });
+      const terminalTab = workflow.getByRole("tab", { name: "Terminal" });
 
       // Initial state: only the Home pane is in the stage.
       await expect(homeTab).toHaveAttribute("aria-selected", "true");
       await expect(panes).toHaveCount(1);
 
-      // Open the shell tab. It is backed by tmux when available and is
-      // available because tmux is a built-in launch target.
-      await workflow.getByRole("button", { name: "Shell" }).click();
+      await openTerminalWorkflowTab(page);
 
-      // After opening Shell, both Home and Shell panes should be in
-      // the DOM, with Shell marked active.
+      // After opening Terminal, both Home and Terminal panes should be
+      // in the DOM, with Terminal marked active.
       await expect(panes).toHaveCount(2);
-      await expect(tmuxTab).toHaveAttribute("aria-selected", "true");
-      const tmuxPane = workflow.locator(".tabbed-panel-tab-panel.active");
-      await expect(tmuxPane).toHaveCount(1);
+      await expect(terminalTab).toHaveAttribute("aria-selected", "true");
+      const terminalPane = workflow.locator(".tabbed-panel-tab-panel.active");
+      await expect(terminalPane).toHaveCount(1);
 
-      // Mark the shell pane so we can later confirm it's the same
+      // Mark the terminal pane so we can later confirm it's the same
       // DOM element rather than a fresh remount.
-      await tmuxPane.evaluate((el) => {
-        el.setAttribute("data-test-tmux-id", "preserved");
+      await terminalPane.evaluate((el) => {
+        el.setAttribute("data-test-terminal-id", "preserved");
       });
 
-      // Switch to Home: shell pane must remain mounted.
+      // Switch to Home: terminal pane must remain mounted.
       await homeTab.click();
       await expect(homeTab).toHaveAttribute("aria-selected", "true");
       await expect(panes).toHaveCount(2);
-      await expect(workflow.locator('.tabbed-panel-tab-panel[data-test-tmux-id="preserved"]')).toHaveCount(1);
+      await expect(workflow.locator('.tabbed-panel-tab-panel[data-test-terminal-id="preserved"]')).toHaveCount(1);
 
-      // Switch back to Shell: must be the same DOM element, not a
+      // Switch back to Terminal: must be the same DOM element, not a
       // freshly mounted one.
-      await tmuxTab.click();
+      await terminalTab.click();
       await expect(panes).toHaveCount(2);
       const reactivated = workflow.locator(".tabbed-panel-tab-panel.active");
-      await expect(reactivated).toHaveAttribute("data-test-tmux-id", "preserved");
+      await expect(reactivated).toHaveAttribute("data-test-terminal-id", "preserved");
     } finally {
       await api?.dispose();
       await isolatedServer?.stop();
@@ -149,18 +202,18 @@ test.describe("workspace tab persistence", () => {
         name: "Workflow panes",
       });
       const homeTab = workflow.getByRole("tab", { name: "Home" });
-      const tmuxTab = workflow.getByRole("tab", { name: "Shell" });
+      const terminalTab = workflow.getByRole("tab", { name: "Terminal" });
 
       await expect(homeTab).toHaveAttribute("aria-selected", "true");
 
-      await workflow.getByRole("button", { name: "Shell" }).click();
-      await expect(tmuxTab).toHaveAttribute("aria-selected", "true");
+      await openTerminalWorkflowTab(page);
+      await expect(terminalTab).toHaveAttribute("aria-selected", "true");
 
       await page.goto(`${isolatedServer.info.base_url}/terminal/${secondWorkspace.id}`);
       await expect(homeTab).toHaveAttribute("aria-selected", "true");
 
       await page.goto(`${isolatedServer.info.base_url}/terminal/${firstWorkspace.id}`);
-      await expect(tmuxTab).toHaveAttribute("aria-selected", "true");
+      await expect(terminalTab).toHaveAttribute("aria-selected", "true");
     } finally {
       await api?.dispose();
       await isolatedServer?.stop();
@@ -336,8 +389,8 @@ test.describe("workspace tab persistence", () => {
       await expect(panes).toHaveCount(1);
       await expect(homeTab).toHaveAttribute("aria-selected", "true");
 
-      await workflow.getByRole("button", { name: "Shell" }).click();
-      await expect(workflow.getByRole("tab", { name: "Shell" })).toHaveAttribute("aria-selected", "true");
+      await openTerminalWorkflowTab(page);
+      await expect(workflow.getByRole("tab", { name: "Terminal" })).toHaveAttribute("aria-selected", "true");
       await expect(page.locator(".right-sidebar .workspace-diff")).toBeVisible();
       await expect(panes).toHaveCount(2);
 
@@ -346,8 +399,156 @@ test.describe("workspace tab persistence", () => {
         await page.keyboard.press(key);
       }
       await expect(page).toHaveURL(new RegExp(`/terminal/${workspace.id}$`));
-      await expect(workflow.getByRole("tab", { name: "Shell" })).toHaveAttribute("aria-selected", "true");
+      await expect(workflow.getByRole("tab", { name: "Terminal" })).toHaveAttribute("aria-selected", "true");
       await expect(alphaDiffFile).toBeVisible();
+    } finally {
+      await api?.dispose();
+      await isolatedServer?.stop();
+    }
+  });
+
+  test("workspace diff context expansion renders text from the real preview API", async ({ page }) => {
+    test.skip(
+      !hasCommand("git") || !hasCommand("tmux", ["-V"]),
+      "git and tmux are required for the real workspace flow",
+    );
+    await page.setViewportSize({ width: 1400, height: 860 });
+
+    let isolatedServer: IsolatedE2EServer | null = null;
+    let api: APIRequestContext | null = null;
+    try {
+      isolatedServer = await startIsolatedWorkspaceE2EServer();
+      api = await playwrightRequest.newContext({
+        baseURL: isolatedServer.info.base_url,
+      });
+
+      const workspace = await createIssueWorkspace(api, 12);
+      const workspaceResponse = await api.get(`/api/v1/workspaces/${workspace.id}`);
+      expect(workspaceResponse.ok()).toBe(true);
+      const workspaceDetail = (await workspaceResponse.json()) as WorkspaceStatusResponse;
+      expect(workspaceDetail.worktree_path).toBeTruthy();
+      const worktreePath = workspaceDetail.worktree_path!;
+
+      runGit(worktreePath, ["config", "user.email", "test@test.com"]);
+      runGit(worktreePath, ["config", "user.name", "Test"]);
+      const baseLines = Array.from({ length: 120 }, (_, index) => `workspace hidden line ${index + 1}`);
+      await writeFile(join(worktreePath, "expand-context.ts"), `${baseLines.join("\n")}\n`);
+      runGit(worktreePath, ["add", "expand-context.ts"]);
+      runGit(worktreePath, ["commit", "-m", "add expandable context fixture"]);
+      const changedLines = [...baseLines];
+      changedLines[9] = "workspace changed line 10";
+      changedLines[89] = "workspace changed line 90";
+      await writeFile(join(worktreePath, "expand-context.ts"), `${changedLines.join("\n")}\n`);
+
+      await page.goto(`${isolatedServer.info.base_url}/terminal/${workspace.id}`);
+      await page.locator(".seg-control .seg-btn", { hasText: "Diff" }).click();
+      const previewResponses = Promise.all([
+        page.waitForResponse((response) => {
+          const url = response.url();
+          return (
+            response.request().method() === "GET" &&
+            url.includes(`/api/v1/workspaces/${workspace.id}/file-preview`) &&
+            url.includes("path=expand-context.ts") &&
+            url.includes("side=old")
+          );
+        }),
+        page.waitForResponse((response) => {
+          const url = response.url();
+          return (
+            response.request().method() === "GET" &&
+            url.includes(`/api/v1/workspaces/${workspace.id}/file-preview`) &&
+            url.includes("path=expand-context.ts") &&
+            url.includes("side=new")
+          );
+        }),
+      ]);
+
+      const file = page.locator('.right-sidebar .diff-file[data-file-path="expand-context.ts"]');
+      await expect(file).toBeVisible();
+      await expect
+        .poll(async () => {
+          return await file.locator(".pierre-diff").evaluate((host) => {
+            return host.shadowRoot?.querySelectorAll("[data-separator][data-expand-index]").length ?? 0;
+          });
+        })
+        .toBeGreaterThanOrEqual(2);
+      await clickPierreExpander(file, 1);
+      const responses = await previewResponses;
+      expect(responses.every((response) => response.ok())).toBe(true);
+
+      await expect
+        .poll(async () => {
+          const stats = await expandedContextStats(file);
+          return {
+            blank: stats.blank,
+            hasMiddleLine: stats.texts.some((text) => text.includes("workspace hidden line 50")),
+          };
+        })
+        .toEqual({
+          blank: 0,
+          hasMiddleLine: true,
+        });
+
+      const refreshedLines = [...changedLines];
+      refreshedLines[49] = "workspace refreshed hidden line 50";
+      await writeFile(join(worktreePath, "expand-context.ts"), `${refreshedLines.join("\n")}\n`);
+
+      const refreshResponse = page.waitForResponse((response) => {
+        return (
+          response.request().method() === "POST" &&
+          response.url().includes(`/api/v1/workspaces/${workspace.id}/refresh`)
+        );
+      });
+      await page.getByRole("button", { name: "Refresh workspace details" }).click();
+      expect((await refreshResponse).ok()).toBe(true);
+      await expect
+        .poll(async () => (await pierreDiffText(file)).includes("workspace refreshed hidden line 50"))
+        .toBe(true);
+
+      const refreshedPreviewResponses = Promise.all([
+        page.waitForResponse((response) => {
+          const url = response.url();
+          return (
+            response.request().method() === "GET" &&
+            url.includes(`/api/v1/workspaces/${workspace.id}/file-preview`) &&
+            url.includes("path=expand-context.ts") &&
+            url.includes("side=old")
+          );
+        }),
+        page.waitForResponse((response) => {
+          const url = response.url();
+          return (
+            response.request().method() === "GET" &&
+            url.includes(`/api/v1/workspaces/${workspace.id}/file-preview`) &&
+            url.includes("path=expand-context.ts") &&
+            url.includes("side=new")
+          );
+        }),
+      ]);
+      await expect
+        .poll(async () => {
+          return await file.locator(".pierre-diff").evaluate((host) => {
+            return host.shadowRoot?.querySelectorAll("[data-separator][data-expand-index]").length ?? 0;
+          });
+        })
+        .toBeGreaterThanOrEqual(3);
+      await clickPierreExpander(file, 1);
+      const refreshedResponses = await refreshedPreviewResponses;
+      expect(refreshedResponses.every((response) => response.ok())).toBe(true);
+      await expect
+        .poll(async () => {
+          const stats = await expandedContextStats(file);
+          return {
+            blank: stats.blank,
+            hasStaleHiddenLine: stats.texts.some((text) => text.includes("workspace hidden line 50")),
+            hasUnchangedContext: stats.texts.some((text) => text.includes("workspace hidden line 40")),
+          };
+        })
+        .toEqual({
+          blank: 0,
+          hasStaleHiddenLine: false,
+          hasUnchangedContext: true,
+        });
     } finally {
       await api?.dispose();
       await isolatedServer?.stop();

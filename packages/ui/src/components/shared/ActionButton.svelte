@@ -13,6 +13,7 @@
     disabled?: boolean;
     title?: string | undefined;
     ariaLabel?: string | undefined;
+    ariaDescribedby?: string | undefined;
     label?: string;
     shortLabel?: string;
     ariaExpanded?: boolean;
@@ -30,6 +31,7 @@
     disabled = false,
     title = undefined,
     ariaLabel = undefined,
+    ariaDescribedby = undefined,
     label = undefined,
     shortLabel = undefined,
     ariaExpanded = undefined,
@@ -57,6 +59,7 @@
   {title}
   aria-expanded={ariaExpanded}
   aria-label={ariaLabel ?? (label && shortLabel ? label : undefined)}
+  aria-describedby={ariaDescribedby}
   onclick={onclick}
 >
   {#if children}
@@ -178,6 +181,25 @@
   .action-button--solid.action-button--success[aria-expanded="true"] {
     background: #145c27;
     border-color: #145c27;
+  }
+
+  /* Info solid — primary submit / save */
+  .action-button--solid.action-button--info {
+    background: var(--accent-blue);
+    color: #fff;
+    border: 1px solid var(--accent-blue);
+  }
+  .action-button--solid.action-button--info:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--accent-blue) 88%, #000);
+    border-color: color-mix(in srgb, var(--accent-blue) 88%, #000);
+  }
+  .action-button--solid.action-button--info:focus-visible {
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent-blue) 42%, transparent);
+  }
+  .action-button--solid.action-button--info:active:not(:disabled),
+  .action-button--solid.action-button--info[aria-expanded="true"] {
+    background: color-mix(in srgb, var(--accent-blue) 78%, #000);
+    border-color: color-mix(in srgb, var(--accent-blue) 78%, #000);
   }
 
   /* Success soft — approve */

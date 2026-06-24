@@ -30,6 +30,14 @@ function defaultHost(provider: string): string | undefined {
   return defaultHosts[provider.toLowerCase()];
 }
 
+// providerDefaultHost resolves the platform host for a provider when a
+// route or payload omits it (provider-default routes like
+// /pulls/github/...). Consumers comparing refs against API objects need
+// the concrete host, since the API models platform_host as required.
+export function providerDefaultHost(provider: string): string | undefined {
+  return defaultHost(canonicalProvider(provider));
+}
+
 function shouldUseHostRoute(ref: ProviderRouteRef): boolean {
   const provider = canonicalProvider(ref.provider);
   const host = ref.platformHost?.trim();
@@ -63,6 +71,7 @@ type PullSuffix =
   | "/import-metadata"
   | "/labels"
   | "/merge"
+  | "/merge/deferred"
   | "/ready-for-review"
   | "/reviewers"
   | "/discussions/{discussion_id}/reply"
@@ -107,7 +116,14 @@ export function providerItemPath(kind: "pulls" | "issues", ref: ProviderRouteRef
   return `/${kind}/{provider}/{owner}/{name}/{number}${suffix}`;
 }
 
-type RepoSuffix = "" | "/comment-autocomplete" | "/commits/{sha}/diff" | "/labels" | "/refresh" | "/resolve/{number}";
+type RepoSuffix =
+  | ""
+  | "/comment-autocomplete"
+  | "/commits/{sha}/diff"
+  | "/labels"
+  | "/refresh"
+  | "/worktree-base"
+  | "/resolve/{number}";
 
 type RepoPath<S extends RepoSuffix> =
   | `/repo/{provider}/{owner}/{name}${S}`

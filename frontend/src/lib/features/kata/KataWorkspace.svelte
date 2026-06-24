@@ -114,6 +114,9 @@
       daemonInfos.find((daemon) => daemon.default)?.id ??
       daemonInfos[0]?.id,
   );
+  const listStatusFilter = $derived<KataTaskSearchFilters["status"]>(
+    store.currentView.name === "logbook" ? "all" : store.searchFilters.status,
+  );
   const eventStream = createKataEventStreamController({
     getDaemonId: () => activeKataDaemonId,
     getLastEventID: () => store.eventCursor,
@@ -414,6 +417,11 @@
     return store.currentView.groups.flatMap((group) => group.issues);
   }
 
+  function selectedIssueMatchesStatusFilter(status: KataTaskSearchFilters["status"]): boolean {
+    const selected = store.selectedIssue?.issue;
+    return !selected || status === "all" || selected.status === status;
+  }
+
   function loadLayoutPrefs(): void {
     if (typeof window === "undefined") return;
     try {
@@ -472,10 +480,14 @@
 
   async function updateSearchFilters(filters: Partial<KataTaskSearchFilters>): Promise<void> {
     const generation = beginNavigation();
+    const nextStatus = filters.status ?? store.searchFilters.status;
     resetDetailDrafts();
     // Same rationale as openRoutedProjectScope: a pending detail load is
     // abandoned by the filter reload, so drop it before awaiting.
     store.invalidatePendingLoads();
+    if (!selectedIssueMatchesStatusFilter(nextStatus)) {
+      store.clearSelection();
+    }
     await runViewTask(() => store.updateSearchFilters(filters));
     if (!isCurrentNavigation(generation)) return;
     const nextScopeUID = scopeUIDFromFilters(store.searchFilters);
@@ -826,6 +838,7 @@
         scopedProjectName={selectedProjectName()}
         selectedIssueUID={store.pendingSelectionUID ?? store.selectedIssue?.issue.uid ?? null}
         loading={viewLoading}
+        statusFilter={listStatusFilter}
         resetGeneration={listResetGeneration}
         navigationGeneration={navigationEpoch}
         api={store.api}

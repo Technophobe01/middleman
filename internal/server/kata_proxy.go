@@ -199,6 +199,9 @@ func newKataDaemonProxyEntry(d kata.Daemon) (kataProxyCacheEntry, error) {
 			pr.Out.Header.Del(kataDaemonHeaderName)
 			if d.Local {
 				pr.Out.Header.Del("Authorization")
+				if token := kataDaemonForwardToken(d); token != "" {
+					pr.Out.Header.Set("Authorization", "Bearer "+token)
+				}
 				return
 			}
 			if token := kataDaemonForwardToken(d); token != "" && pr.Out.Header.Get("Authorization") == "" {
@@ -304,10 +307,4 @@ func newDefaultKataDaemonTransport() http.RoundTripper {
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	}).Clone()
-}
-
-func writeProblemResponse(w http.ResponseWriter, p *ProblemError) {
-	w.Header().Set("Content-Type", "application/problem+json")
-	w.WriteHeader(p.Status)
-	_ = json.NewEncoder(w).Encode(p)
 }

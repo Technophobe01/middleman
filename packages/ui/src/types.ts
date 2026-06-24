@@ -27,7 +27,7 @@ export interface ActionRegistry {
 export interface NavigateEvent {
   path: string;
   route: {
-    page: "pulls" | "issues" | "activity" | "diff" | "board" | "reviews";
+    page: "pulls" | "issues" | "activity" | "diff" | "board" | "reviews" | "inbox";
     view?: string;
     tab?: string;
     presentation?: "fullLayout" | "focus";
@@ -88,6 +88,7 @@ export type { SyncStore } from "./stores/sync.svelte.js";
 export type { DiffStore } from "./stores/diff.svelte.js";
 export type { DiffReviewDraftStore } from "./stores/diff-review-draft.svelte.js";
 export type { GroupingStore } from "./stores/grouping.svelte.js";
+export type { DetailActivityViewStore } from "./stores/detail-activity-view.svelte.js";
 export type { CollapsedReposStore } from "./stores/collapsedRepos.svelte.js";
 export type { SettingsStore } from "./stores/settings.svelte.js";
 export type { EventsStore } from "./stores/events.svelte.js";
@@ -104,6 +105,7 @@ import type { SyncStore } from "./stores/sync.svelte.js";
 import type { DiffStore } from "./stores/diff.svelte.js";
 import type { DiffReviewDraftStore } from "./stores/diff-review-draft.svelte.js";
 import type { GroupingStore } from "./stores/grouping.svelte.js";
+import type { DetailActivityViewStore } from "./stores/detail-activity-view.svelte.js";
 import type { CollapsedReposStore } from "./stores/collapsedRepos.svelte.js";
 import type { SettingsStore } from "./stores/settings.svelte.js";
 import type { EventsStore } from "./stores/events.svelte.js";
@@ -121,6 +123,7 @@ export interface StoreInstances {
   diff: DiffStore;
   diffReviewDraft: DiffReviewDraftStore;
   grouping: GroupingStore;
+  detailActivityView: DetailActivityViewStore;
   collapsedRepos: CollapsedReposStore;
   settings: SettingsStore;
   events: EventsStore;

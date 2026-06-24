@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/danielgtaylor/huma/v2"
@@ -36,32 +37,6 @@ import (
 
 const middlemanCSRFHeaderName = "X-Middleman-Csrf"
 
-type EmbedConfig struct {
-	Theme *ThemeConfig `json:"theme,omitempty"`
-	UI    *UIConfig    `json:"ui,omitempty"`
-}
-
-type ThemeConfig struct {
-	Mode   string            `json:"mode,omitempty"`
-	Colors map[string]string `json:"colors,omitempty"`
-	Fonts  map[string]string `json:"fonts,omitempty"`
-	Radii  map[string]string `json:"radii,omitempty"`
-}
-
-type UIConfig struct {
-	HideSync          *bool    `json:"hideSync,omitempty"`
-	HideRepoSelector  *bool    `json:"hideRepoSelector,omitempty"`
-	HideStar          *bool    `json:"hideStar,omitempty"`
-	SidebarCollapsed  *bool    `json:"sidebarCollapsed,omitempty"`
-	Repo              *RepoRef `json:"repo,omitempty"`
-	ActiveWorktreeKey string   `json:"activeWorktreeKey,omitempty"`
-}
-
-type RepoRef struct {
-	Owner string `json:"owner"`
-	Name  string `json:"name"`
-}
-
 type versionOutputBody struct {
 	Version string `json:"version"`
 }
@@ -69,7 +44,11 @@ type versionOutputBody struct {
 type versionOutput = bodyOutput[versionOutputBody]
 
 type ServerOptions struct {
-	EmbedConfig                        *EmbedConfig
+	// APIAuthToken, when non-empty, gates /api routes behind bearer
+	// or session-cookie auth (see api_auth.go). Health probes stay
+	// open. Minted under data_dir by the serve entrypoint when
+	// [api].require_auth is set.
+	APIAuthToken                       string
 	Clones                             *gitclone.Manager // optional clone manager for diff view
 	WorktreeDir                        string            // base dir for workspace worktrees
 	DisableWorkspaceBackgroundMonitors bool
@@ -92,6 +71,7 @@ type ServerOptions struct {
 	// Use this for httptest-style listeners on ephemeral ports.
 	HostCheckAllowLoopbackAnyPort bool
 	msgvaultRemoteImageDeps       *msgvaultRemoteImageDeps
+	deferredMergeMaxWait          time.Duration
 }
 
 type shutdownDeadline struct {
@@ -158,7 +138,12 @@ type Server struct {
 	workspacePRMonitor          *workspace.PRMonitor
 	workspacePushedHeadObserver *workspace.PushedHeadObserver
 	tmuxActivity                *tmuxActivityTracker
+	fleetTmuxMonitor            *fleetTmuxMonitor
+	fleetWorktreeDiscoverer     *fleetWorktreeDiscoverer
+	fleetWorktreeStatsSampler   *fleetWorktreeStatsSampler
+	fleetPlatformAuthMonitor    *fleetPlatformAuthMonitor
 	runtime                     *localruntime.Manager
+	tmuxCmd                     []string
 	telemetry                   telemetry.Client
 	cfg                         *config.Config
 	cfgPath                     string
@@ -169,14 +154,17 @@ type Server struct {
 	// bound at startup (registry, listeners, clone manager, etc.) so a
 	// config-file watcher reload can detect when those changed and
 	// surface restart_required to the UI without ever mutating them.
-	bootCfgSnapshot        startupConfigSnapshot
-	runtimeStripEnvVars    []string
-	configWatcher          *configwatch.Watcher
-	basePath               string
-	options                ServerOptions
-	allowedHostMu          sync.RWMutex
-	allowedHosts           map[string]struct{}
-	hostOpts               HostCheckOptions
+	bootCfgSnapshot     startupConfigSnapshot
+	runtimeStripEnvVars []string
+	configWatcher       *configwatch.Watcher
+	basePath            string
+	options             ServerOptions
+	allowedHostMu       sync.RWMutex
+	allowedHosts        map[string]struct{}
+	// hostOpts is atomic: Serve repoints an ephemeral (port-0) bind
+	// at the kernel-assigned port while requests may already be
+	// reading the options.
+	hostOpts               atomic.Pointer[HostCheckOptions]
 	version                string
 	now                    func() time.Time
 	handler                http.Handler
@@ -188,6 +176,9 @@ type Server struct {
 	labelCatalogRefreshIDs map[int64]struct{}
 	detailSyncMu           sync.Mutex
 	detailSyncInFlight     map[string]struct{}
+	deferredMergeMu        sync.Mutex
+	deferredMergeInFlight  map[string]struct{}
+	deferredMergeMaxWait   time.Duration
 	writeCredProbeMu       sync.Mutex
 	writeCredProbes        map[string]writeCredentialProbe
 	writeCredProbeInFlight map[string]chan struct{}
@@ -200,6 +191,18 @@ type Server struct {
 	docsRegistry           *docs.Registry
 	docsPublishLocks       *docsPublishLockSet
 	msgvault               *msgvaultHandler
+
+	// toolingStatus caches the assembled CLI tooling probe;
+	// toolingRun overrides the probe subprocess runner in tests.
+	toolingStatus toolingStatusCache
+	toolingRun    toolingRunner
+
+	// apiAuthToken gates /api routes when non-empty (api_auth.go).
+	apiAuthToken string
+
+	// sshFleet relays API exchanges to fleet peers reached over
+	// ssh(1); nil when no ssh peers are configured (fleet_ssh.go).
+	sshFleet *sshFleetTransport
 
 	// bg tracks short-lived goroutines that HTTP handlers spawn
 	// outside of the Syncer's own wait group (e.g. mergePR's
@@ -420,6 +423,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 	if first && s.runtime != nil {
 		s.runtime.Shutdown()
+	}
+	if first {
+		s.sshFleet.shutdown()
 	}
 
 	var httpErr error
@@ -663,6 +669,10 @@ func newServer(
 		options.HostCheck,
 		options.HostCheckAllowLoopbackAnyPort,
 	)
+	deferredMergeMaxWait := options.deferredMergeMaxWait
+	if deferredMergeMaxWait <= 0 {
+		deferredMergeMaxWait = defaultDeferredMergeMaxWait
+	}
 
 	s := &Server{
 		db:                     database,
@@ -676,11 +686,12 @@ func newServer(
 		bootCfgSnapshot:        snapshotStartupConfig(cfg),
 		runtimeStripEnvVars:    initialRuntimeStripEnvNames(cfg),
 		options:                options,
-		hostOpts:               hostOpts,
+		apiAuthToken:           options.APIAuthToken,
 		now:                    time.Now,
 		hub:                    NewEventHubWithCapacity(cfg.SSEBufferSizeOrDefault()),
 		tmuxActivity:           newTmuxActivityTracker(nil),
 		labelCatalogRefreshIDs: make(map[int64]struct{}),
+		deferredMergeMaxWait:   deferredMergeMaxWait,
 		docsPublishLocks:       newDocsPublishLockSet(),
 		msgvault:               newMsgvaultHandler(cfg, basePath, options.msgvaultRemoteImageDeps),
 		bgCtx: shutdownAwareContext{
@@ -697,6 +708,7 @@ func newServer(
 	s.docsRegistry = docs.NewRegistry(docFolders)
 	warnDocFolderDaemonBindings(docFolders)
 
+	s.hostOpts.Store(&hostOpts)
 	if hostOpts.TrustReverseProxy && len(hostOpts.Allowed) == 0 {
 		slog.Warn(
 			"trust_reverse_proxy is enabled but allowed_hosts is empty; only loopback Hosts will be accepted",
@@ -708,15 +720,43 @@ func newServer(
 	// terminal handler all share the same value and the nil-safety
 	// of the call is explicit at this level.
 	tmuxCmd := cfg.TmuxCommand()
+	s.tmuxCmd = tmuxCmd
+	hideTmuxStatus := false
+	if cfg != nil {
+		hideTmuxStatus = cfg.Terminal.HideTmuxStatus
+	}
 	tmuxAvailable := tmuxCommandAvailable(tmuxCmd)
+	includeUnmanagedTmuxDetails := false
+	if cfg != nil {
+		includeUnmanagedTmuxDetails = cfg.Fleet.Sessions.IncludeUnmanagedDetails
+	}
+	s.fleetTmuxMonitor = newFleetTmuxMonitor(
+		tmuxCmd, includeUnmanagedTmuxDetails, nil,
+	)
+	s.fleetWorktreeDiscoverer = newFleetWorktreeDiscoverer(database)
+	s.fleetWorktreeStatsSampler = newFleetWorktreeStatsSampler(
+		database, s.notifyWorktreeStatsChanged,
+	)
+	s.fleetPlatformAuthMonitor = newFleetPlatformAuthMonitor(
+		s.snapshotPlatformAuthConfig,
+	)
+	if cfg != nil && len(cfg.Fleet.SSHPeers) > 0 && cfg.DataDir != "" {
+		s.sshFleet = newSSHFleetTransport(
+			filepath.Join(cfg.DataDir, "ssh-sockets"),
+			cfg.Fleet.SSHPeers,
+			s.hub,
+		)
+	}
 	if options.WorktreeDir != "" {
 		s.workspaces = workspace.NewManager(database, options.WorktreeDir)
 		s.workspacePRMonitor = workspace.NewPRMonitor(database)
 		s.workspacePushedHeadObserver = workspace.NewPushedHeadObserver(database)
 		s.workspaces.SetTmuxCommand(tmuxCmd)
+		s.workspaces.SetHideTmuxStatus(hideTmuxStatus)
 		s.workspaces.SetIssueBranchSlugEnabled(
 			cfg.IssueWorkspaceBranchSlugEnabled(),
 		)
+		s.workspaces.SetWorktreeBasePathResolver(s.worktreeBasePathForRepo)
 		ptyOwnerDir := options.PtyOwnerDir
 		if ptyOwnerDir == "" {
 			ptyOwnerDir = filepath.Join(
@@ -767,6 +807,7 @@ func newServer(
 			TmuxCommand:              tmuxCmd,
 			TmuxOwnerMarker:          s.workspaces.TmuxOwnerMarker(),
 			WrapAgentSessionsInTmux:  cfg.TmuxAgentSessionsEnabled(),
+			HideTmuxStatus:           hideTmuxStatus,
 			StripEnvVars:             s.runtimeStripEnvVars,
 			ShellCommand:             cfg.ShellCommand(),
 			OnSessionExit:            s.handleRuntimeSessionExit,
@@ -781,6 +822,18 @@ func newServer(
 	if s.workspaces != nil && !options.DisableWorkspaceBackgroundMonitors {
 		s.runBackground(s.runWorkspacePRMonitorLoop)
 		s.runBackground(s.runWorkspacePushedHeadObserverLoop)
+	}
+	if s.workspaces != nil && tmuxAvailable && s.fleetTmuxMonitor != nil {
+		s.runBackground(s.fleetTmuxMonitor.run)
+	}
+	if s.fleetWorktreeDiscoverer != nil && !options.DisableWorkspaceBackgroundMonitors {
+		s.runBackground(s.fleetWorktreeDiscoverer.run)
+	}
+	if s.fleetWorktreeStatsSampler != nil && !options.DisableWorkspaceBackgroundMonitors {
+		s.runBackground(s.fleetWorktreeStatsSampler.run)
+	}
+	if s.fleetPlatformAuthMonitor != nil && !options.DisableWorkspaceBackgroundMonitors {
+		s.runBackground(s.fleetPlatformAuthMonitor.run)
 	}
 
 	// Watch the config file so an external edit (vim, dotfiles deploy,
@@ -889,6 +942,57 @@ func (s *Server) restoreRuntimeSessions(ctx context.Context) error {
 }
 
 func (s *Server) handleRuntimeSessionExit(info localruntime.SessionInfo) {
+	if info.WorkspaceID == hostRuntimeScope {
+		if s.db == nil || info.TmuxSession == "" {
+			return
+		}
+		s.runBackground(func(ctx context.Context) {
+			cleanupCtx, cancel := context.WithTimeout(
+				ctx, runtimeSessionCleanupTimeout,
+			)
+			defer cancel()
+			// Generation-qualified: command session keys are reusable, so
+			// this exit's cleanup must not delete the row of a newer live
+			// session relaunched under the same key.
+			if _, err := s.db.DeleteHostRuntimeTmuxSessionCreatedAt(
+				cleanupCtx, info.Key, info.CreatedAt,
+			); err != nil {
+				slog.Warn(
+					"forget host runtime tmux session",
+					"session_key", info.Key,
+					"tmux_session", info.TmuxSession,
+					"err", err,
+				)
+			}
+		})
+		return
+	}
+	if worktreeID, ok := strings.CutPrefix(info.WorkspaceID, "project-worktree:"); ok {
+		if worktreeID == "" || s.db == nil || info.TmuxSession == "" {
+			return
+		}
+		s.runBackground(func(ctx context.Context) {
+			cleanupCtx, cancel := context.WithTimeout(
+				ctx, runtimeSessionCleanupTimeout,
+			)
+			defer cancel()
+			// Generation-qualified: command session keys are reusable, so
+			// this exit's cleanup must not delete the row of a newer live
+			// session relaunched under the same key.
+			if _, err := s.db.DeleteProjectWorktreeTmuxSessionCreatedAt(
+				cleanupCtx, worktreeID, info.Key, info.CreatedAt,
+			); err != nil {
+				slog.Warn(
+					"forget project worktree runtime tmux session",
+					"worktree_id", worktreeID,
+					"session_key", info.Key,
+					"tmux_session", info.TmuxSession,
+					"err", err,
+				)
+			}
+		})
+		return
+	}
 	if s.workspaces == nil {
 		return
 	}
@@ -938,24 +1042,14 @@ func (s *Server) bootstrapScript() string {
 	builder.WriteString(`window.__BASE_PATH__=`)
 	builder.WriteString(scriptSafe(string(safeBase)))
 	builder.WriteString(`;`)
-	cfg := s.options.EmbedConfig
+	// The served config carries the daemon-side UI state thin
+	// clients set over the API (PUT /api/v1/ui/active-worktree);
+	// presentation preferences (embed mode, theming) are injected
+	// client-side by whoever hosts the webview.
 	if awKey, set := s.ActiveWorktreeKey(); set {
-		if cfg == nil {
-			cfg = &EmbedConfig{}
-		} else {
-			cfgCopy := *cfg
-			cfg = &cfgCopy
-		}
-		if cfg.UI == nil {
-			cfg.UI = &UIConfig{}
-		} else {
-			uiCopy := *cfg.UI
-			cfg.UI = &uiCopy
-		}
-		cfg.UI.ActiveWorktreeKey = awKey
-	}
-	if cfg != nil {
-		configJSON, _ := json.Marshal(cfg)
+		configJSON, _ := json.Marshal(map[string]any{
+			"ui": map[string]any{"activeWorktreeKey": awKey},
+		})
 		builder.WriteString(`window.__middleman_config=`)
 		builder.WriteString(scriptSafe(string(configJSON)))
 		builder.WriteString(`;`)
@@ -972,28 +1066,51 @@ func scriptSafe(s string) string {
 
 // ServeHTTP implements http.Handler so Server can be used directly.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if !checkHost(w, r, s.hostOpts) {
-		return
-	}
+	logged := &statusLoggingResponseWriter{ResponseWriter: w}
+	w = logged
 	start := time.Now()
 	slog.Debug(
 		"http request started",
 		"method", r.Method,
 		"path", r.URL.Path,
-		"query", r.URL.RawQuery,
+		"query", redactedQuery(r.URL),
 		"remote_addr", r.RemoteAddr,
 		"user_agent", r.UserAgent(),
 	)
 	defer func() {
-		slog.Debug(
-			"http request completed",
+		status := logged.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		args := []any{
 			"method", r.Method,
 			"path", r.URL.Path,
+			"query", redactedQuery(r.URL),
+			"status", status,
 			"duration", time.Since(start).String(),
-		)
+			"bytes", logged.bytes,
+			"remote_addr", r.RemoteAddr,
+			"user_agent", r.UserAgent(),
+		}
+		if status >= http.StatusBadRequest {
+			slog.Warn("http request failed", args...)
+		} else {
+			slog.Debug("http request completed", args...)
+		}
 	}()
+	if !checkHost(w, r, *s.hostOpts.Load()) {
+		return
+	}
 	if !s.checkHost(w, r) {
 		return
+	}
+	if s.apiAuthToken != "" {
+		if s.handleAuthBootstrap(w, r) {
+			return
+		}
+		if s.isGatedAPIRequest(r) && !s.authorizeAPIRequest(w, r) {
+			return
+		}
 	}
 	if r.Method != http.MethodGet && s.isMutatingAPIRequest(r) {
 		if !checkCSRF(w, r, s.isKataProxyAPIRequest(r)) {
@@ -1228,6 +1345,7 @@ func (s *Server) ListenAndServe(addr string) error {
 // Returns http.ErrServerClosed when stopped by Shutdown.
 func (s *Server) Serve(ln net.Listener) error {
 	s.setAllowedHostsForListener(ln)
+	s.adoptListenerHostPort(ln)
 	srv := &http.Server{
 		Handler:     s,
 		ReadTimeout: 15 * time.Second,
@@ -1256,9 +1374,27 @@ func (s *Server) Serve(ln net.Listener) error {
 // close the listener after a startup handler has been swapped to this Server.
 func (s *Server) AttachHTTPServer(srv *http.Server, ln net.Listener) {
 	s.setAllowedHostsForListener(ln)
+	s.adoptListenerHostPort(ln)
 	s.bgMu.Lock()
 	s.httpSrv = srv
 	s.bgMu.Unlock()
+}
+
+// adoptListenerHostPort repoints the Host-check bind at the actual
+// bound port when the configured bind asked for a kernel-assigned
+// one (port 0) - otherwise every request to an ephemeral-port daemon
+// would be rejected, since no Host header can match port "0".
+func (s *Server) adoptListenerHostPort(ln net.Listener) {
+	opts := *s.hostOpts.Load()
+	if opts.Bind.Port != "0" {
+		return
+	}
+	_, port, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		return
+	}
+	opts.Bind.Port = port
+	s.hostOpts.Store(&opts)
 }
 
 func (s *Server) setAllowedHostsForListener(ln net.Listener) {

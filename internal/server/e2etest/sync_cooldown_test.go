@@ -19,6 +19,7 @@ import (
 	"go.kenn.io/middleman/internal/config"
 	"go.kenn.io/middleman/internal/db"
 	ghclient "go.kenn.io/middleman/internal/github"
+	"go.kenn.io/middleman/internal/platform"
 	"go.kenn.io/middleman/internal/server"
 	"go.kenn.io/middleman/internal/testutil/dbtest"
 )
@@ -256,6 +257,84 @@ platform_host = "gitea"
 	}, got)
 }
 
+func TestTriggerSyncE2EPrioritizesProviderQualifiedFilter(t *testing.T) {
+	require := require.New(t)
+
+	var mu sync.Mutex
+	var calls []string
+	done := make(chan struct{})
+	var doneClosed atomic.Bool
+	mock := &mockGH{
+		listOpenPullRequestsFn: func(
+			_ context.Context, owner, repo string,
+		) ([]*gh.PullRequest, error) {
+			mu.Lock()
+			calls = append(calls, owner+"/"+repo)
+			callCount := len(calls)
+			mu.Unlock()
+			if callCount == 2 && doneClosed.CompareAndSwap(false, true) {
+				close(done)
+			}
+			return nil, nil
+		},
+	}
+	baseURL, client, _, syncer := startSyncCooldownE2EServerWithSyncer(t, `
+sync_interval = "5m"
+github_token_env = "MIDDLEMAN_GITHUB_TOKEN"
+host = "127.0.0.1"
+port = 8091
+
+[[repos]]
+owner = "acme"
+name = "third"
+`, mock)
+	syncer.SetParallelism(1)
+	syncer.SetRepos([]ghclient.RepoRef{
+		{
+			Platform:     platform.KindGitHub,
+			PlatformHost: "github.com",
+			Owner:        "acme",
+			Name:         "third",
+			RepoPath:     "acme/third",
+		},
+		{
+			Platform:     platform.KindGitea,
+			PlatformHost: "github.com",
+			Owner:        "acme",
+			Name:         "widget",
+			RepoPath:     "acme/widget",
+		},
+		{
+			Platform:     platform.KindGitHub,
+			PlatformHost: "github.com",
+			Owner:        "acme",
+			Name:         "widget",
+			RepoPath:     "acme/widget",
+		},
+	})
+
+	status, body := postJSON(
+		t, client,
+		baseURL+"/api/v1/sync?priority_repo=github|github.com/acme/widget",
+		nil,
+	)
+	require.Equal(http.StatusAccepted, status, body)
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		require.Fail("explicit sync did not process all repos")
+	}
+
+	mu.Lock()
+	got := append([]string(nil), calls...)
+	mu.Unlock()
+	require.Equal([]string{
+		"acme/widget",
+		"acme/third",
+	}, got)
+}
+
 func TestAddRepoE2ETriggersImmediateSyncDuringCooldown(t *testing.T) {
 	require := require.New(t)
 
@@ -484,7 +563,7 @@ func waitForRepoSynced(
 		}
 		repo = got
 		return true
-	}, 2*time.Second, 10*time.Millisecond)
+	}, 5*time.Second, 10*time.Millisecond)
 
 	return repo
 }

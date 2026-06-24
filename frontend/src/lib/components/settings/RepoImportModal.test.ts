@@ -12,6 +12,16 @@ vi.mock("../../api/settings.js", () => ({
 const preview = previewRepos as MockedFunction<typeof previewRepos>;
 const bulk = bulkAddRepos as MockedFunction<typeof bulkAddRepos>;
 
+function defaultFleetSettings() {
+  return {
+    enabled: false,
+    sessions: {},
+    peers: [],
+    ssh_peers: [],
+    restart_required: false,
+  };
+}
+
 const rows = [
   {
     provider: "github",
@@ -128,8 +138,13 @@ describe("RepoImportModal", () => {
         cursor_blink: true,
         font_ligatures: false,
         renderer: "xterm",
+        hide_tmux_status: false,
+      },
+      notifications: {
+        enabled: false,
       },
       agents: [],
+      fleet: defaultFleetSettings(),
     });
     render(RepoImportModal, {
       props: { open: true, onClose: vi.fn(), onImported },
@@ -199,8 +214,13 @@ describe("RepoImportModal", () => {
         cursor_blink: true,
         font_ligatures: false,
         renderer: "xterm",
+        hide_tmux_status: false,
+      },
+      notifications: {
+        enabled: false,
       },
       agents: [],
+      fleet: defaultFleetSettings(),
     });
     render(RepoImportModal, {
       props: { open: true, onClose: vi.fn(), onImported: vi.fn() },

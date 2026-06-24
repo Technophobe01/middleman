@@ -144,6 +144,9 @@ func (m *mockClient) CreateReviewWithComments(
 func (m *mockClient) MarkPullRequestReadyForReview(context.Context, string, string, int) (*gh.PullRequest, error) {
 	return nil, nil
 }
+func (m *mockClient) ConvertPullRequestToDraft(context.Context, string, string, int) (*gh.PullRequest, error) {
+	return nil, nil
+}
 func (m *mockClient) DismissReview(context.Context, string, string, int, int64, string) (*gh.PullRequestReview, error) {
 	return nil, nil
 }
@@ -165,7 +168,11 @@ func (m *mockClient) ListPullRequestsPage(context.Context, string, string, strin
 func (m *mockClient) ListIssuesPage(context.Context, string, string, string, int) ([]*gh.Issue, bool, error) {
 	return nil, false, nil
 }
-func (m *mockClient) InvalidateListETagsForRepo(string, string, ...string) {}
+func (m *mockClient) ListNotifications(context.Context, ghclient.NotificationListOptions) ([]ghclient.NotificationThread, bool, error) {
+	return nil, false, nil
+}
+func (m *mockClient) MarkNotificationThreadRead(context.Context, string) error { return nil }
+func (m *mockClient) InvalidateListETagsForRepo(string, string, ...string)     {}
 
 func TestSyncerStopIsIdempotent(t *testing.T) {
 	syncer := ghclient.NewSyncer(

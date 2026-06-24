@@ -19,7 +19,8 @@ Use this document as the intent-level guide for frontend UI work in `middleman`.
 ## Sources of truth
 
 - Tokens: `frontend/src/app.css`
-- Shared primitives: `packages/ui/src/components/shared/`
+- Shared primitives: `packages/ui/src/components/shared/` and
+  `frontend/src/lib/components/shared/`
 - Diff/file-tree adapters: `packages/ui/src/components/diff/PierreFileDiff.svelte`
   and `packages/ui/src/components/diff/PierreFileTree.svelte`
 - Routed item references and URL builders: `packages/ui/src/routes.ts`
@@ -71,6 +72,12 @@ Intent:
 - semantic action styling instead of per-screen button CSS
 
 If a new repeated button treatment is needed, extend `ActionButton` rather than creating another local button pattern.
+
+### Modal primitives
+
+- `Modal`
+- `ConfirmDialog`
+- `DialogButton`
 
 ### LeftSidebarToggle
 

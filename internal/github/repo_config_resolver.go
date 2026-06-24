@@ -31,6 +31,7 @@ func canonicalRepoHost(host string) string {
 func canonicalRepoRef(repo RepoRef) RepoRef {
 	kind := repoPlatform(repo)
 	out := RepoRef{
+		Platform:           kind,
 		Owner:              strings.TrimSpace(repo.Owner),
 		Name:               strings.TrimSpace(repo.Name),
 		PlatformHost:       canonicalRepoHost(repo.PlatformHost),
@@ -47,8 +48,6 @@ func canonicalRepoRef(repo RepoRef) RepoRef {
 		if out.RepoPath != "" {
 			out.RepoPath = canonicalRepoName(out.RepoPath)
 		}
-	} else {
-		out.Platform = kind
 	}
 	if out.RepoPath == "" {
 		out.RepoPath = out.Owner + "/" + out.Name
@@ -66,6 +65,7 @@ type ConfiguredRepoStatus struct {
 	Owner            string `json:"owner"`
 	Name             string `json:"name"`
 	RepoPath         string `json:"repo_path"`
+	WorktreeBasePath string `json:"worktree_base_path,omitempty"`
 	IsGlob           bool   `json:"is_glob"`
 	MatchedRepoCount int    `json:"matched_repo_count"`
 }
@@ -115,6 +115,7 @@ func FallbackConfiguredRepoRefs(
 
 func fallbackRepoRef(raw config.Repo, kind platform.Kind, host string) RepoRef {
 	repo := RepoRef{
+		Platform:     kind,
 		Owner:        strings.TrimSpace(raw.Owner),
 		Name:         strings.TrimSpace(raw.Name),
 		PlatformHost: strings.ToLower(strings.TrimSpace(host)),
@@ -127,9 +128,7 @@ func fallbackRepoRef(raw config.Repo, kind platform.Kind, host string) RepoRef {
 		repo.Owner = canonicalRepoOwner(repo.Owner)
 		repo.Name = canonicalRepoName(repo.Name)
 		repo.PlatformHost = canonicalRepoHost(repo.PlatformHost)
-		return repo
 	}
-	repo.Platform = kind
 	return repo
 }
 
@@ -302,6 +301,7 @@ func repoRefFromRepository(
 		name = raw.Name
 	}
 	ref := RepoRef{
+		Platform:           kind,
 		Owner:              strings.TrimSpace(owner),
 		Name:               strings.TrimSpace(name),
 		PlatformHost:       canonicalRepoHost(host),
@@ -327,9 +327,7 @@ func repoRefFromRepository(
 	if ref.DefaultBranch == "" {
 		ref.DefaultBranch = repo.Ref.DefaultBranch
 	}
-	if kind != platform.KindGitHub {
-		ref.Platform = kind
-	} else {
+	if kind == platform.KindGitHub {
 		ref.Owner = canonicalRepoOwner(ref.Owner)
 		ref.Name = canonicalRepoName(ref.Name)
 		ref.RepoPath = canonicalRepoName(ref.RepoPath)

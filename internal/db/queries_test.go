@@ -957,11 +957,15 @@ func TestProviderCanonicalReadPathsUseLookupKeys(t *testing.T) {
 	require.NotNil(refreshedIssue)
 	assert.NotNil(refreshedIssue.DetailFetchedAt)
 
-	users, err := d.ListCommentAutocompleteUsers(ctx, "gitlab.example.com", "group/subgroup", "projectname", "auth", 10)
+	users, err := d.ListCommentAutocompleteUsers(
+		ctx, "gitlab", "gitlab.example.com", "group/subgroup", "projectname", "auth", 10,
+	)
 	require.NoError(err)
 	assert.Equal([]string{"author"}, users)
 
-	refs, err := d.ListCommentAutocompleteReferences(ctx, "gitlab.example.com", "group/subgroup", "projectname", "GitLab", "", 10)
+	refs, err := d.ListCommentAutocompleteReferences(
+		ctx, "gitlab", "gitlab.example.com", "group/subgroup", "projectname", "GitLab", "", 10,
+	)
 	require.NoError(err)
 	require.Len(refs, 2)
 	assert.Equal([]int{8, 7}, []int{refs[0].Number, refs[1].Number})
@@ -2443,6 +2447,8 @@ func TestPullRequestRepoScopedQueriesCanonicalizeOwnerName(t *testing.T) {
 }
 
 func TestListPullRequestsFilterBySearch(t *testing.T) {
+	require := require.New(t)
+	assert := Assert.New(t)
 	d := openTestDB(t)
 
 	repoID := insertTestRepo(t, d, "owner", "repo")
@@ -2450,11 +2456,62 @@ func TestListPullRequestsFilterBySearch(t *testing.T) {
 
 	insertTestMR(t, d, repoID, 1, "add feature", base)
 	insertTestMR(t, d, repoID, 2, "fix bug", base.Add(time.Hour))
+	insertTestMR(t, d, repoID, 3, "feature cleanup", base.Add(2*time.Hour))
 
 	prs, err := d.ListMergeRequests(t.Context(), ListMergeRequestsOpts{Search: "feature"})
-	require.NoError(t, err)
-	require.Len(t, prs, 1)
-	Assert.Equal(t, 1, prs[0].Number)
+	require.NoError(err)
+	require.Len(prs, 2)
+	assert.ElementsMatch([]int{1, 3}, []int{prs[0].Number, prs[1].Number})
+
+	prs, err = d.ListMergeRequests(t.Context(), ListMergeRequestsOpts{Search: "feature add"})
+	require.NoError(err)
+	require.Len(prs, 1)
+	assert.Equal(1, prs[0].Number)
+}
+
+func TestListPullRequestsFilterBySearchPreservesApostrophesInTerms(t *testing.T) {
+	require := require.New(t)
+	assert := Assert.New(t)
+	d := openTestDB(t)
+
+	repoID := insertTestRepo(t, d, "owner", "repo")
+	base := baseTime()
+
+	insertTestMR(t, d, repoID, 1, "can't reproduce", base)
+	insertTestMR(t, d, repoID, 2, "O'Reilly docs update", base.Add(time.Hour))
+
+	prs, err := d.ListMergeRequests(t.Context(), ListMergeRequestsOpts{Search: "can't"})
+	require.NoError(err)
+	require.Len(prs, 1)
+	assert.Equal(1, prs[0].Number)
+
+	prs, err = d.ListMergeRequests(t.Context(), ListMergeRequestsOpts{Search: "O'Reilly"})
+	require.NoError(err)
+	require.Len(prs, 1)
+	assert.Equal(2, prs[0].Number)
+}
+
+func TestListPullRequestsFilterBySearchRepoFragment(t *testing.T) {
+	require := require.New(t)
+	assert := Assert.New(t)
+	d := openTestDB(t)
+
+	apiRepoID := insertTestRepo(t, d, "acme", "api")
+	workerRepoID := insertTestRepo(t, d, "tools", "worker")
+	base := baseTime()
+
+	insertTestMR(t, d, apiRepoID, 1, "fix bug", base)
+	insertTestMR(t, d, workerRepoID, 2, "fix bug", base.Add(time.Hour))
+
+	prs, err := d.ListMergeRequests(t.Context(), ListMergeRequestsOpts{Search: "acm"})
+	require.NoError(err)
+	require.Len(prs, 1)
+	assert.Equal(1, prs[0].Number)
+
+	prs, err = d.ListMergeRequests(t.Context(), ListMergeRequestsOpts{Search: "work bug"})
+	require.NoError(err)
+	require.Len(prs, 1)
+	assert.Equal(2, prs[0].Number)
 }
 
 func TestListPullRequestsFilterBySearchNumber(t *testing.T) {
@@ -2540,14 +2597,13 @@ func TestListPullRequestsFilterByKanban(t *testing.T) {
 	repoID := insertTestRepo(t, d, "owner", "repo")
 	base := baseTime()
 
-	id1 := insertTestMR(t, d, repoID, 1, "pr 1", base)
+	insertTestMR(t, d, repoID, 1, "pr 1", base)
 	id2 := insertTestMR(t, d, repoID, 2, "pr 2", base.Add(time.Hour))
 	id3 := insertTestMR(t, d, repoID, 3, "pr 3", base.Add(2*time.Hour))
 
 	// Set PR 2 to "reviewing".
 	require.NoError(d.SetKanbanState(ctx, id2, "reviewing"))
-	// Ensure kanban for PR 1 and 3 (status = "new").
-	require.NoError(d.EnsureKanbanState(ctx, id1))
+	// Leave PR 1 without a kanban row; the board treats missing rows as "new".
 	require.NoError(d.EnsureKanbanState(ctx, id3))
 
 	prs, err := d.ListMergeRequests(ctx, ListMergeRequestsOpts{KanbanState: "reviewing"})
@@ -2555,6 +2611,11 @@ func TestListPullRequestsFilterByKanban(t *testing.T) {
 	require.Len(prs, 1)
 	assert.Equal(2, prs[0].Number)
 	assert.Equal(KanbanStatusReviewing, prs[0].KanbanStatus)
+
+	prs, err = d.ListMergeRequests(ctx, ListMergeRequestsOpts{KanbanState: "new"})
+	require.NoError(err)
+	require.Len(prs, 2)
+	assert.Equal([]int{3, 1}, []int{prs[0].Number, prs[1].Number})
 }
 
 func TestListMergeRequests_AttachesLabels(t *testing.T) {
@@ -3377,6 +3438,42 @@ func TestUpdatePRState(t *testing.T) {
 	assert.True(pr.MergedAt.Equal(mergedAt))
 }
 
+func TestUpdateMRDraftStateAdvancesTimestampToRejectStaleSync(t *testing.T) {
+	assert := Assert.New(t)
+	require := require.New(t)
+	d := openTestDB(t)
+	ctx := t.Context()
+
+	repoID := insertTestRepo(t, d, "o", "r")
+	base := time.Now().UTC().Add(time.Hour)
+	insertTestMR(t, d, repoID, 1, "current pr", base)
+
+	require.NoError(d.UpdateMRDraftState(ctx, repoID, 1, true))
+
+	staleSync := testMR(repoID, 1, withMRTitle("stale sync"), withMRActivity(base))
+	staleSync.IsDraft = false
+	_, err := d.UpsertMergeRequest(ctx, staleSync)
+	require.NoError(err)
+
+	pr, err := d.GetMergeRequest(ctx, "o", "r", 1)
+	require.NoError(err)
+	require.NotNil(pr)
+	assert.True(pr.IsDraft)
+	assert.Equal("current pr", pr.Title)
+	assert.True(pr.UpdatedAt.After(base))
+	assert.False(pr.LastActivityAt.Before(base))
+}
+
+func TestUpdateMRDraftStateReturnsErrorWhenMissing(t *testing.T) {
+	require := require.New(t)
+	d := openTestDB(t)
+	ctx := t.Context()
+
+	repoID := insertTestRepo(t, d, "o", "r")
+	err := d.UpdateMRDraftState(ctx, repoID, 404, true)
+	require.Error(err)
+}
+
 func TestListIssues_AttachesLabels(t *testing.T) {
 	require := require.New(t)
 	d := openTestDB(t)
@@ -3556,6 +3653,11 @@ func TestListIssuesFilterBySearch(t *testing.T) {
 	require.Len(issues, 1)
 	assert.Equal(278, issues[0].Number)
 
+	issues, err = d.ListIssues(t.Context(), ListIssuesOpts{Search: "filter broken"})
+	require.NoError(err)
+	require.Len(issues, 1)
+	assert.Equal(278, issues[0].Number)
+
 	issues, err = d.ListIssues(t.Context(), ListIssuesOpts{Search: "278"})
 	require.NoError(err)
 	require.Len(issues, 1)
@@ -3570,6 +3672,29 @@ func TestListIssuesFilterBySearch(t *testing.T) {
 	issues, err = d.ListIssues(t.Context(), ListIssuesOpts{Search: "2"})
 	require.NoError(err)
 	require.Len(issues, 3)
+}
+
+func TestListIssuesFilterBySearchRepoFragment(t *testing.T) {
+	require := require.New(t)
+	assert := Assert.New(t)
+	d := openTestDB(t)
+
+	apiRepoID := insertTestRepo(t, d, "acme", "api")
+	workerRepoID := insertTestRepo(t, d, "tools", "worker")
+	base := baseTime()
+
+	insertTestIssue(t, d, apiRepoID, 1, "fix bug", base)
+	insertTestIssue(t, d, workerRepoID, 2, "fix bug", base.Add(time.Hour))
+
+	issues, err := d.ListIssues(t.Context(), ListIssuesOpts{Search: "acm"})
+	require.NoError(err)
+	require.Len(issues, 1)
+	assert.Equal(1, issues[0].Number)
+
+	issues, err = d.ListIssues(t.Context(), ListIssuesOpts{Search: "work bug"})
+	require.NoError(err)
+	require.Len(issues, 1)
+	assert.Equal(2, issues[0].Number)
 }
 
 func TestListIssuesFilterBySearchLabel(t *testing.T) {
@@ -3823,13 +3948,54 @@ func TestListCommentAutocompleteUsers(t *testing.T) {
 		DedupeKey: "issue-comment-1",
 	}}))
 
-	users, err := d.ListCommentAutocompleteUsers(ctx, "github.com", "acme", "widget", "al", 10)
+	users, err := d.ListCommentAutocompleteUsers(ctx, "github", "github.com", "acme", "widget", "al", 10)
 	require.NoError(err)
 	assert.Equal([]string{"alice", "albert", "alex"}, users)
 
-	users, err = d.ListCommentAutocompleteUsers(ctx, "github.com", "acme", "widget", "bert", 10)
+	users, err = d.ListCommentAutocompleteUsers(ctx, "github", "github.com", "acme", "widget", "bert", 10)
 	require.NoError(err)
 	assert.Equal([]string{"albert"}, users)
+}
+
+func TestListCommentAutocompleteUsersScopesByProvider(t *testing.T) {
+	assert := Assert.New(t)
+	require := require.New(t)
+	d := openTestDB(t)
+	ctx := t.Context()
+	base := baseTime()
+
+	githubRepoID := insertTestRepo(t, d, "acme", "widget")
+	giteaRepoID, err := d.UpsertRepo(ctx, RepoIdentity{
+		Platform:     "gitea",
+		PlatformHost: "github.com",
+		Owner:        "acme",
+		Name:         "widget",
+		RepoPath:     "acme/widget",
+	})
+	require.NoError(err)
+
+	insertTestIssueWithOptions(t, d, testIssue(
+		githubRepoID,
+		1,
+		withIssueTitle("GitHub collision issue"),
+		withIssueAuthor("alice"),
+		withIssueActivity(base.Add(time.Hour)),
+	))
+	insertTestIssueWithOptions(t, d, testIssue(
+		giteaRepoID,
+		901,
+		withIssueTitle("Gitea collision issue"),
+		withIssueAuthor("gina"),
+		withIssueActivity(base.Add(2*time.Hour)),
+	))
+
+	users, err := d.ListCommentAutocompleteUsers(ctx, "gitea", "github.com", "acme", "widget", "", 10)
+	require.NoError(err)
+	assert.Equal([]string{"gina"}, users)
+
+	users, err = d.ListCommentAutocompleteUsers(ctx, "github", "github.com", "acme", "widget", "", 10)
+	require.NoError(err)
+	assert.Equal([]string{"alice"}, users)
 }
 
 func TestListCommentAutocompleteReferences(t *testing.T) {
@@ -3845,29 +4011,72 @@ func TestListCommentAutocompleteReferences(t *testing.T) {
 	insertTestIssue(t, d, repoID, 17, "Mention bug", base.Add(2*time.Hour))
 	insertTestIssue(t, d, repoID, 101, "Numbered item", base.Add(time.Hour))
 
-	refs, err := d.ListCommentAutocompleteReferences(ctx, "github.com", "acme", "widget", "1", "", 10)
+	refs, err := d.ListCommentAutocompleteReferences(ctx, "github", "github.com", "acme", "widget", "1", "", 10)
 	require.NoError(err)
 	require.Len(refs, 3)
 	assert.Equal(CommentAutocompleteReference{Kind: "pull", Number: 12, Title: "Polish mentions", State: "open"}, refs[0])
 	assert.Equal(CommentAutocompleteReference{Kind: "issue", Number: 17, Title: "Mention bug", State: "open"}, refs[1])
 	assert.Equal(CommentAutocompleteReference{Kind: "issue", Number: 101, Title: "Numbered item", State: "open"}, refs[2])
 
-	refs, err = d.ListCommentAutocompleteReferences(ctx, "github.com", "acme", "widget", "doc", "", 10)
+	refs, err = d.ListCommentAutocompleteReferences(ctx, "github", "github.com", "acme", "widget", "doc", "", 10)
 	require.NoError(err)
 	require.Len(refs, 1)
 	assert.Equal(CommentAutocompleteReference{Kind: "pull", Number: 3, Title: "Add docs", State: "open"}, refs[0])
 
-	refs, err = d.ListCommentAutocompleteReferences(ctx, "github.com", "acme", "widget", "1", "issue", 10)
+	refs, err = d.ListCommentAutocompleteReferences(ctx, "github", "github.com", "acme", "widget", "1", "issue", 10)
 	require.NoError(err)
 	assert.Equal([]CommentAutocompleteReference{
 		{Kind: "issue", Number: 17, Title: "Mention bug", State: "open"},
 		{Kind: "issue", Number: 101, Title: "Numbered item", State: "open"},
 	}, refs)
 
-	refs, err = d.ListCommentAutocompleteReferences(ctx, "github.com", "acme", "widget", "1", "pull", 10)
+	refs, err = d.ListCommentAutocompleteReferences(ctx, "github", "github.com", "acme", "widget", "1", "pull", 10)
 	require.NoError(err)
 	assert.Equal([]CommentAutocompleteReference{
 		{Kind: "pull", Number: 12, Title: "Polish mentions", State: "open"},
+	}, refs)
+}
+
+func TestListCommentAutocompleteReferencesScopesByProvider(t *testing.T) {
+	assert := Assert.New(t)
+	require := require.New(t)
+	d := openTestDB(t)
+	ctx := t.Context()
+	base := baseTime()
+
+	githubRepoID := insertTestRepo(t, d, "acme", "widget")
+	giteaRepoID, err := d.UpsertRepo(ctx, RepoIdentity{
+		Platform:     "gitea",
+		PlatformHost: "github.com",
+		Owner:        "acme",
+		Name:         "widget",
+		RepoPath:     "acme/widget",
+	})
+	require.NoError(err)
+
+	insertTestIssueWithOptions(t, d, testIssue(
+		githubRepoID,
+		1,
+		withIssueTitle("Provider collision issue"),
+		withIssueActivity(base.Add(time.Hour)),
+	))
+	insertTestIssueWithOptions(t, d, testIssue(
+		giteaRepoID,
+		901,
+		withIssueTitle("Provider collision issue"),
+		withIssueActivity(base.Add(2*time.Hour)),
+	))
+
+	refs, err := d.ListCommentAutocompleteReferences(ctx, "gitea", "github.com", "acme", "widget", "collision", "", 10)
+	require.NoError(err)
+	assert.Equal([]CommentAutocompleteReference{
+		{Kind: "issue", Number: 901, Title: "Provider collision issue", State: "open"},
+	}, refs)
+
+	refs, err = d.ListCommentAutocompleteReferences(ctx, "github", "github.com", "acme", "widget", "collision", "", 10)
+	require.NoError(err)
+	assert.Equal([]CommentAutocompleteReference{
+		{Kind: "issue", Number: 1, Title: "Provider collision issue", State: "open"},
 	}, refs)
 }
 
@@ -3990,6 +4199,40 @@ func TestGetRepoByHostOwnerNameUsesLookupKeysForNonGitHubRows(t *testing.T) {
 	assert.Equal("Group/SubGroup/ProjectName", repo.RepoPath)
 	assert.Equal("group/subgroup", repo.OwnerKey)
 	assert.Equal("projectname", repo.NameKey)
+}
+
+func TestCountReposByHostOwnerNameCountsProviders(t *testing.T) {
+	assert := Assert.New(t)
+	require := require.New(t)
+	d := openTestDB(t)
+	ctx := t.Context()
+
+	_, err := d.UpsertRepo(ctx, RepoIdentity{
+		Platform:     "github",
+		PlatformHost: "forge.example.com",
+		Owner:        "acme",
+		Name:         "widget",
+	})
+	require.NoError(err)
+	_, err = d.UpsertRepo(ctx, RepoIdentity{
+		Platform:     "gitlab",
+		PlatformHost: "forge.example.com",
+		Owner:        "acme",
+		Name:         "widget",
+	})
+	require.NoError(err)
+
+	count, err := d.CountReposByHostOwnerName(
+		ctx, "forge.example.com", "acme", "widget",
+	)
+	require.NoError(err)
+	assert.Equal(2, count)
+
+	miss, err := d.CountReposByHostOwnerName(
+		ctx, "forge.example.com", "acme", "missing",
+	)
+	require.NoError(err)
+	assert.Equal(0, miss)
 }
 
 func TestRepoIdentifierCasefoldTriggers(t *testing.T) {
@@ -4202,6 +4445,124 @@ func TestWorkspaceCRUD(t *testing.T) {
 	assert.Nil(noSuch)
 }
 
+func TestGetWorkspaceByIssueForProviderDisambiguatesProvider(t *testing.T) {
+	assert := Assert.New(t)
+	require := require.New(t)
+	d := openTestDB(t)
+	ctx := t.Context()
+
+	for _, provider := range []string{"github", "gitlab"} {
+		_, err := d.UpsertRepo(ctx, RepoIdentity{
+			Platform:     provider,
+			PlatformHost: "forge.example.com",
+			Owner:        "acme",
+			Name:         "widget",
+		})
+		require.NoError(err)
+	}
+	require.NoError(d.InsertWorkspace(ctx, &Workspace{
+		ID:              "github-issue-workspace",
+		Platform:        "github",
+		PlatformHost:    "forge.example.com",
+		RepoOwner:       "acme",
+		RepoName:        "widget",
+		ItemType:        WorkspaceItemTypeIssue,
+		ItemNumber:      7,
+		GitHeadRef:      "middleman/issue-7",
+		WorkspaceBranch: "middleman/issue-7",
+		WorktreePath:    "/tmp/github-issue-workspace",
+		TmuxSession:     "github-issue-workspace",
+		Status:          "ready",
+	}))
+	require.NoError(d.InsertWorkspace(ctx, &Workspace{
+		ID:              "gitlab-issue-workspace",
+		Platform:        "gitlab",
+		PlatformHost:    "forge.example.com",
+		RepoOwner:       "acme",
+		RepoName:        "widget",
+		ItemType:        WorkspaceItemTypeIssue,
+		ItemNumber:      7,
+		GitHeadRef:      "middleman/issue-7",
+		WorkspaceBranch: "middleman/issue-7",
+		WorktreePath:    "/tmp/gitlab-issue-workspace",
+		TmuxSession:     "gitlab-issue-workspace",
+		Status:          "ready",
+	}))
+
+	got, err := d.GetWorkspaceByIssueForProvider(
+		ctx, "gitlab", "forge.example.com", "acme", "widget", 7,
+	)
+	require.NoError(err)
+	require.NotNil(got)
+	assert.Equal("gitlab-issue-workspace", got.ID)
+	assert.Equal("gitlab", got.Platform)
+
+	miss, err := d.GetWorkspaceByIssueForProvider(
+		ctx, "forgejo", "forge.example.com", "acme", "widget", 7,
+	)
+	require.NoError(err)
+	assert.Nil(miss)
+}
+
+func TestGetWorkspaceByMRForProviderDisambiguatesProvider(t *testing.T) {
+	assert := Assert.New(t)
+	require := require.New(t)
+	d := openTestDB(t)
+	ctx := t.Context()
+
+	for _, provider := range []string{"github", "gitlab"} {
+		_, err := d.UpsertRepo(ctx, RepoIdentity{
+			Platform:     provider,
+			PlatformHost: "forge.example.com",
+			Owner:        "acme",
+			Name:         "widget",
+		})
+		require.NoError(err)
+	}
+	require.NoError(d.InsertWorkspace(ctx, &Workspace{
+		ID:              "github-pr-workspace",
+		Platform:        "github",
+		PlatformHost:    "forge.example.com",
+		RepoOwner:       "acme",
+		RepoName:        "widget",
+		ItemType:        WorkspaceItemTypePullRequest,
+		ItemNumber:      7,
+		GitHeadRef:      "feature",
+		WorkspaceBranch: "middleman/pr-7",
+		WorktreePath:    "/tmp/github-pr-workspace",
+		TmuxSession:     "github-pr-workspace",
+		Status:          "ready",
+	}))
+	require.NoError(d.InsertWorkspace(ctx, &Workspace{
+		ID:              "gitlab-pr-workspace",
+		Platform:        "gitlab",
+		PlatformHost:    "forge.example.com",
+		RepoOwner:       "acme",
+		RepoName:        "widget",
+		ItemType:        WorkspaceItemTypePullRequest,
+		ItemNumber:      7,
+		GitHeadRef:      "feature",
+		WorkspaceBranch: "middleman/pr-7",
+		WorktreePath:    "/tmp/gitlab-pr-workspace",
+		TmuxSession:     "gitlab-pr-workspace",
+		Status:          "ready",
+	}))
+
+	got, err := d.GetWorkspaceByMRForProvider(
+		ctx, "gitlab", "forge.example.com", "acme", "widget", 7,
+	)
+	require.NoError(err)
+	require.NotNil(got)
+	assert.Equal("gitlab-pr-workspace", got.ID)
+	assert.Equal("gitlab", got.Platform)
+
+	miss, err := d.GetWorkspaceByMRForProvider(
+		ctx, "forgejo", "forge.example.com", "acme", "widget", 7,
+	)
+	require.NoError(err)
+	assert.Nil(miss)
+}
+
 func TestFreshWorkspaceRuntimeSessionSchemaIncludesTmuxSession(t *testing.T) {
 	assert := Assert.New(t)
 	require := require.New(t)
@@ -4231,6 +4592,7 @@ func TestFreshWorkspaceRuntimeSessionSchemaIncludesTmuxSession(t *testing.T) {
 	}
 	require.NoError(rows.Err())
 
+	assert.Equal("TEXT", columns["display_region"])
 	assert.Equal("TEXT", columns["tmux_session"])
 	assert.Equal("DATETIME", columns["created_at"])
 }

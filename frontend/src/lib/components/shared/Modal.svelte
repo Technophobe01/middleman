@@ -1,13 +1,23 @@
 <script lang="ts">
   import XIcon from "@lucide/svelte/icons/x";
-  import { onMount } from "svelte";
+  import { onMount, untrack } from "svelte";
+  import { pushModalFrame } from "@middleman/ui/stores/keyboard/modal-stack";
   import type { Snippet } from "svelte";
 
+  // Shared in-app dialog shell: backdrop, dialog frame, header, footer slot,
+  // focus trap, Escape close, focus restore, and optional modal-stack frame.
+  // Feature components own only their body content and domain actions.
   interface Props {
     open: boolean;
     title?: string | undefined;
     ariaLabel?: string | undefined;
     width?: number | undefined;
+    frameId?: string | undefined;
+    // Header close (X) button, off by default. Dialogs here provide an explicit
+    // Cancel/close in their footer, so an X would duplicate it and add a stop to
+    // the focus trap. Opt in with showClose only for content-only dialogs that
+    // have no other dismiss control (Escape and backdrop click always close).
+    showClose?: boolean;
     onClose: () => void;
     children: Snippet;
     footer?: Snippet | undefined;
@@ -18,6 +28,8 @@
     title = undefined,
     ariaLabel = undefined,
     width = 440,
+    frameId = undefined,
+    showClose = false,
     onClose,
     children,
     footer = undefined,
@@ -70,6 +82,11 @@
   }
 
   $effect(() => {
+    if (!open || !frameId) return;
+    return untrack(() => pushModalFrame(frameId, []));
+  });
+
+  $effect(() => {
     if (open) {
       previousFocus = document.activeElement instanceof HTMLElement
         ? document.activeElement
@@ -79,8 +96,15 @@
         const primary = body?.querySelector<HTMLElement>(
           "input:not([type='hidden']), textarea, [tabindex]:not([tabindex='-1'])",
         );
-        const fallback = dialog?.querySelector<HTMLElement>("button, [tabindex]:not([tabindex='-1'])");
-        (primary ?? fallback ?? dialog)?.focus();
+        // Prefer a body or footer control so confirmation dialogs land on their
+        // first action (Cancel) instead of the header close button; only fall
+        // back to the close button when there is nothing else to focus.
+        const action = dialog?.querySelector<HTMLElement>(
+          ".dialog-body button:not([disabled]), .dialog-body [tabindex]:not([tabindex='-1'])," +
+            " .dialog-foot button:not([disabled]), .dialog-foot [tabindex]:not([tabindex='-1'])",
+        );
+        const close = dialog?.querySelector<HTMLElement>(".dialog-close");
+        (primary ?? action ?? close ?? dialog)?.focus();
       });
     } else if (previousFocus) {
       const restore = previousFocus;
@@ -112,9 +136,11 @@
       {#if title}
         <header class="dialog-head">
           <h2 class="dialog-title">{title}</h2>
-          <button class="dialog-close" type="button" onclick={onClose} aria-label="Close">
-            <XIcon size={14} strokeWidth={1.75} aria-hidden="true" />
-          </button>
+          {#if showClose}
+            <button class="dialog-close" type="button" onclick={onClose} aria-label="Close">
+              <XIcon size={14} strokeWidth={1.75} aria-hidden="true" />
+            </button>
+          {/if}
         </header>
       {/if}
       <div class="dialog-body">

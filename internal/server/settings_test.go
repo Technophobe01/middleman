@@ -338,6 +338,7 @@ command = ["codex", "--full-auto"]
 	assert.Equal("acme", resp.Repos[0].Owner)
 	assert.Equal(1, resp.Repos[0].MatchedRepoCount)
 	assert.Equal("threaded", resp.Activity.ViewMode)
+	assert.True(resp.Notifications.Enabled)
 	assert.Empty(resp.Terminal.FontFamily)
 	assert.Equal(config.DefaultTerminalFontSize, resp.Terminal.FontSize)
 	assert.Equal(config.DefaultTerminalScrollback, resp.Terminal.Scrollback)
@@ -349,6 +350,7 @@ command = ["codex", "--full-auto"]
 	require.NotNil(resp.Terminal.CursorBlink)
 	assert.True(*resp.Terminal.CursorBlink)
 	assert.False(resp.Terminal.FontLigatures)
+	assert.False(resp.Terminal.HideTmuxStatus)
 	assertDefaultModeVisibility(t, resp.Modes)
 	require.Len(resp.Agents, 1)
 	assert.Equal("codex", resp.Agents[0].Key)
@@ -425,13 +427,14 @@ func TestHandleUpdateSettings(t *testing.T) {
 		HideBots:   true,
 	}
 	terminal := config.Terminal{
-		FontFamily:    "\"Fira Code\", monospace",
-		FontSize:      16,
-		Scrollback:    5000,
-		LineHeight:    1.15,
-		CursorBlink:   new(true),
-		FontLigatures: true,
-		Renderer:      config.TerminalRendererXterm,
+		FontFamily:     "\"Fira Code\", monospace",
+		FontSize:       16,
+		Scrollback:     5000,
+		LineHeight:     1.15,
+		CursorBlink:    new(true),
+		FontLigatures:  true,
+		Renderer:       config.TerminalRendererXterm,
+		HideTmuxStatus: true,
 	}
 	body := updateSettingsRequest{
 		Activity: &activity,
@@ -452,6 +455,7 @@ func TestHandleUpdateSettings(t *testing.T) {
 	assert.Equal(5000, cfg2.Terminal.Scrollback)
 	assert.InDelta(1.15, cfg2.Terminal.LineHeight, 0.001)
 	assert.True(cfg2.Terminal.FontLigatures)
+	assert.True(cfg2.Terminal.HideTmuxStatus)
 }
 
 func TestHandleUpdateTerminalSettingsPreservesActivity(t *testing.T) {
@@ -1955,6 +1959,36 @@ port = 8091
 	assert.Equal("Group/Subgroup/Project", dbRepo.RepoPath)
 }
 
+func TestWorktreeBasePathResolverMatchesProviderIdentity(t *testing.T) {
+	assert := Assert.New(t)
+	require := require.New(t)
+
+	srv := &Server{cfg: &config.Config{Repos: []config.Repo{
+		{
+			Platform:         "github",
+			PlatformHost:     "forge.example.com",
+			Owner:            "acme",
+			Name:             "widget",
+			WorktreeBasePath: "/tmp/github-widget",
+		},
+		{
+			Platform:         "gitlab",
+			PlatformHost:     "forge.example.com",
+			Owner:            "acme",
+			Name:             "widget",
+			WorktreeBasePath: "/tmp/gitlab-widget",
+		},
+	}}}
+
+	got, ok, err := srv.worktreeBasePathForRepo(
+		t.Context(), "gitlab", "forge.example.com", "acme", "widget",
+	)
+
+	require.NoError(err)
+	require.True(ok)
+	assert.Equal("/tmp/gitlab-widget", got)
+}
+
 func TestHandleBulkAddReposPersistsGiteaProviderIdentity(t *testing.T) {
 	assert := Assert.New(t)
 	require := require.New(t)
@@ -2212,4 +2246,107 @@ name = "widget"
 	var resp settingsResponse
 	require.NoError(json.NewDecoder(rr.Body).Decode(&resp))
 	assert.Equal([]string{"widget", "api", "worker"}, []string{resp.Repos[0].Name, resp.Repos[1].Name, resp.Repos[2].Name})
+}
+
+// TestSetActiveWorktreeRoute pins the UI focus contract thin clients
+// use: PUT /api/v1/ui/active-worktree records the focused worktree
+// key, the served SPA config carries it, and an empty key clears it.
+func TestSetActiveWorktreeRoute(t *testing.T) {
+	require := require.New(t)
+	srv, _ := setupTestServer(t)
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+
+	put := func(body string) *http.Response {
+		req, err := http.NewRequest(
+			http.MethodPut,
+			ts.URL+"/api/v1/ui/active-worktree",
+			strings.NewReader(body),
+		)
+		require.NoError(err)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		require.NoError(err)
+		return resp
+	}
+
+	resp := put(`{"key":"local:wt-alpha"}`)
+	resp.Body.Close()
+	require.Equal(http.StatusNoContent, resp.StatusCode)
+	key, set := srv.ActiveWorktreeKey()
+	require.True(set)
+	require.Equal("local:wt-alpha", key)
+
+	// Empty key clears the focus.
+	resp = put(`{"key":""}`)
+	resp.Body.Close()
+	require.Equal(http.StatusNoContent, resp.StatusCode)
+	key, set = srv.ActiveWorktreeKey()
+	require.True(set)
+	require.Empty(key)
+}
+
+// TestFleetSSHPeerSettingsRoutes pins the fleet host editing contract
+// thin clients use: GET lists the configured ssh peers, PUT replaces
+// the set (validated, persisted, rolled back on failure) and reports
+// restart_required because the transport is wired at startup.
+func TestFleetSSHPeerSettingsRoutes(t *testing.T) {
+	require := require.New(t)
+	srv, _, cfgPath := setupTestServerWithConfig(t)
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+
+	type peersBody struct {
+		SSHPeers        []config.FleetSSHPeer `json:"ssh_peers"`
+		RestartRequired bool                  `json:"restart_required"`
+	}
+	get := func() peersBody {
+		resp, err := http.Get(ts.URL + "/api/v1/settings/fleet/ssh-peers")
+		require.NoError(err)
+		defer resp.Body.Close()
+		require.Equal(http.StatusOK, resp.StatusCode)
+		var body peersBody
+		require.NoError(json.NewDecoder(resp.Body).Decode(&body))
+		return body
+	}
+	put := func(payload string) *http.Response {
+		req, err := http.NewRequest(
+			http.MethodPut,
+			ts.URL+"/api/v1/settings/fleet/ssh-peers",
+			strings.NewReader(payload),
+		)
+		require.NoError(err)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		require.NoError(err)
+		return resp
+	}
+
+	require.Empty(get().SSHPeers)
+
+	resp := put(`{"ssh_peers":[
+		{"key":"epyc","name":"EPYC","destination":"wes@epyc.local","platform":"linux"}
+	]}`)
+	defer resp.Body.Close()
+	require.Equal(http.StatusOK, resp.StatusCode)
+	var updated peersBody
+	require.NoError(json.NewDecoder(resp.Body).Decode(&updated))
+	require.Len(updated.SSHPeers, 1)
+	require.Equal("epyc", updated.SSHPeers[0].Key)
+	require.True(updated.RestartRequired,
+		"ssh peers are startup-bound; an edit demands a restart")
+
+	// Persisted: the config file carries the peer.
+	raw, err := os.ReadFile(cfgPath)
+	require.NoError(err)
+	require.Contains(string(raw), `wes@epyc.local`)
+
+	// Invalid set (duplicate keys) rejects and rolls back.
+	bad := put(`{"ssh_peers":[
+		{"key":"dup","destination":"a@b"},
+		{"key":"dup","destination":"c@d"}
+	]}`)
+	defer bad.Body.Close()
+	require.Equal(http.StatusBadRequest, bad.StatusCode)
+	require.Len(get().SSHPeers, 1, "failed update must not persist")
 }

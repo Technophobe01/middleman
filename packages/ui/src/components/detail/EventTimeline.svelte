@@ -10,6 +10,7 @@
   import { untrack } from "svelte";
   import { slide } from "svelte/transition";
   import type { IssueEvent, PREvent } from "../../api/types.js";
+  import type { DetailActivityViewMode } from "../../stores/detail-activity-view.svelte.js";
   import type { StoreInstances } from "../../types.js";
   import { renderMarkdown } from "../../utils/markdown.js";
   import { timeAgo } from "../../utils/time.js";
@@ -23,6 +24,7 @@
   import DiffReviewThreadSnippet from "../diff/DiffReviewThreadSnippet.svelte";
   import {
     reviewThreadContext,
+    reviewThreadLineLabel,
     type ReviewThread,
   } from "../diff/review-thread-context.js";
 
@@ -39,6 +41,7 @@
     canReplyToThreads?: boolean;
     filtered?: boolean;
     showCommitDetails?: boolean;
+    activityViewMode?: DetailActivityViewMode;
     onEditComment?: ((event: PREvent | IssueEvent, body: string) => Promise<boolean>) | undefined;
     jumpToReviewThread?: ((thread: ReviewThread) => void) | undefined;
   }
@@ -56,6 +59,7 @@
     canReplyToThreads = false,
     filtered = false,
     showCommitDetails = true,
+    activityViewMode = "normal",
     onEditComment,
     jumpToReviewThread,
   }: Props = $props();
@@ -269,6 +273,12 @@
     return event.EventType === "commit" ? normalizeSHA(event.Summary) : null;
   }
 
+  function commitOrder(event: PREvent | IssueEvent): number {
+    if (event.EventType !== "commit") return event.ID;
+    const metadata = parseMetadata(event);
+    return metadataNumber(metadata, "commit_order_key") ?? metadataNumber(metadata, "commit_order") ?? event.ID;
+  }
+
   function addUniquePrefix(
     prefixes: CommitSHAIndex["prefixes"],
     prefix: string,
@@ -336,11 +346,25 @@
       if (beforeCommit) {
         const afterSHA = forcePushAfterSHA(event);
         const afterCommit = afterSHA ? lookupCommitBySHA(commitIndex, afterSHA) : null;
+        const beforeOrder = commitOrder(beforeCommit);
+        const afterOrder = afterCommit ? commitOrder(afterCommit) : null;
+        if (afterCommit && afterOrder !== null && afterOrder < beforeOrder) {
+          boundaries.push({
+            eventID: event.ID,
+            orderCommitID: afterOrder,
+            startAfterCommitID: 0,
+            afterCommitID: afterOrder,
+            endAtCommitID: afterOrder,
+            pushedAt: eventSortValue(event),
+            usesAfterAnchor: true,
+          });
+          continue;
+        }
         boundaries.push({
           eventID: event.ID,
-          orderCommitID: beforeCommit.ID,
-          startAfterCommitID: beforeCommit.ID,
-          afterCommitID: afterCommit?.ID,
+          orderCommitID: beforeOrder,
+          startAfterCommitID: beforeOrder,
+          afterCommitID: afterCommit ? commitOrder(afterCommit) : undefined,
           pushedAt: eventSortValue(event),
           usesAfterAnchor: false,
         });
@@ -352,10 +376,10 @@
       if (!afterCommit) continue;
       boundaries.push({
         eventID: event.ID,
-        orderCommitID: afterCommit.ID,
+        orderCommitID: commitOrder(afterCommit),
         startAfterCommitID: 0,
-        afterCommitID: afterCommit.ID,
-        endAtCommitID: afterCommit.ID,
+        afterCommitID: commitOrder(afterCommit),
+        endAtCommitID: commitOrder(afterCommit),
         pushedAt: eventSortValue(event),
         usesAfterAnchor: true,
       });
@@ -407,7 +431,11 @@
 
     const commitEvents = sourceEvents
       .filter((event) => event.EventType === "commit")
-      .sort((a, b) => a.ID - b.ID);
+      .sort((a, b) => commitOrder(a) - commitOrder(b) || a.ID - b.ID);
+    const commitOrderAt = (index: number): number => {
+      const event = commitEvents[index];
+      return event ? commitOrder(event) : Number.POSITIVE_INFINITY;
+    };
     let commitIndex = 0;
 
     for (const [index, generation] of generations.entries()) {
@@ -420,13 +448,13 @@
       };
       while (
         commitIndex < commitEvents.length &&
-        (commitEvents[commitIndex]?.ID ?? 0) <= generation.effectiveStartAfterCommitID
+        commitOrderAt(commitIndex) <= generation.effectiveStartAfterCommitID
       ) {
         commitIndex += 1;
       }
       while (
         commitIndex < commitEvents.length &&
-        (commitEvents[commitIndex]?.ID ?? Number.POSITIVE_INFINITY) <= generation.effectiveEndAtCommitID
+        commitOrderAt(commitIndex) <= generation.effectiveEndAtCommitID
       ) {
         const event = commitEvents[commitIndex];
         if (!event) break;
@@ -543,6 +571,22 @@
   const displayEvents = $derived(collapseLifecycleTransitions(events));
   const displayOrderingEvents = $derived(collapseLifecycleTransitions(orderingEvents));
   const timelineEntries = $derived(buildTimelineEntries(displayEvents, displayOrderingEvents));
+  const compactTimelineEntries = $derived(buildCompactTimelineEntries(displayEvents, displayOrderingEvents));
+  const renderedTimelineEntries = $derived(
+    activityViewMode === "compact" ? compactTimelineEntries : timelineEntries,
+  );
+
+  function buildCompactTimelineEntries(
+    sourceEvents: Array<PREvent | IssueEvent>,
+    orderingSourceEvents: Array<PREvent | IssueEvent>,
+  ): TimelineEntry[] {
+    return orderEventsForForcePushBoundaries(sourceEvents, orderingSourceEvents).map((event) => ({
+      key: `compact-event-${event.ID}`,
+      event,
+      reviewThread: reviewThreadFor(event) ?? undefined,
+      replies: [],
+    }));
+  }
 
   function isCompactEvent(eventType: string): boolean {
     return (
@@ -597,6 +641,105 @@
       default:
         return typeLabels[eventType] ?? eventType;
     }
+  }
+
+  function compactEventLabel(eventType: string): string {
+    return typeLabels[eventType] ?? systemEventLabel(eventType);
+  }
+
+  function compactMarkdownPreview(body: string): string {
+    const lines = body.replace(/\r\n/g, "\n").split("\n");
+    let inFence = false;
+    let codeFallback = "";
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (trimmed.startsWith("```") || trimmed.startsWith("~~~")) {
+        inFence = !inFence;
+        continue;
+      }
+      if (trimmed.length === 0) continue;
+      if (inFence) {
+        codeFallback ||= trimmed;
+        continue;
+      }
+
+      const text = trimmed
+        .replace(/!\[[^\]]*]\([^)]+\)/g, "")
+        .replace(/\[([^\]]+)]\([^)]+\)/g, "$1")
+        .replace(/`([^`]+)`/g, "$1")
+        .replace(/^#{1,6}\s+/, "")
+        .replace(/^>\s?/, "")
+        .replace(/^[-*+]\s+/, "")
+        .replace(/^\d+\.\s+/, "")
+        .replace(/[*_~]/g, "")
+        .trim();
+      if (text.length > 0) return text;
+    }
+
+    return codeFallback;
+  }
+
+  function compactEventContext(
+    event: PREvent | IssueEvent,
+    reviewThread: TimelineReviewThread | undefined,
+  ): string {
+    if (reviewThread) return reviewThreadLineLabel(reviewThread.thread);
+    if (event.EventType === "commit") return shortCommit(event.Summary);
+    if (event.EventType === "force_push") return event.Summary;
+    return "";
+  }
+
+  function compactReviewSummary(event: PREvent | IssueEvent): string {
+    const bodyPreview = compactMarkdownPreview(event.Body);
+    const summary = event.Summary.trim();
+    const verdict = reviewVerdictLabel(summary);
+    if (verdict && bodyPreview) return `${verdict} - ${bodyPreview}`;
+    if (verdict) return verdict;
+    if (summary && bodyPreview) return `${summary} - ${bodyPreview}`;
+    return summary || bodyPreview || "Left a review";
+  }
+
+  function reviewVerdictLabel(summary: string): string {
+    switch (summary.toUpperCase()) {
+      case "APPROVED":
+        return "Approved";
+      case "CHANGES_REQUESTED":
+        return "Changes requested";
+      case "COMMENTED":
+        return "Commented";
+      case "DISMISSED":
+        return "Dismissed";
+      case "PENDING":
+        return "Pending";
+      default:
+        return "";
+    }
+  }
+
+  function compactEventSummary(
+    event: PREvent | IssueEvent,
+    reviewThread: TimelineReviewThread | undefined,
+  ): string {
+    if (event.EventType === "review") {
+      return compactReviewSummary(event);
+    }
+    if (event.EventType === "review_comment") {
+      return compactMarkdownPreview(event.Body)
+        || (reviewThread ? compactMarkdownPreview(reviewThread.thread.body) : "")
+        || event.Summary
+        || "Left a review comment";
+    }
+    if (event.EventType === "issue_comment") {
+      return compactMarkdownPreview(event.Body) || event.Summary || "Commented";
+    }
+    if (event.EventType === "commit") {
+      return commitTitle(event.Body) || event.Summary;
+    }
+    if (event.EventType === "cross_referenced") {
+      return metadataString(parseMetadata(event), "source_title") ?? event.Summary;
+    }
+    return event.Summary || compactMarkdownPreview(event.Body) || systemEventLabel(event.EventType);
   }
 
   function parseMetadata(event: PREvent | IssueEvent): Record<string, unknown> {
@@ -689,7 +832,9 @@
   let savingEditId = $state<number | null>(null);
   let editError = $state<string | null>(null);
   let collapsedThreads = $state<string[]>([]);
+  let expandedCompactRows = $state<string[]>([]);
   let replyingThreadID = $state<string | null>(null);
+  let replyingEntryKey = $state<string | null>(null);
   let replyDraft = $state("");
   let savingReplyThreadID = $state<string | null>(null);
   let replyError = $state<string | null>(null);
@@ -737,6 +882,12 @@
     );
   }
 
+  function isReplyingToEntry(entry: TimelineEntry): boolean {
+    const targetID = replyTargetID(entry);
+    if (targetID === null || replyingThreadID !== targetID) return false;
+    return activityViewMode === "compact" ? replyingEntryKey === entry.key : true;
+  }
+
   function isThreadCollapsed(entry: TimelineEntry): boolean {
     return collapsedThreads.includes(entryThreadID(entry));
   }
@@ -748,16 +899,40 @@
       : [...collapsedThreads, id];
   }
 
+  function compactEntryCanExpand(entry: TimelineEntry): boolean {
+    if (entry.event.EventType === "commit") return showCommitDetails && commitDetailsBody(entry.event.Body).length > 0;
+    return (
+      shouldRenderMarkdown(entry.event.EventType) &&
+      (entry.event.Body.trim().length > 0 || entry.reviewThread !== undefined)
+    );
+  }
+
+  function compactEntryCanCopy(entry: TimelineEntry): boolean {
+    return shouldRenderMarkdown(entry.event.EventType) && entry.event.Body.trim().length > 0;
+  }
+
+  function isCompactEntryExpanded(entry: TimelineEntry): boolean {
+    return expandedCompactRows.includes(entry.key);
+  }
+
+  function toggleCompactEntry(entry: TimelineEntry): void {
+    expandedCompactRows = expandedCompactRows.includes(entry.key)
+      ? expandedCompactRows.filter((item) => item !== entry.key)
+      : [...expandedCompactRows, entry.key];
+  }
+
   function startReply(entry: TimelineEntry): void {
     const targetID = replyTargetID(entry);
     if (!targetID) return;
     replyingThreadID = targetID;
+    replyingEntryKey = entry.key;
     replyDraft = "";
     replyError = null;
   }
 
   function cancelReply(): void {
     replyingThreadID = null;
+    replyingEntryKey = null;
     replyDraft = "";
     replyError = null;
   }
@@ -831,7 +1006,7 @@
 
   function inlineReplyButtonHtml(entry: TimelineEntry): string {
     const targetID = replyTargetID(entry);
-    const expanded = targetID !== null && replyingThreadID === targetID;
+    const expanded = isReplyingToEntry(entry);
     const disabled = savingReplyThreadID !== null;
     return `
       <span class="thread-reply-inline-float">
@@ -1068,8 +1243,8 @@
         </div>
       {/if}
     </div>
-  {:else if canEditComment(event)}
-    <div class={nested ? "event-body-wrap event-body-wrap--nested" : "event-body-wrap"}>
+	{:else if canEditComment(event)}
+	  <div class={nested ? "event-body-wrap event-body-wrap--nested" : "event-body-wrap"}>
       {#if editingId === event.ID && provider && repoOwner && repoName && repoPath}
         <div class="edit-panel">
           <CommentEditor
@@ -1120,19 +1295,63 @@
           <PencilIcon size={14} />
         </button>
       {/if}
-    </div>
-  {/if}
+	  </div>
+	{/if}
+{/snippet}
+
+{#snippet threadReplyPanel(entry: TimelineEntry, targetID: string)}
+	{#if provider && repoOwner && repoName && repoPath}
+	  <div class="thread-reply-panel">
+	    <CommentEditor
+	      {provider}
+	      {platformHost}
+	      owner={repoOwner}
+	      name={repoName}
+	      {repoPath}
+	      value={replyDraft}
+	      placeholder="Reply to thread... (Cmd+Enter to submit)"
+	      disabled={savingReplyThreadID === targetID}
+	      oninput={(nextBody) => {
+	        replyDraft = nextBody;
+	      }}
+	      onsubmit={() => {
+	        void submitReply(entry);
+	      }}
+	    />
+	    {#if replyError}
+	      <p class="edit-error">{replyError}</p>
+	    {/if}
+	    <div class="edit-actions">
+	      <button
+	        class="edit-action edit-action--primary"
+	        onclick={() => void submitReply(entry)}
+	        disabled={savingReplyThreadID === targetID || !canReplyToThread(entry)}
+	      >
+	        <CheckIcon size={14} />
+	        {savingReplyThreadID === targetID ? "Replying..." : "Reply"}
+	      </button>
+	      <button
+	        class="edit-action"
+	        onclick={cancelReply}
+	        disabled={savingReplyThreadID === targetID}
+	      >
+	        <XIcon size={14} />
+	        Cancel
+	      </button>
+	    </div>
+	  </div>
+	{/if}
 {/snippet}
 
 {#if events.length === 0}
   <p class="empty">{filtered ? "No activity matches the current filters" : "No activity yet"}</p>
 {:else}
   <ol class="timeline">
-    {#each timelineEntries as entry (entry.key)}
+    {#each renderedTimelineEntries as entry (entry.key)}
       {@const event = entry.event}
       {@const targetID = replyTargetID(entry)}
       {@const hasReplyOnlyAction = entry.replies.length === 0 && canReplyToThread(entry)}
-      <li class={isCompactEvent(event.EventType) ? "event event--compact" : "event"}>
+      <li class={activityViewMode === "compact" || isCompactEvent(event.EventType) ? "event event--compact" : "event"}>
         <div class="event-rail">
           <span
             class="dot"
@@ -1140,7 +1359,110 @@
           ></span>
           <span class="rail-line"></span>
         </div>
-        {#if isCompactEvent(event.EventType)}
+        {#if activityViewMode === "compact"}
+          {@const compactContext = compactEventContext(event, entry.reviewThread)}
+          {@const compactSummary = compactEventSummary(event, entry.reviewThread)}
+          {@const compactMetadata = event.EventType === "cross_referenced" ? parseMetadata(event) : null}
+          {@const compactSourceUrl = compactMetadata ? metadataString(compactMetadata, "source_url") : null}
+          {@const compactSourceLink = compactMetadata ? crossReferenceLink(compactMetadata, compactSourceUrl) : null}
+          {@const canExpandCompact = compactEntryCanExpand(entry)}
+          {@const compactExpanded = isCompactEntryExpanded(entry)}
+          {@const canCopyCompact = compactEntryCanCopy(entry)}
+          <div class={["event-card event-card--compact event-card--compact-row", hasReplyOnlyAction && compactExpanded && "event-card--reply-inline"]}>
+            <div class="compact-event-line">
+              {#if canExpandCompact}
+                <button
+                  class="compact-event-row compact-event-toggle"
+                  type="button"
+                  onclick={() => toggleCompactEntry(entry)}
+                  aria-expanded={compactExpanded}
+                  title={compactExpanded ? "Collapse activity" : "Expand activity"}
+                >
+                  <span class="compact-event-expander" aria-hidden="true">
+                    {#if compactExpanded}
+                      <ChevronDownIcon size={14} />
+                    {:else}
+                      <ChevronRightIcon size={14} />
+                    {/if}
+                  </span>
+                  <span
+                    class="event-type compact-event-type"
+                    style="color: {typeColors[event.EventType] ?? 'var(--text-muted)'}"
+                  >
+                    {compactEventLabel(event.EventType)}
+                  </span>
+                  <span class="event-author compact-event-author">{event.Author || "Unknown"}</span>
+                  <span class="compact-event-context" title={compactContext}>
+                    {compactContext}
+                  </span>
+                  <span class="compact-event-summary" title={compactSummary}>
+                    {compactSummary}
+                  </span>
+                  <span class="event-time compact-event-time">{timeAgo(event.CreatedAt)}</span>
+                </button>
+              {:else}
+                <div class="compact-event-row">
+                  <span class="compact-event-expander" aria-hidden="true"></span>
+                  <span
+                    class="event-type compact-event-type"
+                    style="color: {typeColors[event.EventType] ?? 'var(--text-muted)'}"
+                  >
+                    {compactEventLabel(event.EventType)}
+                  </span>
+                  <span class="event-author compact-event-author">{event.Author || "Unknown"}</span>
+                  <span class="compact-event-context" title={compactContext}>
+                    {compactContext}
+                  </span>
+                  <span class="compact-event-summary" title={compactSummary}>
+                    {#if compactSourceLink}
+                      <a
+                        class={["system-event-link", { "item-ref": compactSourceLink.internal }]}
+                        href={compactSourceLink.href}
+                        target={compactSourceLink.internal ? undefined : "_blank"}
+                        rel={compactSourceLink.internal ? undefined : "noopener noreferrer"}
+                        {...(compactSourceLink.dataAttributes ?? {})}
+                      >
+                        {compactSummary}
+                      </a>
+                    {:else}
+                      {compactSummary}
+                    {/if}
+                  </span>
+                  <span class="event-time compact-event-time">{timeAgo(event.CreatedAt)}</span>
+                </div>
+              {/if}
+              {#if canCopyCompact}
+                <button
+                  class="event-action-btn compact-copy-btn"
+                  class:copied={copiedId === String(event.ID)}
+                  onclick={() => copyText(String(event.ID), event.Body)}
+                  title={copiedId === String(event.ID) ? "Copied!" : "Copy to clipboard"}
+                  aria-label={copiedId === String(event.ID) ? "Copied" : "Copy comment"}
+                >
+                  {#if copiedId === String(event.ID)}
+                    <CheckIcon size={14} />
+                  {:else}
+                    <CopyIcon size={14} />
+                  {/if}
+                </button>
+              {/if}
+            </div>
+            {#if canExpandCompact && compactExpanded}
+              <div class="compact-expanded-content">
+                {#if event.EventType === "commit"}
+                  <div class="event-body commit-body-details">
+                    {commitDetailsBody(event.Body)}
+                  </div>
+                {:else}
+                  {@render eventBody(event, false, entry.reviewThread, hasReplyOnlyAction ? entry : undefined)}
+                {/if}
+              </div>
+            {/if}
+            {#if isReplyingToEntry(entry) && targetID !== null}
+              {@render threadReplyPanel(entry, targetID)}
+            {/if}
+          </div>
+        {:else if isCompactEvent(event.EventType)}
           {@const metadata = parseMetadata(event)}
           {@const commitDetails = event.EventType === "commit" ? commitDetailsBody(event.Body) : ""}
           <div class="event-card event-card--compact">
@@ -1253,7 +1575,7 @@
                     class="thread-toggle thread-reply-action"
                     type="button"
                     onclick={() => startReply(entry)}
-                    aria-expanded={targetID !== null && replyingThreadID === targetID}
+                    aria-expanded={isReplyingToEntry(entry)}
                     disabled={savingReplyThreadID !== null}
                   >
                     <MessageSquareReplyIcon size={14} />
@@ -1287,46 +1609,8 @@
                 </ol>
               {/if}
             {/if}
-            {#if targetID !== null && replyingThreadID === targetID && provider && repoOwner && repoName && repoPath}
-              <div class="thread-reply-panel">
-                <CommentEditor
-                  {provider}
-                  {platformHost}
-                  owner={repoOwner}
-                  name={repoName}
-                  {repoPath}
-                  value={replyDraft}
-                  placeholder="Reply to thread... (Cmd+Enter to submit)"
-                  disabled={savingReplyThreadID === targetID}
-                  oninput={(nextBody) => {
-                    replyDraft = nextBody;
-                  }}
-                  onsubmit={() => {
-                    void submitReply(entry);
-                  }}
-                />
-                {#if replyError}
-                  <p class="edit-error">{replyError}</p>
-                {/if}
-                <div class="edit-actions">
-                  <button
-                    class="edit-action edit-action--primary"
-                    onclick={() => void submitReply(entry)}
-                    disabled={savingReplyThreadID === targetID || !canReplyToThread(entry)}
-                  >
-                    <CheckIcon size={14} />
-                    {savingReplyThreadID === targetID ? "Replying..." : "Reply"}
-                  </button>
-                  <button
-                    class="edit-action"
-                    onclick={cancelReply}
-                    disabled={savingReplyThreadID === targetID}
-                  >
-                    <XIcon size={14} />
-                    Cancel
-                  </button>
-                </div>
-              </div>
+            {#if isReplyingToEntry(entry) && targetID !== null}
+              {@render threadReplyPanel(entry, targetID)}
             {/if}
           </div>
         {/if}
@@ -1412,6 +1696,97 @@
   }
 
   .event-header--compact .event-time {
+    margin-left: 0;
+  }
+
+  .event-card--compact-row {
+    overflow: hidden;
+  }
+
+  .compact-event-line {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) max-content;
+    align-items: center;
+    gap: var(--focus-detail-space-xs, 0.31rem);
+    min-width: 0;
+  }
+
+  .compact-event-row {
+    display: grid;
+    grid-template-columns: 1.15rem minmax(6.5rem, 7.5rem) minmax(5rem, 7rem) minmax(0, 8.5rem) minmax(0, 1fr) max-content;
+    align-items: center;
+    gap: var(--focus-detail-space-xs, 0.46rem);
+    min-width: 0;
+  }
+
+  .compact-event-toggle {
+    width: 100%;
+    color: inherit;
+    text-align: left;
+    border-radius: var(--radius-sm);
+  }
+
+  .compact-event-toggle:hover {
+    background: var(--bg-surface-hover);
+  }
+
+  .compact-event-toggle:focus-visible {
+    outline: 2px solid var(--focus-ring, var(--accent-blue));
+    outline-offset: 2px;
+  }
+
+  .compact-event-expander {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-muted);
+  }
+
+  .event-action-btn.compact-copy-btn {
+    width: 1.75rem;
+    height: 1.75rem;
+    opacity: 0.72;
+  }
+
+  .compact-event-line:hover .compact-copy-btn,
+  .event-action-btn.compact-copy-btn:focus-visible,
+  .event-action-btn.compact-copy-btn.copied {
+    opacity: 1;
+  }
+
+  .compact-expanded-content {
+    margin-top: var(--focus-detail-space-sm, 0.62rem);
+    padding-top: var(--focus-detail-space-sm, 0.62rem);
+    border-top: 1px solid var(--border-muted);
+  }
+
+  .compact-expanded-content .event-body-wrap {
+    margin-top: 0;
+  }
+
+  .compact-event-type,
+  .compact-event-author,
+  .compact-event-context,
+  .compact-event-summary,
+  .compact-event-time {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .compact-event-context {
+    font-family: var(--font-mono);
+    font-size: var(--font-size-xs);
+    color: var(--text-secondary);
+  }
+
+  .compact-event-summary {
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+  }
+
+  .compact-event-time {
     margin-left: 0;
   }
 

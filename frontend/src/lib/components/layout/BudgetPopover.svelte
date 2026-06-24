@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { RateLimitHostStatus } from "@middleman/ui/api/types";
-  import { budgetColor, formatCompact } from "./budget-utils";
+  import { budgetColor, formatCompact, syncBudgetColor } from "./budget-utils";
 
   interface Props {
     hosts: Record<string, RateLimitHostStatus>;
@@ -81,7 +81,7 @@
 >
   <div class="popover-header">API Budget</div>
 
-  {#each hostEntries() as [hostname, h], i}
+  {#each hostEntries() as [hostname, h], i (hostname)}
     {#if i > 0}
       <div class="popover-divider"></div>
     {/if}
@@ -146,13 +146,24 @@
         {/if}
       </div>
 
-      <!-- Middleman Budget -->
+      <!-- Eager refresh budget -->
       {#if h.budget_limit > 0}
-        <div class="budget-row">
-          <span class="row-label">Middleman</span>
+        <div class="budget-row budget-row--eager">
+          <span class="row-label">Eager refresh</span>
           <span class="row-bar-cell"></span>
           <span class="row-value">
-            <span class="budget-spent">{formatCompact(h.budget_spent)}</span> / {formatCompact(h.budget_limit)} <span class="row-unit">req/hr</span>
+            <span
+              class="budget-spent"
+              class:budget-spent--over={h.budget_spent > h.budget_limit}
+              style:color={syncBudgetColor(h.budget_spent, h.budget_limit)}
+            >{formatCompact(h.budget_spent)}</span> / {formatCompact(h.budget_limit)} <span class="row-unit">budgeted req/hr</span>
+          </span>
+          <span class="row-note">
+            {#if h.budget_spent > h.budget_limit}
+              Details, comments, and backfills are paused.
+            {:else}
+              Details, comments, and backfills pause when spent.
+            {/if}
           </span>
         </div>
       {/if}
@@ -211,10 +222,13 @@
   .budget-row {
     /* label | bar | value (with inline reset) */
     display: grid;
-    grid-template-columns: 60px 60px 1fr;
+    grid-template-columns: 78px 42px 1fr;
     align-items: center;
     column-gap: 8px;
     margin-bottom: 6px;
+  }
+  .budget-row--eager {
+    align-items: start;
   }
   .row-label {
     color: var(--text-muted);
@@ -249,6 +263,14 @@
     font-size: 0.9em;
     opacity: 0.7;
   }
+  .row-note {
+    display: block;
+    grid-column: 3;
+    margin-top: 1px;
+    color: var(--text-muted);
+    font-size: 0.9em;
+    line-height: 1.2;
+  }
   .row-unknown {
     color: var(--text-muted);
     font-size: var(--font-size-2xs);
@@ -257,6 +279,9 @@
   .budget-spent {
     color: var(--budget-blue);
     font-weight: 600;
+  }
+  .budget-spent--over {
+    font-weight: 700;
   }
   .throttle-indicator {
     font-size: var(--font-size-2xs);

@@ -1,4 +1,15 @@
 import { expect, test, type Locator, type Page } from "@playwright/test";
+import { startIsolatedE2EServer } from "./support/e2eServer";
+
+type PullListRow = {
+  Title: string;
+  ReviewDecision: string;
+  KanbanStatus: string;
+};
+
+type PullDetailRow = {
+  merge_request: PullListRow;
+};
 
 async function waitForPRList(page: Page): Promise<void> {
   await page.locator(".pull-item").first().waitFor({ state: "visible", timeout: 10_000 });
@@ -77,9 +88,7 @@ async function expectCompactFiltersAtMinimumWidth(
   await expect.poll(async () => sidebarWidth(sidebar)).toBe(200);
 
   const filterBar = sidebar.locator(".filter-bar").first();
-  const compactFilters = filterBar.getByRole("button", {
-    name: "Filters",
-  });
+  const compactFilters = filterBar.locator(".compact-filter-menu .filter-btn");
   await expect(compactFilters).toBeVisible();
   await expect(filterBar.locator(".state-toggle")).toBeHidden();
   await expect(filterBar.locator(".group-toggle")).toBeHidden();
@@ -103,7 +112,7 @@ async function expectCompactFiltersInNarrowViewport(
 
   const sidebar = page.locator(".sidebar").first();
   const filterBar = sidebar.locator(".filter-bar").first();
-  await expect(filterBar.getByRole("button", { name: "Filters" })).toBeVisible();
+  await expect(filterBar.locator(".compact-filter-menu .filter-btn")).toBeVisible();
   await expect(filterBar.locator(".state-toggle")).toBeHidden();
   await expect(filterBar.locator(".group-toggle")).toBeHidden();
 }
@@ -125,21 +134,22 @@ async function setPersistedSidebarWidth(
 }
 
 async function expectCompactFilterBar(filterBar: Locator): Promise<void> {
-  await expect(filterBar.getByRole("button", { name: "Filters" })).toBeVisible();
+  await expect(filterBar.locator(".compact-filter-menu .filter-btn")).toBeVisible();
+  await expect(filterBar.locator(".local-filter-menu .filter-btn")).toBeHidden();
   await expect(filterBar.locator(".state-toggle")).toBeHidden();
   await expect(filterBar.locator(".group-toggle")).toBeHidden();
   await expectFastAnimation(filterBar.locator(".compact-filter-menu"));
 }
 
 async function openCompactFilters(filterBar: Locator): Promise<Locator> {
-  await filterBar.getByRole("button", { name: "Filters" }).click();
+  await filterBar.locator(".compact-filter-menu .filter-btn").click();
   const dropdown = filterBar.page().locator(".filter-dropdown");
   await expect(dropdown).toBeVisible();
   return dropdown;
 }
 
 async function expectExpandedFilterBar(filterBar: Locator): Promise<void> {
-  await expect(filterBar.getByRole("button", { name: "Filters" })).toBeHidden();
+  await expect(filterBar.locator(".compact-filter-menu .filter-btn")).toBeHidden();
   await expect(filterBar.locator(".state-toggle")).toBeVisible();
   await expect(filterBar.locator(".group-toggle")).toBeVisible();
   await expectFastAnimation(filterBar.locator(".state-toggle"));
@@ -148,6 +158,32 @@ async function expectExpandedFilterBar(filterBar: Locator): Promise<void> {
     scrollWidth: node.scrollWidth,
   }));
   expect(filterMetrics.scrollWidth).toBeLessThanOrEqual(filterMetrics.clientWidth);
+}
+
+async function expectPullLocalFilterIconOnly(filterBar: Locator): Promise<void> {
+  const localFilter = filterBar.locator(".local-filter-menu");
+  await expect(filterBar.locator(".state-toggle")).toBeVisible();
+  await expect(filterBar.locator(".group-toggle")).toBeVisible();
+  await expect(filterBar.locator(".compact-filter-menu")).toBeHidden();
+  await expect(localFilter.locator(".filter-trigger-label")).toHaveCSS("display", "none");
+
+  const triggerWidth = await localFilter
+    .locator(".filter-btn")
+    .evaluate((node) => Math.round(node.getBoundingClientRect().width));
+  expect(triggerWidth).toBe(34);
+
+  const filterMetrics = await filterBar.evaluate((node) => ({
+    clientWidth: node.clientWidth,
+    scrollWidth: node.scrollWidth,
+  }));
+  expect(filterMetrics.scrollWidth).toBeLessThanOrEqual(filterMetrics.clientWidth);
+}
+
+async function expectPullLocalFilterLabeled(filterBar: Locator): Promise<void> {
+  await expectExpandedFilterBar(filterBar);
+  const localFilter = filterBar.locator(".local-filter-menu");
+  await expect(localFilter.locator(".filter-trigger-label")).toHaveText("PR filters");
+  await expect(localFilter.locator(".filter-trigger-label")).not.toHaveCSS("display", "none");
 }
 
 async function expectFastAnimation(locator: Locator): Promise<void> {
@@ -269,9 +305,14 @@ test.describe("collapsible sidebar", () => {
     await expectCompactFiltersInNarrowViewport(page, "/issues", waitForIssueList);
   });
 
-  test("pull filters switch at the buffered 396px fit point", async ({ page }) => {
-    await expectCompactFilterBar(await setPersistedSidebarWidth(page, "/pulls", 395, waitForPRList));
-    await expectExpandedFilterBar(await setPersistedSidebarWidth(page, "/pulls", 396, waitForPRList));
+  test("pull filters switch at the buffered 431px fit point", async ({ page }) => {
+    await expectCompactFilterBar(await setPersistedSidebarWidth(page, "/pulls", 430, waitForPRList));
+    await expectExpandedFilterBar(await setPersistedSidebarWidth(page, "/pulls", 431, waitForPRList));
+  });
+
+  test("pull PR filter becomes icon-only before the filter row compacts", async ({ page }) => {
+    await expectPullLocalFilterIconOnly(await setPersistedSidebarWidth(page, "/pulls", 520, waitForPRList));
+    await expectPullLocalFilterLabeled(await setPersistedSidebarWidth(page, "/pulls", 521, waitForPRList));
   });
 
   test("issue filters switch at the buffered 373px fit point", async ({ page }) => {
@@ -283,28 +324,95 @@ test.describe("collapsible sidebar", () => {
     const filterBar = await setPersistedSidebarWidth(page, "/pulls", 395, waitForPRList);
     await expectCompactFilterBar(filterBar);
 
-    let dropdown = await openCompactFilters(filterBar);
+    const dropdown = await openCompactFilters(filterBar);
+    await expect(dropdown.locator(".filter-section-title", { hasText: "PR" })).toBeVisible();
+    await expect(dropdown.locator(".filter-section-title", { hasText: "Kanban" })).toBeVisible();
     await dropdown.locator(".filter-item", { hasText: "Closed" }).click();
     await expect(filterBar.page().locator(".state-note")).toBeVisible();
+    await expect(dropdown).toBeVisible();
 
-    dropdown = await openCompactFilters(filterBar);
-    await dropdown.locator(".filter-item", { hasText: "All" }).last().click();
+    await dropdown.locator(".filter-item", { hasText: "Flat list" }).click();
+    await expect(dropdown).toBeVisible();
     await expect(page.locator(".repo-header")).toHaveCount(0, {
       timeout: 5_000,
     });
     await expect(page.locator(".repo-chip").first()).toBeVisible();
   });
 
+  test("pull compact filters apply PR attributes and kanban status against the real API", async ({ page }) => {
+    const server = await startIsolatedE2EServer();
+    try {
+      const stateResponse = await page.request.put(`${server.info.base_url}/api/v1/pulls/github/acme/widgets/1/state`, {
+        data: { status: "reviewing" },
+      });
+      expect(stateResponse.ok()).toBe(true);
+
+      const pullsResponse = await page.request.get(`${server.info.base_url}/api/v1/pulls?state=open`);
+      expect(pullsResponse.ok()).toBe(true);
+      const pulls = (await pullsResponse.json()) as PullListRow[];
+      const expectedTitles = pulls
+        .filter((pull) => pull.ReviewDecision.trim().toUpperCase() === "APPROVED" && pull.KanbanStatus === "reviewing")
+        .map((pull) => pull.Title);
+      expect(expectedTitles).toEqual(["Add widget caching layer"]);
+
+      const filterBar = await setPersistedSidebarWidth(page, `${server.info.base_url}/pulls`, 395, waitForPRList);
+      await expectCompactFilterBar(filterBar);
+
+      const dropdown = await openCompactFilters(filterBar);
+      await dropdown.getByRole("button", { name: "Approved", exact: true }).click();
+      await dropdown.getByRole("button", { name: "Reviewing", exact: true }).click();
+
+      const rows = page.locator(".pull-item");
+      await expect(rows).toHaveCount(expectedTitles.length);
+      for (const title of expectedTitles) {
+        await expect(page.locator(".pull-item", { hasText: title })).toBeVisible();
+      }
+    } finally {
+      await server.stop();
+    }
+  });
+
+  test("pull compact filters keep default-new PRs visible through the real API", async ({ page }) => {
+    const server = await startIsolatedE2EServer();
+    try {
+      const detailResponse = await page.request.get(`${server.info.base_url}/api/v1/pulls/github/acme/widgets/1`);
+      expect(detailResponse.ok()).toBe(true);
+      const detail = (await detailResponse.json()) as PullDetailRow;
+      expect(detail.merge_request.KanbanStatus).toBe("new");
+
+      const pullsResponse = await page.request.get(`${server.info.base_url}/api/v1/pulls?state=open`);
+      expect(pullsResponse.ok()).toBe(true);
+      const pulls = (await pullsResponse.json()) as PullListRow[];
+      const expectedTitles = pulls.filter((pull) => pull.KanbanStatus === "new").map((pull) => pull.Title);
+      expect(expectedTitles).toContain("Add widget caching layer");
+
+      const filterBar = await setPersistedSidebarWidth(page, `${server.info.base_url}/pulls`, 395, waitForPRList);
+      await expectCompactFilterBar(filterBar);
+
+      const dropdown = await openCompactFilters(filterBar);
+      await dropdown.getByRole("button", { name: "New", exact: true }).click();
+
+      const rows = page.locator(".pull-item");
+      await expect(rows).toHaveCount(expectedTitles.length);
+      for (const title of expectedTitles) {
+        await expect(page.locator(".pull-item", { hasText: title })).toBeVisible();
+      }
+    } finally {
+      await server.stop();
+    }
+  });
+
   test("issue compact filters update state and grouping", async ({ page }) => {
     const filterBar = await setPersistedSidebarWidth(page, "/issues", 372, waitForIssueList);
     await expectCompactFilterBar(filterBar);
 
-    let dropdown = await openCompactFilters(filterBar);
+    const dropdown = await openCompactFilters(filterBar);
     await dropdown.locator(".filter-item", { hasText: "Closed" }).click();
     await expect(filterBar.page().locator(".state-note")).toBeVisible();
+    await expect(dropdown).toBeVisible();
 
-    dropdown = await openCompactFilters(filterBar);
     await dropdown.locator(".filter-item", { hasText: "All" }).last().click();
+    await expect(dropdown).toBeVisible();
     await expect(page.locator(".repo-header")).toHaveCount(0, {
       timeout: 5_000,
     });

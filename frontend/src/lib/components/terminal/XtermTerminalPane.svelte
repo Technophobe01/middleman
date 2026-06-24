@@ -113,7 +113,8 @@
     rows: number,
   ): string {
     const sep = url.includes("?") ? "&" : "?";
-    return `${url}${sep}cols=${cols}&rows=${rows}`;
+    const resizeActive = active ? "1" : "0";
+    return `${url}${sep}cols=${cols}&rows=${rows}&resize_active=${resizeActive}`;
   }
 
   function buildWsUrl(
@@ -172,6 +173,12 @@
     sendControl("refresh", cols, rows);
   }
 
+  function sendResizeActive(nextActive: boolean): void {
+    if (ws?.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "resize_active", active: nextActive }));
+    }
+  }
+
   function sendControl(
     type: "resize" | "refresh",
     cols: number,
@@ -197,10 +204,18 @@
     terminal.refresh(0, Math.max(0, terminal.rows - 1));
   }
 
+  function isFirefox(): boolean {
+    return navigator.userAgent.toLowerCase().includes("firefox/");
+  }
+
   function recreateWebglAddon(): void {
     if (!terminal) return;
     webglAddon?.dispose();
     webglAddon = null;
+    if (isFirefox()) {
+      scheduleTerminalResize();
+      return;
+    }
     try {
       const wgl = new WebglAddon();
       wgl.onContextLoss(() => {
@@ -248,7 +263,7 @@
   }
 
   function resizeVisibleTerminal(): void {
-    if (!fitAddon || !terminal) return;
+    if (!fitAddon || !terminal || !active) return;
 
     fitAddon.fit();
     terminal.refresh(0, Math.max(0, terminal.rows - 1));
@@ -289,6 +304,7 @@
 
     socket.onopen = () => {
       reconnectDelay = 1000;
+      sendResizeActive(active);
       if (active) scheduleTerminalRefresh();
     };
 
@@ -437,8 +453,9 @@
   });
 
   $effect(() => {
-    if (!terminal || !active) return;
-    scheduleTerminalRefresh();
+    if (!terminal) return;
+    sendResizeActive(active);
+    if (active) scheduleTerminalRefresh();
   });
 
   onMount(() => {

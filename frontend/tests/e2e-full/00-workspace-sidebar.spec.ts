@@ -101,6 +101,79 @@ async function createIssueWorkspace(api: APIRequestContext, issueNumber: number)
 test.describe("workspace sidebar full-stack", () => {
   test.describe.configure({ timeout: lockedWorkspaceTestTimeoutMs });
 
+  test("shows retrying copy when the workspace list request stalls", async ({ page }) => {
+    let isolatedServer: IsolatedE2EServer | null = null;
+    try {
+      isolatedServer = await startIsolatedWorkspaceE2EServer();
+      await page.route("**/api/v1/workspaces", async () => {
+        // Keep the first list request pending so the real app shell
+        // exercises the workspace rail's hung-request state.
+      });
+
+      await page.goto(`${isolatedServer.info.base_url}/workspaces`);
+
+      await expect(page.getByText("Loading workspaces...")).toBeVisible();
+      await expect(page.getByText("Still loading workspaces. Retrying...")).toBeVisible({
+        timeout: 12_000,
+      });
+    } finally {
+      await isolatedServer?.stop();
+    }
+  });
+
+  test("empty Workspaces pane explains creation and renders launch targets from settings", async ({ page }) => {
+    let isolatedServer: IsolatedE2EServer | null = null;
+    let api: APIRequestContext | null = null;
+    try {
+      isolatedServer = await startIsolatedWorkspaceE2EServer();
+      api = await playwrightRequest.newContext({
+        baseURL: isolatedServer.info.base_url,
+      });
+
+      const seedResponse = await api.put("/api/v1/settings", {
+        data: {
+          agents: [
+            {
+              key: "e2e-agent",
+              label: "E2E Agent",
+              command: ["/bin/sh", "-lc", "true"],
+              enabled: true,
+            },
+          ],
+        },
+      });
+      const seedBody = await seedResponse.text();
+      expect(seedResponse.status(), `PUT /api/v1/settings failed: ${seedBody}`).toBe(200);
+
+      await page.goto(`${isolatedServer.info.base_url}/workspaces`);
+
+      await expect(
+        page.getByRole("heading", {
+          name: "Create a workspace to run agents from a PR or issue",
+        }),
+      ).toBeVisible();
+      await expect(page.getByText("Workspaces are git worktrees created from PR or issue heads.")).toBeVisible();
+      await expect(page.getByText(/From a PR or issue, use the/)).toBeVisible();
+      await expect(page.getByRole("button", { name: "Create Workspace" })).toBeDisabled();
+      await expect(page.getByText("No workspaces yet.")).toBeVisible();
+
+      const launchSurface = page.getByLabel("Launch surface example");
+      await expect(
+        launchSurface.getByText("You can then launch configured agents via the buttons provided"),
+      ).toBeVisible();
+      await expect(launchSurface.getByText("Launch", { exact: true })).toBeVisible();
+      await expect(launchSurface.getByRole("button", { name: "E2E Agent" })).toBeDisabled();
+      await expect(launchSurface.getByRole("button", { name: "Shell" })).toBeDisabled();
+
+      const iconColor = await launchSurface.locator(".section-icon").evaluate((node) => getComputedStyle(node).color);
+      const sectionColor = await launchSurface.locator(".section-bar").evaluate((node) => getComputedStyle(node).color);
+      expect(iconColor).toBe(sectionColor);
+    } finally {
+      await api?.dispose();
+      await isolatedServer?.stop();
+    }
+  });
+
   test("shows provider icons in group headers when workspaces span multiple providers", async ({ page }) => {
     let isolatedServer: IsolatedE2EServer | null = null;
     let api: APIRequestContext | null = null;
@@ -211,7 +284,7 @@ test.describe("workspace sidebar full-stack", () => {
       await expect(rows).toHaveCount(2);
       await expect(headers).toHaveCount(2);
 
-      await page.getByTitle("Sort workspaces").click();
+      await page.getByTitle("View workspace options").click();
       await page.locator(".filter-dropdown .filter-item", { hasText: "Created" }).click();
 
       // Flat list ordered by the real created_at column: the
@@ -231,7 +304,7 @@ test.describe("workspace sidebar full-stack", () => {
       await expect(headers).toHaveCount(0);
       await expect(rows.first().locator(".repo-context")).toContainText("group/project");
 
-      await page.getByTitle("Sort workspaces").click();
+      await page.getByTitle("View workspace options").click();
       await page.locator(".filter-dropdown .filter-item", { hasText: "Item activity" }).click();
 
       await expect(headers).toHaveCount(0);
@@ -245,6 +318,138 @@ test.describe("workspace sidebar full-stack", () => {
       await expect(rows).toHaveCount(2);
       await expect(rows.nth(0).locator(".repo-context")).toContainText(firstItemActivityRepo ?? "");
       await expect(rows.nth(1).locator(".repo-context")).toContainText(secondItemActivityRepo ?? "");
+    } finally {
+      await api?.dispose();
+      await isolatedServer?.stop();
+    }
+  });
+
+  test("view menu hides org names and PR diff stats against the real backend and persists", async ({ page }) => {
+    let isolatedServer: IsolatedE2EServer | null = null;
+    let api: APIRequestContext | null = null;
+    try {
+      isolatedServer = await startIsolatedWorkspaceE2EServer();
+      api = await playwrightRequest.newContext({
+        baseURL: isolatedServer.info.base_url,
+      });
+
+      // acme/widgets PR #1 ships real +240/-30 diff stats in the seeded
+      // fixture, so the rail renders its diff-stats chip from backend
+      // data rather than a route mock.
+      const createResponse = await api.post("/api/v1/workspaces", {
+        data: {
+          platform_host: "github.com",
+          owner: "acme",
+          name: "widgets",
+          mr_number: 1,
+        },
+      });
+      expect(createResponse.status()).toBe(202);
+      const workspace = (await createResponse.json()) as WorkspaceStatusResponse;
+      await waitForWorkspaceReady(api, workspace.id);
+
+      const workspacesResponse = await api.get("/api/v1/workspaces");
+      expect(workspacesResponse.ok()).toBe(true);
+      const workspacesPayload = (await workspacesResponse.json()) as {
+        workspaces: Array<{ id: string; mr_additions?: number | null; mr_deletions?: number | null }>;
+      };
+      const seeded = workspacesPayload.workspaces.find((entry) => entry.id === workspace.id);
+      expect(seeded?.mr_additions).toBe(240);
+      expect(seeded?.mr_deletions).toBe(30);
+
+      // The terminal route derives the rail width from the global
+      // sidebar width (clamped to 420px). Pin it wide so the 260px
+      // container query that hides diff stats can never fire and mask
+      // the toggle's effect.
+      await page.addInitScript(() => {
+        window.localStorage.setItem("middleman-sidebar-width", "420");
+      });
+
+      await page.goto(`${isolatedServer.info.base_url}/terminal/${workspace.id}`);
+
+      const groupLabel = page.locator(".workspace-list-sidebar .group-header .group-label");
+      const diffStats = page.locator(".workspace-list-sidebar .workspace-diff-stats");
+      const viewTrigger = page.getByTitle("View workspace options");
+      const viewBadge = viewTrigger.locator(".filter-badge");
+
+      // Defaults: org name shown in the repo label, diff stats visible.
+      await expect(groupLabel).toHaveText("acme/widgets");
+      await expect(diffStats).toBeVisible();
+      await expect(page.getByLabel("240 additions, 30 deletions")).toBeVisible();
+      await expect(viewBadge).toHaveCount(0);
+
+      // Visibility toggles do not close the menu, so both can be flipped
+      // in a single pass before dismissing it.
+      await viewTrigger.click();
+      await page.locator(".filter-dropdown .filter-item", { hasText: "Show org names" }).click();
+      await page.locator(".filter-dropdown .filter-item", { hasText: "Show PR diff stats" }).click();
+      await page.keyboard.press("Escape");
+
+      await expect(groupLabel).toHaveText("widgets");
+      await expect(diffStats).toHaveCount(0);
+      // Branch metadata survives hiding the diff stats.
+      await expect(page.locator(".workspace-list-sidebar .ws-row .branch-chip")).toBeVisible();
+      // Both deviations from default register on the trigger badge.
+      await expect(viewBadge).toHaveText("2");
+
+      // Both choices persist against the real backend across a reload.
+      await page.reload();
+      await expect(groupLabel).toHaveText("widgets");
+      await expect(diffStats).toHaveCount(0);
+      await expect(viewBadge).toHaveText("2");
+    } finally {
+      await api?.dispose();
+      await isolatedServer?.stop();
+    }
+  });
+
+  test("context menu delete removes the workspace through the real backend", async ({ page }) => {
+    let isolatedServer: IsolatedE2EServer | null = null;
+    let api: APIRequestContext | null = null;
+    try {
+      isolatedServer = await startIsolatedWorkspaceE2EServer();
+      api = await playwrightRequest.newContext({
+        baseURL: isolatedServer.info.base_url,
+      });
+
+      const deletedWorkspace = await createIssueWorkspace(api, 10);
+      await createIssueWorkspace(api, 11);
+
+      await page.goto(`${isolatedServer.info.base_url}/terminal/${deletedWorkspace.id}`);
+
+      const rows = page.locator(".workspace-list-sidebar .ws-row");
+      await expect(rows).toHaveCount(2);
+
+      const deletedRow = rows.filter({ hasText: "Widget rendering broken on Safari" });
+      await expect(deletedRow).toHaveCount(1);
+      await deletedRow.click({ button: "right" });
+
+      await page
+        .getByRole("menu", { name: "Workspace actions" })
+        .getByRole("menuitem", { name: "Delete workspace..." })
+        .click();
+
+      const dialog = page.getByRole("dialog", { name: "Delete workspace?" });
+      await expect(dialog).toBeVisible();
+      await expect(dialog).toContainText("Widget rendering broken on Safari");
+
+      const deleteResponse = page.waitForResponse(
+        (response) =>
+          response.request().method() === "DELETE" &&
+          new URL(response.url()).pathname === `/api/v1/workspaces/${deletedWorkspace.id}`,
+      );
+      await dialog.getByRole("button", { name: "Delete workspace" }).click();
+      expect((await deleteResponse).status()).toBe(204);
+
+      await expect(page).toHaveURL(/\/workspaces$/);
+      await expect(rows).toHaveCount(1);
+      await expect(rows).not.toContainText("Widget rendering broken on Safari");
+      await expect(rows).toContainText("Add dark mode support");
+
+      const workspacesResponse = await api.get("/api/v1/workspaces");
+      expect(workspacesResponse.ok()).toBe(true);
+      const workspacesPayload = (await workspacesResponse.json()) as WorkspaceListResponse;
+      expect(workspacesPayload.workspaces.map((workspace) => workspace.id)).not.toContain(deletedWorkspace.id);
     } finally {
       await api?.dispose();
       await isolatedServer?.stop();
@@ -353,6 +558,7 @@ test.describe("workspace sidebar full-stack", () => {
             letter_spacing: 0,
             cursor_blink: true,
             font_ligatures: false,
+            hide_tmux_status: false,
             renderer: "ghostty-web",
           },
         },

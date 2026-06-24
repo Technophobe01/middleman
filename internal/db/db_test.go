@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	Assert "github.com/stretchr/testify/assert"
 	_ "modernc.org/sqlite"
 
 	"github.com/stretchr/testify/require"
@@ -31,6 +32,7 @@ func openDBWithMigrations(t *testing.T) *DB {
 }
 
 func TestOpenAndSchema(t *testing.T) {
+	require := require.New(t)
 	d := openDBWithMigrations(t)
 	tables := []string{
 		"middleman_repos",
@@ -44,13 +46,17 @@ func TestOpenAndSchema(t *testing.T) {
 		"middleman_mr_review_drafts",
 		"middleman_mr_review_draft_comments",
 		"middleman_mr_review_threads",
+		"middleman_project_worktree_runtime_sessions",
+		"middleman_host_runtime_sessions",
+		"middleman_notification_items",
+		"middleman_notification_sync_watermarks",
 	}
 	for _, tbl := range tables {
 		var name string
 		err := d.ReadDB().QueryRow(
 			"SELECT name FROM sqlite_master WHERE type='table' AND name=?", tbl,
 		).Scan(&name)
-		require.NoErrorf(t, err, "table %s should exist", tbl)
+		require.NoErrorf(err, "table %s should exist", tbl)
 	}
 
 	for _, column := range []string{"workspace_branch", "associated_pr_number", "terminal_backend"} {
@@ -61,9 +67,80 @@ func TestOpenAndSchema(t *testing.T) {
 			 WHERE name = ?`,
 			column,
 		).Scan(&found)
-		require.NoError(t, err)
-		require.Equal(t, column, found)
+		require.NoError(err)
+		require.Equal(column, found)
 	}
+
+	runtimeSessionColumns := map[string][]string{
+		"middleman_project_worktree_runtime_sessions": {
+			"runtime_backend",
+			"backend_session_key",
+		},
+		"middleman_host_runtime_sessions": {
+			"runtime_backend",
+			"backend_session_key",
+		},
+	}
+	for table, columns := range runtimeSessionColumns {
+		for _, column := range columns {
+			var found string
+			err := d.ReadDB().QueryRow(
+				`SELECT name
+				 FROM pragma_table_info(?)
+				 WHERE name = ?`,
+				table, column,
+			).Scan(&found)
+			require.NoError(err)
+			require.Equal(column, found)
+		}
+	}
+}
+
+func TestOpenRepairsFleetSchemaSkippedByBranchNotificationMigrationCollision(t *testing.T) {
+	require := require.New(t)
+	assert := Assert.New(t)
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "collision.db")
+
+	d, err := Open(dbPath)
+	require.NoError(err)
+	require.NoError(d.Close())
+
+	raw, err := sql.Open("sqlite", dbPath)
+	require.NoError(err)
+	_, err = raw.Exec(`
+		INSERT INTO middleman_workspace_runtime_sessions
+		    (workspace_id, session_key, target_key, label, kind, scope, tmux_session)
+		VALUES ('ws-1', 'session-1', 'plain_shell', 'Terminal', 'terminal', 'session', '');
+	`)
+	require.NoError(err)
+	require.NoError(removeProjectDiscoveryColumnsForTest(raw))
+	_, err = raw.Exec(`UPDATE schema_migrations SET version = 34, dirty = FALSE`)
+	require.NoError(err)
+	require.NoError(raw.Close())
+
+	reopened, err := Open(dbPath)
+	require.NoError(err)
+	t.Cleanup(func() { require.NoError(reopened.Close()) })
+
+	var version int
+	var dirty bool
+	err = reopened.ReadDB().QueryRow(
+		`SELECT version, dirty FROM schema_migrations LIMIT 1`,
+	).Scan(&version, &dirty)
+	require.NoError(err)
+	assert.Equal(latestMigrationVersionForTest(t), version)
+	assert.False(dirty)
+	assertFleetIntegrationSchemaForTest(t, reopened.ReadDB())
+
+	var displayRegion string
+	err = reopened.ReadDB().QueryRow(`
+		SELECT display_region
+		FROM middleman_workspace_runtime_sessions
+		WHERE session_key = 'session-1'
+	`).Scan(&displayRegion)
+	require.NoError(err)
+	assert.Equal("terminal", displayRegion)
 }
 
 func TestOpenCreatesFile(t *testing.T) {
@@ -639,6 +716,7 @@ func TestOpenRepairsLegacyTimestampStorage(t *testing.T) {
 	require.NoError(removeIssueAssigneesColumnForTest(raw))
 	require.NoError(removeMergeRequestUserListColumnsForTest(raw))
 	require.NoError(removeEventDirectURLColumnsForTest(raw))
+	require.NoError(removeProjectDiscoveryColumnsForTest(raw))
 	_, err = raw.ExecContext(ctx,
 		`UPDATE schema_migrations SET version = ?, dirty = FALSE`,
 		9,
@@ -747,6 +825,7 @@ func TestOpenRepairsBrokenWorkspaceMigrationVersion11(t *testing.T) {
 	require.NoError(removeIssueAssigneesColumnForTest(raw))
 	require.NoError(removeMergeRequestUserListColumnsForTest(raw))
 	require.NoError(removeEventDirectURLColumnsForTest(raw))
+	require.NoError(removeProjectDiscoveryColumnsForTest(raw))
 	_, err = raw.Exec(`UPDATE schema_migrations SET version = 11, dirty = FALSE`)
 	require.NoError(err)
 	require.NoError(raw.Close())
@@ -827,6 +906,121 @@ func TestOpenRepairsCurrentSchemaMissingWorkspaceTerminalBackend(t *testing.T) {
 		WorkspaceBranch: "feature/backend",
 	})
 	require.NoError(err)
+}
+
+func TestOpenRenamesWorkspaceTmuxSessionsTableToRuntimeSessions(t *testing.T) {
+	require := require.New(t)
+	ctx := t.Context()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "rename-runtime-sessions.db")
+
+	d, err := Open(path)
+	require.NoError(err)
+	require.NoError(d.InsertWorkspace(ctx, &Workspace{
+		ID:              "ws-1",
+		PlatformHost:    "github.com",
+		RepoOwner:       "acme",
+		RepoName:        "widget",
+		ItemType:        WorkspaceItemTypePullRequest,
+		ItemNumber:      1,
+		GitHeadRef:      "feature/helper",
+		WorktreePath:    "/tmp/ws-1",
+		TmuxSession:     "middleman-ws-1",
+		Status:          "ready",
+		WorkspaceBranch: "feature/helper",
+	}))
+	require.NoError(d.Close())
+
+	raw, err := sql.Open("sqlite", path)
+	require.NoError(err)
+	_, err = raw.Exec(`
+		DROP INDEX IF EXISTS middleman_workspace_runtime_sessions_workspace_id_idx;
+		DROP TABLE IF EXISTS middleman_workspace_runtime_sessions;
+		CREATE TABLE middleman_workspace_tmux_sessions (
+		    workspace_id TEXT NOT NULL,
+		    session_name TEXT NOT NULL,
+		    target_key   TEXT NOT NULL,
+		    created_at   DATETIME NOT NULL DEFAULT (datetime('now')),
+		    PRIMARY KEY(workspace_id, session_name)
+		);
+		CREATE INDEX middleman_workspace_tmux_sessions_workspace_id_idx
+		    ON middleman_workspace_tmux_sessions(workspace_id);
+		INSERT INTO middleman_workspace_tmux_sessions
+		    (workspace_id, session_name, target_key, created_at)
+		VALUES
+		    ('ws-1', 'middleman-ws-1-helper', 'helper',
+		     '2026-05-30 12:00:00+00:00');
+		UPDATE schema_migrations SET version = 28, dirty = FALSE;
+	`)
+	require.NoError(err)
+	require.NoError(removeIssueAssigneesColumnForTest(raw))
+	require.NoError(removeMergeRequestUserListColumnsForTest(raw))
+	require.NoError(removeEventDirectURLColumnsForTest(raw))
+	require.NoError(removeProjectDiscoveryColumnsForTest(raw))
+	require.NoError(raw.Close())
+
+	reopened, err := Open(path)
+	require.NoError(err)
+	t.Cleanup(func() { require.NoError(reopened.Close()) })
+
+	require.False(tableExistsForTest(
+		t, reopened.ReadDB(), "middleman_workspace_tmux_sessions",
+	))
+	var count int
+	err = reopened.ReadDB().QueryRow(
+		`SELECT COUNT(*) FROM middleman_workspace_runtime_sessions`,
+	).Scan(&count)
+	require.NoError(err)
+	require.Equal(1, count)
+	var session WorkspaceRuntimeSession
+	err = reopened.ReadDB().QueryRow(`
+		SELECT workspace_id, session_key, target_key, label, kind, display_region, scope,
+		       tmux_session, created_at
+		FROM middleman_workspace_runtime_sessions`,
+	).Scan(
+		&session.WorkspaceID,
+		&session.SessionKey,
+		&session.TargetKey,
+		&session.Label,
+		&session.Kind,
+		&session.DisplayRegion,
+		&session.Scope,
+		&session.TmuxSession,
+		&session.CreatedAt,
+	)
+	require.NoError(err)
+	require.Equal("ws-1", session.WorkspaceID)
+	require.NotEqual("middleman-ws-1-helper", session.SessionKey)
+	require.Regexp(`^ws-1_[0-9a-f]{16}$`, session.SessionKey)
+	require.Equal("helper", session.TargetKey)
+	require.Equal("helper", session.Label)
+	require.Equal("agent", session.Kind)
+	require.Equal("workflow", session.DisplayRegion)
+	require.Equal("session", session.Scope)
+	require.Equal("middleman-ws-1-helper", session.TmuxSession)
+	require.Equal(
+		time.Date(2026, 5, 30, 12, 0, 0, 0, time.UTC),
+		session.CreatedAt.UTC(),
+	)
+	for _, column := range []string{
+		"workspace_id",
+		"session_key",
+		"target_key",
+		"created_at",
+		"label",
+		"kind",
+		"display_region",
+		"scope",
+		"tmux_session",
+	} {
+		hasColumn, err := hasColumn(
+			reopened.ReadDB(),
+			"middleman_workspace_runtime_sessions",
+			column,
+		)
+		require.NoError(err)
+		require.Truef(hasColumn, "runtime sessions column %q", column)
+	}
 }
 
 func TestOpenInitializesBranchActivitySchema(t *testing.T) {
@@ -956,6 +1150,7 @@ func TestOpenMigratesWorkspaceUniquenessAndPreservesSetupEvents(t *testing.T) {
 	require.NoError(removeIssueAssigneesColumnForTest(raw))
 	require.NoError(removeMergeRequestUserListColumnsForTest(raw))
 	require.NoError(removeEventDirectURLColumnsForTest(raw))
+	require.NoError(removeProjectDiscoveryColumnsForTest(raw))
 	_, err = raw.Exec(`UPDATE schema_migrations SET version = 11, dirty = FALSE`)
 	require.NoError(err)
 	require.NoError(raw.Close())
@@ -1182,6 +1377,56 @@ func tableExistsForTest(t *testing.T, db *sql.DB, name string) bool {
 	).Scan(&count)
 	require.NoError(t, err)
 	return count > 0
+}
+
+func indexExistsForTest(t *testing.T, db *sql.DB, name string) bool {
+	t.Helper()
+	var count int
+	err := db.QueryRow(
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?`,
+		name,
+	).Scan(&count)
+	require.NoError(t, err)
+	return count > 0
+}
+
+func assertFleetIntegrationSchemaForTest(t *testing.T, db *sql.DB) {
+	t.Helper()
+	assert := Assert.New(t)
+	for _, table := range []string{
+		"middleman_project_worktree_runtime_sessions",
+		"middleman_worktree_stats",
+		"middleman_host_runtime_sessions",
+	} {
+		assert.True(tableExistsForTest(t, db, table), "%s should exist", table)
+	}
+	assert.True(
+		indexExistsForTest(
+			t,
+			db,
+			"middleman_project_worktree_runtime_sessions_worktree_id_idx",
+		),
+	)
+
+	for table, columns := range map[string][]string{
+		"middleman_workspace_runtime_sessions": {"display_region"},
+		"middleman_projects": {
+			"is_stale",
+			"repository_kind",
+		},
+		"middleman_project_worktrees": {
+			"is_stale",
+			"is_hidden",
+			"session_backend",
+			"linked_issue_numbers",
+		},
+	} {
+		for _, column := range columns {
+			hasColumn, err := hasColumn(db, table, column)
+			require.NoError(t, err)
+			assert.True(hasColumn, "%s.%s should exist", table, column)
+		}
+	}
 }
 
 func rewriteWorkspacesToVersion11ForTest(raw *sql.DB) error {
@@ -1418,6 +1663,43 @@ func removeDiscussionColumnsForTest(raw *sql.DB) error {
 	return err
 }
 
+// removeProjectDiscoveryColumnsForTest strips schema folded into migration
+// 000034 so a rewound fixture can replay the forward migrations without
+// hitting duplicate schema errors.
+func removeProjectDiscoveryColumnsForTest(raw *sql.DB) error {
+	hasDisplayRegion, err := hasColumn(
+		raw,
+		"middleman_workspace_runtime_sessions",
+		"display_region",
+	)
+	if err != nil {
+		return err
+	}
+	if hasDisplayRegion {
+		if _, err := raw.Exec(
+			`ALTER TABLE middleman_workspace_runtime_sessions DROP COLUMN display_region`,
+		); err != nil {
+			return err
+		}
+	}
+	_, err = raw.Exec(`
+		DROP TABLE middleman_host_runtime_sessions;
+		DROP TABLE middleman_worktree_stats;
+		DROP INDEX middleman_project_worktree_runtime_sessions_worktree_id_idx;
+		DROP TABLE middleman_project_worktree_runtime_sessions;
+		ALTER TABLE middleman_project_worktrees DROP COLUMN linked_issue_numbers;
+		ALTER TABLE middleman_project_worktrees DROP COLUMN session_backend;
+		ALTER TABLE middleman_project_worktrees DROP COLUMN is_stale;
+		ALTER TABLE middleman_project_worktrees DROP COLUMN is_hidden;
+		ALTER TABLE middleman_projects DROP COLUMN repository_kind;
+		ALTER TABLE middleman_projects DROP COLUMN is_stale;
+	`)
+	return err
+}
+
+// removeIssueAssigneesColumnForTest strips the assignees column added by
+// migration 000030 so a downgraded fixture can replay the forward migrations
+// without hitting a duplicate-column error.
 func removeIssueAssigneesColumnForTest(raw *sql.DB) error {
 	_, err := raw.Exec(`ALTER TABLE middleman_issues DROP COLUMN assignees_json`)
 	return err

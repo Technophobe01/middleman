@@ -39,16 +39,19 @@ type configChangedEvent struct {
 // startup. It is taken once in newServer and compared in applyConfigChange
 // to detect drift that the watcher cannot fix without a restart.
 type startupConfigSnapshot struct {
-	SyncInterval        string
-	DefaultPlatformHost string
-	Host                string
-	Port                int
-	BasePath            string
-	DataDir             string
-	SyncBudgetPerHour   int
-	AllowedHosts        []config.HostKey
-	TrustReverseProxy   bool
-	ProviderHosts       []tokenauth.Key
+	SyncInterval                    string
+	NotificationSyncInterval        string
+	NotificationPropagationInterval string
+	NotificationBatchSize           int
+	DefaultPlatformHost             string
+	Host                            string
+	Port                            int
+	BasePath                        string
+	DataDir                         string
+	SyncBudgetPerHour               int
+	AllowedHosts                    []config.HostKey
+	TrustReverseProxy               bool
+	ProviderHosts                   []tokenauth.Key
 	// GitHubAppSplitHosts lists hosts whose effective credential chain
 	// resolves sync reads through a GitHub App installation token.
 	// Split topology is startup-bound: write rate trackers and the
@@ -64,6 +67,9 @@ type startupConfigSnapshot struct {
 	Roborev       config.Roborev
 	Tmux          config.Tmux
 	Shell         config.Shell
+	FleetSessions config.FleetSessions
+	RequireAuth   bool
+	SSHPeers      []config.FleetSSHPeer
 }
 
 func snapshotStartupConfig(cfg *config.Config) startupConfigSnapshot {
@@ -71,18 +77,21 @@ func snapshotStartupConfig(cfg *config.Config) startupConfigSnapshot {
 		return startupConfigSnapshot{}
 	}
 	snap := startupConfigSnapshot{
-		SyncInterval:        cfg.SyncInterval,
-		DefaultPlatformHost: cfg.DefaultPlatformHost,
-		Host:                cfg.Host,
-		Port:                cfg.Port,
-		BasePath:            cfg.BasePath,
-		DataDir:             cfg.DataDir,
-		SyncBudgetPerHour:   cfg.SyncBudgetPerHour,
-		AllowedHosts:        startupAllowedHosts(cfg),
-		TrustReverseProxy:   cfg.TrustReverseProxy,
-		ProviderHosts:       startupProviderHosts(cfg),
-		GitHubAppSplitHosts: githubAppSplitHosts(cfg),
-		Roborev:             cfg.Roborev,
+		SyncInterval:                    cfg.SyncInterval,
+		NotificationSyncInterval:        cfg.Notifications.SyncInterval,
+		NotificationPropagationInterval: cfg.Notifications.PropagationInterval,
+		NotificationBatchSize:           cfg.Notifications.BatchSize,
+		DefaultPlatformHost:             cfg.DefaultPlatformHost,
+		Host:                            cfg.Host,
+		Port:                            cfg.Port,
+		BasePath:                        cfg.BasePath,
+		DataDir:                         cfg.DataDir,
+		SyncBudgetPerHour:               cfg.SyncBudgetPerHour,
+		AllowedHosts:                    startupAllowedHosts(cfg),
+		TrustReverseProxy:               cfg.TrustReverseProxy,
+		ProviderHosts:                   startupProviderHosts(cfg),
+		GitHubAppSplitHosts:             githubAppSplitHosts(cfg),
+		Roborev:                         cfg.Roborev,
 	}
 	snap.Tmux.Command = slices.Clone(cfg.Tmux.Command)
 	if cfg.Tmux.AgentSessions != nil {
@@ -91,6 +100,11 @@ func snapshotStartupConfig(cfg *config.Config) startupConfigSnapshot {
 	}
 	snap.Shell.Command = slices.Clone(cfg.Shell.Command)
 	snap.TokenEnvNames = startupBoundTokenEnvNames(cfg)
+	// API auth, fleet session monitoring, and the ssh peer set are
+	// wired in newServer, so edits require a restart.
+	snap.FleetSessions = cfg.Fleet.Sessions
+	snap.RequireAuth = cfg.API.RequireAuth
+	snap.SSHPeers = slices.Clone(cfg.Fleet.SSHPeers)
 	return snap
 }
 
@@ -365,25 +379,7 @@ func (s *Server) applyConfigChange(ctx context.Context) configChangedEvent {
 
 	s.cfgMu.Lock()
 	defer s.cfgMu.Unlock()
-	// Apply hot-reloadable fields. Repos and Platforms are deep-copied
-	// so subsequent in-memory mutations from the Settings UI cannot
-	// surprise the file's last view.
-	s.cfg.GitHubTokenEnv = newCfg.GitHubTokenEnv
-	s.cfg.Repos = slices.Clone(newCfg.Repos)
-	s.cfg.Platforms = slices.Clone(newCfg.Platforms)
-	// GitHubApps must mirror the file even though the credential
-	// topology it implies is startup-bound (restart_required is
-	// flagged separately): the middleman-github-app CLI edits the
-	// file while the server runs, and a later settings save from the
-	// stale in-memory view would silently drop the [[github_apps]]
-	// entry.
-	s.cfg.GitHubApps = slices.Clone(newCfg.GitHubApps)
-	s.cfg.Activity = newCfg.Activity
-	s.cfg.Terminal = newCfg.Terminal
-	s.cfg.Modes = cloneModeVisibility(newCfg.Modes)
-	s.cfg.Agents = cloneConfigAgents(newCfg.Agents)
-	s.cfg.DocFolders = slices.Clone(newCfg.DocFolders)
-	s.cfg.Msgvault = cloneMsgvault(newCfg.Msgvault)
+	*s.cfg = cloneReloadedConfig(newCfg)
 	if s.docsRegistry != nil {
 		s.docsRegistry.Replace(newCfg.DocFolders)
 	}
@@ -583,6 +579,35 @@ func cloneMsgvault(in *config.Msgvault) *config.Msgvault {
 	}
 	out := *in
 	return &out
+}
+
+func cloneReloadedConfig(in *config.Config) config.Config {
+	if in == nil {
+		return config.Config{}
+	}
+	out := *in
+	out.AllowedHosts = slices.Clone(in.AllowedHosts)
+	out.Repos = slices.Clone(in.Repos)
+	out.Platforms = slices.Clone(in.Platforms)
+	out.GitHubApps = slices.Clone(in.GitHubApps)
+	for i := range out.GitHubApps {
+		out.GitHubApps[i].SelectedRepos = slices.Clone(
+			in.GitHubApps[i].SelectedRepos,
+		)
+	}
+	out.Modes = cloneModeVisibility(in.Modes)
+	out.Agents = cloneConfigAgents(in.Agents)
+	out.DocFolders = slices.Clone(in.DocFolders)
+	out.Msgvault = cloneMsgvault(in.Msgvault)
+	out.Tmux.Command = slices.Clone(in.Tmux.Command)
+	if in.Tmux.AgentSessions != nil {
+		v := *in.Tmux.AgentSessions
+		out.Tmux.AgentSessions = &v
+	}
+	out.Shell.Command = slices.Clone(in.Shell.Command)
+	out.Fleet.Peers = slices.Clone(in.Fleet.Peers)
+	out.Fleet.SSHPeers = slices.Clone(in.Fleet.SSHPeers)
+	return out
 }
 
 // resolveReposForReload walks the reloaded repo list and asks the syncer

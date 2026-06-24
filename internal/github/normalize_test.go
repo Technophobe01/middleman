@@ -434,6 +434,82 @@ func TestNormalizeIssueTimelineEventAssigned(t *testing.T) {
 	assert.Contains(event.MetadataJSON, `"assignee":"bob"`)
 }
 
+func TestNormalizeIssueTimelineEventCrossReferenced(t *testing.T) {
+	require := require.New(t)
+	assert := Assert.New(t)
+	createdAt := time.Date(2024, 6, 1, 12, 30, 0, 0, time.UTC)
+
+	event := NormalizeIssueTimelineEvent(23, PullRequestTimelineEvent{
+		NodeID:            "CRE_1",
+		EventType:         "cross_referenced",
+		Actor:             "mariusvniekerk",
+		CreatedAt:         createdAt,
+		SourceType:        "PullRequest",
+		SourceOwner:       "kenn-io",
+		SourceRepo:        "roborev",
+		SourceNumber:      860,
+		SourceTitle:       "Add global review guidelines",
+		SourceURL:         "https://github.com/kenn-io/roborev/pull/860",
+		IsCrossRepository: false,
+		WillCloseTarget:   false,
+	})
+
+	require.NotNil(event)
+	assert.Equal(int64(23), event.IssueID)
+	assert.Equal("cross_referenced", event.EventType)
+	assert.Equal("mariusvniekerk", event.Author)
+	assert.Equal("Referenced from kenn-io/roborev#860", event.Summary)
+	assert.Equal("timeline-CRE_1", event.DedupeKey)
+	assert.Contains(event.MetadataJSON, `"source_title":"Add global review guidelines"`)
+	assert.Contains(event.MetadataJSON, `"source_url":"https://github.com/kenn-io/roborev/pull/860"`)
+}
+
+func TestNormalizeIssueTimelineEventLifecycle(t *testing.T) {
+	createdAt := time.Date(2024, 6, 1, 12, 40, 0, 0, time.UTC)
+
+	tests := []struct {
+		name      string
+		eventType string
+		nodeID    string
+		summary   string
+	}{
+		{
+			name:      "closed",
+			eventType: "closed",
+			nodeID:    "CE_1",
+			summary:   "closed this",
+		},
+		{
+			name:      "reopened",
+			eventType: "reopened",
+			nodeID:    "RE_1",
+			summary:   "reopened this",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require := require.New(t)
+			assert := Assert.New(t)
+
+			event := NormalizeIssueTimelineEvent(23, PullRequestTimelineEvent{
+				NodeID:    tt.nodeID,
+				EventType: tt.eventType,
+				Actor:     "maintainer",
+				CreatedAt: createdAt,
+			})
+
+			require.NotNil(event)
+			assert.Equal(int64(23), event.IssueID)
+			assert.Equal(tt.eventType, event.EventType)
+			assert.Equal("maintainer", event.Author)
+			assert.Equal(tt.summary, event.Summary)
+			assert.Equal(createdAt, event.CreatedAt)
+			assert.Equal("timeline-"+tt.nodeID, event.DedupeKey)
+		})
+	}
+}
+
 func TestNormalizeTimelineEventForcePush(t *testing.T) {
 	require := require.New(t)
 	assert := Assert.New(t)

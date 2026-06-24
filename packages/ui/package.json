@@ -41,6 +41,9 @@
     "./utils/repo-color": {
       "default": "./src/utils/repo-color.ts"
     },
+    "./utils/repo-label": {
+      "default": "./src/utils/repo-label.ts"
+    },
     "./routes": {
       "default": "./src/routes.ts"
     },
@@ -71,6 +74,10 @@
     "./stores/grouping": {
       "svelte": "./src/stores/grouping.svelte.ts",
       "default": "./src/stores/grouping.svelte.ts"
+    },
+    "./stores/detail-activity-view": {
+      "svelte": "./src/stores/detail-activity-view.svelte.ts",
+      "default": "./src/stores/detail-activity-view.svelte.ts"
     },
     "./stores/workflow": {
       "svelte": "./src/stores/workflow.svelte.ts",
@@ -115,11 +122,11 @@
   "scripts": {
     "check": "cd ../.. && node node_modules/vite-plus/bin/vp run ui-package-check",
     "lint": "cd ../.. && node node_modules/vite-plus/bin/vp lint packages/ui --no-error-on-unmatched-pattern",
-    "typecheck": "cd ../.. && node node_modules/vite-plus/bin/vp lint packages/ui '!packages/ui/src/api/generated/**' '!packages/ui/src/api/roborev/generated/**' --no-error-on-unmatched-pattern --threads=1 && cd packages/ui && node ../../node_modules/vite-plus/bin/vp exec -- svelte-check --tsconfig ./tsconfig.json --fail-on-warnings"
+    "typecheck": "cd ../.. && node node_modules/vite-plus/bin/vp run ui-package-typecheck"
   },
   "dependencies": {
     "@lucide/svelte": "1.17.0",
-    "@pierre/diffs": "1.2.7",
+    "@pierre/diffs": "1.2.10",
     "@pierre/trees": "1.0.0-beta.4",
     "@tiptap/core": "3.26.0",
     "@tiptap/extension-document": "3.26.0",
@@ -129,7 +136,7 @@
     "@tiptap/extension-text": "3.26.0",
     "@tiptap/pm": "3.26.0",
     "@tiptap/suggestion": "3.26.0",
-    "dompurify": "3.4.8",
+    "dompurify": "3.4.11",
     "marked": "17.0.6",
     "openapi-fetch": "^0.17.0",
     "prosemirror-state": "^1.4.4",

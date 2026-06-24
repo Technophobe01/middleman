@@ -221,5 +221,7 @@ Related docs:
 
 - [`context/ui-design-system.md`](./ui-design-system.md) for visual primitives
   and styling guidance.
+- [`context/notifications-in-activity.md`](./notifications-in-activity.md) for
+  notification feed rows, state, and sync behavior.
 - [`context/workspace-runtime-lifecycle.md`](./workspace-runtime-lifecycle.md)
   for runtime-specific workspace tab and shell behavior.

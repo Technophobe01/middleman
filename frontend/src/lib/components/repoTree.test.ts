@@ -61,9 +61,25 @@ describe("buildRepoTree", () => {
     expect(tree.map((h) => h.label)).toEqual(["github.com", "gitlab.com"]);
   });
 
-  it("uses the first option's provider when a host's providers disagree", () => {
+  it("omits the host provider when a host's providers disagree", () => {
     const tree = buildRepoTree([opt("ghe.example.com", "a/x", "github"), opt("ghe.example.com", "b/y", "gitlab")]);
-    expect(tree[0]!.provider).toBe("github");
+    expect(tree[0]!.provider).toBe("");
+  });
+
+  it("gives provider-qualified leaves visible provider labels", () => {
+    const tree = buildRepoTree([
+      {
+        ...opt("github.com", "acme/widgets", "github"),
+        value: "github|github.com/acme/widgets",
+      },
+      {
+        ...opt("github.com", "acme/widgets", "gitea"),
+        value: "gitea|github.com/acme/widgets",
+      },
+    ]);
+
+    const acme = tree[0]!.children[0]!;
+    expect(acme.children.map((repo) => repo.displayLabel)).toEqual(["gitea/widgets", "github/widgets"]);
   });
 
   it("returns an empty array for no options", () => {
@@ -155,6 +171,31 @@ describe("visibleRows", () => {
     expect(labels).toContain("web");
     expect(labels).toContain("web-sdk");
     expect(labels).not.toContain("api");
+  });
+
+  it("matches provider-qualified leaves by visible and slash display labels", () => {
+    const tree = buildRepoTree([
+      {
+        ...opt("github.com", "acme/widgets", "github"),
+        value: "github|github.com/acme/widgets",
+      },
+      {
+        ...opt("github.com", "acme/widgets", "gitea"),
+        value: "gitea|github.com/acme/widgets",
+      },
+    ]);
+
+    const visibleLabelRows = visibleRows(tree, {
+      isCollapsed: () => true,
+      query: "gitea/widgets",
+    });
+    expect(visibleLabelRows.map((row) => row.displayLabel ?? row.node.label)).toEqual(["acme", "gitea/widgets"]);
+
+    const slashValueRows = visibleRows(tree, {
+      isCollapsed: () => true,
+      query: "gitea/github.com/acme/widgets",
+    });
+    expect(slashValueRows.map((row) => row.displayLabel ?? row.node.label)).toEqual(["acme", "gitea/widgets"]);
   });
 
   it("keeps a multi-repo owner as an owner row when a filter matches only one repo", () => {

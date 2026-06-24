@@ -1,6 +1,11 @@
-import { beforeEach, describe, expect, it } from "vite-plus/test";
-import type { ActivitySettings } from "../api/types.js";
-import { buildActivityFilterTypes, createActivityStore, DEFAULT_EVENT_TYPES } from "./activity.svelte.js";
+import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import type { ActivityItem, ActivitySettings } from "../api/types.js";
+import {
+  buildActivityFilterTypes,
+  createActivityStore,
+  DEFAULT_EVENT_TYPES,
+  notificationDbId,
+} from "./activity.svelte.js";
 
 const fakeClient = {
   GET: async () => ({
@@ -135,6 +140,7 @@ describe("buildActivityFilterTypes", () => {
       "comment",
       "review",
       "force_push",
+      "notification",
     ]);
   });
 
@@ -147,6 +153,7 @@ describe("buildActivityFilterTypes", () => {
       "comment",
       "review",
       "commit",
+      "notification",
     ]);
   });
 
@@ -158,6 +165,7 @@ describe("buildActivityFilterTypes", () => {
       "review",
       "commit",
       "force_push",
+      "notification",
     ]);
   });
 
@@ -168,9 +176,28 @@ describe("buildActivityFilterTypes", () => {
       "review",
       "commit",
       "force_push",
+      "notification",
     ]);
     expect(buildActivityFilterTypes("issues", allEvents, false)).toEqual([
       "new_issue",
+      "comment",
+      "review",
+      "commit",
+      "force_push",
+      "notification",
+    ]);
+  });
+
+  it("keeps the all-selected shortcut only while notifications stay on", () => {
+    expect(buildActivityFilterTypes("all", allEvents, false, true)).toEqual([]);
+  });
+
+  it("builds an explicit list omitting notifications when they are hidden", () => {
+    expect(buildActivityFilterTypes("all", allEvents, false, false)).toEqual([
+      "new_pr",
+      "new_issue",
+      "default_branch_commit",
+      "default_branch_force_push",
       "comment",
       "review",
       "commit",
@@ -188,6 +215,8 @@ describe("activity store URL hydration", () => {
     );
     const s = makeStore();
     s.initializeFromMount();
+    // Notifications default on, so a legacy filtered URL (no notif=0)
+    // gains the notification type on hydration.
     expect(s.getActivityFilterTypes()).toEqual([
       "new_pr",
       "new_issue",
@@ -195,9 +224,10 @@ describe("activity store URL hydration", () => {
       "comment",
       "review",
       "force_push",
+      "notification",
     ]);
     expect(new URLSearchParams(window.location.search).get("types")).toBe(
-      "new_pr,new_issue,default_branch_force_push,comment,review,force_push",
+      "new_pr,new_issue,default_branch_force_push,comment,review,force_push,notification",
     );
   });
 
@@ -211,6 +241,31 @@ describe("activity store URL hydration", () => {
     s.initializeFromMount();
     expect(s.getActivityFilterTypes()).toEqual([]);
     expect(new URLSearchParams(window.location.search).has("types")).toBe(false);
+  });
+});
+
+describe("activity store notification visibility", () => {
+  it("shows notifications by default and persists hiding them via the notif param", () => {
+    const s = makeStore();
+    s.initializeFromMount();
+    expect(s.getShowNotifications()).toBe(true);
+    // Default-on, all-selected: no explicit type filter at all.
+    expect(s.getActivityFilterTypes()).toEqual([]);
+    expect(new URLSearchParams(window.location.search).has("notif")).toBe(false);
+
+    s.setShowNotifications(false);
+    s.setActivityFilterTypes(
+      buildActivityFilterTypes(s.getItemFilter(), s.getEnabledEvents(), s.getHideDefaultBranchActivity(), false),
+    );
+    s.syncToURL();
+    expect(new URLSearchParams(window.location.search).get("notif")).toBe("0");
+    // Hiding notifications sends the explicit non-notification list.
+    expect(s.getActivityFilterTypes()).not.toContain("notification");
+
+    const next = makeStore();
+    next.initializeFromMount();
+    expect(next.getShowNotifications()).toBe(false);
+    expect(next.getActivityFilterTypes()).not.toContain("notification");
   });
 });
 
@@ -231,5 +286,106 @@ describe("activity store default-branch visibility", () => {
     next.setHideDefaultBranchActivity(false);
     next.syncToURL();
     expect(new URLSearchParams(window.location.search).has("hide_branch")).toBe(false);
+  });
+});
+
+describe("activity store commit roll-up", () => {
+  it("shows individual commits by default and persists the URL override for rolled-up commits", () => {
+    const s = makeStore();
+    s.initializeFromMount();
+    expect(s.getRollUpCommits()).toBe(false);
+
+    s.setRollUpCommits(true);
+    s.syncToURL();
+    expect(new URLSearchParams(window.location.search).get("rollup_commits")).toBe("1");
+
+    const next = makeStore();
+    next.initializeFromMount();
+    expect(next.getRollUpCommits()).toBe(true);
+
+    next.setRollUpCommits(false);
+    next.syncToURL();
+    expect(new URLSearchParams(window.location.search).has("rollup_commits")).toBe(false);
+  });
+});
+
+function notificationItem(id: string, state: "unread" | "read"): ActivityItem {
+  return {
+    id,
+    cursor: id,
+    activity_type: "notification",
+    item_type: "pr",
+    item_number: 1,
+    item_state: state,
+    body_preview: "review_requested",
+    repo_owner: "acme",
+    repo_name: "widgets",
+    platform_host: "github.com",
+  } as unknown as ActivityItem;
+}
+
+describe("notificationDbId", () => {
+  it("parses ntf-source ids and rejects everything else", () => {
+    expect(notificationDbId("ntf:42")).toBe(42);
+    expect(notificationDbId("pr:1")).toBeNull();
+    expect(notificationDbId("ntf:0")).toBeNull();
+    expect(notificationDbId("ntf:-3")).toBeNull();
+    expect(notificationDbId("ntf:abc")).toBeNull();
+    expect(notificationDbId("ntf:")).toBeNull();
+  });
+});
+
+describe("activity store markNotificationSeen", () => {
+  function storeWith(post: ReturnType<typeof vi.fn>) {
+    const client = {
+      GET: async () => ({ data: { items: [notificationItem("ntf:42", "unread")], capped: false }, error: null }),
+      POST: post,
+    } as unknown as Parameters<typeof createActivityStore>[0]["client"];
+    return createActivityStore({ client });
+  }
+
+  it("flips the row to read and queues the upstream GitHub read", async () => {
+    const post = vi.fn(async () => ({ data: { queued: [42], succeeded: [], failed: [] }, error: null }));
+    const s = storeWith(post);
+    await s.loadActivity();
+    expect(s.getActivityItems()[0]!.item_state).toBe("unread");
+
+    await s.markNotificationSeen(s.getActivityItems()[0]!);
+
+    expect(post).toHaveBeenCalledWith("/notifications/read", { body: { ids: [42] } });
+    expect(s.getActivityItems()[0]!.item_state).toBe("read");
+  });
+
+  it("rolls back the optimistic flip when the request fails", async () => {
+    const post = vi.fn(async () => ({ data: null, error: { detail: "boom" } }));
+    const s = storeWith(post);
+    await s.loadActivity();
+
+    await s.markNotificationSeen(s.getActivityItems()[0]!);
+
+    expect(s.getActivityItems()[0]!.item_state).toBe("unread");
+  });
+
+  it("rolls back when the bulk response reports the id as failed despite a 200", async () => {
+    const post = vi.fn(async () => ({
+      data: { succeeded: [], queued: [], failed: [{ id: 42, error: "not found" }] },
+      error: null,
+    }));
+    const s = storeWith(post);
+    await s.loadActivity();
+
+    await s.markNotificationSeen(s.getActivityItems()[0]!);
+
+    expect(s.getActivityItems()[0]!.item_state).toBe("unread");
+  });
+
+  it("ignores rows that are not notification feed rows", async () => {
+    const post = vi.fn(async () => ({ data: { queued: [], succeeded: [], failed: [] }, error: null }));
+    const s = storeWith(post);
+    await s.loadActivity();
+
+    await s.markNotificationSeen({ ...s.getActivityItems()[0]!, id: "pr:7" });
+
+    expect(post).not.toHaveBeenCalled();
   });
 });

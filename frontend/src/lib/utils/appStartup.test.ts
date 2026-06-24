@@ -37,6 +37,13 @@ function makeStores(): StoreInstances {
 function makeSettings(): Settings {
   return {
     repos: [],
+    fleet: {
+      enabled: false,
+      sessions: {},
+      peers: [],
+      ssh_peers: [],
+      restart_required: false,
+    },
     activity: {
       view_mode: "threaded",
       time_range: "7d",
@@ -55,6 +62,7 @@ function makeSettings(): Settings {
       cursor_blink: true,
       font_ligatures: false,
       renderer: "xterm",
+      hide_tmux_status: false,
     },
     modes: {
       activity: true,
@@ -68,6 +76,7 @@ function makeSettings(): Settings {
       reviews: true,
       workspaces: true,
     },
+    notifications: { enabled: true },
     agents: [],
   };
 }

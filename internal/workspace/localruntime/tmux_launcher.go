@@ -33,7 +33,37 @@ func (p tmuxEnvPolicy) paneEnvironment(
 	command []string,
 	extraStripVars []string,
 ) tmuxPaneEnvironment {
+	return paneEnvironmentFromEnv(
+		p.environment(baseEnv, extraStripVars), command,
+	)
+}
+
+// paneEnvironmentWithExtra applies the policy to baseEnv and then appends
+// caller-supplied variables, which always reach the pane even when the
+// policy's allowlist would drop them. Keys must be shell identifiers; the
+// caller validates them.
+func (p tmuxEnvPolicy) paneEnvironmentWithExtra(
+	baseEnv []string,
+	command []string,
+	extraStripVars []string,
+	extraEnv map[string]string,
+) tmuxPaneEnvironment {
 	env := p.environment(baseEnv, extraStripVars)
+	keys := make([]string, 0, len(extraEnv))
+	for key := range extraEnv {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+	for _, key := range keys {
+		env = append(env, key+"="+extraEnv[key])
+	}
+	return paneEnvironmentFromEnv(env, command)
+}
+
+func paneEnvironmentFromEnv(
+	env []string,
+	command []string,
+) tmuxPaneEnvironment {
 	envWithTerm := append(slices.Clone(env), "TERM=xterm-256color")
 	keys := tmuxEnvironmentKeys(envWithTerm)
 	parts := make([]string, 0, len(keys)+4)
@@ -91,6 +121,7 @@ type tmuxLauncher struct {
 	CWD         string
 	Pane        tmuxPaneEnvironment
 	OwnerMarker string
+	HideStatus  bool
 }
 
 type tmuxLaunchResult struct {
@@ -128,6 +159,17 @@ func (l tmuxLauncher) prepare(ctx context.Context) (tmuxLaunchResult, error) {
 			return tmuxLaunchResult{AttachCommand: l.attachSessionCommand()}, nil
 		}
 		return tmuxLaunchResult{}, fmt.Errorf("tmux new-session: %w", err)
+	}
+	if l.HideStatus {
+		if err := l.run(ctx, l.hideStatusCommand()); err != nil {
+			if killErr := l.run(ctx, l.killSessionCommand()); killErr != nil {
+				return tmuxLaunchResult{}, fmt.Errorf(
+					"hide tmux status: %w; cleanup new tmux session: %v",
+					err, killErr,
+				)
+			}
+			return tmuxLaunchResult{}, fmt.Errorf("hide tmux status: %w", err)
+		}
 	}
 	created = true
 	return tmuxLaunchResult{
@@ -225,21 +267,61 @@ func (l tmuxLauncher) newSessionPaneCommand() (string, func(), error) {
 	if err != nil {
 		return "", nil, fmt.Errorf("write tmux pane environment: %w", err)
 	}
+	// tmux parses shell-command with its default shell, which may not be
+	// POSIX-compatible. Keep the POSIX handoff in a script run by /bin/sh.
+	scriptPath, err := writeTmuxPaneScript(path, l.Pane.paneCommand)
+	if err != nil {
+		_ = os.Remove(path)
+		return "", nil, fmt.Errorf("write tmux pane script: %w", err)
+	}
 	cleanup := func() {
 		_ = os.Remove(path)
+		_ = os.Remove(scriptPath)
 	}
-	return strings.Join([]string{
-		"__middleman_env_file=" + shellCommand([]string{path}),
-		`__middleman_cleanup_env_file() { /bin/rm -f "$__middleman_env_file"; }`,
-		`trap __middleman_cleanup_env_file EXIT`,
+	return shellCommand([]string{"/bin/sh", scriptPath}), cleanup, nil
+}
+
+func writeTmuxPaneScript(envPath string, paneCommand string) (string, error) {
+	file, err := os.CreateTemp(tmuxPaneEnvironmentTempDir(), "middleman-tmux-pane-*")
+	if err != nil {
+		return "", err
+	}
+	path := file.Name()
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
+		_ = os.Remove(path)
+		return "", err
+	}
+
+	content := strings.Join([]string{
+		"__middleman_env_file=" + shellCommand([]string{envPath}),
+		"__middleman_script_file=" + shellCommand([]string{path}),
+		`__middleman_cleanup_tmux_files() { /bin/rm -f "$__middleman_env_file" "$__middleman_script_file"; }`,
+		`trap __middleman_cleanup_tmux_files EXIT`,
 		`if [ ! -r "$__middleman_env_file" ]; then exit 127; fi`,
 		`. "$__middleman_env_file"`,
-		`__middleman_cleanup_env_file`,
+		`__middleman_cleanup_tmux_files`,
 		`trap - EXIT`,
-		`unset -f __middleman_cleanup_env_file`,
+		`unset -f __middleman_cleanup_tmux_files`,
 		`unset __middleman_env_file`,
-		l.Pane.paneCommand,
-	}, "\n"), cleanup, nil
+		`unset __middleman_script_file`,
+		paneCommand,
+	}, "\n")
+	if _, err := file.WriteString(content); err != nil {
+		_ = file.Close()
+		_ = os.Remove(path)
+		return "", err
+	}
+	if _, err := file.WriteString("\n"); err != nil {
+		_ = file.Close()
+		_ = os.Remove(path)
+		return "", err
+	}
+	if err := file.Close(); err != nil {
+		_ = os.Remove(path)
+		return "", err
+	}
+	return path, nil
 }
 
 func writeTmuxPaneEnvironment(env []string, keys []string) (string, error) {
@@ -321,6 +403,19 @@ func (l tmuxLauncher) newSessionCommand(paneCommand string) []string {
 	return command
 }
 
+func (l tmuxLauncher) hideStatusCommand() []string {
+	return append(
+		slices.Clone(l.TmuxCommand),
+		"set-option", "-q", "-t", l.Session, "status", "off",
+	)
+}
+
+func (l tmuxLauncher) killSessionCommand() []string {
+	return append(
+		slices.Clone(l.TmuxCommand), "kill-session", "-t", l.Session,
+	)
+}
+
 func (l tmuxLauncher) attachSessionCommand() []string {
 	return append(
 		slices.Clone(l.TmuxCommand), "attach-session", "-t", l.Session,
@@ -345,6 +440,12 @@ func tmuxSessionEnvironment(env []string, extraStrip []string) []string {
 		}
 	}
 	return out
+}
+
+// IsShellIdentifier reports whether value is a valid POSIX shell variable
+// name, the requirement for env keys passed to command sessions.
+func IsShellIdentifier(value string) bool {
+	return isShellIdentifier(value)
 }
 
 func isShellIdentifier(value string) bool {

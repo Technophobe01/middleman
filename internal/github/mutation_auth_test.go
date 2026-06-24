@@ -196,6 +196,124 @@ func TestMutationsUseUserPATWhileReadsUseAppToken(t *testing.T) {
 	assert.Equal(4321, writeGQLRT.Remaining())
 }
 
+func TestNotificationAPIsUseUserAuthAndBackgroundBudget(t *testing.T) {
+	require := require.New(t)
+	assert := Assert.New(t)
+	t.Setenv("TEST_NOTIFICATION_AUTH_PAT", "user-pat")
+
+	var mu sync.Mutex
+	authByCall := map[string]string{}
+	record := func(name string, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		authByCall[name] = r.Header.Get("Authorization")
+	}
+	setRate := func(w http.ResponseWriter, remaining string) {
+		w.Header().Set("X-RateLimit-Limit", "5000")
+		w.Header().Set("X-RateLimit-Remaining", remaining)
+		w.Header().Set("X-RateLimit-Reset", "2000000000")
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v3/repos/acme/widgets/notifications",
+		func(w http.ResponseWriter, r *http.Request) {
+			record("notifications:list-repo", r)
+			setRate(w, "4990")
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[{
+				"id":"ntf-1",
+				"unread":true,
+				"reason":"mention",
+				"updated_at":"2026-06-17T00:00:00Z",
+				"repository":{"name":"widgets","owner":{"login":"acme"}},
+				"subject":{"title":"Review","type":"PullRequest","url":"https://github.example.com/api/v3/repos/acme/widgets/pulls/5"}
+			}]`))
+		})
+	mux.HandleFunc("GET /api/v3/notifications/threads/ntf-1",
+		func(w http.ResponseWriter, r *http.Request) {
+			record("notifications:get", r)
+			setRate(w, "4989")
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{
+				"id":"ntf-1",
+				"unread":true,
+				"reason":"mention",
+				"updated_at":"2026-06-17T00:00:00Z",
+				"repository":{"name":"widgets","owner":{"login":"acme"}},
+				"subject":{"title":"Review","type":"PullRequest","url":"https://github.example.com/api/v3/repos/acme/widgets/pulls/5"}
+			}`))
+		})
+	mux.HandleFunc("PATCH /api/v3/notifications/threads/ntf-1",
+		func(w http.ResponseWriter, r *http.Request) {
+			record("notifications:mark-read", r)
+			setRate(w, "4988")
+			w.WriteHeader(http.StatusNoContent)
+		})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	var mints atomic.Int64
+	source := tokenauth.NewManagedSource(tokenauth.Descriptor{
+		Key: tokenauth.Key{Platform: "github", Host: "github.example.com"},
+		Candidates: []tokenauth.Candidate{
+			{
+				Kind:           tokenauth.SourceKindGitHubApp,
+				Host:           "github.example.com",
+				FilePath:       "/keys/app.pem",
+				AppID:          7,
+				InstallationID: 11,
+			},
+			{Kind: tokenauth.SourceKindEnv, EnvName: "TEST_NOTIFICATION_AUTH_PAT"},
+		},
+	}, tokenauth.Options{
+		GitHubApp: func(context.Context, tokenauth.Candidate) (string, time.Time, error) {
+			mints.Add(1)
+			return "ghs_app_token", time.Now().Add(time.Hour), nil
+		},
+	})
+	database := openTestDB(t)
+	readRT := NewRateTracker(database, "github.example.com", "rest")
+	writeRT := NewRateTracker(database, "github.example.com", "rest_write")
+	budget := NewSyncBudget(100)
+	client, err := NewClient(
+		source,
+		"github.example.com",
+		readRT,
+		budget,
+		WithBaseURLForTesting(srv.URL),
+	)
+	require.NoError(err)
+	c, ok := client.(*liveClient)
+	require.True(ok)
+	c.SetWriteRateTracker(writeRT)
+
+	syncCtx := WithSyncBudget(t.Context())
+	threads, hasNext, err := c.ListNotifications(syncCtx, NotificationListOptions{
+		All:       true,
+		RepoOwner: "acme",
+		RepoName:  "widgets",
+	})
+	require.NoError(err)
+	require.False(hasNext)
+	require.Len(threads, 1)
+	_, err = c.GetNotificationThread(syncCtx, "ntf-1")
+	require.NoError(err)
+	require.NoError(c.MarkNotificationThreadRead(syncCtx, "ntf-1"))
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal("Bearer user-pat", authByCall["notifications:list-repo"])
+	assert.Equal("Bearer user-pat", authByCall["notifications:get"])
+	assert.Equal("Bearer user-pat", authByCall["notifications:mark-read"])
+	assert.Equal(int64(0), mints.Load(), "notification APIs must not mint app tokens")
+	assert.Equal(0, readRT.RequestsThisHour())
+	assert.Equal(-1, readRT.Remaining(),
+		"PAT notification responses must not overwrite the app-token read tracker")
+	assert.Equal(0, writeRT.RequestsThisHour())
+	assert.Equal(-1, writeRT.Remaining())
+	assert.Equal(3, budget.Spent())
+}
+
 // TestMutationAuthFallsBackToReadClientWhenUnsplit pins the hand-built
 // client shape used across this package's tests: without a dedicated
 // write client, mutations flow through the read client unchanged.

@@ -5,6 +5,7 @@
   import TerminalIcon from "@lucide/svelte/icons/terminal";
   import SparklesIcon from "@lucide/svelte/icons/sparkles";
   import BoxIcon from "@lucide/svelte/icons/box";
+  import { isVisibleLaunchTarget } from "./launchTargets";
 
   interface LaunchMenuProps {
     launchTargets: LaunchTarget[];
@@ -21,9 +22,7 @@
   let open = $state(false);
   let rootEl = $state<HTMLDivElement | null>(null);
 
-  const visibleTargets = $derived(
-    launchTargets.filter((target) => target.kind !== "plain_shell"),
-  );
+  const visibleTargets = $derived(launchTargets.filter(isVisibleLaunchTarget));
 
   function launch(targetKey: string): void {
     open = false;
@@ -31,13 +30,13 @@
   }
 
   function sourceLabel(target: LaunchTarget): string {
-    if (target.kind === "shell") return "shell";
+    if (target.kind === "plain_shell") return "shell";
     if (target.source === "config") return "configured";
     return target.source;
   }
 
   function targetLabel(target: LaunchTarget): string {
-    return target.kind === "shell" ? "Shell" : target.label;
+    return target.kind === "plain_shell" ? "Shell" : target.label;
   }
 
   $effect(() => {
@@ -91,7 +90,7 @@
     <div class="launch-popover">
       <div class="popover-heading">Run configurations</div>
       {#each visibleTargets as target (target.key)}
-        {@const isShell = target.kind === "shell"}
+        {@const isShell = target.kind === "plain_shell"}
         {@const isAgent = target.kind === "agent"}
         <button
           class="launch-option"

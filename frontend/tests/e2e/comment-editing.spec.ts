@@ -38,6 +38,7 @@ const mockRepo = {
     review_mutation: true,
     workflow_approval: true,
     ready_for_review: true,
+    draft_mutation: true,
     issue_mutation: true,
     review_draft_mutation: false,
     review_thread_resolution: false,
@@ -193,7 +194,8 @@ test("edits a pull request timeline comment", async ({ page }) => {
   await expect(page.getByText("Edited PR comment")).toBeVisible();
 });
 
-test("copies a direct provider link from a pull request timeline comment", async ({ page, context }) => {
+test("copies a direct provider link from a pull request timeline comment", async ({ page, context, browserName }) => {
+  test.skip(browserName === "firefox", "Playwright Firefox does not support granting clipboard-read permission");
   await context.grantPermissions(["clipboard-read", "clipboard-write"]);
   const directURL = "https://github.com/acme/widgets/pull/42#issuecomment-9101";
   const event: TimelineEvent = {

@@ -122,6 +122,72 @@ func readFakeGHArgv(t *testing.T, path string) []string {
 	return lines
 }
 
+func TestLoadRejectsNonPositiveNotificationIntervals(t *testing.T) {
+	cases := []struct {
+		name    string
+		content string
+		wantErr string
+	}{
+		{
+			name: "sync interval zero",
+			content: `
+[notifications]
+sync_interval = "0s"
+`,
+			wantErr: "notifications.sync_interval must be positive",
+		},
+		{
+			name: "propagation interval negative",
+			content: `
+[notifications]
+propagation_interval = "-1s"
+`,
+			wantErr: "notifications.propagation_interval must be positive",
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, tt.content))
+			require.Error(t, err)
+			Assert.Contains(t, err.Error(), tt.wantErr)
+		})
+	}
+}
+
+func TestSaveAppliesNotificationDefaultsForInMemoryConfig(t *testing.T) {
+	require := require.New(t)
+	assert := Assert.New(t)
+	cfg := &Config{
+		SyncInterval:        "5m",
+		GitHubTokenEnv:      "MIDDLEMAN_GITHUB_TOKEN",
+		DefaultPlatformHost: "github.com",
+		Host:                "127.0.0.1",
+		Port:                8091,
+		BasePath:            "/",
+		DataDir:             DefaultDataDir(),
+		SyncBudgetPerHour:   defaultSyncBudgetPerHour,
+		Repos: []Repo{{
+			Owner: "acme",
+			Name:  "widget",
+		}},
+		Activity: Activity{
+			ViewMode:  defaultViewMode,
+			TimeRange: defaultTimeRange,
+		},
+	}
+	path := filepath.Join(t.TempDir(), "config.toml")
+
+	require.NoError(cfg.Save(path))
+	reloaded, err := Load(path)
+	require.NoError(err)
+
+	assert.True(reloaded.NotificationsEnabled())
+	assert.Equal(defaultNotificationSyncInterval, reloaded.Notifications.SyncInterval)
+	assert.Equal(defaultNotificationPropagationInterval, reloaded.Notifications.PropagationInterval)
+	assert.Equal(25, reloaded.Notifications.BatchSize)
+}
+
 func TestLoadValid(t *testing.T) {
 	assert := Assert.New(t)
 	path := writeConfig(t, `
@@ -194,6 +260,24 @@ name = "repo"
 	require.Len(t, cfg.Repos, 1)
 	assert.Equal("github", cfg.Repos[0].Platform)
 	assert.Equal("github.com", cfg.Repos[0].PlatformHostOrDefault())
+	assert.True(cfg.NotificationsEnabled())
+}
+
+func TestNotificationsAlwaysEnabled(t *testing.T) {
+	// Notifications are a built-in capability with no enable/disable
+	// setting. A legacy config that still carries the removed
+	// [notifications] enabled key must load without error (the key is
+	// ignored) and keep notifications on.
+	cfg, err := Load(writeConfig(t, `
+[[repos]]
+owner = "test"
+name = "repo"
+
+[notifications]
+enabled = false
+`))
+	require.NoError(t, err)
+	Assert.True(t, cfg.NotificationsEnabled())
 }
 
 func TestLoadDocFoldersRoundTrips(t *testing.T) {
@@ -322,6 +406,54 @@ id = "notes"`,
 			require.Contains(t, err.Error(), "doc_folders")
 		})
 	}
+}
+
+func TestLoadRoundTripsHostAuthorityConfig(t *testing.T) {
+	assert := Assert.New(t)
+
+	cfg, cfg2 := roundTripConfigString(t, `
+host = "127.0.0.1"
+port = 8091
+allowed_hosts = ["middleman.local:8091", "studio.tailnet:8091"]
+trust_reverse_proxy = true
+`)
+
+	assert.Equal(
+		[]string{"middleman.local:8091", "studio.tailnet:8091"},
+		cfg.AllowedHosts,
+	)
+	assert.True(cfg.TrustReverseProxy)
+	assert.Equal(cfg.AllowedHosts, cfg2.AllowedHosts)
+	assert.Equal(cfg.TrustReverseProxy, cfg2.TrustReverseProxy)
+}
+
+func TestListenAddrBracketsIPv6Host(t *testing.T) {
+	assert := Assert.New(t)
+	require := require.New(t)
+
+	cfg, err := Load(writeConfig(t, `
+host = "::1"
+port = 8091
+`))
+	require.NoError(err)
+
+	assert.Equal("[::1]:8091", cfg.ListenAddr())
+	assert.Equal("127.0.0.1:8091", (&Config{
+		Host: "127.0.0.1",
+		Port: 8091,
+	}).ListenAddr())
+}
+
+func TestLoadRoundTripsAPIAuthConfig(t *testing.T) {
+	assert := Assert.New(t)
+
+	cfg, cfg2 := roundTripConfigString(t, `
+[api]
+require_auth = true
+`)
+
+	assert.True(cfg.API.RequireAuth)
+	assert.True(cfg2.API.RequireAuth)
 }
 
 func TestLoadNormalizesDefaultPlatformHost(t *testing.T) {
@@ -920,9 +1052,11 @@ func TestEnsureDefaultCreatesFile(t *testing.T) {
 
 	data, err := os.ReadFile(path)
 	require.NoError(t, err)
-	assert.Contains(string(data), "sync_interval")
-	assert.Contains(string(data), "github_token_env")
-	assert.Contains(string(data), "[[repos]]")
+	content := string(data)
+	assert.Contains(content, "sync_interval")
+	assert.Contains(content, "github_token_env")
+	assert.Contains(content, "[[repos]]")
+	assert.Contains(content, "[notifications]")
 }
 
 func TestEnsureDefaultSkipsExisting(t *testing.T) {
@@ -2891,6 +3025,65 @@ func TestSavePreservesTmuxCommand(t *testing.T) {
 	)
 }
 
+// TestSaveRoundTripsFleet guards against Save silently dropping the
+// [fleet] section: peers, the local host key, peer timeout, and the
+// [fleet.sessions] toggle must all survive a Save/Load round trip.
+func TestSaveRoundTripsFleet(t *testing.T) {
+	assert := Assert.New(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+
+	cfg := &Config{
+		SyncInterval:   "5m",
+		GitHubTokenEnv: "MIDDLEMAN_GITHUB_TOKEN",
+		Host:           "127.0.0.1",
+		Port:           8091,
+		DataDir:        dir,
+		Activity:       Activity{ViewMode: "threaded", TimeRange: "7d"},
+		Fleet: Fleet{
+			Enabled:     true,
+			Key:         "studio",
+			PeerTimeout: "3s",
+			Sessions:    FleetSessions{IncludeUnmanagedDetails: true},
+			Peers: []FleetPeer{
+				{Key: "laptop", Name: "Laptop", BaseURL: "http://laptop:8091"},
+				{Key: "server", BaseURL: "http://10.0.0.2:8091"},
+			},
+		},
+	}
+	require.NoError(t, cfg.Save(path))
+
+	reloaded, err := Load(path)
+	require.NoError(t, err)
+	assert.True(reloaded.Fleet.Enabled)
+	assert.Equal("studio", reloaded.Fleet.Key)
+	assert.Equal("3s", reloaded.Fleet.PeerTimeout)
+	assert.True(reloaded.Fleet.Sessions.IncludeUnmanagedDetails)
+	assert.Equal(cfg.Fleet.Peers, reloaded.Fleet.Peers)
+}
+
+// TestSaveOmitsEmptyFleet keeps default configs clean: a daemon with no
+// fleet federation must not gain a [fleet] section on save.
+func TestSaveOmitsEmptyFleet(t *testing.T) {
+	assert := Assert.New(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+
+	cfg := &Config{
+		SyncInterval:   "5m",
+		GitHubTokenEnv: "MIDDLEMAN_GITHUB_TOKEN",
+		Host:           "127.0.0.1",
+		Port:           8091,
+		DataDir:        dir,
+		Activity:       Activity{ViewMode: "threaded", TimeRange: "7d"},
+	}
+	require.NoError(t, cfg.Save(path))
+
+	saved, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.NotContains(string(saved), "[fleet]")
+}
+
 func TestLoadAgents(t *testing.T) {
 	assert := Assert.New(t)
 	path := writeConfig(t, `
@@ -3434,4 +3627,327 @@ allowed_hosts = ["mm.local:8091"]
 		[]HostKey{{Host: "mm.local", Port: "8091"}},
 		again,
 	)
+}
+
+func TestFleetConfigParsesAndValidates(t *testing.T) {
+	require := require.New(t)
+	path := writeConfig(t, `
+[fleet]
+enabled = true
+key = "studio"
+peer_timeout = "2s"
+[fleet.sessions]
+include_unmanaged_details = true
+[[fleet.peers]]
+key = "mbp"
+name = "MacBook"
+base_url = "http://mbp:8091"
+`)
+	cfg, err := Load(path)
+	require.NoError(err)
+	require.True(cfg.Fleet.Enabled)
+	require.Equal("studio", cfg.Fleet.Key)
+	require.Len(cfg.Fleet.Peers, 1)
+	require.Equal("mbp", cfg.Fleet.Peers[0].Key)
+	require.Equal("http://mbp:8091", cfg.Fleet.Peers[0].BaseURL)
+	require.Equal("2s", cfg.Fleet.PeerTimeoutOrDefault().String())
+	require.True(cfg.Fleet.Sessions.IncludeUnmanagedDetails)
+}
+
+func TestFleetConfigNormalizesHostKeys(t *testing.T) {
+	assert := Assert.New(t)
+	path := writeConfig(t, `
+[fleet]
+key = " studio "
+[[fleet.peers]]
+key = " mbp "
+name = "MacBook"
+base_url = "http://mbp:8091"
+[[fleet.ssh_peers]]
+key = " epyc "
+destination = "dev@epyc.tail"
+`)
+	cfg, err := Load(path)
+	require.NoError(t, err)
+
+	assert.Equal("studio", cfg.Fleet.Key)
+	require.Len(t, cfg.Fleet.Peers, 1)
+	assert.Equal("mbp", cfg.Fleet.Peers[0].Key)
+	require.Len(t, cfg.Fleet.SSHPeers, 1)
+	assert.Equal("epyc", cfg.Fleet.SSHPeers[0].Key)
+}
+
+func TestFleetRejectsTrimmedEmptyAndDuplicatePeerKeys(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		want    string
+	}{
+		{
+			name: "empty http peer",
+			content: `
+[[fleet.peers]]
+key = "   "
+base_url = "http://empty:8091"
+`,
+			want: "key is required",
+		},
+		{
+			name: "duplicate http peers",
+			content: `
+[[fleet.peers]]
+key = "mini"
+base_url = "http://mini:8091"
+[[fleet.peers]]
+key = " mini "
+base_url = "http://mini2:8091"
+`,
+			want: "duplicate key",
+		},
+		{
+			name: "http peer collides with local key",
+			content: `
+[fleet]
+key = " hub "
+[[fleet.peers]]
+key = "hub"
+base_url = "http://hub:8091"
+`,
+			want: "collides with fleet.key",
+		},
+		{
+			name: "ssh peer collides with trimmed http peer",
+			content: `
+[[fleet.peers]]
+key = " mini "
+base_url = "http://mini:8091"
+[[fleet.ssh_peers]]
+key = "mini"
+destination = "dev@mini"
+`,
+			want: "collides with fleet.peers",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, tc.content))
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tc.want)
+		})
+	}
+}
+
+func TestFleetConfigDefaultsToDisabledFederation(t *testing.T) {
+	require := require.New(t)
+	path := writeConfig(t, `
+[fleet]
+key = "studio"
+[[fleet.peers]]
+key = "mbp"
+base_url = "http://mbp:8091"
+`)
+	cfg, err := Load(path)
+	require.NoError(err)
+	require.False(cfg.Fleet.Enabled)
+	require.Len(cfg.Fleet.Peers, 1)
+}
+
+func TestFleetSessionsConfigDefaultsToRedactedUnmanagedDetails(t *testing.T) {
+	path := writeConfig(t, `
+[fleet]
+key = "studio"
+`)
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	require.False(t, cfg.Fleet.Sessions.IncludeUnmanagedDetails)
+}
+
+func TestFleetRejectsDuplicatePeerKeys(t *testing.T) {
+	path := writeConfig(t, `
+[[fleet.peers]]
+key = "dup"
+base_url = "http://a:8091"
+[[fleet.peers]]
+key = "dup"
+base_url = "http://b:8091"
+`)
+	_, err := Load(path)
+	require.Error(t, err, "expected duplicate peer key to fail validation")
+}
+
+func TestFleetRejectsReservedSelfKey(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		want    string
+	}{
+		{
+			name: "local key",
+			content: `
+[fleet]
+key = "self"
+`,
+			want: "fleet.key",
+		},
+		{
+			name: "http peer",
+			content: `
+[[fleet.peers]]
+key = "self"
+base_url = "http://middleman.local:8091"
+`,
+			want: "fleet.peers[0]",
+		},
+		{
+			name: "ssh peer",
+			content: `
+[[fleet.ssh_peers]]
+key = "self"
+destination = "dev@middleman.local"
+`,
+			want: "fleet.ssh_peers[0]",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeConfig(t, tc.content)
+			_, err := Load(path)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tc.want)
+			require.Contains(t, err.Error(), "reserved")
+		})
+	}
+}
+
+func TestFleetRejectsSchemelessBaseURL(t *testing.T) {
+	path := writeConfig(t, "[[fleet.peers]]\nkey = \"p\"\nbase_url = \"localhost:8091\"\n")
+	_, err := Load(path)
+	require.Error(t, err, "expected scheme-less base_url to be rejected")
+}
+
+func TestFleetPeerTimeoutDefaults(t *testing.T) {
+	var f Fleet
+	require.Equal(t, 2*time.Second, f.PeerTimeoutOrDefault(), "empty peer timeout must default to 2s")
+}
+
+func TestValidateHostBinding(t *testing.T) {
+	cases := []struct {
+		name    string
+		host    string
+		wantErr string
+	}{
+		{name: "loopback v4", host: "127.0.0.1"},
+		{name: "loopback v6", host: "::1"},
+		{name: "specific non-loopback", host: "100.100.1.2"},
+		{name: "specific non-loopback v6", host: "fd7a:115c:a1e0::1"},
+		{
+			name:    "wildcard v4",
+			host:    "0.0.0.0",
+			wantErr: "unspecified",
+		},
+		{
+			name:    "wildcard v6",
+			host:    "::",
+			wantErr: "unspecified",
+		},
+		{
+			name:    "hostname",
+			host:    "studio.tailnet",
+			wantErr: "invalid host",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			require := require.New(t)
+			path := writeConfig(t, "host = \""+tc.host+"\"\n")
+			_, err := Load(path)
+			if tc.wantErr == "" {
+				require.NoError(err)
+				return
+			}
+			require.Error(err)
+			require.Contains(err.Error(), tc.wantErr)
+		})
+	}
+}
+
+// TestValidateFleetSSHPeers pins the load-time rejection of ssh peer
+// configs that would later surface as unroutable hosts or merge
+// collisions.
+func TestValidateFleetSSHPeers(t *testing.T) {
+	base := func() *Config {
+		return &Config{
+			Fleet: Fleet{
+				Key:   "studio",
+				Peers: []FleetPeer{{Key: "mbp", BaseURL: "http://x"}},
+			},
+		}
+	}
+
+	ok := base()
+	ok.Fleet.SSHPeers = []FleetSSHPeer{
+		{Key: "epyc", Destination: "wes@epyc.local"},
+	}
+	require.NoError(t, ok.validateFleetSSHPeers())
+
+	cases := []struct {
+		name  string
+		peers []FleetSSHPeer
+		want  string
+	}{
+		{"empty key", []FleetSSHPeer{{Destination: "x@y"}}, "key is required"},
+		{"empty destination", []FleetSSHPeer{{Key: "epyc"}}, "destination is required"},
+		{"self collision", []FleetSSHPeer{{Key: "studio", Destination: "x@y"}}, "collides with fleet.key"},
+		{"http peer collision", []FleetSSHPeer{{Key: "mbp", Destination: "x@y"}}, "collides with fleet.peers"},
+		{"duplicate ssh key", []FleetSSHPeer{
+			{Key: "epyc", Destination: "x@y"},
+			{Key: "epyc", Destination: "x@z"},
+		}, "collides with fleet.ssh_peers"},
+		{"remote command with flags", []FleetSSHPeer{
+			{
+				Key: "epyc", Destination: "x@y",
+				RemoteCommand: "middleman --config /etc/mm.toml",
+			},
+		}, "remote_command must be a bare executable"},
+		{"remote command with semicolon", []FleetSSHPeer{
+			{
+				Key: "epyc", Destination: "x@y",
+				RemoteCommand: "middleman;rm",
+			},
+		}, "remote_command must be a bare executable"},
+		{"remote command with substitution", []FleetSSHPeer{
+			{
+				Key: "epyc", Destination: "x@y",
+				RemoteCommand: "$(which middleman)",
+			},
+		}, "remote_command must be a bare executable"},
+		{"remote command with newline", []FleetSSHPeer{
+			{
+				Key: "epyc", Destination: "x@y",
+				RemoteCommand: "middleman\nrm",
+			},
+		}, "remote_command must be a bare executable"},
+		{"remote command with trailing newline", []FleetSSHPeer{
+			{
+				Key: "epyc", Destination: "x@y",
+				RemoteCommand: "middleman\n",
+			},
+		}, "remote_command must be a bare executable"},
+		{"remote command with trailing space", []FleetSSHPeer{
+			{
+				Key: "epyc", Destination: "x@y",
+				RemoteCommand: "middleman ",
+			},
+		}, "remote_command must be a bare executable"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := base()
+			cfg.Fleet.SSHPeers = tc.peers
+			err := cfg.validateFleetSSHPeers()
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tc.want)
+		})
+	}
 }

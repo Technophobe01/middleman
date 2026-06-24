@@ -34,8 +34,7 @@
   const { detail: detailStore } = getStores();
   const splitViewStorageKey = "pr-detail-split-view";
   const splitViewRatioStorageKey = "pr-detail-split-ratio";
-  const regularConversationPanelWidth = 800 + 24 + 24;
-  const minSplitViewWidth = regularConversationPanelWidth * 2;
+  const minSplitViewWidth = 1280;
   const minSplitPaneWidth = 480;
   const splitResizeHandleWidth = 4;
 
@@ -58,6 +57,7 @@
     review_mutation: true,
     workflow_approval: true,
     ready_for_review: true,
+    draft_mutation: true,
     issue_mutation: true,
     review_draft_mutation: false,
     review_thread_resolution: false,

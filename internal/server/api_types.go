@@ -28,6 +28,7 @@ type providerCapabilitiesResponse struct {
 	ReviewMutation         bool     `json:"review_mutation"`
 	WorkflowApproval       bool     `json:"workflow_approval"`
 	ReadyForReview         bool     `json:"ready_for_review"`
+	DraftMutation          bool     `json:"draft_mutation"`
 	IssueMutation          bool     `json:"issue_mutation"`
 	LabelMutation          bool     `json:"label_mutation"`
 	AssigneeMutation       bool     `json:"assignee_mutation"`
@@ -214,6 +215,69 @@ type commentAutocompleteResponse struct {
 	References []db.CommentAutocompleteReference `json:"references,omitempty"`
 }
 
+type notificationResponse struct {
+	ID                      int64  `json:"id"`
+	PlatformHost            string `json:"platform_host"`
+	Provider                string `json:"provider"`
+	RepoPath                string `json:"repo_path"`
+	PlatformThreadID        string `json:"platform_thread_id"`
+	RepoOwner               string `json:"repo_owner"`
+	RepoName                string `json:"repo_name"`
+	SubjectType             string `json:"subject_type"`
+	SubjectTitle            string `json:"subject_title"`
+	SubjectURL              string `json:"subject_url"`
+	SubjectLatestCommentURL string `json:"subject_latest_comment_url"`
+	WebURL                  string `json:"web_url"`
+	ItemNumber              *int   `json:"item_number,omitempty"`
+	ItemType                string `json:"item_type"`
+	ItemAuthor              string `json:"item_author"`
+	Reason                  string `json:"reason"`
+	Unread                  bool   `json:"unread"`
+	Participating           bool   `json:"participating"`
+	GitHubUpdatedAt         string `json:"github_updated_at"`
+	GitHubLastReadAt        string `json:"github_last_read_at,omitempty"`
+	DoneAt                  string `json:"done_at,omitempty"`
+	DoneReason              string `json:"done_reason"`
+	GitHubReadQueuedAt      string `json:"github_read_queued_at,omitempty"`
+	GitHubReadSyncedAt      string `json:"github_read_synced_at,omitempty"`
+	GitHubReadError         string `json:"github_read_error"`
+	GitHubReadAttempts      int    `json:"github_read_attempts"`
+	GitHubReadLastAttemptAt string `json:"github_read_last_attempt_at,omitempty"`
+	GitHubReadNextAttemptAt string `json:"github_read_next_attempt_at,omitempty"`
+}
+
+type notificationSummaryResponse struct {
+	TotalActive int            `json:"total_active"`
+	Unread      int            `json:"unread"`
+	Done        int            `json:"done"`
+	ByReason    map[string]int `json:"by_reason"`
+	ByRepo      map[string]int `json:"by_repo"`
+}
+
+type notificationSyncStatusResponse struct {
+	Running        bool   `json:"running"`
+	LastStartedAt  string `json:"last_started_at,omitempty"`
+	LastFinishedAt string `json:"last_finished_at,omitempty"`
+	LastError      string `json:"last_error"`
+}
+
+type notificationsResponse struct {
+	Items   []notificationResponse         `json:"items"`
+	Summary notificationSummaryResponse    `json:"summary"`
+	Sync    notificationSyncStatusResponse `json:"sync"`
+}
+
+type notificationBulkFailure struct {
+	ID    int64  `json:"id"`
+	Error string `json:"error"`
+}
+
+type notificationBulkResponse struct {
+	Succeeded []int64                   `json:"succeeded"`
+	Queued    []int64                   `json:"queued"`
+	Failed    []notificationBulkFailure `json:"failed"`
+}
+
 type resolveItemResponse struct {
 	ItemType    string `json:"item_type" doc:"'pr' or 'issue'"`
 	Number      int    `json:"number"`
@@ -388,6 +452,16 @@ type workspaceRuntimeResponse struct {
 	Sessions      []localruntime.SessionInfo  `json:"sessions"`
 }
 
+type runtimeAttachSpecResponse struct {
+	Version           int      `json:"version"`
+	Kind              string   `json:"kind"`
+	SessionKey        string   `json:"session_key"`
+	TargetKey         string   `json:"target_key"`
+	TmuxSession       string   `json:"tmux_session"`
+	Command           []string `json:"command"`
+	RequiresLocalHost bool     `json:"requires_local_host"`
+}
+
 // workspaceRef is the lightweight link from item detail APIs back to an
 // existing middleman workspace.
 //
@@ -502,4 +576,5 @@ type activityItemResponse struct {
 	AuthoredAt     string          `json:"authored_at,omitempty"`
 	CommittedAt    string          `json:"committed_at,omitempty"`
 	ActivityURL    string          `json:"activity_url,omitempty"`
+	SubjectState   string          `json:"subject_state,omitempty"`
 }

@@ -38,6 +38,14 @@ describe("WorkspaceHome", () => {
             disabled_reason: "missing not found on PATH",
           },
           {
+            key: "disabled_config",
+            label: "Disabled config",
+            kind: "agent",
+            source: "config",
+            available: false,
+            disabled_reason: "disabled by config",
+          },
+          {
             key: "shell",
             label: "Shell",
             kind: "shell",
@@ -60,6 +68,7 @@ describe("WorkspaceHome", () => {
             label: "Codex",
             kind: "agent",
             status: "running",
+            display_region: "workflow",
             created_at: "2026-04-25T00:00:00Z",
           },
           {
@@ -69,6 +78,7 @@ describe("WorkspaceHome", () => {
             label: "Shell",
             kind: "plain_shell",
             status: "running",
+            display_region: "terminal",
             created_at: "2026-04-25T00:00:01Z",
           },
         ],
@@ -93,13 +103,14 @@ describe("WorkspaceHome", () => {
         }) as HTMLButtonElement
       ).disabled,
     ).toBe(true);
+    expect(screen.queryByRole("button", { name: "Disabled config" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Plain shell" })).toBeNull();
     expect(screen.queryByRole("button", { name: "shell" })).toBeNull();
 
     await fireEvent.click(screen.getByRole("button", { name: "Codex" }));
     expect(onLaunch).toHaveBeenCalledWith("codex");
     await fireEvent.click(screen.getByRole("button", { name: "Shell" }));
-    expect(onLaunch).toHaveBeenCalledWith("shell");
+    expect(onLaunch).toHaveBeenCalledWith("plain_shell");
 
     await fireEvent.click(screen.getByRole("button", { name: /Codex\s+Running/ }));
     expect(onOpenSession).toHaveBeenCalledWith("ws-1:codex");

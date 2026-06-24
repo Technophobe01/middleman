@@ -77,7 +77,9 @@ test("settings saves and reloads workspace terminal options", async ({ page }) =
   const lineHeight = page.getByLabel("Line height");
   const letterSpacing = page.getByLabel("Letter spacing");
   const cursorBlink = page.getByLabel("Cursor blink");
-  const renderer = page.getByLabel("Terminal renderer");
+  const renderer = page.getByRole("combobox", {
+    name: "Terminal renderer: xterm.js",
+  });
   const saveButton = page.getByRole("button", {
     name: "Save",
     exact: true,
@@ -88,13 +90,15 @@ test("settings saves and reloads workspace terminal options", async ({ page }) =
   await expect(lineHeight).toHaveValue("1");
   await expect(letterSpacing).toHaveValue("0");
   await expect(cursorBlink).toBeChecked();
-  await expect(renderer).toHaveValue("xterm");
+  await expect(page.locator("select#terminal-renderer")).toHaveCount(0);
+  await expect(renderer).toHaveText("xterm.js");
 
   await fontSize.fill("18");
   await scrollback.fill("5000");
   await lineHeight.fill("1.15");
   await letterSpacing.fill("1");
-  await renderer.selectOption("ghostty-web");
+  await renderer.click();
+  await page.getByRole("option", { name: "ghostty-web" }).click();
   await cursorBlink.uncheck();
   await input.click();
   await input.pressSequentially('"Iosevka Term", monospace');
@@ -122,6 +126,7 @@ test("settings saves and reloads workspace terminal options", async ({ page }) =
           letter_spacing: number;
           cursor_blink: boolean;
           font_ligatures: boolean;
+          hide_tmux_status: boolean;
           renderer: string;
         };
       };
@@ -135,6 +140,7 @@ test("settings saves and reloads workspace terminal options", async ({ page }) =
       letter_spacing: 1,
       cursor_blink: false,
       font_ligatures: false,
+      hide_tmux_status: false,
       renderer: "ghostty-web",
     });
 
@@ -146,7 +152,11 @@ test("settings saves and reloads workspace terminal options", async ({ page }) =
   await expect(page.getByLabel("Line height")).toHaveValue("1.15");
   await expect(page.getByLabel("Letter spacing")).toHaveValue("1");
   await expect(page.getByLabel("Cursor blink")).not.toBeChecked();
-  await expect(page.getByLabel("Terminal renderer")).toHaveValue("ghostty-web");
+  await expect(
+    page.getByRole("combobox", {
+      name: "Terminal renderer: ghostty-web",
+    }),
+  ).toHaveText("ghostty-web");
 });
 
 test("settings saves visible modes and hides disabled nav entries", async ({ page }) => {
@@ -216,17 +226,17 @@ test.describe("terminal options popover", () => {
       const workspace = (await createResponse.json()) as WorkspaceStatusResponse;
       await waitForWorkspaceReady(workspaceApi, workspace.id);
 
-      await page.addInitScript((workspaceId) => {
-        localStorage.setItem(`middleman-workspace-active-tab:${workspaceId}`, "shell");
-      }, workspace.id);
-
       await page.goto(`${workspaceServer.info.base_url}/terminal/${workspace.id}`);
+      await page.getByRole("button", { name: "Open terminal panel" }).click();
       await expect(page.locator(".terminal-container .xterm-screen")).toBeVisible();
       await expect.poll(() => terminalScreenSizeKey(page)).not.toBe("0pxx0px");
       const initialScreenSize = await terminalScreenSizeKey(page);
 
       await page.getByRole("button", { name: "Terminal options" }).click();
-      await expect(page.getByRole("dialog", { name: "Terminal options" })).toBeVisible();
+      const terminalOptionsDialog = page.getByRole("dialog", { name: "Terminal options" });
+      await expect(terminalOptionsDialog).toBeVisible();
+      await expect(terminalOptionsDialog.getByText("Visible modes")).toHaveCount(0);
+      await expect(terminalOptionsDialog.getByRole("button", { name: "Save visible modes" })).toHaveCount(0);
       await page.getByLabel("Font size").fill("20");
       await expect.poll(() => terminalScreenSizeKey(page)).not.toBe(initialScreenSize);
 

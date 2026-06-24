@@ -1,4 +1,6 @@
 import type { ActivityItem } from "../api/types.js";
+import { repoIdentityKey } from "../utils/repo-label.js";
+import type { RepoLabelIdentity } from "../utils/repo-label.js";
 
 export interface CollapsedActivityRun {
   kind: "collapsed";
@@ -11,6 +13,11 @@ export interface CollapsedActivityRun {
 }
 
 export type ActivityRow = ActivityItem | CollapsedActivityRun;
+
+export interface CollapseActivityRunsOptions {
+  rollUpCommits?: boolean;
+  rollUpNonCommitActivity?: boolean;
+}
 
 export function isCollapsedActivityRow(row: ActivityRow): row is CollapsedActivityRun {
   return "kind" in row && row.kind === "collapsed";
@@ -28,8 +35,59 @@ export function isDefaultBranchActivity(item: ActivityItem): boolean {
   return isDefaultBranchCommitActivity(item) || isDefaultBranchForcePushActivity(item);
 }
 
+// Resolve the open/closed/merged lifecycle state that the "Hide closed/merged"
+// filter should test for a row. Notification rows carry unread/read in
+// item_state; their linked PR/issue's lifecycle state rides in subject_state
+// (an empty string when the row is unanchored or the subject is unknown), so
+// the filter must read subject_state for notifications and fall back to
+// item_state only when no subject link is present. Every other row uses
+// item_state directly. Allowed values: "open" | "closed" | "merged" | "".
+export function activitySubjectState(item: ActivityItem): string {
+  if (item.activity_type === "notification") {
+    return item.subject_state || item.item_state;
+  }
+  return item.item_state;
+}
+
+// Shared predicate for the "Hide closed/merged" filter so desktop, threaded,
+// and mobile activity surfaces all hide the same rows, including notifications
+// whose linked PR/issue is closed/merged even when no sibling PR row is loaded.
+export function isClosedOrMergedActivity(item: ActivityItem): boolean {
+  const state = activitySubjectState(item);
+  return state === "merged" || state === "closed";
+}
+
 export function shortSha(sha: string | undefined): string {
   return sha ? sha.slice(0, 7) : "";
+}
+
+// A notification's reason rides in body_preview from the backend union; turn
+// the raw GitHub reason token into a human label. Shared so the desktop,
+// threaded, and mobile activity surfaces render the same notification labels
+// instead of drifting apart.
+export function notificationReasonLabel(reason: string): string {
+  switch (reason) {
+    case "review_requested":
+      return "Review requested";
+    case "mention":
+      return "Mentioned";
+    case "team_mention":
+      return "Team mentioned";
+    case "assign":
+      return "Assigned";
+    case "author":
+      return "Your thread";
+    case "comment":
+      return "New comment";
+    case "state_change":
+      return "State changed";
+    case "subscribed":
+      return "Subscribed";
+    case "ci_activity":
+      return "CI activity";
+    default:
+      return "Notification";
+  }
 }
 
 function repoKeyForItem(item: ActivityItem): string {
@@ -45,26 +103,37 @@ function activityRunAuthor(item: ActivityItem): string {
   return item.author_name || item.author;
 }
 
-function activityRunGroupKey(item: ActivityItem): string | null {
+function activityRunGroupKey(item: ActivityItem, options: Required<CollapseActivityRunsOptions>): string | null {
   const author = activityRunAuthor(item);
-  if (item.activity_type === "commit" || item.activity_type === "comment" || item.activity_type === "review") {
+  if (item.activity_type === "commit") {
+    if (!options.rollUpCommits) return null;
+    return ["item", item.activity_type, repoKeyForItem(item), item.item_type, item.item_number, author].join("|");
+  }
+
+  if (item.activity_type === "comment" || item.activity_type === "review") {
+    if (!options.rollUpNonCommitActivity) return null;
     return ["item", item.activity_type, repoKeyForItem(item), item.item_type, item.item_number, author].join("|");
   }
 
   if (isDefaultBranchCommitActivity(item)) {
+    if (!options.rollUpCommits) return null;
     return ["branch", repoKeyForItem(item), item.branch_name ?? "", author].join("|");
   }
 
   return null;
 }
 
-export function collapseActivityRuns(items: ActivityItem[]): ActivityRow[] {
+export function collapseActivityRuns(items: ActivityItem[], options: CollapseActivityRunsOptions = {}): ActivityRow[] {
+  const resolvedOptions = {
+    rollUpCommits: options.rollUpCommits ?? false,
+    rollUpNonCommitActivity: options.rollUpNonCommitActivity ?? true,
+  };
   const result: ActivityRow[] = [];
   let i = 0;
 
   while (i < items.length) {
     const item = items[i]!;
-    const groupKey = activityRunGroupKey(item);
+    const groupKey = activityRunGroupKey(item, resolvedOptions);
     if (groupKey === null) {
       result.push(item);
       i++;
@@ -74,7 +143,7 @@ export function collapseActivityRuns(items: ActivityItem[]): ActivityRow[] {
     let j = i + 1;
     while (j < items.length) {
       const next = items[j]!;
-      if (activityRunGroupKey(next) !== groupKey) break;
+      if (activityRunGroupKey(next, resolvedOptions) !== groupKey) break;
       j++;
     }
 
@@ -103,15 +172,10 @@ export function collapseActivityRuns(items: ActivityItem[]): ActivityRow[] {
   return result;
 }
 
-export interface ActivityRepoKeyRef {
-  provider: string;
-  platformHost: string;
-  owner: string;
-  name: string;
-}
+export type ActivityRepoKeyRef = RepoLabelIdentity;
 
 export function activityRepoKey(ref: ActivityRepoKeyRef): string {
-  return `${ref.provider}|${ref.platformHost}|${ref.owner}/${ref.name}`;
+  return repoIdentityKey(ref);
 }
 
 export function activityItemKey(ref: ActivityRepoKeyRef & { itemType: string; itemNumber: number }): string {

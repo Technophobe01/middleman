@@ -1,6 +1,6 @@
 <script lang="ts">
   import { tick, untrack } from "svelte";
-  import { providerItemPath, providerRepoPath, providerRouteParams } from "../../api/provider-routes.js";
+  import { canonicalProvider, providerItemPath, providerRepoPath, providerRouteParams } from "../../api/provider-routes.js";
   import type { Label, ProviderCapabilities } from "../../api/types.js";
   import {
     getStores, getClient, getActions,
@@ -14,6 +14,7 @@
   import { timeAgo } from "../../utils/time.js";
   import { copyToClipboard } from "../../utils/clipboard.js";
   import EventTimeline from "./EventTimeline.svelte";
+  import DetailActivityViewMenu from "./DetailActivityViewMenu.svelte";
   import IssueCommentBox from "./IssueCommentBox.svelte";
   import ActionButton from "../shared/ActionButton.svelte";
   import Chip from "../shared/Chip.svelte";
@@ -38,7 +39,7 @@
 
   const CLEAR_LABELS_PENDING = "__clear-label-selection__";
 
-  const { issues, activity } = getStores();
+  const { issues, activity, detailActivityView } = getStores();
   const client = getClient();
   const actions = getActions();
   const uiConfig = getUIConfig();
@@ -58,6 +59,7 @@
     review_mutation: true,
     workflow_approval: true,
     ready_for_review: true,
+    draft_mutation: true,
     issue_mutation: true,
     label_mutation: false,
     assignee_mutation: false,
@@ -349,6 +351,17 @@
     return data?.users ?? [];
   }
 
+  function userAvatarURL(username: string): string {
+    if (canonicalProvider(provider) !== "github") return "";
+    const login = encodeURIComponent(username.trim());
+    const host = issues.getIssueDetail()?.repo?.platform_host
+      ?? issues.getIssueDetail()?.platform_host
+      ?? platformHost
+      ?? "";
+    if (login === "" || host === "") return "";
+    return `https://${host}/${login}.png?size=40`;
+  }
+
   function onDocumentMousedown(e: MouseEvent): void {
     if (!labelPickerOpen) return;
     const target = e.target as Node;
@@ -436,6 +449,10 @@
 
   let workspaceCreating = $state(false);
   let workspaceError = $state<string | null>(null);
+  const createWorkspaceTitle =
+    "Create an issue worktree, then open Workspaces to launch agents or shells on that branch.";
+  const createWorkspaceDescriptionId =
+    "issue-create-workspace-description";
   const ISSUE_WORKSPACE_BRANCH_CONFLICT_TYPE =
     "urn:middleman:error:issue-workspace-branch-conflict";
 
@@ -903,6 +920,7 @@
             disabled={staleIssue || assigneeGate.unavailable}
             disabledReason={assigneeGate.unavailable ? assigneeGate.reason : undefined}
             loadCandidates={loadUserCandidates}
+            avatarUrlForUser={userAvatarURL}
             onchange={(next) => issues.setIssueAssignees(owner, name, number, next)}
           >
             {#snippet icon()}
@@ -1034,11 +1052,22 @@
             tone="info"
             surface="soft"
             size="sm"
+            title={staleIssue
+              ? "Refresh details before creating a workspace."
+              : createWorkspaceTitle}
+            ariaDescribedby={createWorkspaceDescriptionId}
             label={workspaceCreating ? "Creating..." : "Create Workspace"}
             shortLabel={workspaceCreating ? "Creating..." : "Create Workspace"}
           >
             <PackagePlusIcon size="14" strokeWidth="2.2" aria-hidden="true" />
           </ActionButton>
+        {/if}
+        {#if !workspace}
+          <span id={createWorkspaceDescriptionId} class="sr-only">
+            {staleIssue
+              ? "Refresh details before creating a workspace."
+              : createWorkspaceTitle}
+          </span>
         {/if}
         {#if issue.State === "open" && capabilities.state_mutation}
           {@const closeGate = operationGate(repoOperations?.close_issue)}
@@ -1118,7 +1147,13 @@
 
       <!-- Activity -->
       <div class="section">
-        <h3 class="section-title">Activity</h3>
+        <div class="section-title-row">
+          <h3 class="section-title">Activity</h3>
+          <DetailActivityViewMenu
+            viewMode={detailActivityView.getMode()}
+            onViewChange={(mode) => detailActivityView.setMode(mode)}
+          />
+        </div>
         {#if issues.getIssueDetailLoaded()}
           <EventTimeline
             events={detail.events ?? []}
@@ -1127,6 +1162,7 @@
             repoOwner={owner}
             repoName={name}
             {repoPath}
+            activityViewMode={detailActivityView.getMode()}
             onEditComment={capabilities.comment_mutation && !staleIssue && !editCommentGate.unavailable
               ? editTimelineComment
               : undefined}
@@ -1296,6 +1332,18 @@
     color: var(--accent-red);
   }
 
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+
   .issue-detail {
     padding: 20px 24px;
     display: flex;
@@ -1436,6 +1484,13 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
+  }
+
+  .section-title-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
   }
 
   .section-title {

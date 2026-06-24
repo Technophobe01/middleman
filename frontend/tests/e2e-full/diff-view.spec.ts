@@ -2,9 +2,17 @@ import { expect, test, type Locator, type Page, type Request } from "@playwright
 import type { DiffFile, DiffLine, DiffResult, FilesResult } from "@middleman/ui/api/types";
 import { startIsolatedE2EServer } from "./support/e2eServer";
 
-type DiffFixtureFile = Omit<DiffFile, "patch"> & { patch?: string };
+type DiffFixtureFile = Omit<DiffFile, "patch"> & {
+  patch?: string;
+  preserveHunkCounts?: boolean;
+};
 type DiffFixture = Omit<DiffResult, "files"> & {
   files: DiffFixtureFile[];
+};
+type MergeRequestDetailForRoute = {
+  diff_head_sha?: string;
+  events?: unknown[] | null;
+  merge_request?: { ID?: number };
 };
 
 const gitBackedDiffTestTimeoutMs = 120_000;
@@ -382,6 +390,105 @@ const oversizedSparseDiff: DiffResult = withServerDiffData({
   ],
 });
 
+const syntaxContextPath = "src/example.test.ts";
+const syntaxContextOldText = [
+  "import { vi } from 'vitest';",
+  "",
+  "function render() {",
+  "  return null;",
+  "}",
+  "",
+  "const setup = true;",
+  "",
+  "function mount() {",
+  "const html = `",
+  "  <div>",
+  "  </div>",
+  "  <main>",
+  "    content",
+  "  </main>",
+  "  <footer>",
+  "    footer",
+  "  </footer>",
+  "`;",
+  "afterRender();",
+  ...Array.from({ length: 59 }, (_, index) => `// unchanged ${index + 21}`),
+  "function makeFile() {}",
+  "export const done = true;",
+].join("\n");
+const syntaxContextNewText = [
+  "import { vi } from 'vitest';",
+  "",
+  "function render() {",
+  "  return null;",
+  "}",
+  "",
+  "const setup = true;",
+  "",
+  "function mount() {",
+  "const html = `",
+  "  <span>new</span>",
+  "  <div>",
+  "  </div>",
+  "  <main>",
+  "    content",
+  "  </main>",
+  "  <footer>",
+  "    footer",
+  "  </footer>",
+  "`;",
+  "afterRender();",
+  ...Array.from({ length: 59 }, (_, index) => `// unchanged ${index + 21}`),
+  'vi.doMock("./worker", () => ({',
+  "  run: () => undefined,",
+  "}));",
+  "function makeFile() {}",
+  "export const done = true;",
+].join("\n");
+const syntaxContextDiff: DiffResult = withServerDiffData({
+  stale: false,
+  whitespace_only_count: 0,
+  files: [
+    {
+      path: syntaxContextPath,
+      old_path: syntaxContextPath,
+      status: "modified",
+      is_binary: false,
+      is_whitespace_only: false,
+      additions: 4,
+      deletions: 0,
+      hunks: [
+        {
+          old_start: 10,
+          old_count: 2,
+          new_start: 10,
+          new_count: 3,
+          section: "function mount() {",
+          lines: [
+            { type: "context", content: "const html = `", old_num: 10, new_num: 10 },
+            { type: "add", content: "  <span>new</span>", new_num: 11 },
+            { type: "context", content: "  <div>", old_num: 11, new_num: 12 },
+          ],
+        },
+        {
+          old_start: 80,
+          old_count: 2,
+          new_start: 81,
+          new_count: 5,
+          section: "afterRender();",
+          lines: [
+            { type: "add", content: 'vi.doMock("./worker", () => ({', new_num: 81 },
+            { type: "add", content: "  run: () => undefined,", new_num: 82 },
+            { type: "add", content: "}));", new_num: 83 },
+            { type: "context", content: "function makeFile() {}", old_num: 80, new_num: 84 },
+            { type: "context", content: "export const done = true;", old_num: 81, new_num: 85 },
+          ],
+        },
+      ],
+    },
+  ],
+});
+
 const previewDiff: DiffResult = withServerDiffData({
   stale: smallDiff.stale,
   whitespace_only_count: smallDiff.whitespace_only_count,
@@ -392,14 +499,14 @@ const previewDiff: DiffResult = withServerDiffData({
       status: "modified",
       is_binary: false,
       is_whitespace_only: false,
-      additions: 4,
-      deletions: 3,
+      additions: 6,
+      deletions: 5,
       hunks: [
         {
           old_start: 1,
-          old_count: 5,
+          old_count: 7,
           new_start: 1,
-          new_count: 6,
+          new_count: 7,
           lines: [
             {
               type: "context",
@@ -425,6 +532,26 @@ const previewDiff: DiffResult = withServerDiffData({
               old_num: 5,
             },
             { type: "add", content: "- [x] Markdown task", new_num: 5 },
+            {
+              type: "delete",
+              content: "<em>alpha</em><strong>beta</strong><code>gamma</code>",
+              old_num: 6,
+            },
+            {
+              type: "add",
+              content: '<a href="/link">link</a><strong>two</strong><code>three</code>',
+              new_num: 6,
+            },
+            {
+              type: "delete",
+              content: "<table><tbody><tr><td>Keep</td></tr></tbody></table>",
+              old_num: 7,
+            },
+            {
+              type: "add",
+              content: "<table><tbody><tr><td>Keep</td><td>Added cell</td></tr></tbody></table>",
+              new_num: 7,
+            },
           ],
         },
       ],
@@ -433,10 +560,254 @@ const previewDiff: DiffResult = withServerDiffData({
   ],
 });
 
+const listReviewPreviewDiff: DiffResult = withServerDiffData({
+  stale: false,
+  whitespace_only_count: 0,
+  files: [
+    {
+      path: "docs/list-review.md",
+      old_path: "docs/list-review.md",
+      status: "modified",
+      is_binary: false,
+      is_whitespace_only: false,
+      additions: 4,
+      deletions: 0,
+      hunks: [
+        {
+          old_start: 1,
+          old_count: 0,
+          new_start: 1,
+          new_count: 4,
+          lines: [
+            { type: "add", content: "- Issues", new_num: 1 },
+            { type: "add", content: "- Actions", new_num: 2 },
+            { type: "add", content: "- Statuses", new_num: 3 },
+            { type: "add", content: "- Members", new_num: 4 },
+          ],
+        },
+      ],
+    },
+    ...smallDiff.files,
+  ],
+});
+
+const untargetedListReviewPreviewDiff: DiffResult = withServerDiffData({
+  stale: false,
+  whitespace_only_count: 0,
+  files: [
+    {
+      path: "docs/untargeted-list-review.md",
+      old_path: "docs/untargeted-list-review.md",
+      status: "modified",
+      is_binary: false,
+      is_whitespace_only: false,
+      additions: 1,
+      deletions: 0,
+      hunks: [
+        {
+          old_start: 1,
+          old_count: 4,
+          new_start: 1,
+          new_count: 5,
+          lines: [
+            { type: "context", content: "- Issues", old_num: 1, new_num: 1 },
+            { type: "context", content: "- Actions", old_num: 2, new_num: 2 },
+            { type: "context", content: "- Statuses", old_num: 3, new_num: 3 },
+            { type: "context", content: "", old_num: 4, new_num: 4 },
+            { type: "add", content: "Paragraph with review note.", new_num: 5 },
+          ],
+        },
+      ],
+    },
+    ...smallDiff.files,
+  ],
+});
+
+const changedListReviewPreviewDiff: DiffResult = withServerDiffData({
+  stale: false,
+  whitespace_only_count: 0,
+  files: [
+    {
+      path: "docs/changed-list-review.md",
+      old_path: "docs/changed-list-review.md",
+      status: "modified",
+      is_binary: false,
+      is_whitespace_only: false,
+      additions: 1,
+      deletions: 0,
+      hunks: [
+        {
+          old_start: 1,
+          old_count: 2,
+          new_start: 1,
+          new_count: 3,
+          lines: [
+            { type: "context", content: "- Issues", old_num: 1, new_num: 1 },
+            { type: "add", content: "- Actions", new_num: 2 },
+            { type: "context", content: "- Statuses", old_num: 2, new_num: 3 },
+          ],
+        },
+      ],
+    },
+    ...smallDiff.files,
+  ],
+});
+
+const edgeListReviewPreviewDiff: DiffResult = withServerDiffData({
+  stale: false,
+  whitespace_only_count: 0,
+  files: [
+    {
+      path: "docs/edge-added-list-review.md",
+      old_path: "docs/edge-added-list-review.md",
+      status: "modified",
+      is_binary: false,
+      is_whitespace_only: false,
+      additions: 3,
+      deletions: 0,
+      hunks: [
+        {
+          old_start: 1,
+          old_count: 2,
+          new_start: 1,
+          new_count: 5,
+          lines: [
+            { type: "add", content: "- Prepended", new_num: 1 },
+            { type: "add", content: "prepended details", new_num: 2 },
+            { type: "context", content: "- Issues", old_num: 1, new_num: 3 },
+            { type: "context", content: "- Statuses", old_num: 2, new_num: 4 },
+            { type: "add", content: "- Appended", new_num: 5 },
+          ],
+        },
+      ],
+    },
+    {
+      path: "docs/edge-deleted-list-review.md",
+      old_path: "docs/edge-deleted-list-review.md",
+      status: "modified",
+      is_binary: false,
+      is_whitespace_only: false,
+      additions: 0,
+      deletions: 3,
+      hunks: [
+        {
+          old_start: 1,
+          old_count: 5,
+          new_start: 1,
+          new_count: 2,
+          lines: [
+            { type: "delete", content: "- Removed first", old_num: 1 },
+            { type: "delete", content: "removed first details", old_num: 2 },
+            { type: "context", content: "- Issues", old_num: 3, new_num: 1 },
+            { type: "context", content: "- Statuses", old_num: 4, new_num: 2 },
+            { type: "delete", content: "- Removed last", old_num: 5 },
+          ],
+        },
+      ],
+    },
+    ...smallDiff.files,
+  ],
+});
+
+const multiHunkMarkdownDiff: DiffResult = withServerDiffData({
+  stale: false,
+  whitespace_only_count: 0,
+  files: [
+    {
+      path: "docs/multihunk.md",
+      old_path: "docs/multihunk.md",
+      status: "modified",
+      is_binary: false,
+      is_whitespace_only: false,
+      additions: 1,
+      deletions: 0,
+      hunks: [
+        {
+          old_start: 1,
+          old_count: 2,
+          new_start: 1,
+          new_count: 2,
+          lines: [
+            { type: "context", content: "```text", old_num: 1, new_num: 1 },
+            { type: "context", content: "first hunk code", old_num: 2, new_num: 2 },
+          ],
+        },
+        {
+          old_start: 10,
+          old_count: 2,
+          new_start: 10,
+          new_count: 3,
+          lines: [
+            { type: "context", content: "second hunk code", old_num: 10, new_num: 10 },
+            { type: "add", content: "added hunk code", new_num: 11 },
+            { type: "context", content: "```", old_num: 11, new_num: 12 },
+          ],
+        },
+      ],
+    },
+  ],
+});
+
+const blockFillMarkdownDiff: DiffResult = withServerDiffData({
+  stale: false,
+  whitespace_only_count: 0,
+  files: [
+    {
+      path: "docs/block-fill.md",
+      old_path: "docs/block-fill.md",
+      status: "modified",
+      is_binary: false,
+      is_whitespace_only: false,
+      additions: 1,
+      deletions: 1,
+      hunks: [
+        {
+          old_start: 1,
+          old_count: 6,
+          new_start: 1,
+          new_count: 6,
+          lines: [
+            { type: "context", content: "# Block fills", old_num: 1, new_num: 1 },
+            { type: "context", content: "", old_num: 2, new_num: 2 },
+            {
+              type: "delete",
+              content: "Removed standalone block that should have a filled background.",
+              old_num: 3,
+            },
+            { type: "context", content: "", old_num: 4, new_num: 3 },
+            { type: "context", content: "Shared stable block", old_num: 5, new_num: 4 },
+            { type: "context", content: "", old_num: 6, new_num: 5 },
+            {
+              type: "add",
+              content: "Added standalone block that should have a filled background.",
+              new_num: 6,
+            },
+          ],
+        },
+      ],
+    },
+  ],
+});
+
+const splitRichPreviewDiff: DiffResult = withServerDiffData({
+  stale: false,
+  whitespace_only_count: 0,
+  files: [previewDiff.files[0]!, blockFillMarkdownDiff.files[0]!, ...smallDiff.files],
+});
+
 // --- Helpers ---
 
 function cssString(value: string): string {
   return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+async function expectNonTransparentBackground(locator: Locator) {
+  await expect
+    .poll(async () => {
+      const background = await locator.evaluate((element) => getComputedStyle(element).backgroundColor);
+      return background !== "rgba(0, 0, 0, 0)" && background !== "transparent";
+    })
+    .toBe(true);
 }
 
 function treeFileItems(pageOrLocator: Page | ReturnType<Page["locator"]>) {
@@ -498,6 +869,28 @@ async function clickTreeFileItem(pageOrLocator: Page | ReturnType<Page["locator"
   const item = treeFileItem(pageOrLocator, path);
   await activateVisibleTarget(item);
   await expect(item).toHaveAttribute("aria-selected", "true");
+}
+
+async function jumpToFile(page: Page, path: string): Promise<void> {
+  await page.getByRole("button", { name: "Jump to file" }).click();
+  const menu = page.locator(".file-jump-menu");
+  await expect(menu).toBeVisible();
+  await menu.getByRole("searchbox", { name: "Jump to file" }).fill(path);
+  await menu.locator(".file-jump-option").first().click();
+  await expect(menu).toBeHidden();
+}
+
+async function scrollFileTreeToTop(page: Page): Promise<void> {
+  await page.locator(".diff-file-tree").evaluate((host) => {
+    host.scrollTop = 0;
+    const root = host.shadowRoot;
+    if (!root) return;
+    for (const element of root.querySelectorAll<HTMLElement>("*")) {
+      if (element.scrollHeight > element.clientHeight) {
+        element.scrollTop = 0;
+      }
+    }
+  });
 }
 
 const diffAdditionsSelector = '[data-content] [data-line-type="change-addition"]';
@@ -599,6 +992,21 @@ async function expectPierreDiffVisibleExactText(file: ReturnType<Page["locator"]
     .toContain(text);
 }
 
+async function pierreAdditionTokenStats(file: ReturnType<Page["locator"]>, lineText: string) {
+  return await file.locator(".pierre-diff").evaluate((host, lineText) => {
+    const rows = Array.from(
+      host.shadowRoot?.querySelectorAll('[data-content] [data-line-type="change-addition"]') ?? [],
+    );
+    const row = rows.find((candidate) => candidate.textContent?.includes(lineText));
+    const spans = Array.from(row?.querySelectorAll("span") ?? []).map((span) => span.textContent ?? "");
+    return {
+      hasSeparateDoMock: spans.includes("doMock"),
+      hasSeparateVi: spans.includes("vi"),
+      singleLineSpan: spans.length === 1 && spans[0] === lineText,
+    };
+  }, lineText);
+}
+
 async function expectRenderedNonBlankRows(file: ReturnType<Page["locator"]>, textFragment: string) {
   await expect
     .poll(async () => {
@@ -614,6 +1022,94 @@ async function expectRenderedNonBlankRows(file: ReturnType<Page["locator"]>, tex
       hasText: true,
       nonBlankPositive: true,
     });
+}
+
+async function expectVisibleExpandedRowContent(file: ReturnType<Page["locator"]>, expectedText: string) {
+  await expect
+    .poll(async () => {
+      return await file.locator(".pierre-diff").evaluate((host, expectedText) => {
+        const root = host.shadowRoot;
+        const gutters = Array.from(root?.querySelectorAll("[data-gutter] > [data-line-index]") ?? []);
+        const contents = Array.from(root?.querySelectorAll("[data-content] > [data-line-index]") ?? []);
+        const visibleExpanded = gutters.filter((gutter): gutter is HTMLElement => {
+          if (!(gutter instanceof HTMLElement)) return false;
+          if (gutter.getAttribute("data-line-type") !== "context-expanded") return false;
+          const rect = gutter.getBoundingClientRect();
+          return rect.bottom > 0 && rect.top < window.innerHeight;
+        });
+
+        let matched = false;
+        let missing = 0;
+        let blank = 0;
+        for (const gutter of visibleExpanded) {
+          const gutterRect = gutter.getBoundingClientRect();
+          const index = gutter.getAttribute("data-line-index");
+          const content = contents.find((candidate): candidate is HTMLElement => {
+            if (!(candidate instanceof HTMLElement)) return false;
+            if (candidate.getAttribute("data-line-index") !== index) return false;
+            const contentRect = candidate.getBoundingClientRect();
+            return Math.abs(contentRect.top - gutterRect.top) <= 1;
+          });
+          if (!content) {
+            missing += 1;
+            continue;
+          }
+          const text = content.textContent?.trim() ?? "";
+          if (text.length === 0) blank += 1;
+          if (text.includes(expectedText)) matched = true;
+        }
+
+        return {
+          blank,
+          matched,
+          missing,
+          visibleExpandedPositive: visibleExpanded.length > 0,
+        };
+      }, expectedText);
+    })
+    .toEqual({
+      blank: 0,
+      matched: true,
+      missing: 0,
+      visibleExpandedPositive: true,
+    });
+}
+
+async function expectRenderedPierreContainmentDisabled(page: Page): Promise<void> {
+  await expect
+    .poll(
+      async () => {
+        return await page.locator(".diff-file .pierre-diff").evaluateAll((hosts) => {
+          for (const host of hosts) {
+            const root = host.shadowRoot;
+            const code = root?.querySelector("code");
+            if (!(root instanceof ShadowRoot) || !(code instanceof HTMLElement)) continue;
+
+            const visibleTextRows = Array.from(root.querySelectorAll("[data-content] [data-line-type]")).filter(
+              (element): element is HTMLElement => {
+                if (!(element instanceof HTMLElement)) return false;
+                const rect = element.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0 && (element.textContent?.trim().length ?? 0) > 0;
+              },
+            ).length;
+            if (visibleTextRows === 0) continue;
+
+            const placeholderProbe = document.createElement("div");
+            placeholderProbe.dataset.placeholder = "";
+            root.append(placeholderProbe);
+            const containment = {
+              code: getComputedStyle(code).contain,
+              placeholder: getComputedStyle(placeholderProbe).contain,
+            };
+            placeholderProbe.remove();
+            return containment;
+          }
+          return null;
+        });
+      },
+      { timeout: 10_000 },
+    )
+    .toEqual({ code: "none", placeholder: "none" });
 }
 
 async function scrollDiffAreaUntilPierreText(
@@ -821,6 +1317,7 @@ function patchForFile(file: DiffFixtureFile): string {
 }
 
 function normalizeFixtureFile(file: DiffFixtureFile): DiffFixtureFile {
+  if (file.preserveHunkCounts) return file;
   return {
     ...file,
     hunks: file.hunks.map((hunk) => ({
@@ -919,7 +1416,9 @@ async function mockFilePreviewApi(page: Page): Promise<void> {
           path,
           media_type: "text/markdown; charset=utf-8",
           encoding: "base64",
-          content: btoa("# Rendered preview\n\n- [x] Markdown task\n"),
+          content: btoa(
+            '# Rendered preview\n\nNew paragraph that should be highlighted.\n\n- [x] Markdown task\n<a href="/link">link</a><strong>two</strong><code>three</code>\n<table><tbody><tr><td>Keep</td><td>Added cell</td></tr></tbody></table>\n',
+          ),
         }),
       });
       return;
@@ -941,6 +1440,87 @@ async function mockFilePreviewApi(page: Page): Promise<void> {
       status: 404,
       contentType: "application/json",
       body: JSON.stringify({ detail: "preview unavailable" }),
+    });
+  });
+}
+
+async function mockReviewThreadOnPreviewMarkdown(
+  page: Page,
+  body: string,
+  line = 3,
+  path = "docs/preview.md",
+): Promise<void> {
+  await mockReviewThreadsOnPreviewMarkdown(page, [{ body, line, path }]);
+}
+
+interface PreviewMarkdownReviewThread {
+  body: string;
+  line?: number;
+  lineType?: "add" | "delete";
+  newLine?: number;
+  oldLine?: number;
+  path?: string;
+  side?: "left" | "right";
+}
+
+async function mockReviewThreadsOnPreviewMarkdown(page: Page, threads: PreviewMarkdownReviewThread[]): Promise<void> {
+  await page.route("**/api/v1/pulls/github/acme/widgets/1", async (route) => {
+    const response = await route.fetch();
+    const detail = (await response.json()) as MergeRequestDetailForRoute;
+    const timestamp = "2026-06-17T15:00:00Z";
+
+    await route.fulfill({
+      response,
+      json: {
+        ...detail,
+        events: [
+          ...(detail.events ?? []),
+          ...threads.map((thread, index) => {
+            const line = thread.line ?? 3;
+            const path = thread.path ?? "docs/preview.md";
+            const side = thread.side ?? "right";
+            const lineType = thread.lineType ?? (side === "left" ? "delete" : "add");
+            const newLine = thread.newLine ?? (side === "right" ? line : undefined);
+            const oldLine = thread.oldLine ?? (side === "left" ? line : undefined);
+            const externalID = `e2e-rich-preview-${path}-${side}-${line}-${index}`;
+            const threadID = `thread-rich-preview-${path}-${side}-${line}-${index}`;
+            return {
+              Author: "reviewer",
+              Body: thread.body,
+              CreatedAt: timestamp,
+              DedupeKey: `review_comment:${externalID}`,
+              DirectURL: "",
+              EventType: "review_comment",
+              ID: 900_001 + index,
+              MergeRequestID: detail.merge_request?.ID ?? 1,
+              MetadataJSON: "{}",
+              PlatformExternalID: externalID,
+              PlatformID: 900_001 + index,
+              Resolvable: false,
+              Resolved: false,
+              Summary: thread.body,
+              ThreadID: threadID,
+              diff_thread: {
+                author_login: "reviewer",
+                body: thread.body,
+                can_resolve: false,
+                created_at: timestamp,
+                diff_head_sha: detail.diff_head_sha,
+                id: threadID,
+                line,
+                line_type: lineType,
+                new_line: newLine,
+                old_line: oldLine,
+                path,
+                provider_comment_id: externalID,
+                resolved: false,
+                side,
+                updated_at: timestamp,
+              },
+            };
+          }),
+        ],
+      },
     });
   });
 }
@@ -1406,6 +1986,64 @@ test.describe("diff view", () => {
     await expect.poll(() => mainArea.evaluate((el) => Math.round(el.scrollTop))).toBe(0);
   });
 
+  test("diff pane boundary wheel events do not scroll the outer detail frame", async ({ page }) => {
+    await mockDiffApi(page, largeDiff);
+    await navigateToDiff(page);
+    await waitForDiffLoaded(page);
+    await waitForSidebarFilesLoaded(page);
+
+    const mainArea = page.locator(".main-area");
+    const diffArea = page.locator(".diff-area");
+    await page.evaluate(() => {
+      document.documentElement.style.overflow = "hidden";
+      document.body.style.overflow = "hidden";
+    });
+    await mainArea.evaluate((area) => {
+      area.style.overflowY = "auto";
+      area.style.overflowAnchor = "none";
+      const filesView = area.firstElementChild;
+      if (!(filesView instanceof HTMLElement)) throw new Error("missing files view");
+      const frameHeight = Math.round(area.getBoundingClientRect().height);
+      filesView.style.flex = `0 0 ${frameHeight}px`;
+      filesView.style.minHeight = `${frameHeight}px`;
+      const topSpacer = document.createElement("div");
+      topSpacer.dataset.testid = "overscroll-top-spacer";
+      topSpacer.setAttribute("aria-hidden", "true");
+      topSpacer.style.flexShrink = "0";
+      topSpacer.style.height = "180px";
+      area.insertBefore(topSpacer, area.firstElementChild);
+      const bottomSpacer = document.createElement("div");
+      bottomSpacer.dataset.testid = "overscroll-bottom-spacer";
+      bottomSpacer.setAttribute("aria-hidden", "true");
+      bottomSpacer.style.flexShrink = "0";
+      bottomSpacer.style.height = "1200px";
+      area.appendChild(bottomSpacer);
+    });
+    await expect.poll(async () => mainArea.evaluate((area) => area.scrollHeight > area.clientHeight)).toBe(true);
+    const pinnedFrameScrollTop = await mainArea.evaluate((area) => {
+      area.scrollTop = 180;
+      return Math.round(area.scrollTop);
+    });
+    expect(pinnedFrameScrollTop).toBeGreaterThan(0);
+    await expect(diffArea).toBeVisible();
+
+    await diffArea.evaluate((area) => {
+      area.scrollTop = 0;
+    });
+    await diffArea.hover();
+    await page.mouse.wheel(0, -900);
+    await expect.poll(async () => mainArea.evaluate((area) => Math.round(area.scrollTop))).toBe(pinnedFrameScrollTop);
+
+    const bottomScrollTop = await diffArea.evaluate((area) => {
+      area.scrollTop = area.scrollHeight - area.clientHeight;
+      return Math.round(area.scrollTop);
+    });
+    expect(bottomScrollTop).toBeGreaterThan(0);
+    await diffArea.hover();
+    await page.mouse.wheel(0, 900);
+    await expect.poll(async () => mainArea.evaluate((area) => Math.round(area.scrollTop))).toBe(pinnedFrameScrollTop);
+  });
+
   test("sidebar jump to the last file preserves expanded body space above it", async ({ page }) => {
     await mockDiffApi(page, largeDiff);
     await navigateToDiff(page);
@@ -1598,6 +2236,7 @@ test.describe("diff view", () => {
         timeout: 10_000,
       })
       .toBe(0);
+    await expectRenderedPierreContainmentDisabled(page);
   });
 
   test("rich preview toggle renders markdown and browser images", async ({ page }) => {
@@ -1614,20 +2253,20 @@ test.describe("diff view", () => {
 
     await previewToggle.click();
     await expect(previewToggle).toHaveAttribute("aria-checked", "true");
-    await expect(
-      page.getByLabel("After markdown preview").getByRole("heading", { name: "Rendered preview" }),
-    ).toBeVisible();
-    await expect(page.locator(".markdown-rich-diff")).toContainText("Markdown task");
-    await expect(
-      page.locator(".markdown-rich-diff__block--delete", {
-        hasText: "Old paragraph that should be highlighted.",
-      }),
-    ).toContainText("Old paragraph that should be highlighted.");
-    await expect(
-      page.locator(".markdown-rich-diff__block--add", {
-        hasText: "New paragraph that should be highlighted.",
-      }),
-    ).toContainText("New paragraph that should be highlighted.");
+    const markdownPreview = page.locator(".markdown-rich-diff--unified");
+    await expect(markdownPreview.getByRole("heading", { name: "Rendered preview" })).toBeVisible();
+    await expect(markdownPreview).toContainText("Markdown task");
+    await expect(markdownPreview).toContainText("paragraph that should be highlighted.");
+    await expect(markdownPreview.locator("del", { hasText: "Old" })).toBeVisible();
+    await expect(markdownPreview.locator("ins", { hasText: "New" })).toBeVisible();
+    await expect(markdownPreview.locator("del em", { hasText: "alpha" })).toBeVisible();
+    await expect(markdownPreview.locator("ins a", { hasText: "link" })).toBeVisible();
+    await expect(markdownPreview.locator("strong del", { hasText: "beta" })).toBeVisible();
+    await expect(markdownPreview.locator("strong ins", { hasText: "two" })).toBeVisible();
+    await expect(markdownPreview.locator("code del", { hasText: "gamma" })).toBeVisible();
+    await expect(markdownPreview.locator("code ins", { hasText: "three" })).toBeVisible();
+    await expect(markdownPreview.locator("tr > ins")).toHaveCount(0);
+    await expect(markdownPreview.locator('td[data-diff-kind="insert"] ins', { hasText: "Added cell" })).toBeVisible();
 
     const handlerFile = page.locator('[data-file-path="internal/server/handler.go"]');
     await handlerFile.scrollIntoViewIfNeeded();
@@ -1637,6 +2276,384 @@ test.describe("diff view", () => {
 
     await clickTreeFileItem(page, "assets/logo.png");
     await expect(page.locator(".diff-image-preview img[alt='assets/logo.png']")).toBeVisible();
+  });
+
+  test("rich preview side-by-side panes do not underline changed text", async ({ page }) => {
+    await page.setViewportSize({ width: 2200, height: 1000 });
+    await mockDiffApi(page, splitRichPreviewDiff);
+    await navigateToDiff(page);
+    await waitForDiffLoaded(page);
+
+    await openDiffFilterMenu(page);
+    await page.getByRole("switch", { name: "Rich preview" }).click();
+    await page.getByRole("switch", { name: "Side-by-side diffs" }).click();
+
+    const markdownPreview = page.locator('[data-file-path="docs/preview.md"] .markdown-rich-diff--split');
+    await expect(markdownPreview).toBeVisible();
+    const beforeChange = markdownPreview
+      .locator('[aria-label="Before markdown preview"] del')
+      .filter({ hasText: "Old" })
+      .first();
+    const afterChange = markdownPreview
+      .locator('[aria-label="After markdown preview"] ins')
+      .filter({ hasText: "New" })
+      .first();
+    await expect(beforeChange).toBeVisible();
+    await expect(afterChange).toBeVisible();
+    await expect
+      .poll(() => beforeChange.evaluate((element) => getComputedStyle(element).textDecorationLine))
+      .toBe("none");
+    await expect
+      .poll(() => afterChange.evaluate((element) => getComputedStyle(element).textDecorationLine))
+      .toBe("none");
+    const blockFillPreview = page.locator('[data-file-path="docs/block-fill.md"] .markdown-rich-diff--split');
+    await expect(blockFillPreview).toBeVisible();
+    const deletedBlock = blockFillPreview
+      .locator('[aria-label="Before markdown preview"] del.markdown-diff__block')
+      .filter({ hasText: "Removed standalone block" })
+      .first();
+    await expect(deletedBlock).toBeVisible();
+    await expect
+      .poll(() =>
+        deletedBlock.evaluate((element) => {
+          const textElement = element.querySelector("*") ?? element;
+          return getComputedStyle(textElement).textDecorationLine;
+        }),
+      )
+      .toBe("none");
+    const inlineBeforeChange = markdownPreview
+      .locator('[aria-label="Before markdown preview"] strong del')
+      .filter({ hasText: "beta" })
+      .first();
+    const inlineAfterChange = markdownPreview
+      .locator('[aria-label="After markdown preview"] strong ins')
+      .filter({ hasText: "two" })
+      .first();
+    await expect(inlineBeforeChange).toBeVisible();
+    await expect(inlineAfterChange).toBeVisible();
+    await expect
+      .poll(() => inlineBeforeChange.evaluate((element) => getComputedStyle(element).backgroundColor))
+      .not.toBe("rgba(0, 0, 0, 0)");
+    await expect
+      .poll(() => inlineAfterChange.evaluate((element) => getComputedStyle(element).backgroundColor))
+      .not.toBe("rgba(0, 0, 0, 0)");
+    await expect
+      .poll(() => markdownPreview.evaluate((element) => element.getBoundingClientRect().width))
+      .toBeGreaterThan(1300);
+  });
+
+  test("rich preview gives standalone block additions and deletions visible fills", async ({ page }) => {
+    await mockDiffApi(page, blockFillMarkdownDiff);
+    await navigateToDiff(page);
+    await waitForDiffLoaded(page);
+
+    await openDiffFilterMenu(page);
+    await page.getByRole("switch", { name: "Rich preview" }).click();
+
+    const markdownPreview = page.locator('[data-file-path="docs/block-fill.md"] .markdown-rich-diff--unified');
+    await expect(markdownPreview).toBeVisible();
+    await expectNonTransparentBackground(
+      markdownPreview.locator("del.markdown-diff__block").filter({
+        hasText: "Removed standalone block that should have a filled background.",
+      }),
+    );
+    await expectNonTransparentBackground(
+      markdownPreview.locator("ins.markdown-diff__block").filter({
+        hasText: "Added standalone block that should have a filled background.",
+      }),
+    );
+  });
+
+  test("rich preview shows review thread cards", async ({ page }) => {
+    const reviewBody = "Review note should show in rich preview";
+    await mockDiffApi(page, previewDiff);
+    await mockFilePreviewApi(page);
+    await mockReviewThreadOnPreviewMarkdown(page, reviewBody);
+    await navigateToDiff(page);
+    await waitForDiffLoaded(page);
+    await waitForSidebarFilesLoaded(page);
+
+    await openDiffFilterMenu(page);
+    await page.getByRole("switch", { name: "Rich preview" }).click();
+
+    const markdownFile = page.locator('[data-file-path="docs/preview.md"]');
+    await expect(markdownFile.locator(".markdown-rich-diff--unified")).toBeVisible();
+    const reviewCard = markdownFile
+      .locator(".markdown-rich-diff--unified .inline-review-thread")
+      .filter({ hasText: reviewBody });
+    await expect(reviewCard).toBeVisible();
+    await expect
+      .poll(() =>
+        reviewCard.evaluate(
+          (element) =>
+            element.previousElementSibling?.classList.contains("markdown-rich-diff__anchored-block") ?? false,
+        ),
+      )
+      .toBe(true);
+    await expect
+      .poll(() =>
+        reviewCard.evaluate((element) => {
+          const preview = element.closest(".markdown-rich-diff--unified");
+          if (!preview) return false;
+          const cardRect = element.getBoundingClientRect();
+          const previewRect = preview.getBoundingClientRect();
+          return cardRect.right <= previewRect.right + 1;
+        }),
+      )
+      .toBe(true);
+  });
+
+  test("rich preview anchors multiple list review cards to their source items", async ({ page }) => {
+    await mockDiffApi(page, listReviewPreviewDiff);
+    await mockReviewThreadsOnPreviewMarkdown(page, [
+      { body: "Actions review note", line: 2, path: "docs/list-review.md" },
+      { body: "Issues review note", line: 1, path: "docs/list-review.md" },
+    ]);
+    await navigateToDiff(page);
+    await waitForDiffLoaded(page);
+    await waitForSidebarFilesLoaded(page);
+
+    await openDiffFilterMenu(page);
+    await page.getByRole("switch", { name: "Rich preview" }).click();
+
+    const markdownFile = page.locator('[data-file-path="docs/list-review.md"]');
+    await expect(markdownFile.locator(".markdown-rich-diff--unified")).toBeVisible();
+    await expect(markdownFile.locator(".markdown-rich-diff__split-list")).toHaveCount(3);
+    await expect
+      .poll(() =>
+        markdownFile.locator(".markdown-rich-diff__split-list").evaluateAll((lists) =>
+          lists.every((list) => {
+            const style = getComputedStyle(list);
+            return style.marginTop === "0px" && style.marginBottom === "0px";
+          }),
+        ),
+      )
+      .toBe(true);
+    await expect
+      .poll(() =>
+        markdownFile
+          .locator(".markdown-diff__block")
+          .evaluateAll(
+            (blocks) => blocks.filter((block) => block.querySelector(".markdown-rich-diff__split-list")).length,
+          ),
+      )
+      .toBeGreaterThan(0);
+    await expect
+      .poll(() =>
+        markdownFile.locator(".markdown-diff__block").evaluateAll((blocks) =>
+          blocks
+            .filter((block) => block.querySelector(".markdown-rich-diff__split-list"))
+            .every((block) => {
+              const style = getComputedStyle(block);
+              return (
+                style.marginTop === "0px" &&
+                style.marginBottom === "0px" &&
+                style.paddingTop === "0px" &&
+                style.paddingBottom === "0px"
+              );
+            }),
+        ),
+      )
+      .toBe(true);
+    await expect
+      .poll(() => markdownFile.locator(".markdown-rich-diff--unified .review-thread-body").allTextContents())
+      .toEqual(["Issues review note", "Actions review note"]);
+
+    const issuesCard = markdownFile
+      .locator(".markdown-rich-diff--unified .inline-review-thread")
+      .filter({ hasText: "Issues review note" });
+    const actionsCard = markdownFile
+      .locator(".markdown-rich-diff--unified .inline-review-thread")
+      .filter({ hasText: "Actions review note" });
+    await expect
+      .poll(() => issuesCard.evaluate((element) => element.previousElementSibling?.textContent?.trim() ?? ""))
+      .toContain("Issues");
+    await expect
+      .poll(() => actionsCard.evaluate((element) => element.previousElementSibling?.textContent?.trim() ?? ""))
+      .toContain("Actions");
+    await expect
+      .poll(() => markdownFile.locator(".markdown-rich-diff__split-list").last().textContent())
+      .toContain("Statuses");
+    await expect
+      .poll(() => markdownFile.locator(".markdown-rich-diff__split-list").last().textContent())
+      .toContain("Members");
+  });
+
+  test("rich preview keeps untargeted lists intact when a later block has a review card", async ({ page }) => {
+    const reviewBody = "Paragraph review note";
+    await mockDiffApi(page, untargetedListReviewPreviewDiff);
+    await mockReviewThreadOnPreviewMarkdown(page, reviewBody, 5, "docs/untargeted-list-review.md");
+    await navigateToDiff(page);
+    await waitForDiffLoaded(page);
+    await waitForSidebarFilesLoaded(page);
+
+    await openDiffFilterMenu(page);
+    await page.getByRole("switch", { name: "Rich preview" }).click();
+
+    const markdownPreview = page.locator(
+      '[data-file-path="docs/untargeted-list-review.md"] .markdown-rich-diff--unified',
+    );
+    await expect(markdownPreview).toBeVisible();
+    await expect(markdownPreview.locator("ul")).toHaveCount(1);
+    await expect(markdownPreview.locator("ul.markdown-rich-diff__split-list")).toHaveCount(0);
+
+    const reviewCard = markdownPreview.locator(".inline-review-thread").filter({ hasText: reviewBody });
+    await expect(reviewCard).toBeVisible();
+    await expect
+      .poll(() => reviewCard.evaluate((element) => element.previousElementSibling?.textContent?.trim() ?? ""))
+      .toContain("Paragraph with review note.");
+  });
+
+  test("rich preview keeps unchanged list siblings aligned around an added item review card", async ({ page }) => {
+    const reviewBody = "Added list item review note";
+    await mockDiffApi(page, changedListReviewPreviewDiff);
+    await mockReviewThreadOnPreviewMarkdown(page, reviewBody, 2, "docs/changed-list-review.md");
+    await navigateToDiff(page);
+    await waitForDiffLoaded(page);
+    await waitForSidebarFilesLoaded(page);
+
+    await openDiffFilterMenu(page);
+    await page.getByRole("switch", { name: "Rich preview" }).click();
+
+    const markdownPreview = page.locator('[data-file-path="docs/changed-list-review.md"] .markdown-rich-diff--unified');
+    await expect(markdownPreview).toBeVisible();
+    await expect(markdownPreview.locator("ins", { hasText: "Actions" })).toBeVisible();
+    await expect(markdownPreview.locator("ins", { hasText: "Issues" })).toHaveCount(0);
+    await expect(markdownPreview.locator("del", { hasText: "Statuses" })).toHaveCount(0);
+
+    const reviewCard = markdownPreview.locator(".inline-review-thread").filter({ hasText: reviewBody });
+    await expect(reviewCard).toBeVisible();
+    await expect
+      .poll(() => reviewCard.evaluate((element) => element.previousElementSibling?.textContent?.trim() ?? ""))
+      .toContain("Actions");
+  });
+
+  test("rich preview keeps unchanged list siblings aligned for edge added and deleted item comments", async ({
+    page,
+  }) => {
+    await mockDiffApi(page, edgeListReviewPreviewDiff);
+    await mockReviewThreadsOnPreviewMarkdown(page, [
+      {
+        body: "Prepended item review note",
+        line: 1,
+        path: "docs/edge-added-list-review.md",
+      },
+      {
+        body: "Appended item review note",
+        line: 5,
+        path: "docs/edge-added-list-review.md",
+      },
+      {
+        body: "Deleted first item review note",
+        line: 1,
+        oldLine: 1,
+        path: "docs/edge-deleted-list-review.md",
+        side: "left",
+      },
+      {
+        body: "Deleted last item review note",
+        line: 5,
+        oldLine: 5,
+        path: "docs/edge-deleted-list-review.md",
+        side: "left",
+      },
+    ]);
+    await navigateToDiff(page);
+    await waitForDiffLoaded(page);
+    await waitForSidebarFilesLoaded(page);
+
+    await openDiffFilterMenu(page);
+    await page.getByRole("switch", { name: "Rich preview" }).click();
+
+    const addedPreview = page.locator('[data-file-path="docs/edge-added-list-review.md"] .markdown-rich-diff--unified');
+    await expect(addedPreview).toBeVisible();
+    await expect(addedPreview.locator("ins", { hasText: "Prepended" })).toBeVisible();
+    await expect(addedPreview.locator("ins", { hasText: "Appended" })).toBeVisible();
+    await expect(addedPreview.locator("ins", { hasText: "Issues" })).toHaveCount(0);
+    await expect(addedPreview.locator("ins", { hasText: "Statuses" })).toHaveCount(0);
+    await expect(addedPreview.locator("del", { hasText: "Issues" })).toHaveCount(0);
+    await expect(addedPreview.locator("del", { hasText: "Statuses" })).toHaveCount(0);
+    await expect(addedPreview.locator(".inline-review-thread").filter({ hasText: "Prepended item" })).toBeVisible();
+    await expect(addedPreview.locator(".inline-review-thread").filter({ hasText: "Appended item" })).toBeVisible();
+
+    const deletedPreview = page.locator(
+      '[data-file-path="docs/edge-deleted-list-review.md"] .markdown-rich-diff--unified',
+    );
+    await expect(deletedPreview).toBeVisible();
+    await expect(deletedPreview.locator("del", { hasText: "Removed first" })).toBeVisible();
+    await expect(deletedPreview.locator("del", { hasText: "Removed last" })).toBeVisible();
+    await expect(deletedPreview.locator("del", { hasText: "Issues" })).toHaveCount(0);
+    await expect(deletedPreview.locator("del", { hasText: "Statuses" })).toHaveCount(0);
+    await expect(deletedPreview.locator("ins", { hasText: "Issues" })).toHaveCount(0);
+    await expect(deletedPreview.locator("ins", { hasText: "Statuses" })).toHaveCount(0);
+    await expect(deletedPreview.locator(".inline-review-thread").filter({ hasText: "Deleted first" })).toBeVisible();
+    await expect(deletedPreview.locator(".inline-review-thread").filter({ hasText: "Deleted last" })).toBeVisible();
+  });
+
+  test("rich preview keeps unmapped review thread cards visible as file-level fallback", async ({ page }) => {
+    const reviewBody = "Unmapped rich preview note should stay visible";
+    await mockDiffApi(page, previewDiff);
+    await mockFilePreviewApi(page);
+    await mockReviewThreadOnPreviewMarkdown(page, reviewBody, 99);
+    await navigateToDiff(page);
+    await waitForDiffLoaded(page);
+    await waitForSidebarFilesLoaded(page);
+
+    await openDiffFilterMenu(page);
+    await page.getByRole("switch", { name: "Rich preview" }).click();
+
+    const markdownFile = page.locator('[data-file-path="docs/preview.md"]');
+    await expect(markdownFile.locator(".markdown-rich-diff--unified")).toBeVisible();
+    const fallbackCard = markdownFile.locator(".preview-shell > .inline-review-thread").filter({
+      hasText: reviewBody,
+    });
+    await expect(fallbackCard).toBeVisible();
+    await expect(fallbackCard).toHaveClass(/inline-review-thread--file-level/);
+    await expect(fallbackCard).toContainText("File");
+    await expect(
+      markdownFile.locator(".markdown-rich-diff--unified .inline-review-thread").filter({ hasText: reviewBody }),
+    ).toHaveCount(0);
+  });
+
+  test("rich preview hides synthetic hunk separators inside spanning markdown blocks", async ({ page }) => {
+    await mockDiffApi(page, multiHunkMarkdownDiff);
+    await navigateToDiff(page);
+    await waitForDiffLoaded(page);
+
+    await openDiffFilterMenu(page);
+    await page.getByRole("switch", { name: "Rich preview" }).click();
+
+    const markdownFile = page.locator('[data-file-path="docs/multihunk.md"]');
+    const markdownPreview = markdownFile.locator(".markdown-rich-diff--unified");
+    await expect(markdownPreview).toBeVisible();
+    const codeBlock = markdownPreview.locator("code").filter({ hasText: "first hunk code" });
+    await expect(codeBlock).toBeVisible();
+    await expect(codeBlock).toContainText("second hunk code");
+    await expect(codeBlock).toContainText("added hunk code");
+    await expect(codeBlock).not.toContainText("---");
+    await expect(markdownPreview.locator("hr")).toHaveCount(0);
+  });
+
+  test("rich preview keeps hidden hunk-gap review threads as file-level fallback", async ({ page }) => {
+    const reviewBody = "Hidden hunk gap review note should stay fallback";
+    await mockDiffApi(page, multiHunkMarkdownDiff);
+    await mockReviewThreadOnPreviewMarkdown(page, reviewBody, 6, "docs/multihunk.md");
+    await navigateToDiff(page);
+    await waitForDiffLoaded(page);
+    await waitForSidebarFilesLoaded(page);
+
+    await openDiffFilterMenu(page);
+    await page.getByRole("switch", { name: "Rich preview" }).click();
+
+    const markdownFile = page.locator('[data-file-path="docs/multihunk.md"]');
+    const fallbackCard = markdownFile.locator(".preview-shell > .inline-review-thread").filter({
+      hasText: reviewBody,
+    });
+    await expect(fallbackCard).toBeVisible();
+    await expect(fallbackCard).toHaveClass(/inline-review-thread--file-level/);
+    await expect(
+      markdownFile.locator(".markdown-rich-diff--unified .inline-review-thread").filter({ hasText: reviewBody }),
+    ).toHaveCount(0);
   });
 
   test("rich preview refetches blob content after a same-PR diff reload", async ({ page }) => {
@@ -1945,6 +2962,74 @@ test.describe("diff view", () => {
     await expect.poll(() => previewRequests).toBe(0);
   });
 
+  test("sparse diffs with syntax state gaps preload full context before rendering", async ({ page }) => {
+    await page.addInitScript(() => {
+      (globalThis as { __middlemanForceSyntaxHighlight?: boolean }).__middlemanForceSyntaxHighlight = true;
+    });
+
+    const previewSides: string[] = [];
+    await mockDiffApi(page, syntaxContextDiff);
+    await page.route("**/api/v1/pulls/github/acme/widgets/1/file-preview**", async (route) => {
+      const url = new URL(route.request().url());
+      if (url.searchParams.get("path") !== syntaxContextPath) {
+        await route.fulfill({
+          status: 404,
+          contentType: "application/json",
+          body: JSON.stringify({ detail: "not found" }),
+        });
+        return;
+      }
+
+      const side = url.searchParams.get("side");
+      previewSides.push(side ?? "");
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          path: syntaxContextPath,
+          media_type: "text/plain; charset=utf-8",
+          encoding: "base64",
+          content: Buffer.from(side === "old" ? syntaxContextOldText : syntaxContextNewText).toString("base64"),
+        }),
+      });
+    });
+
+    await navigateToDiff(page);
+    await waitForDiffLoaded(page);
+
+    const file = page.locator(`[data-file-path="${syntaxContextPath}"]`);
+    await expect.poll(() => [...new Set(previewSides)].sort()).toEqual(["new", "old"]);
+    await expectPierreDiffVisibleText(file, diffAdditionsSelector, "vi.doMock");
+    await expect
+      .poll(() => pierreAdditionTokenStats(file, 'vi.doMock("./worker", () => ({'))
+      .toEqual({
+        hasSeparateDoMock: true,
+        hasSeparateVi: true,
+        singleLineSpan: false,
+      });
+  });
+
+  test("sparse diffs with syntax state gaps fall back when full context fails", async ({ page }) => {
+    let previewRequests = 0;
+    await mockDiffApi(page, syntaxContextDiff);
+    await page.route("**/api/v1/pulls/github/acme/widgets/1/file-preview**", async (route) => {
+      previewRequests++;
+      await route.fulfill({
+        status: 503,
+        contentType: "application/json",
+        body: JSON.stringify({ detail: "preview unavailable" }),
+      });
+    });
+
+    await navigateToDiff(page);
+    await waitForDiffLoaded(page);
+
+    const file = page.locator(`[data-file-path="${syntaxContextPath}"]`);
+    await expect.poll(() => previewRequests).toBeGreaterThan(0);
+    await expect(file.getByText("Could not load more context")).toBeVisible();
+    await expectPierreDiffVisibleText(file, diffAdditionsSelector, "vi.doMock");
+  });
+
   test("context expansion keeps earlier virtualized file rows rendered", async ({ page }) => {
     await page.setViewportSize({ width: 1852, height: 918 });
 
@@ -2046,6 +3131,7 @@ test.describe("diff view", () => {
         {
           path: "src/components/detail/PullDetail.svelte",
           old_path: "src/components/detail/PullDetail.svelte",
+          preserveHunkCounts: true,
           status: "modified",
           is_binary: false,
           is_whitespace_only: false,
@@ -2054,9 +3140,9 @@ test.describe("diff view", () => {
           hunks: [
             {
               old_start: 949,
-              old_count: 6,
+              old_count: 48,
               new_start: 949,
-              new_count: 7,
+              new_count: 49,
               lines: [
                 {
                   type: "context",
@@ -2158,6 +3244,7 @@ test.describe("diff view", () => {
     await clickPierreContextExpander(page, detailFile, 0, "[data-expand-down]");
     await expect.poll(() => [...new Set(previewSides)].sort()).toEqual(["new", "old"]);
     await expectRenderedNonBlankRows(schemaFile, "schema response row");
+    await expectVisibleExpandedRowContent(detailFile, "function onActionMenuKeydown(e: KeyboardEvent): void {");
     await scrollDiffAreaUntilPierreText(
       page,
       diffArea,
@@ -2290,6 +3377,40 @@ test.describe("diff view", () => {
     // Clearing filter restores full list.
     await filterInput.fill("");
     await expect(treeFileItems(page)).toHaveCount(50);
+  });
+
+  test("filtered file tree consumes hidden explicit file jumps without revealing stale rows", async ({ page }) => {
+    const targetPath = "src/pkg8/file_40.go";
+    await mockDiffApi(page, largeDiff);
+    await navigateToDiff(page);
+    await waitForDiffLoaded(page);
+    await waitForSidebarFilesLoaded(page);
+
+    const filterInput = page.locator(".diff-files-filter__input").first();
+    await filterInput.fill("file_1");
+    await expect(treeFileItems(page)).toHaveCount(11);
+    await expect(treeFileItem(page, targetPath)).toHaveCount(0);
+
+    await jumpToFile(page, targetPath);
+    await expect(page.locator(`[data-file-path="${targetPath}"]`)).toBeVisible();
+    await expect(treeFileItem(page, targetPath)).toHaveCount(0);
+    await expect(page.locator(".diff-file-tree [data-item-type='file'][aria-selected='true']")).toHaveCount(0);
+
+    await filterInput.fill("");
+    await expect(treeFileItems(page)).toHaveCount(50);
+    const targetTreeItem = treeFileItem(page, targetPath);
+    await expect(targetTreeItem).toHaveAttribute("aria-selected", "true");
+    await scrollFileTreeToTop(page);
+    expect(
+      await targetTreeItem.evaluate((item) => {
+        const rect = item.getBoundingClientRect();
+        return rect.bottom > 0 && rect.top < window.innerHeight;
+      }),
+    ).toBe(false);
+
+    await jumpToFile(page, targetPath);
+    await expect(targetTreeItem).toHaveAttribute("aria-selected", "true");
+    await expect(targetTreeItem).toBeInViewport();
   });
 
   test("inline file filter is hidden for small diffs", async ({ page }) => {
@@ -2843,10 +3964,9 @@ test.describe("diff view (git-backed)", () => {
       await categoryFilter.getByRole("button", { name: "Plans/docs (2)" }).click();
 
       const planFile = page.locator('[data-file-path="docs/cache-plan.md"]');
-      await expect(planFile.locator(".markdown-rich-diff__block--add")).toContainText("Cache refresh plan");
-      await expect(planFile.locator(".markdown-rich-diff__block--add")).toContainText(
-        "Verify changed-file summaries refresh",
-      );
+      const planPreview = planFile.locator(".markdown-rich-diff--unified");
+      await expect(planPreview.locator("ins", { hasText: "Cache refresh plan" })).toBeVisible();
+      await expect(planPreview.locator("ins", { hasText: "Verify changed-file summaries refresh" })).toBeVisible();
 
       const previewResponse = await page.request.get(
         `${server.info.base_url}/api/v1/pulls/github/acme/widgets/1/file-preview?path=internal/cache.go`,
@@ -2951,7 +4071,7 @@ test.describe("diff view (git-backed)", () => {
       await selectPierreReviewLine(cacheFile, 1, "right");
       const rightComposer = page.getByPlaceholder("Leave a comment");
       await expect(rightComposer).toBeVisible();
-      await expect(rightComposer).toBeFocused();
+      await expect(rightComposer).toBeEditable();
       await expectPierreDiffFirstVisible(cacheFile, diffAdditionsSelector);
       const cacheContentBox = await visibleBoundingBox(cacheFile.locator(".file-content"));
       const composerBox = await visibleBoundingBox(inlineComposerFor(rightComposer));
@@ -2969,7 +4089,7 @@ test.describe("diff view (git-backed)", () => {
       await selectPierreReviewLine(configFile, 1, "left");
       const leftComposer = page.getByPlaceholder("Leave a comment");
       await expect(leftComposer).toBeVisible();
-      await expect(leftComposer).toBeFocused();
+      await expect(leftComposer).toBeEditable();
       await leftComposer.fill("Left-side config note");
       await submitInlineComposer(leftComposer);
       await expect(

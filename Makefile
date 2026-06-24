@@ -21,17 +21,26 @@ AIR_BIN := $(shell if command -v air >/dev/null 2>&1; then command -v air; \
 	elif [ -n "$$(go env GOBIN)" ] && [ -x "$$(go env GOBIN)/air$(EXE_SUFFIX)" ]; then printf "%s" "$$(go env GOBIN)/air$(EXE_SUFFIX)"; \
 	elif [ -x "$(GOPATH_FIRST)/bin/air$(EXE_SUFFIX)" ]; then printf "%s" "$(GOPATH_FIRST)/bin/air$(EXE_SUFFIX)"; \
 	fi)
+NILAWAY_BIN := $(shell if command -v nilaway >/dev/null 2>&1; then command -v nilaway; \
+	elif [ -n "$$(go env GOBIN)" ] && [ -x "$$(go env GOBIN)/nilaway$(EXE_SUFFIX)" ]; then printf "%s" "$$(go env GOBIN)/nilaway$(EXE_SUFFIX)"; \
+	elif [ -x "$(GOPATH_FIRST)/bin/nilaway$(EXE_SUFFIX)" ]; then printf "%s" "$(GOPATH_FIRST)/bin/nilaway$(EXE_SUFFIX)"; \
+	fi)
 DEV_LOG_DIR ?= tmp/logs
 DEV_BACKEND_LOG ?= $(DEV_LOG_DIR)/backend-dev.log
 VITE_PLUS_VERSION := 0.1.24
 VITE_PLUS_BIN := node ./node_modules/vite-plus/bin/vp
 VITE_PLUS_FRONTEND_BIN := node ../node_modules/vite-plus/bin/vp
 VITE_PLUS_PACKAGE_BIN := node ../../node_modules/vite-plus/bin/vp
+DEV_CLONE_BACKEND_LOG ?= $(DEV_LOG_DIR)/backend-dev-clone.log
+DEV_CLONE_DB_DIR ?= tmp/dev-db-clone
+DEV_CLONE_PORT ?= 8092
+DEV_CLONE_FRONTEND_PORT ?= 5175
 
 .PHONY: ensure-embed-dir ensure-tmp-dir check-air air-install build build-release install \
         rust-pty-manager rust-test vite-plus-install frontend-deps check-vite-plus-bin frontend githubapp-frontend frontend-dev frontend-dev-bun frontend-check api-generate roborev-api-generate \
-        dev dev-ephemeral dev-ephemeral-stop test test-short test-integration test-e2e test-e2e-roborev test-gitlab-container gitlab-fixture-bake vet lint nilaway testify-helper-check \
-        frontend-api-client-check font-size-token-check huma-route-check script-tests guardrail-check race-times tidy svelte-skills svelte-skills-sync clean install-hooks help
+        dev dev-ephemeral dev-ephemeral-stop test test-short test-integration test-e2e test-e2e-roborev test-fleet-container test-fleet-drive-container test-gitlab-container gitlab-fixture-bake vet lint nilaway testify-helper-check \
+        frontend-api-client-check font-size-token-check huma-route-check playwright-version-check script-tests guardrail-check race-times tidy svelte-skills svelte-skills-sync clean install-hooks help \
+        dev-clone-db frontend-dev-clone-db
 
 # gotestsum prints package names on success and full output on failure,
 # while persisting raw `go test -json` events for downstream reporters.
@@ -120,13 +129,35 @@ githubapp-frontend: frontend-deps
 frontend-dev:
 	./scripts/frontend-dev.sh $(ARGS)
 
+# Clone the configured database into this worktree and run the backend against it.
+# Override with DEV_CLONE_DB_DIR=... DEV_CLONE_PORT=... MIDDLEMAN_CONFIG=...
+dev-clone-db: ensure-embed-dir check-air
+	@clone_config="$$(MIDDLEMAN_DEV_CLONE_DIR="$(abspath $(DEV_CLONE_DB_DIR))" MIDDLEMAN_DEV_CLONE_PORT="$(DEV_CLONE_PORT)" ./scripts/dev-clone-db.sh)"; \
+		echo "cloned dev config: $$clone_config"; \
+		echo "cloned dev database: $(abspath $(DEV_CLONE_DB_DIR))/middleman.db"; \
+		echo "backend URL: http://127.0.0.1:$(DEV_CLONE_PORT)"; \
+		MIDDLEMAN_CONFIG="$$clone_config" MIDDLEMAN_LOG_FILE="$${MIDDLEMAN_LOG_FILE:-$(DEV_CLONE_BACKEND_LOG)}" GOFLAGS="$${GOFLAGS:+$$GOFLAGS }-buildvcs=false" $(MAKE) dev
+
+# Run Vite against the cloned database backend from `make dev-clone-db`.
+frontend-dev-clone-db:
+	@clone_config="$(abspath $(DEV_CLONE_DB_DIR))/config.toml"; \
+		if [ ! -f "$$clone_config" ]; then \
+			clone_config="$$(MIDDLEMAN_DEV_CLONE_DIR="$(abspath $(DEV_CLONE_DB_DIR))" MIDDLEMAN_DEV_CLONE_PORT="$(DEV_CLONE_PORT)" ./scripts/dev-clone-db.sh)"; \
+		fi; \
+		echo "frontend proxy config: $$clone_config"; \
+		MIDDLEMAN_CONFIG="$$clone_config" $(MAKE) frontend-dev ARGS="$${ARGS:---port $(DEV_CLONE_FRONTEND_PORT)}"
+
 # Run Vite+ dev server after installing dependencies with Bun; Node launches Vite+ (use alongside `make dev`)
 frontend-dev-bun: frontend-deps
 	cd frontend && $(VITE_PLUS_FRONTEND_BIN) dev
 
 # Run TypeScript/Svelte lint and type checks
 frontend-check: frontend-deps
-	$(VITE_PLUS_BIN) run frontend-check
+	$(VITE_PLUS_BIN) fmt --check frontend packages/ui packages/github-app-ui --no-error-on-unmatched-pattern --threads=1
+	$(VITE_PLUS_BIN) lint frontend packages/ui packages/github-app-ui '!frontend/dist/**' '!packages/github-app-ui/dist/**' '!frontend/test-results/**' '!packages/github-app-ui/test-results/**' '!packages/ui/src/api/generated/**' '!packages/ui/src/api/roborev/generated/**' --no-error-on-unmatched-pattern --threads=1
+	cd frontend && ../node_modules/.bin/svelte-check --tsconfig ./tsconfig.json --fail-on-warnings
+	cd packages/ui && ../../node_modules/.bin/svelte-check --tsconfig ./tsconfig.json --fail-on-warnings
+	cd packages/github-app-ui && ../../node_modules/.bin/svelte-check --tsconfig ./tsconfig.json --fail-on-warnings
 
 # Prevent production frontend code from bypassing generated API clients
 frontend-api-client-check: check-vite-plus-bin
@@ -140,13 +171,22 @@ font-size-token-check: check-vite-plus-bin
 huma-route-check:
 	GOFLAGS="$${GOFLAGS:+$$GOFLAGS }-buildvcs=false" go run ./tools/nohttpmux ./...
 
+# Keep the CI Playwright container image tag in lockstep with the @playwright/test pin
+playwright-version-check: check-vite-plus-bin
+	$(VITE_PLUS_BIN) exec -- node scripts/check-playwright-version.mjs
+
 # Run lightweight script regression tests
 script-tests: check-vite-plus-bin
 	$(VITE_PLUS_BIN) exec -- node --test scripts/*.test.mjs scripts/*.test.ts
 
-# Run lightweight generated-client/Huma guardrails
-guardrail-check: frontend-deps
-	$(MAKE) frontend-api-client-check font-size-token-check huma-route-check script-tests
+# Run lightweight generated-client/Huma guardrails.
+# Guard on vite-plus being present (check-vite-plus-bin) rather than running
+# frontend-deps: every sub-target either is Go-only or runs through
+# `vp exec -- node`, so this needs node_modules + vp, never a standalone `bun`.
+# Under setup-vp (CI) bun is not on PATH, so a `bun install` prerequisite here
+# fails with exit 127 even though deps are already installed.
+guardrail-check: check-vite-plus-bin
+	$(MAKE) frontend-api-client-check font-size-token-check huma-route-check playwright-version-check script-tests
 
 
 # Regenerate the checked-in OpenAPI document and generated clients
@@ -243,6 +283,22 @@ test-e2e-roborev:
 	ROBOREV_SRC="$(ROBOREV_SRC)" ROBOREV_REF="$(ROBOREV_REF)" \
 		./scripts/run-roborev-e2e.sh
 
+# Run opt-in fleet federation container tests.
+test-fleet-container: ensure-embed-dir ensure-tmp-dir
+	@if [ "$${MIDDLEMAN_FLEET_CONTAINER_E2E:-}" != "1" ]; then \
+		echo "Set MIDDLEMAN_FLEET_CONTAINER_E2E=1 to run the fleet container e2e fixture." >&2; \
+		exit 1; \
+	fi
+	GOFLAGS="$${GOFLAGS:+$$GOFLAGS }-buildvcs=false" $(GOTESTSUM)=tmp/test-fleet-container-output.json -- ./internal/server -run TestFleetContainerReadE2E -shuffle=on -timeout 10m
+
+# Run opt-in fleet drive container tests.
+test-fleet-drive-container: ensure-embed-dir ensure-tmp-dir
+	@if [ "$${MIDDLEMAN_FLEET_DRIVE_CONTAINER_E2E:-}" != "1" ]; then \
+		echo "Set MIDDLEMAN_FLEET_DRIVE_CONTAINER_E2E=1 to run the fleet drive container e2e fixture." >&2; \
+		exit 1; \
+	fi
+	GOFLAGS="$${GOFLAGS:+$$GOFLAGS }-buildvcs=false" $(GOTESTSUM)=tmp/test-fleet-drive-container-output.json -- ./internal/server -run TestFleetContainerDriveE2E -shuffle=on -timeout 10m
+
 # Run opt-in GitLab CE container compatibility tests.
 test-gitlab-container: ensure-embed-dir ensure-tmp-dir
 	@if [ "$${MIDDLEMAN_GITLAB_CONTAINER_E2E:-}" != "1" ]; then \
@@ -274,7 +330,7 @@ lint: ensure-embed-dir
 
 # Run NilAway against first-party Go packages
 nilaway: ensure-embed-dir
-	@if ! command -v nilaway >/dev/null 2>&1; then \
+	@if [ -z "$(NILAWAY_BIN)" ]; then \
 		echo "nilaway not found. Install with:" >&2; \
 		echo "go install go.uber.org/nilaway/cmd/nilaway@v0.0.0-20260318203545-ad240b12fb4c" >&2; \
 		exit 1; \
@@ -283,7 +339,7 @@ nilaway: ensure-embed-dir
 		echo "failed to determine module path" >&2; \
 		exit 1; \
 	}; \
-		nilaway -include-pkgs="$$module_path" -test=false ./...
+		"$(NILAWAY_BIN)" -include-pkgs="$$module_path" -test=false ./...
 
 # Tidy dependencies
 tidy:
@@ -321,6 +377,8 @@ help:
 	@echo "  dev            - Run Go server with air live reload, debug file logs, and info-level console logs"
 	@echo "  dev-ephemeral  - Run backend and frontend dev servers on free ports with copied DB state and status JSON"
 	@echo "  dev-ephemeral-stop - Stop the default ephemeral dev stack, or use STATUS=/path/to/dev-ephemeral.json"
+	@echo "  dev-clone-db   - Clone current DB into tmp/dev-db-clone and run backend on DEV_CLONE_PORT (default 8092)"
+	@echo "  frontend-dev-clone-db - Run Vite against cloned DB backend (default port $(DEV_CLONE_FRONTEND_PORT))"
 	@echo "  frontend-deps  - Install Bun workspace dependencies for frontend and packages/ui"
 	@echo "  vite-plus-install - Install global Vite+ launcher with Bun when vp is missing"
 	@echo "  frontend       - Build frontend SPA with Vite+"
@@ -335,6 +393,8 @@ help:
 	@echo "  test-short     - Run fast tests only"
 	@echo "  test-e2e       - Run full-stack E2E Playwright tests"
 	@echo "  test-e2e-roborev - Run roborev e2e tests with Docker (ROBOREV_SRC, ROBOREV_REF)"
+	@echo "  test-fleet-container - Run opt-in fleet container e2e tests"
+	@echo "  test-fleet-drive-container - Run opt-in fleet drive container e2e tests"
 	@echo "  test-gitlab-container - Run opt-in GitLab CE container e2e tests"
 	@echo "  gitlab-fixture-bake - Build a reusable GitLab fixture image"
 	@echo "  vet            - Run go vet"

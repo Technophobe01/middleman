@@ -32,7 +32,7 @@ import (
 )
 
 type listPullsInput struct {
-	Repo    string `query:"repo"`
+	Repo    string `query:"repo" doc:"Repository filter. Accepts owner/name, platform_host/repo_path, comma-separated values, or provider|platform_host/repo_path for provider-qualified matches."`
 	State   string `query:"state"`
 	Kanban  string `query:"kanban"`
 	Starred bool   `query:"starred"`
@@ -173,7 +173,7 @@ type resolveDiffReviewThreadInput struct {
 }
 
 type listIssuesInput struct {
-	Repo     string `query:"repo"`
+	Repo     string `query:"repo" doc:"Repository filter. Accepts owner/name, platform_host/repo_path, comma-separated values, or provider|platform_host/repo_path for provider-qualified matches."`
 	State    string `query:"state"`
 	Starred  bool   `query:"starred"`
 	Q        string `query:"q"`
@@ -355,15 +355,26 @@ type mergePRInput struct {
 	Owner        string `path:"owner"`
 	Name         string `path:"name"`
 	Number       int    `path:"number"`
-	Body         struct {
-		CommitTitle   string `json:"commit_title"`
-		CommitMessage string `json:"commit_message"`
-		Method        string `json:"method"`
-		// ExpectedHeadSHA is the reviewed diff head the client rendered.
-		// For head-binding providers, merge rejects missing, stale, or
-		// mismatched reviewed-head assertions before provider mutation.
-		ExpectedHeadSHA string `json:"expected_head_sha,omitempty"`
-	}
+	Body         mergePRInputBody
+}
+
+type deferMergePRInput struct {
+	Provider     string `path:"provider"`
+	PlatformHost string
+	Owner        string `path:"owner"`
+	Name         string `path:"name"`
+	Number       int    `path:"number"`
+	Body         mergePRInputBody
+}
+
+type mergePRInputBody struct {
+	CommitTitle   string `json:"commit_title"`
+	CommitMessage string `json:"commit_message"`
+	Method        string `json:"method"`
+	// ExpectedHeadSHA is the reviewed diff head the client rendered.
+	// For head-binding providers, merge rejects missing, stale, or
+	// mismatched reviewed-head assertions before provider mutation.
+	ExpectedHeadSHA string `json:"expected_head_sha,omitempty"`
 }
 
 type mergePRBody struct {
@@ -373,6 +384,13 @@ type mergePRBody struct {
 }
 
 type mergePROutput = bodyOutput[mergePRBody]
+
+type deferMergePRBody struct {
+	Status        string `json:"status"`
+	PendingChecks int    `json:"pending_checks"`
+}
+
+type deferMergePROutput = acceptedBodyOutput[deferMergePRBody]
 
 type editPRContentInput struct {
 	Provider     string `path:"provider"`
@@ -447,6 +465,7 @@ type getStackForPROutput = bodyOutput[stackContextResponse]
 
 type createWorkspaceInput struct {
 	Body struct {
+		Provider     string `json:"provider,omitempty"`
 		PlatformHost string `json:"platform_host"`
 		Owner        string `json:"owner"`
 		Name         string `json:"name"`
@@ -491,6 +510,17 @@ type getWorkspaceDiffInput struct {
 	To         string `query:"to"     doc:"End SHA for range diff (inclusive)"`
 }
 
+type getWorkspaceFilePreviewInput struct {
+	ID         string `path:"id"`
+	Base       string `query:"base"       enum:"head,pushed,merge-target" doc:"Diff base: head, pushed, or merge-target"`
+	Whitespace string `query:"whitespace" enum:"hide"                     doc:"Set to hide to ignore whitespace-only changes"`
+	Path       string `query:"path"       doc:"Changed file path to preview"`
+	Side       string `query:"side"       enum:"old,new"                  doc:"Optional diff side to read for context expansion"`
+	Commit     string `query:"commit" doc:"Scope to a single commit SHA"`
+	From       string `query:"from"   doc:"Start SHA for range diff (inclusive)"`
+	To         string `query:"to"     doc:"End SHA for range diff (inclusive)"`
+}
+
 type getWorkspaceCommitsInput struct {
 	ID string `path:"id"`
 }
@@ -510,7 +540,8 @@ type getWorkspaceRuntimeInput struct {
 type launchWorkspaceRuntimeSessionInput struct {
 	ID   string `path:"id"`
 	Body struct {
-		TargetKey string `json:"target_key"`
+		TargetKey     string `json:"target_key"`
+		DisplayRegion string `json:"display_region,omitempty"`
 	}
 }
 
@@ -527,6 +558,11 @@ type renameWorkspaceRuntimeSessionInput struct {
 	}
 }
 
+type getWorkspaceRuntimeSessionAttachSpecInput struct {
+	ID         string `path:"id"`
+	SessionKey string `path:"session_key"`
+}
+
 type deleteWorkspaceInput struct {
 	ID    string `path:"id"`
 	Force bool   `query:"force"`
@@ -541,12 +577,15 @@ type listWorkspacesOutput = bodyOutput[listWorkspacesOutputBody]
 type getWorkspaceOutput = bodyOutput[workspaceResponse]
 
 type getWorkspaceDiffOutput = bodyOutput[diffResponse]
+type getWorkspaceFilePreviewOutput = bodyOutput[filePreviewResponse]
 type getWorkspaceFilesOutput = bodyOutput[filesResponse]
 type getWorkspaceCommitsOutput = bodyOutput[commitsResponse]
 
 type getWorkspaceRuntimeOutput = bodyOutput[workspaceRuntimeResponse]
 
 type workspaceRuntimeSessionOutput = bodyOutput[localruntime.SessionInfo]
+
+type runtimeAttachSpecOutput = bodyOutput[runtimeAttachSpecResponse]
 
 type createWorkspaceOutput = acceptedBodyOutput[workspaceResponse]
 
@@ -561,7 +600,7 @@ type workspaceDiffRequest struct {
 }
 
 type listActivityInput struct {
-	Repo   string   `query:"repo"`
+	Repo   string   `query:"repo" doc:"Repository filter. Accepts owner/name, platform_host/repo_path, comma-separated values, or provider|platform_host/repo_path for provider-qualified matches."`
 	Types  []string `query:"types"`
 	Search string   `query:"search"`
 	After  string   `query:"after"`
@@ -569,10 +608,36 @@ type listActivityInput struct {
 }
 
 type triggerSyncInput struct {
-	PriorityRepos []string `query:"priority_repo" doc:"Optional repository filters to sync first. Accepts repeated values or comma-separated values. Each value may be host-qualified as platform_host/owner/name or bare as owner/name; bare values match the first tracked repo with that repo path."`
+	PriorityRepos []string `query:"priority_repo" doc:"Optional repository filters to sync first. Accepts repeated values or comma-separated values. Each value may be provider-qualified as provider|platform_host/owner/name, host-qualified as platform_host/owner/name, or bare as owner/name; bare values match the first tracked repo with that repo path."`
 }
 
 type listActivityOutput = bodyOutput[activityResponse]
+
+type listNotificationsInput struct {
+	State  string   `query:"state"`
+	Reason []string `query:"reason"`
+	Type   []string `query:"type"`
+	Repo   string   `query:"repo"`
+	Search string   `query:"q"`
+	Sort   string   `query:"sort"`
+	Limit  int      `query:"limit"`
+	Offset int      `query:"offset"`
+}
+
+type listNotificationsOutput struct {
+	Body notificationsResponse
+}
+
+type notificationBulkInput struct {
+	Body struct {
+		IDs      []int64 `json:"ids"`
+		MarkRead *bool   `json:"mark_read,omitempty"`
+	}
+}
+
+type notificationBulkOutput struct {
+	Body notificationBulkResponse
+}
 
 func apiConfig(basePath string) huma.Config {
 	config := huma.DefaultConfig("middleman API", "0.1.0")
@@ -615,11 +680,52 @@ func (s *Server) registerAPI(api huma.API) {
 	s.registerDocsAPI(api)
 	s.registerMsgvaultAPI(api)
 	s.registerMessagesAPI(api)
+	huma.Register(api, huma.Operation{
+		OperationID:   "list-notifications",
+		Method:        http.MethodGet,
+		Path:          "/notifications",
+		DefaultStatus: http.StatusOK,
+		Summary:       "List notifications",
+		Tags:          []string{"Activity"},
+	}, s.listNotifications)
+	huma.Register(api, huma.Operation{
+		OperationID:   "sync-notifications",
+		Method:        http.MethodPost,
+		Path:          "/notifications/sync",
+		DefaultStatus: http.StatusAccepted,
+		Summary:       "Sync notifications",
+		Tags:          []string{"Sync"},
+	}, s.syncNotifications)
+	huma.Register(api, huma.Operation{
+		OperationID:   "mark-notifications-read",
+		Method:        http.MethodPost,
+		Path:          "/notifications/read",
+		DefaultStatus: http.StatusOK,
+		Summary:       "Mark notifications read",
+		Tags:          []string{"Activity"},
+	}, s.markNotificationsRead)
+	huma.Register(api, huma.Operation{
+		OperationID:   "mark-notifications-done",
+		Method:        http.MethodPost,
+		Path:          "/notifications/done",
+		DefaultStatus: http.StatusOK,
+		Summary:       "Mark notifications done",
+		Tags:          []string{"Activity"},
+	}, s.markNotificationsDone)
+	huma.Register(api, huma.Operation{
+		OperationID:   "mark-notifications-undone",
+		Method:        http.MethodPost,
+		Path:          "/notifications/undone",
+		DefaultStatus: http.StatusOK,
+		Summary:       "Mark notifications undone",
+		Tags:          []string{"Activity"},
+	}, s.markNotificationsUndone)
 	huma.Get(api, "/pulls", s.listPulls,
 		documentOperation("list-pulls", "List pull requests", "Pull Requests"))
 	huma.Get(api, "/issues", s.listIssues,
 		documentOperation("list-issues", "List issues", "Issues"))
 	s.registerProviderRepoAPI(api)
+	s.registerFleetRoutes(api)
 
 	huma.Register(api, huma.Operation{
 		OperationID:   "list-repo-summaries",
@@ -727,6 +833,8 @@ func (s *Server) registerAPI(api huma.API) {
 		documentOperation("get-workspace-commits", "Get workspace commits", "Workspaces"))
 	huma.Get(api, "/workspaces/{id}/diff", s.getWorkspaceDiff,
 		documentOperation("get-workspace-diff", "Get workspace diff", "Workspaces"))
+	huma.Get(api, "/workspaces/{id}/file-preview", s.getWorkspaceFilePreview,
+		documentOperation("get-workspace-file-preview", "Get workspace file preview", "Workspaces"))
 	huma.Get(api, "/workspaces/{id}/files", s.getWorkspaceFiles,
 		documentOperation("get-workspace-files", "Get workspace files", "Workspaces"))
 	huma.Register(api, huma.Operation{
@@ -744,6 +852,28 @@ func (s *Server) registerAPI(api huma.API) {
 		Summary:     "Refresh workspace",
 		Tags:        []string{"Workspaces"},
 	}, s.refreshWorkspace)
+	huma.Register(api, huma.Operation{
+		OperationID: "push-workspace-branch",
+		Method:      http.MethodPost,
+		Path:        "/workspaces/{id}/push",
+		Summary:     "Push workspace branch",
+		Tags:        []string{"Workspaces"},
+	}, s.pushWorkspaceBranch)
+	huma.Register(api, huma.Operation{
+		OperationID: "pull-workspace-branch",
+		Method:      http.MethodPost,
+		Path:        "/workspaces/{id}/pull",
+		Summary:     "Pull workspace branch",
+		Tags:        []string{"Workspaces"},
+	}, s.pullWorkspaceBranch)
+	huma.Register(api, huma.Operation{
+		OperationID:   "reveal-workspace",
+		Method:        http.MethodPost,
+		Path:          "/workspaces/{id}/reveal",
+		DefaultStatus: http.StatusNoContent,
+		Summary:       "Reveal workspace folder",
+		Tags:          []string{"Workspaces"},
+	}, s.revealWorkspace)
 	huma.Register(api, huma.Operation{
 		OperationID: "get-workspace-runtime",
 		Method:      http.MethodGet,
@@ -766,6 +896,13 @@ func (s *Server) registerAPI(api huma.API) {
 		Summary:       "Stop workspace runtime session",
 		Tags:          []string{"Workspaces"},
 	}, s.stopWorkspaceRuntimeSession)
+	huma.Register(api, huma.Operation{
+		OperationID: "get-workspace-runtime-session-attach-spec",
+		Method:      http.MethodGet,
+		Path:        "/workspaces/{id}/runtime/sessions/{session_key}/attach-spec",
+		Summary:     "Get workspace runtime session attach spec",
+		Tags:        []string{"Workspaces"},
+	}, s.getWorkspaceRuntimeSessionAttachSpec)
 	huma.Register(api, huma.Operation{
 		OperationID: "rename-workspace-runtime-session",
 		Method:      http.MethodPatch,
@@ -805,6 +942,14 @@ func (s *Server) registerAPI(api huma.API) {
 		Tags:        []string{"Projects"},
 	}, s.getProject)
 	huma.Register(api, huma.Operation{
+		OperationID:   "delete-project",
+		Method:        http.MethodDelete,
+		Path:          "/projects/{project_id}",
+		DefaultStatus: http.StatusNoContent,
+		Summary:       "Delete project",
+		Tags:          []string{"Projects"},
+	}, s.deleteProject)
+	huma.Register(api, huma.Operation{
 		OperationID:   "register-worktree",
 		Method:        http.MethodPost,
 		Path:          "/projects/{project_id}/worktrees",
@@ -812,6 +957,70 @@ func (s *Server) registerAPI(api huma.API) {
 		Summary:       "Register worktree",
 		Tags:          []string{"Projects"},
 	}, s.registerWorktree)
+	huma.Register(api, huma.Operation{
+		OperationID:   "delete-worktree",
+		Method:        http.MethodDelete,
+		Path:          "/projects/{project_id}/worktrees/{worktree_id}",
+		DefaultStatus: http.StatusNoContent,
+		Summary:       "Delete worktree",
+		Tags:          []string{"Projects"},
+	}, s.deleteProjectWorktree)
+	huma.Register(api, huma.Operation{
+		OperationID:   "remove-worktree",
+		Method:        http.MethodPost,
+		Path:          "/projects/{project_id}/worktrees/{worktree_id}/delete",
+		DefaultStatus: http.StatusNoContent,
+		Summary:       "Remove worktree (optionally from disk)",
+		Tags:          []string{"Projects"},
+	}, s.removeProjectWorktree)
+	huma.Register(api, huma.Operation{
+		OperationID:   "create-worktree-from-merge-request",
+		Method:        http.MethodPost,
+		Path:          "/projects/{project_id}/worktrees/from-merge-request",
+		DefaultStatus: http.StatusCreated,
+		Summary:       "Create worktree from a merge request head",
+		Tags:          []string{"Projects"},
+	}, s.createProjectWorktreeFromMergeRequest)
+	huma.Register(api, huma.Operation{
+		OperationID:   "remove-stale-worktree",
+		Method:        http.MethodPost,
+		Path:          "/worktrees/remove-stale",
+		DefaultStatus: http.StatusOK,
+		Summary:       "Remove a stale worktree",
+		Tags:          []string{"Projects"},
+	}, s.removeStaleWorktree)
+	huma.Register(api, huma.Operation{
+		OperationID: "set-worktree-hidden",
+		Method:      http.MethodPut,
+		Path:        "/projects/{project_id}/worktrees/{worktree_id}/hidden",
+		Summary:     "Set worktree hidden",
+		Tags:        []string{"Projects"},
+	}, s.setProjectWorktreeHidden)
+	huma.Register(api, huma.Operation{
+		OperationID: "set-worktree-session-backend",
+		Method:      http.MethodPut,
+		Path:        "/projects/{project_id}/worktrees/{worktree_id}/session-backend",
+		Summary:     "Set worktree session backend",
+		Tags:        []string{"Projects"},
+	}, s.setProjectWorktreeSessionBackend)
+	// OperationID stays generic ("links", not "linked-issues"): the project
+	// registry's operation surface must not bake issue/PR-tracker terms into
+	// op IDs (enforced by TestW1SliceAGate). The path and body field keep the
+	// precise "linked issue numbers" naming; the op ID does not.
+	huma.Register(api, huma.Operation{
+		OperationID: "set-worktree-links",
+		Method:      http.MethodPut,
+		Path:        "/projects/{project_id}/worktrees/{worktree_id}/linked-issues",
+		Summary:     "Set worktree linked issues",
+		Tags:        []string{"Projects"},
+	}, s.setProjectWorktreeLinkedIssues)
+	huma.Register(api, huma.Operation{
+		OperationID: "refresh-worktree-stats",
+		Method:      http.MethodPost,
+		Path:        "/projects/{project_id}/worktrees/{worktree_id}/refresh-stats",
+		Summary:     "Refresh worktree git stats",
+		Tags:        []string{"Projects"},
+	}, s.refreshProjectWorktreeStats)
 	huma.Register(api, huma.Operation{
 		OperationID: "list-worktrees",
 		Method:      http.MethodGet,
@@ -826,6 +1035,121 @@ func (s *Server) registerAPI(api huma.API) {
 		Summary:     "List launch targets",
 		Tags:        []string{"Projects"},
 	}, s.listLaunchTargets)
+	huma.Register(api, huma.Operation{
+		OperationID:   "clone-project",
+		Method:        http.MethodPost,
+		Path:          "/projects/clone",
+		DefaultStatus: http.StatusCreated,
+		Summary:       "Clone a repository and register it as a project",
+		Tags:          []string{"Projects"},
+	}, s.cloneProject)
+	huma.Register(api, huma.Operation{
+		OperationID: "list-project-branches",
+		Method:      http.MethodGet,
+		Path:        "/projects/{project_id}/branches",
+		Summary:     "List project repository branches",
+		Tags:        []string{"Projects"},
+	}, s.listProjectBranches)
+	huma.Register(api, huma.Operation{
+		OperationID: "inspect-project-worktree",
+		Method:      http.MethodGet,
+		Path:        "/projects/{project_id}/worktrees/{worktree_id}/inspect",
+		Summary:     "Inspect project worktree",
+		Tags:        []string{"Projects"},
+	}, s.inspectProjectWorktree)
+	huma.Register(api, huma.Operation{
+		OperationID: "get-project-worktree-runtime",
+		Method:      http.MethodGet,
+		Path:        "/projects/{project_id}/worktrees/{worktree_id}/runtime",
+		Summary:     "Get project worktree runtime",
+		Tags:        []string{"Projects"},
+	}, s.getProjectWorktreeRuntime)
+	huma.Register(api, huma.Operation{
+		OperationID: "ensure-project-worktree-runtime-shell",
+		Method:      http.MethodPost,
+		Path:        "/projects/{project_id}/worktrees/{worktree_id}/runtime/shell",
+		Summary:     "Ensure project worktree shell",
+		Tags:        []string{"Projects"},
+	}, s.ensureProjectWorktreeRuntimeShell)
+	huma.Register(api, huma.Operation{
+		OperationID: "launch-project-worktree-runtime-session",
+		Method:      http.MethodPost,
+		Path:        "/projects/{project_id}/worktrees/{worktree_id}/runtime/sessions",
+		Summary:     "Launch project worktree runtime session",
+		Tags:        []string{"Projects"},
+	}, s.launchProjectWorktreeRuntimeSession)
+	huma.Register(api, huma.Operation{
+		OperationID:   "stop-project-worktree-runtime-session",
+		Method:        http.MethodDelete,
+		Path:          "/projects/{project_id}/worktrees/{worktree_id}/runtime/sessions/{session_key}",
+		DefaultStatus: http.StatusNoContent,
+		Summary:       "Stop project worktree runtime session",
+		Tags:          []string{"Projects"},
+	}, s.stopProjectWorktreeRuntimeSession)
+	huma.Register(api, huma.Operation{
+		OperationID: "get-project-worktree-runtime-session-attach-spec",
+		Method:      http.MethodGet,
+		Path:        "/projects/{project_id}/worktrees/{worktree_id}/runtime/sessions/{session_key}/attach-spec",
+		Summary:     "Get project worktree runtime session attach spec",
+		Tags:        []string{"Projects"},
+	}, s.getProjectWorktreeRuntimeSessionAttachSpec)
+	huma.Register(api, huma.Operation{
+		OperationID: "complete-filesystem-path",
+		Method:      http.MethodGet,
+		Path:        "/filesystem/complete",
+		Summary:     "Complete a local filesystem path",
+		Tags:        []string{"System"},
+	}, s.completeFilesystemPath)
+	huma.Register(api, huma.Operation{
+		OperationID: "validate-filesystem-repo",
+		Method:      http.MethodGet,
+		Path:        "/filesystem/validate-repo",
+		Summary:     "Resolve a path to a repository root",
+		Tags:        []string{"System"},
+	}, s.validateFilesystemRepo)
+	huma.Register(api, huma.Operation{
+		OperationID: "list-user-repositories",
+		Method:      http.MethodGet,
+		Path:        "/platform/user-repositories",
+		Summary:     "List the authenticated platform CLI user's repositories",
+		Tags:        []string{"System"},
+	}, s.listUserRepositories)
+	huma.Register(api, huma.Operation{
+		OperationID: "get-tooling-status",
+		Method:      http.MethodGet,
+		Path:        "/tooling-status",
+		Summary:     "Report git/gh/glab CLI availability and auth",
+		Tags:        []string{"System"},
+	}, s.getToolingStatus)
+	huma.Register(api, huma.Operation{
+		OperationID: "launch-host-runtime-session",
+		Method:      http.MethodPost,
+		Path:        "/runtime/sessions",
+		Summary:     "Launch host runtime session",
+		Tags:        []string{"Runtime"},
+	}, s.launchHostRuntimeSession)
+	huma.Register(api, huma.Operation{
+		OperationID: "list-host-runtime-sessions",
+		Method:      http.MethodGet,
+		Path:        "/runtime/sessions",
+		Summary:     "List host runtime sessions",
+		Tags:        []string{"Runtime"},
+	}, s.listHostRuntimeSessions)
+	huma.Register(api, huma.Operation{
+		OperationID:   "stop-host-runtime-session",
+		Method:        http.MethodDelete,
+		Path:          "/runtime/sessions/{session_key}",
+		DefaultStatus: http.StatusNoContent,
+		Summary:       "Stop host runtime session",
+		Tags:          []string{"Runtime"},
+	}, s.stopHostRuntimeSession)
+	huma.Register(api, huma.Operation{
+		OperationID: "get-host-runtime-session-attach-spec",
+		Method:      http.MethodGet,
+		Path:        "/runtime/sessions/{session_key}/attach-spec",
+		Summary:     "Get host runtime session attach spec",
+		Tags:        []string{"Runtime"},
+	}, s.getHostRuntimeSessionAttachSpec)
 }
 
 func (s *Server) registerProviderRepoAPI(api huma.API) {
@@ -935,6 +1259,22 @@ func (s *Server) registerProviderRepoAPI(api huma.API) {
 		documentOperation("merge-pull", "Merge pull request", "Pull Requests"))
 	huma.Post(api, hostPullPath+"/merge", s.mergePROnHost,
 		documentOperation("merge-pull-on-host", "Merge pull request", "Pull Requests"))
+	huma.Register(api, huma.Operation{
+		OperationID:   "defer-merge-pull",
+		Method:        http.MethodPost,
+		Path:          pullPath + "/merge/deferred",
+		DefaultStatus: http.StatusAccepted,
+		Summary:       "Defer pull request merge until pending CI passes",
+		Tags:          []string{"Pull Requests"},
+	}, s.deferMergePR)
+	huma.Register(api, huma.Operation{
+		OperationID:   "defer-merge-pull-on-host",
+		Method:        http.MethodPost,
+		Path:          hostPullPath + "/merge/deferred",
+		DefaultStatus: http.StatusAccepted,
+		Summary:       "Defer pull request merge until pending CI passes",
+		Tags:          []string{"Pull Requests"},
+	}, s.deferMergePROnHost)
 	huma.Post(api, pullPath+"/sync", s.syncPR,
 		documentOperation("sync-pull", "Sync pull request", "Pull Requests"))
 	huma.Post(api, hostPullPath+"/sync", s.syncPROnHost,
@@ -1012,7 +1352,7 @@ func (s *Server) listPulls(ctx context.Context, input *listPullsInput) (*listPul
 		RepoFilters: parseRepoFilters(input.Repo),
 	}
 	if len(opts.RepoFilters) == 0 {
-		if platformHost, owner, name, repoPath := parseRepoFilter(input.Repo); repoPath != "" {
+		if _, platformHost, owner, name, repoPath := parseRepoFilter(input.Repo); repoPath != "" {
 			opts.PlatformHost = platformHost
 			opts.RepoPath = repoPath
 		} else if owner != "" {
@@ -1064,6 +1404,7 @@ func (s *Server) listPulls(ctx context.Context, input *listPullsInput) (*listPul
 		if stackConflictBlocked[mr.ID] {
 			responseMR.MergeableState = "dirty"
 		}
+		responseMR = mergeRequestResponseModel(responseMR)
 		resp := mergeRequestResponse{
 			MergeRequest:  responseMR,
 			Repo:          s.repoRefFromRepo(rp),
@@ -1260,11 +1601,13 @@ func (s *Server) buildPullDetailResponse(
 			responseMR.MergeableState = "dirty"
 		}
 	}
+	responseMR = mergeRequestResponseModel(responseMR)
 	resp.MergeRequest = &responseMR
 
 	if s.workspaces != nil {
-		wsRef, wsErr := s.workspaces.GetByMR(
-			ctx, repo.PlatformHost, repo.Owner, repo.Name, mr.Number,
+		wsRef, wsErr := s.workspaces.GetByMRForProvider(
+			ctx, repo.Platform, repo.PlatformHost, repo.Owner, repo.Name,
+			mr.Number,
 		)
 		if wsErr == nil && wsRef != nil {
 			resp.Workspace = &workspaceRef{
@@ -1275,6 +1618,23 @@ func (s *Server) buildPullDetailResponse(
 	}
 
 	return resp, nil
+}
+
+func mergeRequestResponseModel(mr db.MergeRequest) db.MergeRequest {
+	mr.KanbanStatus = mergeRequestResponseKanbanStatus(mr)
+	return mr
+}
+
+func mergeRequestResponseKanbanStatus(mr db.MergeRequest) db.KanbanStatus {
+	switch mr.KanbanStatus {
+	case db.KanbanStatusNew, db.KanbanStatusReviewing, db.KanbanStatusWaiting, db.KanbanStatusAwaitingMerge:
+		return mr.KanbanStatus
+	case "":
+		return db.KanbanStatusNew
+	default:
+		slog.Warn("normalizing unexpected kanban status in merge request response", "merge_request_id", mr.ID, "status", mr.KanbanStatus)
+		return db.KanbanStatusNew
+	}
 }
 
 func verifiedReviewedHeadSHA(mr *db.MergeRequest) string {
@@ -1967,7 +2327,7 @@ func (s *Server) listIssues(ctx context.Context, input *listIssuesInput) (*listI
 		RepoFilters: parseRepoFilters(input.Repo),
 	}
 	if len(opts.RepoFilters) == 0 {
-		if platformHost, owner, name, repoPath := parseRepoFilter(input.Repo); repoPath != "" {
+		if _, platformHost, owner, name, repoPath := parseRepoFilter(input.Repo); repoPath != "" {
 			opts.PlatformHost = platformHost
 			opts.RepoPath = repoPath
 		} else if owner != "" {
@@ -2135,8 +2495,9 @@ func (s *Server) buildIssueDetailResponse(
 		issueResp.DetailFetchedAt = formatUTCRFC3339(*issue.DetailFetchedAt)
 	}
 	if s.workspaces != nil {
-		wsRef, wsErr := s.workspaces.GetByIssue(
-			ctx, repo.PlatformHost, repo.Owner, repo.Name, issue.Number,
+		wsRef, wsErr := s.workspaces.GetByIssueForProvider(
+			ctx, repo.Platform, repo.PlatformHost, repo.Owner, repo.Name,
+			issue.Number,
 		)
 		if wsErr == nil && wsRef != nil {
 			issueResp.Workspace = &workspaceRef{
@@ -2322,6 +2683,7 @@ func (s *Server) getCommentAutocomplete(
 	case "@":
 		users, err := s.db.ListCommentAutocompleteUsers(
 			ctx,
+			repo.Platform,
 			repo.PlatformHost,
 			input.Owner,
 			input.Name,
@@ -2349,6 +2711,7 @@ func (s *Server) getCommentAutocomplete(
 		}
 		references, err := s.db.ListCommentAutocompleteReferences(
 			ctx,
+			repo.Platform,
 			repo.PlatformHost,
 			input.Owner,
 			input.Name,
@@ -2653,79 +3016,67 @@ func (s *Server) readyForReview(ctx context.Context, input *repoNumberInput) (*a
 }
 
 func (s *Server) mergePR(ctx context.Context, input *mergePRInput) (*mergePROutput, error) {
-	validMethods := map[string]bool{"merge": true, "squash": true, "rebase": true}
-	if !validMethods[input.Body.Method] {
-		return nil, problemValidation(
-			"body.method",
-			"invalid merge method: must be merge, squash, or rebase",
-			"merge", "squash", "rebase",
-		)
-	}
-
-	repo, err := s.requireRepoRouteCapability(
-		ctx,
-		input.Provider, input.PlatformHost, input.Owner, input.Name,
-		capabilityMergeMutation,
-	)
+	result, err := s.mergePRWithBody(ctx, input.Provider, input.PlatformHost, input.Owner, input.Name, input.Number, input.Body)
 	if err != nil {
 		return nil, err
 	}
+	return &mergePROutput{Body: result}, nil
+}
+
+func (s *Server) mergePRWithBody(
+	ctx context.Context,
+	provider string,
+	platformHost string,
+	owner string,
+	name string,
+	number int,
+	body mergePRInputBody,
+) (mergePRBody, error) {
+	repo, err := s.requireRepoRouteCapability(
+		ctx,
+		provider, platformHost, owner, name,
+		capabilityMergeMutation,
+	)
+	if err != nil {
+		return mergePRBody{}, err
+	}
 	if err := s.requireSyncerCapability(*repo, capabilityMergeMutation); err != nil {
-		return nil, err
+		return mergePRBody{}, err
 	}
 
 	mutator, err := s.syncer.MergeMutator(
 		repoProviderKind(*repo), repoProviderHost(*repo),
 	)
 	if err != nil {
-		return nil, unsupportedCapabilityProblem(*repo, capabilityMergeMutation)
+		return mergePRBody{}, unsupportedCapabilityProblem(*repo, capabilityMergeMutation)
 	}
 
-	mr, err := s.db.GetMergeRequestByRepoIDAndNumber(ctx, repo.ID, input.Number)
+	mr, err := s.db.GetMergeRequestByRepoIDAndNumber(ctx, repo.ID, number)
 	if err != nil {
-		return nil, problemInternal("get pull request failed")
+		return mergePRBody{}, problemInternal("get pull request failed")
 	}
 	if mr == nil {
-		return nil, problemNotFound(CodePullNotFound, "pull request not found", nil)
+		return mergePRBody{}, problemNotFound(CodePullNotFound, "pull request not found", nil)
 	}
-
-	// Bind the merge to the head commit the user reviewed locally so a
-	// source-branch push between review and merge is rejected upstream
-	// instead of merging unreviewed code.
-	expectedHeadSHA, err := s.reviewedHeadSHA(repo, mr)
+	expectedHeadSHA, err := s.preflightMergePR(repo, mr, number, body)
 	if err != nil {
-		return nil, err
-	}
-	// Head-binding providers require the client to pin the head it
-	// rendered: an omitted pin would silently bind to whatever the cache
-	// holds now, which may be newer than what the user reviewed.
-	if strings.TrimSpace(input.Body.ExpectedHeadSHA) == "" &&
-		s.capabilitiesForRepo(*repo).MutationHeadBinding {
-		return nil, problemValidation(
-			"body.expected_head_sha",
-			"required for this provider: echo the platform_head_sha you rendered",
-		)
-	}
-	if err := s.verifyClientReviewedHead(
-		repo, input.Number, input.Body.ExpectedHeadSHA, expectedHeadSHA,
-	); err != nil {
-		return nil, err
+		return mergePRBody{}, err
 	}
 
 	result, err := mutator.MergeMergeRequest(
 		ctx,
 		platformRepoRefFromDB(*repo),
-		input.Number,
-		input.Body.CommitTitle,
-		input.Body.CommitMessage,
-		input.Body.Method,
+		number,
+		body.CommitTitle,
+		body.CommitMessage,
+		body.Method,
 		expectedHeadSHA,
 	)
 	if err != nil {
 		if status, message, ok := mergeHTTPErrorStatus(err); ok {
 			slog.Error("provider merge failed",
-				"owner", input.Owner, "repo", input.Name,
-				"number", input.Number, "method", input.Body.Method,
+				"owner", owner, "repo", name,
+				"number", number, "method", body.Method,
 				"status", status,
 				"message", message,
 				"err", err)
@@ -2746,30 +3097,30 @@ func (s *Server) mergePR(ctx context.Context, input *mergePRInput) (*mergePROutp
 						if syncErr := s.syncer.SyncMROnProvider(
 							bgCtx,
 							repoProviderKind(*repo), repoProviderHost(*repo),
-							repo.Owner, repo.Name, input.Number,
+							repo.Owner, repo.Name, number,
 						); syncErr != nil {
 							slog.Warn("background sync after merge failure", "err", syncErr)
 						}
 					})
 				}
-				return nil, problemConflict(CodeConflict, message, map[string]any{"reason": reason})
+				return mergePRBody{}, problemConflict(CodeConflict, message, map[string]any{"reason": reason})
 			}
 
 			// Forward 4xx provider errors as-is so the user sees the real cause
 			// (e.g. 422 validation, 403 forbidden). 5xx becomes 502.
 			if status >= 400 && status < 500 {
-				return nil, newProblem(status, codeForStatus(status), message, nil)
+				return mergePRBody{}, newProblem(status, codeForStatus(status), message, nil)
 			}
-			return nil, problemUpstream(
+			return mergePRBody{}, problemUpstream(
 				"provider merge error: "+message,
 				string(repoProviderKind(*repo)), repoProviderHost(*repo),
 			)
 		}
 		slog.Error("provider merge transport error",
-			"owner", input.Owner, "repo", input.Name,
-			"number", input.Number, "method", input.Body.Method,
+			"owner", owner, "repo", name,
+			"number", number, "method", body.Method,
 			"err", err)
-		return nil, providerCallProblemWithDetail(
+		return mergePRBody{}, providerCallProblemWithDetail(
 			err,
 			string(repoProviderKind(*repo)), repoProviderHost(*repo),
 			"provider merge error: "+err.Error(),
@@ -2777,15 +3128,54 @@ func (s *Server) mergePR(ctx context.Context, input *mergePRInput) (*mergePROutp
 	}
 
 	now := s.now().UTC()
-	_ = s.db.UpdateMRState(ctx, repo.ID, input.Number, "merged", &now, &now)
+	_ = s.db.UpdateMRState(ctx, repo.ID, number, "merged", &now, &now)
+	s.markClosedLinkedNotificationsDone(ctx)
 
-	return &mergePROutput{
-		Body: mergePRBody{
-			Merged:  result.Merged,
-			SHA:     result.SHA,
-			Message: result.Message,
-		},
+	return mergePRBody{
+		Merged:  result.Merged,
+		SHA:     result.SHA,
+		Message: result.Message,
 	}, nil
+}
+
+func (s *Server) preflightMergePR(
+	repo *db.Repo,
+	mr *db.MergeRequest,
+	number int,
+	body mergePRInputBody,
+) (string, error) {
+	validMethods := map[string]bool{"merge": true, "squash": true, "rebase": true}
+	if !validMethods[body.Method] {
+		return "", problemValidation(
+			"body.method",
+			"invalid merge method: must be merge, squash, or rebase",
+			"merge", "squash", "rebase",
+		)
+	}
+
+	// Bind the merge to the head commit the user reviewed locally so a
+	// source-branch push between review and merge is rejected upstream
+	// instead of merging unreviewed code.
+	expectedHeadSHA, err := s.reviewedHeadSHA(repo, mr)
+	if err != nil {
+		return "", err
+	}
+	// Head-binding providers require the client to pin the head it
+	// rendered: an omitted pin would silently bind to whatever the cache
+	// holds now, which may be newer than what the user reviewed.
+	if strings.TrimSpace(body.ExpectedHeadSHA) == "" &&
+		s.capabilitiesForRepo(*repo).MutationHeadBinding {
+		return "", problemValidation(
+			"body.expected_head_sha",
+			"required for this provider: echo the platform_head_sha you rendered",
+		)
+	}
+	if err := s.verifyClientReviewedHead(
+		repo, number, body.ExpectedHeadSHA, expectedHeadSHA,
+	); err != nil {
+		return "", err
+	}
+	return expectedHeadSHA, nil
 }
 
 // reviewedHeadSHA resolves the head commit a mutation should be pinned
@@ -2929,31 +3319,28 @@ func isGenericGitHubErrorMessage(message string, status int) bool {
 func (s *Server) setPRGitHubState(
 	ctx context.Context, input *githubStateInput,
 ) (*githubStateOutput, error) {
-	if input.Body.State != "open" && input.Body.State != "closed" {
+	if input.Body.State != "open" && input.Body.State != "closed" && input.Body.State != "draft" {
 		return nil, problemValidation(
 			"body.state",
-			"state must be 'open' or 'closed'",
-			"open", "closed",
+			"state must be 'open', 'closed', or 'draft'",
+			"open", "closed", "draft",
 		)
 	}
 
+	requiredCapability := capabilityStateMutation
+	if input.Body.State == "draft" {
+		requiredCapability = capabilityDraftMutation
+	}
 	repo, err := s.requireRepoRouteCapability(
 		ctx,
 		input.Provider, input.PlatformHost, input.Owner, input.Name,
-		capabilityStateMutation,
+		requiredCapability,
 	)
 	if err != nil {
 		return nil, err
 	}
-	if err := s.requireSyncerCapability(*repo, capabilityStateMutation); err != nil {
+	if err := s.requireSyncerCapability(*repo, requiredCapability); err != nil {
 		return nil, err
-	}
-
-	mutator, err := s.syncer.StateMutator(
-		repoProviderKind(*repo), repoProviderHost(*repo),
-	)
-	if err != nil {
-		return nil, unsupportedCapabilityProblem(*repo, capabilityStateMutation)
 	}
 
 	mr, err := s.db.GetMergeRequestByRepoIDAndNumber(ctx, repo.ID, input.Number)
@@ -2969,6 +3356,37 @@ func (s *Server) setPRGitHubState(
 			"cannot change state of a merged pull request",
 			nil,
 		)
+	}
+
+	if input.Body.State == "draft" {
+		mutator, err := s.syncer.DraftMutator(
+			repoProviderKind(*repo), repoProviderHost(*repo),
+		)
+		if err != nil {
+			return nil, unsupportedCapabilityProblem(*repo, capabilityDraftMutation)
+		}
+		if err := mutator.ConvertMergeRequestToDraft(
+			ctx, platformRepoRefFromDB(*repo), input.Number,
+		); err != nil {
+			return nil, providerCallProblemWithDetail(
+				err,
+				string(repoProviderKind(*repo)), repoProviderHost(*repo),
+				"Provider API error: "+err.Error(),
+			)
+		}
+		if err := s.db.UpdateMRDraftState(ctx, repo.ID, input.Number, true); err != nil {
+			return nil, problemInternal("update mr draft state: " + err.Error())
+		}
+		out := &githubStateOutput{}
+		out.Body.State = input.Body.State
+		return out, nil
+	}
+
+	mutator, err := s.syncer.StateMutator(
+		repoProviderKind(*repo), repoProviderHost(*repo),
+	)
+	if err != nil {
+		return nil, unsupportedCapabilityProblem(*repo, capabilityStateMutation)
 	}
 
 	if _, err := mutator.SetMergeRequestState(
@@ -3002,6 +3420,7 @@ func (s *Server) setPRGitHubState(
 						)
 					}
 					_, _ = s.db.UpsertMergeRequest(ctx, normalized)
+					s.markClosedLinkedNotificationsDone(ctx)
 					if ghPR.GetMerged() {
 						return nil, problemConflict(
 							CodeConflict,
@@ -3037,6 +3456,9 @@ func (s *Server) setPRGitHubState(
 		input.Body.State, nil, closedAt,
 	); err != nil {
 		return nil, problemInternal("update mr state: " + err.Error())
+	}
+	if input.Body.State == "closed" {
+		s.markClosedLinkedNotificationsDone(ctx)
 	}
 
 	out := &githubStateOutput{}
@@ -3113,6 +3535,7 @@ func (s *Server) setIssueGitHubState(
 					)
 				}
 				_, _ = s.db.UpsertIssue(ctx, normalized)
+				s.markClosedLinkedNotificationsDone(ctx)
 				if ghIssue.GetState() == input.Body.State {
 					out := &githubStateOutput{}
 					out.Body.State = input.Body.State
@@ -3137,6 +3560,9 @@ func (s *Server) setIssueGitHubState(
 		input.Body.State, closedAt,
 	); err != nil {
 		return nil, problemInternal("update issue state: " + err.Error())
+	}
+	if input.Body.State == "closed" {
+		s.markClosedLinkedNotificationsDone(ctx)
 	}
 
 	out := &githubStateOutput{}
@@ -3190,10 +3616,20 @@ func (s *Server) triggerSync(
 	ctx context.Context,
 	input *triggerSyncInput,
 ) (*acceptedOutput, error) {
+	if s.syncer == nil {
+		return nil, problemServiceUnavailable("syncer not configured")
+	}
 	s.syncer.TriggerRunWithPriority(
 		context.WithoutCancel(ctx),
 		s.priorityReposFromFilter(input.PriorityRepos),
 	)
+	if s.notificationsEnabled() {
+		s.runBackground(func(bgCtx context.Context) {
+			if err := s.syncer.RunNotificationSync(bgCtx); err != nil {
+				slog.Warn("notification sync failed", "err", err)
+			}
+		})
+	}
 	return &acceptedOutput{Status: http.StatusAccepted}, nil
 }
 
@@ -3236,6 +3672,26 @@ func matchPriorityRepo(
 	filter string,
 	tracked []ghclient.RepoRef,
 ) (ghclient.RepoRef, bool) {
+	if provider, value, ok := strings.Cut(filter, "|"); ok {
+		provider = strings.TrimSpace(provider)
+		value = strings.Trim(value, "/ ")
+		parts := strings.Split(value, "/")
+		if provider == "" || len(parts) < 3 {
+			return ghclient.RepoRef{}, false
+		}
+
+		host := parts[0]
+		path := strings.Join(parts[1:], "/")
+		for _, repo := range tracked {
+			if strings.EqualFold(string(repoPlatformForPriority(repo)), provider) &&
+				strings.EqualFold(repoHostForPriority(repo), host) &&
+				strings.EqualFold(repoPathForPriority(repo), path) {
+				return repo, true
+			}
+		}
+		return ghclient.RepoRef{}, false
+	}
+
 	for _, repo := range tracked {
 		if strings.EqualFold(repoPathForPriority(repo), filter) {
 			return repo, true
@@ -3294,12 +3750,18 @@ func repoPlatformForPriority(repo ghclient.RepoRef) platform.Kind {
 }
 
 func (s *Server) syncStatus(_ context.Context, _ *struct{}) (*syncStatusOutput, error) {
+	if s.syncer == nil {
+		return &syncStatusOutput{Body: &ghclient.SyncStatus{}}, nil
+	}
 	return &syncStatusOutput{Body: s.syncer.Status()}, nil
 }
 
 func (s *Server) getRateLimits(
 	_ context.Context, _ *struct{},
 ) (*rateLimitsOutput, error) {
+	if s.syncer == nil {
+		return &rateLimitsOutput{Body: rateLimitsResponse{Hosts: map[string]rateLimitHostStatus{}}}, nil
+	}
 	trackers := s.syncer.RateTrackers()
 	gqlTrackers := s.syncer.GQLRateTrackers()
 	budgets := s.syncer.Budgets()
@@ -3542,8 +4004,9 @@ func (s *Server) syncIssue(ctx context.Context, input *issueRepoNumberInput) (*s
 		syncIssueResp.DetailFetchedAt = formatUTCRFC3339(*issue.DetailFetchedAt)
 	}
 	if s.workspaces != nil {
-		wsRef, wsErr := s.workspaces.GetByIssue(
-			ctx, repo.PlatformHost, repo.Owner, repo.Name, issue.Number,
+		wsRef, wsErr := s.workspaces.GetByIssueForProvider(
+			ctx, repo.Platform, repo.PlatformHost, repo.Owner, repo.Name,
+			issue.Number,
 		)
 		if wsErr == nil && wsRef != nil {
 			syncIssueResp.Workspace = &workspaceRef{
@@ -3592,6 +4055,10 @@ func (s *Server) listActivity(ctx context.Context, input *listActivityInput) (*l
 		RepoFilters: parseRepoFilters(input.Repo),
 		Types:       input.Types,
 		Search:      input.Search,
+		// Notifications are always on; this only drops notification rows in
+		// SQL when no config is loaded (the nil-config safety guard), so the
+		// safety-cap window is filled by real activity, not stale notifications.
+		ExcludeNotifications: !s.notificationsEnabled(),
 	}
 
 	opts.Limit = activitySafetyCap + 1
@@ -3615,6 +4082,14 @@ func (s *Server) listActivity(ctx context.Context, input *listActivityInput) (*l
 		opts.AfterTime = &t
 		opts.AfterSource = source
 		opts.AfterSourceID = sourceID
+	}
+
+	if s.cfg != nil {
+		trackedRepos, err := s.trackedNotificationRepoFilters()
+		if err != nil {
+			return nil, problemInternal("load tracked notification repos failed")
+		}
+		opts.NotificationRepoFilters = trackedRepos
 	}
 
 	items, err := s.db.ListActivity(ctx, opts)
@@ -3694,6 +4169,7 @@ func (s *Server) listActivity(ctx context.Context, input *listActivityInput) (*l
 		if item.ActivityURL == "" {
 			item.ActivityURL = branchActivityURL(it)
 		}
+		item.SubjectState = it.SubjectState
 		out[i] = item
 	}
 
@@ -3776,7 +4252,7 @@ func (s *Server) resolveItem(
 	if providerKind != platform.KindGitLab {
 		itemTypeHint = ""
 	}
-	if !s.syncer.IsTrackedRepoOnHost(repo.Owner, repo.Name, repoProviderHost(*repo)) {
+	if !s.isConfiguredRepoTracked(*repo) {
 		return &resolveItemOutput{
 			Body: resolveItemResponse{
 				Number:      number,
@@ -4417,9 +4893,14 @@ func (s *Server) createWorkspace(
 	if s.workspaces == nil {
 		return nil, problemServiceUnavailable("workspace manager not configured")
 	}
+	provider, err := s.createWorkspaceProvider(ctx, input)
+	if err != nil {
+		return nil, err
+	}
 
 	ws, err := s.workspaces.Create(
 		ctx,
+		provider,
 		input.Body.PlatformHost,
 		input.Body.Owner,
 		input.Body.Name,
@@ -4452,6 +4933,40 @@ func (s *Server) createWorkspace(
 		Status: http.StatusAccepted,
 		Body:   s.toWorkspaceResponse(ctx, summary),
 	}, nil
+}
+
+func (s *Server) createWorkspaceProvider(
+	ctx context.Context, input *createWorkspaceInput,
+) (string, error) {
+	if strings.TrimSpace(input.Body.Provider) != "" {
+		provider, err := normalizeRouteProvider(input.Body.Provider)
+		if err != nil {
+			return "", problemValidation("body.provider", err.Error())
+		}
+		return provider, nil
+	}
+	count, err := s.db.CountReposByHostOwnerName(
+		ctx, input.Body.PlatformHost, input.Body.Owner, input.Body.Name,
+	)
+	if err != nil {
+		return "", problemInternal("count matching repos: " + err.Error())
+	}
+	if count > 1 {
+		return "", problemValidation(
+			"body.provider",
+			"provider is required when multiple providers share this host and repository",
+		)
+	}
+	repo, err := s.db.GetRepoByHostOwnerName(
+		ctx, input.Body.PlatformHost, input.Body.Owner, input.Body.Name,
+	)
+	if err != nil {
+		return "", problemInternal("lookup workspace repo: " + err.Error())
+	}
+	if repo == nil {
+		return "", nil
+	}
+	return repo.Platform, nil
 }
 
 func (s *Server) runWorkspaceSetup(ws *workspace.Workspace) {
@@ -4550,8 +5065,9 @@ func (s *Server) createIssueWorkspace(
 		return nil, providerRouteLookupError(err)
 	}
 
-	existing, err := s.workspaces.GetByIssue(
+	existing, err := s.workspaces.GetByIssueForProvider(
 		ctx,
+		repo.Platform,
 		repo.PlatformHost,
 		repo.Owner,
 		repo.Name,
@@ -4581,6 +5097,7 @@ func (s *Server) createIssueWorkspace(
 		repo.Name,
 		input.Number,
 		workspace.CreateIssueOptions{
+			Provider:            input.Provider,
 			GitHeadRef:          strings.TrimSpace(derefString(input.Body.GitHeadRef)),
 			ReuseExistingBranch: input.Body.ReuseExistingBranch,
 		},
@@ -4629,8 +5146,9 @@ func (s *Server) createIssueWorkspace(
 			return nil, problemValidation("body.git_head_ref", msg)
 		}
 		if strings.Contains(msg, "UNIQUE constraint") {
-			existing, getErr := s.workspaces.GetByIssue(
+			existing, getErr := s.workspaces.GetByIssueForProvider(
 				ctx,
+				repo.Platform,
 				repo.PlatformHost,
 				repo.Owner,
 				repo.Name,
@@ -5041,6 +5559,61 @@ func (s *Server) getWorkspaceDiff(
 	}}, nil
 }
 
+func (s *Server) getWorkspaceFilePreview(
+	ctx context.Context,
+	input *getWorkspaceFilePreviewInput,
+) (*getWorkspaceFilePreviewOutput, error) {
+	if strings.TrimSpace(input.Path) == "" {
+		return nil, problemValidation("query.path", "path is required")
+	}
+	side := strings.TrimSpace(input.Side)
+	if side != "" && side != "old" && side != "new" {
+		return nil, problemValidation("query.side", "side must be old or new")
+	}
+
+	req, err := s.workspaceDiffRequest(ctx, input.ID, input.Base)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.applyWorkspaceDiffScope(
+		ctx, &req, input.Commit, input.From, input.To,
+	); err != nil {
+		return nil, err
+	}
+
+	hideWhitespace := input.Whitespace == "hide"
+	content, ok, err := s.workspaceFilePreview(
+		ctx, req, hideWhitespace, input.Path, side,
+	)
+	if err != nil {
+		if errors.Is(err, gitclone.ErrNotFound) {
+			return nil, problemNotFound(CodeNotFound, "workspace file preview not available: file is not changed in this diff", nil)
+		}
+		if errors.Is(err, gitclone.ErrTooLarge) {
+			return nil, problemPayloadTooLarge("file preview is too large", maxFilePreviewBytes)
+		}
+		slog.Error(
+			"failed to read workspace file preview",
+			"workspace_id", input.ID,
+			"base", req.Base,
+			"path", input.Path,
+			"err", err,
+		)
+		return nil, problemUpstream("failed to read workspace file preview", "", "")
+	}
+	if !ok {
+		return nil, workspaceDiffBaseUnavailable(req.Base)
+	}
+
+	return &getWorkspaceFilePreviewOutput{Body: filePreviewResponse{
+		Path:      content.Path,
+		MediaType: previewMediaType(content.Path, content.Data),
+		Encoding:  "base64",
+		Content:   base64.StdEncoding.EncodeToString(content.Data),
+		Size:      content.Size,
+	}}, nil
+}
+
 func (s *Server) workspaceDiffRequest(
 	ctx context.Context,
 	id string,
@@ -5272,6 +5845,47 @@ func (s *Server) workspaceDiff(
 	}
 	return workspace.WorktreeDiff(
 		ctx, req.Summary.WorktreePath, req.Base, hideWhitespace,
+	)
+}
+
+func (s *Server) workspaceFilePreview(
+	ctx context.Context,
+	req workspaceDiffRequest,
+	hideWhitespace bool,
+	path string,
+	side string,
+) (*gitclone.FileContent, bool, error) {
+	if req.FromSHA != "" && req.ToSHA != "" {
+		return workspace.WorktreeFileContentBetween(
+			ctx,
+			req.Summary.WorktreePath,
+			req.FromSHA,
+			req.ToSHA,
+			hideWhitespace,
+			path,
+			side,
+			maxFilePreviewBytes,
+		)
+	}
+	if req.Base == workspace.WorktreeDiffBaseMergeTarget {
+		return workspace.WorktreeFileContentAgainstMergeTarget(
+			ctx,
+			req.Summary.WorktreePath,
+			req.MergeTargetBranch,
+			hideWhitespace,
+			path,
+			side,
+			maxFilePreviewBytes,
+		)
+	}
+	return workspace.WorktreeFileContent(
+		ctx,
+		req.Summary.WorktreePath,
+		req.Base,
+		hideWhitespace,
+		path,
+		side,
+		maxFilePreviewBytes,
 	)
 }
 
@@ -5598,7 +6212,7 @@ func (s *Server) getWorkspaceRuntime(
 	ctx context.Context,
 	input *getWorkspaceRuntimeInput,
 ) (*getWorkspaceRuntimeOutput, error) {
-	summary, err := s.getReadyRuntimeWorkspace(ctx, input.ID)
+	summary, err := s.getRuntimeWorkspace(ctx, input.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -5635,9 +6249,23 @@ func mergeStoredRuntimeSessions(
 	stored []db.WorkspaceRuntimeSession,
 ) []localruntime.SessionInfo {
 	sessions := slices.Clone(live)
+	storedByKey := make(map[string]db.WorkspaceRuntimeSession, len(stored))
+	for _, session := range stored {
+		if session.SessionKey != "" {
+			storedByKey[session.SessionKey] = session
+		}
+	}
 	seen := make(map[string]struct{}, len(sessions))
-	for _, session := range sessions {
+	for i, session := range sessions {
 		seen[session.Key] = struct{}{}
+		if storedSession, ok := storedByKey[session.Key]; ok {
+			sessions[i].DisplayRegion = normalizeRuntimeDisplayRegion(
+				storedSession.DisplayRegion,
+				session,
+			)
+		} else {
+			sessions[i].DisplayRegion = normalizeRuntimeDisplayRegion("", session)
+		}
 	}
 	for _, session := range stored {
 		if session.SessionKey == "" {
@@ -5681,6 +6309,10 @@ func storedRuntimeSessionInfo(
 		Label:       label,
 		Kind:        kind,
 		Status:      localruntime.SessionStatusError,
+		DisplayRegion: normalizeRuntimeDisplayRegion(session.DisplayRegion, localruntime.SessionInfo{
+			TargetKey: targetKey,
+			Kind:      kind,
+		}),
 		CreatedAt:   session.CreatedAt,
 		TmuxSession: session.TmuxSession,
 	}
@@ -5705,6 +6337,10 @@ func (s *Server) launchWorkspaceRuntimeSession(
 	if err != nil {
 		return nil, workspaceRuntimeLaunchError(err)
 	}
+	session.DisplayRegion = normalizeRuntimeDisplayRegion(
+		input.Body.DisplayRegion,
+		session,
+	)
 	if err := s.recordRuntimeSession(
 		ctx, summary.ID, session, "session",
 	); err != nil {
@@ -5763,14 +6399,15 @@ func (s *Server) recordRuntimeSession(
 	if err := s.workspaces.RecordRuntimeSession(
 		ctx,
 		db.WorkspaceRuntimeSession{
-			WorkspaceID: workspaceID,
-			SessionKey:  session.Key,
-			TargetKey:   session.TargetKey,
-			Label:       session.Label,
-			Kind:        string(session.Kind),
-			Scope:       scope,
-			TmuxSession: session.TmuxSession,
-			CreatedAt:   session.CreatedAt,
+			WorkspaceID:   workspaceID,
+			SessionKey:    session.Key,
+			TargetKey:     session.TargetKey,
+			Label:         session.Label,
+			Kind:          string(session.Kind),
+			DisplayRegion: session.DisplayRegion,
+			Scope:         scope,
+			TmuxSession:   session.TmuxSession,
+			CreatedAt:     session.CreatedAt,
 		},
 	); err != nil {
 		return problemInternal("record runtime session: " + err.Error())
@@ -5778,11 +6415,28 @@ func (s *Server) recordRuntimeSession(
 	return nil
 }
 
+func normalizeRuntimeDisplayRegion(
+	value string,
+	session localruntime.SessionInfo,
+) string {
+	switch strings.TrimSpace(value) {
+	case "workflow":
+		return "workflow"
+	case "terminal":
+		return "terminal"
+	}
+	if session.TargetKey == string(localruntime.LaunchTargetPlainShell) ||
+		session.Kind == localruntime.LaunchTargetPlainShell {
+		return "terminal"
+	}
+	return "workflow"
+}
+
 func (s *Server) stopWorkspaceRuntimeSession(
 	ctx context.Context,
 	input *stopWorkspaceRuntimeSessionInput,
 ) (*struct{}, error) {
-	summary, err := s.getReadyRuntimeWorkspace(ctx, input.ID)
+	summary, err := s.getRuntimeWorkspace(ctx, input.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -5813,11 +6467,83 @@ func (s *Server) stopWorkspaceRuntimeSession(
 	return nil, nil
 }
 
+func (s *Server) getWorkspaceRuntimeSessionAttachSpec(
+	ctx context.Context,
+	input *getWorkspaceRuntimeSessionAttachSpecInput,
+) (*runtimeAttachSpecOutput, error) {
+	summary, err := s.getRuntimeWorkspace(ctx, input.ID)
+	if err != nil {
+		return nil, err
+	}
+	if runtimeSessionIsNonTmux(
+		s.runtime.ListSessions(summary.ID),
+		input.SessionKey,
+	) {
+		return nil, problemBadRequest(
+			CodeBadRequest, "runtime session is not tmux-backed", nil,
+		)
+	}
+	stored, err := s.db.ListWorkspaceRuntimeTmuxSessions(ctx, summary.ID)
+	if err != nil {
+		return nil, problemInternal("list runtime tmux sessions: " + err.Error())
+	}
+	targetKey, tmuxSession, ok := workspaceRuntimeAttachTarget(
+		input.SessionKey, stored,
+	)
+	if !ok {
+		return nil, problemNotFound(CodeNotFound, "runtime session not found", nil)
+	}
+	spec, err := runtimeAttachSpec(
+		ctx, s.cfg.TmuxCommand(), input.SessionKey, targetKey, tmuxSession,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &runtimeAttachSpecOutput{Body: spec}, nil
+}
+
+func runtimeSessionIsNonTmux(
+	sessions []localruntime.SessionInfo,
+	sessionKey string,
+) bool {
+	for _, session := range sessions {
+		if session.Key == sessionKey {
+			return session.TmuxSession == ""
+		}
+	}
+	return false
+}
+
+func workspaceRuntimeAttachTarget(
+	sessionKey string,
+	stored []db.WorkspaceRuntimeSession,
+) (targetKey string, tmuxSession string, ok bool) {
+	for _, row := range stored {
+		if row.SessionKey != sessionKey {
+			continue
+		}
+		return row.TargetKey, row.TmuxSession, true
+	}
+	return "", "", false
+}
+
+func runtimeSessionTmuxSession(
+	sessions []localruntime.SessionInfo,
+	key string,
+) string {
+	for _, session := range sessions {
+		if session.Key == key {
+			return session.TmuxSession
+		}
+	}
+	return ""
+}
+
 func (s *Server) renameWorkspaceRuntimeSession(
 	ctx context.Context,
 	input *renameWorkspaceRuntimeSessionInput,
 ) (*workspaceRuntimeSessionOutput, error) {
-	summary, err := s.getReadyRuntimeWorkspace(ctx, input.ID)
+	summary, err := s.getRuntimeWorkspace(ctx, input.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -5885,7 +6611,7 @@ func (s *Server) renameStoredRuntimeSession(
 	return localruntime.SessionInfo{}, false, nil
 }
 
-func (s *Server) getReadyRuntimeWorkspace(
+func (s *Server) getRuntimeWorkspace(
 	ctx context.Context,
 	id string,
 ) (*db.WorkspaceSummary, error) {
@@ -5899,6 +6625,17 @@ func (s *Server) getReadyRuntimeWorkspace(
 	}
 	if summary == nil {
 		return nil, problemNotFound(CodeWorkspaceNotFound, "workspace not found", nil)
+	}
+	return summary, nil
+}
+
+func (s *Server) getReadyRuntimeWorkspace(
+	ctx context.Context,
+	id string,
+) (*db.WorkspaceSummary, error) {
+	summary, err := s.getRuntimeWorkspace(ctx, id)
+	if err != nil {
+		return nil, err
 	}
 	if summary.Status != "ready" {
 		return nil, problemConflict(CodeConflict,

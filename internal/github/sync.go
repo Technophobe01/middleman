@@ -28,6 +28,110 @@ func parseInt64(raw string) (int64, error) {
 	return strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
 }
 
+func withCommitOrderMetadata(metadataJSON string, listOrder int, stableOrder int) string {
+	metadata := map[string]any{}
+	if metadataJSON != "" {
+		var existing map[string]any
+		if err := json.Unmarshal([]byte(metadataJSON), &existing); err == nil && existing != nil {
+			metadata = existing
+		}
+	}
+	metadata["commit_order"] = listOrder
+	metadata["commit_order_key"] = stableOrder
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		return metadataJSON
+	}
+	return string(encoded)
+}
+
+func commitMetadataOrder(metadataJSON string) int {
+	if metadataJSON == "" {
+		return 0
+	}
+	var metadata map[string]any
+	if err := json.Unmarshal([]byte(metadataJSON), &metadata); err != nil {
+		return 0
+	}
+	if order := metadataInt(metadata["commit_order_key"]); order > 0 {
+		return order
+	}
+	return metadataInt(metadata["commit_order"])
+}
+
+func metadataInt(value any) int {
+	switch v := value.(type) {
+	case float64:
+		if v > 0 && v == float64(int(v)) {
+			return int(v)
+		}
+	case int:
+		if v > 0 {
+			return v
+		}
+	case int64:
+		if v > 0 {
+			return int(v)
+		}
+	case json.Number:
+		if n, err := strconv.Atoi(v.String()); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 0
+}
+
+type commitOrderAssigner struct {
+	bySHA map[string]int
+	next  int
+}
+
+func newCommitOrderAssigner(events []db.MREvent) commitOrderAssigner {
+	assigner := commitOrderAssigner{bySHA: map[string]int{}}
+	for _, event := range events {
+		if event.EventType != "commit" {
+			continue
+		}
+		order := commitMetadataOrder(event.MetadataJSON)
+		if order == 0 && event.ID > 0 {
+			order = int(event.ID)
+		}
+		if order > assigner.next {
+			assigner.next = order
+		}
+		sha := commitOrderSHA(event.Summary)
+		if sha != "" && order > 0 {
+			assigner.bySHA[sha] = order
+		}
+	}
+	return assigner
+}
+
+func (a *commitOrderAssigner) apply(event *db.MREvent, listOrder int) {
+	sha := commitOrderSHA(event.Summary)
+	stableOrder := a.bySHA[sha]
+	if stableOrder == 0 {
+		a.next++
+		stableOrder = a.next
+		if sha != "" {
+			a.bySHA[sha] = stableOrder
+		}
+	}
+	event.MetadataJSON = withCommitOrderMetadata(event.MetadataJSON, listOrder, stableOrder)
+}
+
+func (s *Syncer) commitOrderAssigner(ctx context.Context, mrID int64) (commitOrderAssigner, error) {
+	events, err := s.db.ListMREvents(ctx, mrID)
+	if err != nil {
+		return commitOrderAssigner{}, err
+	}
+	return newCommitOrderAssigner(events), nil
+}
+
+func commitOrderSHA(summary string) string {
+	return strings.ToLower(strings.TrimSpace(summary))
+}
+
 // SyncStatus holds the current state of the sync engine.
 type SyncStatus struct {
 	Running     bool      `json:"running"`
@@ -123,6 +227,7 @@ func (e *DiffSyncError) UserMessage() string {
 // RepoRef identifies a repository on a configured provider.
 type RepoRef struct {
 	Platform           platform.Kind
+	RepoID             int64
 	Owner              string
 	Name               string
 	PlatformHost       string
@@ -325,6 +430,8 @@ type Syncer struct {
 	running                  atomic.Bool
 	status                   atomic.Value // stores *SyncStatus
 	stopCh                   chan struct{}
+	notificationSyncMu       sync.RWMutex
+	notificationSync         NotificationSyncStatus
 	stopOnce                 sync.Once
 	wg                       sync.WaitGroup
 	// lifecycleMu serializes TriggerRun registration with Stop so
@@ -342,6 +449,12 @@ type Syncer struct {
 	onMRSynced       func(owner, name string, mr *db.MergeRequest)
 	onSyncCompleted  func(results []RepoSyncResult)
 	onStatusChange   func(status *SyncStatus)
+	// onNotificationSyncComplete fires after each notification sync run
+	// (periodic, manual, or sidecar) so the server can broadcast the same
+	// data-change signal the normal sync uses. Notification sync can insert
+	// rows with older timestamps than the feed's top cursor, which the
+	// feed's incremental poll would miss without a full reload nudge.
+	onNotificationSyncComplete func()
 	// statusMu serializes publishStatus so worker goroutines
 	// can't interleave updates and deliver out-of-order snapshots
 	// to SSE subscribers.
@@ -655,6 +768,7 @@ func (p gitHubClientProvider) Capabilities() platform.Capabilities {
 		ReadReleases:          true,
 		ReadCI:                true,
 		ReadLabels:            labels,
+		ReadNotifications:     true,
 		CommentMutation:       true,
 		StateMutation:         true,
 		MergeMutation:         true,
@@ -662,10 +776,12 @@ func (p gitHubClientProvider) Capabilities() platform.Capabilities {
 		MutationHeadBinding:   true,
 		WorkflowApproval:      true,
 		ReadyForReview:        true,
+		DraftMutation:         true,
 		IssueMutation:         true,
 		LabelMutation:         labels,
 		AssigneeMutation:      assignees,
 		ReviewerMutation:      reviewers,
+		NotificationMutation:  true,
 		ThreadReply:           true,
 		ReviewDraftMutation:   true,
 		ReadReviewThreads:     true,
@@ -680,6 +796,20 @@ func (p gitHubClientProvider) Capabilities() platform.Capabilities {
 
 func (p gitHubClientProvider) GitHubClient() Client {
 	return p.client
+}
+
+func (p gitHubClientProvider) ListNotifications(
+	ctx context.Context,
+	opts platform.NotificationListOptions,
+) ([]platform.NotificationThread, bool, error) {
+	return p.client.ListNotifications(ctx, opts)
+}
+
+func (p gitHubClientProvider) MarkNotificationThreadRead(
+	ctx context.Context,
+	threadID string,
+) error {
+	return p.client.MarkNotificationThreadRead(ctx, threadID)
 }
 
 func (p gitHubClientProvider) GetRepository(
@@ -855,8 +985,10 @@ func (p gitHubClientProvider) ListMergeRequestEvents(
 	for _, review := range reviews {
 		out = append(out, platformgithub.NormalizeReviewEvent(ref, number, review))
 	}
-	for _, commit := range commits {
-		out = append(out, platformgithub.NormalizeCommitEvent(ref, number, commit))
+	for i, commit := range commits {
+		event := platformgithub.NormalizeCommitEvent(ref, number, commit)
+		event.MetadataJSON = withCommitOrderMetadata(event.MetadataJSON, i+1, i+1)
+		out = append(out, event)
 	}
 	for _, timelineEvent := range timelineEvents {
 		event := platformgithub.NormalizeTimelineEvent(ref, number, platformgithub.PullRequestTimelineEvent{
@@ -978,11 +1110,19 @@ func (p gitHubClientProvider) ListIssueEvents(
 	}
 	for _, timelineEvent := range timelineEvents {
 		event := platformgithub.NormalizeIssueTimelineEvent(ref, number, platformgithub.PullRequestTimelineEvent{
-			NodeID:    timelineEvent.NodeID,
-			EventType: timelineEvent.EventType,
-			Actor:     timelineEvent.Actor,
-			Assignee:  timelineEvent.Assignee,
-			CreatedAt: timelineEvent.CreatedAt,
+			NodeID:            timelineEvent.NodeID,
+			EventType:         timelineEvent.EventType,
+			Actor:             timelineEvent.Actor,
+			Assignee:          timelineEvent.Assignee,
+			CreatedAt:         timelineEvent.CreatedAt,
+			SourceType:        timelineEvent.SourceType,
+			SourceOwner:       timelineEvent.SourceOwner,
+			SourceRepo:        timelineEvent.SourceRepo,
+			SourceNumber:      timelineEvent.SourceNumber,
+			SourceTitle:       timelineEvent.SourceTitle,
+			SourceURL:         timelineEvent.SourceURL,
+			IsCrossRepository: timelineEvent.IsCrossRepository,
+			WillCloseTarget:   timelineEvent.WillCloseTarget,
 		})
 		if event != nil {
 			out = append(out, *event)
@@ -1191,6 +1331,21 @@ func (p gitHubClientProvider) MarkReadyForReview(
 		return platform.MergeRequest{}, fmt.Errorf("provider returned no pull request")
 	}
 	return platformgithub.NormalizePullRequest(ref, pr)
+}
+
+func (p gitHubClientProvider) ConvertMergeRequestToDraft(
+	ctx context.Context,
+	ref platform.RepoRef,
+	number int,
+) error {
+	pr, err := p.client.ConvertPullRequestToDraft(ctx, ref.Owner, ref.Name, number)
+	if err != nil {
+		return err
+	}
+	if pr == nil {
+		return fmt.Errorf("provider returned no pull request")
+	}
+	return nil
 }
 
 func (p gitHubClientProvider) CreateIssue(
@@ -1736,6 +1891,13 @@ func (s *Syncer) SetOnStatusChange(fn func(status *SyncStatus)) {
 	s.onStatusChange = fn
 }
 
+// SetOnNotificationSyncComplete registers a callback invoked after each
+// notification sync run finishes. Register it before Start so it is never
+// assigned concurrently with a running sidecar sync.
+func (s *Syncer) SetOnNotificationSyncComplete(fn func()) {
+	s.onNotificationSyncComplete = fn
+}
+
 // SetFetchers registers GitHub GraphQL fetchers keyed by platform host.
 func (s *Syncer) SetFetchers(fetchers map[string]*GraphQLFetcher) {
 	s.fetchers = fetchers
@@ -1991,6 +2153,13 @@ func (s *Syncer) ReadyForReviewMutator(
 	host string,
 ) (platform.ReadyForReviewMutator, error) {
 	return s.clients.ReadyForReviewMutator(kind, canonicalRepoHost(host))
+}
+
+func (s *Syncer) DraftMutator(
+	kind platform.Kind,
+	host string,
+) (platform.DraftMutator, error) {
+	return s.clients.DraftMutator(kind, canonicalRepoHost(host))
 }
 
 func (s *Syncer) IssueMutator(
@@ -3031,6 +3200,13 @@ func (s *Syncer) syncRepoIdentity(ctx context.Context, repo RepoRef) (db.RepoIde
 }
 
 // syncRepo syncs one repository: open PRs, timeline events, and stale closures.
+func (s *Syncer) markClosedLinkedNotificationsDone(ctx context.Context) error {
+	if err := s.db.MarkClosedLinkedNotificationsDone(ctx, time.Now().UTC()); err != nil {
+		return fmt.Errorf("mark closed linked notifications done: %w", err)
+	}
+	return nil
+}
+
 func (s *Syncer) syncRepo(ctx context.Context, repo RepoRef) error {
 	repoIdentity, resolvedRepo, err := s.syncRepoIdentity(ctx, repo)
 	if err != nil {
@@ -3084,6 +3260,14 @@ func (s *Syncer) syncRepo(ctx context.Context, repo RepoRef) error {
 	s.syncRepoLabelCatalog(ctx, repo, repoID)
 
 	syncErr := s.indexSyncRepo(ctx, repo, repoID, cloneFetchOK)
+	if err := s.markClosedLinkedNotificationsDone(ctx); err != nil {
+		markErr := err
+		if syncErr == nil {
+			syncErr = markErr
+		} else {
+			syncErr = errors.Join(syncErr, markErr)
+		}
+	}
 
 	syncErrStr := ""
 	if syncErr != nil {
@@ -4853,14 +5037,20 @@ func (s *Syncer) syncOpenMRFromBulk(
 	// Timeline events — comments, reviews, commits, and system events.
 	// Events use ON CONFLICT DO NOTHING, so partial data is safe.
 	var events []db.MREvent
+	commitOrderer, err := s.commitOrderAssigner(ctx, mrID)
+	if err != nil {
+		return fmt.Errorf("load commit order for MR #%d: %w", number, err)
+	}
 	for _, c := range bulk.Comments {
 		events = append(events, NormalizeCommentEvent(mrID, c))
 	}
 	for _, r := range bulk.Reviews {
 		events = append(events, NormalizeReviewEvent(mrID, r))
 	}
-	for _, c := range bulk.Commits {
-		events = append(events, NormalizeCommitEvent(mrID, c))
+	for i, c := range bulk.Commits {
+		event := NormalizeCommitEvent(mrID, c)
+		commitOrderer.apply(&event, i+1)
+		events = append(events, event)
 	}
 	for _, timelineEvent := range bulk.TimelineEvents {
 		if event := NormalizeTimelineEvent(mrID, timelineEvent); event != nil {
@@ -5397,8 +5587,17 @@ func (s *Syncer) syncProviderMRDetailExtras(
 	if err == nil {
 		dbEvents := make([]db.MREvent, 0, len(events))
 		commentDedupeKeys := make([]string, 0, len(events))
+		commitOrderer, orderErr := s.commitOrderAssigner(ctx, mrID)
+		if orderErr != nil {
+			return calls, false, fmt.Errorf("load commit order for MR #%d: %w", number, orderErr)
+		}
+		commitListOrder := 0
 		for _, event := range events {
 			dbEvent := platform.DBMREvent(mrID, event)
+			if dbEvent.EventType == "commit" {
+				commitListOrder++
+				commitOrderer.apply(&dbEvent, commitListOrder)
+			}
 			dbEvents = append(dbEvents, dbEvent)
 			if dbEvent.EventType == "issue_comment" {
 				commentDedupeKeys = append(commentDedupeKeys, dbEvent.DedupeKey)
@@ -5804,14 +6003,20 @@ func (s *Syncer) refreshTimeline(
 	}
 
 	var events []db.MREvent
+	commitOrderer, err := s.commitOrderAssigner(ctx, mrID)
+	if err != nil {
+		return fmt.Errorf("load commit order for MR #%d: %w", number, err)
+	}
 	for _, c := range comments {
 		events = append(events, NormalizeCommentEvent(mrID, c))
 	}
 	for _, r := range reviews {
 		events = append(events, NormalizeReviewEvent(mrID, r))
 	}
-	for _, c := range commits {
-		events = append(events, NormalizeCommitEvent(mrID, c))
+	for i, c := range commits {
+		event := NormalizeCommitEvent(mrID, c)
+		commitOrderer.apply(&event, i+1)
+		events = append(events, event)
 	}
 	for _, timelineEvent := range timelineEvents {
 		event := NormalizeTimelineEvent(mrID, timelineEvent)
@@ -6709,6 +6914,9 @@ func (s *Syncer) fetchAndUpdateClosedIssue(
 	); err != nil {
 		return err
 	}
+	if err := s.markClosedLinkedNotificationsDone(ctx); err != nil {
+		return err
+	}
 
 	issue, err := s.db.GetIssueByRepoIDAndNumber(ctx, repoID, number)
 	if err != nil {
@@ -6724,7 +6932,7 @@ func (s *Syncer) fetchAndUpdateClosedIssue(
 		}
 	}
 
-	return nil
+	return s.markClosedLinkedNotificationsDone(ctx)
 }
 
 func (s *Syncer) fetchAndUpdateClosedPlatformIssue(
@@ -7419,6 +7627,9 @@ func (s *Syncer) syncMRForRepo(
 	if err != nil {
 		return fmt.Errorf("upsert MR #%d: %w", number, err)
 	}
+	if err := s.markClosedLinkedNotificationsDone(ctx); err != nil {
+		return err
+	}
 	// UpsertMergeRequest preserves ci_had_pending across upserts. Clear
 	// it here when the head SHA changed so a stale pending flag from
 	// the previous head doesn't survive across the refresh.
@@ -7503,6 +7714,12 @@ func (s *Syncer) syncMRForRepo(
 		}
 	}
 
+	if err := s.markClosedLinkedNotificationsDone(ctx); err != nil {
+		if diffErr != nil {
+			return errors.Join(diffErr, err)
+		}
+		return err
+	}
 	if diffErr != nil {
 		return diffErr
 	}
@@ -7736,7 +7953,7 @@ func (s *Syncer) SyncIssueOnProvider(
 	if _, err := s.fetchIssueDetail(ctx, repo, repoID, number); err != nil {
 		return err
 	}
-	return nil
+	return s.markClosedLinkedNotificationsDone(ctx)
 }
 
 func (s *Syncer) syncIssueWithHost(
@@ -7779,7 +7996,7 @@ func (s *Syncer) syncIssueWithHost(
 	if _, err := s.fetchIssueDetail(ctx, repo, repoID, number); err != nil {
 		return err
 	}
-	return nil
+	return s.markClosedLinkedNotificationsDone(ctx)
 }
 
 // SyncItemByNumber fetches an item by number from GitHub, determines
@@ -7893,6 +8110,9 @@ func (s *Syncer) fetchAndUpdateClosed(ctx context.Context, repo RepoRef, repoID 
 	); err != nil {
 		return fmt.Errorf("update closed MR #%d: %w", number, err)
 	}
+	if err := s.markClosedLinkedNotificationsDone(ctx); err != nil {
+		return err
+	}
 
 	mr, err := s.db.GetMergeRequestByRepoIDAndNumber(ctx, repoID, number)
 	if err != nil {
@@ -7947,7 +8167,7 @@ func (s *Syncer) fetchAndUpdateClosed(ctx context.Context, repo RepoRef, repoID 
 			}
 		}
 	}
-	return nil
+	return s.markClosedLinkedNotificationsDone(ctx)
 }
 
 func (s *Syncer) fetchAndUpdateClosedMergeRequest(

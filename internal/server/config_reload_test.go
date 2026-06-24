@@ -1591,3 +1591,316 @@ func TestConfigReload_SubscriberAfterParseErrorGetsCachedEvent(t *testing.T) {
 	assert.False(cached.Valid)
 	assert.NotEmpty(cached.Error)
 }
+
+// TestRestartRequiredForAuthFleetSessionsAndSSHPeers pins that the
+// startup-bound [api] auth gate, fleet session monitor settings, and
+// fleet ssh peer set participate in restart detection: they are wired
+// at newServer time, so editing them mid-run must surface
+// restart_required instead of silently not applying.
+func TestRestartRequiredForAuthFleetSessionsAndSSHPeers(t *testing.T) {
+	require := require.New(t)
+	base := func() *config.Config {
+		cfg := &config.Config{}
+		cfg.API.RequireAuth = false
+		cfg.Fleet.Sessions.IncludeUnmanagedDetails = false
+		cfg.Fleet.SSHPeers = []config.FleetSSHPeer{
+			{Key: "epyc", Destination: "wes@epyc.local"},
+		}
+		return cfg
+	}
+	snap := snapshotStartupConfig(base())
+
+	require.False(snap.restartRequiredFor(base()),
+		"identical config must not demand a restart")
+
+	enabledFlipped := base()
+	enabledFlipped.Fleet.Enabled = true
+	require.False(snap.restartRequiredFor(enabledFlipped),
+		"fleet.enabled changes apply without restart")
+
+	keyChanged := base()
+	keyChanged.Fleet.Key = "studio"
+	require.False(snap.restartRequiredFor(keyChanged),
+		"fleet.key changes apply without restart")
+
+	timeoutChanged := base()
+	timeoutChanged.Fleet.PeerTimeout = "4s"
+	require.False(snap.restartRequiredFor(timeoutChanged),
+		"fleet.peer_timeout changes apply without restart")
+
+	httpPeerAdded := base()
+	httpPeerAdded.Fleet.Peers = []config.FleetPeer{
+		{Key: "mini", BaseURL: "http://mini.local:8091"},
+	}
+	require.False(snap.restartRequiredFor(httpPeerAdded),
+		"HTTP fleet peer changes apply without restart")
+
+	authFlipped := base()
+	authFlipped.API.RequireAuth = true
+	require.True(snap.restartRequiredFor(authFlipped))
+
+	fleetSessionsFlipped := base()
+	fleetSessionsFlipped.Fleet.Sessions.IncludeUnmanagedDetails = true
+	require.True(snap.restartRequiredFor(fleetSessionsFlipped))
+
+	peerAdded := base()
+	peerAdded.Fleet.SSHPeers = append(
+		peerAdded.Fleet.SSHPeers,
+		config.FleetSSHPeer{Key: "mini", Destination: "wes@mini.local"},
+	)
+	require.True(snap.restartRequiredFor(peerAdded))
+
+	peerEdited := base()
+	peerEdited.Fleet.SSHPeers[0].Destination = "wes@epyc.tail"
+	require.True(snap.restartRequiredFor(peerEdited))
+}
+
+func TestRestartRequiredForNotificationIntervals(t *testing.T) {
+	require := require.New(t)
+	base := func() *config.Config {
+		cfg := &config.Config{}
+		cfg.SyncInterval = "5m"
+		cfg.Notifications.SyncInterval = "30s"
+		cfg.Notifications.PropagationInterval = "1m"
+		cfg.Notifications.BatchSize = 25
+		return cfg
+	}
+	snap := snapshotStartupConfig(base())
+
+	require.False(snap.restartRequiredFor(base()),
+		"identical notification loop config must not demand a restart")
+
+	syncIntervalChanged := base()
+	syncIntervalChanged.Notifications.SyncInterval = "2m"
+	require.True(snap.restartRequiredFor(syncIntervalChanged),
+		"notification sync_interval is bound to the startup ticker")
+
+	propagationIntervalChanged := base()
+	propagationIntervalChanged.Notifications.PropagationInterval = "5m"
+	require.True(snap.restartRequiredFor(propagationIntervalChanged),
+		"notification propagation_interval is bound to the startup ticker")
+
+	batchSizeChanged := base()
+	batchSizeChanged.Notifications.BatchSize = 50
+	require.True(snap.restartRequiredFor(batchSizeChanged),
+		"notification batch_size is snapped by the loop")
+}
+
+const validReloadConfigAuthGate = `
+sync_interval = "5m"
+github_token_env = "MIDDLEMAN_GITHUB_TOKEN"
+host = "127.0.0.1"
+port = 8091
+
+[[repos]]
+owner = "acme"
+name = "widget"
+
+[api]
+require_auth = true
+`
+
+const validReloadConfigFleetSessions = `
+sync_interval = "5m"
+github_token_env = "MIDDLEMAN_GITHUB_TOKEN"
+host = "127.0.0.1"
+port = 8091
+
+[[repos]]
+owner = "acme"
+name = "widget"
+
+[fleet.sessions]
+include_unmanaged_details = true
+`
+
+const validReloadConfigSSHPeer = `
+sync_interval = "5m"
+github_token_env = "MIDDLEMAN_GITHUB_TOKEN"
+host = "127.0.0.1"
+port = 8091
+
+[[repos]]
+owner = "acme"
+name = "widget"
+
+[[fleet.ssh_peers]]
+key = "epyc"
+destination = "wes@epyc.local"
+`
+
+const validReloadConfigRestartRequiredFields = `
+sync_interval = "10m"
+github_token_env = "MIDDLEMAN_RELOADED_GITHUB_TOKEN"
+host = "127.0.0.2"
+port = 9191
+base_path = "/middleman"
+allowed_hosts = ["middleman.test:9191"]
+trust_reverse_proxy = true
+
+[[repos]]
+owner = "acme"
+name = "widget"
+
+[api]
+require_auth = true
+
+[fleet.sessions]
+include_unmanaged_details = true
+
+[[fleet.ssh_peers]]
+key = "studio"
+destination = "marius@studio.local"
+
+[roborev]
+endpoint = "http://127.0.0.1:7374"
+
+[tmux]
+command = ["systemd-run", "--user", "--scope", "tmux"]
+
+[shell]
+command = ["systemd-run", "--user", "--scope", "--pty", "bash"]
+`
+
+// The auth gate is wired in newServer; editing it mid-run must surface
+// restart_required on the user-visible config.changed event, not
+// silently apply nothing.
+func TestConfigReload_RestartRequiredOnAuthGateChange(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+
+	srv, _, cfgPath := setupTestServerWithConfigContent(
+		t, validReloadConfig, &mockGH{},
+	)
+	waitForConfigWatcher(t, srv, 2*time.Second)
+	stream := streamConfigEvents(t, srv)
+	defer stream.Close()
+
+	writeConfigToml(t, cfgPath, validReloadConfigAuthGate)
+
+	ev := waitForConfigEvent(t, stream, 2*time.Second)
+	assert.True(ev.Valid)
+	assert.True(ev.RestartRequired,
+		"[api].require_auth change should mark restart_required")
+
+	srv.cfgMu.Lock()
+	savedCfg := *srv.cfg
+	srv.cfgMu.Unlock()
+	savePath := filepath.Join(t.TempDir(), "saved.toml")
+	require.NoError(savedCfg.Save(savePath))
+	reloaded, err := config.Load(savePath)
+	require.NoError(err)
+	assert.True(reloaded.API.RequireAuth,
+		"later settings saves must preserve externally reloaded API auth")
+}
+
+func TestConfigReload_RestartRequiredOnFleetSessionsChange(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+
+	srv, _, cfgPath := setupTestServerWithConfigContent(
+		t, validReloadConfig, &mockGH{},
+	)
+	waitForConfigWatcher(t, srv, 2*time.Second)
+	stream := streamConfigEvents(t, srv)
+	defer stream.Close()
+
+	writeConfigToml(t, cfgPath, validReloadConfigFleetSessions)
+
+	ev := waitForConfigEvent(t, stream, 2*time.Second)
+	assert.True(ev.Valid)
+	assert.True(ev.RestartRequired,
+		"[fleet.sessions].include_unmanaged_details change should mark restart_required")
+
+	srv.cfgMu.Lock()
+	savedCfg := *srv.cfg
+	srv.cfgMu.Unlock()
+	savePath := filepath.Join(t.TempDir(), "saved.toml")
+	require.NoError(savedCfg.Save(savePath))
+	reloaded, err := config.Load(savePath)
+	require.NoError(err)
+	assert.True(reloaded.Fleet.Sessions.IncludeUnmanagedDetails,
+		"later settings saves must preserve externally reloaded fleet session settings")
+}
+
+func TestConfigReload_RestartRequiredOnSSHPeerChange(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+
+	srv, _, cfgPath := setupTestServerWithConfigContent(
+		t, validReloadConfig, &mockGH{},
+	)
+	waitForConfigWatcher(t, srv, 2*time.Second)
+	stream := streamConfigEvents(t, srv)
+	defer stream.Close()
+
+	writeConfigToml(t, cfgPath, validReloadConfigSSHPeer)
+
+	ev := waitForConfigEvent(t, stream, 2*time.Second)
+	assert.True(ev.Valid)
+	assert.True(ev.RestartRequired,
+		"[[fleet.ssh_peers]] change should mark restart_required")
+
+	srv.cfgMu.Lock()
+	savedCfg := *srv.cfg
+	savedCfg.Fleet.SSHPeers = slices.Clone(srv.cfg.Fleet.SSHPeers)
+	srv.cfgMu.Unlock()
+	savePath := filepath.Join(t.TempDir(), "saved.toml")
+	require.NoError(savedCfg.Save(savePath))
+	reloaded, err := config.Load(savePath)
+	require.NoError(err)
+	require.Len(reloaded.Fleet.SSHPeers, 1)
+	assert.Equal("epyc", reloaded.Fleet.SSHPeers[0].Key)
+	assert.Equal("wes@epyc.local", reloaded.Fleet.SSHPeers[0].Destination)
+}
+
+func TestConfigReload_SettingsSavePreservesRestartRequiredFields(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+
+	srv, _, cfgPath := setupTestServerWithConfigContent(
+		t, validReloadConfig, &mockGH{},
+	)
+	waitForConfigWatcher(t, srv, 2*time.Second)
+	stream := streamConfigEvents(t, srv)
+	defer stream.Close()
+
+	writeConfigToml(t, cfgPath, validReloadConfigRestartRequiredFields)
+
+	ev := waitForConfigEvent(t, stream, 2*time.Second)
+	require.True(ev.Valid, "reload error: %s", ev.Error)
+	require.True(ev.RestartRequired)
+
+	rr := doJSON(t, srv, http.MethodPut, "/api/v1/settings", updateSettingsRequest{
+		Activity: &config.Activity{
+			ViewMode:  "flat",
+			TimeRange: "30d",
+		},
+	})
+	require.Equal(http.StatusOK, rr.Code, rr.Body.String())
+
+	reloaded, err := config.Load(cfgPath)
+	require.NoError(err)
+	assert.Equal("10m", reloaded.SyncInterval)
+	assert.Equal("MIDDLEMAN_RELOADED_GITHUB_TOKEN", reloaded.GitHubTokenEnv)
+	assert.Equal("127.0.0.2", reloaded.Host)
+	assert.Equal(9191, reloaded.Port)
+	assert.Equal("/middleman/", reloaded.BasePath)
+	assert.Equal([]string{"middleman.test:9191"}, reloaded.AllowedHosts)
+	assert.True(reloaded.TrustReverseProxy)
+	assert.True(reloaded.API.RequireAuth)
+	assert.True(reloaded.Fleet.Sessions.IncludeUnmanagedDetails)
+	require.Len(reloaded.Fleet.SSHPeers, 1)
+	assert.Equal("studio", reloaded.Fleet.SSHPeers[0].Key)
+	assert.Equal("http://127.0.0.1:7374", reloaded.Roborev.Endpoint)
+	assert.Equal(
+		[]string{"systemd-run", "--user", "--scope", "tmux"},
+		reloaded.Tmux.Command,
+	)
+	assert.Equal(
+		[]string{"systemd-run", "--user", "--scope", "--pty", "bash"},
+		reloaded.Shell.Command,
+	)
+	assert.Equal("flat", reloaded.Activity.ViewMode)
+	assert.Equal("30d", reloaded.Activity.TimeRange)
+}

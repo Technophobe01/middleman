@@ -24,7 +24,7 @@
   import { timeAgo } from "../../utils/time.js";
   import { copyToClipboard } from "../../utils/clipboard.js";
   import EventTimeline from "./EventTimeline.svelte";
-  import PRTimelineFilter from "./PRTimelineFilter.svelte";
+  import DetailActivityViewMenu from "./DetailActivityViewMenu.svelte";
   import CommentBox from "./CommentBox.svelte";
   import ApproveButton from "./ApproveButton.svelte";
   import ApproveWorkflowsButton from "./ApproveWorkflowsButton.svelte";
@@ -71,6 +71,7 @@
   import CopyItemNumber from "./CopyItemNumber.svelte";
   import { DiffSummaryFilesResult } from "./diff-summary.js";
   import {
+    canonicalProvider,
     providerItemPath,
     providerRepoPath,
     providerRouteParams,
@@ -88,7 +89,7 @@
 
   const CLEAR_LABELS_PENDING = "__clear-label-selection__";
 
-  const { detail: detailStore, pulls, activity, diff: diffStore } = getStores();
+  const { detail: detailStore, pulls, activity, diff: diffStore, detailActivityView } = getStores();
   const client = getClient();
   const actions = getActions();
   const uiConfig = getUIConfig();
@@ -108,6 +109,7 @@
     review_mutation: true,
     workflow_approval: true,
     ready_for_review: true,
+    draft_mutation: true,
     issue_mutation: true,
     label_mutation: false,
     assignee_mutation: false,
@@ -200,6 +202,29 @@
     } catch {
       return false;
     }
+  }
+
+  function ciStatusIsPending(status: string): boolean {
+    return ["pending", "in_progress", "queued"].includes(status.toLowerCase());
+  }
+
+  function ciStatusHasFailed(status: string): boolean {
+    return [
+      "failure",
+      "failed",
+      "error",
+      "cancelled",
+      "canceled",
+      "timed_out",
+    ].includes(status.toLowerCase());
+  }
+
+  function shouldDeferMergeForCI(status: string, checksJSON: string): boolean {
+    // The backend rejects a deferred merge once aggregate CI has failed, so a
+    // failed pipeline with a check still running must use the normal merge path
+    // rather than route to the deferred endpoint that would 409.
+    if (ciStatusHasFailed(status)) return false;
+    return ciStatusIsPending(status) || ciChecksHavePending(checksJSON);
   }
 
   function requiredStatusChecksHaveNotPassed(checksJSON: string): boolean {
@@ -585,10 +610,15 @@
   }
 
   async function handleStateChange(
-    newState: "open" | "closed",
+    newState: "open" | "closed" | "draft",
   ): Promise<void> {
     if (stalePR) return;
-    if (!currentCapabilities().state_mutation) return;
+    const caps = currentCapabilities();
+    if (newState === "draft") {
+      if (!caps.draft_mutation) return;
+    } else if (!caps.state_mutation) {
+      return;
+    }
     stateSubmitting = true;
     stateError = null;
     try {
@@ -853,11 +883,43 @@
   const workspace = $derived(detailStore.getDetail()?.workspace);
   let wsCreating = $state(false);
   let wsError = $state<string | null>(null);
+  const createWorkspaceTitle =
+    "Create a PR head worktree, then open Workspaces to launch agents, shells, or local review sessions on that branch.";
+  const createWorkspaceDescriptionId =
+    "pull-create-workspace-description";
   let actionMenuOpen = $state(false);
   let actionMenuWrapEl = $state<HTMLDivElement>();
+  let stateMenuOpen = $state(false);
+  let stateMenuWrapEl = $state<HTMLSpanElement>();
 
   function closeActionMenu(): void {
     actionMenuOpen = false;
+  }
+
+  function closeStateMenu(): void {
+    stateMenuOpen = false;
+  }
+
+  function visiblePRState(pr: Pick<PullRequest, "State" | "IsDraft">): "merged" | "closed" | "draft" | "open" {
+    if (pr.State === "merged") return "merged";
+    if (pr.State === "closed") return "closed";
+    if (pr.IsDraft) return "draft";
+    return "open";
+  }
+
+  function visiblePRStateLabel(pr: Pick<PullRequest, "State" | "IsDraft">): string {
+    const state = visiblePRState(pr);
+    return state.charAt(0).toUpperCase() + state.slice(1);
+  }
+
+  function toggleStateMenu(): void {
+    if (stalePR) return;
+    stateMenuOpen = !stateMenuOpen;
+  }
+
+  async function chooseState(newState: "open" | "closed" | "draft"): Promise<void> {
+    closeStateMenu();
+    await handleStateChange(newState);
   }
 
   function closeLabelPicker(): void {
@@ -1024,9 +1086,23 @@
     return data?.users ?? [];
   }
 
+  function userAvatarURL(username: string): string {
+    if (canonicalProvider(provider) !== "github") return "";
+    const login = encodeURIComponent(username.trim());
+    const host = detailStore.getDetail()?.repo?.platform_host
+      ?? detailStore.getDetail()?.platform_host
+      ?? platformHost
+      ?? "";
+    if (login === "" || host === "") return "";
+    return `https://${host}/${login}.png?size=40`;
+  }
+
   function onActionMenuKeydown(e: KeyboardEvent): void {
     if (actionMenuOpen && e.key === "Escape") {
       actionMenuOpen = false;
+    }
+    if (stateMenuOpen && e.key === "Escape") {
+      stateMenuOpen = false;
     }
   }
 
@@ -1042,6 +1118,9 @@
     const target = e.target as Node;
     if (actionMenuOpen && !actionMenuWrapEl?.contains(target)) {
       closeActionMenu();
+    }
+    if (stateMenuOpen && !stateMenuWrapEl?.contains(target)) {
+      closeStateMenu();
     }
     if (labelPickerOpen) {
       if (
@@ -1066,6 +1145,7 @@
         "/workspaces",
         {
           body: {
+            provider,
             platform_host: detail.platform_host,
             owner: detail.repo_owner,
             name: detail.repo_name,
@@ -1536,14 +1616,46 @@
       </div>
 
       <div class="chips-row">
-        {#if pr.State === "merged"}
-          <Chip class="chip--purple">Merged</Chip>
-        {:else if pr.State === "closed"}
-          <Chip class="chip--red">Closed</Chip>
-        {:else if pr.IsDraft}
-          <Chip class="chip--amber">Draft</Chip>
-        {:else}
-          <Chip class="chip--green">Open</Chip>
+        {#if true}
+          {@const stateLabel = visiblePRStateLabel(pr)}
+          {@const markDraftGate = operationGate(repoOperations?.mark_draft)}
+          {@const canOpenStateMenu = pr.State === "open" && !pr.IsDraft && capabilities.draft_mutation}
+          <span class="state-menu-wrap" bind:this={stateMenuWrapEl}>
+            <Chip
+              class={visiblePRState(pr) === "merged"
+                ? "chip--purple"
+                : visiblePRState(pr) === "closed"
+                  ? "chip--red"
+                  : visiblePRState(pr) === "draft"
+                    ? "chip--amber"
+                    : "chip--green"}
+              interactive={canOpenStateMenu}
+              disabled={stateSubmitting || stalePR || markDraftGate.unavailable}
+              expanded={canOpenStateMenu ? stateMenuOpen : undefined}
+              title={markDraftGate.unavailable ? markDraftGate.reason : undefined}
+              ariaLabel={canOpenStateMenu ? `State: ${stateLabel}` : undefined}
+              onclick={canOpenStateMenu ? toggleStateMenu : undefined}
+            >
+              {stateLabel}
+              {#if canOpenStateMenu}
+                <ChevronDownIcon size="12" strokeWidth="2.2" aria-hidden="true" />
+              {/if}
+            </Chip>
+            {#if canOpenStateMenu && stateMenuOpen}
+              <div class="state-menu" role="menu" aria-label="Pull request state">
+                <button
+                  type="button"
+                  role="menuitem"
+                  class="state-menu-item"
+                  disabled={stateSubmitting || markDraftGate.unavailable}
+                  title={markDraftGate.unavailable ? markDraftGate.reason : undefined}
+                  onclick={() => void chooseState("draft")}
+                >
+                  Draft
+                </button>
+              </div>
+            {/if}
+          </span>
         {/if}
         {#if pr.IsLocked && lockedSupported}
           <Chip class="chip--amber" title="This pull request is locked">Locked</Chip>
@@ -1609,6 +1721,7 @@
           disabled={stalePR || assigneeGate.unavailable}
           disabledReason={assigneeGate.unavailable ? assigneeGate.reason : undefined}
           loadCandidates={loadUserCandidates}
+          avatarUrlForUser={userAvatarURL}
           onchange={(next) => detailStore.setPullAssignees(owner, name, number, next)}
         >
           {#snippet icon()}
@@ -1623,6 +1736,7 @@
           disabledReason={reviewerGate.unavailable ? reviewerGate.reason : undefined}
           tooltipNote="User review requests only; team requests are not shown"
           loadCandidates={loadUserCandidates}
+          avatarUrlForUser={userAvatarURL}
           onchange={(next) => detailStore.setPullReviewers(owner, name, number, next)}
         >
           {#snippet icon()}
@@ -1873,6 +1987,10 @@
             tone="info"
             surface="soft"
             size="sm"
+            title={stalePR
+              ? "Refresh details before creating a workspace."
+              : createWorkspaceTitle}
+            ariaDescribedby={createWorkspaceDescriptionId}
             label={wsCreating ? "Creating..." : "Create Workspace"}
             shortLabel={wsCreating ? "Creating..." : "Create Workspace"}
           >
@@ -1882,6 +2000,11 @@
       {/snippet}
 
       <!-- Approve / Merge / Close / Reopen actions -->
+      {#if !workspace}
+        <span id={createWorkspaceDescriptionId} class="sr-only">
+          {stalePR ? "Refresh details before creating a workspace." : createWorkspaceTitle}
+        </span>
+      {/if}
       {#if pr.State !== "merged" && !stalePR}
         <div class="primary-actions-wrap">
           <div class="actions-row actions-row--primary">
@@ -2035,6 +2158,7 @@
           allowRebase={repoSettings.allowRebase}
           expectedHeadSha={detailHeadSha}
           requireHeadPin={capabilities.mutation_head_binding}
+          deferUntilChecksPass={shouldDeferMergeForCI(p.CIStatus, p.CIChecksJSON)}
           onheadconflict={handleHeadConflict}
           onclose={() => { showMergeModal = false; }}
           onmerged={() => {
@@ -2157,9 +2281,11 @@
       <div class="section">
         <div class="section-title-row">
           <h3 class="section-title">Activity</h3>
-          <PRTimelineFilter
+          <DetailActivityViewMenu
+            viewMode={detailActivityView.getMode()}
+            onViewChange={(mode) => detailActivityView.setMode(mode)}
             filter={timelineFilter}
-            onChange={updateTimelineFilter}
+            onFilterChange={updateTimelineFilter}
           />
         </div>
         {#if detailStore.getDetailLoaded()}
@@ -2176,6 +2302,7 @@
             canReplyToThreads={capabilities.thread_reply && !stalePR && !replyThreadGate.unavailable}
             filtered={hasActiveTimelineFilters}
             showCommitDetails={timelineFilter.showCommitDetails}
+            activityViewMode={detailActivityView.getMode()}
             onEditComment={capabilities.comment_mutation && !stalePR && !editCommentGate.unavailable
               ? editTimelineComment
               : undefined}
@@ -2509,6 +2636,49 @@
     min-width: 0;
   }
 
+  .state-menu-wrap {
+    position: relative;
+    display: inline-flex;
+    z-index: 70;
+  }
+
+  .state-menu {
+    position: absolute;
+    z-index: 25;
+    top: calc(100% + 6px);
+    left: 0;
+    min-width: 120px;
+    padding: 4px;
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-md, 8px);
+    background: var(--bg-surface);
+    box-shadow: 0 12px 30px rgba(0, 0, 0, 0.18);
+  }
+
+  .state-menu-item {
+    width: 100%;
+    min-height: 30px;
+    padding: 0 10px;
+    border: 0;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--text-primary);
+    font: inherit;
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .state-menu-item:hover:not(:disabled) {
+    background: var(--bg-surface-hover);
+  }
+
+  .state-menu-item:disabled {
+    color: var(--text-muted);
+    cursor: not-allowed;
+  }
+
   .chips-row :global(.btn--labels) {
     min-height: 22px;
     padding: 0 8px;
@@ -2744,6 +2914,18 @@
   .action-error--workspace-compact {
     display: block;
     margin-top: 6px;
+  }
+
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
   }
 
   .section {

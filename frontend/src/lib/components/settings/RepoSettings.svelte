@@ -2,9 +2,17 @@
   import { tick } from "svelte";
   import { getStores } from "@middleman/ui";
   import type { ConfigRepo } from "@middleman/ui/api/types";
-  import { addRepo, removeRepo, getSettings, refreshRepo } from "../../api/settings.js";
+  import {
+    addRepo,
+    removeRepo,
+    getSettings,
+    refreshRepo,
+    updateRepoWorktreeBasePath,
+  } from "../../api/settings.js";
+  import SettingsIcon from "@lucide/svelte/icons/settings";
   import ProviderIcon from "../provider/ProviderIcon.svelte";
   import RepoImportModal from "./RepoImportModal.svelte";
+  import RepoPromoteModal from "./RepoPromoteModal.svelte";
 
   const { sync } = getStores();
 
@@ -27,6 +35,11 @@
   let removeError = $state<string | null>(null);
   let refreshingByKey = $state<Record<string, boolean>>({});
   let refreshErrors = $state<Record<string, string>>({});
+  let worktreeBaseDrafts = $state<Record<string, string>>({});
+  let savingWorktreeBaseByKey = $state<Record<string, boolean>>({});
+  let worktreeBaseErrors = $state<Record<string, string>>({});
+  let cloneEditorOpen = $state<Record<string, boolean>>({});
+  let promoteRepo = $state<ConfigRepo | null>(null);
 
   const showProviderIcons = $derived.by(() => {
     const providers = new Set(
@@ -46,6 +59,10 @@
   function repoDisplayLabel(repo: ConfigRepo): string {
     const label = repoLabel(repo);
     return repo.is_glob ? `${label} (${repo.matched_repo_count})` : label;
+  }
+
+  function worktreeBaseValue(repo: ConfigRepo, key: string): string {
+    return worktreeBaseDrafts[key] ?? repo.worktree_base_path ?? "";
   }
 
   async function handleAdd(): Promise<void> {
@@ -116,6 +133,39 @@
     }
   }
 
+  async function handleWorktreeBaseSave(repo: ConfigRepo): Promise<void> {
+    if (embedded || repo.is_glob) return;
+    const key = repoKey(repo);
+    savingWorktreeBaseByKey = { ...savingWorktreeBaseByKey, [key]: true };
+    if (worktreeBaseErrors[key]) {
+      const nextErrors = { ...worktreeBaseErrors };
+      delete nextErrors[key];
+      worktreeBaseErrors = nextErrors;
+    }
+    try {
+      const settings = await updateRepoWorktreeBasePath(
+        repo.owner,
+        repo.name,
+        {
+          provider: repo.provider,
+          host: repo.platform_host,
+        },
+        worktreeBaseValue(repo, key).trim(),
+      );
+      const nextDrafts = { ...worktreeBaseDrafts };
+      delete nextDrafts[key];
+      worktreeBaseDrafts = nextDrafts;
+      onUpdate(settings.repos);
+    } catch (err) {
+      worktreeBaseErrors = {
+        ...worktreeBaseErrors,
+        [key]: err instanceof Error ? err.message : String(err),
+      };
+    } finally {
+      savingWorktreeBaseByKey = { ...savingWorktreeBaseByKey, [key]: false };
+    }
+  }
+
   function handleInputKeydown(e: KeyboardEvent): void {
     if (e.key === "Enter") {
       e.preventDefault();
@@ -146,46 +196,117 @@
   }}
 />
 
+<RepoPromoteModal
+  open={Boolean(promoteRepo)}
+  repo={promoteRepo}
+  onClose={() => { promoteRepo = null; }}
+  onPromoted={(settings) => {
+    onUpdate(settings.repos);
+    void sync.refreshSyncStatus();
+  }}
+/>
+
 <div class="repo-list">
   {#each repos as repo (repoKey(repo))}
     {@const key = repoKey(repo)}
     <div class="repo-row">
-      <div class="repo-main">
-        <span class="repo-name">{#if showProviderIcons}<ProviderIcon provider={repo.provider} size={16} class="repo-provider-icon" />{/if}{repoDisplayLabel(repo)}</span>
-        {#if refreshErrors[key]}
-          <div class="error-msg row-error">{refreshErrors[key]}</div>
+      <div class="repo-line">
+        <div class="repo-main">
+          <span class="repo-name">{#if showProviderIcons}<ProviderIcon provider={repo.provider} size={16} class="repo-provider-icon" />{/if}{repoDisplayLabel(repo)}</span>
+          {#if refreshErrors[key]}
+            <div class="error-msg row-error">{refreshErrors[key]}</div>
+          {/if}
+        </div>
+        {#if confirmingRemove === key}
+          <span class="confirm-prompt">
+            Remove?
+            <button class="confirm-btn confirm-yes" onclick={() => void handleRemove(repo)}>Yes</button>
+            <button class="confirm-btn confirm-no" onclick={() => { confirmingRemove = null; removeError = null; }}>No</button>
+          </span>
+        {:else}
+          <div class="repo-actions">
+            {#if repo.is_glob}
+              <button
+                class="promote-btn"
+                onclick={() => { promoteRepo = repo; }}
+                disabled={embedded}
+                aria-label={`Promote glob repository ${repoLabel(repo)}`}
+              >
+                Promote
+              </button>
+              <button
+                class="refresh-btn"
+                onclick={() => void handleRefresh(repo)}
+                disabled={Boolean(refreshingByKey[key])}
+              >
+                {refreshingByKey[key] ? "Refreshing..." : "Refresh"}
+              </button>
+            {:else}
+              <button
+                class={["clone-btn", { configured: Boolean(repo.worktree_base_path), open: Boolean(cloneEditorOpen[key]) }]}
+                aria-label={`Local clone for ${repoDisplayLabel(repo)}`}
+                aria-expanded={Boolean(cloneEditorOpen[key])}
+                title={repo.worktree_base_path ? `Local clone: ${repo.worktree_base_path}` : "Set local clone"}
+                onclick={() => {
+                  cloneEditorOpen = { ...cloneEditorOpen, [key]: !cloneEditorOpen[key] };
+                }}
+              ><SettingsIcon size={14} aria-hidden="true" /></button>
+            {/if}
+            <button
+              class="remove-btn"
+              title={`Remove ${key}`}
+              onclick={() => {
+                confirmingRemove = key;
+                removeError = null;
+                if (refreshErrors[key]) {
+                  const nextErrors = { ...refreshErrors };
+                  delete nextErrors[key];
+                  refreshErrors = nextErrors;
+                }
+              }}
+            >&times;</button>
+          </div>
         {/if}
       </div>
-      {#if confirmingRemove === key}
-        <span class="confirm-prompt">
-          Remove?
-          <button class="confirm-btn confirm-yes" onclick={() => void handleRemove(repo)}>Yes</button>
-          <button class="confirm-btn confirm-no" onclick={() => { confirmingRemove = null; removeError = null; }}>No</button>
-        </span>
-      {:else}
-        <div class="repo-actions">
-          {#if repo.is_glob}
+      {#if !repo.is_glob && cloneEditorOpen[key]}
+        <div class="worktree-base-body">
+          <div class="worktree-base-control">
+            <input
+              id={`worktree-base-${key}`}
+              class="worktree-base-input"
+              type="text"
+              placeholder="/path/to/existing/clone"
+              aria-label={`Local clone path for ${repoDisplayLabel(repo)}`}
+              value={worktreeBaseValue(repo, key)}
+              disabled={embedded || Boolean(savingWorktreeBaseByKey[key])}
+              oninput={(event) => {
+                worktreeBaseDrafts = {
+                  ...worktreeBaseDrafts,
+                  [key]: event.currentTarget.value,
+                };
+              }}
+              onkeydown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  void handleWorktreeBaseSave(repo);
+                }
+              }}
+            />
             <button
-              class="refresh-btn"
-              onclick={() => void handleRefresh(repo)}
-              disabled={Boolean(refreshingByKey[key])}
+              class="worktree-base-save"
+              aria-label={`Save local clone path for ${repoDisplayLabel(repo)}`}
+              onclick={() => void handleWorktreeBaseSave(repo)}
+              disabled={embedded || Boolean(savingWorktreeBaseByKey[key]) || worktreeBaseValue(repo, key).trim() === (repo.worktree_base_path ?? "")}
             >
-              {refreshingByKey[key] ? "Refreshing..." : "Refresh"}
+              {savingWorktreeBaseByKey[key] ? "Saving..." : "Save"}
             </button>
+          </div>
+          <p class="worktree-base-hint">
+            Workspaces are created as worktrees of this clone instead of starting from a fresh clone.
+          </p>
+          {#if worktreeBaseErrors[key]}
+            <div class="error-msg row-error">{worktreeBaseErrors[key]}</div>
           {/if}
-          <button
-            class="remove-btn"
-            title={`Remove ${key}`}
-            onclick={() => {
-              confirmingRemove = key;
-              removeError = null;
-              if (refreshErrors[key]) {
-                const nextErrors = { ...refreshErrors };
-                delete nextErrors[key];
-                refreshErrors = nextErrors;
-              }
-            }}
-          >&times;</button>
         </div>
       {/if}
     </div>
@@ -223,20 +344,57 @@
   .advanced-body { padding-top: 8px; display: flex; flex-direction: column; gap: 6px; }
   .repo-list { display: flex; flex-direction: column; }
   .repo-row {
-    display: flex; align-items: center; justify-content: space-between;
+    display: flex; flex-direction: column; gap: 6px;
     padding: 8px 0; border-bottom: 1px solid var(--border-muted);
-    gap: 12px;
   }
   .repo-row:last-child { border-bottom: none; }
-  .repo-main { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+  .repo-line { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  .repo-main { display: flex; flex-direction: column; gap: 4px; min-width: 0; flex: 1; }
   .repo-name { display: inline-flex; align-items: center; gap: 6px; font-size: var(--font-size-md); color: var(--text-primary); font-weight: 500; }
   :global(.repo-provider-icon) { color: var(--text-secondary); }
+  .clone-btn {
+    display: inline-flex; align-items: center; color: var(--text-muted);
+    padding: 3px 6px; border-radius: var(--radius-sm);
+    transition: color 0.1s, background 0.1s;
+  }
+  .clone-btn:hover, .clone-btn.open {
+    color: var(--accent-blue); background: color-mix(in srgb, var(--accent-blue) 10%, transparent);
+  }
+  .clone-btn.configured { color: var(--accent-blue); }
+  .worktree-base-body { display: flex; flex-direction: column; gap: 4px; }
+  .worktree-base-control { display: flex; gap: 8px; }
+  .worktree-base-input {
+    flex: 1; min-width: 0; font-size: var(--font-size-sm); padding: 5px 8px;
+    color: var(--text-primary); background: var(--bg-inset);
+    border: 1px solid var(--border-muted); border-radius: var(--radius-sm);
+    font-family: var(--font-mono);
+  }
+  .worktree-base-input:focus { border-color: var(--accent-blue); outline: none; }
+  .worktree-base-save {
+    flex-shrink: 0; padding: 4px 10px; font-size: var(--font-size-sm); font-weight: 600;
+    color: var(--accent-blue); border: 1px solid color-mix(in srgb, var(--accent-blue) 35%, var(--border-muted));
+    border-radius: var(--radius-sm);
+  }
+  .worktree-base-save:hover:not(:disabled) { background: color-mix(in srgb, var(--accent-blue) 10%, transparent); }
+  .worktree-base-save:disabled { opacity: 0.45; cursor: not-allowed; }
+  .worktree-base-hint { margin: 0; color: var(--text-muted); font-size: var(--font-size-xs); }
   .repo-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
   .refresh-btn {
     padding: 4px 10px; font-size: var(--font-size-sm); font-weight: 500;
     color: var(--accent-blue); border: 1px solid color-mix(in srgb, var(--accent-blue) 35%, var(--border-muted));
     border-radius: var(--radius-sm); transition: background 0.12s, opacity 0.12s;
   }
+  .promote-btn {
+    padding: 4px 10px; font-size: var(--font-size-sm); font-weight: 600;
+    color: var(--text-primary); background: var(--bg-inset);
+    border: 1px solid var(--border-muted); border-radius: var(--radius-sm);
+    transition: background 0.12s, border-color 0.12s, opacity 0.12s;
+  }
+  .promote-btn:hover:not(:disabled) {
+    border-color: color-mix(in srgb, var(--accent-blue) 35%, var(--border-muted));
+    background: color-mix(in srgb, var(--accent-blue) 8%, var(--bg-inset));
+  }
+  .promote-btn:disabled { opacity: 0.5; cursor: not-allowed; }
   .refresh-btn:hover:not(:disabled) {
     background: color-mix(in srgb, var(--accent-blue) 10%, transparent);
   }

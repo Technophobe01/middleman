@@ -13,15 +13,23 @@ import (
 	"go.kenn.io/middleman/internal/db"
 	ghclient "go.kenn.io/middleman/internal/github"
 	"go.kenn.io/middleman/internal/platform"
+	"go.kenn.io/middleman/internal/workspace"
 	"go.kenn.io/middleman/internal/workspace/localruntime"
 )
 
 type settingsResponse struct {
-	Repos    []ghclient.ConfiguredRepoStatus `json:"repos" nullable:"false"`
-	Activity config.Activity                 `json:"activity"`
-	Terminal config.Terminal                 `json:"terminal"`
-	Modes    config.ModeVisibility           `json:"modes,omitzero"`
-	Agents   []config.Agent                  `json:"agents" nullable:"false"`
+	Repos         []ghclient.ConfiguredRepoStatus `json:"repos" nullable:"false"`
+	Activity      config.Activity                 `json:"activity"`
+	Notifications notificationsSettingsResponse   `json:"notifications"`
+	Terminal      config.Terminal                 `json:"terminal"`
+	Modes         config.ModeVisibility           `json:"modes,omitzero"`
+	Agents        []config.Agent                  `json:"agents" nullable:"false"`
+	LaunchTargets []localruntime.LaunchTarget     `json:"launch_targets,omitempty"`
+	Fleet         fleetSettingsResponse           `json:"fleet"`
+}
+
+type notificationsSettingsResponse struct {
+	Enabled bool `json:"enabled"`
 }
 
 type updateSettingsRequest struct {
@@ -58,7 +66,13 @@ func (s *Server) buildLocalSettingsResponse() settingsResponse {
 	terminal := s.cfg.Terminal
 	modes := cloneModeVisibility(s.cfg.Modes).WithDefaults()
 	agents := cloneConfigAgents(s.cfg.Agents)
+	tmuxCommand := s.cfg.TmuxCommand()
+	fleetSettings := s.buildFleetSettingsResponseLocked()
 	s.cfgMu.Unlock()
+	launchTargets := localruntime.ResolveLaunchTargets(agents, tmuxCommand, nil)
+	if launchTargets == nil {
+		launchTargets = []localruntime.LaunchTarget{}
+	}
 
 	tracked := s.syncer.TrackedRepos()
 	configured := make(
@@ -71,6 +85,7 @@ func (s *Server) buildLocalSettingsResponse() settingsResponse {
 			Owner:            raw.Owner,
 			Name:             raw.Name,
 			RepoPath:         configRepoPath(raw),
+			WorktreeBasePath: raw.WorktreeBasePath,
 			IsGlob:           raw.HasNameGlob(),
 			MatchedRepoCount: matchedRepoCount(raw, tracked),
 		}
@@ -78,9 +93,14 @@ func (s *Server) buildLocalSettingsResponse() settingsResponse {
 	return settingsResponse{
 		Repos:    configured,
 		Activity: activity,
-		Terminal: terminal,
-		Modes:    modes,
-		Agents:   agents,
+		// Notifications are a built-in capability with no enable/disable
+		// setting; report them as always available.
+		Notifications: notificationsSettingsResponse{Enabled: true},
+		Terminal:      terminal,
+		Modes:         modes,
+		Agents:        agents,
+		LaunchTargets: launchTargets,
+		Fleet:         fleetSettings,
 	}
 }
 
@@ -198,6 +218,31 @@ func sameConfiguredRepo(left, right config.Repo) bool {
 		strings.EqualFold(configRepoPath(left), configRepoPath(right))
 }
 
+func (s *Server) worktreeBasePathForRepo(
+	_ context.Context, provider, platformHost, owner, name string,
+) (string, bool, error) {
+	if s.cfg == nil {
+		return "", false, nil
+	}
+	target := config.Repo{
+		Platform:     provider,
+		PlatformHost: platformHost,
+		Owner:        owner,
+		Name:         name,
+	}
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
+	for _, repo := range s.cfg.Repos {
+		if repo.HasNameGlob() || strings.TrimSpace(repo.WorktreeBasePath) == "" {
+			continue
+		}
+		if sameConfiguredRepo(repo, target) {
+			return repo.WorktreeBasePath, true, nil
+		}
+	}
+	return "", false, nil
+}
+
 func repoMatchesConfig(
 	repo ghclient.RepoRef, raw config.Repo,
 ) bool {
@@ -253,11 +298,21 @@ func repoProvider(repo ghclient.RepoRef) string {
 	return strings.ToLower(provider)
 }
 
+func trackedRepoHost(repo ghclient.RepoRef) string {
+	host := strings.TrimSpace(repo.PlatformHost)
+	if host != "" {
+		return strings.ToLower(host)
+	}
+	if defaultHost, ok := platform.DefaultHost(platform.Kind(repoProvider(repo))); ok {
+		return defaultHost
+	}
+	return ""
+}
+
 func trackedRepoKey(repo ghclient.RepoRef) string {
 	return repoProvider(repo) + "\x00" +
-		strings.ToLower(repo.PlatformHost) + "\x00" +
-		strings.ToLower(repo.Owner) + "\x00" +
-		strings.ToLower(repo.Name)
+		trackedRepoHost(repo) + "\x00" +
+		strings.ToLower(strings.Trim(trackedRepoPath(repo), "/ "))
 }
 
 func (s *Server) persistResolvedRepos(
@@ -444,13 +499,39 @@ func cloneConfigAgents(agents []config.Agent) []config.Agent {
 	return cloned
 }
 
+func cloneFleetPeers(peers []config.FleetPeer) []config.FleetPeer {
+	if peers == nil {
+		return []config.FleetPeer{}
+	}
+	return slices.Clone(peers)
+}
+
+func cloneFleetSSHPeers(peers []config.FleetSSHPeer) []config.FleetSSHPeer {
+	if peers == nil {
+		return []config.FleetSSHPeer{}
+	}
+	return slices.Clone(peers)
+}
+
 func (s *Server) refreshRuntimeTargetsLocked() {
-	if s.runtime == nil || s.cfg == nil {
+	if s.cfg == nil {
 		return
 	}
-	tmuxCmd := s.cfg.TmuxCommand()
+	if s.workspaces != nil {
+		s.workspaces.SetHideTmuxStatus(s.cfg.Terminal.HideTmuxStatus)
+	}
+	if s.runtime == nil {
+		return
+	}
+	tmuxCmd := s.bootTmuxCommand()
 	targets := localruntime.ResolveLaunchTargets(s.cfg.Agents, tmuxCmd, nil)
 	s.runtime.UpdateTargetsAndStripEnvVars(targets, s.cfg.TokenEnvNames())
+	s.runtime.UpdateHideTmuxStatus(s.cfg.Terminal.HideTmuxStatus)
+}
+
+func (s *Server) bootTmuxCommand() []string {
+	cfg := &config.Config{Tmux: s.bootCfgSnapshot.Tmux}
+	return cfg.TmuxCommand()
 }
 
 func (s *Server) updateRuntimeStripEnvVars(cfg *config.Config) {
@@ -622,6 +703,97 @@ func (s *Server) refreshConfiguredRepoOnHost(
 		Owner:        input.Owner,
 		Name:         input.Name,
 	})
+}
+
+func (s *Server) updateConfiguredRepoWorktreeBase(
+	ctx context.Context, input *repoWorktreeBaseInput,
+) (*settingsOutput, error) {
+	return s.updateConfiguredRepoWorktreeBasePath(ctx, repoConfigInput{
+		Provider:     input.Provider,
+		PlatformHost: input.PlatformHost,
+		Owner:        input.Owner,
+		Name:         input.Name,
+	}, input.Body.WorktreeBasePath)
+}
+
+func (s *Server) updateConfiguredRepoWorktreeBaseOnHost(
+	ctx context.Context, input *repoWorktreeBaseHostInput,
+) (*settingsOutput, error) {
+	return s.updateConfiguredRepoWorktreeBasePath(ctx, repoConfigInput{
+		Provider:     input.Provider,
+		PlatformHost: input.PlatformHost,
+		Owner:        input.Owner,
+		Name:         input.Name,
+	}, input.Body.WorktreeBasePath)
+}
+
+func (s *Server) updateConfiguredRepoWorktreeBasePath(
+	ctx context.Context, ref repoConfigInput, rawPath string,
+) (*settingsOutput, error) {
+	if s.cfgPath == "" {
+		return nil, problemNotFound(CodeSettingsUnavailable, "settings not available", nil)
+	}
+
+	provider, err := normalizeRouteProvider(ref.Provider)
+	if err != nil {
+		return nil, problemValidation("path.provider", err.Error())
+	}
+	targetRef := config.Repo{
+		Platform:     provider,
+		PlatformHost: ref.PlatformHost,
+		Owner:        ref.Owner,
+		Name:         ref.Name,
+	}
+
+	worktreeBasePath := strings.TrimSpace(rawPath)
+	if worktreeBasePath != "" {
+		abs, err := workspace.ValidateWorktreeBasePath(
+			ctx, worktreeBasePath, targetRef.PlatformHostOrDefault(),
+			ref.Owner, ref.Name,
+		)
+		if err != nil {
+			return nil, problemValidation("body.worktree_base_path", err.Error())
+		}
+		worktreeBasePath = abs
+	}
+
+	s.cfgMu.Lock()
+	idx := -1
+	for i, rp := range s.cfg.Repos {
+		if sameConfiguredRepo(rp, targetRef) {
+			idx = i
+			break
+		}
+	}
+	if idx == -1 {
+		s.cfgMu.Unlock()
+		return nil, problemNotFound(CodeRepoNotFound,
+			ref.Owner+"/"+ref.Name+" is not configured", nil)
+	}
+	if s.cfg.Repos[idx].HasNameGlob() {
+		s.cfgMu.Unlock()
+		return nil, problemBadRequest(
+			CodeBadRequest,
+			"worktree base paths are only supported for exact repositories",
+			nil,
+		)
+	}
+
+	prev := s.cfg.Repos[idx].WorktreeBasePath
+	s.cfg.Repos[idx].WorktreeBasePath = worktreeBasePath
+	if err := s.cfg.Validate(); err != nil {
+		s.cfg.Repos[idx].WorktreeBasePath = prev
+		s.cfgMu.Unlock()
+		return nil, problemBadRequest(CodeBadRequest, err.Error(), nil)
+	}
+	if err := s.cfg.Save(s.cfgPath); err != nil {
+		s.cfg.Repos[idx].WorktreeBasePath = prev
+		s.cfgMu.Unlock()
+		return nil, problemInternal("save config: " + err.Error())
+	}
+	s.cfgMu.Unlock()
+
+	return &settingsOutput{Body: s.buildLocalSettingsResponse()}, nil
 }
 
 func (s *Server) deleteConfiguredRepo(

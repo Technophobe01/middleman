@@ -44,6 +44,8 @@ type FixtureClient struct {
 	Labels                    map[string][]*gh.Label
 	CheckRunErrors            map[string]error
 	WorkflowRuns              map[string][]*gh.WorkflowRun
+	Notifications             []ghclient.NotificationThread
+	MarkReadNotifications     []string
 	ListRepositoriesByOwnerFn func(context.Context, string) ([]*gh.Repository, error)
 	mu                        sync.RWMutex
 	nextID                    int64
@@ -69,6 +71,21 @@ func NewFixtureClient() ghclient.Client {
 		WorkflowRuns:     make(map[string][]*gh.WorkflowRun),
 		nextID:           10_000,
 	}
+}
+
+func (c *FixtureClient) ListNotifications(
+	_ context.Context, _ ghclient.NotificationListOptions,
+) ([]ghclient.NotificationThread, bool, error) {
+	out := make([]ghclient.NotificationThread, len(c.Notifications))
+	copy(out, c.Notifications)
+	return out, false, nil
+}
+
+func (c *FixtureClient) MarkNotificationThreadRead(
+	_ context.Context, threadID string,
+) error {
+	c.MarkReadNotifications = append(c.MarkReadNotifications, threadID)
+	return nil
 }
 
 func repoKey(owner, repo string) string {
@@ -928,6 +945,19 @@ func (c *FixtureClient) MarkPullRequestReadyForReview(
 				owner, repo, number, number,
 			),
 		}
+	}
+	return clonePullRequest(pr), nil
+}
+
+func (c *FixtureClient) ConvertPullRequestToDraft(
+	_ context.Context, owner, repo string, number int,
+) (*gh.PullRequest, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	pr := c.updatePullRequestDraft(owner, repo, number, true)
+	if pr == nil {
+		return nil, nil
 	}
 	return clonePullRequest(pr), nil
 }

@@ -5,6 +5,7 @@ import { providerRepoPath, providerRouteParams } from "@middleman/ui/api/provide
 import { apiErrorMessage, client } from "./runtime.js";
 
 type UpdateSettingsRequest = components["schemas"]["UpdateSettingsRequest"];
+type UpdateFleetSettingsRequest = components["schemas"]["UpdateFleetSettingsInputBody"];
 export type RepoPreviewResponse = components["schemas"]["RepoPreviewResponse"];
 export type RepoPreviewRow = components["schemas"]["RepoPreviewRow"];
 
@@ -68,6 +69,16 @@ export async function updateSettings(settings: {
   return data;
 }
 
+export async function updateFleetSettings(fleet: UpdateFleetSettingsRequest): Promise<Settings["fleet"]> {
+  const { data, error, response } = await client.PUT("/settings/fleet", {
+    body: fleet,
+  });
+  if (!data) {
+    throw new Error(requestErrorMessage(error, `PUT /settings/fleet -> ${response.status}`));
+  }
+  return data;
+}
+
 export async function addRepo(owner: string, name: string, options: RepoRequestOptions): Promise<Settings> {
   const { data, error, response } = await client.POST("/repos", {
     body: { ...options, owner, name },
@@ -107,6 +118,29 @@ export async function refreshRepo(owner: string, name: string, options: RepoRequ
   });
   if (!data) {
     throw new Error(requestErrorMessage(error, `POST /repos/{owner}/{name}/refresh -> ${response.status}`));
+  }
+  return data;
+}
+
+export async function updateRepoWorktreeBasePath(
+  owner: string,
+  name: string,
+  options: RepoRequestOptions,
+  worktreeBasePath: string,
+): Promise<Settings> {
+  const ref = {
+    provider: options.provider,
+    platformHost: options.host,
+    owner,
+    name,
+    repoPath: `${owner}/${name}`,
+  };
+  const { data, error, response } = await client.PUT(providerRepoPath(ref, "/worktree-base"), {
+    params: { path: providerRouteParams(ref) },
+    body: { worktree_base_path: worktreeBasePath },
+  });
+  if (!data) {
+    throw new Error(requestErrorMessage(error, `PUT /repos/{owner}/{name}/worktree-base -> ${response.status}`));
   }
   return data;
 }

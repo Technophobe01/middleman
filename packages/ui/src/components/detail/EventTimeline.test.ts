@@ -515,6 +515,287 @@ describe("EventTimeline", () => {
     );
   });
 
+  it("renders threaded comments as separate compact rows with one-line previews", async () => {
+    const { container } = render(EventTimeline, {
+      props: {
+        activityViewMode: "compact",
+        events: [
+          makeEvent({
+            ID: 4,
+            EventType: "issue_comment",
+            Author: "reviewer",
+            Body: "```ts\nreturn cache.get(key);\n```",
+            ThreadID: "compact-discussion",
+            CreatedAt: "2024-06-01T12:03:00Z",
+          }),
+          makeEvent({
+            ID: 3,
+            EventType: "issue_comment",
+            Author: "reviewer",
+            Body: "Reply with [a link](https://example.test)\n\nand details",
+            ThreadID: "compact-discussion",
+            CreatedAt: "2024-06-01T12:02:00Z",
+          }),
+          makeEvent({
+            ID: 1,
+            EventType: "issue_comment",
+            Author: "author",
+            Body: "Root **comment**\n\n```ts\nconst hidden = true;\n```",
+            ThreadID: "compact-discussion",
+            CreatedAt: "2024-06-01T12:00:00Z",
+          }),
+        ],
+      },
+    });
+
+    expect(container.querySelectorAll(".event-card--compact-row")).toHaveLength(3);
+    expect(container.querySelectorAll(".thread-reply")).toHaveLength(0);
+    expect(container.textContent).toContain("Root comment");
+    expect(container.textContent).toContain("Reply with a link");
+    expect(container.textContent).toContain("return cache.get(key);");
+    expect(container.textContent).not.toContain("const hidden = true");
+    const copyButtons = screen.getAllByLabelText("Copy comment");
+    expect(copyButtons).toHaveLength(3);
+    await fireEvent.click(copyButtons[1]!);
+    expect(copyToClipboard).toHaveBeenCalledWith("Reply with [a link](https://example.test)\n\nand details");
+
+    expect(screen.queryByText("and details")).toBeNull();
+    const expandableRows = container.querySelectorAll<HTMLButtonElement>(".compact-event-toggle");
+    expect(expandableRows.length).toBe(3);
+    await fireEvent.click(expandableRows[1]!);
+
+    expect(screen.getByText("and details")).toBeTruthy();
+    expect(expandableRows[1]?.getAttribute("aria-expanded")).toBe("true");
+  });
+
+  it("expands compact commit rows to show the full commit message", async () => {
+    const { container } = render(EventTimeline, {
+      props: {
+        activityViewMode: "compact",
+        events: [
+          makeEvent({
+            EventType: "commit",
+            Author: "alice",
+            Summary: "abcdef1234567890",
+            Body: "feat: add cache store\n\nCache entries now expire after refresh.",
+          }),
+        ],
+      },
+    });
+
+    const row = container.querySelector<HTMLElement>(".event-card--compact-row");
+    expect(row?.textContent).toContain("feat: add cache store");
+    expect(row?.textContent).not.toContain("Cache entries now expire after refresh.");
+
+    const toggle = row?.querySelector<HTMLButtonElement>(".compact-event-toggle");
+    expect(toggle).toBeTruthy();
+    await fireEvent.click(toggle!);
+
+    expect(row?.textContent).toContain("Cache entries now expire after refresh.");
+    expect(toggle?.getAttribute("aria-expanded")).toBe("true");
+  });
+
+  it("keeps compact commit details collapsed when commit details are hidden", () => {
+    const { container } = render(EventTimeline, {
+      props: {
+        activityViewMode: "compact",
+        showCommitDetails: false,
+        events: [
+          makeEvent({
+            EventType: "commit",
+            Author: "alice",
+            Summary: "abcdef1234567890",
+            Body: "feat: add cache store\n\nCache entries now expire after refresh.",
+          }),
+        ],
+      },
+    });
+
+    const row = container.querySelector<HTMLElement>(".event-card--compact-row");
+    expect(row?.textContent).toContain("feat: add cache store");
+    expect(row?.textContent).not.toContain("Cache entries now expire after refresh.");
+    expect(row?.querySelector(".compact-event-toggle")).toBeNull();
+    expect(row?.querySelector(".commit-body-details")).toBeNull();
+  });
+
+  it("renders compact review verdicts and review comment context", () => {
+    const { container } = render(EventTimeline, {
+      props: {
+        activityViewMode: "compact",
+        events: [
+          makeEvent({
+            ID: 2,
+            EventType: "review_comment",
+            Author: "reviewer",
+            Body: "This branch needs a guard clause.",
+            Summary: "",
+            CreatedAt: "2024-06-01T12:01:00Z",
+            diff_thread: {
+              id: "compact-review-thread",
+              provider_comment_id: "2",
+              path: "src/review.ts",
+              old_path: "src/review.ts",
+              side: "right",
+              line: 42,
+              new_line: 42,
+              line_type: "add",
+              diff_head_sha: "head-sha",
+              commit_sha: "head-sha",
+              body: "This branch needs a guard clause.",
+              author_login: "reviewer",
+              resolved: false,
+              can_resolve: false,
+              created_at: "2024-06-01T12:01:00Z",
+              updated_at: "2024-06-01T12:01:00Z",
+            },
+          } as Partial<PREvent>),
+          makeEvent({
+            ID: 1,
+            EventType: "review",
+            Author: "maintainer",
+            Body: "Please handle the cache fallback before merge.",
+            Summary: "CHANGES_REQUESTED",
+            CreatedAt: "2024-06-01T12:00:00Z",
+          }),
+        ],
+      },
+    });
+
+    expect(container.querySelectorAll(".event-card--compact-row")).toHaveLength(2);
+    expect(screen.getByText("Changes requested - Please handle the cache fallback before merge.")).toBeTruthy();
+    expect(container.textContent).not.toContain("CHANGES_REQUESTED");
+    expect(screen.getByText("src/review.ts:42")).toBeTruthy();
+    expect(screen.getByText("This branch needs a guard clause.")).toBeTruthy();
+  });
+
+  it("keeps review thread replies available when compact rows expand", async () => {
+    const { container } = render(EventTimeline, {
+      props: {
+        activityViewMode: "compact",
+        events: [
+          makeReviewThreadEvent({
+            ID: 1,
+            Body: "First compact review comment",
+            CreatedAt: "2024-06-01T12:01:00Z",
+            diff_thread: {
+              ...makeReviewThreadEvent().diff_thread!,
+              provider_comment_id: "1",
+              body: "First compact review comment",
+            },
+          }),
+          makeReviewThreadEvent({
+            ID: 2,
+            Body: "Second compact review comment",
+            CreatedAt: "2024-06-01T12:02:00Z",
+            diff_thread: {
+              ...makeReviewThreadEvent().diff_thread!,
+              provider_comment_id: "2",
+              body: "Second compact review comment",
+            },
+          }),
+        ],
+        provider: "github",
+        platformHost: "github.com",
+        repoOwner: "acme",
+        repoName: "widget",
+        repoPath: "acme/widget",
+        number: 7,
+        canReplyToThreads: true,
+      },
+      context: new Map([
+        [
+          STORES_KEY,
+          {
+            detail: {
+              replyToDiscussion: vi.fn().mockResolvedValue(true),
+              getDetailError: vi.fn(),
+            },
+            diff: makeDiffStore(),
+            diffReviewDraft: {
+              setRouteContext: vi.fn(),
+              isSubmitting: () => false,
+            },
+          },
+        ],
+      ]),
+    });
+
+    const rows = Array.from(container.querySelectorAll<HTMLElement>(".event-card--compact-row"));
+    expect(rows).toHaveLength(2);
+    await fireEvent.click(rows[0]!.querySelector<HTMLButtonElement>(".compact-event-toggle")!);
+    await fireEvent.click(rows[1]!.querySelector<HTMLButtonElement>(".compact-event-toggle")!);
+
+    expect(container.querySelectorAll(".thread-reply-action--inline")).toHaveLength(2);
+    await fireEvent.click(rows[1]!.querySelector<HTMLButtonElement>(".thread-reply-action--inline")!);
+
+    expect(container.querySelectorAll(".thread-reply-panel")).toHaveLength(1);
+    expect(rows[0]!.querySelector(".thread-reply-panel")).toBeNull();
+    expect(rows[1]!.querySelector(".thread-reply-panel")).toBeTruthy();
+    expect(screen.getByRole("button", { name: /cancel/i })).toBeTruthy();
+  });
+
+  it("keeps normal review thread reply composer visible when thread entries regroup", async () => {
+    const rootComment = makeReviewThreadEvent({
+      ID: 1,
+      Body: "Root review thread comment",
+      CreatedAt: "2024-06-01T12:01:00Z",
+      diff_thread: {
+        ...makeReviewThreadEvent().diff_thread!,
+        id: "thread-regroup",
+        provider_comment_id: "1",
+        body: "Root review thread comment",
+      },
+    });
+    const replyComment = makeReviewThreadEvent({
+      ID: 2,
+      Body: "Existing reply after regroup",
+      CreatedAt: "2024-06-01T12:02:00Z",
+      diff_thread: {
+        ...makeReviewThreadEvent().diff_thread!,
+        id: "thread-regroup",
+        provider_comment_id: "2",
+        body: "Existing reply after regroup",
+      },
+    });
+    const props = {
+      events: [rootComment],
+      provider: "github",
+      platformHost: "github.com",
+      repoOwner: "acme",
+      repoName: "widget",
+      repoPath: "acme/widget",
+      number: 7,
+      canReplyToThreads: true,
+    } as const;
+    const { container, rerender } = render(EventTimeline, {
+      props,
+      context: new Map([
+        [
+          STORES_KEY,
+          {
+            detail: {
+              replyToDiscussion: vi.fn().mockResolvedValue(true),
+              getDetailError: vi.fn(),
+            },
+            diff: makeDiffStore(),
+            diffReviewDraft: {
+              setRouteContext: vi.fn(),
+              isSubmitting: () => false,
+            },
+          },
+        ],
+      ]),
+    });
+
+    await fireEvent.click(container.querySelector<HTMLButtonElement>(".thread-reply-action--inline")!);
+    expect(container.querySelectorAll(".thread-reply-panel")).toHaveLength(1);
+
+    await rerender({ ...props, events: [rootComment, replyComment] });
+
+    expect(container.querySelectorAll(".thread-reply-panel")).toHaveLength(1);
+    expect(screen.getByText("Existing reply after regroup")).toBeTruthy();
+  });
+
   it("can collapse and expand threaded replies", async () => {
     const { container } = render(EventTimeline, {
       props: {
@@ -681,6 +962,114 @@ describe("EventTimeline", () => {
     expect(text.indexOf("new C2 after rebase")).toBeLessThan(text.indexOf("ccccccc -> fffffff"));
     expect(text.indexOf("ccccccc -> fffffff")).toBeLessThan(text.indexOf("old C3 before rebase"));
     expect(text.indexOf("ccccccc -> fffffff")).toBeLessThan(text.indexOf("old C2 before rebase"));
+  });
+
+  it("orders force-push generations from commit ancestry even when database IDs are not generation order", () => {
+    const oldHead = "cccccccccccccccccccccccccccccccccccccccc";
+    const newHead = "ffffffffffffffffffffffffffffffffffffffff";
+    const { container } = render(EventTimeline, {
+      props: {
+        events: [
+          makeEvent({
+            ID: 70,
+            EventType: "force_push",
+            Author: "alice",
+            Summary: "ccccccc -> fffffff",
+            CreatedAt: "2024-06-01T12:00:00Z",
+            MetadataJSON: JSON.stringify({
+              before_sha: oldHead,
+              after_sha: newHead,
+            }),
+          }),
+          makeEvent({
+            ID: 20,
+            EventType: "commit",
+            Summary: newHead,
+            Body: "new head after rebase despite lower database id",
+            CreatedAt: "2024-06-01T10:03:00Z",
+            MetadataJSON: JSON.stringify({ commit_order: 3 }),
+          }),
+          makeEvent({
+            ID: 30,
+            EventType: "commit",
+            Summary: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            Body: "new base after rebase despite lower database id",
+            CreatedAt: "2024-06-01T10:02:00Z",
+            MetadataJSON: JSON.stringify({ commit_order: 2 }),
+          }),
+          makeEvent({
+            ID: 90,
+            EventType: "commit",
+            Summary: oldHead,
+            Body: "old head before rebase with higher database id",
+            CreatedAt: "2024-06-01T10:03:00Z",
+            MetadataJSON: JSON.stringify({ commit_order: 1 }),
+          }),
+        ],
+      },
+    });
+
+    const text = container.textContent ?? "";
+    expect(text.indexOf("new head after rebase despite lower database id")).toBeLessThan(
+      text.indexOf("ccccccc -> fffffff"),
+    );
+    expect(text.indexOf("new base after rebase despite lower database id")).toBeLessThan(
+      text.indexOf("ccccccc -> fffffff"),
+    );
+    expect(text.indexOf("ccccccc -> fffffff")).toBeLessThan(
+      text.indexOf("old head before rebase with higher database id"),
+    );
+  });
+
+  it("orders force-push generations by stable commit keys when list positions collide", () => {
+    const oldHead = "cccccccccccccccccccccccccccccccccccccccc";
+    const newHead = "ffffffffffffffffffffffffffffffffffffffff";
+    const { container } = render(EventTimeline, {
+      props: {
+        events: [
+          makeEvent({
+            ID: 70,
+            EventType: "force_push",
+            Author: "alice",
+            Summary: "ccccccc -> fffffff",
+            CreatedAt: "2024-06-01T12:00:00Z",
+            MetadataJSON: JSON.stringify({
+              before_sha: oldHead,
+              after_sha: newHead,
+            }),
+          }),
+          makeEvent({
+            ID: 20,
+            EventType: "commit",
+            Summary: newHead,
+            Body: "new head after same-length rebase",
+            CreatedAt: "2024-06-01T10:03:00Z",
+            MetadataJSON: JSON.stringify({ commit_order: 2, commit_order_key: 4 }),
+          }),
+          makeEvent({
+            ID: 30,
+            EventType: "commit",
+            Summary: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            Body: "new base after same-length rebase",
+            CreatedAt: "2024-06-01T10:02:00Z",
+            MetadataJSON: JSON.stringify({ commit_order: 1, commit_order_key: 3 }),
+          }),
+          makeEvent({
+            ID: 90,
+            EventType: "commit",
+            Summary: oldHead,
+            Body: "old head before same-length rebase",
+            CreatedAt: "2024-06-01T10:03:00Z",
+            MetadataJSON: JSON.stringify({ commit_order: 2, commit_order_key: 2 }),
+          }),
+        ],
+      },
+    });
+
+    const text = container.textContent ?? "";
+    expect(text.indexOf("new head after same-length rebase")).toBeLessThan(text.indexOf("ccccccc -> fffffff"));
+    expect(text.indexOf("new base after same-length rebase")).toBeLessThan(text.indexOf("ccccccc -> fffffff"));
+    expect(text.indexOf("ccccccc -> fffffff")).toBeLessThan(text.indexOf("old head before same-length rebase"));
   });
 
   it("keeps later commits in chronological order after force-push generations", () => {
@@ -1239,6 +1628,51 @@ describe("EventTimeline", () => {
     assert(link.getAttribute("data-number")).toBe("1");
     assert(link.getAttribute("data-external-url")).toBe("https://github.com/kenn-io/kit/pull/1");
     assert(screen.getByText("2h ago")).toBeTruthy();
+  });
+
+  it("keeps compact cross-reference summaries navigable", () => {
+    render(EventTimeline, {
+      props: {
+        events: [
+          makeEvent({
+            ID: 4,
+            EventType: "cross_referenced",
+            Summary: "Referenced from kenn-io/kit#1",
+            MetadataJSON: JSON.stringify({
+              source_type: "PullRequest",
+              source_owner: "kenn-io",
+              source_repo: "kit",
+              source_number: 1,
+              source_title: "Add shared git tooling packages",
+              source_url: "https://github.com/kenn-io/kit/pull/1",
+            }),
+          }),
+        ],
+        provider: "github",
+        platformHost: "github.com",
+        repoOwner: "kenn-io",
+        repoName: "middleman",
+        repoPath: "kenn-io/middleman",
+        activityViewMode: "compact",
+      },
+    });
+
+    const link = screen.getByRole("link", {
+      name: "Add shared git tooling packages",
+    });
+    const assert = expect.soft;
+    assert(link.closest(".event-card--compact-row")).toBeTruthy();
+    assert(link.getAttribute("href")).toBe("/pulls/github/kenn-io/kit/1");
+    assert(link.classList.contains("item-ref")).toBe(true);
+    assert(link.getAttribute("target")).toBeNull();
+    assert(link.getAttribute("rel")).toBeNull();
+    assert(link.getAttribute("data-provider")).toBe("github");
+    assert(link.getAttribute("data-platform-host")).toBe("github.com");
+    assert(link.getAttribute("data-owner")).toBe("kenn-io");
+    assert(link.getAttribute("data-name")).toBe("kit");
+    assert(link.getAttribute("data-repo-path")).toBe("kenn-io/kit");
+    assert(link.getAttribute("data-number")).toBe("1");
+    assert(link.getAttribute("data-external-url")).toBe("https://github.com/kenn-io/kit/pull/1");
   });
 
   it("keeps external cross-reference links when item metadata is incomplete", () => {

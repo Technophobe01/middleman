@@ -9,6 +9,7 @@
     isDefaultBranchActivity,
     isDefaultBranchCommitActivity,
     isDefaultBranchForcePushActivity,
+    notificationReasonLabel,
     shortSha,
     type ActivityRow,
   } from "./activityRows.js";
@@ -16,6 +17,10 @@
     localDateLabel,
     parseAPITimestamp,
   } from "../utils/time.js";
+  import {
+    createRepoLabelFormatter,
+    type RepoLabelIdentity,
+  } from "../utils/repo-label.js";
   import Chip from "./shared/Chip.svelte";
   import ItemKindChip from "./shared/ItemKindChip.svelte";
   import ItemStateChip from "./shared/ItemStateChip.svelte";
@@ -24,6 +29,7 @@
   const { grouping, activity } = getStores();
   import { repoColor } from "../utils/repo-color.js";
   import ArrowUpRightIcon from "@lucide/svelte/icons/arrow-up-right";
+  import CheckIcon from "@lucide/svelte/icons/check";
   import ChevronDownIcon from "@lucide/svelte/icons/chevron-down";
   import ChevronRightIcon from "@lucide/svelte/icons/chevron-right";
 
@@ -114,6 +120,13 @@
     items: ThreadedEntry[];
   }
 
+  const repoLabelFormatter = $derived.by(() =>
+    createRepoLabelFormatter(
+      items.map(activityRepoIdentity),
+      { showOrgNames: !grouping.getHideOrgName() },
+    ),
+  );
+
   const grouped = $derived.by(() => {
     const byRepo = grouping.getGroupByRepo();
 
@@ -176,7 +189,9 @@
           itemAuthor: itemAuthor(first),
           workspace: first.workspace,
           events,
-          displayEvents: collapseActivityRuns(events),
+          displayEvents: collapseActivityRuns(events, {
+            rollUpCommits: activity.getRollUpCommits(),
+          }),
         },
       });
     }
@@ -188,7 +203,9 @@
     threadedEntries.sort((a, b) =>
       parseAPITimestamp(entryLatestTime(b)).getTime() - parseAPITimestamp(entryLatestTime(a)).getTime());
 
-    const allEntries = collapseTopLevelBranchRuns(threadedEntries);
+    const allEntries = activity.getRollUpCommits()
+      ? collapseTopLevelBranchRuns(threadedEntries)
+      : threadedEntries;
 
     if (!byRepo) {
       if (allEntries.length === 0) return [];
@@ -212,7 +229,7 @@
         owner: entryRepoOwner(entry),
         name: entryRepoName(entry),
       });
-      repoLabels.set(repoKey, repoLabel(entryRepoOwner(entry), entryRepoName(entry)));
+      repoLabels.set(repoKey, repoLabel(entryRepoIdentity(entry)));
       let bucket = repoMap.get(repoKey);
       if (!bucket) {
         bucket = [];
@@ -278,7 +295,9 @@
         branchItems.push(branchRowRepresentative(branchEntry.row));
         j++;
       }
-      for (const row of collapseActivityRuns(branchItems)) {
+      for (const row of collapseActivityRuns(branchItems, {
+        rollUpCommits: activity.getRollUpCommits(),
+      })) {
         result.push(branchEntryFromRow(row));
       }
       i = j;
@@ -345,6 +364,24 @@
     }
   }
 
+  // Notification rows carry their reason in body_preview; everything
+  // else labels purely by activity type.
+  function eventRowLabel(row: ActivityItem): string {
+    if (row.activity_type === "notification") {
+      return notificationReasonLabel(row.body_preview);
+    }
+    return eventLabel(row.activity_type);
+  }
+
+  function isUnreadNotification(row: ActivityItem): boolean {
+    return row.activity_type === "notification" && row.item_state === "unread";
+  }
+
+  function handleMarkSeen(e: Event, row: ActivityItem): void {
+    e.stopPropagation();
+    void activity.markNotificationSeen(row);
+  }
+
   function eventClass(type: string): string {
     switch (type) {
       case "comment": return "evt-comment";
@@ -353,6 +390,7 @@
       case "default_branch_commit": return "evt-commit";
       case "force_push": return "evt-force-push";
       case "default_branch_force_push": return "evt-force-push";
+      case "notification": return "evt-notification";
       default: return "";
     }
   }
@@ -371,7 +409,11 @@
 
   function handleItemClick(group: ItemGroup): void {
     if (group.events.length > 0) {
-      onSelectItem?.(group.events[0]!);
+      // Route through handleEventClick so a top-level notification group
+      // whose subject has no in-app detail (release, discussion,
+      // item_number 0) follows its provider URL instead of opening an
+      // invalid #0 detail drawer, matching the expanded event rows.
+      handleEventClick(group.events[0]!);
     }
   }
 
@@ -393,7 +435,19 @@
       }
       return;
     }
+    // Notifications without a tracked PR/issue subject (releases,
+    // discussions, item_number 0) have no in-app detail; follow their
+    // web URL instead of opening a #0 detail drawer.
+    if (event.activity_type === "notification" && !opensInDetailPane(event)) {
+      const url = event.activity_url || event.item_url;
+      if (url) window.open(url, "_blank", "noopener");
+      return;
+    }
     onSelectItem?.(event);
+  }
+
+  function opensInDetailPane(event: ActivityItem): boolean {
+    return (event.item_type === "pr" || event.item_type === "issue") && event.item_number > 0;
   }
 
   function isSelectedItemGroup(group: ItemGroup): boolean {
@@ -436,8 +490,32 @@
     return event.item_author || eventAuthor(event);
   }
 
-  function repoLabel(owner: string, name: string): string {
-    return grouping.getHideOrgName() ? name : `${owner}/${name}`;
+  function activityRepoIdentity(item: ActivityItem): RepoLabelIdentity {
+    return {
+      provider: item.repo?.provider ?? "",
+      platformHost: item.repo?.platform_host ?? item.platform_host,
+      owner: item.repo?.owner ?? item.repo_owner,
+      name: item.repo?.name ?? item.repo_name,
+      repoPath: item.repo?.repo_path,
+    };
+  }
+
+  function entryRepoIdentity(entry: ThreadedEntry): RepoLabelIdentity {
+    return {
+      provider: entry.kind === "item" ? entry.group.provider : entry.provider,
+      platformHost: entryPlatformHost(entry),
+      owner: entryRepoOwner(entry),
+      name: entryRepoName(entry),
+      repoPath: entryRepoPath(entry),
+    };
+  }
+
+  function entryRepoPath(entry: ThreadedEntry): string {
+    return entry.kind === "item" ? entry.group.repoPath : entry.repoPath;
+  }
+
+  function repoLabel(repo: RepoLabelIdentity): string {
+    return repoLabelFormatter.format(repo);
   }
 
   function branchRowAuthor(row: ActivityRow): string {
@@ -548,7 +626,7 @@
                   class="repo-chip repo-tag"
                   style="color: {repoColor(`${entry.repoOwner}/${entry.repoName}`)}; background: color-mix(in srgb, {repoColor(`${entry.repoOwner}/${entry.repoName}`)} 15%, transparent);"
                 >
-                  <span class="repo-chip__label">{repoLabel(entry.repoOwner, entry.repoName)}</span>
+                  <span class="repo-chip__label">{repoLabel(entryRepoIdentity(entry))}</span>
                 </Chip>
               </span>
             {/if}
@@ -613,7 +691,7 @@
                 class="repo-chip repo-tag"
                 style="color: {repoColor(`${itemGroup.repoOwner}/${itemGroup.repoName}`)}; background: color-mix(in srgb, {repoColor(`${itemGroup.repoOwner}/${itemGroup.repoName}`)} 15%, transparent);"
               >
-                <span class="repo-chip__label">{repoLabel(itemGroup.repoOwner, itemGroup.repoName)}</span>
+                <span class="repo-chip__label">{repoLabel(entryRepoIdentity(entry))}</span>
               </Chip>
             </span>
           {/if}
@@ -658,12 +736,23 @@
               </div>
             {:else}
               <div class="event-row" onclick={() => handleEventClick(row)}>
-                <span class="event-type {eventClass(row.activity_type)}">{eventLabel(row.activity_type)}</span>
+                <span class="event-type {eventClass(row.activity_type)}">{eventRowLabel(row)}</span>
                 {#if eventSummary(row)}
                   <span class="event-summary">{eventSummary(row)}</span>
                 {/if}
                 <span class="event-author">{eventAuthor(row)}</span>
                 <span class="event-time">{relativeTime(row.created_at)}</span>
+                {#if isUnreadNotification(row)}
+                  <button
+                    class="event-mark-seen"
+                    type="button"
+                    aria-label="Mark notification seen"
+                    title="Mark seen"
+                    onclick={(e) => handleMarkSeen(e, row)}
+                  >
+                    <CheckIcon size="13" strokeWidth="2" aria-hidden="true" />
+                  </button>
+                {/if}
               </div>
             {/if}
           {/each}
@@ -944,6 +1033,7 @@
   .event-type.evt-review { color: var(--accent-green); }
   .event-type.evt-commit { color: var(--accent-teal); }
   .event-type.evt-force-push { color: var(--accent-red); }
+  .event-type.evt-notification { color: var(--accent-blue); }
 
   .branch-event-type {
     font-size: var(--font-size-xs);
@@ -974,6 +1064,24 @@
     color: var(--text-muted);
     margin-left: auto;
     flex-shrink: 0;
+  }
+
+  .event-mark-seen {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    padding: 2px;
+    border: none;
+    border-radius: 4px;
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+  }
+
+  .event-mark-seen:hover {
+    background: var(--bg-hover, rgba(127, 127, 127, 0.15));
+    color: var(--accent-blue);
   }
 
   .empty-state {

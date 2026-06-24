@@ -9,7 +9,14 @@
 
   const client = getClient();
 
-  onMount(() => pushModalFrame("merge-modal", []));
+  onMount(() => {
+    const cleanupFrame = pushModalFrame("merge-modal", []);
+    window.addEventListener("keydown", handleKeydown, { capture: true });
+    return () => {
+      window.removeEventListener("keydown", handleKeydown, { capture: true });
+      cleanupFrame();
+    };
+  });
 
   interface Props {
     owner: string;
@@ -29,6 +36,8 @@
     expectedHeadSha?: string | undefined;
     /** capabilities.mutation_head_binding for this repo's provider. */
     requireHeadPin?: boolean;
+    /** When true, the primary action waits for currently pending CI before merging. */
+    deferUntilChecksPass?: boolean;
     onclose: () => void;
     onmerged: () => void;
     onheadconflict?: ((reason: "stale_state" | "head_unknown", context?: string) => void) | undefined;
@@ -39,6 +48,7 @@
     prAuthor, prAuthorDisplayName,
     allowSquash, allowMerge, allowRebase,
     expectedHeadSha, requireHeadPin = false,
+    deferUntilChecksPass = false,
     onclose, onmerged, onheadconflict,
   }: Props = $props();
 
@@ -103,21 +113,36 @@
   let merging = $state(false);
   let error = $state<string | null>(null);
 
-  async function handleMerge(): Promise<void> {
+  function mergeParams(): MergeParams {
+    return {
+      commit_title: commitTitle,
+      commit_message: commitMessage,
+      method: selectedMethod,
+      ...(pinnedHeadShaAtOpen !== "" && { expected_head_sha: pinnedHeadShaAtOpen }),
+    };
+  }
+
+  function handleMergeError(requestError: { detail?: string; title?: string; details?: unknown } | undefined): boolean {
+    if (!requestError) return false;
+    const reason = isProblem(requestError) ? problemConflictReason(requestError) : undefined;
+    if (reason === "stale_state" || reason === "head_unknown") {
+      onheadconflict?.(reason, isProblem(requestError) ? problemConflictContext(requestError) : undefined);
+      onclose();
+      return true;
+    }
+    throw new Error(requestError.detail ?? requestError.title ?? "failed to merge pull request");
+  }
+
+  async function submitMerge(deferred: boolean): Promise<void> {
     if (headPinMissing) return;
     merging = true;
     error = null;
     try {
       // Pin the merge to the head the user reviewed; the server rejects
       // the request when the synced head has moved past it.
-      const params: MergeParams = {
-        commit_title: commitTitle,
-        commit_message: commitMessage,
-        method: selectedMethod,
-        ...(pinnedHeadShaAtOpen !== "" && { expected_head_sha: pinnedHeadShaAtOpen }),
-      };
+      const params = mergeParams();
       const ref = { provider, platformHost, owner, name, repoPath };
-      const { error } = await client.POST(providerItemPath("pulls", ref, "/merge"), {
+      const { error } = await client.POST(providerItemPath("pulls", ref, deferred ? "/merge/deferred" : "/merge"), {
         params: { path: { ...providerRouteParams(ref), number } },
         body: params,
       });
@@ -125,13 +150,11 @@
         // Head-pinning conflicts close the modal: the user must
         // re-review the refreshed detail before retrying, so an
         // inline retry from this stale form would be wrong.
-        const reason = isProblem(error) ? problemConflictReason(error) : undefined;
-        if (reason === "stale_state" || reason === "head_unknown") {
-          onheadconflict?.(reason, isProblem(error) ? problemConflictContext(error) : undefined);
-          onclose();
-          return;
-        }
-        throw new Error(error.detail ?? error.title ?? "failed to merge pull request");
+        if (handleMergeError(error)) return;
+      }
+      if (deferred) {
+        onclose();
+        return;
       }
       onmerged();
     } catch (err) {
@@ -141,9 +164,18 @@
     }
   }
 
+  function handleMerge(): void {
+    if (deferUntilChecksPass) {
+      void submitMerge(true);
+      return;
+    }
+    void submitMerge(false);
+  }
+
   function handleKeydown(e: KeyboardEvent): void {
     if (e.key === "Escape") {
       e.preventDefault();
+      e.stopImmediatePropagation();
       onclose();
     }
   }
@@ -153,6 +185,11 @@
       methods.find(m => m.value === selectedMethod)?.label
       ?? "Merge"
     );
+  }
+
+  function primaryButtonLabel(): string {
+    if (merging) return deferUntilChecksPass ? "Merge scheduled..." : "Merging...";
+    return deferUntilChecksPass ? "Merge after CI is complete" : methodLabel();
   }
 </script>
 
@@ -233,6 +270,11 @@
       {#if error}
         <p class="merge-error">{error}</p>
       {/if}
+      {#if deferUntilChecksPass}
+        <div class="ci-defer-note">
+          CI is still running. This will merge only if the checks that are pending now pass.
+        </div>
+      {/if}
     </div>
 
     {#if headPinMissing}
@@ -254,18 +296,28 @@
       </ActionButton>
       <ActionButton
         class="btn btn--primary btn--green"
-        onclick={() => void handleMerge()}
+        onclick={handleMerge}
         disabled={merging || headPinMissing}
         tone="success"
         surface="solid"
       >
-        {merging ? "Merging\u2026" : methodLabel()}
+        {primaryButtonLabel()}
       </ActionButton>
     </div>
   </div>
 </div>
 
 <style>
+  .ci-defer-note {
+    padding: 8px 10px;
+    border: 1px solid var(--accent-amber-soft, rgba(217, 119, 6, 0.35));
+    border-radius: var(--radius-sm);
+    background: var(--accent-amber-soft, rgba(217, 119, 6, 0.12));
+    color: var(--text-secondary);
+    font-size: var(--font-size-sm);
+    line-height: 1.35;
+  }
+
   .head-pin-note {
     margin: 0 0 var(--space-3, 12px);
     color: var(--text-secondary, #888);

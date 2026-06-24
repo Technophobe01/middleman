@@ -6,8 +6,9 @@
   import Chip from "../shared/Chip.svelte";
   import FilterDropdown from "../shared/FilterDropdown.svelte";
   import LeftSidebarToggle from "../shared/LeftSidebarToggle.svelte";
-  import type { PullRequest } from "../../api/types.js";
+  import type { KanbanStatus, PullRequest } from "../../api/types.js";
   import type { GroupingMode } from "../../stores/grouping.svelte.js";
+  import type { PullAttributeFilter } from "../../stores/pulls.svelte.js";
   import {
     buildPullRequestFilesRoute,
     buildPullRequestRoute,
@@ -32,9 +33,28 @@
     grouping.getGroupingMode(),
   );
   const workflowGroups = $derived(
-    groupByWorkflow(pulls.getPulls()),
+    groupByWorkflow(pulls.getFilteredPulls()),
   );
   const pullStateOptions = ["open", "closed", "all"] as const;
+  const attributeFilterOptions: {
+    value: PullAttributeFilter;
+    label: string;
+  }[] = [
+    { value: "approved", label: "Approved" },
+    { value: "draft", label: "Draft" },
+    { value: "ready", label: "Ready for review" },
+    { value: "merge_conflicts", label: "Merge conflicts" },
+    { value: "failed_ci", label: "Failed CI" },
+  ];
+  const kanbanFilterOptions: {
+    value: KanbanStatus;
+    label: string;
+  }[] = [
+    { value: "new", label: "New" },
+    { value: "reviewing", label: "Reviewing" },
+    { value: "waiting", label: "Waiting" },
+    { value: "awaiting_merge", label: "Awaiting merge" },
+  ];
   const groupingOptions: {
     value: GroupingMode;
     label: string;
@@ -43,9 +63,12 @@
     { value: "byWorkflow", label: "Status" },
     { value: "flat", label: "All" },
   ];
-  // Playwright-measured with a buffered "9999 PRs" count label:
-  // the full PR filter row first fits at 396px.
-  const COMPACT_FILTER_MAX_WIDTH = 395;
+  // Playwright-measured with the local PR filter icon and sidebar toggle:
+  // the full PR filter row needs 423px, so collapse with a small buffer.
+  const COMPACT_FILTER_MAX_WIDTH = 430;
+  // Keep the full filter groups visible at medium widths, but collapse the
+  // local PR filter trigger label before it crowds the sidebar toggle.
+  const LOCAL_FILTER_ICON_ONLY_MAX_WIDTH = 520;
 
   interface Props {
     getDetailTab?: () => string;
@@ -61,6 +84,7 @@
   let searchInput = $state(pulls.getSearchQuery() ?? "");
   let debounceHandle: ReturnType<typeof setTimeout> | null = null;
   let refreshHandle: ReturnType<typeof setInterval> | null = null;
+  const visiblePulls = $derived(pulls.getDisplayOrderPRs());
 
   $effect(() => {
     void pulls.loadPulls();
@@ -96,19 +120,37 @@
     return "All";
   }
 
+  function pullStateDropdownLabel(state: string): string {
+    if (state === "all") return "All states";
+    return pullStateLabel(state);
+  }
+
+  function groupingDropdownLabel(mode: GroupingMode): string {
+    if (mode === "byRepo") return "By repo";
+    if (mode === "byWorkflow") return "By status";
+    return "Flat list";
+  }
+
   function setPullState(state: string): void {
     pulls.setFilterState(state);
     void pulls.loadPulls();
   }
 
-  const compactFilterSections = $derived.by(() => [
+  function resetCompactView(): void {
+    pulls.clearLocalFilters();
+    grouping.setGroupingMode("byRepo");
+    if (pulls.getFilterState() !== "open") {
+      setPullState("open");
+    }
+  }
+
+  const toolbarFilterSections = $derived.by(() => [
     {
       title: "State",
       items: pullStateOptions.map((state) => ({
         id: `state-${state}`,
-        label: pullStateLabel(state),
+        label: pullStateDropdownLabel(state),
         active: pulls.getFilterState() === state,
-        closeOnSelect: true,
         onSelect: () => setPullState(state),
       })),
     },
@@ -116,19 +158,47 @@
       title: "Group",
       items: groupingOptions.map((option) => ({
         id: `group-${option.value}`,
-        label: option.label,
+        label: groupingDropdownLabel(option.value),
         active: groupingMode === option.value,
-        closeOnSelect: true,
         onSelect: () => grouping.setGroupingMode(option.value),
       })),
     },
   ]);
 
+  const localFilterSections = $derived.by(() => [
+    {
+      title: "PR",
+      items: attributeFilterOptions.map((option) => ({
+        id: `pr-${option.value}`,
+        label: option.label,
+        active: pulls.getAttributeFilters().includes(option.value),
+        onSelect: () => pulls.toggleAttributeFilter(option.value),
+      })),
+    },
+    {
+      title: "Kanban",
+      items: kanbanFilterOptions.map((option) => ({
+        id: `kanban-${option.value}`,
+        label: option.label,
+        active: pulls.getKanbanStatusFilters().includes(option.value),
+        onSelect: () => pulls.toggleKanbanStatusFilter(option.value),
+      })),
+    },
+  ]);
+  const compactFilterSections = $derived.by(() => [
+    ...toolbarFilterSections,
+    ...localFilterSections,
+  ]);
   const hasCompactFilterChanges = $derived(
-    pulls.getFilterState() !== "open" || groupingMode !== "byRepo",
+    pulls.getFilterState() !== "open"
+      || groupingMode !== "byRepo"
+      || pulls.getLocalFilterCount() > 0,
   );
   const useCompactFilters = $derived(
     sidebarWidth <= COMPACT_FILTER_MAX_WIDTH,
+  );
+  const useIconOnlyLocalFilters = $derived(
+    sidebarWidth <= LOCAL_FILTER_ICON_ONLY_MAX_WIDTH,
   );
 
   interface PullGroup {
@@ -220,7 +290,7 @@
   const selectedVisiblePR = $derived.by(() => {
     const sel = pulls.getSelectedPR();
     if (sel === null) return null;
-    const pr = pulls.getPulls().find(
+    const pr = visiblePulls.find(
       (p) => (p.repo_owner ?? "") === sel.owner
         && (p.repo_name ?? "") === sel.name
         && p.Number === sel.number
@@ -265,7 +335,7 @@
 <div class="pull-list">
   <div class="filter-bar" class:filter-bar--compact={useCompactFilters}>
     <Chip size="sm" uppercase={false} class="chip--muted list-count-chip">
-      {pulls.getPulls().length} PRs
+      {visiblePulls.length} PRs
     </Chip>
     <div class="state-toggle">
       {#each pullStateOptions as s (s)}
@@ -289,11 +359,27 @@
       <FilterDropdown
         label="Filters"
         title="Filters"
-        icon="more"
         active={hasCompactFilterChanges}
-        showBadge={false}
+        badgeCount={pulls.getLocalFilterCount()}
         sections={compactFilterSections}
-        minWidth="160px"
+        resetLabel="Reset view"
+        onReset={resetCompactView}
+        minWidth="190px"
+      />
+    </div>
+    <div
+      class="local-filter-menu"
+      class:local-filter-menu--icon-only={useIconOnlyLocalFilters}
+    >
+      <FilterDropdown
+        label="PR filters"
+        title="PR filters"
+        active={pulls.getLocalFilterCount() > 0}
+        badgeCount={pulls.getLocalFilterCount()}
+        sections={localFilterSections}
+        resetLabel="Clear filters"
+        onReset={pulls.clearLocalFilters}
+        minWidth="190px"
       />
     </div>
     {#if isSidebarToggleEnabled()}
@@ -353,14 +439,16 @@
       <p class="state-message">Loading…</p>
     {:else if pulls.getError() !== null && pulls.getPulls().length === 0}
       <p class="state-message state-message--error">Error: {pulls.getError()}</p>
-    {:else if pulls.getPulls().length === 0 && sync.getSyncState()?.running}
+    {:else if visiblePulls.length === 0 && sync.getSyncState()?.running && pulls.getPulls().length === 0}
       <div class="state-message sync-message">
         <span class="sync-dot"></span>
         Syncing from GitHub…
       </div>
-    {:else if pulls.getPulls().length === 0 && !sync.getSyncState()?.last_run_at}
+    {:else if visiblePulls.length === 0 && !sync.getSyncState()?.last_run_at && pulls.getPulls().length === 0}
       <p class="state-message">Waiting for first sync…</p>
-    {:else if pulls.getPulls().length === 0}
+    {:else if visiblePulls.length === 0 && pulls.getLocalFilterCount() > 0}
+      <p class="state-message">No pull requests match these filters.</p>
+    {:else if visiblePulls.length === 0}
       <p class="state-message">No pull requests found.</p>
     {:else}
       {#if groupedPulls !== null}
@@ -407,7 +495,7 @@
           </div>
         {/each}
       {:else}
-        {#each pulls.getPulls() as pr (pr.ID)}
+        {#each visiblePulls as pr (pr.ID)}
           {@const prRef = routeRefForPull(pr)}
           {@const prSelected = isSelected(prRef)}
           <PullItem
@@ -695,15 +783,43 @@
     transform-origin: left center;
   }
 
-  .compact-filter-menu :global(.filter-btn) {
-    width: 26px;
+  .local-filter-menu {
+    flex-shrink: 0;
+  }
+
+  .local-filter-menu--icon-only :global(.filter-btn) {
+    width: 34px;
     justify-content: center;
-    padding: 3px;
+    gap: 0;
+    padding-inline: 0;
+  }
+
+  .local-filter-menu--icon-only :global(.filter-trigger-label) {
+    display: none;
+  }
+
+  .local-filter-menu--icon-only :global(.filter-badge) {
+    position: absolute;
+    top: -5px;
+    right: -5px;
+  }
+
+  .compact-filter-menu :global(.filter-btn) {
+    width: 34px;
+    justify-content: center;
+    gap: 0;
+    padding-inline: 0;
   }
 
   .compact-filter-menu :global(.filter-trigger-label),
   .compact-filter-menu :global(.filter-trigger-detail) {
     display: none;
+  }
+
+  .compact-filter-menu :global(.filter-badge) {
+    position: absolute;
+    top: -5px;
+    right: -5px;
   }
 
   .state-btn {
@@ -755,6 +871,10 @@
 
   .filter-bar--compact .state-toggle,
   .filter-bar--compact .group-toggle {
+    display: none;
+  }
+
+  .filter-bar--compact .local-filter-menu {
     display: none;
   }
 

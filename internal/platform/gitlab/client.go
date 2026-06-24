@@ -28,6 +28,7 @@ type clientOptions struct {
 	baseURL           string
 	foregroundTimeout time.Duration
 	rateTracker       *ratelimit.RateTracker
+	disableRetries    bool
 }
 
 type Client struct {
@@ -42,6 +43,9 @@ type Client struct {
 	// client lifetime (user IDs are immutable).
 	userIDMu sync.Mutex
 	userIDs  map[string]int64
+
+	projectCloneURLMu sync.Mutex
+	projectCloneURLs  map[int64]string
 }
 
 type PreviewOptions struct {
@@ -81,6 +85,12 @@ func WithRateTracker(rateTracker *ratelimit.RateTracker) ClientOption {
 	}
 }
 
+func WithoutRetriesForTesting() ClientOption {
+	return func(opts *clientOptions) {
+		opts.disableRetries = true
+	}
+}
+
 func NewClient(host string, source tokenauth.Source, options ...ClientOption) (*Client, error) {
 	opts := clientOptions{
 		baseURL:           "https://" + strings.TrimRight(host, "/") + "/api/v4",
@@ -91,6 +101,9 @@ func NewClient(host string, source tokenauth.Source, options ...ClientOption) (*
 	}
 
 	clientOptions := []gitlab.ClientOptionFunc{gitlab.WithBaseURL(opts.baseURL)}
+	if opts.disableRetries {
+		clientOptions = append(clientOptions, gitlab.WithoutRetries())
+	}
 	baseTransport := http.DefaultTransport
 	if opts.rateTracker != nil {
 		baseTransport = &rateTrackingTransport{
@@ -119,6 +132,7 @@ func NewClient(host string, source tokenauth.Source, options ...ClientOption) (*
 		api:               api,
 		foregroundTimeout: opts.foregroundTimeout,
 		userIDs:           make(map[string]int64),
+		projectCloneURLs:  make(map[int64]string),
 	}, nil
 }
 
@@ -271,7 +285,7 @@ func (c *Client) PreviewNamespace(
 	if err == nil {
 		return result.finish(), nil
 	}
-	if !isGitLabStatus(err, http.StatusNotFound) {
+	if !isGitLabNotFound(err) {
 		return PreviewResult{}, mapGitLabError("preview_group", err)
 	}
 	if err := ctx.Err(); err != nil {
@@ -311,7 +325,12 @@ func (c *Client) ListOpenMergeRequests(
 			return nil, mapGitLabError("list_merge_requests", err)
 		}
 		for _, mr := range mrs {
-			out = append(out, NormalizeMergeRequest(normalizedRef, mr, nil))
+			normalized := NormalizeMergeRequest(normalizedRef, mr, nil)
+			normalized.HeadRepoCloneURL, err = c.optionalHeadRepoCloneURL(ctx, normalizedRef, mr.ProjectID, mr.SourceProjectID)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, normalized)
 		}
 		if resp == nil || resp.NextPage == 0 {
 			return out, nil
@@ -333,7 +352,72 @@ func (c *Client) GetMergeRequest(
 	if err != nil {
 		return platform.MergeRequest{}, mapGitLabError("get_merge_request", err)
 	}
-	return NormalizeDetailedMergeRequest(normalizedRef, mr), nil
+	normalized := NormalizeDetailedMergeRequest(normalizedRef, mr)
+	normalized.HeadRepoCloneURL, err = c.optionalHeadRepoCloneURL(ctx, normalizedRef, mr.ProjectID, mr.SourceProjectID)
+	if err != nil {
+		return platform.MergeRequest{}, err
+	}
+	return normalized, nil
+}
+
+func (c *Client) optionalHeadRepoCloneURL(
+	ctx context.Context,
+	ref platform.RepoRef,
+	targetProjectID int64,
+	sourceProjectID int64,
+) (string, error) {
+	cloneURL, err := c.headRepoCloneURL(ctx, ref, targetProjectID, sourceProjectID)
+	if err == nil {
+		return cloneURL, nil
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return "", ctxErr
+	}
+	if isUnavailableSourceProjectError(err) {
+		return "", nil
+	}
+	return "", err
+}
+
+func (c *Client) headRepoCloneURL(
+	ctx context.Context,
+	ref platform.RepoRef,
+	targetProjectID int64,
+	sourceProjectID int64,
+) (string, error) {
+	if sourceProjectID == 0 || sourceProjectID == targetProjectID || sourceProjectID == ref.PlatformID {
+		return ref.CloneURL, nil
+	}
+	return c.projectCloneURL(ctx, sourceProjectID)
+}
+
+func (c *Client) projectCloneURL(ctx context.Context, projectID int64) (string, error) {
+	c.projectCloneURLMu.Lock()
+	cached, ok := c.projectCloneURLs[projectID]
+	c.projectCloneURLMu.Unlock()
+	if ok {
+		return cached, nil
+	}
+
+	project, _, err := c.api.Projects.GetProject(
+		projectID,
+		nil,
+		gitlab.WithContext(ctx),
+		gitlab.WithRequestRetry(func(context.Context, *http.Response, error) (bool, error) {
+			return false, nil
+		}),
+	)
+	if err != nil || project == nil {
+		if err == nil {
+			err = errors.New("source project response was empty")
+		}
+		return "", mapSourceProjectLookupError(err)
+	}
+	cloneURL := strings.TrimSpace(project.HTTPURLToRepo)
+	c.projectCloneURLMu.Lock()
+	c.projectCloneURLs[projectID] = cloneURL
+	c.projectCloneURLMu.Unlock()
+	return cloneURL, nil
 }
 
 func (c *Client) ListMergeRequestEvents(
@@ -815,12 +899,58 @@ func mapGitLabErrorForHost(platformHost, capability string, err error) error {
 	}
 }
 
+func mapSourceProjectLookupError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, gitlab.ErrNotFound) {
+		return err
+	}
+	var gitlabErr *gitlab.ErrorResponse
+	if errors.As(err, &gitlabErr) {
+		switch {
+		case gitlabErr.HasStatusCode(http.StatusUnauthorized),
+			gitlabErr.HasStatusCode(http.StatusForbidden),
+			gitlabErr.HasStatusCode(http.StatusNotFound),
+			gitlabErr.HasStatusCode(http.StatusTooManyRequests):
+			return mapGitLabError("get_source_project", err)
+		}
+	}
+	return err
+}
+
+// isGitLabStatus reports whether err carries a typed GitLab response with the
+// given status. It matches only on the typed *gitlab.ErrorResponse (errors.As
+// unwraps platform.Error). It deliberately does NOT fall back to substring
+// matching on err.Error(): that string embeds the request URL, so an unrelated
+// host:port (for example an ephemeral httptest port like 127.0.0.1:40404, or a
+// project ID) could contain "404"/"403" and misclassify a transient 429/5xx as
+// a not-found/forbidden error that callers then silently swallow.
+//
+// Note: go-gitlab does not return a typed *gitlab.ErrorResponse for 404s; it
+// returns the sentinel gitlab.ErrNotFound. Use isGitLabNotFound for those.
 func isGitLabStatus(err error, status int) bool {
 	var gitlabErr *gitlab.ErrorResponse
-	if errors.As(err, &gitlabErr) && gitlabErr.HasStatusCode(status) {
-		return true
+	return errors.As(err, &gitlabErr) && gitlabErr.HasStatusCode(status)
+}
+
+// isGitLabNotFound reports whether err is a GitLab 404. go-gitlab's
+// CheckResponse returns the sentinel gitlab.ErrNotFound (a plain error, not a
+// *gitlab.ErrorResponse) for every 404, so errors.Is is the only reliable
+// detection. errors.Is unwraps platform.Error, so wrapped errors match too.
+func isGitLabNotFound(err error) bool {
+	return errors.Is(err, gitlab.ErrNotFound)
+}
+
+func isUnavailableSourceProjectError(err error) bool {
+	var platformErr *platform.Error
+	if errors.As(err, &platformErr) {
+		if platformErr.Code == platform.ErrCodePermissionDenied ||
+			platformErr.Code == platform.ErrCodeNotFound {
+			return true
+		}
 	}
-	return strings.Contains(err.Error(), strconv.Itoa(status))
+	return isGitLabNotFound(err) || isGitLabStatus(err, http.StatusForbidden)
 }
 
 func partialError(namespace string, page int64, err error) PartialError {

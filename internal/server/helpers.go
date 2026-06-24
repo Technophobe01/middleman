@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"go.kenn.io/middleman/internal/db"
+	ghclient "go.kenn.io/middleman/internal/github"
 	"go.kenn.io/middleman/internal/platform"
 )
 
@@ -140,9 +141,10 @@ func (s *Server) lookupRepoMap(ctx context.Context) (map[int64]db.Repo, error) {
 
 // filterConfiguredRepos returns only repos that are currently tracked.
 func (s *Server) filterConfiguredRepos(repos []db.Repo) []db.Repo {
+	tracked := s.trackedConfiguredRepoSet()
 	filtered := make([]db.Repo, 0, len(repos))
 	for _, r := range repos {
-		if s.syncer.IsTrackedRepoOnHost(r.Owner, r.Name, r.PlatformHost) {
+		if _, ok := tracked[configuredDBRepoKey(r)]; ok {
 			filtered = append(filtered, r)
 		}
 	}
@@ -177,14 +179,39 @@ func (s *Server) lookupRepo(
 func (s *Server) filterConfiguredRepoSummaries(
 	summaries []db.RepoSummary,
 ) []db.RepoSummary {
+	tracked := s.trackedConfiguredRepoSet()
 	filtered := make([]db.RepoSummary, 0, len(summaries))
 	for _, summary := range summaries {
 		repo := summary.Repo
-		if s.syncer.IsTrackedRepoOnHost(repo.Owner, repo.Name, repo.PlatformHost) {
+		if _, ok := tracked[configuredDBRepoKey(repo)]; ok {
 			filtered = append(filtered, summary)
 		}
 	}
 	return filtered
+}
+
+func (s *Server) trackedConfiguredRepoSet() map[string]struct{} {
+	trackedRepos := s.syncer.TrackedRepos()
+	tracked := make(map[string]struct{}, len(trackedRepos))
+	for _, repo := range trackedRepos {
+		tracked[trackedRepoKey(repo)] = struct{}{}
+	}
+	return tracked
+}
+
+func configuredDBRepoKey(repo db.Repo) string {
+	return trackedRepoKey(ghclient.RepoRef{
+		Platform:     repoProviderKind(repo),
+		PlatformHost: repoProviderHost(repo),
+		Owner:        repo.Owner,
+		Name:         repo.Name,
+		RepoPath:     repo.RepoPath,
+	})
+}
+
+func (s *Server) isConfiguredRepoTracked(repo db.Repo) bool {
+	_, ok := s.trackedConfiguredRepoSet()[configuredDBRepoKey(repo)]
+	return ok
 }
 
 // lookupRepoID resolves a repository from owner/name inputs and returns a
@@ -261,20 +288,36 @@ func (s *Server) lookupIssueID(ctx context.Context, ref repoNumberPathRef) (int6
 	return issue.ID, nil
 }
 
-// parseRepoFilter splits the repo query parameter when it is in owner/name or
-// platform_host/repo_path form and otherwise returns empty parts so callers can
-// ignore invalid input. Repo paths can contain slashes, so hosted filters keep
-// everything after the host together as repoPath.
-func parseRepoFilter(repo string) (platformHost, owner, name, repoPath string) {
-	parts := strings.Split(strings.Trim(repo, "/ "), "/")
+// parseRepoFilter splits the shared repo query parameter used by pull, issue,
+// and activity list endpoints. The accepted wire forms are owner/name,
+// platform_host/repo_path, and provider|platform_host/repo_path. Slash-qualified
+// provider labels such as provider/platform_host/repo_path are display-only and
+// intentionally parse as host-qualified values to keep nested repo paths
+// unambiguous. Repo paths can contain slashes, so hosted filters keep everything
+// after the host together as repoPath.
+func parseRepoFilter(repo string) (provider, platformHost, owner, name, repoPath string) {
+	repo = strings.Trim(repo, "/ ")
+	if providerPart, hostedPath, ok := strings.Cut(repo, "|"); ok {
+		provider := strings.ToLower(strings.TrimSpace(providerPart))
+		if _, ok := platform.MetadataFor(platform.Kind(provider)); !ok {
+			return "", "", "", "", ""
+		}
+		parts := strings.Split(strings.Trim(hostedPath, "/ "), "/")
+		if len(parts) < 2 {
+			return "", "", "", "", ""
+		}
+		return provider, parts[0], "", "", strings.Join(parts[1:], "/")
+	}
+
+	parts := strings.Split(repo, "/")
 	switch len(parts) {
 	case 2:
-		return "", parts[0], parts[1], ""
+		return "", "", parts[0], parts[1], ""
 	default:
 		if len(parts) >= 3 {
-			return parts[0], "", "", strings.Join(parts[1:], "/")
+			return "", parts[0], "", "", strings.Join(parts[1:], "/")
 		}
-		return "", "", "", ""
+		return "", "", "", "", ""
 	}
 }
 
@@ -282,14 +325,16 @@ func parseRepoFilters(repo string) []db.RepoFilter {
 	parts := strings.Split(repo, ",")
 	filters := make([]db.RepoFilter, 0, len(parts))
 	for _, part := range parts {
-		platformHost, owner, name, repoPath := parseRepoFilter(part)
+		provider, platformHost, owner, name, repoPath := parseRepoFilter(part)
 		if repoPath != "" {
 			filters = append(filters, db.RepoFilter{
+				Platform:     provider,
 				PlatformHost: platformHost,
 				RepoPath:     repoPath,
 			})
 		} else if owner != "" {
 			filters = append(filters, db.RepoFilter{
+				Platform:     provider,
 				PlatformHost: platformHost,
 				RepoOwner:    owner,
 				RepoName:     name,

@@ -1,7 +1,8 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/svelte";
-import { afterEach, describe, expect, it, vi } from "vite-plus/test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import type { PullDetail } from "../../api/types.js";
 import { ACTIONS_KEY, API_CLIENT_KEY, NAVIGATE_KEY, STORES_KEY, UI_CONFIG_KEY } from "../../context.js";
+import { createDetailActivityViewStore } from "../../stores/detail-activity-view.svelte.js";
 import PullDetailComponent from "./PullDetail.svelte";
 
 const capabilities = {
@@ -132,6 +133,12 @@ function renderPullDetail(
     GET: vi.fn(async () => ({
       data: repoSettings,
     })),
+    POST: vi.fn(async () => ({
+      data: {},
+    })),
+  },
+  options = {
+    hideWorkspaceAction: true,
   },
 ) {
   const detailStore = {
@@ -159,7 +166,7 @@ function renderPullDetail(
       provider: "github",
       platformHost: "github.com",
       repoPath: "acme/widget",
-      hideWorkspaceAction: true,
+      hideWorkspaceAction: options.hideWorkspaceAction,
     },
     context: new Map<symbol, unknown>([
       [API_CLIENT_KEY, apiClient],
@@ -169,6 +176,7 @@ function renderPullDetail(
           detail: detailStore,
           pulls: { loadPulls: vi.fn() },
           activity: { loadActivity: vi.fn() },
+          detailActivityView: createDetailActivityViewStore(),
         },
       ],
       [ACTIONS_KEY, { pull: [] }],
@@ -188,6 +196,10 @@ function getActionMenuLabelsButton(): HTMLButtonElement {
 }
 
 describe("PullDetail approvals", () => {
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
   afterEach(() => {
     cleanup();
     vi.useRealTimers();
@@ -208,6 +220,21 @@ describe("PullDetail approvals", () => {
     await fireEvent.mouseDown(document.body);
 
     expect(document.querySelector(".approval-popup")).toBeNull();
+  });
+
+  it("explains that creating a workspace enables agent sessions", () => {
+    renderPullDetail(pullDetail(), undefined, undefined, { hideWorkspaceAction: false });
+
+    const buttons = screen.getAllByRole("button", { name: "Create Workspace" });
+    expect(buttons.length).toBeGreaterThan(0);
+    for (const button of buttons) {
+      expect(button.getAttribute("title")).toContain("PR head worktree");
+      expect(button.getAttribute("title")).toContain("launch agents");
+      expect(button.getAttribute("title")).toContain("local review sessions");
+      const descriptionId = button.getAttribute("aria-describedby");
+      expect(descriptionId).toBeTruthy();
+      expect(document.getElementById(descriptionId ?? "")?.textContent).toContain(button.getAttribute("title"));
+    }
   });
 
   it("normalizes backend review decision casing before enabling approver popup", async () => {
@@ -459,6 +486,39 @@ describe("PullDetail approvals", () => {
     expect(labelsIcon?.getAttribute("height")).toBe("14");
   });
 
+  it("uses the shared View menu to persist compact activity rows", async () => {
+    const detail = pullDetail();
+    detail.events = [
+      {
+        ID: 30,
+        MergeRequestID: 1,
+        PlatformID: 30,
+        PlatformExternalID: "",
+        EventType: "issue_comment",
+        Author: "alice",
+        Summary: "",
+        Body: "Compact **activity** preview",
+        MetadataJSON: "",
+        CreatedAt: "2026-05-01T12:03:00Z",
+        DedupeKey: "comment-30",
+        DirectURL: "",
+        ThreadID: null,
+        Resolvable: false,
+        Resolved: false,
+      },
+    ];
+    const { container } = renderPullDetail(detail);
+
+    expect(screen.queryByRole("button", { name: /filters/i })).toBeNull();
+
+    await fireEvent.click(screen.getByRole("button", { name: /view/i }));
+    await fireEvent.click(screen.getByRole("button", { name: /compact/i }));
+
+    expect(localStorage.getItem("middleman-detail-activity-view")).toBe("compact");
+    expect(container.querySelectorAll(".event-card--compact-row")).toHaveLength(1);
+    expect(container.textContent).toContain("Compact activity preview");
+  });
+
   const warningCases = [
     {
       name: "does not describe GitHub unstable mergeability as required checks",
@@ -594,6 +654,40 @@ describe("PullDetail approvals", () => {
     expect(button.title).toBe("No user credential for writes on github.com");
   });
 
+  it("opens a state menu from the open chip and marks a pull request as draft", async () => {
+    const detail = pullDetail();
+    detail.repo.capabilities = {
+      ...capabilities,
+      draft_mutation: true,
+    } as PullDetail["repo"]["capabilities"];
+    const apiClient = {
+      GET: vi.fn(async () => ({
+        data: {
+          AllowSquashMerge: false,
+          AllowMergeCommit: false,
+          AllowRebaseMerge: false,
+          ViewerCanMerge: true,
+        },
+      })),
+      POST: vi.fn(async () => ({ data: { state: "draft" } })),
+    };
+
+    const { detailStore } = renderPullDetail(detail, undefined, apiClient);
+
+    await fireEvent.click(screen.getByRole("button", { name: "State: Open" }));
+    await fireEvent.click(screen.getByRole("menuitem", { name: "Draft" }));
+
+    expect(apiClient.POST).toHaveBeenCalledWith("/pulls/{provider}/{owner}/{name}/{number}/github-state", {
+      params: { path: { provider: "github", owner: "acme", name: "widget", number: 1 } },
+      body: { state: "draft" },
+    });
+    expect(detailStore.loadDetail).toHaveBeenCalledWith("acme", "widget", 1, {
+      provider: "github",
+      platformHost: "github.com",
+      repoPath: "acme/widget",
+    });
+  });
+
   it("gates actions from the detail payload before repo settings resolve", async () => {
     // The detail payload carries repo.operations as the primary
     // source; the separate /repo settings request is only a fallback.
@@ -646,5 +740,87 @@ describe("PullDetail approvals", () => {
     });
     expect(button.disabled).toBe(true);
     expect(button.title).toBe("No user credential for writes on github.com");
+  });
+
+  it("opens the merge modal in deferred mode when CI is still pending", async () => {
+    const detail = pullDetail();
+    detail.repo.capabilities.merge_mutation = true;
+    detail.merge_request.CIStatus = "pending";
+    detail.merge_request.CIChecksJSON = JSON.stringify([
+      {
+        name: "build",
+        status: "in_progress",
+        conclusion: "",
+        url: "https://example.com/build",
+        app: "GitHub Actions",
+      },
+    ]);
+
+    renderPullDetail(detail, {
+      AllowSquashMerge: true,
+      AllowMergeCommit: false,
+      AllowRebaseMerge: false,
+      ViewerCanMerge: true,
+    });
+
+    await fireEvent.click(await screen.findByRole("button", { name: "Squash and merge" }));
+
+    expect(screen.getByRole("heading", { name: "Merge Pull Request" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Merge after CI is complete" })).toBeTruthy();
+  });
+
+  it("opens the merge modal in deferred mode when aggregate CI is pending without check rows", async () => {
+    const detail = pullDetail();
+    detail.repo.capabilities.merge_mutation = true;
+    detail.merge_request.CIStatus = "pending";
+    detail.merge_request.CIChecksJSON = "";
+
+    renderPullDetail(detail, {
+      AllowSquashMerge: true,
+      AllowMergeCommit: false,
+      AllowRebaseMerge: false,
+      ViewerCanMerge: true,
+    });
+
+    await fireEvent.click(await screen.findByRole("button", { name: "Squash and merge" }));
+
+    expect(screen.getByRole("heading", { name: "Merge Pull Request" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Merge after CI is complete" })).toBeTruthy();
+  });
+
+  it("opens the merge modal in normal mode when aggregate CI has already failed", async () => {
+    const detail = pullDetail();
+    detail.repo.capabilities.merge_mutation = true;
+    detail.merge_request.CIStatus = "failure";
+    detail.merge_request.CIChecksJSON = JSON.stringify([
+      {
+        name: "build",
+        status: "completed",
+        conclusion: "failure",
+        url: "https://example.com/build",
+        app: "GitHub Actions",
+      },
+      {
+        name: "integration",
+        status: "in_progress",
+        conclusion: "",
+        url: "https://example.com/integration",
+        app: "GitHub Actions",
+      },
+    ]);
+
+    renderPullDetail(detail, {
+      AllowSquashMerge: true,
+      AllowMergeCommit: false,
+      AllowRebaseMerge: false,
+      ViewerCanMerge: true,
+    });
+
+    await fireEvent.click(await screen.findByRole("button", { name: "Squash and merge" }));
+
+    expect(screen.getByRole("heading", { name: "Merge Pull Request" })).toBeTruthy();
+    // A failed aggregate with a still-running check must not route to deferred
+    // merge, since the backend would reject that with a 409.
+    expect(screen.queryByRole("button", { name: "Merge after CI is complete" })).toBeNull();
   });
 });

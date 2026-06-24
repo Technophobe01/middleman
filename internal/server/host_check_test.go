@@ -1,8 +1,10 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -353,4 +355,36 @@ func TestParseForwardedHost(t *testing.T) {
 			})
 		}
 	})
+}
+
+// TestHostCheckEphemeralPortFollowsListener pins the port-0 contract:
+// a config bind of 127.0.0.1:0 means "kernel-assigned", so Serve must
+// repoint the accept-set at the actual bound port — otherwise every
+// request to an ephemeral-port daemon is rejected.
+func TestHostCheckEphemeralPortFollowsListener(t *testing.T) {
+	assert := Assert.New(t)
+	require := require.New(t)
+	srv := setupHostCheckServer(t, HostCheckOptions{
+		Bind: config.HostKey{Host: "127.0.0.1", Port: "0"},
+	})
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(err)
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Shutdown(context.Background()) })
+
+	resp, err := http.Get("http://" + ln.Addr().String() + "/healthz")
+	require.NoError(err)
+	defer resp.Body.Close()
+	assert.Equal(http.StatusOK, resp.StatusCode)
+
+	// The accept-set follows the real port — other ports still reject.
+	req, err := http.NewRequest(
+		http.MethodGet, "http://"+ln.Addr().String()+"/healthz", nil,
+	)
+	require.NoError(err)
+	req.Host = "127.0.0.1:9"
+	wrong, err := http.DefaultClient.Do(req)
+	require.NoError(err)
+	defer wrong.Body.Close()
+	assert.Equal(http.StatusForbidden, wrong.StatusCode)
 }

@@ -119,7 +119,12 @@ make vet        # go vet
 
 ### End-to-End Tests
 
-**E2E tests are non-negotiable.** Every major feature, bug fix, and refactor must include e2e tests that exercise the full stack (HTTP API with real SQLite). Even small changes merit e2e coverage when they touch API behavior, data flow between layers, or anything a user would notice if it broke. When in doubt, write the e2e test — the cost of a missing one is always higher than the cost of writing it.
+Coverage of real behavior is non-negotiable; the lane is chosen by the behavior under test, not by a blanket "must have e2e" rule. Avoid the expensive lanes unless they add distinct confidence. Four independent axes:
+
+- **Component or app harness first.** UI-owned behavior such as filtering, sorting, hidden/disabled states, menu contents, route-derived view state, and store/component data flow should usually be covered in Vitest. Use **Vitest + jsdom** (`vp test`) when layout/browser primitives are not material; mount the real `App.svelte` via `frontend/src/test/appHarness.ts` when routing matters.
+- **Vitest browser before Playwright for real DOM needs.** Use `*.browser.svelte.ts` / `vitest-browser-svelte` (`vp test --project browser`) when the behavior needs a real browser DOM, native focus/keyboard semantics, localStorage/matchMedia, computed styles, or layout, but does not need an external HTTP server or multi-page Playwright workflow.
+- **Playwright/full-stack only for boundaries they uniquely prove.** Reserve Playwright for screenshots/video, `getBoundingClientRect`, scroll/sticky/overflow geometry, container queries, pointer drag, viewport emulation, canvas/xterm, computed CSS pixels, or workflows that must exercise browser navigation against a running app. Use `frontend/tests/e2e-full/` or `internal/server/` Go tests when the behavior depends on backend persistence, sync, capabilities, normalization, wire shape, or middleware. If a real-backend API/server test already proves the runtime path and a component/browser test proves the UI presentation, do not require duplicate full-stack e2e just to click through the same data.
+- **Mocking is the exception.** Do not assert backend-computed values through a hand-written fixture. Mock the API (`frontend/src/test/mockApiFetch.ts`, never fork the Playwright copy) only when the behavior is owned by the frontend or the seeded server cannot produce the state.
 
 ### Test Guidelines
 
@@ -135,6 +140,12 @@ make vet        # go vet
 - Use `openTestDB(t)` helper for database tests
 - All tests use `t.TempDir()` for temp directories
 - Tests should be fast and isolated
+- Shell script tests must exercise observable behavior by running the script
+  against controlled inputs and asserting outputs, side effects, or exit
+  codes. Do not add bash tests that grep shell scripts, workflows, config
+  files, or docs for expected implementation text; those checks are usually
+  tautological and should be replaced with real execution, parser/tool-native
+  validation, or a documented manual release check.
 - Do not run tests with `-v` (especially `go test`) — default output has enough signal to debug failures, and verbose output wastes tokens. Only use `-v` if the user asks for it or a failure genuinely needs the extra detail
 - For provider-specific live or container test fixtures used when fake transports can't catch endpoint or auth drift, follow `context/testing.md` and `context/platform-sync-invariants.md`. The GitHub GraphQL gate is `MIDDLEMAN_LIVE_GITHUB_TESTS=1`.
 
@@ -170,7 +181,7 @@ make vet        # go vet
 - Use conventional commit messages whose subject explains the reason or user-visible outcome, not just the mechanical change. Good subjects answer "why does this commit exist?" (for example, `fix: restore workspace activity for launched agents`), while vague mechanics such as `fix: run agents under tmux` are not acceptable on their own
 - Commit bodies must add any important context about the bug, regression, constraint, or tradeoff that motivated the change; do not rely on the diff to explain intent
 - Run tests before committing when applicable
-- Before pushing any frontend change, you must have run the full affected Playwright e2e suite locally after the final frontend/test edit; focused component tests, type checks, and CI-only verification are not enough.
+- Before pushing any frontend change, you must have run the full affected suite locally after the final frontend/test edit — the full `vp test` Vitest run, plus the full affected Playwright e2e suite whenever the change touches Playwright specs or the shared mock fixtures they rely on; type checks and CI-only verification are not enough.
 - Never push new workstreams unless explicitly asked. When addressing review feedback or CI failures on an existing PR, an agent may push after the fix is implemented and relevant local validation has run.
 
 ## Pull Requests

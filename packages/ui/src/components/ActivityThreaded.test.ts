@@ -53,7 +53,9 @@ function branchActivityItem(id: string, overrides: Partial<ActivityItem> = {}): 
 const expanded = vi.hoisted(() => ({ value: true }));
 const groupByRepo = vi.hoisted(() => ({ value: false }));
 const hideOrgName = vi.hoisted(() => ({ value: false }));
+const rollUpCommits = vi.hoisted(() => ({ value: false }));
 const toggleThreadItem = vi.hoisted(() => vi.fn());
+const markNotificationSeen = vi.hoisted(() => vi.fn(async () => undefined));
 
 vi.mock("../context.js", () => ({
   getStores: () => ({
@@ -64,6 +66,8 @@ vi.mock("../context.js", () => ({
     activity: {
       isThreadItemExpanded: () => expanded.value,
       toggleThreadItem,
+      getRollUpCommits: () => rollUpCommits.value,
+      markNotificationSeen,
     },
   }),
 }));
@@ -74,6 +78,7 @@ describe("ActivityThreaded collapse", () => {
     expanded.value = true;
     groupByRepo.value = false;
     hideOrgName.value = false;
+    rollUpCommits.value = false;
     toggleThreadItem.mockClear();
   });
 
@@ -115,6 +120,8 @@ describe("ActivityThreaded collapse", () => {
   });
 
   it("renders branch activity as top-level rows interleaved with item threads", async () => {
+    rollUpCommits.value = true;
+
     const { container } = render(ActivityThreaded, {
       props: {
         items: [
@@ -149,6 +156,38 @@ describe("ActivityThreaded collapse", () => {
     expect(container.textContent).not.toContain("main updates on acme/widgets");
     expect(container.textContent).not.toContain("#0");
     expect(container.querySelector(".branch-activity-row .thread-caret")).toBeNull();
+  });
+
+  it("shows default-branch commits as individual rows when commit roll-up is off", () => {
+    const { container } = render(ActivityThreaded, {
+      props: {
+        items: [
+          branchActivityItem("c3", {
+            created_at: "2026-04-27T12:03:00Z",
+            body_preview: "Ship direct main commit 3",
+            commit_sha: "3333333333333333333333333333333333333333",
+          }),
+          branchActivityItem("c2", {
+            created_at: "2026-04-27T12:02:00Z",
+            body_preview: "Ship direct main commit 2",
+            commit_sha: "2222222222222222222222222222222222222222",
+          }),
+          branchActivityItem("c1", {
+            created_at: "2026-04-27T12:01:00Z",
+            body_preview: "Ship direct main commit 1",
+            commit_sha: "1111111111111111111111111111111111111111",
+          }),
+        ],
+        onSelectItem: undefined,
+      },
+    });
+
+    const rows = Array.from(container.querySelectorAll(".branch-activity-row"));
+    expect(rows).toHaveLength(3);
+    expect(rows[0]?.textContent).toContain("Ship direct main commit 3");
+    expect(rows[1]?.textContent).toContain("Ship direct main commit 2");
+    expect(rows[2]?.textContent).toContain("Ship direct main commit 1");
+    expect(container.textContent).not.toContain("3 commits");
   });
 
   it("labels commit rows without the branch type or duplicated commit text", () => {
@@ -300,6 +339,38 @@ describe("ActivityThreaded collapse", () => {
     expect(container.textContent).not.toContain("acme/widgets");
   });
 
+  it("keeps hidden-org grouped activity headers distinguishable", () => {
+    groupByRepo.value = true;
+    hideOrgName.value = true;
+
+    const { container } = render(ActivityThreaded, {
+      props: {
+        items: [
+          activityItem("acme-widgets"),
+          activityItem("platform-widgets", {
+            id: "platform-widgets",
+            item_number: 2,
+            repo_owner: "platform",
+            repo_name: "widgets",
+            repo: {
+              provider: "gitlab",
+              platform_host: "gitlab.example.com",
+              owner: "platform",
+              name: "widgets",
+              repo_path: "platform/widgets",
+            },
+          }),
+        ],
+        onSelectItem: undefined,
+      },
+    });
+
+    const repoNames = Array.from(container.querySelectorAll(".repo-header .repo-name")).map((el) =>
+      el.textContent?.trim(),
+    );
+    expect(repoNames).toEqual(["acme/widgets", "platform/widgets"]);
+  });
+
   it("keeps force-push rows as provider compare links", async () => {
     const onSelectBranchCommit = vi.fn();
     const open = vi.spyOn(window, "open").mockImplementation(() => null);
@@ -331,6 +402,95 @@ describe("ActivityThreaded collapse", () => {
       "_blank",
       "noopener",
     );
+    open.mockRestore();
+  });
+});
+
+describe("ActivityThreaded notification events", () => {
+  afterEach(() => {
+    cleanup();
+    expanded.value = true;
+    markNotificationSeen.mockClear();
+  });
+
+  it("labels a notification event by its reason and marks it seen", async () => {
+    const notif = activityItem("ntf:42", {
+      activity_type: "notification",
+      item_state: "unread",
+      body_preview: "review_requested",
+    });
+    const { container, getByRole } = render(ActivityThreaded, {
+      props: { items: [notif], onSelectItem: undefined },
+    });
+
+    expect(container.textContent).toContain("Review requested");
+    const btn = getByRole("button", { name: "Mark notification seen" });
+    await fireEvent.click(btn);
+    expect(markNotificationSeen).toHaveBeenCalledTimes(1);
+    expect(markNotificationSeen.mock.calls[0]![0]).toMatchObject({ id: "ntf:42" });
+  });
+
+  it("omits the seen control once a notification is read", () => {
+    const notif = activityItem("ntf:43", {
+      activity_type: "notification",
+      item_state: "read",
+      body_preview: "mention",
+    });
+    const { container, queryByRole } = render(ActivityThreaded, {
+      props: { items: [notif], onSelectItem: undefined },
+    });
+
+    expect(container.textContent).toContain("Mentioned");
+    expect(queryByRole("button", { name: "Mark notification seen" })).toBeNull();
+  });
+
+  it("opens the web URL for a notification without a PR/issue subject", async () => {
+    const onSelectItem = vi.fn();
+    const open = vi.spyOn(window, "open").mockImplementation(() => null);
+    const notif = activityItem("ntf:44", {
+      activity_type: "notification",
+      item_state: "read",
+      item_type: "release",
+      item_number: 0,
+      body_preview: "subscribed",
+      activity_url: "https://github.com/acme/widgets/releases/tag/v1.2.3",
+    });
+
+    const { container } = render(ActivityThreaded, {
+      props: { items: [notif], onSelectItem },
+    });
+    const row = container.querySelector(".event-row");
+    expect(row).not.toBeNull();
+    await fireEvent.click(row!);
+
+    expect(onSelectItem).not.toHaveBeenCalled();
+    expect(open).toHaveBeenCalledWith("https://github.com/acme/widgets/releases/tag/v1.2.3", "_blank", "noopener");
+    open.mockRestore();
+  });
+
+  it("opens the web URL when the top-level notification group row is clicked", async () => {
+    const onSelectItem = vi.fn();
+    const open = vi.spyOn(window, "open").mockImplementation(() => null);
+    const notif = activityItem("ntf:45", {
+      activity_type: "notification",
+      item_state: "read",
+      item_type: "release",
+      item_number: 0,
+      body_preview: "subscribed",
+      activity_url: "https://github.com/acme/widgets/releases/tag/v2.0.0",
+    });
+
+    const { container } = render(ActivityThreaded, {
+      props: { items: [notif], onSelectItem },
+    });
+    const row = container.querySelector(".item-row");
+    expect(row).not.toBeNull();
+    await fireEvent.click(row!);
+
+    // The top-level group row must not reopen the invalid #0 detail
+    // drawer; it follows the provider URL like the expanded event row.
+    expect(onSelectItem).not.toHaveBeenCalled();
+    expect(open).toHaveBeenCalledWith("https://github.com/acme/widgets/releases/tag/v2.0.0", "_blank", "noopener");
     open.mockRestore();
   });
 });

@@ -147,7 +147,7 @@ afterEach(() => {
 });
 
 describe("Provider events store wiring", () => {
-  it("passes onDataChanged that refreshes pulls, issues, and activity", () => {
+  it("passes onDataChanged that refreshes the core stores", () => {
     render(Provider, { props: { client: stubClient } });
 
     expect(captured.store).not.toBeNull();

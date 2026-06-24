@@ -134,7 +134,7 @@ func TestWriteRuntimeMetadataRecordsBoundTCPPort(t *testing.T) {
 		require.NoError(ln.Close())
 	})
 
-	require.NoError(writeRuntimeMetadata(lockHandle, ln))
+	require.NoError(writeRuntimeMetadata(lockHandle, ln, dataDir, "/", false))
 
 	data, err := os.ReadFile(runtimelock.MetadataPath(dataDir))
 	require.NoError(err)
@@ -154,7 +154,10 @@ func TestWriteRuntimeMetadataRejectsNonTCPListener(t *testing.T) {
 		require.NoError(t, lockHandle.Release())
 	})
 
-	err = writeRuntimeMetadata(lockHandle, fakeListener{addr: fakeAddr("not-an-address")})
+	err = writeRuntimeMetadata(
+		lockHandle, fakeListener{addr: fakeAddr("not-an-address")},
+		dataDir, "/", false,
+	)
 	require.Error(t, err)
 	Assert.Contains(t, err.Error(), "non-TCP")
 }
@@ -258,6 +261,7 @@ func TestResolveStartupReposExpandsConfiguredGlobs(t *testing.T) {
 	)
 
 	assert.Equal([]ghclient.RepoRef{{
+		Platform:     "github",
 		Owner:        "roborev-dev",
 		Name:         "middleman",
 		PlatformHost: "github.com",
@@ -295,6 +299,7 @@ func TestResolveStartupReposKeepsExactReposWhenResolutionFails(t *testing.T) {
 	)
 
 	assert.Equal([]ghclient.RepoRef{{
+		Platform:     "github",
 		Owner:        "roborev-dev",
 		Name:         "middleman",
 		PlatformHost: "github.com",
@@ -322,12 +327,20 @@ func TestResolveStartupReposFallsBackToDBForOfflineGlobs(t *testing.T) {
 		ctx, cfg, mustProviderRegistry(t, nil), database,
 	)
 
-	assert.Len(repos, 2)
-	names := make([]string, len(repos))
-	for i, r := range repos {
-		names[i] = r.Name
-	}
-	assert.ElementsMatch([]string{"widgets", "tools"}, names)
+	assert.ElementsMatch([]ghclient.RepoRef{
+		{
+			Platform:     platform.KindGitHub,
+			Owner:        "acme",
+			Name:         "widgets",
+			PlatformHost: "github.com",
+		},
+		{
+			Platform:     platform.KindGitHub,
+			Owner:        "acme",
+			Name:         "tools",
+			PlatformHost: "github.com",
+		},
+	}, repos)
 }
 
 func TestResolveStartupReposUsesProviderRegistryForGitLab(t *testing.T) {

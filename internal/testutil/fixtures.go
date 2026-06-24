@@ -10,7 +10,9 @@ import (
 
 	gh "github.com/google/go-github/v84/github"
 	"github.com/stretchr/testify/require"
+
 	"go.kenn.io/middleman/internal/db"
+	ghclient "go.kenn.io/middleman/internal/github"
 )
 
 // SeedResult holds references to seeded data for use in E2E tests.
@@ -32,6 +34,14 @@ func SeedFixtures(ctx context.Context, d *db.DB) (*SeedResult, error) {
 	toolsID, err := d.UpsertRepo(ctx, db.GitHubRepoIdentity("github.com", "acme", "tools"))
 	if err != nil {
 		return nil, fmt.Errorf("upsert acme/tools: %w", err)
+	}
+	const toolsCloneURL = "https://github.com/acme/tools.git"
+	if err := d.UpdateRepoProviderMetadata(ctx, toolsID, db.RepoProviderMetadata{
+		WebURL:        "https://github.com/acme/tools",
+		CloneURL:      toolsCloneURL,
+		DefaultBranch: "main",
+	}); err != nil {
+		return nil, fmt.Errorf("update acme/tools metadata: %w", err)
 	}
 	_, err = d.UpsertRepo(ctx, db.GitHubRepoIdentity("github.com", "acme", "archived"))
 	if err != nil {
@@ -95,7 +105,8 @@ func SeedFixtures(ctx context.Context, d *db.DB) (*SeedResult, error) {
 		"- [ ] Cmd+K opens palette, focus lands in the search input\n" +
 		"- [ ] Tab/Shift+Tab cycles within the palette dialog only\n" +
 		"- [ ] `>settings` + Enter navigates to /settings\n" +
-		"- [x] Cache invalidates on widget update\n"
+		"- [x] Cache invalidates on widget update\n" +
+		"- [x] Small, scoped PR (< 500 total lines excluding tests); or opened as Draft with a plan on how to break it into smaller pieces\n"
 	w1ID, err := d.UpsertMergeRequest(ctx, &db.MergeRequest{
 		RepoID:            widgetsID,
 		PlatformID:        1001,
@@ -411,6 +422,7 @@ func SeedFixtures(ctx context.Context, d *db.DB) (*SeedResult, error) {
 			State:             "open",
 			HeadBranch:        pr.head,
 			BaseBranch:        pr.base,
+			HeadRepoCloneURL:  toolsCloneURL,
 			CIStatus:          pr.ci,
 			ReviewDecision:    pr.review,
 			MergeableState:    pr.mergeableState,
@@ -881,6 +893,84 @@ func SeedFixtures(ctx context.Context, d *db.DB) (*SeedResult, error) {
 		return nil, fmt.Errorf("upsert tools issue#5 events: %w", err)
 	}
 
+	notifPRNumber := 1
+	notifIssueNumber := 5
+	seededNotifications := []db.Notification{
+		{
+			Platform:               "github",
+			PlatformHost:           "github.com",
+			PlatformNotificationID: "notif-widgets-1",
+			RepoID:                 &widgetsID,
+			RepoOwner:              "acme",
+			RepoName:               "widgets",
+			SubjectType:            "PullRequest",
+			SubjectTitle:           "Add widget caching layer",
+			WebURL:                 "https://github.com/acme/widgets/pull/1",
+			ItemNumber:             &notifPRNumber,
+			ItemType:               "pr",
+			ItemAuthor:             "alice",
+			Reason:                 "review_requested",
+			Unread:                 true,
+			Participating:          true,
+			SourceUpdatedAt:        now.Add(-2 * time.Hour),
+			SyncedAt:               now,
+		},
+		{
+			Platform:               "github",
+			PlatformHost:           "github.com",
+			PlatformNotificationID: "notif-tools-5",
+			RepoID:                 &toolsID,
+			RepoOwner:              "acme",
+			RepoName:               "tools",
+			SubjectType:            "Issue",
+			SubjectTitle:           "Support config file loading",
+			WebURL:                 "https://github.com/acme/tools/issues/5",
+			ItemNumber:             &notifIssueNumber,
+			ItemType:               "issue",
+			ItemAuthor:             "dave",
+			Reason:                 "mention",
+			Unread:                 true,
+			Participating:          true,
+			SourceUpdatedAt:        now.Add(-16 * time.Hour),
+			SyncedAt:               now,
+		},
+	}
+	if err := d.UpsertNotifications(ctx, seededNotifications); err != nil {
+		return nil, fmt.Errorf("upsert notifications: %w", err)
+	}
+	fixtureNotifications := []ghclient.NotificationThread{
+		{
+			ID:            "notif-widgets-1",
+			RepoOwner:     "acme",
+			RepoName:      "widgets",
+			SubjectType:   "PullRequest",
+			SubjectTitle:  "Add widget caching layer",
+			WebURL:        "https://github.com/acme/widgets/pull/1",
+			ItemNumber:    &notifPRNumber,
+			ItemType:      "pr",
+			ItemAuthor:    "alice",
+			Reason:        "review_requested",
+			Unread:        true,
+			Participating: true,
+			UpdatedAt:     now.Add(-2 * time.Hour),
+		},
+		{
+			ID:            "notif-tools-5",
+			RepoOwner:     "acme",
+			RepoName:      "tools",
+			SubjectType:   "Issue",
+			SubjectTitle:  "Support config file loading",
+			WebURL:        "https://github.com/acme/tools/issues/5",
+			ItemNumber:    &notifIssueNumber,
+			ItemType:      "issue",
+			ItemAuthor:    "dave",
+			Reason:        "mention",
+			Unread:        true,
+			Participating: true,
+			UpdatedAt:     now.Add(-16 * time.Hour),
+		},
+	}
+
 	// --- Build FixtureClient open items ---
 
 	openPRs := map[string][]*gh.PullRequest{
@@ -936,6 +1026,73 @@ func SeedFixtures(ctx context.Context, d *db.DB) (*SeedResult, error) {
 			buildGHReview(5014, "carol", "DISMISSED", w1Created.Add(6*time.Hour)),
 		},
 	}
+	reviewThreads := map[string][]ghclient.PullRequestReviewThread{
+		issueKey("acme", "widgets", 1): {
+			{
+				NodeID:     "PRRT_cache_guard",
+				IsResolved: false,
+				Path:       "src/cache/store.ts",
+				Side:       "RIGHT",
+				Line:       42,
+				Comments: []ghclient.PullRequestReviewThreadComment{
+					{
+						NodeID:           "PRRC_cache_guard",
+						DatabaseID:       6011,
+						ReviewDatabaseID: 5012,
+						SubjectType:      "LINE",
+						Body:             "Guard the cache fallback before returning stale data.\n\nExpanded context explains stale data handling.",
+						AuthorLogin:      "bob",
+						Path:             "src/cache/store.ts",
+						Line:             42,
+						URL:              "https://github.com/acme/widgets/pull/1#discussion_r6011",
+						CommitID:         widgetsPR1HeadSHA,
+						OriginalCommitID: widgetsPR1HeadSHA,
+						CreatedAt:        w1Created.Add(3*time.Hour + 15*time.Minute),
+						UpdatedAt:        w1Created.Add(3*time.Hour + 15*time.Minute),
+					},
+					{
+						NodeID:           "PRRC_cache_guard_followup",
+						DatabaseID:       6012,
+						ReviewDatabaseID: 5012,
+						SubjectType:      "LINE",
+						Body:             "Follow-up compact review context for the same thread.",
+						AuthorLogin:      "bob",
+						Path:             "src/cache/store.ts",
+						Line:             42,
+						URL:              "https://github.com/acme/widgets/pull/1#discussion_r6012",
+						CommitID:         widgetsPR1HeadSHA,
+						OriginalCommitID: widgetsPR1HeadSHA,
+						CreatedAt:        w1Created.Add(3*time.Hour + 20*time.Minute),
+						UpdatedAt:        w1Created.Add(3*time.Hour + 20*time.Minute),
+					},
+				},
+			},
+			{
+				NodeID:     "PRRT_reply_regroup",
+				IsResolved: false,
+				Path:       "src/cache/store.ts",
+				Side:       "RIGHT",
+				Line:       43,
+				Comments: []ghclient.PullRequestReviewThreadComment{
+					{
+						NodeID:           "PRRC_reply_regroup_root",
+						DatabaseID:       6013,
+						ReviewDatabaseID: 5012,
+						SubjectType:      "LINE",
+						Body:             "Regroup root review thread comment.",
+						AuthorLogin:      "bob",
+						Path:             "src/cache/store.ts",
+						Line:             43,
+						URL:              "https://github.com/acme/widgets/pull/1#discussion_r6013",
+						CommitID:         widgetsPR1HeadSHA,
+						OriginalCommitID: widgetsPR1HeadSHA,
+						CreatedAt:        w1Created.Add(3*time.Hour + 25*time.Minute),
+						UpdatedAt:        w1Created.Add(3*time.Hour + 25*time.Minute),
+					},
+				},
+			},
+		},
+	}
 
 	allIssues := map[string][]*gh.Issue{
 		"acme/widgets": {
@@ -956,14 +1113,16 @@ func SeedFixtures(ctx context.Context, d *db.DB) (*SeedResult, error) {
 	result := &SeedResult{
 		FixtureClient: func() *FixtureClient {
 			return &FixtureClient{
-				OpenPRs:    openPRs,
-				PRs:        allPRs,
-				OpenIssues: openIssues,
-				Issues:     allIssues,
-				Comments:   make(map[string][]*gh.IssueComment),
-				Reviews:    reviews,
-				Tags:       make(map[string][]*gh.RepositoryTag),
-				Labels:     make(map[string][]*gh.Label),
+				OpenPRs:       openPRs,
+				PRs:           allPRs,
+				OpenIssues:    openIssues,
+				Issues:        allIssues,
+				Comments:      make(map[string][]*gh.IssueComment),
+				Reviews:       reviews,
+				ReviewThreads: reviewThreads,
+				Tags:          make(map[string][]*gh.RepositoryTag),
+				Labels:        make(map[string][]*gh.Label),
+				Notifications: fixtureNotifications,
 				CombinedStatuses: map[string]*gh.CombinedStatus{
 					refKey("acme", "widgets", widgetsPR1HeadSHA): {
 						State: new("success"),

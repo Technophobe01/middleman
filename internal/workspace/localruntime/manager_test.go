@@ -341,14 +341,15 @@ exit 0
 	}
 	require.NotEmpty(newSession)
 	newSessionText := strings.Join(newSession, "\n")
+	scriptText := requireNewSessionPaneScript(t, newSession)
 	assert.Contains(newSession, "-E")
 	assert.NotContains(newSession, "-e")
 	assert.Contains(newSession, "-c")
 	assert.Contains(newSession, "/tmp/work tree")
-	assert.Contains(newSessionText, "__middleman_env_file=")
-	assert.Contains(newSessionText, "exec env -i")
-	assert.Contains(newSessionText, `XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR-}"`)
-	assert.Contains(newSessionText, shellquote.Join(agent.Command[0]))
+	assert.Contains(scriptText, "__middleman_env_file=")
+	assert.Contains(scriptText, "exec env -i")
+	assert.Contains(scriptText, `XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR-}"`)
+	assert.Contains(scriptText, shellquote.Join(agent.Command[0]))
 	assert.NotContains(newSessionText, "argv-visible-value")
 }
 
@@ -512,21 +513,22 @@ exit 0
 	}
 	require.NotEmpty(newSession)
 	newSessionText := strings.Join(newSession, "\n")
+	scriptText := requireNewSessionPaneScript(t, newSession)
 	assert.Contains(newSession, "-c")
 	assert.Contains(newSession, "/tmp/work tree")
-	assert.Contains(newSessionText, "exec env -i")
-	assert.Contains(newSessionText, shellquote.Join(os.Args[0]))
+	assert.Contains(scriptText, "exec env -i")
+	assert.Contains(scriptText, shellquote.Join(os.Args[0]))
 	assert.Contains(
-		newSessionText,
+		scriptText,
 		"XDG_RUNTIME_DIR=\"${XDG_RUNTIME_DIR-}\"",
 	)
 	assert.Contains(
-		newSessionText,
+		scriptText,
 		"MIDDLEMAN_TEST_CUSTOM_SHELL_ENV=\"${MIDDLEMAN_TEST_CUSTOM_SHELL_ENV-}\"",
 	)
 	assert.Contains(newSession, "-E")
 	assert.NotContains(newSession, "-e")
-	assert.Contains(newSessionText, "__middleman_env_file=")
+	assert.Contains(scriptText, "__middleman_env_file=")
 	assert.Contains(newSession, ";")
 	assert.Contains(newSession, "set-option")
 	assert.Contains(newSession, "-t")
@@ -1141,6 +1143,24 @@ func TestManagerUpdateTargetsAndStripEnvVarsPreservesPreviousNames(t *testing.T)
 	assert.Len(targets, 1)
 	assert.Equal("new", targets[0].Key)
 	assert.Equal([]string{"OLD_TOKEN", "NEW_TOKEN"}, mgr.currentStripEnvVars())
+}
+
+func TestManagerLaunchTargetsHideInternalShellTarget(t *testing.T) {
+	mgr := NewManager(Options{Targets: []LaunchTarget{
+		{
+			Key: "shell", Label: "Shell", Kind: LaunchTargetShell,
+			Source: "system", Command: []string{"tmux"}, Available: true,
+		},
+		plainShellTarget(),
+		helperTarget("codex", "sleep"),
+	}})
+	t.Cleanup(mgr.Shutdown)
+
+	targets := mgr.LaunchTargets()
+	assert := Assert.New(t)
+	assert.Len(targets, 2)
+	assert.Equal(string(LaunchTargetPlainShell), targets[0].Key)
+	assert.Equal("codex", targets[1].Key)
 }
 
 func TestManagerLaunchCommandDoesNotWrapWhenConfigDisabled(t *testing.T) {
@@ -1874,6 +1894,58 @@ drain:
 			"the session as output-closed and emit the exit frame")
 }
 
+func TestAttachmentResizeOwnerPrefersActiveLocalUntilInactive(t *testing.T) {
+	require := require.New(t)
+	assert := Assert.New(t)
+
+	pty := &fakeRuntimePTY{
+		output: make(chan []byte),
+		done:   make(chan struct{}),
+	}
+	s := &session{
+		info: SessionInfo{
+			Key:         "session-1",
+			WorkspaceID: "ws-1",
+			Status:      SessionStatusRunning,
+		},
+		pty:         pty,
+		done:        make(chan struct{}),
+		outputDone:  make(chan struct{}),
+		subscribers: make(map[chan []byte]struct{}),
+	}
+
+	remote, err := attachToSession(
+		s, "ws-1", "session-1", nil,
+		AttachSessionOptions{
+			ResizePriority: ResizePriorityRemote,
+			ResizeActive:   true,
+		},
+	)
+	require.NoError(err)
+	defer remote.Close()
+	require.NoError(remote.Resize(80, 24))
+
+	local, err := attachToSession(
+		s, "ws-1", "session-1", nil,
+		AttachSessionOptions{ResizePriority: ResizePriorityLocal},
+	)
+	require.NoError(err)
+	require.NoError(remote.Resize(90, 25))
+	local.SetResizeActive(true)
+	require.NoError(remote.Resize(95, 26))
+	require.NoError(local.Resize(100, 30))
+
+	local.SetResizeActive(false)
+	require.NoError(remote.Resize(120, 40))
+
+	assert.Equal([]terminalResize{
+		{cols: 80, rows: 24},
+		{cols: 90, rows: 25},
+		{cols: 100, rows: 30},
+		{cols: 120, rows: 40},
+	}, pty.resizes())
+}
+
 type fakeRuntimePtyOwner struct {
 	startedSession      string
 	startedCwd          string
@@ -1957,8 +2029,15 @@ func (f *fakeRuntimePtyOwner) Stop(_ context.Context, session string) error {
 }
 
 type fakeRuntimePTY struct {
-	output chan []byte
-	done   chan struct{}
+	mu          sync.Mutex
+	output      chan []byte
+	done        chan struct{}
+	resizeCalls []terminalResize
+}
+
+type terminalResize struct {
+	cols int
+	rows int
 }
 
 func (f *fakeRuntimePTY) Output() <-chan []byte { return f.output }
@@ -1967,7 +2046,18 @@ func (f *fakeRuntimePTY) Done() <-chan struct{} { return f.done }
 
 func (f *fakeRuntimePTY) Write([]byte) error { return nil }
 
-func (f *fakeRuntimePTY) Resize(int, int) error { return nil }
+func (f *fakeRuntimePTY) Resize(cols, rows int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.resizeCalls = append(f.resizeCalls, terminalResize{cols: cols, rows: rows})
+	return nil
+}
+
+func (f *fakeRuntimePTY) resizes() []terminalResize {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.resizeCalls)
+}
 
 func (f *fakeRuntimePTY) ExitCode() int { return 0 }
 

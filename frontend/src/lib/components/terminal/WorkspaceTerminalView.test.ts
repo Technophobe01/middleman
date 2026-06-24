@@ -315,8 +315,8 @@ describe("WorkspaceTerminalView", () => {
       "fetch",
       vi.fn().mockImplementation((input: Request | URL | string) => {
         const url = input instanceof Request ? input.url : String(input);
-        const { pathname } = new URL(url);
-        if (pathname.endsWith("/api/v1/workspaces/ws-1")) {
+        const { pathname } = new URL(url, "http://localhost");
+        if (pathname.endsWith("/workspaces/ws-1")) {
           return Promise.resolve(Response.json(workspaceResponse));
         }
         if (pathname.endsWith("/api/v1/workspaces")) {
@@ -353,7 +353,92 @@ describe("WorkspaceTerminalView", () => {
 
   afterEach(() => {
     cleanup();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
     vi.unstubAllGlobals();
+  });
+
+  it("explains workspace creation in the main pane when no workspaces exist", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation((input: Request | URL | string) => {
+        const url = input instanceof Request ? input.url : String(input);
+        const { pathname } = new URL(url, "http://localhost");
+        if (pathname.endsWith("/api/v1/workspaces")) {
+          return Promise.resolve(Response.json({ workspaces: [] }));
+        }
+        if (pathname.endsWith("/api/v1/snapshot")) {
+          return Promise.resolve(
+            Response.json({
+              hosts: [
+                {
+                  configKey: "local",
+                  diagnostics: [],
+                  id: "local",
+                  kind: "self",
+                  name: "local",
+                  operationAvailability: {},
+                  platform: "darwin",
+                  preferredTransport: "local",
+                  reachable: true,
+                  tmuxSessions: [],
+                },
+              ],
+            }),
+          );
+        }
+        if (pathname.endsWith("/api/v1/settings")) {
+          return Promise.resolve(
+            Response.json({
+              launch_targets: [
+                {
+                  key: "configured-agent",
+                  label: "Configured Agent",
+                  kind: "agent",
+                  source: "config",
+                  available: true,
+                },
+                {
+                  key: "plain_shell",
+                  label: "Shell",
+                  kind: "plain_shell",
+                  source: "system",
+                  available: true,
+                },
+              ],
+            }),
+          );
+        }
+        return Promise.resolve(Response.json({}));
+      }),
+    );
+
+    render(WorkspaceTerminalView, {
+      props: {
+        workspaceId: "",
+      },
+    });
+
+    expect(await screen.findByText("Create a workspace to run agents from a PR or issue")).toBeTruthy();
+    expect(screen.getByText(/Workspaces are git worktrees created from PR or issue heads\./i)).toBeTruthy();
+    expect(screen.getByText(/From a PR or issue, use the/i)).toBeTruthy();
+    const exampleCard = screen.getByLabelText("Workspace workflow example");
+    expect(exampleCard).toBeTruthy();
+    expect(screen.queryByText("Example workflow")).toBeNull();
+    const createWorkspaceButton = screen.getByRole("button", {
+      name: "Create Workspace",
+    }) as HTMLButtonElement;
+    expect(createWorkspaceButton.disabled).toBe(true);
+    expect(createWorkspaceButton.getAttribute("title")).toContain("launch agents");
+    const capabilityCopy = screen.getByText(/start agents, local review sessions, or a shell/i);
+    expect(screen.getByText("You can then launch configured agents via the buttons provided")).toBeTruthy();
+    const exampleHeading = await screen.findByText("Launch");
+    expect(capabilityCopy.compareDocumentPosition(exampleHeading) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(screen.queryByText("New session")).toBeNull();
+    expect(screen.queryByRole("button", { name: /Codex review agent/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /Claude review agent/i })).toBeNull();
+    expect((screen.getByRole("button", { name: /Configured Agent/i }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: /Shell/i }) as HTMLButtonElement).disabled).toBe(true);
   });
 
   it("closes an agent tab immediately when its terminal exits", async () => {
@@ -375,6 +460,247 @@ describe("WorkspaceTerminalView", () => {
     await waitFor(() => expect(screen.queryByRole("tab", { name: /Helper/ })).toBeNull());
     expect(screen.getByRole("tab", { name: /Home/ }).getAttribute("aria-selected")).toBe("true");
     expect(localStorage.getItem("middleman-workspace-active-tab:ws-1")).toBe("home");
+  });
+
+  it("polls local workspace runtime so peer-spawned sessions appear", async () => {
+    localStorage.setItem("middleman-workspace-active-tab:ws-1", "home");
+    const intervalCallbacks: Array<{ callback: () => void; delay: number | undefined }> = [];
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation((callback: TimerHandler, delay?: number) => {
+        intervalCallbacks.push({ callback: callback as () => void, delay });
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      });
+    const clearIntervalSpy = vi.spyOn(globalThis, "clearInterval").mockImplementation(() => undefined);
+    mocks.getWorkspaceRuntime
+      .mockResolvedValueOnce({ launch_targets: [], sessions: [] })
+      .mockResolvedValueOnce(runtimeWithSession("2026-04-29T00:03:00Z"));
+
+    render(WorkspaceTerminalView, {
+      props: {
+        workspaceId: "ws-1",
+      },
+    });
+
+    await waitFor(() => expect(mocks.getWorkspaceRuntime).toHaveBeenCalledWith("ws-1", undefined));
+    expect(screen.queryByRole("tab", { name: /Helper/ })).toBeNull();
+    const runtimePoll = intervalCallbacks.find((interval) => interval.delay === 3000);
+    expect(runtimePoll).toBeTruthy();
+
+    runtimePoll!.callback();
+
+    await waitFor(() => expect(screen.getByRole("tab", { name: /Helper/ })).toBeTruthy());
+    expect(mocks.getWorkspaceRuntime).toHaveBeenCalledTimes(2);
+    setIntervalSpy.mockRestore();
+    clearIntervalSpy.mockRestore();
+  });
+
+  it("polls remote workspace runtime so peer-spawned sessions appear", async () => {
+    localStorage.setItem("middleman-workspace-active-tab:fleet:member:ws-1", "home");
+    const intervalCallbacks: Array<{ callback: () => void; delay: number | undefined }> = [];
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation((callback: TimerHandler, delay?: number) => {
+        intervalCallbacks.push({ callback: callback as () => void, delay });
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      });
+    const clearIntervalSpy = vi.spyOn(globalThis, "clearInterval").mockImplementation(() => undefined);
+    mocks.getWorkspaceRuntime
+      .mockResolvedValueOnce({ launch_targets: [], sessions: [] })
+      .mockResolvedValueOnce(runtimeWithSession("2026-04-29T00:03:00Z"));
+
+    render(WorkspaceTerminalView, {
+      props: {
+        workspaceId: "ws-1",
+        workspaceHostKey: "member",
+      },
+    });
+
+    await waitFor(() => expect(mocks.getWorkspaceRuntime).toHaveBeenCalledWith("ws-1", "member"));
+    expect(screen.queryByRole("tab", { name: /Helper/ })).toBeNull();
+    const runtimePoll = intervalCallbacks.find((interval) => interval.delay === 3000);
+    expect(runtimePoll).toBeTruthy();
+
+    runtimePoll!.callback();
+
+    await waitFor(() => expect(screen.getByRole("tab", { name: /Helper/ })).toBeTruthy());
+    expect(mocks.getWorkspaceRuntime).toHaveBeenCalledTimes(2);
+    setIntervalSpy.mockRestore();
+    clearIntervalSpy.mockRestore();
+  });
+
+  it("persists remote terminal layout under the fleet-scoped workspace key", async () => {
+    localStorage.setItem("middleman-workspace-active-tab:fleet:member:ws-1", "home");
+    localStorage.removeItem("middleman-workspace-terminal-layout:ws-1");
+    mocks.getWorkspaceRuntime.mockResolvedValue({ launch_targets: [], sessions: [] });
+
+    render(WorkspaceTerminalView, {
+      props: {
+        workspaceId: "ws-1",
+        workspaceHostKey: "member",
+      },
+    });
+
+    await screen.findByRole("tab", { name: "Home" });
+    await waitFor(() =>
+      expect(localStorage.getItem("middleman-workspace-terminal-layout:fleet:member:ws-1")).toContain(
+        '"workflowMode":"tabs"',
+      ),
+    );
+    expect(localStorage.getItem("middleman-workspace-terminal-layout:ws-1")).toBeNull();
+  });
+
+  it("does not show remote runtime while same-id local workspace data is still cached", async () => {
+    localStorage.setItem("middleman-workspace-active-tab:ws-1", "session:ws-1:helper");
+    localStorage.setItem("middleman-workspace-active-tab:fleet:member:ws-1", "home");
+    const remoteWorkspace = deferred<typeof workspaceResponse>();
+    const eventListeners: Record<string, () => void> = {};
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation((input: Request | URL | string) => {
+        const url = input instanceof Request ? input.url : String(input);
+        const { pathname } = new URL(url, "http://localhost");
+        if (pathname === "/api/v1/workspaces/ws-1") {
+          return Promise.resolve(Response.json(workspaceResponse));
+        }
+        if (pathname === "/api/v1/fleet/hosts/member/workspaces/ws-1") {
+          return remoteWorkspace.promise.then((workspace) => Response.json({ ...workspace, fleet_host_key: "member" }));
+        }
+        if (pathname === "/api/v1/workspaces") {
+          return Promise.resolve(
+            Response.json({
+              workspaces: [workspaceResponse],
+            }),
+          );
+        }
+        return Promise.resolve(Response.json({}));
+      }),
+    );
+    vi.stubGlobal(
+      "EventSource",
+      class {
+        addEventListener(type: string, callback: () => void): void {
+          eventListeners[type] = callback;
+        }
+        close(): void {}
+      },
+    );
+
+    mocks.getWorkspaceRuntime.mockResolvedValue(runtimeWithStaleSession());
+    const { rerender } = render(WorkspaceTerminalView, {
+      props: {
+        workspaceId: "ws-1",
+      },
+    });
+
+    await screen.findByRole("tab", { name: /Helper/ });
+
+    mocks.getWorkspaceRuntime.mockClear();
+    mocks.getWorkspaceRuntime.mockResolvedValue(runtimeWithTwoWorkflowSessions());
+    await rerender({
+      workspaceId: "ws-1",
+      workspaceHostKey: "member",
+    });
+
+    eventListeners["reconnect.stale"]?.();
+    await waitFor(() => expect(mocks.getWorkspaceRuntime).toHaveBeenCalledWith("ws-1", "member"));
+    expect(screen.queryByRole("tab", { name: /Reviewer/ })).toBeNull();
+
+    remoteWorkspace.resolve(workspaceResponse);
+
+    await waitFor(() => expect(screen.getByRole("tab", { name: /Reviewer/ })).toBeTruthy());
+  });
+
+  it("does not overlap runtime polling while a slow fetch is in flight", async () => {
+    localStorage.setItem("middleman-workspace-active-tab:fleet:member:ws-1", "home");
+    const intervalCallbacks: Array<{ callback: () => void; delay: number | undefined }> = [];
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation((callback: TimerHandler, delay?: number) => {
+        intervalCallbacks.push({ callback: callback as () => void, delay });
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      });
+    const clearIntervalSpy = vi.spyOn(globalThis, "clearInterval").mockImplementation(() => undefined);
+    let resolveFirst: (value: ReturnType<typeof runtimeWithStaleSession>) => void = () => undefined;
+    const firstFetch = new Promise<ReturnType<typeof runtimeWithStaleSession>>((resolve) => {
+      resolveFirst = resolve;
+    });
+    mocks.getWorkspaceRuntime
+      .mockReturnValueOnce(firstFetch)
+      .mockResolvedValueOnce(runtimeWithSession("2026-04-29T00:03:00Z"));
+
+    render(WorkspaceTerminalView, {
+      props: {
+        workspaceId: "ws-1",
+        workspaceHostKey: "member",
+      },
+    });
+
+    await waitFor(() => expect(mocks.getWorkspaceRuntime).toHaveBeenCalledWith("ws-1", "member"));
+    const runtimePoll = intervalCallbacks.find((interval) => interval.delay === 3000);
+    expect(runtimePoll).toBeTruthy();
+
+    runtimePoll!.callback();
+    await Promise.resolve();
+    expect(mocks.getWorkspaceRuntime).toHaveBeenCalledTimes(1);
+
+    resolveFirst({ launch_targets: [], sessions: [] });
+    await waitFor(() => expect(screen.getByRole("tab", { name: /Home/ })).toBeTruthy());
+
+    runtimePoll!.callback();
+    await waitFor(() => expect(mocks.getWorkspaceRuntime).toHaveBeenCalledTimes(2));
+    setIntervalSpy.mockRestore();
+    clearIntervalSpy.mockRestore();
+  });
+
+  it("forces post-launch runtime refresh past an older in-flight poll", async () => {
+    localStorage.setItem("middleman-workspace-active-tab:ws-1", "home");
+    const intervalCallbacks: Array<{ callback: () => void; delay: number | undefined }> = [];
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation((callback: TimerHandler, delay?: number) => {
+        intervalCallbacks.push({ callback: callback as () => void, delay });
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      });
+    const clearIntervalSpy = vi.spyOn(globalThis, "clearInterval").mockImplementation(() => undefined);
+    const stalePoll = deferred<ReturnType<typeof runtimeWithTerminalSession>>();
+    mocks.getWorkspaceRuntime
+      .mockResolvedValueOnce(runtimeWithTerminalSession())
+      .mockReturnValueOnce(stalePoll.promise)
+      .mockResolvedValueOnce(runtimeWithTerminalSession(relaunchedShellSession));
+    mocks.launchWorkspaceSession.mockResolvedValue(relaunchedShellSession);
+
+    render(WorkspaceTerminalView, {
+      props: {
+        workspaceId: "ws-1",
+      },
+    });
+
+    const terminalButton = await screen.findByRole("button", {
+      name: "Open terminal panel",
+    });
+    await fireEvent.click(terminalButton);
+    await waitFor(() => expect(sockets.some((socket) => socket.url.includes("ws-1_shell_a"))).toBe(true));
+    const runtimePoll = intervalCallbacks.find((interval) => interval.delay === 3000);
+    expect(runtimePoll).toBeTruthy();
+
+    runtimePoll!.callback();
+    await Promise.resolve();
+    expect(mocks.getWorkspaceRuntime).toHaveBeenCalledTimes(2);
+
+    await fireEvent.click(screen.getAllByRole("button", { name: "New terminal" })[0]!);
+
+    await waitFor(() => expect(mocks.getWorkspaceRuntime).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(sockets.some((socket) => socket.url.includes("ws-1_shell_b"))).toBe(true));
+
+    stalePoll.resolve(runtimeWithTerminalSession());
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(sockets.filter((socket) => socket.url.includes("ws-1_shell_a"))).toHaveLength(1);
+    expect(sockets.filter((socket) => socket.url.includes("ws-1_shell_b"))).toHaveLength(1);
+    setIntervalSpy.mockRestore();
+    clearIntervalSpy.mockRestore();
   });
 
   it("shows a relaunched agent with the same key and a new generation", async () => {
@@ -419,21 +745,20 @@ describe("WorkspaceTerminalView", () => {
     expect(container.querySelector(".workspace-stage.grid")).toBeNull();
   });
 
-  it("activates a restored Shell tab after runtime tabs are normalized", async () => {
+  it("drops a restored legacy Shell tab after runtime tabs are normalized", async () => {
     localStorage.setItem("middleman-workspace-active-tab:ws-1", "shell");
 
-    const { container } = render(WorkspaceTerminalView, {
+    render(WorkspaceTerminalView, {
       props: {
         workspaceId: "ws-1",
       },
     });
 
-    const shellTab = await screen.findByRole("tab", { name: /Shell/ });
+    const homeTab = await screen.findByRole("tab", { name: "Home" });
 
-    expect(shellTab.getAttribute("aria-selected")).toBe("true");
-    await waitFor(() =>
-      expect(container.querySelector(".tabbed-panel-tab-panel.active .terminal-container")).toBeTruthy(),
-    );
+    expect(homeTab.getAttribute("aria-selected")).toBe("true");
+    expect(screen.queryByRole("tab", { name: /Shell/ })).toBeNull();
+    expect(sockets).toHaveLength(0);
   });
 
   it("closes a terminal-panel shell when its terminal exits", async () => {
@@ -493,7 +818,7 @@ describe("WorkspaceTerminalView", () => {
     await fireEvent.click(screen.getByRole("button", { name: "Close Shell" }));
     await fireEvent.click(await screen.findByRole("button", { name: "Stop session" }));
 
-    await waitFor(() => expect(mocks.stopWorkspaceSession).toHaveBeenCalledWith("ws-1", "ws-1_shell_a"));
+    await waitFor(() => expect(mocks.stopWorkspaceSession).toHaveBeenCalledWith("ws-1", "ws-1_shell_a", undefined));
   });
 
   it("uses an in-app modal when renaming a tab", async () => {
@@ -528,7 +853,7 @@ describe("WorkspaceTerminalView", () => {
     await fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
     await waitFor(() => expect(screen.getByRole("tab", { name: /Review helper/ })).toBeTruthy());
-    expect(mocks.renameWorkspaceSession).toHaveBeenCalledWith("ws-1", "ws-1:helper", "Review helper");
+    expect(mocks.renameWorkspaceSession).toHaveBeenCalledWith("ws-1", "ws-1:helper", "Review helper", undefined);
   });
 
   it("renders duplicate runtime labels literally instead of synthesizing names", async () => {
@@ -576,7 +901,7 @@ describe("WorkspaceTerminalView", () => {
 
     await waitFor(() => expect(screen.getByRole("tab", { name: /Plan review/ })).toBeTruthy());
     expect(screen.getByRole("tab", { name: /Helper 2/ })).toBeTruthy();
-    expect(mocks.renameWorkspaceSession).toHaveBeenCalledWith("ws-1", "ws-1:helper", "Plan review");
+    expect(mocks.renameWorkspaceSession).toHaveBeenCalledWith("ws-1", "ws-1:helper", "Plan review", undefined);
   });
 
   it("shows a moving insertion slot while sorting workflow tabs", async () => {
@@ -679,6 +1004,45 @@ describe("WorkspaceTerminalView", () => {
 
     await waitFor(() => expect(sockets.some((socket) => socket.url.includes("ws-1_shell_b"))).toBe(true));
     expect(screen.getByRole("button", { name: "Shell 2" })).toBeTruthy();
+  });
+
+  it("shows newly discovered terminal sessions without auto-splitting them", async () => {
+    localStorage.setItem("middleman-workspace-active-tab:ws-1", "home");
+    const intervalCallbacks: Array<{ callback: () => void; delay: number | undefined }> = [];
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation((callback: TimerHandler, delay?: number) => {
+        intervalCallbacks.push({ callback: callback as () => void, delay });
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      });
+    const clearIntervalSpy = vi.spyOn(globalThis, "clearInterval").mockImplementation(() => undefined);
+    mocks.getWorkspaceRuntime
+      .mockResolvedValueOnce(runtimeWithTerminalSession())
+      .mockResolvedValueOnce(runtimeWithTwoTerminalSessions());
+
+    render(WorkspaceTerminalView, {
+      props: {
+        workspaceId: "ws-1",
+      },
+    });
+
+    const terminalButton = await screen.findByRole("button", {
+      name: "Open terminal panel",
+    });
+    await fireEvent.click(terminalButton);
+    await waitFor(() => expect(sockets.some((socket) => socket.url.includes("ws-1_shell_a"))).toBe(true));
+    const runtimePoll = intervalCallbacks.find((interval) => interval.delay === 3000);
+    expect(runtimePoll).toBeTruthy();
+
+    runtimePoll!.callback();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Shell 2" })).toBeTruthy());
+    expect(sockets.some((socket) => socket.url.includes("ws-1_shell_b"))).toBe(false);
+
+    await fireEvent.click(screen.getByRole("button", { name: "Shell 2" }));
+
+    await waitFor(() => expect(sockets.some((socket) => socket.url.includes("ws-1_shell_b"))).toBe(true));
+    setIntervalSpy.mockRestore();
+    clearIntervalSpy.mockRestore();
   });
 
   it("ignores older runtime responses after terminal cleanup refreshes", async () => {

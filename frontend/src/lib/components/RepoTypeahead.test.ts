@@ -8,11 +8,15 @@ import RepoTypeahead from "./RepoTypeahead.svelte";
 
 let settingsStore: ReturnType<typeof createSettingsStore>;
 
-vi.mock("@middleman/ui", () => ({
-  getStores: () => ({
-    settings: settingsStore,
-  }),
-}));
+vi.mock("@middleman/ui", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@middleman/ui")>();
+  return {
+    ...actual,
+    getStores: () => ({
+      settings: settingsStore,
+    }),
+  };
+});
 
 vi.mock("../api/runtime.js", () => ({
   client: {
@@ -520,5 +524,110 @@ describe("RepoTypeahead", () => {
     await fireEvent.keyDown(input, { key: " " });
 
     expect(onchange).toHaveBeenLastCalledWith("github.com/import-lab/api,github.com/import-lab/web");
+  });
+
+  it("uses provider-qualified values when configured repos collide by host and path", async () => {
+    const onchange = vi.fn();
+    settingsStore.setConfiguredRepos([
+      {
+        provider: "github",
+        platform_host: "github.com",
+        owner: "acme",
+        name: "widgets",
+        repo_path: "acme/widgets",
+        is_glob: false,
+        matched_repo_count: 1,
+      },
+      {
+        provider: "gitea",
+        platform_host: "github.com",
+        owner: "acme",
+        name: "widgets",
+        repo_path: "acme/widgets",
+        is_glob: false,
+        matched_repo_count: 1,
+      },
+    ]);
+
+    render(RepoTypeahead, { props: { selected: undefined, onchange } });
+
+    await fireEvent.click(screen.getByRole("button", { name: /all repos/i }));
+    await fireEvent.input(screen.getByPlaceholderText("Filter repos..."), {
+      target: { value: "gitea/widgets" },
+    });
+    const giteaRow = screen.getByRole("option", {
+      name: "gitea/github.com/acme/widgets",
+    });
+    expect(giteaRow.querySelector(".repo-tree-label")?.textContent).toBe("gitea/widgets");
+    expect(screen.queryByRole("option", { name: "github/github.com/acme/widgets" })).toBeNull();
+    await fireEvent.mouseDown(
+      screen.getByRole("option", {
+        name: "gitea/github.com/acme/widgets",
+      }),
+    );
+
+    expect(onchange).toHaveBeenLastCalledWith("gitea|github.com/acme/widgets");
+  });
+
+  it("keeps provider-qualified selected values valid in desktop validation", async () => {
+    const onchange = vi.fn();
+    settingsStore.setConfiguredRepos([
+      {
+        provider: "github",
+        platform_host: "github.com",
+        owner: "acme",
+        name: "widgets",
+        repo_path: "acme/widgets",
+        is_glob: false,
+        matched_repo_count: 1,
+      },
+      {
+        provider: "gitea",
+        platform_host: "github.com",
+        owner: "acme",
+        name: "widgets",
+        repo_path: "acme/widgets",
+        is_glob: false,
+        matched_repo_count: 1,
+      },
+    ]);
+
+    render(RepoTypeahead, {
+      props: {
+        selected: "gitea|github.com/acme/widgets",
+        onchange,
+      },
+    });
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "gitea/github.com/acme/widgets" })).toBeTruthy();
+    });
+    expect(onchange).not.toHaveBeenCalled();
+  });
+
+  it("normalizes stale provider slash values before desktop validation removes missing repos", async () => {
+    const onchange = vi.fn();
+    settingsStore.setConfiguredRepos([
+      {
+        provider: "github",
+        platform_host: "github.com",
+        owner: "acme",
+        name: "widgets",
+        repo_path: "acme/widgets",
+        is_glob: false,
+        matched_repo_count: 1,
+      },
+    ]);
+
+    render(RepoTypeahead, {
+      props: {
+        selected: "github/github.com/acme/widgets,github.com/acme/missing",
+        onchange,
+      },
+    });
+
+    await waitFor(() => {
+      expect(onchange).toHaveBeenCalledWith("github.com/acme/widgets,github.com/acme/missing");
+    });
   });
 });

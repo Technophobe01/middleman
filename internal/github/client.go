@@ -13,6 +13,7 @@ import (
 	"time"
 
 	gh "github.com/google/go-github/v84/github"
+	"go.kenn.io/middleman/internal/platform"
 	"go.kenn.io/middleman/internal/tokenauth"
 )
 
@@ -79,6 +80,15 @@ type PullRequestReviewThreadComment struct {
 	UpdatedAt        time.Time
 }
 
+// Notification list options and threads are provider-neutral types;
+// the aliases keep this package's Client interface and its many
+// implementations/mocks in their historical shape while letting the
+// platform registry treat GitHub as one NotificationReader among the
+// providers.
+type NotificationListOptions = platform.NotificationListOptions
+
+type NotificationThread = platform.NotificationThread
+
 // EditPullRequestOpts holds optional fields for editing a pull request.
 // Nil pointer fields are omitted from the GitHub API call.
 type EditPullRequestOpts struct {
@@ -128,12 +138,15 @@ type Client interface {
 	// submits is backed out through dismissal.
 	DismissReview(ctx context.Context, owner, repo string, number int, reviewID int64, message string) (*gh.PullRequestReview, error)
 	MarkPullRequestReadyForReview(ctx context.Context, owner, repo string, number int) (*gh.PullRequest, error)
+	ConvertPullRequestToDraft(ctx context.Context, owner, repo string, number int) (*gh.PullRequest, error)
 	MergePullRequest(ctx context.Context, owner, repo string, number int, commitTitle, commitMessage, method, expectedHeadSHA string) (*gh.PullRequestMergeResult, error)
 	EditPullRequest(ctx context.Context, owner, repo string, number int, opts EditPullRequestOpts) (*gh.PullRequest, error)
 	EditIssue(ctx context.Context, owner, repo string, number int, state string) (*gh.Issue, error)
 	EditIssueContent(ctx context.Context, owner, repo string, number int, title *string, body *string) (*gh.Issue, error)
 	ListPullRequestsPage(ctx context.Context, owner, repo, state string, page int) ([]*gh.PullRequest, bool, error)
 	ListIssuesPage(ctx context.Context, owner, repo, state string, page int) ([]*gh.Issue, bool, error)
+	ListNotifications(ctx context.Context, opts NotificationListOptions) ([]NotificationThread, bool, error)
+	MarkNotificationThreadRead(ctx context.Context, threadID string) error
 	// InvalidateListETagsForRepo drops cached conditional-GET
 	// validators for the given repo's list endpoints so the next
 	// list call issues an unconditional fetch. The endpoints
@@ -168,6 +181,13 @@ type issueTimelineLister interface {
 		owner, repo string,
 		number int,
 	) ([]PullRequestTimelineEvent, error)
+}
+
+func normalizedPlatformHost(platformHost string) string {
+	if platformHost == "" {
+		return "github.com"
+	}
+	return strings.ToLower(platformHost)
 }
 
 func graphQLEndpointForHost(platformHost string) string {
@@ -238,6 +258,17 @@ func NewClient(
 	writeHTTPClient := &http.Client{Transport: wrapPublicGitHubAPIGuard(
 		mutationAuthTransport{base: authRT},
 	)}
+	notificationTransport := mutationAuthTransport{base: authRT}
+	var notificationRoundTripper http.RoundTripper = notificationTransport
+	if budget != nil {
+		notificationRoundTripper = &budgetTransport{
+			base:   notificationRoundTripper,
+			budget: budget,
+		}
+	}
+	notificationHTTPClient := &http.Client{Transport: wrapPublicGitHubAPIGuard(
+		notificationRoundTripper,
+	)}
 
 	newGHClient := func(hc *http.Client) (*gh.Client, error) {
 		if options.baseURLOverride != "" {
@@ -265,20 +296,26 @@ func NewClient(
 	if err != nil {
 		return nil, err
 	}
+	ghNotificationClient, err := newGHClient(notificationHTTPClient)
+	if err != nil {
+		return nil, err
+	}
 	graphQLEndpoint := graphQLEndpointForHost(platformHost)
 	if options.baseURLOverride != "" {
 		graphQLEndpoint = options.baseURLOverride + "/api/graphql"
 	}
 	return &liveClient{
-		gh:              ghClient,
-		ghWrite:         ghWriteClient,
-		source:          source,
-		httpClient:      httpClient,
-		httpWriteClient: writeHTTPClient,
-		rateTracker:     rateTracker,
-		platformHost:    platformHost,
-		graphQLEndpoint: graphQLEndpoint,
-		etag:            et,
+		gh:                     ghClient,
+		ghWrite:                ghWriteClient,
+		ghNotifications:        ghNotificationClient,
+		source:                 source,
+		httpClient:             httpClient,
+		httpWriteClient:        writeHTTPClient,
+		httpNotificationClient: notificationHTTPClient,
+		rateTracker:            rateTracker,
+		platformHost:           normalizedPlatformHost(platformHost),
+		graphQLEndpoint:        graphQLEndpoint,
+		etag:                   et,
 	}, nil
 }
 
@@ -314,6 +351,12 @@ type liveClient struct {
 	// credential's budget. Nil in hand-built test clients; accessors
 	// fall back to the read client.
 	ghWrite *gh.Client
+	// ghNotifications/httpNotificationClient carry user-scoped
+	// notification APIs on the user's own credential, through the
+	// background sync budget transport. In GitHub App split-auth mode
+	// their PAT rate headers must not feed the app-token read tracker or
+	// the mutation write tracker.
+	ghNotifications *gh.Client
 	// source is the credential chain reads resolve through. Split
 	// behavior (the viewer-permission overlay in GetRepository) is
 	// derived from its current descriptor on every call, so a config
@@ -323,6 +366,7 @@ type liveClient struct {
 	source                  tokenauth.Source
 	httpClient              *http.Client
 	httpWriteClient         *http.Client
+	httpNotificationClient  *http.Client
 	rateTracker             *RateTracker
 	writeRateTracker        *RateTracker
 	graphQLRateTracker      *RateTracker
@@ -339,6 +383,13 @@ func (c *liveClient) writeGH() *gh.Client {
 		return c.ghWrite
 	}
 	return c.gh
+}
+
+func (c *liveClient) notificationGH() *gh.Client {
+	if c.ghNotifications != nil {
+		return c.ghNotifications
+	}
+	return c.writeGH()
 }
 
 func (c *liveClient) writeHTTPClient() *http.Client {
@@ -378,6 +429,10 @@ func (c *liveClient) splitAuthActive() bool {
 	return c.source.Descriptor().HasActiveGitHubApp()
 }
 
+func (c *liveClient) bypassNotificationReadRateReserve() bool {
+	return c.splitAuthActive()
+}
+
 // InvalidateListETagsForRepo evicts cached ETag entries for the repo's
 // list endpoints. Pass any combination of "pulls", "issues", and
 // "comments" to scope the invalidation; omitting endpoints clears
@@ -388,6 +443,140 @@ func (c *liveClient) InvalidateListETagsForRepo(owner, repo string, endpoints ..
 		return
 	}
 	c.etag.invalidateRepo(owner, repo, endpoints...)
+}
+
+func (c *liveClient) ListNotifications(ctx context.Context, opts NotificationListOptions) ([]NotificationThread, bool, error) {
+	page := max(opts.Page, 1)
+	ghOpts := &gh.NotificationListOptions{
+		All:           opts.All,
+		Participating: opts.Participating,
+		ListOptions:   gh.ListOptions{Page: page, PerPage: 100},
+	}
+	if opts.Since != nil {
+		ghOpts.Since = opts.Since.UTC()
+	}
+	var notifications []*gh.Notification
+	var resp *gh.Response
+	var err error
+	if opts.RepoOwner != "" && opts.RepoName != "" {
+		notifications, resp, err = c.notificationGH().Activity.ListRepositoryNotifications(ctx, opts.RepoOwner, opts.RepoName, ghOpts)
+	} else {
+		notifications, resp, err = c.notificationGH().Activity.ListNotifications(ctx, ghOpts)
+	}
+	c.trackNotificationRate(resp)
+	if err != nil {
+		return nil, false, err
+	}
+	threads := make([]NotificationThread, 0, len(notifications))
+	for _, notification := range notifications {
+		threads = append(threads, c.normalizeNotification(notification))
+	}
+	return threads, resp != nil && resp.NextPage != 0, nil
+}
+
+func (c *liveClient) GetNotificationThread(ctx context.Context, threadID string) (NotificationThread, error) {
+	notification, resp, err := c.notificationGH().Activity.GetThread(ctx, threadID)
+	c.trackNotificationRate(resp)
+	if err != nil {
+		return NotificationThread{}, err
+	}
+	return c.normalizeNotification(notification), nil
+}
+
+func (c *liveClient) MarkNotificationThreadRead(ctx context.Context, threadID string) error {
+	resp, err := c.notificationGH().Activity.MarkThreadRead(ctx, threadID)
+	c.trackNotificationRate(resp)
+	return err
+}
+
+func (c *liveClient) normalizeNotification(n *gh.Notification) NotificationThread {
+	if n == nil {
+		return NotificationThread{}
+	}
+	thread := NotificationThread{
+		ID:     n.GetID(),
+		Reason: n.GetReason(),
+		Unread: n.GetUnread(),
+	}
+	if updated := n.GetUpdatedAt(); !updated.IsZero() {
+		thread.UpdatedAt = updated.UTC()
+	}
+	if lastRead := n.GetLastReadAt(); !lastRead.IsZero() {
+		lastReadAt := lastRead.UTC()
+		thread.LastReadAt = &lastReadAt
+	}
+	if repo := n.GetRepository(); repo != nil {
+		thread.RepoName = strings.ToLower(repo.GetName())
+		if owner := repo.GetOwner(); owner != nil {
+			thread.RepoOwner = strings.ToLower(owner.GetLogin())
+		}
+	}
+	if subject := n.GetSubject(); subject != nil {
+		thread.SubjectType = subject.GetType()
+		thread.SubjectTitle = subject.GetTitle()
+		thread.SubjectURL = subject.GetURL()
+		thread.SubjectLatestCommentURL = subject.GetLatestCommentURL()
+		thread.ItemType, thread.ItemNumber, thread.WebURL = c.notificationItem(subject.GetType(), subject.GetURL(), thread.RepoOwner, thread.RepoName)
+	}
+	return thread
+}
+
+func (c *liveClient) notificationItem(subjectType, apiURL, owner, repo string) (string, *int, string) {
+	itemType := "other"
+	subjectLower := strings.ToLower(subjectType)
+	switch subjectLower {
+	case "pullrequest":
+		itemType = "pr"
+	case "issue":
+		itemType = "issue"
+	case "release":
+		itemType = "release"
+	case "commit":
+		itemType = "commit"
+	}
+
+	if owner == "" || repo == "" || apiURL == "" {
+		return itemType, nil, ""
+	}
+	segments := strings.Split(strings.TrimRight(apiURL, "/"), "/")
+	lastSegment := func(prefix string) (string, bool) {
+		for i := 0; i < len(segments)-1; i++ {
+			if segments[i] == prefix {
+				return segments[i+1], true
+			}
+		}
+		return "", false
+	}
+	host := c.platformHost
+	if host == "" {
+		host = "github.com"
+	}
+	switch itemType {
+	case "pr":
+		if value, ok := lastSegment("pulls"); ok {
+			if number, err := strconv.Atoi(value); err == nil {
+				return itemType, &number, fmt.Sprintf("https://%s/%s/%s/pull/%d", host, owner, repo, number)
+			}
+		}
+		if value, ok := lastSegment("issues"); ok {
+			if number, err := strconv.Atoi(value); err == nil {
+				return itemType, &number, fmt.Sprintf("https://%s/%s/%s/pull/%d", host, owner, repo, number)
+			}
+		}
+	case "issue":
+		if value, ok := lastSegment("issues"); ok {
+			if number, err := strconv.Atoi(value); err == nil {
+				return itemType, &number, fmt.Sprintf("https://%s/%s/%s/issues/%d", host, owner, repo, number)
+			}
+		}
+	case "commit":
+		if sha, ok := lastSegment("commits"); ok && sha != "" {
+			return itemType, nil, fmt.Sprintf("https://%s/%s/%s/commit/%s", host, owner, repo, sha)
+		}
+	case "release":
+		return itemType, nil, ""
+	}
+	return itemType, nil, ""
 }
 
 func (c *liveClient) ListReleases(
@@ -624,11 +813,38 @@ const issueTimelineEventsQuery = `
 query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
   repository(owner: $owner, name: $repo) {
     issue(number: $number) {
-      timelineItems(itemTypes: [ASSIGNED_EVENT, UNASSIGNED_EVENT], first: 100, after: $cursor) {
+      timelineItems(itemTypes: [ASSIGNED_EVENT, UNASSIGNED_EVENT, CROSS_REFERENCED_EVENT, CLOSED_EVENT, REOPENED_EVENT], first: 100, after: $cursor) {
         nodes {
           __typename
           ... on Node {
             id
+          }
+          ... on CrossReferencedEvent {
+            actor { login }
+            createdAt
+            isCrossRepository
+            willCloseTarget
+            source {
+              __typename
+              ... on Issue {
+                number
+                title
+                url
+                repository {
+                  owner { login }
+                  name
+                }
+              }
+              ... on PullRequest {
+                number
+                title
+                url
+                repository {
+                  owner { login }
+                  name
+                }
+              }
+            }
           }
           ... on AssignedEvent {
             actor { login }
@@ -650,6 +866,14 @@ query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
               ... on Organization { login }
               ... on User { login }
             }
+            createdAt
+          }
+          ... on ClosedEvent {
+            actor { login }
+            createdAt
+          }
+          ... on ReopenedEvent {
+            actor { login }
             createdAt
           }
         }
@@ -709,6 +933,15 @@ mutation($pullRequestId: ID!) {
           isDefault
         }
       }
+    }
+  }
+}`
+
+const convertToDraftMutation = `
+mutation($pullRequestId: ID!) {
+  convertPullRequestToDraft(input: {pullRequestId: $pullRequestId}) {
+    pullRequest {
+      id
     }
   }
 }`
@@ -937,6 +1170,17 @@ func (c *liveClient) trackWriteRate(resp *gh.Response) {
 	}
 	c.writeRateTracker.RecordRequest()
 	c.writeRateTracker.UpdateFromRate(rateFromGitHub(resp.Rate))
+}
+
+// trackNotificationRate records notification API responses only when the
+// read client and notification client use the same credential. In GitHub App
+// split-auth mode, reads use an installation token while notifications use
+// the user's PAT, so PAT headers cannot update the installation read tracker.
+func (c *liveClient) trackNotificationRate(resp *gh.Response) {
+	if c.splitAuthActive() {
+		return
+	}
+	c.trackRate(resp)
 }
 
 func (c *liveClient) GetRateLimitSnapshot(ctx context.Context) (*RateLimitSnapshot, error) {
@@ -1870,6 +2114,20 @@ func (c *liveClient) ListIssueTimelineEvents(
 								Login    string `json:"login"`
 							} `json:"assignee"`
 							CreatedAt time.Time `json:"createdAt"`
+							Source    *struct {
+								TypeName   string `json:"__typename"`
+								Number     int    `json:"number"`
+								Title      string `json:"title"`
+								URL        string `json:"url"`
+								Repository *struct {
+									Owner *struct {
+										Login string `json:"login"`
+									} `json:"owner"`
+									Name string `json:"name"`
+								} `json:"repository"`
+							} `json:"source"`
+							IsCrossRepository bool `json:"isCrossRepository"`
+							WillCloseTarget   bool `json:"willCloseTarget"`
 						} `json:"nodes"`
 						PageInfo struct {
 							HasNextPage bool    `json:"hasNextPage"`
@@ -1964,6 +2222,12 @@ func (c *liveClient) ListIssueTimelineEvents(
 				event.EventType = "assigned"
 			case "UnassignedEvent":
 				event.EventType = "unassigned"
+			case "CrossReferencedEvent":
+				event.EventType = "cross_referenced"
+			case "ClosedEvent":
+				event.EventType = "closed"
+			case "ReopenedEvent":
+				event.EventType = "reopened"
 			default:
 				continue
 			}
@@ -1973,6 +2237,20 @@ func (c *liveClient) ListIssueTimelineEvents(
 			if node.Assignee != nil {
 				event.Assignee = node.Assignee.Login
 			}
+			if node.Source != nil {
+				event.SourceType = node.Source.TypeName
+				event.SourceNumber = node.Source.Number
+				event.SourceTitle = node.Source.Title
+				event.SourceURL = node.Source.URL
+				if node.Source.Repository != nil {
+					event.SourceRepo = node.Source.Repository.Name
+					if node.Source.Repository.Owner != nil {
+						event.SourceOwner = node.Source.Repository.Owner.Login
+					}
+				}
+			}
+			event.IsCrossRepository = node.IsCrossRepository
+			event.WillCloseTarget = node.WillCloseTarget
 			events = append(events, event)
 		}
 
@@ -2353,6 +2631,143 @@ func (c *liveClient) MarkPullRequestReadyForReview(
 	}
 
 	return adaptPR(mutationResult.Data.MarkPullRequestReadyForReview.PullRequest), nil
+}
+
+func (c *liveClient) ConvertPullRequestToDraft(
+	ctx context.Context, owner, repo string, number int,
+) (*gh.PullRequest, error) {
+	type draftIDResponse struct {
+		Errors []graphQLError `json:"errors"`
+		Data   struct {
+			Repository *struct {
+				PullRequest *struct {
+					ID string `json:"id"`
+				} `json:"pullRequest"`
+			} `json:"repository"`
+		} `json:"data"`
+	}
+	type draftMutationResponse struct {
+		Errors []graphQLError `json:"errors"`
+		Data   struct {
+			ConvertPullRequestToDraft *struct {
+				PullRequest *struct {
+					ID string `json:"id"`
+				} `json:"pullRequest"`
+			} `json:"convertPullRequestToDraft"`
+		} `json:"data"`
+	}
+
+	postGraphQL := func(payload any, dest any) (*http.Response, error) {
+		body, err := json.Marshal(payload)
+		if err != nil {
+			return nil, err
+		}
+		req, err := http.NewRequestWithContext(
+			ctx,
+			http.MethodPost,
+			c.graphQLEndpoint,
+			bytes.NewReader(body),
+		)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Accept", "application/vnd.github+json")
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := c.writeHTTPClient().Do(req)
+		if err != nil {
+			return nil, err
+		}
+		c.trackWriteGraphQLRateHeaders(resp)
+		if resp.StatusCode != http.StatusOK {
+			_ = resp.Body.Close()
+			return resp, newReadyForReviewError(
+				fmt.Errorf("graphql status %s", resp.Status),
+				resp.StatusCode,
+				resp.StatusCode == http.StatusNotFound,
+			)
+		}
+		if err := json.NewDecoder(resp.Body).Decode(dest); err != nil {
+			_ = resp.Body.Close()
+			return resp, err
+		}
+		_ = resp.Body.Close()
+		return resp, nil
+	}
+
+	idPayload := graphQLRequest{
+		Query: readyForReviewIDQuery,
+		Variables: map[string]any{
+			"owner":  owner,
+			"repo":   repo,
+			"number": number,
+		},
+	}
+	var idResult draftIDResponse
+	if _, err := postGraphQL(idPayload, &idResult); err != nil {
+		return nil, fmt.Errorf(
+			"converting %s/%s#%d to draft: resolve pull request id: %w",
+			owner, repo, number, err,
+		)
+	}
+	if len(idResult.Errors) > 0 {
+		statusCode, staleState := readyForReviewGraphQLErrorMeta(idResult.Errors)
+		return nil, newReadyForReviewError(fmt.Errorf(
+			"converting %s/%s#%d to draft: resolve pull request id: graphql errors: %s",
+			owner, repo, number, joinGraphQLErrorMessages(idResult.Errors),
+		), statusCode, staleState)
+	}
+	if idResult.Data.Repository == nil || idResult.Data.Repository.PullRequest == nil || idResult.Data.Repository.PullRequest.ID == "" {
+		return nil, newReadyForReviewError(
+			fmt.Errorf(
+				"converting %s/%s#%d to draft: resolve pull request id: missing pull request in graphql response",
+				owner, repo, number,
+			),
+			http.StatusNotFound,
+			true,
+		)
+	}
+
+	mutationPayload := graphQLRequest{
+		Query: convertToDraftMutation,
+		Variables: map[string]any{
+			"pullRequestId": idResult.Data.Repository.PullRequest.ID,
+		},
+	}
+	var mutationResult draftMutationResponse
+	if _, err := postGraphQL(mutationPayload, &mutationResult); err != nil {
+		return nil, fmt.Errorf(
+			"converting %s/%s#%d to draft: %w",
+			owner, repo, number, err,
+		)
+	}
+	if len(mutationResult.Errors) > 0 {
+		statusCode, staleState := readyForReviewGraphQLErrorMeta(mutationResult.Errors)
+		return nil, newReadyForReviewError(fmt.Errorf(
+			"converting %s/%s#%d to draft: graphql errors: %s",
+			owner, repo, number, joinGraphQLErrorMessages(mutationResult.Errors),
+		), statusCode, staleState)
+	}
+	if mutationResult.Data.ConvertPullRequestToDraft == nil || mutationResult.Data.ConvertPullRequestToDraft.PullRequest == nil {
+		return nil, newReadyForReviewError(
+			fmt.Errorf(
+				"converting %s/%s#%d to draft: missing pull request in graphql response",
+				owner, repo, number,
+			),
+			0,
+			false,
+		)
+	}
+
+	draft := true
+	state := "open"
+	nodeID := mutationResult.Data.ConvertPullRequestToDraft.PullRequest.ID
+	return &gh.PullRequest{
+		NodeID: &nodeID,
+		Number: &number,
+		State:  &state,
+		Draft:  &draft,
+	}, nil
 }
 
 func (c *liveClient) MergePullRequest(

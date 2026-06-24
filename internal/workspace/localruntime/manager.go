@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -44,16 +45,21 @@ var (
 )
 
 type SessionInfo struct {
-	Key         string           `json:"key"`
-	WorkspaceID string           `json:"workspace_id"`
-	TargetKey   string           `json:"target_key"`
-	Label       string           `json:"label"`
-	Kind        LaunchTargetKind `json:"kind"`
-	Status      SessionStatus    `json:"status"`
-	CreatedAt   time.Time        `json:"created_at"`
-	ExitedAt    *time.Time       `json:"exited_at,omitempty"`
-	ExitCode    *int             `json:"exit_code,omitempty"`
-	TmuxSession string           `json:"-"`
+	Key           string           `json:"key"`
+	WorkspaceID   string           `json:"workspace_id"`
+	TargetKey     string           `json:"target_key"`
+	Label         string           `json:"label"`
+	Kind          LaunchTargetKind `json:"kind"`
+	Status        SessionStatus    `json:"status"`
+	DisplayRegion string           `json:"display_region"`
+	CreatedAt     time.Time        `json:"created_at"`
+	ExitedAt      *time.Time       `json:"exited_at,omitempty"`
+	ExitCode      *int             `json:"exit_code,omitempty"`
+	TmuxSession   string           `json:"-"`
+	// Reused reports that ensure semantics returned an already-live
+	// session instead of launching one. Callers whose post-launch
+	// bookkeeping fails must not stop a session they did not start.
+	Reused bool `json:"-"`
 }
 
 func (s SessionInfo) Compare(other SessionInfo) int {
@@ -83,6 +89,9 @@ type Options struct {
 	// the tmux launch target is available. Other sessions are started
 	// through PtyOwnerRuntime.
 	WrapAgentSessionsInTmux bool
+	// HideTmuxStatus turns off tmux's status line for newly-created
+	// tmux-backed runtime sessions.
+	HideTmuxStatus bool
 	// StripEnvVars names additional env vars to strip beyond the
 	// built-in credential prefixes (e.g. a configured token env).
 	StripEnvVars []string
@@ -107,6 +116,7 @@ type Manager struct {
 	tmuxCommand       []string
 	tmuxOwnerMarker   string
 	wrapAgentsInTmux  bool
+	hideTmuxStatus    bool
 	stripEnvVars      []string
 	onSessionExit     func(SessionInfo)
 	ptyOwnerRuntime   ptyownerruntime.Owner
@@ -169,17 +179,39 @@ type session struct {
 	lifecycleMu           sync.Mutex
 	lifecycleClosed       bool
 	stopRequested         bool
+	nextAttachmentID      uint64
+	resizeOwnerID         uint64
+	resizeOwnerPriority   ResizePriority
+	resizeAttachments     map[uint64]resizeAttachment
+}
+
+type ResizePriority int
+
+const (
+	ResizePriorityRemote ResizePriority = iota + 1
+	ResizePriorityLocal
+)
+
+type AttachSessionOptions struct {
+	ResizePriority ResizePriority
+	ResizeActive   bool
+}
+
+type resizeAttachment struct {
+	priority ResizePriority
+	active   bool
 }
 
 type Attachment struct {
 	Output <-chan []byte
 	Done   <-chan struct{}
 
-	info    func() SessionInfo
-	write   func([]byte) error
-	resize  func(cols, rows int) error
-	refresh func(context.Context) error
-	close   func()
+	info            func() SessionInfo
+	write           func([]byte) error
+	resize          func(cols, rows int) error
+	refresh         func(context.Context) error
+	setResizeActive func(active bool)
+	close           func()
 
 	// sessionOutputClosed reports whether the underlying session's
 	// PTY EOF has been observed by drainOutput (s.outputClosed=true).
@@ -206,6 +238,7 @@ func NewManager(options Options) *Manager {
 		tmuxCommand:       slices.Clone(options.TmuxCommand),
 		tmuxOwnerMarker:   options.TmuxOwnerMarker,
 		wrapAgentsInTmux:  options.WrapAgentSessionsInTmux,
+		hideTmuxStatus:    options.HideTmuxStatus,
 		stripEnvVars:      dedupeStrings(options.StripEnvVars),
 		onSessionExit:     options.OnSessionExit,
 		ptyOwnerRuntime:   options.PtyOwnerRuntime,
@@ -605,6 +638,9 @@ func (m *Manager) LaunchTargets() []LaunchTarget {
 
 	targets := make([]LaunchTarget, 0, len(m.targetsList))
 	for _, target := range m.targetsList {
+		if target.Kind == LaunchTargetShell {
+			continue
+		}
 		targets = append(targets, cloneTarget(target))
 	}
 	return targets
@@ -632,6 +668,12 @@ func (m *Manager) UpdateTargetsAndStripEnvVars(
 	m.mu.Unlock()
 }
 
+func (m *Manager) UpdateHideTmuxStatus(hide bool) {
+	m.mu.Lock()
+	m.hideTmuxStatus = hide
+	m.mu.Unlock()
+}
+
 func cloneLaunchTargetSet(
 	targets []LaunchTarget,
 ) (map[string]LaunchTarget, []LaunchTarget) {
@@ -655,6 +697,12 @@ func (m *Manager) currentStripEnvVars() []string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return slices.Clone(m.stripEnvVars)
+}
+
+func (m *Manager) currentHideTmuxStatus() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.hideTmuxStatus
 }
 
 func (m *Manager) ListSessions(workspaceID string) []SessionInfo {
@@ -732,7 +780,10 @@ func (m *Manager) Detach(workspaceID string, sessionKey string) error {
 // StopWorkspace stops every running runtime session that
 // belongs to workspaceID. It is intended to be called when a
 // workspace is deleted so launched processes do not survive the
-// worktree they were started in.
+// worktree they were started in. The marker it takes internally is
+// released on return; callers that go on to delete the workspace's
+// backing rows must hold their own BeginStopping/EndStopping pair
+// across the whole destructive flow.
 func (m *Manager) StopWorkspace(
 	ctx context.Context,
 	workspaceID string,
@@ -740,17 +791,8 @@ func (m *Manager) StopWorkspace(
 	// 1. Mark the workspace as stopping under the manager mutex.
 	//    New Launch calls that observe this marker bail
 	//    out via claimInflight before spawning a process.
-	m.mu.Lock()
-	m.stoppingWS[workspaceID]++
-	m.mu.Unlock()
-	defer func() {
-		m.mu.Lock()
-		m.stoppingWS[workspaceID]--
-		if m.stoppingWS[workspaceID] <= 0 {
-			delete(m.stoppingWS, workspaceID)
-		}
-		m.mu.Unlock()
-	}()
+	m.BeginStopping(workspaceID)
+	defer m.EndStopping(workspaceID)
 
 	// 2. Drain any Launch calls that passed claimInflight
 	//    before the marker was set. They are mid-startSession; once
@@ -1062,6 +1104,17 @@ func (m *Manager) AttachSession(
 	workspaceID string,
 	key string,
 ) (*Attachment, error) {
+	return m.AttachSessionWithOptions(workspaceID, key, AttachSessionOptions{
+		ResizePriority: ResizePriorityLocal,
+		ResizeActive:   true,
+	})
+}
+
+func (m *Manager) AttachSessionWithOptions(
+	workspaceID string,
+	key string,
+	options AttachSessionOptions,
+) (*Attachment, error) {
 	slog.Debug(
 		"runtime terminal attach requested",
 		"workspace_id", workspaceID,
@@ -1071,7 +1124,7 @@ func (m *Manager) AttachSession(
 	s := m.sessions[key]
 	m.mu.Unlock()
 	attachment, err := attachToSession(
-		s, workspaceID, key, m.refreshSession,
+		s, workspaceID, key, m.refreshSession, options,
 	)
 	if err != nil {
 		slog.Debug(
@@ -1104,11 +1157,31 @@ func (a *Attachment) Resize(cols, rows int) error {
 	return a.resize(cols, rows)
 }
 
+// clampWinsizeDim bounds a client-supplied terminal dimension into the
+// uint16 range pty.Winsize requires, so an oversized cols/rows value is
+// capped rather than silently truncated by the narrowing conversion.
+func clampWinsizeDim(v int) uint16 {
+	switch {
+	case v < 1:
+		return 1
+	case v > math.MaxUint16:
+		return math.MaxUint16
+	default:
+		return uint16(v)
+	}
+}
+
 func (a *Attachment) Refresh(ctx context.Context) error {
 	if a == nil || a.refresh == nil {
 		return errors.New("attachment is closed")
 	}
 	return a.refresh(ctx)
+}
+
+func (a *Attachment) SetResizeActive(active bool) {
+	if a != nil && a.setResizeActive != nil {
+		a.setResizeActive(active)
+	}
 }
 
 func (a *Attachment) Info() SessionInfo {
@@ -1249,6 +1322,7 @@ func (m *Manager) shellLaunchCommand(
 		CWD:         cwd,
 		Pane:        paneEnv,
 		OwnerMarker: m.tmuxOwnerMarker,
+		HideStatus:  m.currentHideTmuxStatus(),
 	}.prepare(ctx)
 	if err != nil {
 		return launchCommand{}, err
@@ -1402,6 +1476,7 @@ func (m *Manager) launchCommand(
 		CWD:         cwd,
 		Pane:        paneEnv,
 		OwnerMarker: m.tmuxOwnerMarker,
+		HideStatus:  m.currentHideTmuxStatus(),
 	}.prepare(ctx)
 	if err != nil {
 		return launchCommand{}, err
@@ -1830,6 +1905,106 @@ func (s *session) subscribe() (<-chan []byte, func()) {
 	}
 }
 
+func (s *session) registerResizeAttachment(
+	priority ResizePriority,
+	active bool,
+) uint64 {
+	if priority == 0 {
+		priority = ResizePriorityRemote
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.nextAttachmentID++
+	id := s.nextAttachmentID
+	if s.resizeAttachments == nil {
+		s.resizeAttachments = make(map[uint64]resizeAttachment)
+	}
+	s.resizeAttachments[id] = resizeAttachment{
+		priority: priority,
+		active:   active,
+	}
+	if active && (s.resizeOwnerID == 0 || priority > s.resizeOwnerPriority) {
+		s.resizeOwnerID = id
+		s.resizeOwnerPriority = priority
+	}
+	return id
+}
+
+func (s *session) unregisterResizeAttachment(id uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.resizeAttachments != nil {
+		delete(s.resizeAttachments, id)
+	}
+	if s.resizeOwnerID != id {
+		return
+	}
+	s.resizeOwnerID = 0
+	s.resizeOwnerPriority = 0
+	s.selectResizeOwnerLocked()
+}
+
+func (s *session) canResize(id uint64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	attachment, ok := s.resizeAttachments[id]
+	if !ok || !attachment.active {
+		return false
+	}
+	if s.resizeOwnerID == 0 {
+		s.resizeOwnerID = id
+		s.resizeOwnerPriority = attachment.priority
+		return true
+	}
+	if attachment.priority > s.resizeOwnerPriority {
+		s.resizeOwnerID = id
+		s.resizeOwnerPriority = attachment.priority
+		return true
+	}
+	return s.resizeOwnerID == id
+}
+
+func (s *session) setResizeAttachmentActive(id uint64, active bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	attachment, ok := s.resizeAttachments[id]
+	if !ok {
+		return
+	}
+	attachment.active = active
+	s.resizeAttachments[id] = attachment
+	if active {
+		if s.resizeOwnerID == 0 ||
+			attachment.priority > s.resizeOwnerPriority {
+			s.resizeOwnerID = id
+			s.resizeOwnerPriority = attachment.priority
+		}
+		return
+	}
+	if s.resizeOwnerID == id {
+		s.resizeOwnerID = 0
+		s.resizeOwnerPriority = 0
+		s.selectResizeOwnerLocked()
+	}
+}
+
+func (s *session) selectResizeOwnerLocked() {
+	for attachmentID, attachment := range s.resizeAttachments {
+		if !attachment.active {
+			continue
+		}
+		if s.resizeOwnerID == 0 || attachment.priority > s.resizeOwnerPriority {
+			s.resizeOwnerID = attachmentID
+			s.resizeOwnerPriority = attachment.priority
+		}
+	}
+}
+
 func (s *session) closeSubscribers() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -2062,6 +2237,7 @@ func attachToSession(
 	workspaceID string,
 	key string,
 	refresh func(context.Context, *session) error,
+	options AttachSessionOptions,
 ) (*Attachment, error) {
 	if s == nil {
 		return nil, fmt.Errorf("session %q not found", key)
@@ -2076,6 +2252,10 @@ func attachToSession(
 	}
 
 	output, unsubscribe := s.subscribe()
+	resizeAttachmentID := s.registerResizeAttachment(
+		options.ResizePriority,
+		options.ResizeActive,
+	)
 	return &Attachment{
 		Output: output,
 		Done:   s.done,
@@ -2091,12 +2271,17 @@ func attachToSession(
 			if cols <= 0 || rows <= 0 {
 				return nil
 			}
+			if !s.canResize(resizeAttachmentID) {
+				return nil
+			}
+			clampedCols := clampWinsizeDim(cols)
+			clampedRows := clampWinsizeDim(rows)
 			if s.pty != nil {
-				return s.pty.Resize(cols, rows)
+				return s.pty.Resize(int(clampedCols), int(clampedRows))
 			}
 			return pty.Setsize(s.ptmx, &pty.Winsize{
-				Rows: uint16(rows),
-				Cols: uint16(cols),
+				Rows: clampedRows,
+				Cols: clampedCols,
 			})
 		},
 		refresh: func(ctx context.Context) error {
@@ -2105,7 +2290,13 @@ func attachToSession(
 			}
 			return refresh(ctx, s)
 		},
-		close: unsubscribe,
+		setResizeActive: func(active bool) {
+			s.setResizeAttachmentActive(resizeAttachmentID, active)
+		},
+		close: func() {
+			s.unregisterResizeAttachment(resizeAttachmentID)
+			unsubscribe()
+		},
 		sessionOutputClosed: func() bool {
 			s.mu.Lock()
 			defer s.mu.Unlock()

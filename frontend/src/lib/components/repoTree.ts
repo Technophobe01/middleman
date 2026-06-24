@@ -1,5 +1,5 @@
 export interface RepoTreeOption {
-  value: string; // `${platformHost}/${repoPath}`
+  value: string; // `${platformHost}/${repoPath}` or `${provider}|${platformHost}/${repoPath}`
   owner: string;
   name: string;
   provider: string; // canonical, lowercase
@@ -10,6 +10,7 @@ export interface RepoLeaf {
   kind: "repo";
   id: string;
   label: string;
+  displayLabel?: string;
   value: string;
 }
 
@@ -32,10 +33,34 @@ export interface HostNode {
 export type RepoTreeNodeData = HostNode | OwnerNode | RepoLeaf;
 
 function stripHostPrefix(value: string, platformHost: string): string {
+  const providerSeparator = value.indexOf("|");
+  const concreteValue = providerSeparator === -1 ? value : value.slice(providerSeparator + 1);
   const prefix = `${platformHost}/`;
-  if (value.startsWith(prefix)) return value.slice(prefix.length);
+  if (concreteValue.startsWith(prefix)) return concreteValue.slice(prefix.length);
   // Defensive fallback: drop everything up to and including the first slash.
-  return value.replace(/^[^/]+\//, "");
+  return concreteValue.replace(/^[^/]+\//, "");
+}
+
+function providerQualifiedLeafLabel(option: RepoTreeOption, name: string): string | undefined {
+  return option.value.includes("|") ? `${option.provider}/${name}` : undefined;
+}
+
+function slashDisplayValue(value: string): string {
+  const providerSeparator = value.indexOf("|");
+  if (providerSeparator === -1) return value;
+  return `${value.slice(0, providerSeparator)}/${value.slice(providerSeparator + 1)}`;
+}
+
+function leafMatches(leaf: RepoLeaf, ownerLabel: string, query: string): boolean {
+  if (query === "") return true;
+  const visibleLabel = leaf.displayLabel ?? leaf.label;
+  return [
+    leaf.value,
+    slashDisplayValue(leaf.value),
+    visibleLabel,
+    `${ownerLabel}/${visibleLabel}`,
+    `${ownerLabel}/${leaf.label}`,
+  ].some((label) => label.toLowerCase().includes(query));
 }
 
 export function buildRepoTree(options: readonly RepoTreeOption[]): HostNode[] {
@@ -59,6 +84,8 @@ export function buildRepoTree(options: readonly RepoTreeOption[]): HostNode[] {
         children: [],
       };
       hosts.set(option.platformHost, host);
+    } else if (host.provider !== option.provider) {
+      host.provider = "";
     }
 
     let owner = host.children.find((node) => node.label === ownerPath);
@@ -72,10 +99,12 @@ export function buildRepoTree(options: readonly RepoTreeOption[]): HostNode[] {
       host.children.push(owner);
     }
 
+    const displayLabel = providerQualifiedLeafLabel(option, name);
     owner.children.push({
       kind: "repo",
       id: option.value,
       label: name,
+      ...(displayLabel ? { displayLabel } : {}),
       value: option.value,
     });
   }
@@ -84,7 +113,7 @@ export function buildRepoTree(options: readonly RepoTreeOption[]): HostNode[] {
   for (const host of sorted) {
     host.children.sort((a, b) => a.label.localeCompare(b.label));
     for (const owner of host.children) {
-      owner.children.sort((a, b) => a.label.localeCompare(b.label));
+      owner.children.sort((a, b) => (a.displayLabel ?? a.label).localeCompare(b.displayLabel ?? b.label));
     }
   }
   return sorted;
@@ -112,7 +141,6 @@ export interface VisibleRowsOptions {
 export function visibleRows(tree: readonly HostNode[], { isCollapsed, query }: VisibleRowsOptions): VisibleRow[] {
   const q = query?.trim().toLowerCase() ?? "";
   const filtering = q !== "";
-  const matches = (leaf: RepoLeaf) => !filtering || leaf.value.toLowerCase().includes(q);
 
   // Prune to the owners/hosts that still have a matching leaf, but keep a
   // reference to the ORIGINAL (unpruned) node alongside the matching leaves.
@@ -125,7 +153,7 @@ export function visibleRows(tree: readonly HostNode[], { isCollapsed, query }: V
       owners: host.children
         .map((owner) => ({
           original: owner,
-          matchingLeaves: owner.children.filter(matches),
+          matchingLeaves: owner.children.filter((leaf) => leafMatches(leaf, owner.label, q)),
         }))
         .filter((owner) => owner.matchingLeaves.length > 0),
     }))
@@ -158,7 +186,7 @@ export function visibleRows(tree: readonly HostNode[], { isCollapsed, query }: V
           depth: ownerDepth,
           hasChildren: false,
           expanded: false,
-          displayLabel: `${owner.original.label}/${leaf.label}`,
+          displayLabel: `${owner.original.label}/${leaf.displayLabel ?? leaf.label}`,
         });
         continue;
       }
@@ -176,6 +204,7 @@ export function visibleRows(tree: readonly HostNode[], { isCollapsed, query }: V
           depth: ownerDepth + 1,
           hasChildren: false,
           expanded: false,
+          ...(leaf.displayLabel ? { displayLabel: leaf.displayLabel } : {}),
         });
       }
     }

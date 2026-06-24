@@ -193,6 +193,7 @@ type mockGH struct {
 	createIssueFn              func(context.Context, string, string, string, string) (*gh.Issue, error)
 	getUserFn                  func(context.Context, string) (*gh.User, error)
 	markReadyForReviewFn       func(context.Context, string, string, int) (*gh.PullRequest, error)
+	convertToDraftFn           func(context.Context, string, string, int) (*gh.PullRequest, error)
 	dismissReviewFn            func(context.Context, string, string, int, int64, string) (*gh.PullRequestReview, error)
 	editPullRequestFn          func(context.Context, string, string, int, ghclient.EditPullRequestOpts) (*gh.PullRequest, error)
 	editIssueFn                func(context.Context, string, string, int, string) (*gh.Issue, error)
@@ -220,6 +221,8 @@ type mockGH struct {
 	rateLimitSnapshotFn        func(context.Context) (*ghclient.RateLimitSnapshot, error)
 	rateLimitSnapshotCalls     int
 	listIssueCommentsErr       error
+	listNotificationsFn        func(context.Context, ghclient.NotificationListOptions) ([]ghclient.NotificationThread, bool, error)
+	markNotificationReadFn     func(context.Context, string) error
 }
 
 func (m *mockGH) ListOpenPullRequests(ctx context.Context, owner, repo string) ([]*gh.PullRequest, error) {
@@ -546,6 +549,17 @@ func (m *mockGH) MarkPullRequestReadyForReview(
 	return &gh.PullRequest{Number: &number, Draft: &draft}, nil
 }
 
+func (m *mockGH) ConvertPullRequestToDraft(
+	ctx context.Context, owner, repo string, number int,
+) (*gh.PullRequest, error) {
+	if m.convertToDraftFn != nil {
+		return m.convertToDraftFn(ctx, owner, repo, number)
+	}
+	draft := true
+	state := "open"
+	return &gh.PullRequest{Number: &number, State: &state, Draft: &draft}, nil
+}
+
 func (m *mockGH) MergePullRequest(
 	ctx context.Context, owner, repo string, number int,
 	commitTitle, commitMessage, method, _ string,
@@ -624,6 +638,20 @@ func (m *mockGH) ListIssuesPage(
 		return m.listIssuesPageFn(ctx, owner, repo, state, page)
 	}
 	return nil, false, nil
+}
+
+func (m *mockGH) ListNotifications(ctx context.Context, opts ghclient.NotificationListOptions) ([]ghclient.NotificationThread, bool, error) {
+	if m.listNotificationsFn != nil {
+		return m.listNotificationsFn(ctx, opts)
+	}
+	return nil, false, nil
+}
+
+func (m *mockGH) MarkNotificationThreadRead(ctx context.Context, threadID string) error {
+	if m.markNotificationReadFn != nil {
+		return m.markNotificationReadFn(ctx, threadID)
+	}
+	return nil
 }
 
 // InvalidateListETagsForRepo is a no-op for the server test mock,
@@ -825,6 +853,27 @@ func setupTestServer(t *testing.T) (*Server, *db.DB) {
 	return setupTestServerWithMock(t, &mockGH{})
 }
 
+func setupNotificationsEnabledTestServer(t *testing.T) (*Server, *db.DB) {
+	t.Helper()
+	database := dbtest.Open(t)
+	syncer := ghclient.NewSyncer(
+		map[string]ghclient.Client{"github.com": &mockGH{}},
+		database,
+		nil,
+		defaultTestRepos,
+		time.Minute,
+		nil,
+		nil,
+	)
+	t.Cleanup(syncer.Stop)
+	srv := New(
+		database, syncer, nil, "/",
+		notificationsEnabledConfig(), ServerOptions{},
+	)
+	t.Cleanup(func() { gracefulShutdown(t, srv) })
+	return srv, database
+}
+
 func setupTestServerWithDatabase(
 	t *testing.T, database *db.DB, repos []ghclient.RepoRef,
 ) *Server {
@@ -846,7 +895,13 @@ func setupTestServerWithMock(t *testing.T, mock *mockGH) (*Server, *db.DB) {
 }
 
 var defaultTestRepos = []ghclient.RepoRef{
-	{Owner: "acme", Name: "widget", PlatformHost: "github.com"},
+	{
+		Platform:     "github",
+		Owner:        "acme",
+		Name:         "widget",
+		PlatformHost: "github.com",
+		CloneURL:     "https://github.com/acme/widget.git",
+	},
 }
 
 func setupTestServerWithRepos(
@@ -993,6 +1048,10 @@ func withSeedPRHeadRepoCloneURL(cloneURL string) seedPROpt {
 	return func(pr *db.MergeRequest) { pr.HeadRepoCloneURL = cloneURL }
 }
 
+func withSeedPRHeadBranch(branch string) seedPROpt {
+	return func(pr *db.MergeRequest) { pr.HeadBranch = branch }
+}
+
 func withSeedPRTitle(title string) seedPROpt {
 	return func(pr *db.MergeRequest) { pr.Title = title }
 }
@@ -1072,6 +1131,36 @@ func seedPR(t *testing.T, database *db.DB, owner, name string, number int, opts 
 	}
 	require.NoError(t, database.EnsureKanbanState(ctx, prID))
 
+	return prID
+}
+
+func insertTestActivityPR(
+	t *testing.T,
+	database *db.DB,
+	repoID int64,
+	owner string,
+	name string,
+	number int,
+	title string,
+	createdAt time.Time,
+) int64 {
+	t.Helper()
+	numberText := strconv.Itoa(number)
+	prID, err := database.UpsertMergeRequest(t.Context(), &db.MergeRequest{
+		RepoID:         repoID,
+		PlatformID:     int64(number) * 1000,
+		Number:         number,
+		URL:            "https://github.com/" + owner + "/" + name + "/pull/" + numberText,
+		Title:          title,
+		Author:         "testuser",
+		State:          db.MergeRequestStateOpen,
+		HeadBranch:     "feature",
+		BaseBranch:     "main",
+		CreatedAt:      createdAt,
+		UpdatedAt:      createdAt,
+		LastActivityAt: createdAt,
+	})
+	require.NoError(t, err)
 	return prID
 }
 
@@ -1471,6 +1560,56 @@ func TestAPIListPulls(t *testing.T) {
 	assert.Equal("github", body[0].Repo.Provider)
 	assert.Equal("github.com", body[0].Repo.PlatformHost)
 	assert.Equal("acme/widget", body[0].Repo.RepoPath)
+}
+
+func TestAPIPullResponsesNormalizeMissingKanbanStateToNew(t *testing.T) {
+	require := require.New(t)
+	assert := Assert.New(t)
+	srv, database := setupTestServer(t)
+	ctx := t.Context()
+
+	repoID, err := database.UpsertRepo(ctx, db.GitHubRepoIdentity("github.com", "acme", "widget"))
+	require.NoError(err)
+	now := time.Now().UTC().Truncate(time.Second)
+	mrID, err := database.UpsertMergeRequest(ctx, &db.MergeRequest{
+		RepoID:         repoID,
+		PlatformID:     7000,
+		Number:         7,
+		URL:            "https://github.com/acme/widget/pull/7",
+		Title:          "Default kanban PR",
+		Author:         "alice",
+		State:          "open",
+		HeadBranch:     "feature/default-kanban",
+		BaseBranch:     "main",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		LastActivityAt: now,
+	})
+	require.NoError(err)
+	kanbanState, err := database.GetKanbanState(ctx, mrID)
+	require.NoError(err)
+	require.Nil(kanbanState)
+
+	rawList := doJSON(t, srv, http.MethodGet, "/api/v1/pulls", nil)
+	require.Equal(http.StatusOK, rawList.Code)
+	var list []mergeRequestResponse
+	require.NoError(json.Unmarshal(rawList.Body.Bytes(), &list))
+	require.Len(list, 1)
+	assert.Equal(db.KanbanStatusNew, list[0].KanbanStatus)
+
+	rawNewList := doJSON(t, srv, http.MethodGet, "/api/v1/pulls?kanban=new", nil)
+	require.Equal(http.StatusOK, rawNewList.Code)
+	var newList []mergeRequestResponse
+	require.NoError(json.Unmarshal(rawNewList.Body.Bytes(), &newList))
+	require.Len(newList, 1)
+	assert.Equal(db.KanbanStatusNew, newList[0].KanbanStatus)
+
+	rawDetail := doJSON(t, srv, http.MethodGet, "/api/v1/pulls/gh/acme/widget/7", nil)
+	require.Equal(http.StatusOK, rawDetail.Code)
+	var detail mergeRequestDetailResponse
+	require.NoError(json.Unmarshal(rawDetail.Body.Bytes(), &detail))
+	require.NotNil(detail.MergeRequest)
+	assert.Equal(db.KanbanStatusNew, detail.MergeRequest.KanbanStatus)
 }
 
 func TestAPIListItemsIncludeWorkspaceRefs(t *testing.T) {
@@ -3430,6 +3569,58 @@ func TestAPIListRepos(t *testing.T) {
 	require.Equal("widget", (*resp.JSON200)[0].Name)
 }
 
+func TestAPIConfiguredRepoFiltersUseProviderIdentity(t *testing.T) {
+	require := require.New(t)
+	assert := Assert.New(t)
+	ctx := t.Context()
+	srv, database, _ := setupTestServerWithConfig(t)
+	client := setupTestClientWithBaseURL(t, srv, "http://127.0.0.1:8091")
+
+	_, err := database.UpsertRepo(ctx, db.RepoIdentity{
+		Platform:     "github",
+		PlatformHost: "github.com",
+		Owner:        "acme",
+		Name:         "widget",
+		RepoPath:     "acme/widget",
+	})
+	require.NoError(err)
+	_, err = database.UpsertRepo(ctx, db.RepoIdentity{
+		Platform:     "gitea",
+		PlatformHost: "github.com",
+		Owner:        "acme",
+		Name:         "widget",
+		RepoPath:     "acme/widget",
+	})
+	require.NoError(err)
+	srv.syncer.SetRepos([]ghclient.RepoRef{{
+		Platform:     platform.KindGitHub,
+		PlatformHost: "github.com",
+		Owner:        "acme",
+		Name:         "widget",
+		RepoPath:     "acme/widget",
+	}})
+
+	reposResp, err := client.HTTP.ListReposWithResponse(ctx)
+	require.NoError(err)
+	require.Equal(http.StatusOK, reposResp.StatusCode())
+	require.NotNil(reposResp.JSON200)
+	require.Len(*reposResp.JSON200, 1)
+	assert.Equal("github", (*reposResp.JSON200)[0].Platform)
+	assert.Equal("github.com", (*reposResp.JSON200)[0].PlatformHost)
+	assert.Equal("acme", (*reposResp.JSON200)[0].Owner)
+	assert.Equal("widget", (*reposResp.JSON200)[0].Name)
+
+	summariesResp, err := client.HTTP.ListRepoSummariesWithResponse(ctx)
+	require.NoError(err)
+	require.Equal(http.StatusOK, summariesResp.StatusCode())
+	require.NotNil(summariesResp.JSON200)
+	require.Len(*summariesResp.JSON200, 1)
+	assert.Equal("github", (*summariesResp.JSON200)[0].Repo.Provider)
+	assert.Equal("github.com", (*summariesResp.JSON200)[0].PlatformHost)
+	assert.Equal("acme", (*summariesResp.JSON200)[0].Owner)
+	assert.Equal("widget", (*summariesResp.JSON200)[0].Name)
+}
+
 func TestAPIGitLabConfiguredRepoSyncThroughProviderRegistry(t *testing.T) {
 	assert := Assert.New(t)
 	require := require.New(t)
@@ -4888,9 +5079,9 @@ func TestAPIListRepoSummaries(t *testing.T) {
 	assert := Assert.New(t)
 
 	repos := []ghclient.RepoRef{
-		{Owner: "acme", Name: "widgets", PlatformHost: "github.com"},
-		{Owner: "acme", Name: "tools", PlatformHost: "github.com"},
-		{Owner: "acme", Name: "archived", PlatformHost: "github.com"},
+		{Platform: "github", Owner: "acme", Name: "widgets", PlatformHost: "github.com"},
+		{Platform: "github", Owner: "acme", Name: "tools", PlatformHost: "github.com"},
+		{Platform: "github", Owner: "acme", Name: "archived", PlatformHost: "github.com"},
 	}
 	srv, database := setupTestServerWithRepos(t, &mockGH{}, repos)
 	client := setupTestClient(t, srv)
@@ -5326,7 +5517,7 @@ func TestAPICreateIssue(t *testing.T) {
 		t,
 		mock,
 		[]ghclient.RepoRef{
-			{Owner: "acme", Name: "widgets", PlatformHost: "github.com"},
+			{Platform: "github", Owner: "acme", Name: "widgets", PlatformHost: "github.com"},
 		},
 	)
 	client := setupTestClient(t, srv)
@@ -5382,7 +5573,7 @@ func TestAPICreateIssueRejectsNilProviderPayload(t *testing.T) {
 		t,
 		mock,
 		[]ghclient.RepoRef{
-			{Owner: "acme", Name: "widgets", PlatformHost: "github.com"},
+			{Platform: "github", Owner: "acme", Name: "widgets", PlatformHost: "github.com"},
 		},
 	)
 	client := setupTestClient(t, srv)
@@ -5702,7 +5893,7 @@ func TestAPICreateIssueUsesPlatformHost(t *testing.T) {
 		},
 	}
 	repos := []ghclient.RepoRef{
-		{Owner: "acme", Name: "widgets", PlatformHost: "github.com"},
+		{Platform: "github", Owner: "acme", Name: "widgets", PlatformHost: "github.com"},
 		{Owner: "acme", Name: "widgets", PlatformHost: "ghe.example.com"},
 	}
 	syncer := ghclient.NewSyncer(
@@ -6145,6 +6336,138 @@ func TestAPICommentAutocompleteUsesRepoPlatformHost(t *testing.T) {
 	assert.Equal([]db.CommentAutocompleteReference{{Kind: "pull", Number: 12, Title: "Polish mentions", State: "open"}}, body.References)
 }
 
+func TestAPICommentAutocompleteReferencesScopesByProvider(t *testing.T) {
+	assert := Assert.New(t)
+	require := require.New(t)
+	srv, database := setupTestServer(t)
+	ctx := t.Context()
+	now := time.Now().UTC().Truncate(time.Second)
+
+	githubRepoID, err := database.UpsertRepo(ctx, db.RepoIdentity{
+		Platform:     "github",
+		PlatformHost: "github.com",
+		Owner:        "acme",
+		Name:         "widget",
+		RepoPath:     "acme/widget",
+	})
+	require.NoError(err)
+	giteaRepoID, err := database.UpsertRepo(ctx, db.RepoIdentity{
+		Platform:     "gitea",
+		PlatformHost: "github.com",
+		Owner:        "acme",
+		Name:         "widget",
+		RepoPath:     "acme/widget",
+	})
+	require.NoError(err)
+
+	_, err = database.UpsertIssue(ctx, &db.Issue{
+		RepoID:         githubRepoID,
+		PlatformID:     17001,
+		Number:         1,
+		URL:            "https://github.com/acme/widget/issues/1",
+		Title:          "Provider collision issue",
+		Author:         "alice",
+		State:          "open",
+		CreatedAt:      now.Add(-2 * time.Hour),
+		UpdatedAt:      now.Add(-2 * time.Hour),
+		LastActivityAt: now.Add(-2 * time.Hour),
+	})
+	require.NoError(err)
+	_, err = database.UpsertIssue(ctx, &db.Issue{
+		RepoID:         giteaRepoID,
+		PlatformID:     17901,
+		Number:         901,
+		URL:            "https://github.com/acme/widget/issues/901",
+		Title:          "Provider collision issue",
+		Author:         "gina",
+		State:          "open",
+		CreatedAt:      now.Add(-time.Hour),
+		UpdatedAt:      now.Add(-time.Hour),
+		LastActivityAt: now.Add(-time.Hour),
+	})
+	require.NoError(err)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/host/github.com/repo/gitea/acme/widget/comment-autocomplete?trigger=%23&q=collision&limit=10", nil)
+	rr := httptest.NewRecorder()
+	srv.ServeHTTP(rr, req)
+	require.Equal(http.StatusOK, rr.Code, rr.Body.String())
+
+	var body commentAutocompleteResponse
+	require.NoError(json.NewDecoder(rr.Body).Decode(&body))
+	assert.Equal([]db.CommentAutocompleteReference{
+		{Kind: "issue", Number: 901, Title: "Provider collision issue", State: "open"},
+	}, body.References)
+	assert.Empty(body.Users)
+}
+
+func TestAPICommentAutocompleteGitLabMergeRequestReferencesScopesByProvider(t *testing.T) {
+	assert := Assert.New(t)
+	require := require.New(t)
+	srv, database := setupTestServer(t)
+	ctx := t.Context()
+	now := time.Now().UTC().Truncate(time.Second)
+
+	giteaRepoID, err := database.UpsertRepo(ctx, db.RepoIdentity{
+		Platform:     "gitea",
+		PlatformHost: "gitlab.example.com",
+		Owner:        "acme",
+		Name:         "widget",
+		RepoPath:     "acme/widget",
+	})
+	require.NoError(err)
+	gitlabRepoID, err := database.UpsertRepo(ctx, db.RepoIdentity{
+		Platform:     "gitlab",
+		PlatformHost: "gitlab.example.com",
+		Owner:        "acme",
+		Name:         "widget",
+		RepoPath:     "acme/widget",
+	})
+	require.NoError(err)
+
+	_, err = database.UpsertMergeRequest(ctx, &db.MergeRequest{
+		RepoID:         giteaRepoID,
+		PlatformID:     12001,
+		Number:         1,
+		URL:            "https://gitlab.example.com/acme/widget/pulls/1",
+		Title:          "Provider collision merge request",
+		Author:         "gina",
+		State:          "open",
+		HeadBranch:     "feature-gitea",
+		BaseBranch:     "main",
+		CreatedAt:      now.Add(-2 * time.Hour),
+		UpdatedAt:      now.Add(-2 * time.Hour),
+		LastActivityAt: now.Add(-2 * time.Hour),
+	})
+	require.NoError(err)
+	_, err = database.UpsertMergeRequest(ctx, &db.MergeRequest{
+		RepoID:         gitlabRepoID,
+		PlatformID:     12901,
+		Number:         901,
+		URL:            "https://gitlab.example.com/acme/widget/-/merge_requests/901",
+		Title:          "Provider collision merge request",
+		Author:         "glenda",
+		State:          "open",
+		HeadBranch:     "feature-gitlab",
+		BaseBranch:     "main",
+		CreatedAt:      now.Add(-time.Hour),
+		UpdatedAt:      now.Add(-time.Hour),
+		LastActivityAt: now.Add(-time.Hour),
+	})
+	require.NoError(err)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/host/gitlab.example.com/repo/gitlab/acme/widget/comment-autocomplete?trigger=!&q=collision&limit=10", nil)
+	rr := httptest.NewRecorder()
+	srv.ServeHTTP(rr, req)
+	require.Equal(http.StatusOK, rr.Code, rr.Body.String())
+
+	var body commentAutocompleteResponse
+	require.NoError(json.NewDecoder(rr.Body).Decode(&body))
+	assert.Equal([]db.CommentAutocompleteReference{
+		{Kind: "pull", Number: 901, Title: "Provider collision merge request", State: "open"},
+	}, body.References)
+	assert.Empty(body.Users)
+}
+
 func TestAPISyncStatus(t *testing.T) {
 	require := require.New(t)
 
@@ -6290,7 +6613,7 @@ func TestMatchPriorityRepoSupportsNestedBareRepoPaths(t *testing.T) {
 		},
 		{
 			Platform:     platform.KindGitea,
-			PlatformHost: "gitea",
+			PlatformHost: "github.com",
 			Owner:        "acme",
 			Name:         "widget",
 			RepoPath:     "acme/widget",
@@ -6307,10 +6630,16 @@ func TestMatchPriorityRepoSupportsNestedBareRepoPaths(t *testing.T) {
 	assert.Equal(platform.KindGitHub, repo.Platform)
 	assert.Equal("acme/widget", repo.RepoPath)
 
-	repo, ok = matchPriorityRepo("gitea/acme/widget", tracked)
+	repo, ok = matchPriorityRepo("gitea|github.com/acme/widget", tracked)
 	assert.True(ok)
 	assert.Equal(platform.KindGitea, repo.Platform)
-	assert.Equal("gitea", repo.PlatformHost)
+	assert.Equal("github.com", repo.PlatformHost)
+	assert.Equal("acme/widget", repo.RepoPath)
+
+	repo, ok = matchPriorityRepo("github|github.com/acme/widget", tracked)
+	assert.True(ok)
+	assert.Equal(platform.KindGitHub, repo.Platform)
+	assert.Equal("github.com", repo.PlatformHost)
 	assert.Equal("acme/widget", repo.RepoPath)
 }
 
@@ -6534,6 +6863,17 @@ func seedIssueOnHost(
 	repoID, err := database.UpsertRepo(ctx, db.GitHubRepoIdentity(host, owner, name))
 	require.NoError(t, err)
 
+	return seedIssueForRepo(t, database, repoID, host, owner, name, number, state, title)
+}
+
+func seedIssueForRepo(
+	t *testing.T, database *db.DB,
+	repoID int64, host, owner, name string, number int,
+	state, title string,
+) int64 {
+	t.Helper()
+	ctx := t.Context()
+
 	now := time.Now().UTC().Truncate(time.Second)
 	issue := &db.Issue{
 		RepoID:         repoID,
@@ -6558,11 +6898,33 @@ func seedIssueOnHost(
 
 func TestAPIClosePR(t *testing.T) {
 	require := require.New(t)
+	assert := Assert.New(t)
 
 	srv, database := setupTestServer(t)
 	handlerNow := testEDTTime(9, 15)
 	setTestServerNow(t, srv, handlerNow)
 	seedPR(t, database, "acme", "widget", 1)
+	repo, err := database.GetRepoByOwnerName(t.Context(), "acme", "widget")
+	require.NoError(err)
+	updatedAt := handlerNow.Add(-time.Hour)
+	number := 1
+	require.NoError(database.UpsertNotifications(t.Context(), []db.Notification{{
+		Platform:               "github",
+		PlatformHost:           "github.com",
+		PlatformNotificationID: "thread-pr-close",
+		RepoID:                 &repo.ID,
+		RepoOwner:              "acme",
+		RepoName:               "widget",
+		SubjectType:            "PullRequest",
+		SubjectTitle:           "Test PR #1",
+		WebURL:                 "https://github.com/acme/widget/pull/1",
+		ItemNumber:             &number,
+		ItemType:               "pr",
+		Reason:                 "mention",
+		Unread:                 true,
+		SourceUpdatedAt:        updatedAt,
+		SyncedAt:               updatedAt,
+	}}))
 	client := setupTestClient(t, srv)
 
 	resp, err := client.HTTP.SetPrGithubStateWithResponse(
@@ -6574,8 +6936,13 @@ func TestAPIClosePR(t *testing.T) {
 
 	pr, err := database.GetMergeRequest(t.Context(), "acme", "widget", 1)
 	require.NoError(err)
-	require.Equal(db.MergeRequestStateClosed, pr.State)
+	assert.Equal(db.MergeRequestStateClosed, pr.State)
 	assertTimePtrEqualsUTC(t, pr.ClosedAt, handlerNow)
+	doneNotifications, err := database.ListNotifications(t.Context(), db.ListNotificationsOpts{State: "done"})
+	require.NoError(err)
+	require.Len(doneNotifications, 1)
+	assert.Equal("thread-pr-close", doneNotifications[0].PlatformNotificationID)
+	assert.Equal("closed", doneNotifications[0].DoneReason)
 }
 
 func TestAPIReopenPR(t *testing.T) {
@@ -7211,6 +7578,137 @@ func TestAPIReadyForReviewDoesNotGetRevertedByStaleSync(t *testing.T) {
 	assert.True(finalPR.UpdatedAt.Equal(readyUpdatedAt))
 }
 
+func TestAPIMarkDraftDoesNotGetRevertedByStaleSync(t *testing.T) {
+	require := require.New(t)
+	assert := Assert.New(t)
+
+	staleUpdatedAt := time.Date(2026, 4, 12, 1, 0, 0, 0, time.UTC)
+	syncStarted := make(chan struct{}, 1)
+	releaseSync := make(chan struct{})
+	mock := &mockGH{
+		getPullRequestFn: func(_ context.Context, owner, repo string, number int) (*gh.PullRequest, error) {
+			syncStarted <- struct{}{}
+			<-releaseSync
+
+			id := int64(101)
+			state := "open"
+			title := "stale sync"
+			url := "https://github.com/acme/widget/pull/1"
+			author := "alice"
+			draft := false
+			headSHA := "abc123"
+			baseSHA := "def456"
+			featureRef := "feature"
+			mainRef := "main"
+			createdAt := gh.Timestamp{Time: staleUpdatedAt.Add(-time.Hour)}
+			updatedAt := gh.Timestamp{Time: staleUpdatedAt}
+			return &gh.PullRequest{
+				ID:        &id,
+				Number:    &number,
+				State:     &state,
+				Title:     &title,
+				HTMLURL:   &url,
+				Draft:     &draft,
+				User:      &gh.User{Login: &author},
+				CreatedAt: &createdAt,
+				UpdatedAt: &updatedAt,
+				Head:      &gh.PullRequestBranch{SHA: &headSHA, Ref: &featureRef},
+				Base:      &gh.PullRequestBranch{SHA: &baseSHA, Ref: &mainRef},
+			}, nil
+		},
+		convertToDraftFn: func(_ context.Context, owner, repo string, number int) (*gh.PullRequest, error) {
+			id := int64(101)
+			state := "open"
+			draft := true
+			return &gh.PullRequest{
+				ID:     &id,
+				Number: &number,
+				State:  &state,
+				Draft:  &draft,
+			}, nil
+		},
+	}
+
+	srv, database := setupTestServerWithMock(t, mock)
+	client := setupTestClient(t, srv)
+
+	repoID, err := database.UpsertRepo(t.Context(), db.GitHubRepoIdentity("github.com", "acme", "widget"))
+	require.NoError(err)
+
+	prID, err := database.UpsertMergeRequest(t.Context(), &db.MergeRequest{
+		RepoID:          repoID,
+		PlatformID:      101,
+		Number:          1,
+		URL:             "https://github.com/acme/widget/pull/1",
+		Title:           "ready PR",
+		Author:          "alice",
+		State:           "open",
+		IsDraft:         false,
+		Body:            "",
+		HeadBranch:      "feature",
+		BaseBranch:      "main",
+		PlatformHeadSHA: "abc123",
+		PlatformBaseSHA: "def456",
+		Additions:       0,
+		Deletions:       0,
+		CommentCount:    0,
+		ReviewDecision:  "",
+		CIStatus:        "",
+		CreatedAt:       staleUpdatedAt.Add(-time.Hour),
+		UpdatedAt:       staleUpdatedAt,
+		LastActivityAt:  staleUpdatedAt,
+	})
+	require.NoError(err)
+	require.NoError(database.EnsureKanbanState(t.Context(), prID))
+
+	syncDone := make(chan *generated.SyncPullResponse, 1)
+	syncErr := make(chan error, 1)
+	go func() {
+		resp, err := client.HTTP.SyncPullWithResponse(
+			t.Context(), "gh", "acme", "widget", 1,
+		)
+		if err != nil {
+			syncErr <- err
+			return
+		}
+		syncDone <- resp
+	}()
+
+	<-syncStarted
+
+	resp, err := client.HTTP.SetPrGithubStateWithResponse(
+		t.Context(), "gh", "acme", "widget", 1,
+		generated.SetPrGithubStateJSONRequestBody{State: "draft"},
+	)
+	require.NoError(err)
+	require.Equal(http.StatusOK, resp.StatusCode())
+
+	draftPR, err := database.GetMergeRequest(t.Context(), "acme", "widget", 1)
+	require.NoError(err)
+	require.True(draftPR.IsDraft)
+	assert.True(draftPR.UpdatedAt.After(staleUpdatedAt))
+
+	close(releaseSync)
+
+	completed := false
+	select {
+	case err := <-syncErr:
+		require.NoError(err)
+		completed = true
+	case resp := <-syncDone:
+		require.Equal(http.StatusOK, resp.StatusCode())
+		completed = true
+	case <-time.After(5 * time.Second):
+	}
+	require.True(completed, "timed out waiting for stale draft sync")
+
+	finalPR, err := database.GetMergeRequest(t.Context(), "acme", "widget", 1)
+	require.NoError(err)
+	assert.True(finalPR.IsDraft)
+	assert.Equal("ready PR", finalPR.Title)
+	assert.True(finalPR.UpdatedAt.Equal(draftPR.UpdatedAt))
+}
+
 func TestAPISyncIssueDoesNotOverwriteNewerStateChange(t *testing.T) {
 	require := require.New(t)
 	assert := Assert.New(t)
@@ -7367,6 +7865,8 @@ func TestAPIListPullsSearchByNumber(t *testing.T) {
 	seedPR(t, database, "acme", "widget", 12, withSeedPRTitle("add feature"))
 	prID := seedPR(t, database, "acme", "widget", 278, withSeedPRTitle("fix bug"))
 	seedPR(t, database, "acme", "widget", 290, withSeedPRTitle("another change"))
+	seedPR(t, database, "tools", "worker", 301, withSeedPRTitle("repair bug"))
+	seedPR(t, database, "docs", "reader", 302, withSeedPRTitle("can't reproduce"))
 	repo, err := database.GetRepoByOwnerName(ctx, "acme", "widget")
 	require.NoError(err)
 	require.NoError(database.ReplaceMergeRequestLabels(ctx, repo.ID, prID, []db.Label{{
@@ -7401,12 +7901,24 @@ func TestAPIListPullsSearchByNumber(t *testing.T) {
 	q = "fix"
 	assert.ElementsMatch([]int{278}, pullNumbers(&generated.ListPullsParams{Q: &q}))
 
+	q = "fix widget"
+	assert.ElementsMatch([]int{278}, pullNumbers(&generated.ListPullsParams{Q: &q}))
+
+	q = "work bug"
+	assert.ElementsMatch([]int{301}, pullNumbers(&generated.ListPullsParams{Q: &q}))
+
+	q = "needs-review bug"
+	assert.ElementsMatch([]int{278}, pullNumbers(&generated.ListPullsParams{Q: &q}))
+
+	q = "can't"
+	assert.ElementsMatch([]int{302}, pullNumbers(&generated.ListPullsParams{Q: &q}))
+
 	q = "needs-review"
 	assert.ElementsMatch([]int{278}, pullNumbers(&generated.ListPullsParams{Q: &q}))
 
 	// Substring of number matches multiple.
 	q = "2"
-	assert.ElementsMatch([]int{12, 278, 290}, pullNumbers(&generated.ListPullsParams{Q: &q}))
+	assert.ElementsMatch([]int{12, 278, 290, 302}, pullNumbers(&generated.ListPullsParams{Q: &q}))
 }
 
 func TestAPIListIssuesSearchByNumber(t *testing.T) {
@@ -7418,6 +7930,8 @@ func TestAPIListIssuesSearchByNumber(t *testing.T) {
 	seedIssueOnHost(t, database, "github.com", "acme", "widget", 12, "open", "report a bug")
 	issueID := seedIssueOnHost(t, database, "github.com", "acme", "widget", 278, "open", "filter broken")
 	seedIssueOnHost(t, database, "github.com", "acme", "widget", 290, "open", "another change")
+	seedIssueOnHost(t, database, "github.com", "tools", "worker", 301, "open", "triage bug")
+	seedIssueOnHost(t, database, "github.com", "docs", "reader", 302, "open", "O'Reilly reference")
 	repo, err := database.GetRepoByOwnerName(ctx, "acme", "widget")
 	require.NoError(err)
 	require.NoError(database.ReplaceIssueLabels(ctx, repo.ID, issueID, []db.Label{{
@@ -7452,12 +7966,24 @@ func TestAPIListIssuesSearchByNumber(t *testing.T) {
 	q = "broken"
 	assert.ElementsMatch([]int{278}, issueNumbers(&generated.ListIssuesParams{Q: &q}))
 
+	q = "filter widget"
+	assert.ElementsMatch([]int{278}, issueNumbers(&generated.ListIssuesParams{Q: &q}))
+
+	q = "work bug"
+	assert.ElementsMatch([]int{301}, issueNumbers(&generated.ListIssuesParams{Q: &q}))
+
+	q = "needs-triage filter"
+	assert.ElementsMatch([]int{278}, issueNumbers(&generated.ListIssuesParams{Q: &q}))
+
+	q = "O'Reilly"
+	assert.ElementsMatch([]int{302}, issueNumbers(&generated.ListIssuesParams{Q: &q}))
+
 	q = "needs-triage"
 	assert.ElementsMatch([]int{278}, issueNumbers(&generated.ListIssuesParams{Q: &q}))
 
 	// Substring of number matches multiple.
 	q = "2"
-	assert.ElementsMatch([]int{12, 278, 290}, issueNumbers(&generated.ListIssuesParams{Q: &q}))
+	assert.ElementsMatch([]int{12, 278, 290, 302}, issueNumbers(&generated.ListIssuesParams{Q: &q}))
 }
 
 func TestAPIListItemsHonorsLimit(t *testing.T) {
@@ -7627,6 +8153,43 @@ func TestAPIListPullsFiltersHostedNestedRepoPath(t *testing.T) {
 	assert.Equal("project.special", (*resp.JSON200)[0].RepoName)
 }
 
+func TestAPIListPullsAcceptsProviderQualifiedRepoFilter(t *testing.T) {
+	assert := Assert.New(t)
+	require := require.New(t)
+	srv, database := setupTestServer(t)
+	client := setupTestClient(t, srv)
+	ctx := t.Context()
+
+	githubRepo, err := database.UpsertRepo(ctx, db.RepoIdentity{
+		Platform:     "github",
+		PlatformHost: "github.com",
+		Owner:        "acme",
+		Name:         "widget",
+	})
+	require.NoError(err)
+	giteaRepo, err := database.UpsertRepo(ctx, db.RepoIdentity{
+		Platform:     "gitea",
+		PlatformHost: "github.com",
+		Owner:        "acme",
+		Name:         "widget",
+	})
+	require.NoError(err)
+	seedPRForRepo(t, database, githubRepo, "github.com", "acme", "widget", 1)
+	seedPRForRepo(t, database, giteaRepo, "github.com", "acme", "widget", 2)
+
+	repo := "gitea|github.com/acme/widget"
+	resp, err := client.HTTP.ListPullsWithResponse(ctx, &generated.ListPullsParams{Repo: &repo})
+	require.NoError(err)
+	require.Equal(http.StatusOK, resp.StatusCode())
+	require.NotNil(resp.JSON200)
+	require.Len(*resp.JSON200, 1)
+	assert.Equal("gitea", (*resp.JSON200)[0].Repo.Provider)
+	assert.Equal("github.com", (*resp.JSON200)[0].PlatformHost)
+	assert.Equal("acme", (*resp.JSON200)[0].RepoOwner)
+	assert.Equal("widget", (*resp.JSON200)[0].RepoName)
+	assert.EqualValues(2, (*resp.JSON200)[0].Number)
+}
+
 func TestAPIListIssuesIncludesLabels(t *testing.T) {
 	require := require.New(t)
 	srv, database := setupTestServer(t)
@@ -7741,6 +8304,43 @@ func TestAPIListIssuesFiltersHostedNestedRepoPath(t *testing.T) {
 	assert.EqualValues(1, (*resp.JSON200)[0].Number)
 }
 
+func TestAPIListIssuesAcceptsProviderQualifiedRepoFilter(t *testing.T) {
+	assert := Assert.New(t)
+	require := require.New(t)
+	srv, database := setupTestServer(t)
+	client := setupTestClient(t, srv)
+	ctx := t.Context()
+
+	githubRepo, err := database.UpsertRepo(ctx, db.RepoIdentity{
+		Platform:     "github",
+		PlatformHost: "github.com",
+		Owner:        "acme",
+		Name:         "widget",
+	})
+	require.NoError(err)
+	giteaRepo, err := database.UpsertRepo(ctx, db.RepoIdentity{
+		Platform:     "gitea",
+		PlatformHost: "github.com",
+		Owner:        "acme",
+		Name:         "widget",
+	})
+	require.NoError(err)
+	seedIssueForRepo(t, database, githubRepo, "github.com", "acme", "widget", 1, "open", "GitHub issue")
+	seedIssueForRepo(t, database, giteaRepo, "github.com", "acme", "widget", 2, "open", "Gitea issue")
+
+	repo := "gitea|github.com/acme/widget"
+	resp, err := client.HTTP.ListIssuesWithResponse(ctx, &generated.ListIssuesParams{Repo: &repo})
+	require.NoError(err)
+	require.Equal(http.StatusOK, resp.StatusCode())
+	require.NotNil(resp.JSON200)
+	require.Len(*resp.JSON200, 1)
+	assert.Equal("gitea", (*resp.JSON200)[0].Repo.Provider)
+	assert.Equal("github.com", (*resp.JSON200)[0].PlatformHost)
+	assert.Equal("acme", (*resp.JSON200)[0].RepoOwner)
+	assert.Equal("widget", (*resp.JSON200)[0].RepoName)
+	assert.EqualValues(2, (*resp.JSON200)[0].Number)
+}
+
 func TestAPIGetIssueUsesPlatformHostQuery(t *testing.T) {
 	require := require.New(t)
 	assert := Assert.New(t)
@@ -7766,8 +8366,8 @@ func TestAPIGetIssueUsesPlatformHostQuery(t *testing.T) {
 		database,
 		nil,
 		[]ghclient.RepoRef{
-			{Owner: "acme", Name: "widget", PlatformHost: "github.com"},
-			{Owner: "acme", Name: "widget", PlatformHost: "ghe.example.com"},
+			{Platform: "github", Owner: "acme", Name: "widget", PlatformHost: "github.com"},
+			{Platform: "github", Owner: "acme", Name: "widget", PlatformHost: "ghe.example.com"},
 		},
 		time.Minute,
 		nil,
@@ -7801,6 +8401,268 @@ func TestAPIGetIssueUsesPlatformHostQuery(t *testing.T) {
 	if assert.NotNil(body.Issue) {
 		assert.Equal("GHES issue", body.Issue.Title)
 	}
+}
+
+func TestAPIGetIssueWorkspaceUsesProviderScopedLookup(t *testing.T) {
+	require := require.New(t)
+	assert := Assert.New(t)
+	ctx := t.Context()
+
+	database := dbtest.Open(t)
+	for _, provider := range []string{"github", "gitlab"} {
+		repoID, err := database.UpsertRepo(ctx, db.RepoIdentity{
+			Platform:     provider,
+			PlatformHost: "forge.example.com",
+			Owner:        "acme",
+			Name:         "widget",
+		})
+		require.NoError(err)
+		_, err = database.UpsertIssue(ctx, &db.Issue{
+			RepoID:         repoID,
+			PlatformID:     int64(len(provider)) * 1000,
+			Number:         7,
+			URL:            "https://forge.example.com/acme/widget/issues/7",
+			Title:          provider + " issue",
+			Author:         "testuser",
+			State:          "open",
+			CreatedAt:      time.Now().UTC().Truncate(time.Second),
+			UpdatedAt:      time.Now().UTC().Truncate(time.Second),
+			LastActivityAt: time.Now().UTC().Truncate(time.Second),
+		})
+		require.NoError(err)
+	}
+	require.NoError(database.InsertWorkspace(ctx, &db.Workspace{
+		ID:              "github-issue-workspace",
+		Platform:        "github",
+		PlatformHost:    "forge.example.com",
+		RepoOwner:       "acme",
+		RepoName:        "widget",
+		ItemType:        db.WorkspaceItemTypeIssue,
+		ItemNumber:      7,
+		GitHeadRef:      "middleman/issue-7",
+		WorkspaceBranch: "middleman/issue-7",
+		WorktreePath:    filepath.Join(t.TempDir(), "github"),
+		TmuxSession:     "github-issue-workspace",
+		Status:          "ready",
+	}))
+	require.NoError(database.InsertWorkspace(ctx, &db.Workspace{
+		ID:              "gitlab-issue-workspace",
+		Platform:        "gitlab",
+		PlatformHost:    "forge.example.com",
+		RepoOwner:       "acme",
+		RepoName:        "widget",
+		ItemType:        db.WorkspaceItemTypeIssue,
+		ItemNumber:      7,
+		GitHeadRef:      "middleman/issue-7",
+		WorkspaceBranch: "middleman/issue-7",
+		WorktreePath:    filepath.Join(t.TempDir(), "gitlab"),
+		TmuxSession:     "gitlab-issue-workspace",
+		Status:          "ready",
+	}))
+
+	syncer := ghclient.NewSyncer(nil, database, nil, nil, time.Minute, nil, nil)
+	t.Cleanup(syncer.Stop)
+	srv := New(database, syncer, nil, "/", nil, ServerOptions{})
+	srv.workspaces = workspace.NewManager(database, t.TempDir())
+	t.Cleanup(func() { gracefulShutdown(t, srv) })
+
+	req := httptest.NewRequest(
+		http.MethodGet,
+		"/api/v1/host/forge.example.com/issues/gitlab/acme/widget/7",
+		nil,
+	)
+	rr := httptest.NewRecorder()
+	srv.ServeHTTP(rr, req)
+
+	require.Equal(http.StatusOK, rr.Code, rr.Body.String())
+	var body rawIssueDetailResponse
+	require.NoError(json.Unmarshal(rr.Body.Bytes(), &body))
+	if assert.NotNil(body.Workspace) {
+		assert.Equal("gitlab-issue-workspace", body.Workspace.ID)
+	}
+	if assert.NotNil(body.Issue) {
+		assert.Equal("gitlab issue", body.Issue.Title)
+	}
+}
+
+func TestAPIGetPRWorkspaceUsesProviderScopedLookup(t *testing.T) {
+	require := require.New(t)
+	assert := Assert.New(t)
+	ctx := t.Context()
+
+	database := dbtest.Open(t)
+	for _, provider := range []string{"github", "gitlab"} {
+		repoID, err := database.UpsertRepo(ctx, db.RepoIdentity{
+			Platform:     provider,
+			PlatformHost: "forge.example.com",
+			Owner:        "acme",
+			Name:         "widget",
+		})
+		require.NoError(err)
+		_, err = database.UpsertMergeRequest(ctx, &db.MergeRequest{
+			RepoID:         repoID,
+			PlatformID:     int64(len(provider)) * 1000,
+			Number:         7,
+			URL:            "https://forge.example.com/acme/widget/pull/7",
+			Title:          provider + " PR",
+			Author:         "testuser",
+			State:          "open",
+			HeadBranch:     "feature",
+			BaseBranch:     "main",
+			CreatedAt:      time.Now().UTC().Truncate(time.Second),
+			UpdatedAt:      time.Now().UTC().Truncate(time.Second),
+			LastActivityAt: time.Now().UTC().Truncate(time.Second),
+		})
+		require.NoError(err)
+	}
+	require.NoError(database.InsertWorkspace(ctx, &db.Workspace{
+		ID:              "github-pr-workspace",
+		Platform:        "github",
+		PlatformHost:    "forge.example.com",
+		RepoOwner:       "acme",
+		RepoName:        "widget",
+		ItemType:        db.WorkspaceItemTypePullRequest,
+		ItemNumber:      7,
+		GitHeadRef:      "feature",
+		WorkspaceBranch: "middleman/pr-7",
+		WorktreePath:    filepath.Join(t.TempDir(), "github"),
+		TmuxSession:     "github-pr-workspace",
+		Status:          "ready",
+	}))
+	require.NoError(database.InsertWorkspace(ctx, &db.Workspace{
+		ID:              "gitlab-pr-workspace",
+		Platform:        "gitlab",
+		PlatformHost:    "forge.example.com",
+		RepoOwner:       "acme",
+		RepoName:        "widget",
+		ItemType:        db.WorkspaceItemTypePullRequest,
+		ItemNumber:      7,
+		GitHeadRef:      "feature",
+		WorkspaceBranch: "middleman/pr-7",
+		WorktreePath:    filepath.Join(t.TempDir(), "gitlab"),
+		TmuxSession:     "gitlab-pr-workspace",
+		Status:          "ready",
+	}))
+
+	syncer := ghclient.NewSyncer(nil, database, nil, nil, time.Minute, nil, nil)
+	t.Cleanup(syncer.Stop)
+	srv := New(database, syncer, nil, "/", nil, ServerOptions{})
+	srv.workspaces = workspace.NewManager(database, t.TempDir())
+	t.Cleanup(func() { gracefulShutdown(t, srv) })
+
+	req := httptest.NewRequest(
+		http.MethodGet,
+		"/api/v1/host/forge.example.com/pulls/gitlab/acme/widget/7",
+		nil,
+	)
+	rr := httptest.NewRecorder()
+	srv.ServeHTTP(rr, req)
+
+	require.Equal(http.StatusOK, rr.Code, rr.Body.String())
+	var body mergeRequestDetailResponse
+	require.NoError(json.Unmarshal(rr.Body.Bytes(), &body))
+	if assert.NotNil(body.Workspace) {
+		assert.Equal("gitlab-pr-workspace", body.Workspace.ID)
+	}
+	if assert.NotNil(body.MergeRequest) {
+		assert.Equal("gitlab PR", body.MergeRequest.Title)
+	}
+}
+
+func TestAPICreateWorkspaceRejectsEmptyProviderForAmbiguousRepo(t *testing.T) {
+	require := require.New(t)
+	assert := Assert.New(t)
+	ctx := t.Context()
+
+	srv, database := setupTestServer(t)
+	srv.workspaces = workspace.NewManager(database, t.TempDir())
+	for _, provider := range []string{"github", "gitlab"} {
+		repoID, err := database.UpsertRepo(ctx, db.RepoIdentity{
+			Platform:     provider,
+			PlatformHost: "forge.example.com",
+			Owner:        "acme",
+			Name:         "widget",
+		})
+		require.NoError(err)
+		_, err = database.UpsertMergeRequest(ctx, &db.MergeRequest{
+			RepoID:         repoID,
+			PlatformID:     int64(len(provider)) * 1000,
+			Number:         7,
+			URL:            "https://forge.example.com/acme/widget/pull/7",
+			Title:          provider + " PR",
+			Author:         "testuser",
+			State:          "open",
+			HeadBranch:     "feature",
+			BaseBranch:     "main",
+			CreatedAt:      time.Now().UTC().Truncate(time.Second),
+			UpdatedAt:      time.Now().UTC().Truncate(time.Second),
+			LastActivityAt: time.Now().UTC().Truncate(time.Second),
+		})
+		require.NoError(err)
+	}
+	client := setupTestClient(t, srv)
+	provider := ""
+
+	resp, err := client.HTTP.CreateWorkspaceWithResponse(
+		ctx,
+		generated.CreateWorkspaceInputBody{
+			Provider:     &provider,
+			PlatformHost: "forge.example.com",
+			Owner:        "acme",
+			Name:         "widget",
+			MrNumber:     7,
+		},
+	)
+	require.NoError(err)
+	require.Equal(http.StatusBadRequest, resp.StatusCode(), string(resp.Body))
+
+	var problem rawProblemDetail
+	require.NoError(json.Unmarshal(resp.Body, &problem))
+	assert.Equal("validationError", problem.Code)
+	assert.Equal("body.provider", problem.Details["field"])
+}
+
+func TestAPICreateWorkspaceAllowsOmittedProviderForUnambiguousRepo(t *testing.T) {
+	require := require.New(t)
+	ctx := t.Context()
+
+	srv, database := setupTestServer(t)
+	srv.workspaces = workspace.NewManager(database, t.TempDir())
+	repoID, err := database.UpsertRepo(ctx, db.RepoIdentity{
+		Platform:     "github",
+		PlatformHost: "github.com",
+		Owner:        "acme",
+		Name:         "widget",
+	})
+	require.NoError(err)
+	_, err = database.UpsertMergeRequest(ctx, &db.MergeRequest{
+		RepoID:         repoID,
+		PlatformID:     7000,
+		Number:         7,
+		URL:            "https://github.com/acme/widget/pull/7",
+		Title:          "github PR",
+		Author:         "testuser",
+		State:          "open",
+		HeadBranch:     "feature",
+		BaseBranch:     "main",
+		CreatedAt:      time.Now().UTC().Truncate(time.Second),
+		UpdatedAt:      time.Now().UTC().Truncate(time.Second),
+		LastActivityAt: time.Now().UTC().Truncate(time.Second),
+	})
+	require.NoError(err)
+
+	payload := strings.NewReader(`{
+		"platform_host": "github.com",
+		"owner": "acme",
+		"name": "widget",
+		"mr_number": 7
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/workspaces", payload)
+	req.Header.Set("content-type", "application/json")
+	rr := httptest.NewRecorder()
+	srv.ServeHTTP(rr, req)
+
+	require.Equal(http.StatusAccepted, rr.Code, rr.Body.String())
 }
 
 func TestAPISyncIssueUsesPlatformHostQuery(t *testing.T) {
@@ -7866,8 +8728,8 @@ func TestAPISyncIssueUsesPlatformHostQuery(t *testing.T) {
 		database,
 		nil,
 		[]ghclient.RepoRef{
-			{Owner: "acme", Name: "widget", PlatformHost: "github.com"},
-			{Owner: "acme", Name: "widget", PlatformHost: "ghe.example.com"},
+			{Platform: "github", Owner: "acme", Name: "widget", PlatformHost: "github.com"},
+			{Platform: "github", Owner: "acme", Name: "widget", PlatformHost: "ghe.example.com"},
 		},
 		time.Minute,
 		nil,
@@ -8000,8 +8862,8 @@ func TestAPISetIssueStateUsesPlatformHostBody(t *testing.T) {
 		database,
 		nil,
 		[]ghclient.RepoRef{
-			{Owner: "acme", Name: "widget", PlatformHost: "github.com"},
-			{Owner: "acme", Name: "widget", PlatformHost: "ghe.example.com"},
+			{Platform: "github", Owner: "acme", Name: "widget", PlatformHost: "github.com"},
+			{Platform: "github", Owner: "acme", Name: "widget", PlatformHost: "ghe.example.com"},
 		},
 		time.Minute,
 		nil,
@@ -9778,6 +10640,329 @@ func TestE2EIssueDetailRemovesDeletedCommentOnGraphQLBulkSync(t *testing.T) {
 	require.Empty(*secondResp.JSON200.Events)
 }
 
+func TestE2EGraphQLBulkSyncPersistsIssueTimelineEvents(t *testing.T) {
+	require := require.New(t)
+	assert := Assert.New(t)
+	ctx := t.Context()
+
+	now := time.Date(2026, 4, 13, 12, 0, 0, 0, time.UTC)
+	nowRFC3339 := now.Format(time.RFC3339)
+
+	gqlSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if bytes.Contains(body, []byte("pullRequests")) {
+			_, _ = w.Write([]byte(`{"data":{"repository":{"pullRequests":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}`))
+			return
+		}
+		resp := `{"data":{"repository":{"issues":{"nodes":[{
+			"databaseId":171200,
+			"number":173,
+			"title":"Bulk timeline issue",
+			"state":"OPEN",
+			"body":"GraphQL bulk issue timeline",
+			"url":"https://github.com/acme/widget/issues/173",
+			"author":{"login":"heidi"},
+			"createdAt":"` + nowRFC3339 + `",
+			"updatedAt":"` + nowRFC3339 + `",
+			"closedAt":null,
+			"labels":{"nodes":[]},
+			"comments":{"totalCount":0,"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}},
+			"timelineItems":{"nodes":[{
+				"__typename":"CrossReferencedEvent",
+				"id":"CRE_issue_173",
+				"actor":{"login":"reviewer"},
+				"createdAt":"` + now.Add(time.Minute).Format(time.RFC3339) + `",
+				"isCrossRepository":false,
+				"willCloseTarget":true,
+				"source":{
+					"__typename":"PullRequest",
+					"number":174,
+					"title":"Fix bulk timeline issue",
+					"url":"https://github.com/acme/widget/pull/174",
+					"repository":{"owner":{"login":"acme"},"name":"widget"}
+				}
+			},{
+				"__typename":"ClosedEvent",
+				"id":"CE_issue_173",
+				"actor":{"login":"closer"},
+				"createdAt":"` + now.Add(2*time.Minute).Format(time.RFC3339) + `"
+			},{
+				"__typename":"ReopenedEvent",
+				"id":"RE_issue_173",
+				"actor":{"login":"opener"},
+				"createdAt":"` + now.Add(3*time.Minute).Format(time.RFC3339) + `"
+			}],"pageInfo":{"hasNextPage":false,"endCursor":""}}
+		}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}`
+		_, _ = w.Write([]byte(resp))
+	}))
+	defer gqlSrv.Close()
+
+	issueID := int64(171200)
+	issueNumber := 173
+	issueTitle := "Bulk timeline issue"
+	issueState := "open"
+	issueURL := "https://github.com/acme/widget/issues/173"
+	issueAuthor := "heidi"
+	issueTime := gh.Timestamp{Time: now}
+	mock := &mockGH{
+		listOpenPullRequestsFn: func(_ context.Context, _, _ string) ([]*gh.PullRequest, error) {
+			return nil, &gh.ErrorResponse{
+				Response: &http.Response{StatusCode: http.StatusNotModified},
+			}
+		},
+		listOpenIssuesFn: func(_ context.Context, _, _ string) ([]*gh.Issue, error) {
+			return []*gh.Issue{{
+				ID:        &issueID,
+				Number:    &issueNumber,
+				Title:     &issueTitle,
+				State:     &issueState,
+				HTMLURL:   &issueURL,
+				User:      &gh.User{Login: &issueAuthor},
+				CreatedAt: &issueTime,
+				UpdatedAt: &issueTime,
+			}}, nil
+		},
+	}
+
+	database := dbtest.Open(t)
+
+	syncer := ghclient.NewSyncer(
+		map[string]ghclient.Client{"github.com": mock},
+		database,
+		nil,
+		defaultTestRepos,
+		time.Minute,
+		nil,
+		map[string]*ghclient.SyncBudget{"github.com": ghclient.NewSyncBudget(10000)},
+	)
+	t.Cleanup(syncer.Stop)
+
+	gqlClient := githubv4.NewEnterpriseClient(gqlSrv.URL, gqlSrv.Client())
+	syncer.SetFetchers(map[string]*ghclient.GraphQLFetcher{
+		"github.com": ghclient.NewGraphQLFetcherWithClient(gqlClient, nil),
+	})
+
+	srv := New(database, syncer, nil, "/", nil, ServerOptions{})
+	t.Cleanup(func() { gracefulShutdown(t, srv) })
+	client := setupTestClient(t, srv)
+
+	srv.syncer.RunOnce(ctx)
+
+	resp, err := client.HTTP.GetIssueWithResponse(
+		ctx, "gh", "acme", "widget", int64(issueNumber),
+	)
+	require.NoError(err)
+	require.Equal(http.StatusOK, resp.StatusCode())
+	require.NotNil(resp.JSON200)
+	require.True(resp.JSON200.DetailLoaded)
+	require.NotNil(resp.JSON200.Events)
+	require.Len(*resp.JSON200.Events, 3)
+
+	byType := make(map[string]generated.IssueEvent, len(*resp.JSON200.Events))
+	for _, event := range *resp.JSON200.Events {
+		byType[event.EventType] = event
+	}
+
+	crossReferenced, ok := byType["cross_referenced"]
+	require.True(ok)
+	assert.Equal("reviewer", crossReferenced.Author)
+	assert.Equal("Referenced from acme/widget#174", crossReferenced.Summary)
+	assert.Contains(crossReferenced.MetadataJSON, `"source_title":"Fix bulk timeline issue"`)
+	assert.Equal("timeline-CRE_issue_173", crossReferenced.DedupeKey)
+
+	closed, ok := byType["closed"]
+	require.True(ok)
+	assert.Equal("closer", closed.Author)
+	assert.Equal("closed this", closed.Summary)
+	assert.Equal("timeline-CE_issue_173", closed.DedupeKey)
+
+	reopened, ok := byType["reopened"]
+	require.True(ok)
+	assert.Equal("opener", reopened.Author)
+	assert.Equal("reopened this", reopened.Summary)
+	assert.Equal("timeline-RE_issue_173", reopened.DedupeKey)
+}
+
+func TestE2EGraphQLBulkSyncPersistsIssueLifecycleTimelineAfterReopen(t *testing.T) {
+	require := require.New(t)
+	assert := Assert.New(t)
+	ctx := t.Context()
+
+	now := time.Now().UTC().Truncate(time.Second)
+	const issueID int64 = 171300
+	const issueNumber = 175
+	const issueTitle = "Reopened timeline issue"
+	const issueURL = "https://github.com/acme/widget/issues/175"
+	const issueAuthor = "heidi"
+	phase := "open"
+
+	issueNode := func(updatedAt time.Time, timelineItems string) string {
+		return `{
+			"databaseId":171300,
+			"number":175,
+			"title":"Reopened timeline issue",
+			"state":"OPEN",
+			"body":"GraphQL reopened issue timeline",
+			"url":"https://github.com/acme/widget/issues/175",
+			"author":{"login":"heidi"},
+			"createdAt":"` + now.Format(time.RFC3339) + `",
+			"updatedAt":"` + updatedAt.Format(time.RFC3339) + `",
+			"closedAt":null,
+			"labels":{"nodes":[]},
+			"comments":{"totalCount":0,"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}},
+			"timelineItems":{"nodes":[` + timelineItems + `],"pageInfo":{"hasNextPage":false,"endCursor":""}}
+		}`
+	}
+
+	gqlSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if bytes.Contains(body, []byte("pullRequests")) {
+			_, _ = w.Write([]byte(`{"data":{"repository":{"pullRequests":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}`))
+			return
+		}
+
+		nodes := "[]"
+		switch phase {
+		case "open":
+			nodes = "[" + issueNode(now, "") + "]"
+		case "closed":
+			nodes = "[]"
+		case "reopened":
+			timelineItems := `{
+				"__typename":"ClosedEvent",
+				"id":"CE_issue_175",
+				"actor":{"login":"closer"},
+				"createdAt":"` + now.Add(time.Minute).Format(time.RFC3339) + `"
+			},{
+				"__typename":"ReopenedEvent",
+				"id":"RE_issue_175",
+				"actor":{"login":"opener"},
+				"createdAt":"` + now.Add(2*time.Minute).Format(time.RFC3339) + `"
+			}`
+			nodes = "[" + issueNode(now.Add(3*time.Minute), timelineItems) + "]"
+		}
+
+		resp := `{"data":{"repository":{"issues":{"nodes":` + nodes + `,"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}`
+		_, _ = w.Write([]byte(resp))
+	}))
+	defer gqlSrv.Close()
+
+	mock := &mockGH{
+		listOpenPullRequestsFn: func(_ context.Context, _, _ string) ([]*gh.PullRequest, error) {
+			return nil, &gh.ErrorResponse{
+				Response: &http.Response{StatusCode: http.StatusNotModified},
+			}
+		},
+		listOpenIssuesFn: func(_ context.Context, _, _ string) ([]*gh.Issue, error) {
+			if phase == "closed" {
+				return nil, nil
+			}
+			state := "open"
+			updatedAt := now
+			if phase == "reopened" {
+				updatedAt = now.Add(3 * time.Minute)
+			}
+			return []*gh.Issue{{
+				ID:        new(issueID),
+				Number:    new(issueNumber),
+				Title:     new(issueTitle),
+				State:     &state,
+				HTMLURL:   new(issueURL),
+				User:      &gh.User{Login: new(issueAuthor)},
+				CreatedAt: &gh.Timestamp{Time: now},
+				UpdatedAt: &gh.Timestamp{Time: updatedAt},
+			}}, nil
+		},
+		getIssueFn: func(_ context.Context, _, _ string, number int) (*gh.Issue, error) {
+			require.Equal(issueNumber, number)
+			state := "closed"
+			closedAt := gh.Timestamp{Time: now.Add(time.Minute)}
+			return &gh.Issue{
+				ID:        new(issueID),
+				Number:    new(issueNumber),
+				Title:     new(issueTitle),
+				State:     &state,
+				HTMLURL:   new(issueURL),
+				User:      &gh.User{Login: new(issueAuthor)},
+				CreatedAt: &gh.Timestamp{Time: now},
+				UpdatedAt: &gh.Timestamp{Time: now.Add(time.Minute)},
+				ClosedAt:  &closedAt,
+			}, nil
+		},
+	}
+
+	database := dbtest.Open(t)
+
+	syncer := ghclient.NewSyncer(
+		map[string]ghclient.Client{"github.com": mock},
+		database,
+		nil,
+		defaultTestRepos,
+		time.Minute,
+		nil,
+		map[string]*ghclient.SyncBudget{"github.com": ghclient.NewSyncBudget(10000)},
+	)
+	t.Cleanup(syncer.Stop)
+
+	gqlClient := githubv4.NewEnterpriseClient(gqlSrv.URL, gqlSrv.Client())
+	syncer.SetFetchers(map[string]*ghclient.GraphQLFetcher{
+		"github.com": ghclient.NewGraphQLFetcherWithClient(gqlClient, nil),
+	})
+
+	srv := New(database, syncer, nil, "/", nil, ServerOptions{})
+	t.Cleanup(func() { gracefulShutdown(t, srv) })
+	client := setupTestClient(t, srv)
+
+	srv.syncer.RunOnce(ctx)
+
+	phase = "closed"
+	srv.syncer.RunOnce(ctx)
+
+	closedResp, err := client.HTTP.GetIssueWithResponse(
+		ctx, "gh", "acme", "widget", int64(issueNumber),
+	)
+	require.NoError(err)
+	require.Equal(http.StatusOK, closedResp.StatusCode())
+	require.NotNil(closedResp.JSON200)
+	assert.Equal("closed", closedResp.JSON200.Issue.State)
+	require.NotNil(closedResp.JSON200.Events)
+	assert.Empty(*closedResp.JSON200.Events)
+
+	phase = "reopened"
+	srv.syncer.RunOnce(ctx)
+
+	reopenedResp, err := client.HTTP.GetIssueWithResponse(
+		ctx, "gh", "acme", "widget", int64(issueNumber),
+	)
+	require.NoError(err)
+	require.Equal(http.StatusOK, reopenedResp.StatusCode())
+	require.NotNil(reopenedResp.JSON200)
+	assert.Equal("open", reopenedResp.JSON200.Issue.State)
+	require.NotNil(reopenedResp.JSON200.Events)
+	require.Len(*reopenedResp.JSON200.Events, 2)
+
+	byType := make(map[string]generated.IssueEvent, len(*reopenedResp.JSON200.Events))
+	for _, event := range *reopenedResp.JSON200.Events {
+		byType[event.EventType] = event
+	}
+
+	closed, ok := byType["closed"]
+	require.True(ok)
+	assert.Equal("closer", closed.Author)
+	assert.Equal("closed this", closed.Summary)
+	assert.Equal("timeline-CE_issue_175", closed.DedupeKey)
+
+	reopened, ok := byType["reopened"]
+	require.True(ok)
+	assert.Equal("opener", reopened.Author)
+	assert.Equal("reopened this", reopened.Summary)
+	assert.Equal("timeline-RE_issue_175", reopened.DedupeKey)
+}
+
 func TestE2EPRDetailRemovesDeletedCommentOnGraphQLBulkSync(t *testing.T) {
 	require := require.New(t)
 	assert := Assert.New(t)
@@ -10401,6 +11586,84 @@ func TestAPIClosePR422AlreadyClosed(t *testing.T) {
 
 	pr, _ := database.GetMergeRequest(t.Context(), "acme", "widget", 1)
 	require.Equal(db.MergeRequestStateClosed, pr.State)
+}
+
+func TestAPIMarkPRDraftPersistsDraftFlag(t *testing.T) {
+	require := require.New(t)
+	assert := Assert.New(t)
+	var gotOwner string
+	var gotRepo string
+	var gotNumber int
+	mock := &mockGH{
+		convertToDraftFn: func(_ context.Context, owner, repo string, number int) (*gh.PullRequest, error) {
+			gotOwner = owner
+			gotRepo = repo
+			gotNumber = number
+			id := int64(1001)
+			title := "Draft PR"
+			state := "open"
+			url := "https://github.com/acme/widget/pull/1"
+			author := "octocat"
+			draft := true
+			now := gh.Timestamp{Time: time.Now().UTC().Add(time.Minute)}
+			headSHA := "abc123"
+			baseSHA := "def456"
+			featureRef := "feature"
+			mainRef := "main"
+			return &gh.PullRequest{
+				ID:        &id,
+				Number:    &number,
+				Title:     &title,
+				State:     &state,
+				HTMLURL:   &url,
+				Draft:     &draft,
+				CreatedAt: &now,
+				UpdatedAt: &now,
+				User:      &gh.User{Login: &author},
+				Head:      &gh.PullRequestBranch{SHA: &headSHA, Ref: &featureRef},
+				Base:      &gh.PullRequestBranch{SHA: &baseSHA, Ref: &mainRef},
+			}, nil
+		},
+	}
+	srv, database := setupTestServerWithMock(t, mock)
+	seedPR(t, database, "acme", "widget", 1)
+	before, err := database.GetMergeRequest(t.Context(), "acme", "widget", 1)
+	require.NoError(err)
+	require.NotNil(before)
+	before.CommentCount = 7
+	before.CIStatus = "success"
+	before.CIChecksJSON = `[{"name":"ci","status":"success"}]`
+	before.ReviewDecision = "APPROVED"
+	before.AssigneesJSON = `["alice"]`
+	before.ReviewersJSON = `["bob"]`
+	before.MergeableState = "clean"
+	_, err = database.UpsertMergeRequest(t.Context(), before)
+	require.NoError(err)
+	client := setupTestClient(t, srv)
+
+	resp, err := client.HTTP.SetPrGithubStateWithResponse(
+		t.Context(), "gh", "acme", "widget", 1,
+		generated.SetPrGithubStateJSONRequestBody{State: "draft"},
+	)
+	require.NoError(err)
+	require.Equal(http.StatusOK, resp.StatusCode())
+
+	assert.Equal("acme", gotOwner)
+	assert.Equal("widget", gotRepo)
+	assert.Equal(1, gotNumber)
+	pr, err := database.GetMergeRequest(t.Context(), "acme", "widget", 1)
+	require.NoError(err)
+	require.NotNil(pr)
+	assert.Equal(db.MergeRequestStateOpen, pr.State)
+	assert.True(pr.IsDraft)
+	assert.Nil(pr.ClosedAt)
+	assert.Equal(7, pr.CommentCount)
+	assert.Equal("success", pr.CIStatus)
+	assert.JSONEq(`[{"name":"ci","status":"success"}]`, pr.CIChecksJSON)
+	assert.Equal("APPROVED", pr.ReviewDecision)
+	assert.Equal([]string{"alice"}, pr.Assignees)
+	assert.Equal([]string{"bob"}, pr.RequestedReviewers)
+	assert.Equal("clean", pr.MergeableState)
 }
 
 // When MarkPullRequestReadyForReview returns (nil, nil) the handler
@@ -16525,7 +17788,7 @@ func TestAPIRateLimitsMultiHostMixed(t *testing.T) {
 		},
 		database, nil,
 		[]ghclient.RepoRef{
-			{Owner: "acme", Name: "widget", PlatformHost: "github.com"},
+			{Platform: "github", Owner: "acme", Name: "widget", PlatformHost: "github.com"},
 			{Owner: "corp", Name: "internal", PlatformHost: "ghe.example.com"},
 		},
 		time.Minute,
@@ -16981,6 +18244,16 @@ func TestAPIActivityStartupRepairsLegacyTimestampStorage(t *testing.T) {
 			ALTER TABLE middleman_issues DROP COLUMN assignees_json;
 			ALTER TABLE middleman_merge_requests DROP COLUMN assignees_json;
 			ALTER TABLE middleman_merge_requests DROP COLUMN reviewers_json;
+			DROP TABLE middleman_host_runtime_sessions;
+			DROP TABLE middleman_worktree_stats;
+			DROP INDEX middleman_project_worktree_runtime_sessions_worktree_id_idx;
+			DROP TABLE middleman_project_worktree_runtime_sessions;
+			ALTER TABLE middleman_project_worktrees DROP COLUMN linked_issue_numbers;
+			ALTER TABLE middleman_project_worktrees DROP COLUMN session_backend;
+			ALTER TABLE middleman_project_worktrees DROP COLUMN is_stale;
+			ALTER TABLE middleman_project_worktrees DROP COLUMN is_hidden;
+			ALTER TABLE middleman_projects DROP COLUMN repository_kind;
+			ALTER TABLE middleman_projects DROP COLUMN is_stale;
 		`)
 	require.NoError(err)
 	_, err = raw.ExecContext(ctx,
@@ -17103,7 +18376,7 @@ func setupTestServerWithClonesAndServer(t *testing.T) (
 
 	clones := gitclone.New(bareDir, nil)
 	mock := &mockGH{}
-	repos := []ghclient.RepoRef{{Owner: "acme", Name: "widget", PlatformHost: "github.com"}}
+	repos := []ghclient.RepoRef{{Platform: "github", Owner: "acme", Name: "widget", PlatformHost: "github.com"}}
 	syncer := ghclient.NewSyncer(map[string]ghclient.Client{"github.com": mock}, database, nil, repos, time.Minute, nil, nil)
 	t.Cleanup(syncer.Stop)
 	srv = New(database, syncer, nil, "/", nil, ServerOptions{Clones: clones})
@@ -17527,6 +18800,126 @@ func TestAPIListActivity(t *testing.T) {
 	assert.Equal("github.com", (*resp.JSON200.Items)[0].PlatformHost)
 }
 
+func TestAPIListActivityIncludesNotificationSyncedBeforeRepo(t *testing.T) {
+	assert := Assert.New(t)
+	require := require.New(t)
+	srv, database := setupNotificationsEnabledTestServer(t)
+	client := setupTestClient(t, srv)
+	ctx := t.Context()
+	base := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+	number := 7
+
+	require.NoError(database.UpsertNotifications(ctx, []db.Notification{{
+		Platform:               "github",
+		PlatformHost:           "github.com",
+		PlatformNotificationID: "thread-before-repo",
+		RepoOwner:              "acme",
+		RepoName:               "widget",
+		SubjectType:            "PullRequest",
+		SubjectTitle:           "Review before repo sync",
+		WebURL:                 "https://github.com/acme/widget/pull/7",
+		ItemNumber:             &number,
+		ItemType:               "pr",
+		ItemAuthor:             "reviewer",
+		Reason:                 "mention",
+		Unread:                 true,
+		SourceUpdatedAt:        base.Add(10 * time.Minute),
+		SyncedAt:               base.Add(10 * time.Minute),
+	}}))
+	mergedAt := base.Add(20 * time.Minute)
+	seedPR(t, database, "acme", "widget", number,
+		withSeedPRTitle("Review before repo sync"),
+		withSeedPRLifecycle(db.MergeRequestStateMerged, &mergedAt, nil),
+		withSeedPRTimes(base, mergedAt, mergedAt))
+
+	types := []string{"notification"}
+	since := base.Add(-time.Minute).Format(time.RFC3339)
+	resp, err := client.HTTP.ListActivityWithResponse(
+		ctx, &generated.ListActivityParams{Since: &since, Types: &types},
+	)
+	require.NoError(err)
+	require.Equal(http.StatusOK, resp.StatusCode())
+	require.NotNil(resp.JSON200)
+	require.NotNil(resp.JSON200.Items)
+	require.Len(*resp.JSON200.Items, 1)
+	item := (*resp.JSON200.Items)[0]
+	assert.Equal("notification", item.ActivityType)
+	assert.Equal("acme", item.RepoOwner)
+	assert.Equal("widget", item.RepoName)
+	assert.NotNil(item.SubjectState)
+	assert.Equal("merged", *item.SubjectState)
+}
+
+func TestAPIListActivityScopesNotificationsToTrackedRepos(t *testing.T) {
+	assert := Assert.New(t)
+	require := require.New(t)
+	srv, database := setupNotificationsEnabledTestServer(t)
+	client := setupTestClient(t, srv)
+	ctx := t.Context()
+	base := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+	number := 7
+
+	trackedRepoID, err := database.UpsertRepo(ctx, db.GitHubRepoIdentity("github.com", "acme", "widget"))
+	require.NoError(err)
+	removedRepoID, err := database.UpsertRepo(ctx, db.GitHubRepoIdentity("github.com", "acme", "removed"))
+	require.NoError(err)
+	insertTestActivityPR(t, database, trackedRepoID, "acme", "widget", number, "Tracked notification", base)
+	insertTestActivityPR(t, database, removedRepoID, "acme", "removed", number, "Removed notification", base)
+
+	require.NoError(database.UpsertNotifications(ctx, []db.Notification{
+		{
+			Platform:               "github",
+			PlatformHost:           "github.com",
+			PlatformNotificationID: "thread-tracked",
+			RepoOwner:              "acme",
+			RepoName:               "widget",
+			SubjectType:            "PullRequest",
+			SubjectTitle:           "Tracked notification",
+			WebURL:                 "https://github.com/acme/widget/pull/7",
+			ItemNumber:             &number,
+			ItemType:               "pr",
+			ItemAuthor:             "reviewer",
+			Reason:                 "mention",
+			Unread:                 true,
+			SourceUpdatedAt:        base.Add(10 * time.Minute),
+			SyncedAt:               base.Add(10 * time.Minute),
+		},
+		{
+			Platform:               "github",
+			PlatformHost:           "github.com",
+			PlatformNotificationID: "thread-removed",
+			RepoOwner:              "acme",
+			RepoName:               "removed",
+			SubjectType:            "PullRequest",
+			SubjectTitle:           "Removed notification",
+			WebURL:                 "https://github.com/acme/removed/pull/7",
+			ItemNumber:             &number,
+			ItemType:               "pr",
+			ItemAuthor:             "reviewer",
+			Reason:                 "mention",
+			Unread:                 true,
+			SourceUpdatedAt:        base.Add(11 * time.Minute),
+			SyncedAt:               base.Add(11 * time.Minute),
+		},
+	}))
+
+	types := []string{"notification"}
+	since := base.Add(-time.Minute).Format(time.RFC3339)
+	resp, err := client.HTTP.ListActivityWithResponse(
+		ctx, &generated.ListActivityParams{Since: &since, Types: &types},
+	)
+	require.NoError(err)
+	require.Equal(http.StatusOK, resp.StatusCode())
+	require.NotNil(resp.JSON200)
+	require.NotNil(resp.JSON200.Items)
+	require.Len(*resp.JSON200.Items, 1)
+	item := (*resp.JSON200.Items)[0]
+	assert.Equal("notification", item.ActivityType)
+	assert.Equal("acme", item.RepoOwner)
+	assert.Equal("widget", item.RepoName)
+	assert.Equal("Tracked notification", item.ItemTitle)
+}
+
 func TestAPIListActivityReturnsDefaultBranchActivity(t *testing.T) {
 	assert := Assert.New(t)
 	require := require.New(t)
@@ -17896,6 +19289,83 @@ func TestAPIListActivityAcceptsHostQualifiedRepoFilter(t *testing.T) {
 	}
 }
 
+func TestAPIListActivityAcceptsProviderQualifiedRepoFilter(t *testing.T) {
+	assert := Assert.New(t)
+	require := require.New(t)
+	srv, database := setupTestServer(t)
+	client := setupTestClient(t, srv)
+	ctx := t.Context()
+
+	githubRepo, err := database.UpsertRepo(ctx, db.RepoIdentity{
+		Platform:     "github",
+		PlatformHost: "github.com",
+		Owner:        "acme",
+		Name:         "widget",
+	})
+	require.NoError(err)
+	giteaRepo, err := database.UpsertRepo(ctx, db.RepoIdentity{
+		Platform:     "gitea",
+		PlatformHost: "github.com",
+		Owner:        "acme",
+		Name:         "widget",
+	})
+	require.NoError(err)
+	seedPRForRepo(t, database, githubRepo, "github.com", "acme", "widget", 1)
+	seedPRForRepo(t, database, giteaRepo, "github.com", "acme", "widget", 2)
+
+	since := time.Now().UTC().AddDate(0, 0, -7).Format(time.RFC3339)
+	repo := "gitea|github.com/acme/widget"
+	resp, err := client.HTTP.ListActivityWithResponse(
+		ctx, &generated.ListActivityParams{Since: &since, Repo: &repo},
+	)
+	require.NoError(err)
+	require.Equal(http.StatusOK, resp.StatusCode())
+	require.NotNil(resp.JSON200)
+	require.NotNil(resp.JSON200.Items)
+	require.NotEmpty(*resp.JSON200.Items)
+	for _, item := range *resp.JSON200.Items {
+		assert.Equal("gitea", item.Repo.Provider)
+		assert.Equal("github.com", item.PlatformHost)
+		assert.Equal("acme", item.RepoOwner)
+		assert.Equal("widget", item.RepoName)
+	}
+}
+
+func TestAPIListActivityKeepsProviderNamedHostsHostQualified(t *testing.T) {
+	assert := Assert.New(t)
+	require := require.New(t)
+	srv, database := setupTestServer(t)
+	client := setupTestClient(t, srv)
+	ctx := t.Context()
+
+	repoID, err := database.UpsertRepo(ctx, db.RepoIdentity{
+		Platform:     "github",
+		PlatformHost: "gitea",
+		Owner:        "acme/team",
+		Name:         "widget",
+	})
+	require.NoError(err)
+	seedPRForRepo(t, database, repoID, "gitea", "acme/team", "widget", 1)
+	seedPROnHost(t, database, "github.com", "acme", "widget", 2)
+
+	since := time.Now().UTC().AddDate(0, 0, -7).Format(time.RFC3339)
+	repo := "gitea/acme/team/widget"
+	resp, err := client.HTTP.ListActivityWithResponse(
+		ctx, &generated.ListActivityParams{Since: &since, Repo: &repo},
+	)
+	require.NoError(err)
+	require.Equal(http.StatusOK, resp.StatusCode())
+	require.NotNil(resp.JSON200)
+	require.NotNil(resp.JSON200.Items)
+	require.NotEmpty(*resp.JSON200.Items)
+	for _, item := range *resp.JSON200.Items {
+		assert.Equal("github", item.Repo.Provider)
+		assert.Equal("gitea", item.PlatformHost)
+		assert.Equal("acme/team", item.RepoOwner)
+		assert.Equal("widget", item.RepoName)
+	}
+}
+
 func TestAPIListActivityFiltersConfiguredReposByHost(t *testing.T) {
 	assert := Assert.New(t)
 	require := require.New(t)
@@ -17955,23 +19425,29 @@ func seedStackedPRState(
 	ctx := t.Context()
 	repoID, err := database.UpsertRepo(ctx, db.GitHubRepoIdentity("github.com", owner, name))
 	require.NoError(t, err)
+	cloneURL := fmt.Sprintf("https://github.com/%s/%s.git", owner, name)
+	require.NoError(t, database.UpdateRepoProviderMetadata(ctx, repoID, db.RepoProviderMetadata{
+		CloneURL:      cloneURL,
+		DefaultBranch: "main",
+	}))
 	now := time.Now().UTC().Truncate(time.Second)
 	pr := &db.MergeRequest{
-		RepoID:         repoID,
-		PlatformID:     int64(number) * 1000,
-		Number:         number,
-		Title:          fmt.Sprintf("PR #%d: %s", number, head),
-		Author:         "testuser",
-		State:          state,
-		IsDraft:        isDraft,
-		HeadBranch:     head,
-		BaseBranch:     base,
-		CIStatus:       ci,
-		ReviewDecision: review,
-		MergeableState: mergeableState,
-		CreatedAt:      now,
-		UpdatedAt:      now,
-		LastActivityAt: now,
+		RepoID:           repoID,
+		PlatformID:       int64(number) * 1000,
+		Number:           number,
+		Title:            fmt.Sprintf("PR #%d: %s", number, head),
+		Author:           "testuser",
+		State:            state,
+		IsDraft:          isDraft,
+		HeadBranch:       head,
+		BaseBranch:       base,
+		HeadRepoCloneURL: cloneURL,
+		CIStatus:         ci,
+		ReviewDecision:   review,
+		MergeableState:   mergeableState,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+		LastActivityAt:   now,
 	}
 	prID, err := database.UpsertMergeRequest(ctx, pr)
 	require.NoError(t, err)
@@ -18016,8 +19492,8 @@ func TestAPIListStacks_RepoFilter(t *testing.T) {
 	assert := Assert.New(t)
 	require := require.New(t)
 	repos := []ghclient.RepoRef{
-		{Owner: "acme", Name: "widget", PlatformHost: "github.com"},
-		{Owner: "acme", Name: "tools", PlatformHost: "github.com"},
+		{Platform: "github", Owner: "acme", Name: "widget", PlatformHost: "github.com"},
+		{Platform: "github", Owner: "acme", Name: "tools", PlatformHost: "github.com"},
 	}
 	srv, database := setupTestServerWithRepos(t, &mockGH{}, repos)
 	client := setupTestClient(t, srv)
@@ -18210,6 +19686,7 @@ func TestAPIStacks_DetectionViaSyncHook(t *testing.T) {
 	// into DB as open PRs forming a linear chain.
 	now := time.Now().UTC().Truncate(time.Second)
 	stringPtr := func(s string) *string { return &s }
+	repoCloneURL := "https://github.com/acme/widget.git"
 	makeGHPR := func(id int64, number int, head, base string) *gh.PullRequest {
 		sha := fmt.Sprintf("sha%d", number)
 		title := fmt.Sprintf("PR #%d: %s", number, head)
@@ -18222,11 +19699,25 @@ func TestAPIStacks_DetectionViaSyncHook(t *testing.T) {
 			User:      &gh.User{Login: stringPtr("testuser")},
 			CreatedAt: &gh.Timestamp{Time: now},
 			UpdatedAt: &gh.Timestamp{Time: now},
-			Head:      &gh.PullRequestBranch{Ref: &head, SHA: &sha},
-			Base:      &gh.PullRequestBranch{Ref: &base, SHA: stringPtr("basesha")},
+			Head: &gh.PullRequestBranch{
+				Ref:  &head,
+				SHA:  &sha,
+				Repo: &gh.Repository{CloneURL: &repoCloneURL},
+			},
+			Base: &gh.PullRequestBranch{Ref: &base, SHA: stringPtr("basesha")},
 		}
 	}
 	mock := &mockGH{
+		getRepositoryFn: func(_ context.Context, owner, repo string) (*gh.Repository, error) {
+			nodeID := "repo-" + owner + "-" + repo
+			return &gh.Repository{
+				Name:     &repo,
+				NodeID:   &nodeID,
+				Owner:    &gh.User{Login: &owner},
+				CloneURL: &repoCloneURL,
+				Archived: new(false),
+			}, nil
+		},
 		listOpenPullRequestsFn: func(_ context.Context, _, _ string) ([]*gh.PullRequest, error) {
 			return []*gh.PullRequest{
 				makeGHPR(1001, 10, "feat/hook-base", "main"),
@@ -18258,6 +19749,269 @@ func TestAPIStacks_DetectionViaSyncHook(t *testing.T) {
 	require.NotNil(ctxResp.JSON200)
 	assert.Equal("hook", ctxResp.JSON200.StackName)
 	assert.Equal(int64(2), ctxResp.JSON200.Size)
+}
+
+func TestAPIStacks_DetectionViaSyncHookIgnoresForkHeadBranchCollision(t *testing.T) {
+	assert := Assert.New(t)
+	require := require.New(t)
+	ctx := t.Context()
+
+	now := time.Now().UTC().Truncate(time.Second)
+	stringPtr := func(s string) *string { return &s }
+	repoCloneURL := "https://github.com/acme/widget.git"
+	forkCloneURL := "https://github.com/fork/widget.git"
+	makeGHPR := func(id int64, number int, head, base, headRepoCloneURL string) *gh.PullRequest {
+		sha := fmt.Sprintf("sha%d", number)
+		title := fmt.Sprintf("PR #%d: %s", number, head)
+		return &gh.PullRequest{
+			ID:        &id,
+			Number:    &number,
+			State:     stringPtr("open"),
+			Title:     &title,
+			Body:      stringPtr(""),
+			User:      &gh.User{Login: stringPtr("testuser")},
+			CreatedAt: &gh.Timestamp{Time: now},
+			UpdatedAt: &gh.Timestamp{Time: now},
+			Head: &gh.PullRequestBranch{
+				Ref:  &head,
+				SHA:  &sha,
+				Repo: &gh.Repository{CloneURL: &headRepoCloneURL},
+			},
+			Base: &gh.PullRequestBranch{Ref: &base, SHA: stringPtr("basesha")},
+		}
+	}
+	mock := &mockGH{
+		getRepositoryFn: func(_ context.Context, owner, repo string) (*gh.Repository, error) {
+			nodeID := "repo-" + owner + "-" + repo
+			return &gh.Repository{
+				Name:     &repo,
+				NodeID:   &nodeID,
+				Owner:    &gh.User{Login: &owner},
+				CloneURL: &repoCloneURL,
+				Archived: new(false),
+			}, nil
+		},
+		listOpenPullRequestsFn: func(_ context.Context, _, _ string) ([]*gh.PullRequest, error) {
+			return []*gh.PullRequest{
+				makeGHPR(9001, 90, "feature/auth", "main", forkCloneURL),
+				makeGHPR(1001, 100, "feature/auth", "main", repoCloneURL),
+				makeGHPR(1011, 101, "feature/auth-ui", "feature/auth", repoCloneURL),
+			}, nil
+		},
+	}
+	srv, database := setupTestServerWithRepos(t, mock, []ghclient.RepoRef{{
+		Owner:        "acme",
+		Name:         "widget",
+		PlatformHost: "github.com",
+		CloneURL:     repoCloneURL,
+	}})
+	client := setupTestClient(t, srv)
+
+	srv.syncer.SetOnSyncCompleted(stacks.SyncCompletedHook(ctx, database, nil))
+	srv.syncer.RunOnce(ctx)
+
+	ctxResp, err := client.HTTP.GetPullStackWithResponse(ctx, "gh", "acme", "widget", 101)
+	require.NoError(err)
+	require.Equal(http.StatusOK, ctxResp.StatusCode(), string(ctxResp.Body))
+	require.NotNil(ctxResp.JSON200)
+	require.NotNil(ctxResp.JSON200.Members)
+	assert.Equal([]int64{100, 101}, stackMemberNumbers(*ctxResp.JSON200.Members))
+
+	forkResp, err := client.HTTP.GetPullWithResponse(ctx, "gh", "acme", "widget", 90)
+	require.NoError(err)
+	require.Equal(http.StatusOK, forkResp.StatusCode(), string(forkResp.Body))
+	require.NotNil(forkResp.JSON200)
+	assert.Nil(forkResp.JSON200.Stack)
+}
+
+func TestAPIStacks_GitLabUnknownForkHeadSyncsButSkipsStackEdges(t *testing.T) {
+	assert := Assert.New(t)
+	require := require.New(t)
+	ctx := t.Context()
+
+	now := time.Now().UTC().Truncate(time.Second)
+	repoRef := platform.RepoRef{
+		Platform:           platform.KindGitLab,
+		Host:               "gitlab.example.com",
+		Owner:              "group",
+		Name:               "project",
+		RepoPath:           "group/project",
+		PlatformID:         4242,
+		PlatformExternalID: "gid://gitlab/Project/4242",
+		WebURL:             "https://gitlab.example.com/group/project",
+		CloneURL:           "https://gitlab.example.com/group/project.git",
+		DefaultBranch:      "main",
+	}
+	makeMR := func(platformID int64, number int, head, base, headRepoCloneURL string) platform.MergeRequest {
+		return platform.MergeRequest{
+			Repo:               repoRef,
+			PlatformID:         platformID,
+			PlatformExternalID: fmt.Sprintf("gid://gitlab/MergeRequest/%d", platformID),
+			Number:             number,
+			URL:                fmt.Sprintf("https://gitlab.example.com/group/project/-/merge_requests/%d", number),
+			Title:              fmt.Sprintf("MR !%d: %s", number, head),
+			Author:             "ada",
+			State:              "open",
+			HeadBranch:         head,
+			BaseBranch:         base,
+			HeadSHA:            fmt.Sprintf("sha%d", number),
+			BaseSHA:            "basesha",
+			HeadRepoCloneURL:   headRepoCloneURL,
+			CreatedAt:          now,
+			UpdatedAt:          now,
+			LastActivityAt:     now,
+		}
+	}
+	provider := &apiTestGitLabProvider{
+		ref: repoRef,
+		mergeRequests: []platform.MergeRequest{
+			makeMR(9001, 90, "feature/fork-ui", "feature/auth", ""),
+			makeMR(1001, 100, "feature/auth", "main", repoRef.CloneURL),
+			makeMR(1011, 101, "feature/auth-ui", "feature/auth", repoRef.CloneURL),
+		},
+	}
+	registry, err := platform.NewRegistry(provider)
+	require.NoError(err)
+
+	database := dbtest.Open(t)
+	syncer := ghclient.NewSyncerWithRegistry(
+		registry, database, nil, []ghclient.RepoRef{{
+			Platform:           platform.KindGitLab,
+			Owner:              "group",
+			Name:               "project",
+			PlatformHost:       "gitlab.example.com",
+			RepoPath:           "group/project",
+			PlatformRepoID:     4242,
+			PlatformExternalID: "gid://gitlab/Project/4242",
+			WebURL:             "https://gitlab.example.com/group/project",
+			CloneURL:           repoRef.CloneURL,
+			DefaultBranch:      "main",
+		}}, time.Minute, nil, nil,
+	)
+	t.Cleanup(syncer.Stop)
+	srv := New(database, syncer, nil, "/", nil, ServerOptions{})
+	t.Cleanup(func() { gracefulShutdown(t, srv) })
+	client := setupTestClient(t, srv)
+
+	syncer.SetOnSyncCompleted(stacks.SyncCompletedHook(ctx, database, nil))
+	syncer.RunOnce(ctx)
+
+	pullsResp, err := client.HTTP.ListPullsWithResponse(ctx, &generated.ListPullsParams{})
+	require.NoError(err)
+	require.Equal(http.StatusOK, pullsResp.StatusCode(), string(pullsResp.Body))
+	require.NotNil(pullsResp.JSON200)
+	pullNumbers := make([]int64, 0, len(*pullsResp.JSON200))
+	for _, pull := range *pullsResp.JSON200 {
+		pullNumbers = append(pullNumbers, pull.Number)
+	}
+	assert.ElementsMatch([]int64{90, 100, 101}, pullNumbers)
+
+	forkResp, err := client.HTTP.GetPullOnHostWithResponse(ctx, "gitlab.example.com", "gl", "group", "project", 90)
+	require.NoError(err)
+	require.Equal(http.StatusOK, forkResp.StatusCode(), string(forkResp.Body))
+	require.NotNil(forkResp.JSON200)
+	assert.Empty(forkResp.JSON200.MergeRequest.HeadRepoCloneURL)
+	assert.Nil(forkResp.JSON200.Stack)
+
+	forkStackResp, err := client.HTTP.GetPullStackOnHostWithResponse(ctx, "gitlab.example.com", "gl", "group", "project", 90)
+	require.NoError(err)
+	assert.Equal(http.StatusNotFound, forkStackResp.StatusCode(), string(forkStackResp.Body))
+
+	tipStackResp, err := client.HTTP.GetPullStackOnHostWithResponse(ctx, "gitlab.example.com", "gl", "group", "project", 101)
+	require.NoError(err)
+	require.Equal(http.StatusOK, tipStackResp.StatusCode(), string(tipStackResp.Body))
+	require.NotNil(tipStackResp.JSON200)
+	require.NotNil(tipStackResp.JSON200.Members)
+	assert.Equal(int64(2), tipStackResp.JSON200.Size)
+	assert.Equal([]int64{100, 101}, stackMemberNumbers(*tipStackResp.JSON200.Members))
+
+	stacksResp, err := client.HTTP.ListStacksWithResponse(ctx, &generated.ListStacksParams{})
+	require.NoError(err)
+	require.Equal(http.StatusOK, stacksResp.StatusCode(), string(stacksResp.Body))
+	require.NotNil(stacksResp.JSON200)
+	require.Len(*stacksResp.JSON200, 1)
+	require.NotNil((*stacksResp.JSON200)[0].Members)
+	assert.Equal([]int64{100, 101}, stackMemberNumbers(*(*stacksResp.JSON200)[0].Members))
+}
+
+func TestAPIStacks_DetectionViaSyncHookIgnoresSameRepoSelfEdge(t *testing.T) {
+	assert := Assert.New(t)
+	require := require.New(t)
+	ctx := t.Context()
+
+	now := time.Now().UTC().Truncate(time.Second)
+	stringPtr := func(s string) *string { return &s }
+	repoCloneURL := "https://github.com/acme/widget.git"
+	makeGHPR := func(id int64, number int, head, base string) *gh.PullRequest {
+		sha := fmt.Sprintf("sha%d", number)
+		title := fmt.Sprintf("PR #%d: %s", number, head)
+		return &gh.PullRequest{
+			ID:        &id,
+			Number:    &number,
+			State:     stringPtr("open"),
+			Title:     &title,
+			Body:      stringPtr(""),
+			User:      &gh.User{Login: stringPtr("testuser")},
+			CreatedAt: &gh.Timestamp{Time: now},
+			UpdatedAt: &gh.Timestamp{Time: now},
+			Head: &gh.PullRequestBranch{
+				Ref:  &head,
+				SHA:  &sha,
+				Repo: &gh.Repository{CloneURL: &repoCloneURL},
+			},
+			Base: &gh.PullRequestBranch{Ref: &base, SHA: stringPtr("basesha")},
+		}
+	}
+	mock := &mockGH{
+		getRepositoryFn: func(_ context.Context, owner, repo string) (*gh.Repository, error) {
+			nodeID := "repo-" + owner + "-" + repo
+			return &gh.Repository{
+				Name:     &repo,
+				NodeID:   &nodeID,
+				Owner:    &gh.User{Login: &owner},
+				CloneURL: &repoCloneURL,
+				Archived: new(false),
+			}, nil
+		},
+		listOpenPullRequestsFn: func(_ context.Context, _, _ string) ([]*gh.PullRequest, error) {
+			return []*gh.PullRequest{
+				makeGHPR(4491, 449, "legacy-parser-base", "legacy-parser-base"),
+				makeGHPR(7481, 748, "locate-parser-interface", "legacy-parser-base"),
+				makeGHPR(7511, 751, "provider-facade-core", "locate-parser-interface"),
+			}, nil
+		},
+	}
+	srv, database := setupTestServerWithRepos(t, mock, []ghclient.RepoRef{{
+		Owner:        "acme",
+		Name:         "widget",
+		PlatformHost: "github.com",
+		CloneURL:     repoCloneURL,
+	}})
+	client := setupTestClient(t, srv)
+
+	srv.syncer.SetOnSyncCompleted(stacks.SyncCompletedHook(ctx, database, nil))
+	srv.syncer.RunOnce(ctx)
+
+	ctxResp, err := client.HTTP.GetPullStackWithResponse(ctx, "gh", "acme", "widget", 751)
+	require.NoError(err)
+	require.Equal(http.StatusOK, ctxResp.StatusCode(), string(ctxResp.Body))
+	require.NotNil(ctxResp.JSON200)
+	require.NotNil(ctxResp.JSON200.Members)
+	assert.Equal([]int64{748, 751}, stackMemberNumbers(*ctxResp.JSON200.Members))
+
+	selfEdgeResp, err := client.HTTP.GetPullWithResponse(ctx, "gh", "acme", "widget", 449)
+	require.NoError(err)
+	require.Equal(http.StatusOK, selfEdgeResp.StatusCode(), string(selfEdgeResp.Body))
+	require.NotNil(selfEdgeResp.JSON200)
+	assert.Nil(selfEdgeResp.JSON200.Stack)
+}
+
+func stackMemberNumbers(members []generated.StackMemberResponse) []int64 {
+	numbers := make([]int64, len(members))
+	for i, member := range members {
+		numbers[i] = member.Number
+	}
+	return numbers
 }
 
 func TestAPIGetStackForPR_SingleFailingIsInProgress(t *testing.T) {
@@ -20190,6 +21944,7 @@ func TestWorkspaceRuntimeLaunchPlainShellCreatesRuntimeSessionE2E(t *testing.T) 
 	assert.Equal("plain_shell", shell.TargetKey)
 	assert.Equal(string(localruntime.LaunchTargetPlainShell), shell.Kind)
 	assert.Equal(string(localruntime.SessionStatusRunning), shell.Status)
+	assert.Equal("terminal", shell.DisplayRegion)
 
 	getResp, err := client.HTTP.GetWorkspaceRuntimeWithResponse(ctx, ws.Id)
 	require.NoError(err)
@@ -20198,6 +21953,56 @@ func TestWorkspaceRuntimeLaunchPlainShellCreatesRuntimeSessionE2E(t *testing.T) 
 	require.NotNil(getResp.JSON200.Sessions)
 	require.Len(*getResp.JSON200.Sessions, 1)
 	assert.Equal(shell.Key, (*getResp.JSON200.Sessions)[0].Key)
+	assert.Equal("terminal", (*getResp.JSON200.Sessions)[0].DisplayRegion)
+}
+
+func TestWorkspaceRuntimeExistingSessionsAvailableWhenWorkspaceErroredE2E(t *testing.T) {
+	t.Parallel()
+
+	require := require.New(t)
+	assert := Assert.New(t)
+
+	client, database, _, _, _ := setupTestServerWithWorkspacesServer(t, nil)
+	ctx := context.Background()
+	ws := createReadyWorkspace(t, ctx, client)
+
+	launchResp, err := client.HTTP.LaunchWorkspaceRuntimeSessionWithResponse(
+		ctx, ws.Id,
+		generated.LaunchWorkspaceRuntimeSessionInputBody{
+			TargetKey: "plain_shell",
+		},
+	)
+	require.NoError(err)
+	require.Equal(http.StatusOK, launchResp.StatusCode())
+	require.NotNil(launchResp.JSON200)
+	shell := launchResp.JSON200
+
+	errMsg := "restart failed"
+	require.NoError(database.UpdateWorkspaceStatus(ctx, ws.Id, "error", &errMsg))
+
+	getResp, err := client.HTTP.GetWorkspaceRuntimeWithResponse(ctx, ws.Id)
+	require.NoError(err)
+	require.Equal(http.StatusOK, getResp.StatusCode())
+	require.NotNil(getResp.JSON200)
+	require.NotNil(getResp.JSON200.Sessions)
+	require.Len(*getResp.JSON200.Sessions, 1)
+	assert.Equal(shell.Key, (*getResp.JSON200.Sessions)[0].Key)
+	assert.Equal(string(localruntime.SessionStatusRunning), (*getResp.JSON200.Sessions)[0].Status)
+
+	stopResp, err := client.HTTP.StopWorkspaceRuntimeSessionWithResponse(
+		ctx, ws.Id, shell.Key,
+	)
+	require.NoError(err)
+	require.Equal(http.StatusNoContent, stopResp.StatusCode())
+
+	relaunchResp, err := client.HTTP.LaunchWorkspaceRuntimeSessionWithResponse(
+		ctx, ws.Id,
+		generated.LaunchWorkspaceRuntimeSessionInputBody{
+			TargetKey: "plain_shell",
+		},
+	)
+	require.NoError(err)
+	require.Equal(http.StatusConflict, relaunchResp.StatusCode())
 }
 
 func TestWorkspaceRuntimeLaunchMultipleAndStopOneE2E(t *testing.T) {
@@ -20609,21 +22414,23 @@ exit 0
 		for _, argv := range readTmuxRecord(t, record) {
 			if len(argv) > 0 &&
 				argv[0] == "new-session" &&
-				strings.Contains(strings.Join(argv, "\n"), agentPath) {
+				runtimeTmuxNewSessionCommandContains(t, argv, agentPath) {
 				newSession = argv
 				return true
 			}
 		}
 		return false
 	}, 2*time.Second, 20*time.Millisecond)
+	scriptText, ok := runtimeTmuxNewSessionScript(t, newSession)
+	require.True(ok, "new-session should run generated tmux pane script")
 
 	session, ok := argAfter(newSession, "-s")
 	require.True(ok, "new-session should name a tmux session")
 	assert.True(isRuntimeTmuxSessionNameForWorkspace(ws.Id, session))
 	assert.Contains(newSession, "-d")
 	assert.Contains(newSession, "-c")
-	assert.Contains(strings.Join(newSession, "\n"), agentPath)
-	assert.Contains(strings.Join(newSession, "\n"), "--flag")
+	assert.Contains(scriptText, agentPath)
+	assert.Contains(scriptText, "--flag")
 	assert.Contains(newSession, ";")
 	assert.Contains(newSession, "set-option")
 	assert.Contains(newSession, "-t")
@@ -20725,6 +22532,17 @@ exit 0
 	require.NoError(err)
 	require.Equal(http.StatusOK, resp.StatusCode())
 
+	require.Eventually(func() bool {
+		return slices.ContainsFunc(
+			readTmuxRecord(t, record),
+			func(argv []string) bool {
+				return slices.Equal(argv, []string{
+					"kill-session", "-t",
+					"middleman-0000000000000001-0123456789abcdef",
+				})
+			},
+		)
+	}, 2*time.Second, 20*time.Millisecond)
 	argvs := readTmuxRecord(t, record)
 	assert.Contains(argvs, []string{
 		"kill-session", "-t", "middleman-0000000000000001-0123456789abcdef",
@@ -20901,7 +22719,7 @@ exit 0
 	var sessionName string
 	require.Eventually(func() bool {
 		name, ok := findRuntimeTmuxNewSessionName(
-			readTmuxRecord(t, record), ws.Id, agentPath,
+			t, readTmuxRecord(t, record), ws.Id, "",
 		)
 		if ok {
 			sessionName = name
@@ -20966,14 +22784,19 @@ func isRuntimeTmuxSessionNameForWorkspace(
 }
 
 func findRuntimeTmuxNewSessionName(
+	t *testing.T,
 	argvs [][]string,
 	workspaceID string,
 	commandPath string,
 ) (string, bool) {
+	t.Helper()
 	for _, argv := range argvs {
 		if len(argv) == 0 ||
-			argv[0] != "new-session" ||
-			!strings.Contains(strings.Join(argv, "\n"), commandPath) {
+			argv[0] != "new-session" {
+			continue
+		}
+		if commandPath != "" &&
+			!runtimeTmuxNewSessionCommandContains(t, argv, commandPath) {
 			continue
 		}
 		name, ok := argAfter(argv, "-s")
@@ -20982,6 +22805,51 @@ func findRuntimeTmuxNewSessionName(
 		}
 	}
 	return "", false
+}
+
+func runtimeTmuxNewSessionCommandContains(
+	t *testing.T,
+	argv []string,
+	needle string,
+) bool {
+	t.Helper()
+	if strings.Contains(strings.Join(argv, "\n"), needle) {
+		return true
+	}
+	scriptText, ok := runtimeTmuxNewSessionScript(t, argv)
+	return ok && strings.Contains(scriptText, needle)
+}
+
+func runtimeTmuxNewSessionScript(t *testing.T, argv []string) (string, bool) {
+	t.Helper()
+	command := tmuxNewSessionPaneCommand(argv)
+	if command == "" {
+		return "", false
+	}
+	words, err := shellquote.Split(command)
+	if err != nil ||
+		len(words) != 2 ||
+		words[0] != "/bin/sh" {
+		return "", false
+	}
+	data, err := os.ReadFile(words[1])
+	if err != nil {
+		return "", false
+	}
+	return string(data), true
+}
+
+func tmuxNewSessionPaneCommand(argv []string) string {
+	if len(argv) == 0 {
+		return ""
+	}
+	command := argv[len(argv)-1]
+	for i, arg := range argv {
+		if arg == ";" && i > 0 {
+			return argv[i-1]
+		}
+	}
+	return command
 }
 
 func isRuntimeSessionKeyForWorkspace(workspaceID string, key string) bool {
@@ -21332,6 +23200,43 @@ func TestWorkspaceDeleteStopsRuntimeSessionsE2E(t *testing.T) {
 	assert.Empty(srv.runtime.ListSessions(ws.Id))
 }
 
+// TestWorkspaceForceDeleteToleratesCorruptWorktreeGitfileE2E verifies a
+// workspace whose worktree .git gitfile was left empty by an
+// interrupted "git worktree add" (the daemon canceling background
+// setup at shutdown) can still be force-deleted through the API. Git
+// rejects such a worktree with "invalid gitfile format", which the
+// delete path's worktree-ownership probe surfaced as a 500 before the
+// fix — leaving the workspace permanently undeletable.
+func TestWorkspaceForceDeleteToleratesCorruptWorktreeGitfileE2E(t *testing.T) {
+	t.Parallel()
+
+	require := require.New(t)
+	assert := Assert.New(t)
+
+	client, database, _, _ := setupTestServerWithWorkspaces(t)
+	ctx := context.Background()
+	ws := createReadyWorkspace(t, ctx, client)
+
+	gitfile := filepath.Join(ws.WorktreePath, ".git")
+	require.FileExists(gitfile)
+	// Truncate the worktree's .git gitfile to reproduce the corrupt
+	// state an interrupted "git worktree add" leaves behind.
+	require.NoError(os.Truncate(gitfile, 0))
+
+	force := true
+	delResp, err := client.HTTP.DeleteWorkspaceWithResponse(
+		ctx, ws.Id, &generated.DeleteWorkspaceParams{Force: &force},
+	)
+	require.NoError(err)
+	require.Equal(
+		http.StatusNoContent, delResp.StatusCode(), string(delResp.Body),
+	)
+
+	got, err := database.GetWorkspace(ctx, ws.Id)
+	require.NoError(err)
+	assert.Nil(got)
+}
+
 // TestWorkspaceDeleteDirtyKeepsRuntimeSessionsE2E covers the case where the
 // workspace is dirty and delete is rejected with 409. Runtime sessions must
 // survive — killing them on a delete that didn't actually happen would leave
@@ -21546,6 +23451,48 @@ func TestWorkspaceDiffEndpointsReportHeadAndPushedE2E(t *testing.T) {
 		},
 	)
 	assert.Equal(int64(1), pushedDiff.WhitespaceOnlyCount)
+}
+
+func TestWorkspaceFilePreviewEndpointReturnsRequestedDiffSideContentE2E(t *testing.T) {
+	t.Parallel()
+
+	require := require.New(t)
+	assert := Assert.New(t)
+
+	client, _, _, _, srv := setupTestServerWithWorkspacesServer(t, nil)
+	ctx := context.Background()
+	ws := createReadyWorkspace(t, ctx, client)
+
+	runGit(t, ws.WorktreePath, "config", "user.email", "test@test.com")
+	runGit(t, ws.WorktreePath, "config", "user.name", "Test")
+
+	path := "preview.go"
+	require.NoError(os.WriteFile(
+		filepath.Join(ws.WorktreePath, path),
+		[]byte("package preview\n\nfunc value() string {\n\treturn \"base\"\n}\n"),
+		0o644,
+	))
+	runGit(t, ws.WorktreePath, "add", ".")
+	runGit(t, ws.WorktreePath, "commit", "-m", "add preview fixture")
+	require.NoError(os.WriteFile(
+		filepath.Join(ws.WorktreePath, path),
+		[]byte("package preview\n\nfunc value() string {\n\treturn \"worktree\"\n}\n"),
+		0o644,
+	))
+
+	oldPreview := requestWorkspaceFilePreview(t, srv, ws.Id, "head", path, "old")
+	oldDecoded, err := base64.StdEncoding.DecodeString(oldPreview.Content)
+	require.NoError(err)
+	newPreview := requestWorkspaceFilePreview(t, srv, ws.Id, "head", path, "new")
+	newDecoded, err := base64.StdEncoding.DecodeString(newPreview.Content)
+	require.NoError(err)
+
+	assert.Equal(path, oldPreview.Path)
+	assert.Equal(path, newPreview.Path)
+	assert.Contains(string(oldDecoded), `return "base"`)
+	assert.NotContains(string(oldDecoded), `return "worktree"`)
+	assert.Contains(string(newDecoded), `return "worktree"`)
+	assert.NotContains(string(newDecoded), `return "base"`)
 }
 
 func TestWorkspaceDiffEndpointsReturnPierreTreeOrderE2E(t *testing.T) {
@@ -22133,6 +24080,34 @@ func requestWorkspaceDiffPath(
 	return body
 }
 
+func requestWorkspaceFilePreview(
+	t *testing.T,
+	srv *Server,
+	workspaceID string,
+	base string,
+	path string,
+	side string,
+) filePreviewResponse {
+	t.Helper()
+
+	query := "/api/v1/workspaces/" + workspaceID +
+		"/file-preview?base=" + url.QueryEscape(base) +
+		"&path=" + url.QueryEscape(path)
+	if side != "" {
+		query += "&side=" + url.QueryEscape(side)
+	}
+	req := newWorkspaceFixtureRequest(http.MethodGet, query, nil)
+	rr := httptest.NewRecorder()
+	srv.ServeHTTP(rr, req)
+	resp := rr.Result()
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var body filePreviewResponse
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
+	return body
+}
+
 func requestWorkspaceDiffForPath(
 	t *testing.T,
 	srv *Server,
@@ -22572,35 +24547,38 @@ func TestWorkspaceRuntimePlainShellTerminalWebSocketE2E(t *testing.T) {
 	require.Contains(got.String(), "echo:ping")
 }
 
-// TestWorkspaceRuntimeShellTerminalDeliversExitFrameE2E pins the
-// websocket "exited" text frame contract. The frontend's ShellDrawer
-// only fires onExit when this frame arrives; without it the drawer
-// doesn't auto-close on shell exit and the user is stranded on a dead
-// session (TerminalPane reconnect-loops on a still-listed-but-
-// output-dead session, which looks like a hang).
-//
-// Uses the "pty-close-on-input-then-sleep" helper to deterministically
-// open the race window where drainOutput's PTY EOF precedes watchSession's
-// cmd.Wait return by hundreds of milliseconds. Without the bridge fix
-// (always send exit frame on outputDone), this test fails because the
-// 100ms timeout fires before attachment.Done — exactly the systemd-
-// run-wrapped shell case the user hit.
+// TestWorkspaceRuntimePlainShellTerminalDeliversExitFrameE2E pins the
+// websocket "exited" text frame contract through the real runtime stack. The
+// frontend's ShellDrawer only fires onExit when this frame arrives; without it
+// the drawer doesn't auto-close on shell exit and the user is stranded on a
+// dead session.
 func TestWorkspaceRuntimePlainShellTerminalDeliversExitFrameE2E(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test fixture uses /bin/sh")
+	}
 	runParallelPTYE2E(t)
 
 	require := require.New(t)
-	tmuxCommand := isolatedRealTmuxCommandOrSkip(t)
+	dir := t.TempDir()
+	ptyOwnerDir := filepath.Join(dir, "pty-owner")
 	cfg := &config.Config{
-		Tmux: config.Tmux{Command: tmuxCommand},
+		Tmux: config.Tmux{
+			Command: []string{filepath.Join(dir, "missing-tmux")},
+		},
 		Shell: config.Shell{
 			Command: serverRuntimeHelperCommand("pty-close-on-input-then-sleep"),
 		},
 	}
-	client, _, _, _, srv := setupTestServerWithWorkspacesServer(t, cfg)
+	fixture := setupWorkspaceServerFixtureWithOptions(
+		t, cfg, ptyOwnerServerOptions(ptyOwnerDir),
+	)
+	client := fixture.client
+	srv := fixture.server
 	ctx := context.Background()
 	ws := createReadyWorkspace(t, ctx, client)
 
 	shell := launchPlainShellRuntimeSession(t, ctx, client, ws.Id)
+	cleanupPtyOwnerWorkspace(t, ptyOwnerDir, shell.Key)
 
 	ts := httptest.NewServer(srv)
 	t.Cleanup(ts.Close)
@@ -22610,20 +24588,13 @@ func TestWorkspaceRuntimePlainShellTerminalDeliversExitFrameE2E(t *testing.T) {
 	conn := dialWebSocketForTest(t, ctx, wsURL, "shell")
 	defer conn.Close(websocket.StatusNormalClosure, "done")
 
-	// Trigger after attach so the session cannot naturally exit before
-	// the websocket connects. The helper then closes its PTY end and
-	// sleeps long enough before process exit that a regression which gates
-	// the exit frame on cmd.Wait would push delivery well past our
-	// promptness budget. The bridge's outputDone path must deliver the
-	// frame within a few hundred ms of PTY EOF; cmd.Wait can only return
-	// when the helper finishes its sleep, so the gap between "right" and
-	// "wrong" is the helper's sleep duration. Helper sleeps 2 s; we allow
-	// up to 800 ms for the PTY-EOF path even on slow CI.
+	// Trigger after attach so the session cannot naturally exit before the
+	// websocket connects. The focused bridge test below covers the fast
+	// outputDone-before-Done race directly; this e2e keeps the real runtime
+	// contract pinned without depending on backend-specific PTY EOF timing.
 	require.NoError(conn.Write(ctx, websocket.MessageBinary, []byte("close\n")))
 	readCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	const exitFrameBudget = 800 * time.Millisecond
-	attachStart := time.Now()
 	for {
 		typ, data, readErr := conn.Read(readCtx)
 		if readErr != nil {
@@ -22635,14 +24606,6 @@ func TestWorkspaceRuntimePlainShellTerminalDeliversExitFrameE2E(t *testing.T) {
 		if typ != websocket.MessageText {
 			continue
 		}
-		elapsed := time.Since(attachStart)
-		require.Lessf(elapsed, exitFrameBudget,
-			"exit frame took %s after attach; bridge appears "+
-				"gated on cmd.Wait rather than PTY EOF (helper "+
-				"sleeps 2 s, so a regression would clock in "+
-				"around there)",
-			elapsed,
-		)
 		var msg struct {
 			Type string `json:"type"`
 			Code int    `json:"code"`
@@ -22653,15 +24616,79 @@ func TestWorkspaceRuntimePlainShellTerminalDeliversExitFrameE2E(t *testing.T) {
 		// reads the snapshot) or -1 (writeRuntimeExit read snapshot
 		// before watchSession populated ExitCode). Both are "the
 		// session ended" signals the frontend treats identically;
-		// pinning a specific value would be timing-dependent. Reject
-		// 0 only on the direct-PTY fallback path — a tmux-backed shell
-		// can report the attach client's clean detach rather than the
-		// pane command's non-zero exit status.
-		if !tmuxCommandAvailable(cfg.TmuxCommand()) {
-			require.NotEqual(0, msg.Code,
-				"non-success exit must report non-zero (or -1)")
-		}
+		// pinning a specific value would be timing-dependent.
+		require.NotEqual(0, msg.Code,
+			"non-success exit must report non-zero (or -1)")
 		return
+	}
+}
+
+// TestBridgeRuntimeAttachmentOutputClosedEmitsExitFrameBeforeDone pins the
+// bridge branch for wrappers where PTY EOF reaches the subscriber before
+// cmd.Wait marks the session done. That is the race the real ShellDrawer cares
+// about, but it is cleaner to drive it with controlled channels than to depend
+// on backend-specific PTY behavior in an e2e helper.
+func TestBridgeRuntimeAttachmentOutputClosedEmitsExitFrameBeforeDone(t *testing.T) {
+	require := require.New(t)
+	closedOutput := make(chan []byte)
+	close(closedOutput)
+	stillWaiting := make(chan struct{})
+	exitCode := 7
+	attach := localruntime.NewAttachmentForTesting(
+		localruntime.AttachmentForTestingOptions{
+			Output: closedOutput,
+			Done:   stillWaiting,
+			Info: func() localruntime.SessionInfo {
+				return localruntime.SessionInfo{ExitCode: &exitCode}
+			},
+			SessionOutputClosed: func() bool { return true },
+		},
+	)
+
+	bridgeReturn := make(chan bool, 1)
+	acceptErr := make(chan error, 1)
+	srv := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+				InsecureSkipVerify: true,
+			})
+			if err != nil {
+				acceptErr <- err
+				return
+			}
+			exited := bridgeRuntimeAttachment(r.Context(), conn, attach)
+			bridgeReturn <- exited
+			conn.Close(websocket.StatusNormalClosure, "test done")
+		},
+	))
+	t.Cleanup(srv.Close)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	require.NoError(err)
+	defer conn.Close(websocket.StatusNormalClosure, "done")
+
+	typ, data, err := conn.Read(ctx)
+	require.NoError(err)
+	require.Equal(websocket.MessageText, typ)
+	var msg struct {
+		Type string `json:"type"`
+		Code int    `json:"code"`
+	}
+	require.NoError(json.Unmarshal(data, &msg))
+	require.Equal("exited", msg.Type)
+	require.Equal(7, msg.Code)
+
+	select {
+	case exited := <-bridgeReturn:
+		require.True(exited,
+			"bridge must report exited when session output closed")
+	case err := <-acceptErr:
+		require.NoError(err, "websocket accept failed")
+	case <-time.After(2 * time.Second):
+		require.Fail("bridge did not return")
 	}
 }
 
@@ -22682,7 +24709,7 @@ func TestWorkspaceRuntimePlainShellAfterExitStartsFreshE2E(t *testing.T) {
 			Command: []string{filepath.Join(t.TempDir(), "missing-tmux")},
 		},
 		Shell: config.Shell{
-			Command: serverRuntimeHelperCommand("pty-close-then-sleep"),
+			Command: serverRuntimeHelperCommand("pty-close-on-input-then-sleep"),
 		},
 	}
 	ptyOwnerDir := filepath.Join(t.TempDir(), "pty-owner")
@@ -22706,8 +24733,8 @@ func TestWorkspaceRuntimePlainShellAfterExitStartsFreshE2E(t *testing.T) {
 	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") +
 		"/ws/v1/workspaces/" + ws.Id +
 		"/runtime/sessions/" + first.Key + "/terminal?cols=80&rows=24"
-	conn, _, err := websocket.Dial(ctx, wsURL, nil)
-	require.NoError(err)
+	conn := dialWebSocketForTest(t, ctx, wsURL, "plain shell after exit")
+	require.NoError(conn.Write(ctx, websocket.MessageBinary, []byte("exit\n")))
 	readCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	for {
@@ -23104,7 +25131,7 @@ func TestWorkspaceRuntimeSessionTerminalSkipsAltScreenReplayE2E(t *testing.T) {
 		ctx, websocket.MessageBinary, []byte("paint\n"),
 	))
 	var got strings.Builder
-	deadline := time.After(2 * time.Second)
+	deadline := time.After(5 * time.Second)
 	for {
 		select {
 		case read := <-reads:
@@ -23440,15 +25467,6 @@ func isolatedRealTmuxCommandIfAvailable(t *testing.T) []string {
 	return isolatedRealTmuxCommand(t, tmuxPath)
 }
 
-func isolatedRealTmuxCommandOrSkip(t *testing.T) []string {
-	t.Helper()
-	tmuxPath, err := exec.LookPath("tmux")
-	if err != nil {
-		t.Skip("tmux not available")
-	}
-	return isolatedRealTmuxCommand(t, tmuxPath)
-}
-
 func isolatedRealTmuxCommand(t *testing.T, tmuxPath string) []string {
 	t.Helper()
 	require := require.New(t)
@@ -23731,6 +25749,14 @@ func TestWorkspaceCRUDE2E(t *testing.T) {
 	)
 	require.NoError(err)
 	require.Equal(http.StatusNotFound, getResp2.StatusCode())
+
+	// 7. List workspaces -- deleted workspace is absent from the public list.
+	listResp3, err := client.HTTP.ListWorkspacesWithResponse(ctx)
+	require.NoError(err)
+	require.Equal(http.StatusOK, listResp3.StatusCode())
+	require.NotNil(listResp3.JSON200)
+	require.NotNil(listResp3.JSON200.Workspaces)
+	assert.Empty(*listResp3.JSON200.Workspaces)
 }
 
 func TestWorkspaceRetryErroredWorkspaceE2E(t *testing.T) {
@@ -24369,7 +26395,7 @@ func TestWorkspaceCreateIssueBranchConflictReturnsTyped409(t *testing.T) {
 	stored, err := fixture.database.GetWorkspace(ctx, reused.ID)
 	require.NoError(err)
 	require.NotNil(stored)
-	assert.Equal(slugBranch, stored.WorkspaceBranch)
+	assert.Empty(stored.WorkspaceBranch)
 }
 
 func prepareIssueWorkspaceAssociationFixture(
@@ -24839,6 +26865,328 @@ func TestWorkspaceCreateUsesPRBranchAndFallbackBranch(t *testing.T) {
 	)
 }
 
+func TestWorkspaceCreateWithLocalBaseUsesPullRefWhenHeadBranchDeleted(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	assert := Assert.New(t)
+	require := require.New(t)
+
+	const prNumber = 43
+	localRepo, remote, platformHost := setupHTTPWorktreeBaseForServerTest(
+		t, "feature",
+	)
+	wantSHA := testGitSHA(t, localRepo, "refs/remotes/origin/feature")
+	runGit(
+		t, remote, "update-ref",
+		fmt.Sprintf("refs/pull/%d/head", prNumber), wantSHA,
+	)
+	runGit(t, remote, "update-ref", "-d", "refs/heads/feature")
+	runGit(t, remote, "update-server-info")
+	runGit(t, localRepo, "fetch", "--prune", "origin")
+
+	cfg := &config.Config{Repos: []config.Repo{{
+		Platform:         "github",
+		PlatformHost:     platformHost,
+		Owner:            "acme",
+		Name:             "widget",
+		WorktreeBasePath: localRepo,
+	}}}
+	fixture := setupWorkspaceServerFixture(t, cfg)
+	ctx := t.Context()
+	seedPROnHost(
+		t, fixture.database,
+		platformHost, "acme", "widget", prNumber,
+		withSeedPRHeadRepoCloneURL("https://"+platformHost+"/acme/widget.git"),
+	)
+
+	createResp, err := fixture.client.HTTP.CreateWorkspaceWithResponse(
+		ctx,
+		generated.CreateWorkspaceInputBody{
+			PlatformHost: platformHost,
+			Owner:        "acme",
+			Name:         "widget",
+			MrNumber:     prNumber,
+		},
+	)
+	require.NoError(err)
+	require.Equal(http.StatusAccepted, createResp.StatusCode())
+	require.NotNil(createResp.JSON202)
+
+	ready := waitForWorkspaceReady(t, ctx, fixture.client, createResp.JSON202.Id)
+	stored, err := fixture.database.GetWorkspace(ctx, ready.Id)
+	require.NoError(err)
+	require.NotNil(stored)
+	assert.Equal("ready", stored.Status)
+	assert.Equal(syntheticPRWorktreeBranchForTest(prNumber), stored.WorkspaceBranch)
+	assert.Equal(wantSHA, testGitSHA(t, ready.WorktreePath, "HEAD"))
+	assert.Equal(
+		syntheticPRWorktreeBranchForTest(prNumber),
+		gitOutput(t, ready.WorktreePath, "branch", "--show-current"),
+	)
+}
+
+func TestWorkspaceCreateGitLabUsesSpecificMergeRequestHeadRefE2E(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	assert := Assert.New(t)
+	require := require.New(t)
+
+	const mrNumber = 57
+	const headBranch = "contributor/gitlab-fork"
+	localRepo, remote, platformHost := setupHTTPWorktreeBaseForServerTest(
+		t, "feature",
+	)
+	runGit(t, localRepo, "checkout", "-b", headBranch, "main")
+	require.NoError(os.WriteFile(
+		filepath.Join(localRepo, "gitlab-mr.txt"),
+		[]byte("gitlab mr head\n"), 0o644,
+	))
+	runGit(t, localRepo, "add", ".")
+	runGit(t, localRepo, "commit", "-m", "gitlab mr head")
+	wantSHA := testGitSHA(t, localRepo, "HEAD")
+	runGit(
+		t, localRepo, "push", remote,
+		fmt.Sprintf("HEAD:refs/merge-requests/%d/head", mrNumber),
+	)
+	runGit(t, remote, "update-server-info")
+
+	fixture := setupWorkspaceServerFixtureWithHost(t, nil, platformHost)
+	ctx := t.Context()
+	repoID, err := fixture.database.UpsertRepo(ctx, db.RepoIdentity{
+		Platform:     string(platform.KindGitLab),
+		PlatformHost: platformHost,
+		Owner:        "acme",
+		Name:         "widget",
+	})
+	require.NoError(err)
+	require.NoError(fixture.database.UpdateRepoProviderMetadata(
+		ctx, repoID, db.RepoProviderMetadata{
+			CloneURL:      "http://" + platformHost + "/acme/widget.git",
+			DefaultBranch: "main",
+		},
+	))
+	seedPRForRepo(
+		t, fixture.database, repoID, platformHost, "acme", "widget", mrNumber,
+		withSeedPRHeadBranch(headBranch),
+		withSeedPRHeadRepoCloneURL("https://"+platformHost+"/fork/widget.git"),
+	)
+	provider := string(platform.KindGitLab)
+
+	createResp, err := fixture.client.HTTP.CreateWorkspaceWithResponse(
+		ctx,
+		generated.CreateWorkspaceInputBody{
+			Provider:     &provider,
+			PlatformHost: platformHost,
+			Owner:        "acme",
+			Name:         "widget",
+			MrNumber:     mrNumber,
+		},
+	)
+	require.NoError(err)
+	require.Equal(http.StatusAccepted, createResp.StatusCode())
+	require.NotNil(createResp.JSON202)
+
+	ready := waitForWorkspaceReady(t, ctx, fixture.client, createResp.JSON202.Id)
+	stored, err := fixture.database.GetWorkspace(ctx, ready.Id)
+	require.NoError(err)
+	require.NotNil(stored)
+	assert.Equal("ready", stored.Status)
+	assert.Equal(headBranch, stored.WorkspaceBranch)
+	assert.Equal(headBranch, gitOutput(t, ready.WorktreePath, "branch", "--show-current"))
+	assert.Equal(wantSHA, testGitSHA(t, ready.WorktreePath, "HEAD"))
+}
+
+func TestWorkspaceCreateReusesExistingWorktreeThroughAPI(t *testing.T) {
+	t.Parallel()
+
+	assert := Assert.New(t)
+	require := require.New(t)
+
+	const prNumber = 44
+	localRepo, _, platformHost := setupHTTPWorktreeBaseForServerTest(
+		t, "feature",
+	)
+	cfg := &config.Config{Repos: []config.Repo{{
+		Platform:         "github",
+		PlatformHost:     platformHost,
+		Owner:            "acme",
+		Name:             "widget",
+		WorktreeBasePath: localRepo,
+	}}}
+	fixture := setupWorkspaceServerFixture(t, cfg)
+	ctx := t.Context()
+	existingBranch := syntheticPRWorktreeBranchForTest(prNumber)
+	worktreePath := filepath.Join(
+		fixture.worktrees, "github", platformHost, "acme", "widget",
+		fmt.Sprintf("pr-%d", prNumber),
+	)
+	runGit(
+		t, localRepo,
+		"worktree", "add", worktreePath, "-b", existingBranch, "main",
+	)
+	wantSHA := testGitSHA(t, worktreePath, "HEAD")
+	seedPROnHost(
+		t, fixture.database,
+		platformHost, "acme", "widget", prNumber,
+		withSeedPRHeadRepoCloneURL("https://"+platformHost+"/acme/widget.git"),
+	)
+
+	createResp, err := fixture.client.HTTP.CreateWorkspaceWithResponse(
+		ctx,
+		generated.CreateWorkspaceInputBody{
+			PlatformHost: platformHost,
+			Owner:        "acme",
+			Name:         "widget",
+			MrNumber:     prNumber,
+		},
+	)
+	require.NoError(err)
+	require.Equal(http.StatusAccepted, createResp.StatusCode())
+	require.NotNil(createResp.JSON202)
+
+	ready := waitForWorkspaceReady(t, ctx, fixture.client, createResp.JSON202.Id)
+	stored, err := fixture.database.GetWorkspace(ctx, ready.Id)
+	require.NoError(err)
+	require.NotNil(stored)
+	assert.Equal("ready", stored.Status)
+	assert.Equal(worktreePath, stored.WorktreePath)
+	assert.Equal(existingBranch, stored.WorkspaceBranch)
+	assert.Equal(worktreePath, ready.WorktreePath)
+	assert.Equal(wantSHA, testGitSHA(t, ready.WorktreePath, "HEAD"))
+	assert.Equal(existingBranch, gitOutput(t, ready.WorktreePath, "branch", "--show-current"))
+}
+
+func TestWorkspaceRetryReusesExistingLocalHeadBranchThroughAPI(t *testing.T) {
+	t.Parallel()
+
+	assert := Assert.New(t)
+	require := require.New(t)
+
+	const prNumber = 45
+	localRepo, _, platformHost := setupHTTPWorktreeBaseForServerTest(
+		t, "feature",
+	)
+	cfg := &config.Config{Repos: []config.Repo{{
+		Platform:         "github",
+		PlatformHost:     platformHost,
+		Owner:            "acme",
+		Name:             "widget",
+		WorktreeBasePath: localRepo,
+	}}}
+	fixture := setupWorkspaceServerFixture(t, cfg)
+	ctx := t.Context()
+	worktreePath := filepath.Join(
+		fixture.worktrees, "github", platformHost, "acme", "widget",
+		fmt.Sprintf("pr-%d", prNumber),
+	)
+	runGit(
+		t, localRepo,
+		"worktree", "add", worktreePath,
+		"-b", "feature", "refs/remotes/origin/feature",
+	)
+	wantSHA := testGitSHA(t, worktreePath, "HEAD")
+	seedPROnHost(
+		t, fixture.database,
+		platformHost, "acme", "widget", prNumber,
+		withSeedPRHeadRepoCloneURL("https://"+platformHost+"/acme/widget.git"),
+	)
+
+	createResp, err := fixture.client.HTTP.CreateWorkspaceWithResponse(
+		ctx,
+		generated.CreateWorkspaceInputBody{
+			PlatformHost: platformHost,
+			Owner:        "acme",
+			Name:         "widget",
+			MrNumber:     prNumber,
+		},
+	)
+	require.NoError(err)
+	require.Equal(http.StatusAccepted, createResp.StatusCode())
+	require.NotNil(createResp.JSON202)
+	ready := waitForWorkspaceReady(t, ctx, fixture.client, createResp.JSON202.Id)
+	stored, err := fixture.database.GetWorkspace(ctx, ready.Id)
+	require.NoError(err)
+	require.NotNil(stored)
+	assert.Equal("ready", stored.Status)
+	assert.Empty(stored.WorkspaceBranch)
+	assert.Equal("feature", gitOutput(t, ready.WorktreePath, "branch", "--show-current"))
+	assert.Equal(wantSHA, testGitSHA(t, ready.WorktreePath, "HEAD"))
+
+	msg := "retry existing local base worktree"
+	require.NoError(fixture.database.UpdateWorkspaceStatus(
+		ctx, ready.Id, "error", &msg,
+	))
+	retryResp, err := fixture.client.HTTP.RetryWorkspaceWithResponse(ctx, ready.Id)
+	require.NoError(err)
+	require.Equal(http.StatusAccepted, retryResp.StatusCode())
+	require.NotNil(retryResp.JSON202)
+
+	retried := waitForWorkspaceReady(t, ctx, fixture.client, ready.Id)
+	stored, err = fixture.database.GetWorkspace(ctx, ready.Id)
+	require.NoError(err)
+	require.NotNil(stored)
+	assert.Equal("ready", stored.Status)
+	assert.Empty(stored.WorkspaceBranch)
+	assert.Equal(worktreePath, stored.WorktreePath)
+	assert.Equal("feature", gitOutput(t, retried.WorktreePath, "branch", "--show-current"))
+	assert.Equal(wantSHA, testGitSHA(t, retried.WorktreePath, "HEAD"))
+
+	force := true
+	deleteResp, err := fixture.client.HTTP.DeleteWorkspaceWithResponse(
+		ctx, ready.Id, &generated.DeleteWorkspaceParams{Force: &force},
+	)
+	require.NoError(err)
+	require.Equal(http.StatusNoContent, deleteResp.StatusCode())
+	assert.Equal(wantSHA, testGitSHA(t, localRepo, "refs/heads/feature"))
+}
+
+func syntheticPRWorktreeBranchForTest(mrNumber int) string {
+	return fmt.Sprintf("middleman/pr-%d", mrNumber)
+}
+
+func setupHTTPWorktreeBaseForServerTest(
+	t *testing.T,
+	branch string,
+) (repo, remote, platformHost string) {
+	t.Helper()
+	root := t.TempDir()
+	remote = filepath.Join(root, "acme", "widget.git")
+	repo = filepath.Join(root, "repo")
+	require.NoError(t, os.MkdirAll(filepath.Dir(remote), 0o755))
+	runGit(t, root, "init", "--bare", "--initial-branch=main", remote)
+	server := httptest.NewServer(http.FileServer(http.Dir(root)))
+	t.Cleanup(server.Close)
+	remoteURL := server.URL + "/acme/widget.git"
+	parsed, err := url.Parse(server.URL)
+	require.NoError(t, err)
+	platformHost = parsed.Host
+
+	runGit(t, root, "init", "--initial-branch=main", repo)
+	runGit(t, repo, "config", "user.email", "test@test.com")
+	runGit(t, repo, "config", "user.name", "Test")
+	runGit(t, repo, "remote", "add", "origin", remote)
+	require.NoError(t, os.WriteFile(
+		filepath.Join(repo, "base.txt"), []byte("base\n"), 0o644,
+	))
+	runGit(t, repo, "add", ".")
+	runGit(t, repo, "commit", "-m", "base commit")
+	runGit(t, repo, "push", "origin", "HEAD:refs/heads/main")
+	runGit(t, remote, "symbolic-ref", "HEAD", "refs/heads/main")
+	runGit(t, repo, "push", "origin", "HEAD:refs/heads/"+branch)
+	runGit(t, remote, "update-server-info")
+	runGit(t, repo, "remote", "set-url", "origin", remoteURL)
+	runGit(t, repo, "fetch", "--prune", "origin")
+	runGit(
+		t, repo, "symbolic-ref",
+		"refs/remotes/origin/HEAD", "refs/remotes/origin/main",
+	)
+	return repo, remote, platformHost
+}
+
 func TestWorkspaceCreateSameRepoHeadCloneURLTracksOriginBranchE2E(t *testing.T) {
 	t.Parallel()
 
@@ -25075,6 +27423,119 @@ func TestWorkspaceDeletePreservesUserCreatedBranch(t *testing.T) {
 	)
 }
 
+func TestWorkspaceDeleteDoesNotCleanupReplacementCloneE2E(t *testing.T) {
+	t.Parallel()
+
+	assert := Assert.New(t)
+	require := require.New(t)
+
+	client, database, _, remotePath := setupTestServerWithWorkspaces(t)
+	ctx := t.Context()
+	const branch = "middleman/pr-42"
+	replacementClone := filepath.Join(t.TempDir(), "replacement-clone")
+	runGit(t, filepath.Dir(replacementClone), "clone", remotePath, replacementClone)
+	runGit(
+		t, replacementClone, "remote", "set-url", "origin",
+		"https://github.com/acme/widget.git",
+	)
+	runGit(t, replacementClone, "branch", branch, "HEAD")
+	branchSHA := testGitSHA(t, replacementClone, "refs/heads/"+branch)
+	wsID := "ws-replacement-clone"
+	require.NoError(database.InsertWorkspace(ctx, &workspace.Workspace{
+		ID:              wsID,
+		Platform:        "github",
+		PlatformHost:    "github.com",
+		RepoOwner:       "acme",
+		RepoName:        "widget",
+		ItemType:        db.WorkspaceItemTypePullRequest,
+		ItemNumber:      42,
+		GitHeadRef:      "feature",
+		WorkspaceBranch: branch,
+		WorktreePath:    replacementClone,
+		TerminalBackend: workspace.TerminalBackendTmux,
+		Status:          "ready",
+	}))
+
+	force := true
+	deleteResp, err := client.HTTP.DeleteWorkspaceWithResponse(
+		ctx, wsID, &generated.DeleteWorkspaceParams{Force: &force},
+	)
+
+	require.NoError(err)
+	require.Equal(http.StatusNoContent, deleteResp.StatusCode())
+	assert.DirExists(replacementClone)
+	assert.Equal(branchSHA, testGitSHA(t, replacementClone, "refs/heads/"+branch))
+	got, err := database.GetWorkspace(ctx, wsID)
+	require.NoError(err)
+	assert.Nil(got)
+}
+
+func TestWorkspaceDeleteDoesNotCleanupReplacementCloneFromStaleLocalBaseE2E(t *testing.T) {
+	t.Parallel()
+
+	assert := Assert.New(t)
+	require := require.New(t)
+
+	cfg := &config.Config{}
+	client, database, _, remotePath, srv := setupTestServerWithWorkspacesServer(t, cfg)
+	ctx := t.Context()
+	const branch = "middleman/pr-42"
+	localRepo := filepath.Join(t.TempDir(), "local-base")
+	runGit(t, filepath.Dir(localRepo), "clone", remotePath, localRepo)
+	replacementClone := filepath.Join(t.TempDir(), "replacement-clone")
+	runGit(
+		t, localRepo,
+		"worktree", "add", replacementClone, "-b", branch, "HEAD",
+	)
+	require.NoError(os.RemoveAll(replacementClone))
+	runGit(t, filepath.Dir(replacementClone), "clone", remotePath, replacementClone)
+	runGit(
+		t, replacementClone, "remote", "set-url", "origin",
+		"https://github.com/acme/widget.git",
+	)
+	runGit(t, replacementClone, "branch", branch, "HEAD")
+	branchSHA := testGitSHA(t, replacementClone, "refs/heads/"+branch)
+
+	srv.cfgMu.Lock()
+	srv.cfg.Repos = []config.Repo{{
+		Platform:         "github",
+		PlatformHost:     "github.com",
+		Owner:            "acme",
+		Name:             "widget",
+		WorktreeBasePath: localRepo,
+	}}
+	srv.cfgMu.Unlock()
+
+	wsID := "ws-stale-local-base-replacement-clone"
+	require.NoError(database.InsertWorkspace(ctx, &workspace.Workspace{
+		ID:              wsID,
+		Platform:        "github",
+		PlatformHost:    "github.com",
+		RepoOwner:       "acme",
+		RepoName:        "widget",
+		ItemType:        db.WorkspaceItemTypePullRequest,
+		ItemNumber:      42,
+		GitHeadRef:      "feature",
+		WorkspaceBranch: branch,
+		WorktreePath:    replacementClone,
+		TerminalBackend: workspace.TerminalBackendTmux,
+		Status:          "ready",
+	}))
+
+	force := true
+	deleteResp, err := client.HTTP.DeleteWorkspaceWithResponse(
+		ctx, wsID, &generated.DeleteWorkspaceParams{Force: &force},
+	)
+
+	require.NoError(err)
+	require.Equal(http.StatusNoContent, deleteResp.StatusCode())
+	assert.DirExists(replacementClone)
+	assert.Equal(branchSHA, testGitSHA(t, replacementClone, "refs/heads/"+branch))
+	got, err := database.GetWorkspace(ctx, wsID)
+	require.NoError(err)
+	assert.Nil(got)
+}
+
 func TestWorkspaceCreatePreservesExistingLocalPreferredBranch(t *testing.T) {
 	t.Parallel()
 
@@ -25293,6 +27754,16 @@ func seedPROnHost(
 	repoID, err := database.UpsertRepo(ctx, db.GitHubRepoIdentity(host, owner, name))
 	require.NoError(t, err)
 
+	return seedPRForRepo(t, database, repoID, host, owner, name, number, opts...)
+}
+
+func seedPRForRepo(
+	t *testing.T, database *db.DB,
+	repoID int64, host, owner, name string, number int,
+	opts ...seedPROpt,
+) int64 {
+	t.Helper()
+	ctx := t.Context()
 	now := time.Now().UTC().Truncate(time.Second)
 	pr := &db.MergeRequest{
 		RepoID:         repoID,

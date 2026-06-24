@@ -23,6 +23,7 @@ const baseCapabilities = {
   review_mutation: true,
   workflow_approval: true,
   ready_for_review: true,
+  draft_mutation: true,
   issue_mutation: true,
   review_draft_mutation: true,
   review_thread_resolution: true,
@@ -38,6 +39,7 @@ function pullDetail(
   provider = "github",
   platformHost = "github.com",
   operations?: Record<string, unknown>,
+  events?: Array<Record<string, unknown>>,
 ) {
   return {
     merge_request: {
@@ -67,7 +69,7 @@ function pullDetail(
       KanbanStatus: "reviewing",
       Starred: false,
     },
-    events: [
+    events: events ?? [
       {
         ID: 51,
         MergeRequestID: 1,
@@ -207,6 +209,131 @@ const diffResponse = {
   ],
 };
 
+const splitComposerDiffResponse = {
+  stale: false,
+  whitespace_only_count: 0,
+  files: [
+    {
+      path: "src/main.ts",
+      old_path: "src/main.ts",
+      status: "modified",
+      additions: 2,
+      deletions: 0,
+      is_binary: false,
+      hunks: [
+        {
+          old_start: 1,
+          old_count: 1,
+          new_start: 1,
+          new_count: 3,
+          section: "",
+          lines: [
+            {
+              type: "context",
+              old_num: 1,
+              new_num: 1,
+              content: "const a = 1;",
+            },
+            {
+              type: "add",
+              old_num: null,
+              new_num: 2,
+              content: "const b = 2;",
+            },
+            {
+              type: "add",
+              old_num: null,
+              new_num: 3,
+              content: "const c = 3;",
+            },
+          ],
+        },
+      ],
+    },
+  ],
+};
+
+const trailingAddedFileDiffResponse = {
+  stale: false,
+  whitespace_only_count: 0,
+  files: [
+    {
+      path: ".github/ISSUE_TEMPLATE/config.yml",
+      old_path: ".github/ISSUE_TEMPLATE/config.yml",
+      status: "added",
+      additions: 4,
+      deletions: 0,
+      is_binary: false,
+      hunks: [
+        {
+          old_start: 0,
+          old_count: 0,
+          new_start: 1,
+          new_count: 4,
+          section: "",
+          lines: [
+            {
+              type: "add",
+              old_num: null,
+              new_num: 1,
+              content: "# Route every new issue through one of the templates above.",
+            },
+            {
+              type: "add",
+              old_num: null,
+              new_num: 2,
+              content: "# Discussions is enabled for this repo, add a contact_links entry pointing",
+            },
+            {
+              type: "add",
+              old_num: null,
+              new_num: 3,
+              content: '# usage/"how do I" questions there instead of the issue tracker.',
+            },
+            {
+              type: "add",
+              old_num: null,
+              new_num: 4,
+              content: "blank_issues_enabled: false",
+            },
+          ],
+        },
+      ],
+    },
+    {
+      path: ".github/ISSUE_TEMPLATE/feature_request.yml",
+      old_path: ".github/ISSUE_TEMPLATE/feature_request.yml",
+      status: "added",
+      additions: 2,
+      deletions: 0,
+      is_binary: false,
+      hunks: [
+        {
+          old_start: 0,
+          old_count: 0,
+          new_start: 1,
+          new_count: 2,
+          section: "",
+          lines: [
+            {
+              type: "add",
+              old_num: null,
+              new_num: 1,
+              content: "name: Feature request",
+            },
+            {
+              type: "add",
+              old_num: null,
+              new_num: 2,
+              content: "description: Suggest a new feature or improvement",
+            },
+          ],
+        },
+      ],
+    },
+  ],
+};
+
 const multiHunkDiffResponse = {
   stale: false,
   whitespace_only_count: 0,
@@ -333,6 +460,7 @@ function scrollingDiffResponse() {
 }
 
 type MockInlineReviewOptions = {
+  detailEvents?: Array<Record<string, unknown>>;
   publishStatus?: "published" | "partially_published";
   detailBody?: string;
   detailFetchedAtSequence?: string[];
@@ -363,7 +491,14 @@ async function mockInlineReviewAPI(
       await route.fallback();
       return;
     }
-    const detail = pullDetail(reviewThreadResolved, capabilities, provider, platformHost, options.operations);
+    const detail = pullDetail(
+      reviewThreadResolved,
+      capabilities,
+      provider,
+      platformHost,
+      options.operations,
+      options.detailEvents,
+    );
     if (options.detailBody !== undefined) {
       detail.merge_request.Body = options.detailBody;
     }
@@ -582,6 +717,150 @@ test("adds and publishes an inline draft review comment", async ({ page }) => {
   await expect(page.getByRole("button", { name: "Show full comment" })).toHaveCount(0);
   await page.getByRole("button", { name: "Publish review" }).click();
   await expect(page.getByText("1 draft comment")).toBeHidden();
+});
+
+test("keeps split-mode inline composers on trailing right-side hunk lines", async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem("diff-view-mode", "split");
+  });
+  await mockInlineReviewAPI(page, baseCapabilities, "github", "github.com", splitComposerDiffResponse, undefined, {
+    detailEvents: [],
+  });
+
+  await page.goto("/pulls/github/acme/widgets/42/files");
+  async function assertRightSideComposer(line: number): Promise<void> {
+    const button = page.getByRole("button", { name: `Comment on new line ${line}` });
+    await expect(button).toBeVisible();
+    await expect(
+      page
+        .locator(".pierre-diff")
+        .first()
+        .evaluate((host, lineNumber) => {
+          const root = host.shadowRoot;
+          const button = Array.from(
+            root?.querySelectorAll<HTMLButtonElement>("[data-middleman-line-comment-button]") ?? [],
+          ).find((candidate) => candidate.getAttribute("aria-label") === `Comment on new line ${lineNumber}`);
+          return button ? pierreCodeSide(root, button) : null;
+
+          function pierreCodeSide(
+            root: ShadowRoot | null | undefined,
+            element: Element,
+          ): "deletions" | "additions" | null {
+            const code = Array.from(root?.querySelectorAll<HTMLElement>("code") ?? []).find((candidate) =>
+              candidate.contains(element),
+            );
+            const pre = code?.parentElement;
+            if (!code || !pre) return null;
+            if (code.hasAttribute("data-additions")) return "additions";
+            if (code.hasAttribute("data-deletions")) return "deletions";
+            const index = Array.from(pre.children)
+              .filter((child) => child.tagName.toLowerCase() === "code")
+              .indexOf(code);
+            if (index === 0) return "deletions";
+            if (index === 1) return "additions";
+            return null;
+          }
+        }, line),
+    ).resolves.toBe("additions");
+
+    await button.click();
+    await expect(page.getByPlaceholder("Leave a comment")).toBeVisible();
+    await expect(
+      page
+        .locator(".pierre-diff")
+        .first()
+        .evaluate((host, lineNumber) => {
+          const root = host.shadowRoot;
+          const slot = root?.querySelector(`slot[name="annotation-additions-${lineNumber}"]`);
+          return slot ? pierreCodeSide(root, slot) : null;
+
+          function pierreCodeSide(
+            root: ShadowRoot | null | undefined,
+            element: Element,
+          ): "deletions" | "additions" | null {
+            const code = Array.from(root?.querySelectorAll<HTMLElement>("code") ?? []).find((candidate) =>
+              candidate.contains(element),
+            );
+            const pre = code?.parentElement;
+            if (!code || !pre) return null;
+            if (code.hasAttribute("data-additions")) return "additions";
+            if (code.hasAttribute("data-deletions")) return "deletions";
+            const index = Array.from(pre.children)
+              .filter((child) => child.tagName.toLowerCase() === "code")
+              .indexOf(code);
+            if (index === 0) return "deletions";
+            if (index === 1) return "additions";
+            return null;
+          }
+        }, line),
+    ).resolves.toBe("additions");
+    await page.getByRole("button", { name: "Cancel" }).click();
+    await expect(page.getByPlaceholder("Leave a comment")).toHaveCount(0);
+  }
+
+  await assertRightSideComposer(2);
+  await assertRightSideComposer(3);
+});
+
+test("keeps final added-file line visible when opening an inline composer", async ({ page }) => {
+  await mockInlineReviewAPI(page, baseCapabilities, "github", "github.com", trailingAddedFileDiffResponse, undefined, {
+    detailEvents: [],
+  });
+
+  await page.goto("/pulls/github/acme/widgets/42/files");
+  await expect(page.getByText("blank_issues_enabled: false")).toBeVisible();
+
+  async function assertComposerLayout(lineNumber: number, lineText: string, followingText?: string): Promise<void> {
+    await page.getByRole("button", { name: `Comment on new line ${lineNumber}` }).click();
+    await expect(page.getByPlaceholder("Leave a comment")).toBeVisible();
+    await expect(page.getByText(lineText)).toBeVisible();
+
+    const layout = await page
+      .locator(".pierre-diff")
+      .first()
+      .evaluate(
+        (host, { lineNumber, lineText, followingText }) => {
+          const root = host.shadowRoot;
+          const line = Array.from(
+            root?.querySelectorAll<HTMLElement>(`[data-diff-new-line="${lineNumber}"]`) ?? [],
+          ).find((node) => node.textContent?.includes(lineText));
+          const following = followingText
+            ? Array.from(root?.querySelectorAll<HTMLElement>("[data-diff-new-line]") ?? []).find((node) =>
+                node.textContent?.includes(followingText),
+              )
+            : host.closest(".diff-file")?.nextElementSibling?.querySelector(".file-header");
+          const slot = root?.querySelector<HTMLSlotElement>(`slot[name="annotation-additions-${lineNumber}"]`);
+          const composer = host.querySelector<HTMLElement>(".inline-composer");
+          if (!line || !slot || !composer || !(following instanceof HTMLElement)) return null;
+          const lineRect = line.getBoundingClientRect();
+          const composerRect = composer.getBoundingClientRect();
+          const followingRect = following.getBoundingClientRect();
+          return {
+            assignedCount: slot.assignedElements({ flatten: true }).length,
+            composerBottom: Math.round(composerRect.bottom),
+            composerTop: Math.round(composerRect.top),
+            followingTop: Math.round(followingRect.top),
+            lineBottom: Math.round(lineRect.bottom),
+            slotInsideLine: slot.closest(`[data-diff-new-line="${lineNumber}"]`) !== null,
+          };
+        },
+        { lineNumber, lineText, followingText },
+      );
+    expect(layout).not.toBeNull();
+    expect(layout!.assignedCount).toBeGreaterThan(0);
+    expect(layout!.slotInsideLine).toBe(false);
+    expect(layout!.composerTop).toBeGreaterThanOrEqual(layout!.lineBottom);
+    expect(layout!.followingTop).toBeGreaterThanOrEqual(layout!.composerBottom);
+    await page.getByRole("button", { name: "Cancel" }).click();
+    await expect(page.getByPlaceholder("Leave a comment")).toHaveCount(0);
+  }
+
+  await assertComposerLayout(
+    3,
+    '# usage/"how do I" questions there instead of the issue tracker.',
+    "blank_issues_enabled: false",
+  );
+  await assertComposerLayout(4, "blank_issues_enabled: false");
 });
 
 test("shows a visible composer focus indicator without focus flicker", async ({ page }) => {

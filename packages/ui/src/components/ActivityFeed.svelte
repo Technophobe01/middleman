@@ -15,18 +15,26 @@
     isDefaultBranchCommitActivity,
     isDefaultBranchForcePushActivity,
     isCollapsedActivityRow,
+    isClosedOrMergedActivity,
+    collapseActivityRuns,
+    notificationReasonLabel,
     shortSha,
   } from "./activityRows.js";
   import {
     localDateLabel,
     parseAPITimestamp,
   } from "../utils/time.js";
+  import {
+    createRepoLabelFormatter,
+    type RepoLabelIdentity,
+  } from "../utils/repo-label.js";
   import { repoColor } from "../utils/repo-color.js";
   import Chip from "./shared/Chip.svelte";
   import ItemKindChip from "./shared/ItemKindChip.svelte";
   import ItemStateChip from "./shared/ItemStateChip.svelte";
   import WorkspaceIndicator from "./shared/WorkspaceIndicator.svelte";
   import ArrowUpRightIcon from "@lucide/svelte/icons/arrow-up-right";
+  import CheckIcon from "@lucide/svelte/icons/check";
   import ChevronsDownUpIcon from "@lucide/svelte/icons/chevrons-down-up";
   import ChevronsUpDownIcon from "@lucide/svelte/icons/chevrons-up-down";
 
@@ -98,6 +106,7 @@
 
   const hiddenFilterCount = $derived(
     (EVENT_TYPES.length - activity.getEnabledEvents().size)
+    + (activity.getShowNotifications() ? 0 : 1)
     + (activity.getHideClosedMerged() ? 1 : 0)
     + (activity.getHideBots() ? 1 : 0)
     + (activity.getHideDefaultBranchActivity() ? 1 : 0)
@@ -125,6 +134,7 @@
       activity.getItemFilter(),
       activity.getEnabledEvents(),
       activity.getHideDefaultBranchActivity(),
+      activity.getShowNotifications(),
     ));
     activity.syncToURL();
     void activity.loadActivity();
@@ -138,7 +148,12 @@
   function toggleEvent(evt: EventType): void {
     const current = activity.getEnabledEvents();
     const next = new Set(current);
-    if (next.has(evt)) { if (next.size > 1) next.delete(evt); }
+    // Deselecting the last event type is valid: it hides every event row
+    // while PR/issue rows and the separate Notifications toggle still
+    // govern their own rows. buildActivityFilterTypes encodes the empty
+    // set as an explicit type list, so the state round-trips through the
+    // URL rather than collapsing back to "show everything".
+    if (next.has(evt)) next.delete(evt);
     else next.add(evt);
     activity.setEnabledEvents(next);
     applyFilters();
@@ -152,6 +167,11 @@
 
   function handleViewModeChange(mode: ViewMode): void {
     activity.setViewMode(mode);
+    activity.syncToURL();
+  }
+
+  function handleRollUpCommitsChange(value: boolean): void {
+    activity.setRollUpCommits(value);
     activity.syncToURL();
   }
 
@@ -183,6 +203,7 @@
       case "force_push": return "Force-pushed";
       case "default_branch_commit": return "Commit";
       case "default_branch_force_push": return "Force-pushed";
+      case "notification": return notificationReasonLabel(item.body_preview);
       default: return item.activity_type;
     }
   }
@@ -220,10 +241,6 @@
     return item.activity_url || item.item_url;
   }
 
-  function repoLabel(owner: string, name: string): string {
-    return grouping.getHideOrgName() ? name : `${owner}/${name}`;
-  }
-
   function handleLinkClick(e: Event, url: string): void {
     e.stopPropagation();
     if (url) window.open(url, "_blank", "noopener");
@@ -238,8 +255,7 @@
       result = result.filter((it) => it.item_type === "issue");
     }
     if (activity.getHideClosedMerged()) {
-      result = result.filter((it) =>
-        it.item_state !== "merged" && it.item_state !== "closed");
+      result = result.filter((it) => !isClosedOrMergedActivity(it));
     }
     if (activity.getHideBots()) {
       result = result.filter((it) => !isBot(it.author));
@@ -250,10 +266,35 @@
     return result;
   });
 
-  const flatRows = $derived(displayItems);
+  const flatRows = $derived.by(() => collapseActivityRuns(displayItems, {
+    rollUpCommits: activity.getRollUpCommits(),
+    rollUpNonCommitActivity: false,
+  }));
+
+  const repoLabelFormatter = $derived.by(() =>
+    createRepoLabelFormatter(
+      displayItems.map(activityRepoIdentity),
+      { showOrgNames: !grouping.getHideOrgName() },
+    ),
+  );
+
+  function activityRepoIdentity(item: ActivityItem): RepoLabelIdentity {
+    return {
+      provider: item.repo?.provider ?? "",
+      platformHost: item.repo?.platform_host ?? item.platform_host,
+      owner: item.repo?.owner ?? item.repo_owner,
+      name: item.repo?.name ?? item.repo_name,
+      repoPath: item.repo?.repo_path,
+    };
+  }
+
+  function repoLabel(item: ActivityItem): string {
+    return repoLabelFormatter.format(activityRepoIdentity(item));
+  }
 
   function resetFilters(): void {
     activity.setEnabledEvents(new Set(EVENT_TYPES));
+    activity.setShowNotifications(true);
     activity.setHideClosedMerged(false);
     activity.setHideBots(false);
     activity.setHideDefaultBranchActivity(false);
@@ -264,13 +305,25 @@
   const activityFilterSections = $derived.by(() => [
     {
       title: "Event types",
-      items: EVENT_TYPES.map((evt) => ({
-        id: evt,
-        label: EVENT_LABELS[evt],
-        active: activity.getEnabledEvents().has(evt),
-        color: EVENT_COLORS[evt],
-        onSelect: () => toggleEvent(evt),
-      })),
+      items: [
+        ...EVENT_TYPES.map((evt) => ({
+          id: evt,
+          label: EVENT_LABELS[evt],
+          active: activity.getEnabledEvents().has(evt),
+          color: EVENT_COLORS[evt],
+          onSelect: () => toggleEvent(evt),
+        })),
+        {
+          id: "notification",
+          label: "Notifications",
+          active: activity.getShowNotifications(),
+          color: "var(--accent-blue)",
+          onSelect: () => {
+            activity.setShowNotifications(!activity.getShowNotifications());
+            applyFilters();
+          },
+        },
+      ],
     },
     {
       title: "Visibility",
@@ -361,6 +414,17 @@
         onSelect: () => handleTimeRangeChange(range.value),
       })),
     },
+    {
+      title: "Commits",
+      items: [
+        {
+          id: "roll-up-commits",
+          label: "Roll up commits",
+          active: activity.getRollUpCommits(),
+          onSelect: () => handleRollUpCommitsChange(!activity.getRollUpCommits()),
+        },
+      ],
+    },
     ...(activity.getViewMode() === "threaded"
       ? [
           {
@@ -395,6 +459,7 @@
       case "default_branch_commit": return "evt-commit";
       case "force_push": return "evt-force-push";
       case "default_branch_force_push": return "evt-force-push";
+      case "notification": return "evt-notification";
       default: return "";
     }
   }
@@ -405,6 +470,7 @@
       : type === "review" ? "chip--green"
       : type === "commit" || type === "default_branch_commit" ? "chip--teal"
       : type === "force_push" || type === "default_branch_force_push" ? "chip--red"
+      : type === "notification" ? "chip--blue"
       : "chip--muted";
     return `evt-label ${eventClass(type)} ${toneClass}`;
   }
@@ -431,7 +497,28 @@
       if (url) window.open(url, "_blank", "noopener");
       return;
     }
+    // Notifications that point at a tracked PR/issue open in the detail
+    // pane like any other row; those for other subjects (discussions,
+    // releases, CI) have no in-app detail, so follow their web URL.
+    if (item.activity_type === "notification" && !opensInDetailPane(item)) {
+      const url = activityLink(item);
+      if (url) window.open(url, "_blank", "noopener");
+      return;
+    }
     onSelectItem?.(item);
+  }
+
+  function opensInDetailPane(item: ActivityItem): boolean {
+    return (item.item_type === "pr" || item.item_type === "issue") && item.item_number > 0;
+  }
+
+  function isUnreadNotification(item: ActivityItem): boolean {
+    return item.activity_type === "notification" && item.item_state === "unread";
+  }
+
+  function handleMarkSeen(e: Event, item: ActivityItem): void {
+    e.stopPropagation();
+    void activity.markNotificationSeen(item);
   }
 
   function isSelectedActivityItem(item: ActivityItem): boolean {
@@ -583,7 +670,7 @@
                   {/if}
                 </span>
                 <span class="compact-meta">
-                  <span>{repoLabel(row.representative.repo_owner, row.representative.repo_name)}</span>
+                  <span>{repoLabel(row.representative)}</span>
                   <Chip
                     size="sm"
                     uppercase={false}
@@ -593,44 +680,59 @@
                 </span>
               </button>
             {:else}
-              <button
-                class="activity-compact-row"
-                class:selected={isSelectedActivityItem(row)}
-                onclick={() => handleRowClick(row)}
-                type="button"
-              >
-                <span class="compact-row-top">
-                  {#if isDefaultBranchActivity(row)}
-                    <Chip size="sm" uppercase={false} class="chip--muted branch-chip">Branch</Chip>
-                    <span class="branch-name">{branchName(row)}</span>
-                  {:else}
-                    <ItemKindChip kind={row.item_type} />
-                    <span class="item-number">#{row.item_number}</span>
-                    {#if row.workspace}
-                      <WorkspaceIndicator status={row.workspace.status} size={12} />
+              {@const unread = isUnreadNotification(row)}
+              <div class="compact-row-slot">
+                <button
+                  class="activity-compact-row"
+                  class:selected={isSelectedActivityItem(row)}
+                  class:has-seen-action={unread}
+                  onclick={() => handleRowClick(row)}
+                  type="button"
+                >
+                  <span class="compact-row-top">
+                    {#if isDefaultBranchActivity(row)}
+                      <Chip size="sm" uppercase={false} class="chip--muted branch-chip">Branch</Chip>
+                      <span class="branch-name">{branchName(row)}</span>
+                    {:else}
+                      <ItemKindChip kind={row.item_type} />
+                      <span class="item-number">#{row.item_number}</span>
+                      {#if row.workspace}
+                        <WorkspaceIndicator status={row.workspace.status} size={12} />
+                      {/if}
+                      {#if hasStateChip(row)}
+                        <ItemStateChip state={row.item_state} />
+                      {/if}
                     {/if}
-                    {#if hasStateChip(row)}
-                      <ItemStateChip state={row.item_state} />
+                    <span class="compact-time">{relativeTime(row.created_at)}</span>
+                  </span>
+                  <span class="compact-title">
+                    {isDefaultBranchActivity(row) ? branchActivityTitle(row) : row.item_title}
+                  </span>
+                  <span class="compact-meta">
+                    <span>{repoLabel(row)}</span>
+                    {#if isDefaultBranchActivity(row) && branchActivityDetail(row)}
+                      <span class="sha">{branchActivityDetail(row)}</span>
                     {/if}
-                  {/if}
-                  <span class="compact-time">{relativeTime(row.created_at)}</span>
-                </span>
-                <span class="compact-title">
-                  {isDefaultBranchActivity(row) ? branchActivityTitle(row) : row.item_title}
-                </span>
-                <span class="compact-meta">
-                  <span>{repoLabel(row.repo_owner, row.repo_name)}</span>
-                  {#if isDefaultBranchActivity(row) && branchActivityDetail(row)}
-                    <span class="sha">{branchActivityDetail(row)}</span>
-                  {/if}
-                  <Chip
-                    size="sm"
-                    uppercase={false}
-                    class={eventChipClass(row.activity_type)}
-                  >{eventLabel(row)}</Chip>
-                  <span>{activityAuthor(row)}</span>
-                </span>
-              </button>
+                    <Chip
+                      size="sm"
+                      uppercase={false}
+                      class={eventChipClass(row.activity_type)}
+                    >{eventLabel(row)}</Chip>
+                    <span>{activityAuthor(row)}</span>
+                  </span>
+                </button>
+                {#if unread}
+                  <button
+                    class="link-btn mark-seen-btn compact-mark-seen"
+                    type="button"
+                    aria-label="Mark notification seen"
+                    title="Mark seen"
+                    onclick={(e) => handleMarkSeen(e, row)}
+                  >
+                    <CheckIcon size="14" strokeWidth="2" aria-hidden="true" />
+                  </button>
+                {/if}
+              </div>
             {/if}
           {/each}
         </div>
@@ -681,7 +783,7 @@
                     style={repoStyle}
                   >
                     <span class="repo-chip__label"
-                      >{repoLabel(row.representative.repo_owner, row.representative.repo_name)}</span>
+                      >{repoLabel(row.representative)}</span>
                   </Chip>
                 </span>
                 <span class="cell cell--author col-author">{row.author}</span>
@@ -736,7 +838,7 @@
                     style={repoStyle}
                   >
                     <span class="repo-chip__label"
-                      >{repoLabel(row.repo_owner, row.repo_name)}</span>
+                      >{repoLabel(row)}</span>
                   </Chip>
                 </span>
                 <span class="cell cell--author col-author">{activityAuthor(row)}</span>
@@ -760,6 +862,17 @@
                 </span>
                 <span class="cell cell--time col-when">{relativeTime(row.created_at)}</span>
                 <span class="cell cell--link">
+                  {#if isUnreadNotification(row)}
+                    <button
+                      class="link-btn mark-seen-btn"
+                      type="button"
+                      aria-label="Mark notification seen"
+                      title="Mark seen"
+                      onclick={(e) => handleMarkSeen(e, row)}
+                    >
+                      <CheckIcon size="14" strokeWidth="2" aria-hidden="true" />
+                    </button>
+                  {/if}
                   {#if activityLink(row)}
                     <button
                       class="link-btn"
@@ -936,6 +1049,28 @@
     flex-direction: column;
   }
 
+  /* The mark-seen action sits beside the row rather than inside it: a
+     <button> cannot nest another button, so the row body stays a real
+     <button> (keyboard focus + Enter/Space) and the action is an absolutely
+     positioned sibling in this relative slot. The row reserves a right
+     gutter via .has-seen-action so the control never overlaps content. */
+  .compact-row-slot {
+    position: relative;
+    display: flex;
+  }
+
+  .compact-row-slot > .activity-compact-row {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .compact-mark-seen {
+    position: absolute;
+    top: 50%;
+    right: 8px;
+    transform: translateY(-50%);
+  }
+
   .activity-compact-row {
     display: flex;
     flex-direction: column;
@@ -948,6 +1083,10 @@
     text-align: left;
     color: inherit;
     background: transparent;
+  }
+
+  .activity-compact-row.has-seen-action {
+    padding-right: 36px;
   }
 
   .activity-compact-row:hover {
@@ -1151,6 +1290,10 @@
     outline-offset: 1px;
   }
 
+  .mark-seen-btn {
+    color: var(--accent-blue);
+  }
+
   :global(.evt-label) {
     font-size: var(--font-size-xs);
     color: var(--text-secondary);
@@ -1160,6 +1303,7 @@
   :global(.evt-label.evt-review) { color: var(--accent-green); }
   :global(.evt-label.evt-commit) { color: var(--accent-teal); }
   :global(.evt-label.evt-force-push) { color: var(--accent-red); }
+  :global(.evt-label.evt-notification) { color: var(--accent-blue); }
 
   .sha {
     color: var(--text-muted);

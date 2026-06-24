@@ -9,6 +9,7 @@
     KanbanBoardView,
     ReviewsView,
     FocusListView,
+    normalizeRepoFilterSelection,
   } from "@middleman/ui";
   import type { StoreInstances } from "@middleman/ui";
   import type { ActivityItem, ModeVisibility } from "@middleman/ui/api/types";
@@ -78,6 +79,7 @@
     isMobilePage,
     getDetailTab,
     getSelectedPRFromRoute,
+    type RoutableItemRef,
   } from "./lib/stores/router.svelte.ts";
   import {
     buildActivitySelectionSearch,
@@ -171,6 +173,11 @@
 
   function stopFullAppShell() {
     fullShellStores?.events.disconnect();
+    // runAppStartup begins sync polling once the shell is ready; its cancel
+    // only aborts in-flight startup, so the interval must be stopped here or
+    // it keeps firing after teardown (leaking across embed-route navigation
+    // and, in jsdom tests, hitting whichever fetch stub is current).
+    fullShellStores?.sync.stopPolling();
     cleanupFullAppShell?.();
     cleanupFullAppShell = undefined;
     fullShellStores = undefined;
@@ -527,13 +534,29 @@
     replaceUrl(`${desktopPathForMobileRoute()}${searchWithDesktopOptOut()}`);
   }
 
+  function getNormalizedGlobalRepo(repo: string | undefined = getGlobalRepo()): string | undefined {
+    return normalizeRepoFilterSelection(
+      repo,
+      (stores?.settings.getConfiguredRepos?.() ?? []).map((configuredRepo) => ({
+        provider: configuredRepo.provider,
+        platformHost: configuredRepo.platform_host,
+        repoPath: configuredRepo.repo_path,
+        isGlob: configuredRepo.is_glob,
+      })),
+    );
+  }
+
   onDestroy(() => {
     stopFullAppShell();
     stores?.events.disconnect();
   });
 
   $effect(() => {
-    const repo = getGlobalRepo();
+    const repo = getNormalizedGlobalRepo();
+    if (repo !== getGlobalRepo()) {
+      setGlobalRepo(repo);
+      return;
+    }
     if (!appReady || !stores) {
       lastRepo = repo;
       return;
@@ -863,6 +886,7 @@
     {client}
     roborevBaseUrl="/api/roborev"
     onError={showFlash}
+    onNotification={showFlash}
     onNavigate={(e) =>
       navigate(typeof e === "string" ? e : e.path)}
     onWorkspaceCommand={emitWorkspaceCommand}
@@ -891,7 +915,7 @@
       })),
     }}
     hostState={{
-      getGlobalRepo,
+      getGlobalRepo: getNormalizedGlobalRepo,
       getGroupByRepo: () => stores?.grouping.getGroupByRepo() ?? true,
       getView,
       getActiveWorktreeKey,
@@ -1049,7 +1073,7 @@
           <FocusListView listType="issues" />
         {:else}
           <MobileActivityView
-            selectedRepo={getGlobalRepo()}
+            selectedRepo={getNormalizedGlobalRepo()}
             onRepoChange={setGlobalRepo}
             onSelectItem={handleActivitySelect}
           />
@@ -1173,11 +1197,14 @@
         {@const r = getRoute()}
         {@const wsId =
           r.page === "terminal" ? r.workspaceId : ""}
+        {@const wsHostKey =
+          r.page === "terminal" ? r.hostKey : undefined}
         <!-- Single mount across /workspaces and /terminal/{id};
              WorkspaceTerminalView reacts to workspaceId changes
              internally so the page doesn't flash on navigation. -->
         <WorkspaceTerminalView
           workspaceId={wsId}
+          workspaceHostKey={wsHostKey}
           isSidebarCollapsed={isSidebarCollapsed()}
           sidebarWidth={getSidebarWidth()}
           onSidebarResize={handleSidebarResize}

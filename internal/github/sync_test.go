@@ -494,6 +494,10 @@ type mockClient struct {
 	listOpenPRsFn                   func(context.Context, string, string) ([]*gh.PullRequest, error)
 	listPullRequestsPageFn          func(context.Context, string, string, string, int) ([]*gh.PullRequest, bool, error)
 	listIssuesPageFn                func(context.Context, string, string, string, int) ([]*gh.Issue, bool, error)
+	listNotificationsFn             func(context.Context, NotificationListOptions) ([]NotificationThread, bool, error)
+	bypassNotificationReadReserve   bool
+	getNotificationThreadFn         func(context.Context, string) (NotificationThread, error)
+	markNotificationThreadReadFn    func(context.Context, string) error
 	comments                        []*gh.IssueComment
 	reviews                         []*gh.PullRequestReview
 	reviewThreads                   []PullRequestReviewThread
@@ -526,6 +530,10 @@ type mockClient struct {
 	dismissedReviewID               int64
 	dismissedReviewMessage          string
 	dismissReviewCalls              atomic.Int32
+}
+
+func (m *mockClient) bypassNotificationReadRateReserve() bool {
+	return m.bypassNotificationReadReserve
 }
 
 type rateLimitSnapshotMockClient struct {
@@ -1291,6 +1299,15 @@ func (m *mockClient) MarkPullRequestReadyForReview(
 	return &gh.PullRequest{Number: &number, Draft: &draft}, nil
 }
 
+func (m *mockClient) ConvertPullRequestToDraft(
+	_ context.Context, _, _ string, number int,
+) (*gh.PullRequest, error) {
+	m.trackCall()
+	draft := true
+	state := "open"
+	return &gh.PullRequest{Number: &number, State: &state, Draft: &draft}, nil
+}
+
 func (m *mockClient) DismissReview(
 	_ context.Context, _, _ string, _ int, reviewID int64, message string,
 ) (*gh.PullRequestReview, error) {
@@ -1368,6 +1385,30 @@ func (m *mockClient) ListIssuesPage(
 	return nil, false, nil
 }
 
+func (m *mockClient) ListNotifications(ctx context.Context, opts NotificationListOptions) ([]NotificationThread, bool, error) {
+	m.trackCall()
+	if m.listNotificationsFn != nil {
+		return m.listNotificationsFn(ctx, opts)
+	}
+	return nil, false, nil
+}
+
+func (m *mockClient) GetNotificationThread(ctx context.Context, threadID string) (NotificationThread, error) {
+	m.trackCall()
+	if m.getNotificationThreadFn != nil {
+		return m.getNotificationThreadFn(ctx, threadID)
+	}
+	return NotificationThread{}, nil
+}
+
+func (m *mockClient) MarkNotificationThreadRead(ctx context.Context, threadID string) error {
+	m.trackCall()
+	if m.markNotificationThreadReadFn != nil {
+		return m.markNotificationThreadReadFn(ctx, threadID)
+	}
+	return nil
+}
+
 // makeTimestamp is a helper for constructing go-github Timestamp values.
 func makeTimestamp(t time.Time) *gh.Timestamp {
 	return &gh.Timestamp{Time: t}
@@ -1426,6 +1467,1650 @@ func buildGitHubLabel(id int64, name, description, color string, isDefault bool)
 		Color:       &color,
 		Default:     &isDefault,
 	}
+}
+
+func TestSyncerStopIsIdempotent(t *testing.T) {
+	syncer := NewSyncer(map[string]Client{"github.com": &mockClient{}}, nil, nil, nil, time.Minute, nil, nil)
+	syncer.Stop()
+	syncer.Stop() // must not panic
+}
+
+func TestSyncNotificationsContinuesAfterHostError(t *testing.T) {
+	require := require.New(t)
+	check := Assert.New(t)
+	d := openTestDB(t)
+	_, err := d.UpsertRepo(t.Context(), db.GitHubRepoIdentity("ghe.example.com", "acme", "widget"))
+	require.NoError(err)
+	_, err = d.UpsertRepo(t.Context(), db.GitHubRepoIdentity("aaa.example.com", "acme", "broken"))
+	require.NoError(err)
+	now := time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC)
+	boom := errors.New("boom")
+	okNumber := 7
+	syncer := NewSyncer(
+		map[string]Client{
+			"aaa.example.com": &mockClient{
+				listNotificationsFn: func(context.Context, NotificationListOptions) ([]NotificationThread, bool, error) {
+					return nil, false, boom
+				},
+			},
+			"ghe.example.com": &mockClient{
+				listNotificationsFn: func(context.Context, NotificationListOptions) ([]NotificationThread, bool, error) {
+					return []NotificationThread{{
+						ID:            "thread-ok",
+						RepoOwner:     "acme",
+						RepoName:      "widget",
+						SubjectType:   "PullRequest",
+						SubjectTitle:  "Review requested",
+						WebURL:        "https://ghe.example.com/acme/widget/pull/7",
+						ItemNumber:    &okNumber,
+						ItemType:      "pr",
+						Reason:        "mention",
+						Unread:        true,
+						Participating: true,
+						UpdatedAt:     now,
+					}}, false, nil
+				},
+			},
+		},
+		d,
+		nil,
+		[]RepoRef{
+			{Owner: "acme", Name: "broken", PlatformHost: "aaa.example.com"},
+			{Owner: "acme", Name: "widget", PlatformHost: "ghe.example.com"},
+		},
+		time.Minute,
+		nil,
+		nil,
+	)
+
+	syncErr := syncer.SyncNotifications(t.Context())
+	require.Error(syncErr)
+	items, listErr := d.ListNotifications(t.Context(), db.ListNotificationsOpts{State: "all"})
+	require.NoError(listErr)
+	require.Len(items, 1)
+	require.ErrorIs(syncErr, boom)
+	check.Equal("ghe.example.com", items[0].PlatformHost)
+	check.Equal("thread-ok", items[0].PlatformNotificationID)
+}
+
+func TestSyncNotificationsIgnoresReadRateReserveWhenNotificationClientBypassesReserve(t *testing.T) {
+	require := require.New(t)
+	assert := Assert.New(t)
+	d := openTestDB(t)
+	_, err := d.UpsertRepo(t.Context(), db.GitHubRepoIdentity("github.com", "acme", "widget"))
+	require.NoError(err)
+	number := 7
+	now := time.Now().UTC()
+	rt := NewRateTracker(d, "github.com", "rest")
+	rt.UpdateFromRate(Rate{
+		Limit:     5000,
+		Remaining: RateReserveBuffer,
+		Reset:     time.Now().UTC().Add(time.Hour),
+	})
+	var calls atomic.Int32
+	syncer := NewSyncer(
+		map[string]Client{
+			"github.com": &mockClient{
+				bypassNotificationReadReserve: true,
+				listNotificationsFn: func(context.Context, NotificationListOptions) ([]NotificationThread, bool, error) {
+					calls.Add(1)
+					return []NotificationThread{{
+						ID:           "thread-7",
+						RepoOwner:    "acme",
+						RepoName:     "widget",
+						SubjectType:  "PullRequest",
+						SubjectTitle: "Review requested",
+						WebURL:       "https://github.com/acme/widget/pull/7",
+						ItemNumber:   &number,
+						ItemType:     "pr",
+						Reason:       "mention",
+						Unread:       true,
+						UpdatedAt:    now,
+					}}, false, nil
+				},
+			},
+		},
+		d,
+		nil,
+		[]RepoRef{{Owner: "acme", Name: "widget", PlatformHost: "github.com"}},
+		time.Minute,
+		map[string]*RateTracker{"github.com": rt},
+		map[string]*SyncBudget{"github.com": NewSyncBudget(10)},
+	)
+
+	syncErr := syncer.SyncNotifications(t.Context())
+
+	require.NoError(syncErr)
+	assert.Equal(int32(2), calls.Load())
+	items, err := d.ListNotifications(t.Context(), db.ListNotificationsOpts{State: "all"})
+	require.NoError(err)
+	require.Len(items, 1)
+	assert.Equal("thread-7", items[0].PlatformNotificationID)
+}
+
+func TestSyncNotificationsStopsBeforeListingWhenSharedReadRateReserveExhausted(t *testing.T) {
+	require := require.New(t)
+	assert := Assert.New(t)
+	d := openTestDB(t)
+	_, err := d.UpsertRepo(t.Context(), db.GitHubRepoIdentity("github.com", "acme", "widget"))
+	require.NoError(err)
+	rt := NewRateTracker(d, "github.com", "rest")
+	rt.UpdateFromRate(Rate{
+		Limit:     5000,
+		Remaining: RateReserveBuffer,
+		Reset:     time.Now().UTC().Add(time.Hour),
+	})
+	var calls atomic.Int32
+	syncer := NewSyncer(
+		map[string]Client{
+			"github.com": &mockClient{
+				listNotificationsFn: func(context.Context, NotificationListOptions) ([]NotificationThread, bool, error) {
+					calls.Add(1)
+					return nil, false, nil
+				},
+			},
+		},
+		d,
+		nil,
+		[]RepoRef{{Owner: "acme", Name: "widget", PlatformHost: "github.com"}},
+		time.Minute,
+		map[string]*RateTracker{"github.com": rt},
+		map[string]*SyncBudget{"github.com": NewSyncBudget(10)},
+	)
+
+	syncErr := syncer.SyncNotifications(t.Context())
+
+	require.Error(syncErr)
+	require.ErrorContains(syncErr, "rate reserve exhausted")
+	assert.Equal(int32(0), calls.Load())
+}
+
+func TestSyncNotificationsStopsBeforeListingWhenSyncBudgetExhausted(t *testing.T) {
+	require := require.New(t)
+	assert := Assert.New(t)
+	d := openTestDB(t)
+	_, err := d.UpsertRepo(t.Context(), db.GitHubRepoIdentity("github.com", "acme", "widget"))
+	require.NoError(err)
+	var calls atomic.Int32
+	syncer := NewSyncer(
+		map[string]Client{
+			"github.com": &mockClient{
+				listNotificationsFn: func(context.Context, NotificationListOptions) ([]NotificationThread, bool, error) {
+					calls.Add(1)
+					return nil, false, nil
+				},
+			},
+		},
+		d,
+		nil,
+		[]RepoRef{{Owner: "acme", Name: "widget", PlatformHost: "github.com"}},
+		time.Minute,
+		nil,
+		map[string]*SyncBudget{"github.com": NewSyncBudget(0)},
+	)
+
+	syncErr := syncer.SyncNotifications(t.Context())
+
+	require.Error(syncErr)
+	require.ErrorContains(syncErr, "sync budget exhausted")
+	assert.Equal(int32(0), calls.Load())
+}
+
+func TestSyncNotificationsCapsRepositoryNotificationPages(t *testing.T) {
+	require := require.New(t)
+	assert := Assert.New(t)
+	d := openTestDB(t)
+	_, err := d.UpsertRepo(t.Context(), db.GitHubRepoIdentity("github.com", "acme", "widget"))
+	require.NoError(err)
+	var participatingCalls atomic.Int32
+	var listCalls atomic.Int32
+	var seen []NotificationListOptions
+	syncer := NewSyncer(
+		map[string]Client{
+			"github.com": &mockClient{
+				listNotificationsFn: func(_ context.Context, opts NotificationListOptions) ([]NotificationThread, bool, error) {
+					seen = append(seen, opts)
+					if opts.Participating {
+						participatingCalls.Add(1)
+						return nil, false, nil
+					}
+					listCalls.Add(1)
+					return nil, true, nil
+				},
+			},
+		},
+		d,
+		nil,
+		[]RepoRef{{Owner: "acme", Name: "widget", PlatformHost: "github.com"}},
+		time.Minute,
+		nil,
+		map[string]*SyncBudget{"github.com": NewSyncBudget(100)},
+	)
+
+	syncErr := syncer.SyncNotifications(t.Context())
+
+	require.Error(syncErr)
+	require.ErrorContains(syncErr, "notification sync page cap reached for acme/widget on github.com after 5 pages")
+	assert.Equal(int32(1), participatingCalls.Load())
+	assert.Equal(int32(notificationSyncMaxPages), listCalls.Load())
+	if assert.Len(seen, notificationSyncMaxPages+1) {
+		assert.Equal("acme", seen[0].RepoOwner)
+		assert.Equal("widget", seen[0].RepoName)
+		assert.True(seen[0].Participating)
+		last := seen[len(seen)-1]
+		assert.Equal(notificationSyncMaxPages, last.Page)
+		assert.Equal("acme", last.RepoOwner)
+		assert.Equal("widget", last.RepoName)
+		assert.False(last.Participating)
+	}
+}
+
+func TestSyncMRMarksLinkedNotificationDone(t *testing.T) {
+	require := require.New(t)
+	assert := Assert.New(t)
+	d := openTestDB(t)
+	repoID, err := d.UpsertRepo(t.Context(), db.GitHubRepoIdentity("github.com", "acme", "widget"))
+	require.NoError(err)
+	now := time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC)
+	number := 7
+	openNumber := 9
+	_, err = d.UpsertMergeRequest(t.Context(), &db.MergeRequest{
+		RepoID:           repoID,
+		PlatformID:       700,
+		Number:           number,
+		URL:              "https://github.com/acme/widget/pull/7",
+		Title:            "Close me",
+		Author:           "alice",
+		State:            "open",
+		CreatedAt:        now,
+		UpdatedAt:        now,
+		LastActivityAt:   now,
+		PlatformHeadSHA:  "head",
+		PlatformBaseSHA:  "base",
+		HeadRepoCloneURL: "https://github.com/acme/widget.git",
+	})
+	require.NoError(err)
+	_, err = d.UpsertMergeRequest(t.Context(), &db.MergeRequest{
+		RepoID:           repoID,
+		PlatformID:       900,
+		Number:           openNumber,
+		URL:              "https://github.com/acme/widget/pull/9",
+		Title:            "Stay open",
+		Author:           "carol",
+		State:            "open",
+		CreatedAt:        now,
+		UpdatedAt:        now,
+		LastActivityAt:   now,
+		PlatformHeadSHA:  "head-open",
+		PlatformBaseSHA:  "base",
+		HeadRepoCloneURL: "https://github.com/acme/widget.git",
+	})
+	require.NoError(err)
+	require.NoError(d.UpsertNotifications(t.Context(), []db.Notification{
+		{
+			Platform:               "github",
+			PlatformHost:           "github.com",
+			PlatformNotificationID: "thread-pr-closed",
+			RepoID:                 &repoID,
+			RepoOwner:              "acme",
+			RepoName:               "widget",
+			SubjectType:            "PullRequest",
+			SubjectTitle:           "Close me",
+			WebURL:                 "https://github.com/acme/widget/pull/7",
+			ItemNumber:             &number,
+			ItemType:               "pr",
+			Reason:                 "mention",
+			Unread:                 true,
+			SourceUpdatedAt:        now,
+			SyncedAt:               now,
+		},
+		{
+			Platform:               "github",
+			PlatformHost:           "github.com",
+			PlatformNotificationID: "thread-pr-open",
+			RepoID:                 &repoID,
+			RepoOwner:              "acme",
+			RepoName:               "widget",
+			SubjectType:            "PullRequest",
+			SubjectTitle:           "Stay open",
+			WebURL:                 "https://github.com/acme/widget/pull/9",
+			ItemNumber:             &openNumber,
+			ItemType:               "pr",
+			Reason:                 "mention",
+			Unread:                 true,
+			SourceUpdatedAt:        now,
+			SyncedAt:               now,
+		},
+	}))
+	closedAt := now.Add(time.Hour)
+	closedPR := buildOpenPR(number, closedAt)
+	closedPR.State = new("closed")
+	closedPR.ClosedAt = makeTimestamp(closedAt)
+	closedPR.User = &gh.User{Login: new("alice")}
+	syncer := NewSyncer(
+		map[string]Client{"github.com": &mockClient{getPullRequestFn: func(context.Context, string, string, int) (*gh.PullRequest, error) {
+			return closedPR, nil
+		}}},
+		d,
+		nil,
+		[]RepoRef{{Owner: "acme", Name: "widget", PlatformHost: "github.com"}},
+		time.Minute,
+		nil,
+		nil,
+	)
+
+	require.NoError(syncer.SyncMR(t.Context(), "acme", "widget", number))
+	active, err := d.ListNotifications(t.Context(), db.ListNotificationsOpts{State: "active"})
+	require.NoError(err)
+	require.Len(active, 1)
+	assert.Equal("thread-pr-open", active[0].PlatformNotificationID)
+	done, err := d.ListNotifications(t.Context(), db.ListNotificationsOpts{State: "done"})
+	require.NoError(err)
+	require.Len(done, 1)
+	assert.Equal("thread-pr-closed", done[0].PlatformNotificationID)
+	assert.Equal("closed", done[0].DoneReason)
+}
+
+func TestSyncIssueMarksLinkedNotificationDone(t *testing.T) {
+	require := require.New(t)
+	assert := Assert.New(t)
+	d := openTestDB(t)
+	repoID, err := d.UpsertRepo(t.Context(), db.GitHubRepoIdentity("github.com", "acme", "widget"))
+	require.NoError(err)
+	now := time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC)
+	number := 8
+	openNumber := 10
+	_, err = d.UpsertIssue(t.Context(), &db.Issue{
+		RepoID:         repoID,
+		PlatformID:     800,
+		Number:         number,
+		URL:            "https://github.com/acme/widget/issues/8",
+		Title:          "Close issue",
+		Author:         "bob",
+		State:          "open",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		LastActivityAt: now,
+	})
+	require.NoError(err)
+	_, err = d.UpsertIssue(t.Context(), &db.Issue{
+		RepoID:         repoID,
+		PlatformID:     1000,
+		Number:         openNumber,
+		URL:            "https://github.com/acme/widget/issues/10",
+		Title:          "Stay open issue",
+		Author:         "dana",
+		State:          "open",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		LastActivityAt: now,
+	})
+	require.NoError(err)
+	require.NoError(d.UpsertNotifications(t.Context(), []db.Notification{
+		{
+			Platform:               "github",
+			PlatformHost:           "github.com",
+			PlatformNotificationID: "thread-issue-closed",
+			RepoID:                 &repoID,
+			RepoOwner:              "acme",
+			RepoName:               "widget",
+			SubjectType:            "Issue",
+			SubjectTitle:           "Close issue",
+			WebURL:                 "https://github.com/acme/widget/issues/8",
+			ItemNumber:             &number,
+			ItemType:               "issue",
+			Reason:                 "mention",
+			Unread:                 true,
+			SourceUpdatedAt:        now,
+			SyncedAt:               now,
+		},
+		{
+			Platform:               "github",
+			PlatformHost:           "github.com",
+			PlatformNotificationID: "thread-issue-open",
+			RepoID:                 &repoID,
+			RepoOwner:              "acme",
+			RepoName:               "widget",
+			SubjectType:            "Issue",
+			SubjectTitle:           "Stay open issue",
+			WebURL:                 "https://github.com/acme/widget/issues/10",
+			ItemNumber:             &openNumber,
+			ItemType:               "issue",
+			Reason:                 "mention",
+			Unread:                 true,
+			SourceUpdatedAt:        now,
+			SyncedAt:               now,
+		},
+	}))
+	closedAt := now.Add(time.Hour)
+	closedIssue := &gh.Issue{
+		ID:        gh.Ptr[int64](800),
+		Number:    new(number),
+		HTMLURL:   new("https://github.com/acme/widget/issues/8"),
+		Title:     new("Close issue"),
+		User:      &gh.User{Login: new("bob")},
+		State:     new("closed"),
+		CreatedAt: makeTimestamp(now),
+		UpdatedAt: makeTimestamp(closedAt),
+		ClosedAt:  makeTimestamp(closedAt),
+	}
+	syncer := NewSyncer(
+		map[string]Client{"github.com": &mockClient{getIssueFn: func(context.Context, string, string, int) (*gh.Issue, error) {
+			return closedIssue, nil
+		}}},
+		d,
+		nil,
+		[]RepoRef{{Owner: "acme", Name: "widget", PlatformHost: "github.com"}},
+		time.Minute,
+		nil,
+		nil,
+	)
+
+	require.NoError(syncer.SyncIssue(t.Context(), "acme", "widget", number))
+	active, err := d.ListNotifications(t.Context(), db.ListNotificationsOpts{State: "active"})
+	require.NoError(err)
+	require.Len(active, 1)
+	assert.Equal("thread-issue-open", active[0].PlatformNotificationID)
+	done, err := d.ListNotifications(t.Context(), db.ListNotificationsOpts{State: "done"})
+	require.NoError(err)
+	require.Len(done, 1)
+	assert.Equal("thread-issue-closed", done[0].PlatformNotificationID)
+	assert.Equal("closed", done[0].DoneReason)
+}
+
+func TestSyncNotificationsEnrichesItemAuthorFromLinkedItems(t *testing.T) {
+	require := require.New(t)
+	assert := Assert.New(t)
+	d := openTestDB(t)
+	repoID, err := d.UpsertRepo(t.Context(), db.GitHubRepoIdentity("github.com", "acme", "widget"))
+	require.NoError(err)
+	now := time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC)
+	prNumber := 7
+	issueNumber := 8
+	_, err = d.UpsertMergeRequest(t.Context(), &db.MergeRequest{
+		RepoID:           repoID,
+		PlatformID:       700,
+		Number:           prNumber,
+		URL:              "https://github.com/acme/widget/pull/7",
+		Title:            "Please review",
+		Author:           "alice",
+		State:            "open",
+		CreatedAt:        now,
+		UpdatedAt:        now,
+		LastActivityAt:   now,
+		PlatformHeadSHA:  "head",
+		PlatformBaseSHA:  "base",
+		HeadRepoCloneURL: "https://github.com/acme/widget.git",
+	})
+	require.NoError(err)
+	_, err = d.UpsertIssue(t.Context(), &db.Issue{
+		RepoID:         repoID,
+		PlatformID:     800,
+		Number:         issueNumber,
+		URL:            "https://github.com/acme/widget/issues/8",
+		Title:          "Issue author",
+		Author:         "bob",
+		State:          "open",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		LastActivityAt: now,
+	})
+	require.NoError(err)
+	syncer := NewSyncer(
+		map[string]Client{
+			"github.com": &mockClient{
+				listNotificationsFn: func(_ context.Context, opts NotificationListOptions) ([]NotificationThread, bool, error) {
+					if opts.Participating {
+						return nil, false, nil
+					}
+					return []NotificationThread{
+						{
+							ID:           "thread-pr",
+							RepoOwner:    "acme",
+							RepoName:     "widget",
+							SubjectType:  "PullRequest",
+							SubjectTitle: "Please review",
+							WebURL:       "https://github.com/acme/widget/pull/7",
+							ItemNumber:   &prNumber,
+							ItemType:     "pr",
+							Reason:       "mention",
+							Unread:       true,
+							UpdatedAt:    now,
+						},
+						{
+							ID:           "thread-issue",
+							RepoOwner:    "acme",
+							RepoName:     "widget",
+							SubjectType:  "Issue",
+							SubjectTitle: "Issue author",
+							WebURL:       "https://github.com/acme/widget/issues/8",
+							ItemNumber:   &issueNumber,
+							ItemType:     "issue",
+							Reason:       "mention",
+							Unread:       true,
+							UpdatedAt:    now,
+						},
+					}, false, nil
+				},
+			},
+		},
+		d,
+		nil,
+		[]RepoRef{{Owner: "acme", Name: "widget", PlatformHost: "github.com"}},
+		time.Minute,
+		nil,
+		nil,
+	)
+
+	require.NoError(syncer.SyncNotifications(t.Context()))
+	prItems, err := d.ListNotifications(t.Context(), db.ListNotificationsOpts{State: "all", Search: "alice"})
+	require.NoError(err)
+	require.Len(prItems, 1)
+	assert.Equal("thread-pr", prItems[0].PlatformNotificationID)
+	assert.Equal("alice", prItems[0].ItemAuthor)
+
+	issueItems, err := d.ListNotifications(t.Context(), db.ListNotificationsOpts{State: "all", Search: "bob"})
+	require.NoError(err)
+	require.Len(issueItems, 1)
+	assert.Equal("thread-issue", issueItems[0].PlatformNotificationID)
+	assert.Equal("bob", issueItems[0].ItemAuthor)
+}
+
+func TestSyncNotificationsEnrichesItemAuthorFromProviderScopedRepo(t *testing.T) {
+	require := require.New(t)
+	assert := Assert.New(t)
+	d := openTestDB(t)
+	forgejoRepoID, err := d.UpsertRepo(t.Context(), db.RepoIdentity{
+		Platform:     "forgejo",
+		PlatformHost: "code.example.com",
+		Owner:        "acme",
+		Name:         "widget",
+		RepoPath:     "acme/widget",
+	})
+	require.NoError(err)
+	githubRepoID, err := d.UpsertRepo(t.Context(), db.RepoIdentity{
+		Platform:     "github",
+		PlatformHost: "code.example.com",
+		Owner:        "acme",
+		Name:         "widget",
+		RepoPath:     "acme/widget",
+	})
+	require.NoError(err)
+	now := time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC)
+	number := 7
+	_, err = d.UpsertMergeRequest(t.Context(), &db.MergeRequest{
+		RepoID:           forgejoRepoID,
+		PlatformID:       700,
+		Number:           number,
+		URL:              "https://code.example.com/acme/widget/pulls/7",
+		Title:            "Wrong provider",
+		Author:           "wrong-author",
+		State:            "open",
+		CreatedAt:        now,
+		UpdatedAt:        now,
+		LastActivityAt:   now,
+		PlatformHeadSHA:  "forgejo-head",
+		PlatformBaseSHA:  "forgejo-base",
+		HeadRepoCloneURL: "https://code.example.com/acme/widget.git",
+	})
+	require.NoError(err)
+	_, err = d.UpsertMergeRequest(t.Context(), &db.MergeRequest{
+		RepoID:           githubRepoID,
+		PlatformID:       701,
+		Number:           number,
+		URL:              "https://code.example.com/acme/widget/pull/7",
+		Title:            "Right provider",
+		Author:           "right-author",
+		State:            "open",
+		CreatedAt:        now,
+		UpdatedAt:        now,
+		LastActivityAt:   now,
+		PlatformHeadSHA:  "github-head",
+		PlatformBaseSHA:  "github-base",
+		HeadRepoCloneURL: "https://code.example.com/acme/widget.git",
+	})
+	require.NoError(err)
+	syncer := NewSyncer(
+		map[string]Client{
+			"code.example.com": &mockClient{
+				listNotificationsFn: func(_ context.Context, opts NotificationListOptions) ([]NotificationThread, bool, error) {
+					if opts.Participating {
+						return nil, false, nil
+					}
+					return []NotificationThread{{
+						ID:           "thread-pr",
+						RepoOwner:    "acme",
+						RepoName:     "widget",
+						SubjectType:  "PullRequest",
+						SubjectTitle: "Review requested",
+						WebURL:       "https://code.example.com/acme/widget/pull/7",
+						ItemNumber:   &number,
+						ItemType:     "pr",
+						Reason:       "mention",
+						Unread:       true,
+						UpdatedAt:    now,
+					}}, false, nil
+				},
+			},
+		},
+		d,
+		nil,
+		[]RepoRef{{Platform: platform.KindGitHub, Owner: "acme", Name: "widget", PlatformHost: "code.example.com"}},
+		time.Minute,
+		nil,
+		nil,
+	)
+
+	require.NoError(syncer.SyncNotifications(t.Context()))
+
+	items, err := d.ListNotifications(t.Context(), db.ListNotificationsOpts{State: "all"})
+	require.NoError(err)
+	require.Len(items, 1)
+	assert.Equal("github", items[0].Platform)
+	require.NotNil(items[0].RepoID)
+	assert.Equal(githubRepoID, *items[0].RepoID)
+	assert.Equal("right-author", items[0].ItemAuthor)
+}
+
+func TestSyncNotificationsMarksParticipatingThreads(t *testing.T) {
+	require := require.New(t)
+	assert := Assert.New(t)
+	d := openTestDB(t)
+	_, err := d.UpsertRepo(t.Context(), db.GitHubRepoIdentity("github.com", "acme", "widget"))
+	require.NoError(err)
+	now := time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC)
+	prNumber := 7
+	issueNumber := 8
+	syncer := NewSyncer(
+		map[string]Client{
+			"github.com": &mockClient{
+				listNotificationsFn: func(_ context.Context, opts NotificationListOptions) ([]NotificationThread, bool, error) {
+					if opts.Participating {
+						return []NotificationThread{{ID: "thread-1"}}, false, nil
+					}
+					return []NotificationThread{
+						{
+							ID:           "thread-1",
+							RepoOwner:    "acme",
+							RepoName:     "widget",
+							SubjectType:  "PullRequest",
+							SubjectTitle: "Review requested",
+							WebURL:       "https://github.com/acme/widget/pull/7",
+							ItemNumber:   &prNumber,
+							ItemType:     "pr",
+							Reason:       "mention",
+							Unread:       true,
+							UpdatedAt:    now,
+						},
+						{
+							ID:           "thread-2",
+							RepoOwner:    "acme",
+							RepoName:     "widget",
+							SubjectType:  "Issue",
+							SubjectTitle: "FYI",
+							WebURL:       "https://github.com/acme/widget/issues/8",
+							ItemNumber:   &issueNumber,
+							ItemType:     "issue",
+							Reason:       "mention",
+							Unread:       true,
+							UpdatedAt:    now,
+						},
+					}, false, nil
+				},
+			},
+		},
+		d,
+		nil,
+		[]RepoRef{{Owner: "acme", Name: "widget", PlatformHost: "github.com"}},
+		time.Minute,
+		nil,
+		nil,
+	)
+
+	require.NoError(syncer.SyncNotifications(t.Context()))
+	items, err := d.ListNotifications(t.Context(), db.ListNotificationsOpts{State: "all"})
+	require.NoError(err)
+	require.Len(items, 2)
+	participatingByThread := map[string]bool{}
+	for _, item := range items {
+		participatingByThread[item.PlatformNotificationID] = item.Participating
+	}
+	assert.True(participatingByThread["thread-1"])
+	assert.False(participatingByThread["thread-2"])
+}
+
+func TestSyncNotificationsSkipsNonPRIssueSubjects(t *testing.T) {
+	require := require.New(t)
+	assert := Assert.New(t)
+	d := openTestDB(t)
+	_, err := d.UpsertRepo(t.Context(), db.GitHubRepoIdentity("github.com", "acme", "widget"))
+	require.NoError(err)
+	now := time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC)
+	prNumber := 7
+	authorNumber := 9
+	syncer := NewSyncer(
+		map[string]Client{
+			"github.com": &mockClient{
+				listNotificationsFn: func(_ context.Context, opts NotificationListOptions) ([]NotificationThread, bool, error) {
+					if opts.Participating {
+						return nil, false, nil
+					}
+					return []NotificationThread{
+						{
+							// CheckSuite/CI notifications carry no subject URL or
+							// number from GitHub, so they cannot anchor to a PR or
+							// issue and must be skipped entirely.
+							ID:           "thread-ci",
+							RepoOwner:    "acme",
+							RepoName:     "widget",
+							SubjectType:  "CheckSuite",
+							SubjectTitle: "CI workflow run failed for some-branch branch",
+							ItemType:     "other",
+							Reason:       "ci_activity",
+							Unread:       true,
+							UpdatedAt:    now,
+						},
+						{
+							// "author" notifications duplicate feed activity on
+							// the user's own thread and must be skipped even when
+							// anchored to a PR.
+							ID:           "thread-author",
+							RepoOwner:    "acme",
+							RepoName:     "widget",
+							SubjectType:  "PullRequest",
+							SubjectTitle: "Your own PR",
+							WebURL:       "https://github.com/acme/widget/pull/9",
+							ItemNumber:   &authorNumber,
+							ItemType:     "pr",
+							Reason:       "author",
+							Unread:       true,
+							UpdatedAt:    now,
+						},
+						{
+							ID:           "thread-pr",
+							RepoOwner:    "acme",
+							RepoName:     "widget",
+							SubjectType:  "PullRequest",
+							SubjectTitle: "Review requested",
+							WebURL:       "https://github.com/acme/widget/pull/7",
+							ItemNumber:   &prNumber,
+							ItemType:     "pr",
+							Reason:       "mention",
+							Unread:       true,
+							UpdatedAt:    now,
+						},
+					}, false, nil
+				},
+			},
+		},
+		d,
+		nil,
+		[]RepoRef{{Owner: "acme", Name: "widget", PlatformHost: "github.com"}},
+		time.Minute,
+		nil,
+		nil,
+	)
+
+	require.NoError(syncer.SyncNotifications(t.Context()))
+	items, err := d.ListNotifications(t.Context(), db.ListNotificationsOpts{State: "all"})
+	require.NoError(err)
+	require.Len(items, 1)
+	assert.Equal("thread-pr", items[0].PlatformNotificationID)
+}
+
+func TestProcessQueuedNotificationReadsStopsRetryMetadataAtMaxAttempts(t *testing.T) {
+	require := require.New(t)
+	assert := Assert.New(t)
+	d := openTestDB(t)
+	repoID, err := d.UpsertRepo(t.Context(), db.GitHubRepoIdentity("github.com", "acme", "widget"))
+	require.NoError(err)
+	number := 7
+	now := time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC)
+	queuedAt := now.Add(time.Minute)
+	notification := db.Notification{
+		Platform:                 "github",
+		PlatformHost:             "github.com",
+		PlatformNotificationID:   "thread-1",
+		RepoID:                   &repoID,
+		RepoOwner:                "acme",
+		RepoName:                 "widget",
+		SubjectType:              "PullRequest",
+		SubjectTitle:             "Please review",
+		WebURL:                   "https://github.com/acme/widget/pull/7",
+		ItemNumber:               &number,
+		ItemType:                 "pr",
+		Reason:                   "mention",
+		Unread:                   false,
+		Participating:            true,
+		SourceUpdatedAt:          now,
+		SyncedAt:                 now,
+		SourceAckQueuedAt:        &queuedAt,
+		SourceAckAttempts:        defaultNotificationPropagationMaxAttempts - 1,
+		SourceAckError:           "temporary failure",
+		SourceLastAcknowledgedAt: &queuedAt,
+	}
+	require.NoError(d.UpsertNotifications(t.Context(), []db.Notification{notification}))
+	var markedThreads []string
+	mc := &mockClient{markNotificationThreadReadFn: func(_ context.Context, threadID string) error {
+		markedThreads = append(markedThreads, threadID)
+		return errors.New("still failing")
+	}}
+	syncer := NewSyncer(map[string]Client{"github.com": mc}, d, nil, nil, time.Minute, nil, nil)
+
+	require.NoError(syncer.ProcessQueuedNotificationReads(t.Context(), platform.KindGitHub, "github.com", 10))
+
+	items, err := d.ListNotifications(t.Context(), db.ListNotificationsOpts{State: "all"})
+	require.NoError(err)
+	require.Len(items, 1)
+	assert.Equal([]string{"thread-1"}, markedThreads)
+	assert.Equal("max_attempts_exceeded", items[0].SourceAckError)
+	assert.Nil(items[0].SourceAckNextAttemptAt)
+	queued, err := d.ListQueuedNotificationAcks(t.Context(), "github", "github.com", 10, now.Add(time.Hour))
+	require.NoError(err)
+	assert.Empty(queued)
+}
+
+func TestProcessQueuedNotificationReadsPausesOnRateLimitWithoutConsumingAttempts(t *testing.T) {
+	require := require.New(t)
+	check := Assert.New(t)
+	d := openTestDB(t)
+	repoID, err := d.UpsertRepo(t.Context(), db.GitHubRepoIdentity("github.com", "acme", "widget"))
+	require.NoError(err)
+	now := time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC)
+	numberOne := 7
+	numberTwo := 8
+	require.NoError(d.UpsertNotifications(t.Context(), []db.Notification{
+		{
+			Platform: "github", PlatformHost: "github.com", PlatformNotificationID: "thread-1", RepoID: &repoID,
+			RepoOwner: "acme", RepoName: "widget", SubjectType: "PullRequest", SubjectTitle: "Please review",
+			WebURL: "https://github.com/acme/widget/pull/7", ItemNumber: &numberOne, ItemType: "pr",
+			Reason: "mention", Unread: true, SourceUpdatedAt: now, SyncedAt: now,
+		},
+		{
+			Platform: "github", PlatformHost: "github.com", PlatformNotificationID: "thread-2", RepoID: &repoID,
+			RepoOwner: "acme", RepoName: "widget", SubjectType: "PullRequest", SubjectTitle: "Please review again",
+			WebURL: "https://github.com/acme/widget/pull/8", ItemNumber: &numberTwo, ItemType: "pr",
+			Reason: "mention", Unread: true, SourceUpdatedAt: now, SyncedAt: now,
+		},
+	}))
+	items, err := d.ListNotifications(t.Context(), db.ListNotificationsOpts{State: "all", Sort: "updated"})
+	require.NoError(err)
+	require.Len(items, 2)
+	queuedAt := now.Add(time.Minute)
+	_, err = d.QueueNotificationIDsRead(t.Context(), []int64{items[0].ID, items[1].ID}, queuedAt)
+	require.NoError(err)
+	resetAt := time.Now().UTC().Add(time.Hour).Round(0)
+	var markedThreads []string
+	mc := &mockClient{markNotificationThreadReadFn: func(_ context.Context, threadID string) error {
+		markedThreads = append(markedThreads, threadID)
+		return &gh.RateLimitError{
+			Rate: gh.Rate{Reset: gh.Timestamp{Time: resetAt}},
+			Response: &http.Response{
+				StatusCode: http.StatusForbidden,
+				Request:    httptest.NewRequest(http.MethodPatch, "https://api.github.com/notifications/threads/"+threadID, nil),
+			},
+			Message: "API rate limit exceeded",
+		}
+	}}
+	syncer := NewSyncer(map[string]Client{"github.com": mc}, d, nil, nil, time.Minute, nil, nil)
+
+	err = syncer.ProcessQueuedNotificationReads(t.Context(), platform.KindGitHub, "github.com", 10)
+	require.Error(err)
+
+	items, err = d.ListNotifications(t.Context(), db.ListNotificationsOpts{State: "all", Sort: "updated"})
+	require.NoError(err)
+	require.Len(items, 2)
+	attemptsByThread := map[string]int{}
+	errorsByThread := map[string]string{}
+	nextAttemptByThread := map[string]*time.Time{}
+	queuedByThread := map[string]*time.Time{}
+	for _, item := range items {
+		attemptsByThread[item.PlatformNotificationID] = item.SourceAckAttempts
+		errorsByThread[item.PlatformNotificationID] = item.SourceAckError
+		nextAttemptByThread[item.PlatformNotificationID] = item.SourceAckNextAttemptAt
+		queuedByThread[item.PlatformNotificationID] = item.SourceAckQueuedAt
+	}
+	check.Equal([]string{"thread-1"}, markedThreads)
+	check.Equal(map[string]int{"thread-1": 0, "thread-2": 0}, attemptsByThread)
+	check.Equal(map[string]string{"thread-1": "rate_limited", "thread-2": "rate_limited"}, errorsByThread)
+	if check.NotNil(nextAttemptByThread["thread-1"]) {
+		check.Equal(resetAt, *nextAttemptByThread["thread-1"])
+	}
+	if check.NotNil(nextAttemptByThread["thread-2"]) {
+		check.Equal(resetAt, *nextAttemptByThread["thread-2"])
+	}
+	check.NotNil(queuedByThread["thread-1"])
+	check.NotNil(queuedByThread["thread-2"])
+}
+
+func TestProcessQueuedNotificationReadsDefersWhenRefetchRateLimited(t *testing.T) {
+	require := require.New(t)
+	check := Assert.New(t)
+	d := openTestDB(t)
+	repoID, err := d.UpsertRepo(t.Context(), db.GitHubRepoIdentity("github.com", "acme", "widget"))
+	require.NoError(err)
+	now := time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC)
+	numberOne := 7
+	numberTwo := 8
+	require.NoError(d.UpsertNotifications(t.Context(), []db.Notification{
+		{
+			Platform: "github", PlatformHost: "github.com", PlatformNotificationID: "thread-1", RepoID: &repoID,
+			RepoOwner: "acme", RepoName: "widget", SubjectType: "PullRequest", SubjectTitle: "Please review",
+			WebURL: "https://github.com/acme/widget/pull/7", ItemNumber: &numberOne, ItemType: "pr",
+			Reason: "mention", Unread: true, SourceUpdatedAt: now, SyncedAt: now,
+		},
+		{
+			Platform: "github", PlatformHost: "github.com", PlatformNotificationID: "thread-2", RepoID: &repoID,
+			RepoOwner: "acme", RepoName: "widget", SubjectType: "PullRequest", SubjectTitle: "Please review again",
+			WebURL: "https://github.com/acme/widget/pull/8", ItemNumber: &numberTwo, ItemType: "pr",
+			Reason: "mention", Unread: true, SourceUpdatedAt: now, SyncedAt: now,
+		},
+	}))
+	items, err := d.ListNotifications(t.Context(), db.ListNotificationsOpts{State: "all", Sort: "updated"})
+	require.NoError(err)
+	require.Len(items, 2)
+	queuedAt := now.Add(time.Minute)
+	_, err = d.QueueNotificationIDsRead(t.Context(), []int64{items[0].ID, items[1].ID}, queuedAt)
+	require.NoError(err)
+	resetAt := time.Now().UTC().Add(time.Hour).Round(0)
+	var refetchedThreads []string
+	var markedThreads []string
+	mc := &mockClient{
+		getNotificationThreadFn: func(_ context.Context, threadID string) (NotificationThread, error) {
+			refetchedThreads = append(refetchedThreads, threadID)
+			return NotificationThread{}, &gh.RateLimitError{
+				Rate: gh.Rate{Reset: gh.Timestamp{Time: resetAt}},
+				Response: &http.Response{
+					StatusCode: http.StatusForbidden,
+					Request:    httptest.NewRequest(http.MethodGet, "https://api.github.com/notifications/threads/"+threadID, nil),
+				},
+				Message: "API rate limit exceeded",
+			}
+		},
+		markNotificationThreadReadFn: func(_ context.Context, threadID string) error {
+			markedThreads = append(markedThreads, threadID)
+			return nil
+		},
+	}
+	syncer := NewSyncer(map[string]Client{"github.com": mc}, d, nil, nil, time.Minute, nil, nil)
+
+	err = syncer.ProcessQueuedNotificationReads(t.Context(), platform.KindGitHub, "github.com", 10)
+	require.Error(err)
+
+	// The refetch budget is shared with mark-read, so a rate-limited refetch
+	// must not reach the mark-read call and must defer every queued ack.
+	check.Equal([]string{"thread-1"}, refetchedThreads)
+	check.Empty(markedThreads)
+
+	items, err = d.ListNotifications(t.Context(), db.ListNotificationsOpts{State: "all", Sort: "updated"})
+	require.NoError(err)
+	require.Len(items, 2)
+	attemptsByThread := map[string]int{}
+	errorsByThread := map[string]string{}
+	nextAttemptByThread := map[string]*time.Time{}
+	queuedByThread := map[string]*time.Time{}
+	for _, item := range items {
+		attemptsByThread[item.PlatformNotificationID] = item.SourceAckAttempts
+		errorsByThread[item.PlatformNotificationID] = item.SourceAckError
+		nextAttemptByThread[item.PlatformNotificationID] = item.SourceAckNextAttemptAt
+		queuedByThread[item.PlatformNotificationID] = item.SourceAckQueuedAt
+	}
+	check.Equal(map[string]int{"thread-1": 0, "thread-2": 0}, attemptsByThread)
+	check.Equal(map[string]string{"thread-1": "rate_limited", "thread-2": "rate_limited"}, errorsByThread)
+	if check.NotNil(nextAttemptByThread["thread-1"]) {
+		check.Equal(resetAt, *nextAttemptByThread["thread-1"])
+	}
+	if check.NotNil(nextAttemptByThread["thread-2"]) {
+		check.Equal(resetAt, *nextAttemptByThread["thread-2"])
+	}
+	check.NotNil(queuedByThread["thread-1"])
+	check.NotNil(queuedByThread["thread-2"])
+}
+
+func TestRunNotificationSyncFiresCompletionHook(t *testing.T) {
+	require := require.New(t)
+	check := Assert.New(t)
+	d := openTestDB(t)
+	syncer := NewSyncer(map[string]Client{"github.com": &mockClient{}}, d, nil, nil, time.Minute, nil, nil)
+	var calls int
+	syncer.SetOnNotificationSyncComplete(func() { calls++ })
+
+	require.NoError(syncer.RunNotificationSync(t.Context()))
+	check.Equal(1, calls)
+
+	// A second run fires the hook again so an already-open feed keeps
+	// reloading after later syncs.
+	require.NoError(syncer.RunNotificationSync(t.Context()))
+	check.Equal(2, calls)
+}
+
+func TestProcessQueuedNotificationReadsPreservesUpstreamReadOnPreAckRefetch(t *testing.T) {
+	require := require.New(t)
+	check := Assert.New(t)
+	d := openTestDB(t)
+	repoID, err := d.UpsertRepo(t.Context(), db.GitHubRepoIdentity("github.com", "acme", "widget"))
+	require.NoError(err)
+	number := 7
+	now := time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC)
+	require.NoError(d.UpsertNotifications(t.Context(), []db.Notification{{
+		Platform: "github", PlatformHost: "github.com", PlatformNotificationID: "thread-1", RepoID: &repoID,
+		RepoOwner: "acme", RepoName: "widget", SubjectType: "PullRequest", SubjectTitle: "Please review",
+		WebURL: "https://github.com/acme/widget/pull/7", ItemNumber: &number, ItemType: "pr",
+		Reason: "mention", Unread: true, SourceUpdatedAt: now, SyncedAt: now,
+	}}))
+	items, err := d.ListNotifications(t.Context(), db.ListNotificationsOpts{State: "unread"})
+	require.NoError(err)
+	require.Len(items, 1)
+	queuedAt := now.Add(time.Minute)
+	_, err = d.QueueNotificationIDsRead(t.Context(), []int64{items[0].ID}, queuedAt)
+	require.NoError(err)
+
+	// The thread advanced upstream, but GitHub reports it already read (the
+	// user read the newer activity elsewhere). The pre-ack refetch must keep
+	// it read locally rather than resurrecting it as unread.
+	newer := now.Add(2 * time.Minute)
+	var markedThreads []string
+	mc := &mockClient{
+		getNotificationThreadFn: func(_ context.Context, threadID string) (NotificationThread, error) {
+			return NotificationThread{
+				ID: threadID, RepoOwner: "acme", RepoName: "widget", SubjectType: "PullRequest",
+				SubjectTitle: "Please review", WebURL: "https://github.com/acme/widget/pull/7",
+				ItemNumber: &number, ItemType: "pr", Reason: "mention",
+				Unread: false, UpdatedAt: newer,
+			}, nil
+		},
+		markNotificationThreadReadFn: func(_ context.Context, threadID string) error {
+			markedThreads = append(markedThreads, threadID)
+			return nil
+		},
+	}
+	syncer := NewSyncer(map[string]Client{"github.com": mc}, d, nil, nil, time.Minute, nil, nil)
+
+	require.NoError(syncer.ProcessQueuedNotificationReads(t.Context(), platform.KindGitHub, "github.com", 10))
+
+	// No mark-read: the advanced thread is already read upstream.
+	check.Empty(markedThreads)
+	all, err := d.ListNotifications(t.Context(), db.ListNotificationsOpts{State: "all", Sort: "updated"})
+	require.NoError(err)
+	require.Len(all, 1)
+	check.False(all[0].Unread)
+	check.Equal(newer, all[0].SourceUpdatedAt)
+	check.Nil(all[0].SourceAckQueuedAt)
+
+	unread, err := d.ListNotifications(t.Context(), db.ListNotificationsOpts{State: "unread"})
+	require.NoError(err)
+	check.Empty(unread)
+}
+
+func TestProcessQueuedNotificationReadsBacksOffRowAndContinuesOnRefetchError(t *testing.T) {
+	require := require.New(t)
+	check := Assert.New(t)
+	d := openTestDB(t)
+	repoID, err := d.UpsertRepo(t.Context(), db.GitHubRepoIdentity("github.com", "acme", "widget"))
+	require.NoError(err)
+	now := time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC)
+	numberOne := 7
+	numberTwo := 8
+	require.NoError(d.UpsertNotifications(t.Context(), []db.Notification{
+		{
+			Platform: "github", PlatformHost: "github.com", PlatformNotificationID: "thread-1", RepoID: &repoID,
+			RepoOwner: "acme", RepoName: "widget", SubjectType: "PullRequest", SubjectTitle: "Please review",
+			WebURL: "https://github.com/acme/widget/pull/7", ItemNumber: &numberOne, ItemType: "pr",
+			Reason: "mention", Unread: true, SourceUpdatedAt: now, SyncedAt: now,
+		},
+		{
+			Platform: "github", PlatformHost: "github.com", PlatformNotificationID: "thread-2", RepoID: &repoID,
+			RepoOwner: "acme", RepoName: "widget", SubjectType: "PullRequest", SubjectTitle: "Please review again",
+			WebURL: "https://github.com/acme/widget/pull/8", ItemNumber: &numberTwo, ItemType: "pr",
+			Reason: "mention", Unread: true, SourceUpdatedAt: now, SyncedAt: now,
+		},
+	}))
+	items, err := d.ListNotifications(t.Context(), db.ListNotificationsOpts{State: "all", Sort: "updated"})
+	require.NoError(err)
+	require.Len(items, 2)
+	queuedAt := now.Add(time.Minute)
+	_, err = d.QueueNotificationIDsRead(t.Context(), []int64{items[0].ID, items[1].ID}, queuedAt)
+	require.NoError(err)
+	var markedThreads []string
+	mc := &mockClient{
+		getNotificationThreadFn: func(_ context.Context, threadID string) (NotificationThread, error) {
+			if threadID == "thread-1" {
+				return NotificationThread{}, errors.New("boom")
+			}
+			// thread-2 has not advanced, so it proceeds to mark-read.
+			return NotificationThread{ID: threadID, UpdatedAt: now}, nil
+		},
+		markNotificationThreadReadFn: func(_ context.Context, threadID string) error {
+			markedThreads = append(markedThreads, threadID)
+			return nil
+		},
+	}
+	syncer := NewSyncer(map[string]Client{"github.com": mc}, d, nil, nil, time.Minute, nil, nil)
+
+	// A per-row refetch error must not abort the batch.
+	require.NoError(syncer.ProcessQueuedNotificationReads(t.Context(), platform.KindGitHub, "github.com", 10))
+	check.Equal([]string{"thread-2"}, markedThreads)
+
+	items, err = d.ListNotifications(t.Context(), db.ListNotificationsOpts{State: "all", Sort: "updated"})
+	require.NoError(err)
+	require.Len(items, 2)
+	byThread := map[string]db.Notification{}
+	for _, item := range items {
+		byThread[item.PlatformNotificationID] = item
+	}
+	// thread-1 backed off for a retry without being acked.
+	failed := byThread["thread-1"]
+	check.Equal(1, failed.SourceAckAttempts)
+	check.Contains(failed.SourceAckError, "boom")
+	check.NotNil(failed.SourceAckNextAttemptAt)
+	check.NotNil(failed.SourceAckQueuedAt)
+	check.Nil(failed.SourceAckSyncedAt)
+	// thread-2 was acked normally.
+	acked := byThread["thread-2"]
+	check.NotNil(acked.SourceAckSyncedAt)
+	check.Nil(acked.SourceAckQueuedAt)
+}
+
+func TestProcessQueuedNotificationReadsReopensRemoteActivityAfterPatchRace(t *testing.T) {
+	require := require.New(t)
+	check := Assert.New(t)
+	d := openTestDB(t)
+	repoID, err := d.UpsertRepo(t.Context(), db.GitHubRepoIdentity("github.com", "acme", "widget"))
+	require.NoError(err)
+	number := 7
+	now := time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC)
+	require.NoError(d.UpsertNotifications(t.Context(), []db.Notification{{
+		Platform: "github", PlatformHost: "github.com", PlatformNotificationID: "thread-1", RepoID: &repoID,
+		RepoOwner: "acme", RepoName: "widget", SubjectType: "PullRequest", SubjectTitle: "Please review",
+		WebURL: "https://github.com/acme/widget/pull/7", ItemNumber: &number, ItemType: "pr",
+		Reason: "mention", Unread: true, SourceUpdatedAt: now, SyncedAt: now,
+	}}))
+	items, err := d.ListNotifications(t.Context(), db.ListNotificationsOpts{State: "unread"})
+	require.NoError(err)
+	require.Len(items, 1)
+	queuedAt := now.Add(time.Minute)
+	_, err = d.QueueNotificationIDsRead(t.Context(), []int64{items[0].ID}, queuedAt)
+	require.NoError(err)
+
+	newer := now.Add(2 * time.Minute)
+	var getCalls int
+	var markedThreads []string
+	mc := &mockClient{
+		getNotificationThreadFn: func(_ context.Context, threadID string) (NotificationThread, error) {
+			getCalls++
+			thread := NotificationThread{
+				ID:           threadID,
+				RepoOwner:    "acme",
+				RepoName:     "widget",
+				SubjectType:  "PullRequest",
+				SubjectTitle: "Please review",
+				WebURL:       "https://github.com/acme/widget/pull/7",
+				ItemNumber:   &number,
+				ItemType:     "pr",
+				Reason:       "mention",
+				Unread:       false,
+				UpdatedAt:    now,
+				LastReadAt:   &queuedAt,
+			}
+			if getCalls > 1 {
+				thread.Unread = true
+				thread.UpdatedAt = newer
+				thread.LastReadAt = nil
+			}
+			return thread, nil
+		},
+		markNotificationThreadReadFn: func(_ context.Context, threadID string) error {
+			markedThreads = append(markedThreads, threadID)
+			return nil
+		},
+	}
+	syncer := NewSyncer(map[string]Client{"github.com": mc}, d, nil, nil, time.Minute, nil, nil)
+
+	require.NoError(syncer.ProcessQueuedNotificationReads(t.Context(), platform.KindGitHub, "github.com", 10))
+
+	unread, err := d.ListNotifications(t.Context(), db.ListNotificationsOpts{State: "unread"})
+	require.NoError(err)
+	require.Len(unread, 1)
+	check.Equal([]string{"thread-1"}, markedThreads)
+	check.Equal(2, getCalls)
+	check.Equal(newer, unread[0].SourceUpdatedAt)
+	check.Nil(unread[0].SourceAckQueuedAt)
+	check.Nil(unread[0].SourceAckSyncedAt)
+	check.Nil(unread[0].SourceAckGenerationAt)
+}
+
+func TestProcessQueuedNotificationReadsReopensAfterPostAckRefetchError(t *testing.T) {
+	require := require.New(t)
+	check := Assert.New(t)
+	d := openTestDB(t)
+	repoID, err := d.UpsertRepo(t.Context(), db.GitHubRepoIdentity("github.com", "acme", "widget"))
+	require.NoError(err)
+	number := 7
+	now := time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC)
+	require.NoError(d.UpsertNotifications(t.Context(), []db.Notification{{
+		Platform: "github", PlatformHost: "github.com", PlatformNotificationID: "thread-1", RepoID: &repoID,
+		RepoOwner: "acme", RepoName: "widget", SubjectType: "PullRequest", SubjectTitle: "Please review",
+		WebURL: "https://github.com/acme/widget/pull/7", ItemNumber: &number, ItemType: "pr",
+		Reason: "mention", Unread: true, SourceUpdatedAt: now, SyncedAt: now,
+	}}))
+	items, err := d.ListNotifications(t.Context(), db.ListNotificationsOpts{State: "unread"})
+	require.NoError(err)
+	require.Len(items, 1)
+	queuedAt := now.Add(time.Minute)
+	_, err = d.QueueNotificationIDsRead(t.Context(), []int64{items[0].ID}, queuedAt)
+	require.NoError(err)
+
+	var getCalls int
+	var markedThreads []string
+	mc := &mockClient{
+		getNotificationThreadFn: func(_ context.Context, threadID string) (NotificationThread, error) {
+			getCalls++
+			if getCalls == 1 {
+				return NotificationThread{
+					ID:           threadID,
+					RepoOwner:    "acme",
+					RepoName:     "widget",
+					SubjectType:  "PullRequest",
+					SubjectTitle: "Please review",
+					WebURL:       "https://github.com/acme/widget/pull/7",
+					ItemNumber:   &number,
+					ItemType:     "pr",
+					Reason:       "mention",
+					Unread:       false,
+					UpdatedAt:    now,
+					LastReadAt:   &queuedAt,
+				}, nil
+			}
+			return NotificationThread{}, errors.New("post-ack refetch failed")
+		},
+		markNotificationThreadReadFn: func(_ context.Context, threadID string) error {
+			markedThreads = append(markedThreads, threadID)
+			return nil
+		},
+	}
+	syncer := NewSyncer(map[string]Client{"github.com": mc}, d, nil, nil, time.Minute, nil, nil)
+
+	require.NoError(syncer.ProcessQueuedNotificationReads(t.Context(), platform.KindGitHub, "github.com", 10))
+
+	unread, err := d.ListNotifications(t.Context(), db.ListNotificationsOpts{State: "unread"})
+	require.NoError(err)
+	require.Len(unread, 1)
+	check.Equal([]string{"thread-1"}, markedThreads)
+	check.Equal(2, getCalls)
+	check.Equal("thread-1", unread[0].PlatformNotificationID)
+	check.True(unread[0].Unread)
+	check.Nil(unread[0].SourceAckQueuedAt)
+	check.Nil(unread[0].SourceAckSyncedAt)
+	check.Nil(unread[0].SourceAckGenerationAt)
+	check.Empty(unread[0].SourceAckError)
+}
+
+func TestNotificationTrackedReposKeyIncludesPlatform(t *testing.T) {
+	require := require.New(t)
+	tracked := map[string]RepoRef{}
+	tracked[notificationRepoKey("github", "github.com", "acme", "widget")] = RepoRef{
+		Platform:     platform.KindGitHub,
+		PlatformHost: "github.com",
+		Owner:        "acme",
+		Name:         "widget",
+	}
+	tracked[notificationRepoKey("gitlab", "code.example.com", "acme", "widget")] = RepoRef{
+		Platform:     platform.KindGitLab,
+		PlatformHost: "code.example.com",
+		Owner:        "acme",
+		Name:         "widget",
+	}
+
+	require.Equal("github/github.com/acme/widget", notificationTrackedReposKey("github", "github.com", tracked))
+	require.Equal("gitlab/code.example.com/acme/widget", notificationTrackedReposKey("gitlab", "code.example.com", tracked))
+}
+
+func TestSyncNotificationsSkipsHostsWithoutTrackedRepos(t *testing.T) {
+	require := require.New(t)
+	d := openTestDB(t)
+	var calls atomic.Int32
+	syncer := NewSyncer(
+		map[string]Client{
+			"github.com": &mockClient{
+				listNotificationsFn: func(context.Context, NotificationListOptions) ([]NotificationThread, bool, error) {
+					calls.Add(1)
+					return nil, false, nil
+				},
+			},
+		},
+		d,
+		nil,
+		nil,
+		time.Minute,
+		nil,
+		nil,
+	)
+
+	require.NoError(syncer.SyncNotifications(t.Context()))
+	require.Equal(int32(0), calls.Load())
+}
+
+func TestSyncNotificationsUsesPersistedSinceWatermark(t *testing.T) {
+	require := require.New(t)
+	assert := Assert.New(t)
+	d := openTestDB(t)
+	_, err := d.UpsertRepo(t.Context(), db.GitHubRepoIdentity("github.com", "acme", "widget"))
+	require.NoError(err)
+	watermark := time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC)
+	lastFullSyncAt := time.Now().UTC()
+	watermarkKey := notificationRepoKey("github", "github.com", "acme", "widget")
+	require.NoError(d.UpdateNotificationSyncWatermark(t.Context(), "github", "github.com", watermark, &lastFullSyncAt, "", watermarkKey))
+	var seen []NotificationListOptions
+	syncer := NewSyncer(
+		map[string]Client{
+			"github.com": &mockClient{
+				listNotificationsFn: func(_ context.Context, opts NotificationListOptions) ([]NotificationThread, bool, error) {
+					seen = append(seen, opts)
+					return nil, false, nil
+				},
+			},
+		},
+		d,
+		nil,
+		[]RepoRef{{Owner: "acme", Name: "widget", PlatformHost: "github.com"}},
+		time.Minute,
+		nil,
+		nil,
+	)
+
+	require.NoError(syncer.SyncNotifications(t.Context()))
+	require.Len(seen, 2)
+	assert.True(seen[0].All)
+	assert.True(seen[0].Participating)
+	assert.Equal(1, seen[0].Page)
+	assert.Equal("acme", seen[0].RepoOwner)
+	assert.Equal("widget", seen[0].RepoName)
+	if assert.NotNil(seen[0].Since) {
+		assert.True(watermark.Add(-notificationSyncSinceOverlap).Equal(*seen[0].Since))
+	}
+	assert.True(seen[1].All)
+	assert.False(seen[1].Participating)
+	assert.Equal(1, seen[1].Page)
+	assert.Equal("acme", seen[1].RepoOwner)
+	assert.Equal("widget", seen[1].RepoName)
+	if assert.NotNil(seen[1].Since) {
+		assert.True(watermark.Add(-notificationSyncSinceOverlap).Equal(*seen[1].Since))
+	}
+}
+
+func TestSyncNotificationsDoesPeriodicFullSyncForReadState(t *testing.T) {
+	require := require.New(t)
+	assert := Assert.New(t)
+	d := openTestDB(t)
+	_, err := d.UpsertRepo(t.Context(), db.GitHubRepoIdentity("github.com", "acme", "widget"))
+	require.NoError(err)
+	watermark := time.Now().UTC().Add(-2 * notificationFullSyncInterval)
+	lastFullSyncAt := watermark
+	watermarkKey := notificationRepoKey("github", "github.com", "acme", "widget")
+	require.NoError(d.UpdateNotificationSyncWatermark(t.Context(), "github", "github.com", watermark, &lastFullSyncAt, "", watermarkKey))
+	var seen []NotificationListOptions
+	syncer := NewSyncer(
+		map[string]Client{
+			"github.com": &mockClient{
+				listNotificationsFn: func(_ context.Context, opts NotificationListOptions) ([]NotificationThread, bool, error) {
+					seen = append(seen, opts)
+					return nil, false, nil
+				},
+			},
+		},
+		d,
+		nil,
+		[]RepoRef{{Owner: "acme", Name: "widget", PlatformHost: "github.com"}},
+		time.Minute,
+		nil,
+		nil,
+	)
+
+	require.NoError(syncer.SyncNotifications(t.Context()))
+	require.Len(seen, 2)
+	assert.True(seen[0].All)
+	assert.True(seen[0].Participating)
+	assert.Equal(1, seen[0].Page)
+	assert.Equal("acme", seen[0].RepoOwner)
+	assert.Equal("widget", seen[0].RepoName)
+	assert.Nil(seen[0].Since)
+	assert.True(seen[1].All)
+	assert.False(seen[1].Participating)
+	assert.Equal(1, seen[1].Page)
+	assert.Equal("acme", seen[1].RepoOwner)
+	assert.Equal("widget", seen[1].RepoName)
+	assert.Nil(seen[1].Since)
+}
+
+func TestSyncNotificationsClearsSinceWhenTrackedReposChange(t *testing.T) {
+	require := require.New(t)
+	assert := Assert.New(t)
+	d := openTestDB(t)
+	_, err := d.UpsertRepo(t.Context(), db.GitHubRepoIdentity("github.com", "acme", "widget"))
+	require.NoError(err)
+	_, err = d.UpsertRepo(t.Context(), db.GitHubRepoIdentity("github.com", "acme", "new-repo"))
+	require.NoError(err)
+	watermark := time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC)
+	lastFullSyncAt := time.Now().UTC()
+	oldKey := notificationRepoKey("github", "github.com", "acme", "widget")
+	require.NoError(d.UpdateNotificationSyncWatermark(t.Context(), "github", "github.com", watermark, &lastFullSyncAt, "", oldKey))
+	var seen []NotificationListOptions
+	syncer := NewSyncer(
+		map[string]Client{
+			"github.com": &mockClient{
+				listNotificationsFn: func(_ context.Context, opts NotificationListOptions) ([]NotificationThread, bool, error) {
+					seen = append(seen, opts)
+					return nil, false, nil
+				},
+			},
+		},
+		d,
+		nil,
+		[]RepoRef{
+			{Owner: "acme", Name: "widget", PlatformHost: "github.com"},
+			{Owner: "acme", Name: "new-repo", PlatformHost: "github.com"},
+		},
+		time.Minute,
+		nil,
+		nil,
+	)
+
+	require.NoError(syncer.SyncNotifications(t.Context()))
+	require.Len(seen, 4)
+	assert.True(seen[0].All)
+	assert.True(seen[0].Participating)
+	assert.Equal(1, seen[0].Page)
+	assert.Equal("acme", seen[0].RepoOwner)
+	assert.Equal("new-repo", seen[0].RepoName)
+	assert.Nil(seen[0].Since)
+	assert.True(seen[1].All)
+	assert.True(seen[1].Participating)
+	assert.Equal(1, seen[1].Page)
+	assert.Equal("acme", seen[1].RepoOwner)
+	assert.Equal("widget", seen[1].RepoName)
+	assert.Nil(seen[1].Since)
+	assert.True(seen[2].All)
+	assert.False(seen[2].Participating)
+	assert.Equal(1, seen[2].Page)
+	assert.Equal("acme", seen[2].RepoOwner)
+	assert.Equal("new-repo", seen[2].RepoName)
+	assert.Nil(seen[2].Since)
+	assert.True(seen[3].All)
+	assert.False(seen[3].Participating)
+	assert.Equal(1, seen[3].Page)
+	assert.Equal("acme", seen[3].RepoOwner)
+	assert.Equal("widget", seen[3].RepoName)
+	assert.Nil(seen[3].Since)
+}
+
+func TestRepoSyncMarksClosedLinkedNotificationsDone(t *testing.T) {
+	require := require.New(t)
+	assert := Assert.New(t)
+	d := openTestDB(t)
+	now := time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC)
+	repoID, err := d.UpsertRepo(t.Context(), db.GitHubRepoIdentity("github.com", "acme", "widget"))
+	require.NoError(err)
+	number := 7
+	_, err = d.UpsertMergeRequest(t.Context(), &db.MergeRequest{
+		RepoID:           repoID,
+		PlatformID:       700,
+		Number:           number,
+		URL:              "https://github.com/acme/widget/pull/7",
+		Title:            "Close me",
+		State:            "open",
+		CreatedAt:        now,
+		UpdatedAt:        now,
+		LastActivityAt:   now,
+		PlatformHeadSHA:  "head-open",
+		PlatformBaseSHA:  "base-open",
+		HeadRepoCloneURL: "https://github.com/acme/widget.git",
+	})
+	require.NoError(err)
+	require.NoError(d.UpsertNotifications(t.Context(), []db.Notification{{
+		Platform:               "github",
+		PlatformHost:           "github.com",
+		PlatformNotificationID: "thread-closed-pr",
+		RepoID:                 &repoID,
+		RepoOwner:              "acme",
+		RepoName:               "widget",
+		SubjectType:            "PullRequest",
+		SubjectTitle:           "Close me",
+		WebURL:                 "https://github.com/acme/widget/pull/7",
+		ItemNumber:             &number,
+		ItemType:               "pr",
+		Reason:                 "mention",
+		Unread:                 true,
+		SourceUpdatedAt:        now,
+		SyncedAt:               now,
+	}}))
+	closed := now.Add(time.Hour)
+	state := "closed"
+	title := "Close me"
+	url := "https://github.com/acme/widget/pull/7"
+	headSHA := "head-closed"
+	baseSHA := "base-closed"
+	syncer := NewSyncer(
+		map[string]Client{
+			"github.com": &mockClient{
+				openPRs:    []*gh.PullRequest{},
+				openIssues: []*gh.Issue{},
+				getPullRequestFn: func(context.Context, string, string, int) (*gh.PullRequest, error) {
+					return &gh.PullRequest{
+						Number:    &number,
+						Title:     &title,
+						HTMLURL:   &url,
+						State:     &state,
+						UpdatedAt: makeTimestamp(closed),
+						CreatedAt: makeTimestamp(now),
+						ClosedAt:  makeTimestamp(closed),
+						Head:      &gh.PullRequestBranch{SHA: &headSHA},
+						Base:      &gh.PullRequestBranch{SHA: &baseSHA},
+					}, nil
+				},
+			},
+		},
+		d,
+		nil,
+		[]RepoRef{{Owner: "acme", Name: "widget", PlatformHost: "github.com"}},
+		time.Minute,
+		nil,
+		nil,
+	)
+
+	syncer.RunOnce(t.Context())
+	active, err := d.ListNotifications(t.Context(), db.ListNotificationsOpts{State: "active"})
+	require.NoError(err)
+	assert.Empty(active)
+	done, err := d.ListNotifications(t.Context(), db.ListNotificationsOpts{State: "done"})
+	require.NoError(err)
+	require.Len(done, 1)
+	assert.Equal("closed", done[0].DoneReason)
+	assert.NotNil(done[0].DoneAt)
+}
+
+func TestSyncIssueOnProviderMarksClosedLinkedNotificationsDone(t *testing.T) {
+	require := require.New(t)
+	assert := Assert.New(t)
+	ctx := t.Context()
+	d := openTestDB(t)
+	now := time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC)
+	repo := RepoRef{
+		Platform:     platform.KindGitLab,
+		PlatformHost: "gitlab.com",
+		Owner:        "acme",
+		Name:         "widget",
+		RepoPath:     "acme/widget",
+	}
+	repoID, err := d.UpsertRepo(ctx, platform.DBRepoIdentity(platformRepoRef(repo)))
+	require.NoError(err)
+	number := 11
+	_, err = d.UpsertIssue(ctx, &db.Issue{
+		RepoID:         repoID,
+		PlatformID:     2001,
+		Number:         number,
+		URL:            "https://gitlab.com/acme/widget/-/issues/11",
+		Title:          "stale issue",
+		Author:         "grace",
+		State:          "open",
+		CreatedAt:      now.Add(-time.Hour),
+		UpdatedAt:      now.Add(-time.Hour),
+		LastActivityAt: now.Add(-time.Hour),
+	})
+	require.NoError(err)
+	require.NoError(d.UpsertNotifications(ctx, []db.Notification{{
+		Platform:               "gitlab",
+		PlatformHost:           "gitlab.com",
+		PlatformNotificationID: "thread-closed-issue",
+		RepoID:                 &repoID,
+		RepoOwner:              "acme",
+		RepoName:               "widget",
+		SubjectType:            "Issue",
+		SubjectTitle:           "Close me",
+		WebURL:                 "https://gitlab.com/acme/widget/-/issues/11",
+		ItemNumber:             &number,
+		ItemType:               "issue",
+		Reason:                 "mention",
+		Unread:                 true,
+		SourceUpdatedAt:        now,
+		SyncedAt:               now,
+	}}))
+
+	provider := &syncTestReadProvider{
+		syncTestProvider: syncTestProvider{
+			kind: platform.KindGitLab,
+			host: "gitlab.com",
+		},
+		issues: []platform.Issue{{
+			Repo:           platformRepoRef(repo),
+			PlatformID:     2001,
+			Number:         number,
+			URL:            "https://gitlab.com/acme/widget/-/issues/11",
+			Title:          "closed issue",
+			Author:         "grace",
+			State:          "closed",
+			CreatedAt:      now,
+			UpdatedAt:      now.Add(time.Minute),
+			LastActivityAt: now.Add(time.Minute),
+		}},
+	}
+	registry, err := platform.NewRegistry(provider)
+	require.NoError(err)
+	syncer := NewSyncerWithRegistry(registry, d, nil, []RepoRef{repo}, time.Minute, nil, nil)
+
+	active, err := d.ListNotifications(ctx, db.ListNotificationsOpts{State: "active"})
+	require.NoError(err)
+	require.Len(active, 1)
+
+	require.NoError(syncer.SyncIssueOnProvider(ctx, platform.KindGitLab, "gitlab.com", "acme", "widget", number))
+
+	active, err = d.ListNotifications(ctx, db.ListNotificationsOpts{State: "active"})
+	require.NoError(err)
+	assert.Empty(active)
+	done, err := d.ListNotifications(ctx, db.ListNotificationsOpts{State: "done"})
+	require.NoError(err)
+	require.Len(done, 1)
+	assert.Equal("closed", done[0].DoneReason)
+	assert.NotNil(done[0].DoneAt)
 }
 
 func TestDiffSyncErrorUserMessageSanitized(t *testing.T) {
@@ -1769,16 +3454,122 @@ func TestSyncStoresForcePushEvent(t *testing.T) {
 	require.NotEmpty(events)
 
 	var forcePush *db.MREvent
+	var commit *db.MREvent
 	for i := range events {
 		if events[i].EventType == "force_push" {
 			forcePush = &events[i]
-			break
+		}
+		if events[i].EventType == "commit" {
+			commit = &events[i]
 		}
 	}
 	require.NotNil(forcePush)
+	require.NotNil(commit)
 	assert.Equal("alice", forcePush.Author)
 	assert.Equal("aaaaaaa -> bbbbbbb", forcePush.Summary)
 	assert.Contains(forcePush.MetadataJSON, `"ref":"feature"`)
+	assert.Contains(commit.MetadataJSON, `"commit_order":1`)
+}
+
+func TestSyncAssignsStableCommitOrderKeysAcrossForcePushReplacement(t *testing.T) {
+	assert := Assert.New(t)
+	require := require.New(t)
+	ctx := t.Context()
+	d := openTestDB(t)
+	now := time.Date(2024, 6, 1, 12, 0, 0, 0, time.UTC)
+	oldBaseSHA := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	oldHeadSHA := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	newBaseSHA := "cccccccccccccccccccccccccccccccccccccccc"
+	newHeadSHA := "dddddddddddddddddddddddddddddddddddddddd"
+
+	commit := func(sha, msg string, committedAt time.Time) *gh.RepositoryCommit {
+		return &gh.RepositoryCommit{
+			SHA: &sha,
+			Commit: &gh.Commit{
+				Message: &msg,
+				Author:  &gh.CommitAuthor{Name: new("dev"), Date: makeTimestamp(committedAt)},
+			},
+		}
+	}
+
+	mc := &mockClient{
+		commits: []*gh.RepositoryCommit{
+			commit(newBaseSHA, "new base", now.Add(-30*time.Minute)),
+			commit(newHeadSHA, "new head", now.Add(-20*time.Minute)),
+		},
+		timelineEvents: []PullRequestTimelineEvent{{
+			EventType: "force_push",
+			Actor:     "alice",
+			BeforeSHA: oldHeadSHA,
+			AfterSHA:  newHeadSHA,
+			Ref:       "feature",
+			CreatedAt: now.Add(-10 * time.Minute),
+		}},
+		reviews:  []*gh.PullRequestReview{},
+		comments: []*gh.IssueComment{},
+	}
+	repo := RepoRef{Owner: "owner", Name: "repo", PlatformHost: "github.com"}
+	repoID, err := d.UpsertRepo(ctx, db.GitHubRepoIdentity("github.com", "owner", "repo"))
+	require.NoError(err)
+	mrID, err := d.UpsertMergeRequest(ctx, &db.MergeRequest{
+		RepoID:         repoID,
+		PlatformID:     1,
+		Number:         1,
+		URL:            "https://github.com/owner/repo/pull/1",
+		Title:          "force push",
+		Author:         "dev",
+		State:          "open",
+		HeadBranch:     "feature",
+		BaseBranch:     "main",
+		CreatedAt:      now.Add(-3 * time.Hour),
+		UpdatedAt:      now,
+		LastActivityAt: now,
+	})
+	require.NoError(err)
+	require.NoError(d.UpsertMREvents(ctx, []db.MREvent{
+		{
+			MergeRequestID: mrID,
+			EventType:      "commit",
+			Summary:        oldBaseSHA,
+			Body:           "old base",
+			MetadataJSON:   `{"commit_order":1,"commit_order_key":1}`,
+			CreatedAt:      now.Add(-2 * time.Hour),
+			DedupeKey:      "commit-" + oldBaseSHA[:12],
+		},
+		{
+			MergeRequestID: mrID,
+			EventType:      "commit",
+			Summary:        oldHeadSHA,
+			Body:           "old head",
+			MetadataJSON:   `{"commit_order":2,"commit_order_key":2}`,
+			CreatedAt:      now.Add(-1 * time.Hour),
+			DedupeKey:      "commit-" + oldHeadSHA[:12],
+		},
+	}))
+
+	syncer := NewSyncer(map[string]Client{"github.com": mc}, d, nil, []RepoRef{repo}, time.Minute, nil, testBudget(500))
+	require.NoError(syncer.refreshTimeline(ctx, repo, repoID, mrID, buildOpenPR(1, now)))
+
+	events, err := d.ListMREvents(ctx, mrID)
+	require.NoError(err)
+
+	findCommit := func(sha string) *db.MREvent {
+		for i := range events {
+			if events[i].EventType == "commit" && events[i].Summary == sha {
+				return &events[i]
+			}
+		}
+		return nil
+	}
+
+	oldHead := findCommit(oldHeadSHA)
+	newHead := findCommit(newHeadSHA)
+	require.NotNil(oldHead)
+	require.NotNil(newHead)
+	assert.Contains(oldHead.MetadataJSON, `"commit_order":2`)
+	assert.Contains(oldHead.MetadataJSON, `"commit_order_key":2`)
+	assert.Contains(newHead.MetadataJSON, `"commit_order":2`)
+	assert.Contains(newHead.MetadataJSON, `"commit_order_key":4`)
 }
 
 func TestSyncStoresPullRequestTimelineEvents(t *testing.T) {
@@ -2819,21 +4610,7 @@ func TestSyncStatusUpdated(t *testing.T) {
 	assert.Empty(status.LastError)
 }
 
-func setTestLocalEDT(t *testing.T) {
-	t.Helper()
-	//nolint:forbidigo // Tests intentionally override the process local zone to verify UTC normalization.
-	oldLocal := time.Local
-	//nolint:forbidigo // Tests intentionally override the process local zone to verify UTC normalization.
-	time.Local = time.FixedZone("EDT", -4*60*60)
-	t.Cleanup(func() {
-		//nolint:forbidigo // Tests intentionally restore the overridden process local zone.
-		time.Local = oldLocal
-	})
-}
-
 func TestSyncStatusUpdatedUsesUTC(t *testing.T) {
-	setTestLocalEDT(t)
-
 	d := openTestDB(t)
 	mc := &mockClient{
 		openPRs:  []*gh.PullRequest{},
@@ -3024,6 +4801,20 @@ type dedupGetUserClient struct {
 	mockClient
 	getUserCount atomic.Int32
 	block        chan struct{}
+	author       string
+	now          time.Time
+}
+
+func (c *dedupGetUserClient) ListOpenPullRequests(
+	_ context.Context, _, repo string,
+) ([]*gh.PullRequest, error) {
+	number := 1
+	if repo == "r2" {
+		number = 2
+	}
+	pr := buildOpenPR(number, c.now)
+	pr.User = &gh.User{Login: &c.author}
+	return []*gh.PullRequest{pr}, nil
 }
 
 func (c *dedupGetUserClient) GetUser(
@@ -3043,17 +4834,10 @@ func TestResolveDisplayNameDedupsConcurrentLookups(t *testing.T) {
 	author := "alice"
 	now := time.Date(2026, 4, 8, 12, 0, 0, 0, time.UTC)
 
-	// Build two PRs in two repos, both authored by "alice".
-	buildAuthoredPR := func(num int) *gh.PullRequest {
-		pr := buildOpenPR(num, now)
-		pr.User = &gh.User{Login: &author}
-		return pr
-	}
-
-	mc := &dedupGetUserClient{block: make(chan struct{})}
-	mc.openPRs = []*gh.PullRequest{
-		buildAuthoredPR(1),
-		buildAuthoredPR(2),
+	mc := &dedupGetUserClient{
+		block:  make(chan struct{}),
+		author: author,
+		now:    now,
 	}
 
 	syncer := NewSyncer(
@@ -7252,7 +9036,6 @@ func TestRunBackfillDiscoveryUsesProviderQualifiedRepo(t *testing.T) {
 
 func TestBackfillRepoStoresCompletionTimestampsInUTC(t *testing.T) {
 	require := require.New(t)
-	setTestLocalEDT(t)
 
 	ctx := t.Context()
 	d := openTestDB(t)
@@ -8566,6 +10349,8 @@ func TestSyncOpenMRFromBulkStoresTimelineEvents(t *testing.T) {
 
 	now := time.Date(2024, 6, 3, 14, 0, 0, 0, time.UTC)
 	timelineAt := now.Add(3 * time.Minute)
+	commitSHA := "abc123def456"
+	commitMsg := "fix: preserve timeline commit order"
 	syncer := NewSyncer(
 		map[string]Client{"github.com": &mockClient{}},
 		d, nil, []RepoRef{{Owner: "owner", Name: "repo", PlatformHost: "github.com"}},
@@ -8575,6 +10360,16 @@ func TestSyncOpenMRFromBulkStoresTimelineEvents(t *testing.T) {
 
 	err = syncer.syncOpenMRFromBulk(ctx, repo, repoID, &BulkPR{
 		PR: buildOpenPR(1, now),
+		Commits: []*gh.RepositoryCommit{{
+			SHA: &commitSHA,
+			Commit: &gh.Commit{
+				Message: &commitMsg,
+				Author: &gh.CommitAuthor{
+					Name: new("dev"),
+					Date: makeTimestamp(now.Add(-time.Minute)),
+				},
+			},
+		}},
 		TimelineEvents: []PullRequestTimelineEvent{{
 			NodeID:          "BRC_1",
 			EventType:       "base_ref_changed",
@@ -8605,11 +10400,20 @@ func TestSyncOpenMRFromBulkStoresTimelineEvents(t *testing.T) {
 
 	events, err := d.ListMREvents(ctx, mr.ID)
 	require.NoError(err)
-	require.Len(events, 2)
+	require.Len(events, 3)
 	assert.Equal("comment_deleted", events[0].EventType)
 	assert.Equal("deleted a comment from reviewer", events[0].Summary)
 	assert.Equal("base_ref_changed", events[1].EventType)
 	assert.Equal("main -> release", events[1].Summary)
+	var commit *db.MREvent
+	for i := range events {
+		if events[i].EventType == "commit" {
+			commit = &events[i]
+			break
+		}
+	}
+	require.NotNil(commit)
+	assert.Contains(commit.MetadataJSON, `"commit_order":1`)
 }
 
 // buildOpenPRWithSHA mirrors buildOpenPR but lets the caller set the
@@ -8836,6 +10640,107 @@ func TestSyncOpenIssueFromBulkRemovesDeletedCommentsWhenCommentsAreComplete(t *t
 	events, err = d.ListIssueEvents(ctx, issue.ID)
 	require.NoError(err)
 	assert.Empty(events)
+}
+
+func TestSyncOpenIssueFromBulkStoresTimelineEvents(t *testing.T) {
+	assert := Assert.New(t)
+	require := require.New(t)
+	ctx := t.Context()
+	d := openTestDB(t)
+
+	repoID, err := d.UpsertRepo(ctx, db.GitHubRepoIdentity("github.com", "owner", "repo"))
+	require.NoError(err)
+
+	now := time.Date(2024, 6, 3, 12, 0, 0, 0, time.UTC)
+	issueID := int64(9301)
+	issueNumber := 9
+	issueTitle := "bulk issue timeline"
+	issueState := "open"
+	issueURL := "https://github.com/owner/repo/issues/9"
+	issueAuthor := "alice"
+	updatedAt := gh.Timestamp{Time: now}
+
+	syncer := NewSyncer(
+		map[string]Client{"github.com": &mockClient{}},
+		d, nil, []RepoRef{{Owner: "owner", Name: "repo", PlatformHost: "github.com"}},
+		time.Minute, nil, nil,
+	)
+	repo := RepoRef{Owner: "owner", Name: "repo", PlatformHost: "github.com"}
+
+	err = syncer.syncOpenIssueFromBulk(ctx, repo, repoID, &BulkIssue{
+		Issue: &gh.Issue{
+			ID:        &issueID,
+			Number:    &issueNumber,
+			Title:     &issueTitle,
+			State:     &issueState,
+			HTMLURL:   &issueURL,
+			User:      &gh.User{Login: &issueAuthor},
+			CreatedAt: &updatedAt,
+			UpdatedAt: &updatedAt,
+		},
+		TimelineEvents: []PullRequestTimelineEvent{
+			{
+				NodeID:       "CRE_issue_1",
+				EventType:    "cross_referenced",
+				Actor:        "reviewer",
+				CreatedAt:    now.Add(time.Minute),
+				SourceType:   "PullRequest",
+				SourceOwner:  "owner",
+				SourceRepo:   "repo",
+				SourceNumber: 22,
+				SourceTitle:  "Fix issue",
+				SourceURL:    "https://github.com/owner/repo/pull/22",
+			},
+			{
+				NodeID:    "CE_issue_1",
+				EventType: "closed",
+				Actor:     "closer",
+				CreatedAt: now.Add(2 * time.Minute),
+			},
+			{
+				NodeID:    "RE_issue_1",
+				EventType: "reopened",
+				Actor:     "opener",
+				CreatedAt: now.Add(3 * time.Minute),
+			},
+		},
+		CommentsComplete: true,
+		TimelineComplete: true,
+	})
+	require.NoError(err)
+
+	issue, err := d.GetIssue(ctx, "owner", "repo", issueNumber)
+	require.NoError(err)
+	require.NotNil(issue)
+	assert.NotNil(issue.DetailFetchedAt)
+
+	events, err := d.ListIssueEvents(ctx, issue.ID)
+	require.NoError(err)
+	require.Len(events, 3)
+
+	byType := make(map[string]db.IssueEvent, len(events))
+	for _, event := range events {
+		byType[event.EventType] = event
+	}
+
+	crossReferenced, ok := byType["cross_referenced"]
+	require.True(ok)
+	assert.Equal("reviewer", crossReferenced.Author)
+	assert.Equal("Referenced from owner/repo#22", crossReferenced.Summary)
+	assert.Contains(crossReferenced.MetadataJSON, `"source_title":"Fix issue"`)
+	assert.Equal("timeline-CRE_issue_1", crossReferenced.DedupeKey)
+
+	closed, ok := byType["closed"]
+	require.True(ok)
+	assert.Equal("closer", closed.Author)
+	assert.Equal("closed this", closed.Summary)
+	assert.Equal("timeline-CE_issue_1", closed.DedupeKey)
+
+	reopened, ok := byType["reopened"]
+	require.True(ok)
+	assert.Equal("opener", reopened.Author)
+	assert.Equal("reopened this", reopened.Summary)
+	assert.Equal("timeline-RE_issue_1", reopened.DedupeKey)
 }
 
 func TestSyncIssuesFromListLogsProgressForLargeIssueSets(t *testing.T) {

@@ -2,7 +2,8 @@ import { createRequire } from "node:module";
 import path from "node:path";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
 import { svelteTesting } from "@testing-library/svelte/vite";
-import { searchForWorkspaceRoot, type Plugin, type ProxyOptions, type UserConfig } from "vite";
+import { defaultClientConditions, searchForWorkspaceRoot, type Plugin, type ProxyOptions, type UserConfig } from "vite";
+import { defineProject, type TestProjectInlineConfiguration } from "vite-plus/test/config";
 import type { InlineConfig } from "vite-plus/test/node";
 import { resolveDevApiUrl } from "./src/lib/dev/apiProxyTarget.ts";
 import { healthcheckPlugin } from "./src/lib/dev/healthcheckPlugin.ts";
@@ -24,6 +25,7 @@ const uiGeneratedSchema = path.resolve(process.cwd(), "../packages/ui/src/api/ge
 const uiApiTypes = path.resolve(process.cwd(), "../packages/ui/src/api/types.ts");
 const uiApiCsrf = path.resolve(process.cwd(), "../packages/ui/src/api/csrf.ts");
 const uiRoutes = path.resolve(process.cwd(), "../packages/ui/src/routes.ts");
+const uiRepoLabel = path.resolve(process.cwd(), "../packages/ui/src/utils/repo-label.ts");
 const uiStoreDetail = path.resolve(process.cwd(), "../packages/ui/src/stores/detail.svelte.ts");
 const uiStoreEvents = path.resolve(process.cwd(), "../packages/ui/src/stores/events.svelte.ts");
 const uiStorePulls = path.resolve(process.cwd(), "../packages/ui/src/stores/pulls.svelte.ts");
@@ -32,6 +34,10 @@ const uiStoreActivity = path.resolve(process.cwd(), "../packages/ui/src/stores/a
 const uiStoreSync = path.resolve(process.cwd(), "../packages/ui/src/stores/sync.svelte.ts");
 const uiStoreDiff = path.resolve(process.cwd(), "../packages/ui/src/stores/diff.svelte.ts");
 const uiStoreGrouping = path.resolve(process.cwd(), "../packages/ui/src/stores/grouping.svelte.ts");
+const uiStoreDetailActivityView = path.resolve(
+  process.cwd(),
+  "../packages/ui/src/stores/detail-activity-view.svelte.ts",
+);
 const uiStoreSettings = path.resolve(process.cwd(), "../packages/ui/src/stores/settings.svelte.ts");
 
 function devApiUrlPlugin(url: string): Plugin {
@@ -145,6 +151,61 @@ function terminalWebSocketProxy(url: string): ProxyOptions {
   return proxy;
 }
 
+// The "unit" project preserves the prior flat test config: jsdom plus the
+// localStorage/elementFromPoint shims in setup.ts. The browser glob exclude
+// keeps *.browser.svelte.ts files off this project so they never double-run.
+const unitTestProject = {
+  extends: true,
+  test: {
+    name: "unit",
+    environment: "jsdom",
+    setupFiles: ["./src/test/setup.ts"],
+    include: ["src/**/*.{test,spec}.?(c|m)[jt]s?(x)", "../packages/ui/src/**/*.{test,spec}.?(c|m)[jt]s?(x)"],
+    exclude: ["tests/e2e/**", "tests/e2e-full/**", "node_modules/**", "src/**/*.browser.svelte.ts"],
+  },
+} satisfies TestProjectInlineConfiguration;
+
+// The "browser" project runs *.browser.svelte.ts specs in a real headless
+// chromium page via the Playwright provider. It intentionally omits setup.ts:
+// a real page has native localStorage and elementFromPoint, so the jsdom shims
+// would be wrong here.
+//
+// The Playwright provider is loaded with a dynamic import inside an async
+// project factory rather than a top-level import on purpose: "vite-plus/test/
+// browser-playwright" transitively pulls in the browser runtime (ws's
+// WebSocketServer, the @vitest/browser client), which fails to evaluate under
+// the jsdom unit runner. src/lib/dev/viteConfig.test.ts and
+// healthcheckPlugin.test.ts import this config module directly, so a static
+// browser import would crash those unit tests. The factory body only runs when
+// the browser project itself is initialized, keeping the browser runtime out of
+// the unit project's module graph.
+//
+// resolve.conditions forces the browser/client export conditions. vite-plugin-svelte
+// only picks Svelte's "browser" export ("./src/index-client.js", which exposes
+// mount()) when the environment is named/consumed as a client; under the browser
+// test runtime it otherwise falls through to Svelte's server entry and mount()
+// throws lifecycle_function_unavailable. Spreading Vite's defaultClientConditions
+// keeps the standard "module"/"development|production" placeholders intact.
+const browserTestProject = defineProject(async () => {
+  const { playwright } = await import("vite-plus/test/browser-playwright");
+  return {
+    extends: true,
+    resolve: {
+      conditions: [...defaultClientConditions],
+    },
+    test: {
+      name: "browser",
+      include: ["src/**/*.browser.svelte.ts"],
+      browser: {
+        enabled: true,
+        provider: playwright() as never,
+        instances: [{ browser: "chromium" }],
+        headless: true,
+      },
+    },
+  };
+});
+
 const config = {
   base: "/",
   // The Go server serves this build under a configurable base_path (default
@@ -194,6 +255,10 @@ const config = {
         replacement: uiRoutes,
       },
       {
+        find: /^@middleman\/ui\/utils\/repo-label$/,
+        replacement: uiRepoLabel,
+      },
+      {
         find: /^@middleman\/ui\/stores\/detail$/,
         replacement: uiStoreDetail,
       },
@@ -226,13 +291,149 @@ const config = {
         replacement: uiStoreGrouping,
       },
       {
+        find: /^@middleman\/ui\/stores\/detail-activity-view$/,
+        replacement: uiStoreDetailActivityView,
+      },
+      {
         find: /^@middleman\/ui\/stores\/settings$/,
         replacement: uiStoreSettings,
       },
     ],
   },
   optimizeDeps: {
+    // @middleman/ui is excluded so Vite serves its source modules directly
+    // (the resolve.alias above points it at ../packages/ui/src). But the
+    // barrel reaches heavy transitive deps that some of those packages own
+    // and frontend cannot resolve bare (the @tiptap/@pierre/prosemirror/
+    // svelte-tiptap cluster). Left undeclared, Vite discovers them mid-run on
+    // a cold optimizer, re-bundles, and reloads the page -- which yanks an
+    // in-flight dynamic import of App.svelte out from under the browser test
+    // tier (TypeError: Failed to fetch dynamically imported module). Force
+    // pre-bundling them at startup so there is nothing to discover later.
+    //
+    // The "@middleman/ui > <dep>" barrel-traversal entries resolve the dep in
+    // packages/ui's context (it is not a frontend dependency); the bare
+    // entries (openapi-fetch, the @lucide/svelte icon paths) resolve from
+    // frontend directly. The set is exactly the cold "new dependencies
+    // optimized" list emitted when mounting App.svelte in the browser tier.
     exclude: ["@middleman/ui"],
+    include: [
+      // packages/ui-owned transitive deps, reached through the excluded barrel.
+      "@middleman/ui > @pierre/diffs",
+      "@middleman/ui > @pierre/diffs/worker",
+      "@middleman/ui > @tiptap/core",
+      "@middleman/ui > @tiptap/extension-document",
+      "@middleman/ui > @tiptap/extension-hard-break",
+      "@middleman/ui > @tiptap/extension-paragraph",
+      "@middleman/ui > @tiptap/extension-placeholder",
+      "@middleman/ui > @tiptap/extension-text",
+      "@middleman/ui > @tiptap/suggestion",
+      "@middleman/ui > prosemirror-state",
+      "@middleman/ui > svelte-tiptap",
+      // Frontend-resolvable deps the barrel also pulls in.
+      "openapi-fetch",
+      // The complete set of @lucide/svelte icon paths imported anywhere in
+      // frontend/src or packages/ui/src (generated by `grep -rhoE
+      // "@lucide/svelte/icons/[a-z0-9-]+" src ../packages/ui/src | sort -u`).
+      // Pre-bundling every icon -- not just the /pulls subset -- stops the cold
+      // optimizer from discovering a new icon mid-run on issues/detail routes,
+      // re-bundling, and reloading the page out from under a browser-tier mount.
+      "@lucide/svelte/icons/alarm-clock",
+      "@lucide/svelte/icons/alert-triangle",
+      "@lucide/svelte/icons/archive-restore",
+      "@lucide/svelte/icons/arrow-down",
+      "@lucide/svelte/icons/arrow-left",
+      "@lucide/svelte/icons/arrow-right",
+      "@lucide/svelte/icons/arrow-right-left",
+      "@lucide/svelte/icons/arrow-up",
+      "@lucide/svelte/icons/arrow-up-down",
+      "@lucide/svelte/icons/arrow-up-right",
+      "@lucide/svelte/icons/box",
+      "@lucide/svelte/icons/calendar",
+      "@lucide/svelte/icons/calendar-clock",
+      "@lucide/svelte/icons/calendar-days",
+      "@lucide/svelte/icons/check",
+      "@lucide/svelte/icons/check-circle",
+      "@lucide/svelte/icons/check-circle-2",
+      "@lucide/svelte/icons/chevron-down",
+      "@lucide/svelte/icons/chevron-left",
+      "@lucide/svelte/icons/chevron-right",
+      "@lucide/svelte/icons/chevron-up",
+      "@lucide/svelte/icons/chevrons-down-up",
+      "@lucide/svelte/icons/chevrons-up-down",
+      "@lucide/svelte/icons/circle",
+      "@lucide/svelte/icons/circle-alert",
+      "@lucide/svelte/icons/circle-check-big",
+      "@lucide/svelte/icons/circle-help",
+      "@lucide/svelte/icons/clock-3",
+      "@lucide/svelte/icons/columns-2",
+      "@lucide/svelte/icons/copy",
+      "@lucide/svelte/icons/dot",
+      "@lucide/svelte/icons/ellipsis",
+      "@lucide/svelte/icons/eraser",
+      "@lucide/svelte/icons/external-link",
+      "@lucide/svelte/icons/file-search",
+      "@lucide/svelte/icons/file-text",
+      "@lucide/svelte/icons/flag",
+      "@lucide/svelte/icons/folder",
+      "@lucide/svelte/icons/folder-input",
+      "@lucide/svelte/icons/folder-open",
+      "@lucide/svelte/icons/funnel",
+      "@lucide/svelte/icons/git-branch",
+      "@lucide/svelte/icons/git-commit-horizontal",
+      "@lucide/svelte/icons/git-merge",
+      "@lucide/svelte/icons/house",
+      "@lucide/svelte/icons/inbox",
+      "@lucide/svelte/icons/layers",
+      "@lucide/svelte/icons/layers-2",
+      "@lucide/svelte/icons/layout-panel-left",
+      "@lucide/svelte/icons/layout-panel-top",
+      "@lucide/svelte/icons/link",
+      "@lucide/svelte/icons/loader-circle",
+      "@lucide/svelte/icons/message-square",
+      "@lucide/svelte/icons/message-square-reply",
+      "@lucide/svelte/icons/minus",
+      "@lucide/svelte/icons/monitor",
+      "@lucide/svelte/icons/monitor-up",
+      "@lucide/svelte/icons/moon",
+      "@lucide/svelte/icons/more-horizontal",
+      "@lucide/svelte/icons/move",
+      "@lucide/svelte/icons/octagon-x",
+      "@lucide/svelte/icons/package-plus",
+      "@lucide/svelte/icons/panel-bottom",
+      "@lucide/svelte/icons/panel-left-close",
+      "@lucide/svelte/icons/panel-left-open",
+      "@lucide/svelte/icons/panel-right",
+      "@lucide/svelte/icons/panel-right-close",
+      "@lucide/svelte/icons/panel-top",
+      "@lucide/svelte/icons/paperclip",
+      "@lucide/svelte/icons/pencil",
+      "@lucide/svelte/icons/play",
+      "@lucide/svelte/icons/plus",
+      "@lucide/svelte/icons/refresh-ccw",
+      "@lucide/svelte/icons/refresh-cw",
+      "@lucide/svelte/icons/rotate-ccw",
+      "@lucide/svelte/icons/rows-2",
+      "@lucide/svelte/icons/save",
+      "@lucide/svelte/icons/search",
+      "@lucide/svelte/icons/send",
+      "@lucide/svelte/icons/send-horizontal",
+      "@lucide/svelte/icons/server",
+      "@lucide/svelte/icons/settings",
+      "@lucide/svelte/icons/sparkles",
+      "@lucide/svelte/icons/star",
+      "@lucide/svelte/icons/sun",
+      "@lucide/svelte/icons/tag",
+      "@lucide/svelte/icons/tags",
+      "@lucide/svelte/icons/terminal",
+      "@lucide/svelte/icons/trash-2",
+      "@lucide/svelte/icons/upload",
+      "@lucide/svelte/icons/user-check",
+      "@lucide/svelte/icons/user-round",
+      "@lucide/svelte/icons/users",
+      "@lucide/svelte/icons/workflow",
+      "@lucide/svelte/icons/x",
+    ],
   },
   server: {
     host: "127.0.0.1",
@@ -252,10 +453,7 @@ const config = {
     },
   },
   test: {
-    environment: "jsdom",
-    setupFiles: ["./src/test/setup.ts"],
-    include: ["src/**/*.{test,spec}.?(c|m)[jt]s?(x)", "../packages/ui/src/**/*.{test,spec}.?(c|m)[jt]s?(x)"],
-    exclude: ["tests/e2e/**", "tests/e2e-full/**", "node_modules/**"],
+    projects: [defineProject(unitTestProject), browserTestProject],
   },
   build: {
     outDir: "dist",

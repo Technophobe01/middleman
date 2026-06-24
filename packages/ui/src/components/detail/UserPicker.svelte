@@ -12,6 +12,7 @@
     pendingUser?: string | null;
     error?: string | null;
     autofocusFilter?: boolean;
+    avatarUrlForUser?: ((username: string) => string) | undefined;
     /// The query the current candidates were fetched for. When set,
     /// the exact-username entry row is withheld until the candidate
     /// list reflects the typed query, so a stale list cannot offer a
@@ -33,6 +34,7 @@
     pendingUser = null,
     error = null,
     autofocusFilter = false,
+    avatarUrlForUser = undefined,
     candidatesQuery = undefined,
     onquery = undefined,
     ontoggle,
@@ -42,6 +44,7 @@
 
   let query = $state("");
   let filterInput: HTMLInputElement | undefined = $state();
+  let failedAvatarKeys = $state<string[]>([]);
 
   onMount(() => {
     if (autofocusFilter) filterInput?.focus();
@@ -80,6 +83,16 @@
   function clearSelectedUsers(): void {
     if (pendingUser !== null || selectedNames.size === 0) return;
     void onclear?.();
+  }
+
+  function avatarKey(username: string): string {
+    return username.toLowerCase();
+  }
+
+  function markAvatarFailed(username: string): void {
+    const key = avatarKey(username);
+    if (failedAvatarKeys.includes(key)) return;
+    failedAvatarKeys = [...failedAvatarKeys, key];
   }
 </script>
 
@@ -132,6 +145,8 @@
   <div class="user-picker__list" role="menu" aria-label="Users">
     {#each listedUsers as username (username.toLowerCase())}
       {@const isSelected = selectedNames.has(username.toLowerCase())}
+      {@const avatarURL = avatarUrlForUser?.(username) ?? ""}
+      {@const showAvatarImage = avatarURL !== "" && !failedAvatarKeys.includes(avatarKey(username))}
       <button
         type="button"
         class={["user-picker__row", { "user-picker__row--selected": isSelected }]}
@@ -140,7 +155,18 @@
         disabled={pendingUser !== null}
         onclick={() => ontoggle(username)}
       >
-        <span class="user-picker__avatar" aria-hidden="true">{username.slice(0, 1).toUpperCase()}</span>
+        {#if showAvatarImage}
+          <img
+            class="user-picker__avatar"
+            src={avatarURL}
+            alt=""
+            loading="lazy"
+            aria-hidden="true"
+            onerror={() => markAvatarFailed(username)}
+          />
+        {:else}
+          <span class="user-picker__avatar" aria-hidden="true">{username.slice(0, 1).toUpperCase()}</span>
+        {/if}
         <span class="user-picker__name">{username}</span>
         <span class="user-picker__status">
           {#if pendingUser === username}
@@ -338,6 +364,7 @@
     color: var(--text-secondary);
     font-size: var(--font-size-xs);
     font-weight: 700;
+    object-fit: cover;
   }
 
   .user-picker__name {

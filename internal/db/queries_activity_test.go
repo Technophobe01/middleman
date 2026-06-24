@@ -123,6 +123,46 @@ func TestListActivity(t *testing.T) {
 		})
 	})
 
+	t.Run("provider qualified repo filter", func(t *testing.T) {
+		assert := Assert.New(t)
+		require := require.New(t)
+		d := openTestDB(t)
+		ctx := t.Context()
+		base := baseTime()
+
+		githubRepo, err := d.UpsertRepo(ctx, RepoIdentity{
+			Platform:     "github",
+			PlatformHost: "github.com",
+			Owner:        "acme",
+			Name:         "widgets",
+		})
+		require.NoError(err)
+		giteaRepo, err := d.UpsertRepo(ctx, RepoIdentity{
+			Platform:     "gitea",
+			PlatformHost: "github.com",
+			Owner:        "acme",
+			Name:         "widgets",
+		})
+		require.NoError(err)
+		insertTestMR(t, d, githubRepo, 1, "github provider", base)
+		insertTestMR(t, d, giteaRepo, 2, "gitea provider", base.Add(time.Hour))
+
+		items, err := d.ListActivity(ctx, ListActivityOpts{
+			Repo: "gitea|github.com/acme/widgets",
+			RepoFilters: []RepoFilter{{
+				Platform:     "gitea",
+				PlatformHost: "github.com",
+				RepoPath:     "acme/widgets",
+			}},
+			Limit: 50,
+		})
+		require.NoError(err)
+		require.Len(items, 1)
+		assert.Equal("gitea", items[0].Platform)
+		assert.Equal("github.com", items[0].PlatformHost)
+		assert.Equal(2, items[0].ItemNumber)
+	})
+
 	t.Run("type filter", func(t *testing.T) {
 		assert := Assert.New(t)
 		items, err := d.ListActivity(ctx, ListActivityOpts{
@@ -538,11 +578,6 @@ func TestListActivity(t *testing.T) {
 	_ = prID2
 }
 
-//go:fix inline
-func ptrInt64(v int64) *int64 {
-	return new(v)
-}
-
 func insertOversizedBranchCommitRow(
 	ctx context.Context,
 	d *DB,
@@ -820,7 +855,7 @@ func TestUpsertMREventsPreservesDirectURLWhenPartialRefreshOmitsIt(t *testing.T)
 
 	err := d.UpsertMREvents(ctx, []MREvent{{
 		MergeRequestID: prID,
-		PlatformID:     ptrInt64(101),
+		PlatformID:     new(int64(101)),
 		EventType:      "issue_comment",
 		Author:         "reviewer",
 		Body:           "first",
@@ -832,7 +867,7 @@ func TestUpsertMREventsPreservesDirectURLWhenPartialRefreshOmitsIt(t *testing.T)
 
 	err = d.UpsertMREvents(ctx, []MREvent{{
 		MergeRequestID: prID,
-		PlatformID:     ptrInt64(101),
+		PlatformID:     new(int64(101)),
 		EventType:      "issue_comment",
 		Author:         "reviewer",
 		Body:           "edited",
@@ -910,7 +945,7 @@ func TestUpsertIssueEventsPreservesDirectURLWhenPartialRefreshOmitsIt(t *testing
 
 	err := d.UpsertIssueEvents(ctx, []IssueEvent{{
 		IssueID:    issueID,
-		PlatformID: ptrInt64(202),
+		PlatformID: new(int64(202)),
 		EventType:  "issue_comment",
 		Author:     "reporter",
 		Body:       "first",
@@ -922,7 +957,7 @@ func TestUpsertIssueEventsPreservesDirectURLWhenPartialRefreshOmitsIt(t *testing
 
 	err = d.UpsertIssueEvents(ctx, []IssueEvent{{
 		IssueID:    issueID,
-		PlatformID: ptrInt64(202),
+		PlatformID: new(int64(202)),
 		EventType:  "issue_comment",
 		Author:     "reporter",
 		Body:       "edited",
@@ -936,4 +971,232 @@ func TestUpsertIssueEventsPreservesDirectURLWhenPartialRefreshOmitsIt(t *testing
 	require.Len(events, 1)
 	require.Equal("edited", events[0].Body)
 	require.Equal("https://github.com/alice/alpha/issues/7#issuecomment-202", events[0].DirectURL)
+}
+
+func TestListActivityIncludesNotifications(t *testing.T) {
+	require := require.New(t)
+	assert := Assert.New(t)
+	d := openTestDB(t)
+	ctx := t.Context()
+	base := baseTime()
+
+	repoID := insertTestRepo(t, d, "alice", "alpha")
+	_ = repoID
+	number := 7
+	err := d.UpsertNotifications(ctx, []Notification{{
+		Platform:               "github",
+		PlatformHost:           "github.com",
+		PlatformNotificationID: "ntf-1",
+		RepoOwner:              "alice",
+		RepoName:               "alpha",
+		SubjectType:            "PullRequest",
+		SubjectTitle:           "Review my change",
+		WebURL:                 "https://github.com/alice/alpha/pull/7",
+		ItemNumber:             &number,
+		ItemType:               "pr",
+		ItemAuthor:             "carol",
+		Reason:                 "review_requested",
+		Unread:                 true,
+		SourceUpdatedAt:        base.Add(10 * time.Minute),
+		SyncedAt:               base.Add(10 * time.Minute),
+	}})
+	require.NoError(err)
+
+	items, err := d.ListActivity(ctx, ListActivityOpts{Limit: 50})
+	require.NoError(err)
+
+	var notif *ActivityItem
+	for i := range items {
+		if items[i].ActivityType == "notification" {
+			notif = &items[i]
+			break
+		}
+	}
+	require.NotNil(notif, "notification should appear in the activity feed")
+	assert.Equal("ntf", notif.Source)
+	assert.Equal("alice", notif.RepoOwner)
+	assert.Equal("alpha", notif.RepoName)
+	assert.Equal("pr", notif.ItemType)
+	assert.Equal(7, notif.ItemNumber)
+	assert.Equal("Review my change", notif.ItemTitle)
+	assert.Equal("review_requested", notif.BodyPreview)
+	assert.Equal("unread", notif.ItemState)
+	assert.Equal("https://github.com/alice/alpha/pull/7", notif.ActivityURL)
+
+	// The notification type participates in the type filter like any
+	// other activity source.
+	filtered, err := d.ListActivity(ctx, ListActivityOpts{Limit: 50, Types: []string{"notification"}})
+	require.NoError(err)
+	require.Len(filtered, 1)
+	assert.Equal("notification", filtered[0].ActivityType)
+
+	// ExcludeNotifications drops them from the union entirely (before
+	// the limit), so a disabled feed never lists notification rows.
+	excluded, err := d.ListActivity(ctx, ListActivityOpts{Limit: 50, ExcludeNotifications: true})
+	require.NoError(err)
+	for _, it := range excluded {
+		assert.NotEqual("notification", it.ActivityType)
+	}
+}
+
+func TestListActivityNotificationCarriesSubjectState(t *testing.T) {
+	require := require.New(t)
+	assert := Assert.New(t)
+	d := openTestDB(t)
+	ctx := t.Context()
+	base := baseTime()
+
+	repoID := insertTestRepo(t, d, "alice", "alpha")
+	number := 7
+	// The notification's linked PR is merged.
+	insertTestMRWithOptions(t, d, testMR(repoID, number,
+		withMRTitle("Merged change"),
+		withMRState(MergeRequestStateMerged),
+		withMRActivity(base)))
+	require.NoError(d.UpsertNotifications(ctx, []Notification{{
+		Platform:               "github",
+		PlatformHost:           "github.com",
+		PlatformNotificationID: "ntf-merged",
+		RepoOwner:              "alice",
+		RepoName:               "alpha",
+		SubjectType:            "PullRequest",
+		SubjectTitle:           "Merged change",
+		WebURL:                 "https://github.com/alice/alpha/pull/7",
+		ItemNumber:             &number,
+		ItemType:               "pr",
+		ItemAuthor:             "carol",
+		Reason:                 "review_requested",
+		Unread:                 true,
+		SourceUpdatedAt:        base.Add(10 * time.Minute),
+		SyncedAt:               base.Add(10 * time.Minute),
+	}}))
+
+	items, err := d.ListActivity(ctx, ListActivityOpts{Limit: 50, Types: []string{"notification"}})
+	require.NoError(err)
+	require.Len(items, 1)
+	// item_state still carries the notification's unread/read state; the
+	// linked PR's merged state rides in subject_state so the feed can hide
+	// closed/merged notifications even with no PR row present.
+	assert.Equal("unread", items[0].ItemState)
+	assert.Equal("merged", items[0].SubjectState)
+}
+
+func TestListActivityNotificationMatchesRepoByIdentity(t *testing.T) {
+	require := require.New(t)
+	assert := Assert.New(t)
+	d := openTestDB(t)
+	ctx := t.Context()
+	base := baseTime()
+	number := 7
+
+	require.NoError(d.UpsertNotifications(ctx, []Notification{{
+		Platform:               "github",
+		PlatformHost:           "github.com",
+		PlatformNotificationID: "ntf-before-repo",
+		RepoOwner:              "alice",
+		RepoName:               "alpha",
+		SubjectType:            "PullRequest",
+		SubjectTitle:           "Matched after repo sync",
+		WebURL:                 "https://github.com/alice/alpha/pull/7",
+		ItemNumber:             &number,
+		ItemType:               "pr",
+		ItemAuthor:             "carol",
+		Reason:                 "mention",
+		Unread:                 true,
+		SourceUpdatedAt:        base.Add(10 * time.Minute),
+		SyncedAt:               base.Add(10 * time.Minute),
+	}}))
+
+	repoID := insertTestRepo(t, d, "alice", "alpha")
+	insertTestMRWithOptions(t, d, testMR(repoID, number,
+		withMRTitle("Matched after repo sync"),
+		withMRState(MergeRequestStateMerged),
+		withMRActivity(base)))
+
+	items, err := d.ListActivity(ctx, ListActivityOpts{Limit: 50, Types: []string{"notification"}})
+	require.NoError(err)
+	require.Len(items, 1)
+	assert.Equal("notification", items[0].ActivityType)
+	assert.Equal("alice", items[0].RepoOwner)
+	assert.Equal("alpha", items[0].RepoName)
+	assert.Equal("merged", items[0].SubjectState)
+}
+
+func TestListActivityNotificationRepoFiltersApplyBeforeUnionLimit(t *testing.T) {
+	require := require.New(t)
+	assert := Assert.New(t)
+	d := openTestDB(t)
+	ctx := t.Context()
+	base := baseTime()
+	number := 7
+
+	trackedRepoID := insertTestRepo(t, d, "alice", "alpha")
+	removedRepoID := insertTestRepo(t, d, "alice", "removed")
+	insertTestMRWithOptions(t, d, testMR(trackedRepoID, number,
+		withMRTitle("Tracked notification"),
+		withMRActivity(base)))
+	insertTestMRWithOptions(t, d, testMR(removedRepoID, number,
+		withMRTitle("Removed notification"),
+		withMRActivity(base)))
+	require.NoError(d.UpsertNotifications(ctx, []Notification{
+		{
+			Platform:               "github",
+			PlatformHost:           "github.com",
+			PlatformNotificationID: "ntf-tracked",
+			RepoOwner:              "alice",
+			RepoName:               "alpha",
+			SubjectType:            "PullRequest",
+			SubjectTitle:           "Tracked notification",
+			WebURL:                 "https://github.com/alice/alpha/pull/7",
+			ItemNumber:             &number,
+			ItemType:               "pr",
+			ItemAuthor:             "carol",
+			Reason:                 "mention",
+			Unread:                 true,
+			SourceUpdatedAt:        base.Add(10 * time.Minute),
+			SyncedAt:               base.Add(10 * time.Minute),
+		},
+		{
+			Platform:               "github",
+			PlatformHost:           "github.com",
+			PlatformNotificationID: "ntf-removed",
+			RepoOwner:              "alice",
+			RepoName:               "removed",
+			SubjectType:            "PullRequest",
+			SubjectTitle:           "Removed notification",
+			WebURL:                 "https://github.com/alice/removed/pull/7",
+			ItemNumber:             &number,
+			ItemType:               "pr",
+			ItemAuthor:             "carol",
+			Reason:                 "mention",
+			Unread:                 true,
+			SourceUpdatedAt:        base.Add(11 * time.Minute),
+			SyncedAt:               base.Add(11 * time.Minute),
+		},
+	}))
+
+	items, err := d.ListActivity(ctx, ListActivityOpts{
+		Limit: 50,
+		Types: []string{"notification"},
+		NotificationRepoFilters: []NotificationRepoFilter{{
+			Platform:     "github",
+			PlatformHost: "github.com",
+			RepoOwner:    "alice",
+			RepoName:     "alpha",
+		}},
+	})
+	require.NoError(err)
+	require.Len(items, 1)
+	assert.Equal("notification", items[0].ActivityType)
+	assert.Equal("alice", items[0].RepoOwner)
+	assert.Equal("alpha", items[0].RepoName)
+	assert.Equal("Tracked notification", items[0].ItemTitle)
+
+	none, err := d.ListActivity(ctx, ListActivityOpts{
+		Limit:                   50,
+		Types:                   []string{"notification"},
+		NotificationRepoFilters: []NotificationRepoFilter{{}},
+	})
+	require.NoError(err)
+	assert.Empty(none)
 }

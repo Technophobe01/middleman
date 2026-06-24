@@ -17,6 +17,7 @@ const mockCapabilities = {
   review_mutation: true,
   workflow_approval: true,
   ready_for_review: true,
+  draft_mutation: true,
   issue_mutation: true,
   review_draft_mutation: false,
   review_thread_resolution: false,
@@ -174,6 +175,7 @@ test("markdown images open in an expanded overlay", async ({ page }) => {
   expect(buttonBox).not.toBeNull();
   expect(buttonBox!.x).toBeGreaterThan(imageBox!.x + imageBox!.width - 44);
   expect(buttonBox!.y).toBeLessThan(imageBox!.y + 16);
+  await page.mouse.move(1, 1);
   await expect(zoomButton).toHaveCSS("opacity", "0");
   await expect(zoomButton).toHaveCSS("pointer-events", "none");
 

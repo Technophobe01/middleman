@@ -9,6 +9,7 @@
   interface Props {
     files: readonly DiffFile[] | null | undefined;
     selectedPath?: string | null;
+    selectedPathRevealKey?: number;
     ariaLabel?: string;
     onSelect?: (path: string) => void;
   }
@@ -16,6 +17,7 @@
   const {
     files,
     selectedPath = null,
+    selectedPathRevealKey = 0,
     ariaLabel = "Changed files",
     onSelect,
   }: Props = $props();
@@ -25,6 +27,7 @@
   let renderedTreeKey = "";
   let syncingSelection = false;
   let selectedPathScrollFrame = 0;
+  let lastSelectedPathRevealKey: number | null = null;
 
   const safeFiles = $derived(files ?? []);
   const treePaths = $derived(safeFiles.map((file) => file.path));
@@ -121,12 +124,22 @@
         tree.getItem(selected)?.deselect();
       }
     }
-    if (selectedPath && tree.getItem(selectedPath)) {
-      tree.getItem(selectedPath)?.select();
-      tree.focusNearestPath(selectedPath);
-      scheduleSelectedPathIntoView(selectedPath);
+    const selectedItem = selectedPath ? tree.getItem(selectedPath) : undefined;
+    if (selectedItem) {
+      selectedItem.select();
     }
+    revealSelectedPathIfRequested(selectedPath, !!selectedItem);
     syncingSelection = false;
+  }
+
+  function revealSelectedPathIfRequested(path: string | null, canRevealPath: boolean): void {
+    const isInitialSync = lastSelectedPathRevealKey === null;
+    if (!isInitialSync && selectedPathRevealKey === lastSelectedPathRevealKey) return;
+    lastSelectedPathRevealKey = selectedPathRevealKey;
+    if (selectedPathRevealKey === 0) return;
+    if (!path || !canRevealPath) return;
+    tree?.focusNearestPath(path);
+    scheduleSelectedPathIntoView(path);
   }
 
   function scheduleSelectedPathIntoView(path: string): void {

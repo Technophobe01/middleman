@@ -15,12 +15,20 @@
   import type { DiffFile } from "../../api/types.js";
   import {
     appThemeType,
+    debugPierreDiff,
     diffFileWithPatch,
     parsePierreFileDiff,
     parsePierreFileDiffWithContents,
+    pierreDiffDebugEnabled,
     pierreFileContents,
+    sparseContextMayDistortSyntax,
   } from "./pierre-diff.js";
+  import {
+    renderedCodeColumns,
+    renderedCodeSide as renderedPierreCodeSide,
+  } from "./pierre-dom.js";
   import { diffTokenizeMaxLineLength, getPierreDiffWorkerPool } from "./pierre-worker-pool.js";
+  import type { WorkerPoolManager } from "@pierre/diffs/worker";
 
   interface Props {
     file: DiffFile | null | undefined;
@@ -43,10 +51,16 @@
   type RenderedLinePair = {
     content: HTMLElement;
     gutter: HTMLElement;
+    side: PierreSide | undefined;
+  };
+  type TransientInsertedAnnotationRow = {
+    content: HTMLElement;
+    gutter: HTMLElement;
   };
   type TransientAnnotationRow = {
     content?: HTMLElement;
     gutter?: HTMLElement;
+    insertedRows?: TransientInsertedAnnotationRow[];
     key: string;
     wrapper: HTMLElement;
   };
@@ -95,6 +109,7 @@
   let fullContextRendered = false;
   let contextLoadPromise: Promise<{ oldFile: FileContents; newFile: FileContents }> | undefined;
   let contextError: string | null = $state(null);
+  let syntaxContextLoadFailedFileKey = $state("");
   let themeType = $state<ThemeTypes>(appThemeType());
   let rendered = $state(false);
   let renderedFileKey = "";
@@ -110,6 +125,9 @@
   let pendingContextExpansion: PendingContextExpansion | undefined;
   let lineCommentButtonHasPointerSnapshot = false;
   let lineCommentButtonWasSelectedOnPointerDown = false;
+  let syntaxHighlightWorkerActive = false;
+  let syntaxHighlightWorkerPool: WorkerPoolManager | undefined;
+  let unsubscribeWorkerStats: (() => void) | undefined;
   const maxImmediateRenderRetries = 5;
 
   const renderFile = $derived(file ? diffFileWithPatch(file) : emptyFile);
@@ -130,6 +148,9 @@
     ),
   );
   const emptyTextualDiff = $derived(!renderFile.patch.trim() || !hasRenderablePierreDiff);
+  const needsFullContextForSyntax = $derived(
+    Boolean(loadFileText) && hasCollapsedContext(renderFile) && sparseContextMayDistortSyntax(renderFile),
+  );
 
   const pierreOptions = $derived.by<FileDiffOptions<unknown>>(() => ({
     diffStyle: viewMode,
@@ -146,15 +167,7 @@
     expansionLineCount: 40,
     tokenizeMaxLineLength: diffTokenizeMaxLineLength,
     onPostRender: () => {
-      removeStalePlaceholderPres();
-      applyLineTargetAttributes();
-      applyHunkHeaderLabels();
-      applyLineCommentButtons();
-      syncLineAnnotationWrappers();
-      rendered = true;
-      installDemandContextHandler();
-      scheduleSelectedRangesApplication();
-      restoreAnnotationFocus();
+      finalizeRenderedDom();
     },
     unsafeCSS: `
       :host {
@@ -164,8 +177,6 @@
         --diffs-tab-size: ${tabWidth};
         --diffs-light-bg: var(--bg-surface, #fff);
         --diffs-dark-bg: var(--bg-surface, #16161e);
-        --diffs-addition-color-override: var(--accent-green);
-        --diffs-deletion-color-override: var(--accent-red);
         --diffs-bg-addition-override: light-dark(
           color-mix(in srgb, var(--accent-green) 12%, transparent),
           color-mix(in srgb, var(--accent-green) 38%, black)
@@ -174,6 +185,8 @@
           color-mix(in srgb, var(--accent-red) 14%, transparent),
           color-mix(in srgb, var(--accent-red) 54%, black)
         );
+        --diffs-addition-color-override: var(--accent-green);
+        --diffs-deletion-color-override: var(--accent-red);
         --diffs-fg-number-addition-override: var(--accent-green);
         --diffs-bg-addition-number-override: var(--accent-green);
         --diffs-fg-number-deletion-override: var(--accent-red);
@@ -198,6 +211,10 @@
       pre {
         margin: 0;
         border-radius: 0;
+      }
+      code,
+      [data-placeholder] {
+        contain: none;
       }
       [data-separator='line-info'] {
         color: var(--diff-text-muted);
@@ -280,6 +297,7 @@
     cleanUpPierreDiff();
     contextLoadPromise = undefined;
     contextError = null;
+    syntaxContextLoadFailedFileKey = "";
     fullContext = undefined;
     fullContextFileDiff = undefined;
     fullContextRendered = false;
@@ -318,6 +336,12 @@
     if (pierreDiff instanceof VirtualizedFileDiff && isHostInScrollViewport()) {
       pierreDiff.setVisibility(true);
     }
+    if (needsFullContextForSyntax && !fullContext && syntaxContextLoadFailedFileKey !== fileKey) {
+      rendered = false;
+      clearRenderedDomState();
+      void loadFullContextForSyntax(fileKey);
+      return;
+    }
     const nextRenderAttemptKey = [
       fileKey,
       viewMode,
@@ -351,15 +375,7 @@
       if (didRender) {
         renderAttemptKey = nextRenderAttemptKey;
         renderRetryCount = 0;
-        removeStalePlaceholderPres();
-        applyLineTargetAttributes();
-        applyHunkHeaderLabels();
-        applyLineCommentButtons();
-        syncLineAnnotationWrappers();
-        rendered = true;
-        installDemandContextHandler();
-        scheduleSelectedRangesApplication();
-        restoreAnnotationFocus();
+        finalizeRenderedDom();
       } else {
         scheduleRenderRetry();
       }
@@ -485,12 +501,27 @@
     clearLineAnnotationWrappers();
     renderedLineRows = new Map();
     fullContextFileDiff = undefined;
+    syntaxHighlightWorkerActive = false;
+    syntaxHighlightWorkerPool = undefined;
+    unsubscribeWorkerStats?.();
+    unsubscribeWorkerStats = undefined;
     pierreDiff?.cleanUp();
     pierreDiff = undefined;
   }
 
   function createPierreDiff(): FileDiff<unknown> | VirtualizedFileDiff<unknown> {
     const workerPool = getPierreDiffWorkerPool();
+    syntaxHighlightWorkerActive = Boolean(workerPool);
+    syntaxHighlightWorkerPool = workerPool;
+    unsubscribeWorkerStats?.();
+    unsubscribeWorkerStats = workerPool?.subscribeToStatChanges(() => {
+      if (rendered) return;
+      queueMicrotask(() => {
+        if (!rendered) {
+          finalizeRenderedDom();
+        }
+      });
+    });
     if (!virtualizer) return new FileDiff<unknown>(pierreOptions, workerPool, true);
     return new VirtualizedFileDiff<unknown>(
       pierreOptions,
@@ -657,9 +688,23 @@
     const expandAll = isExpandAllClick(target, event);
     const direction = expandAll ? "both" : expansionDirection(target);
     const expansionLineCount = expandAll ? Number.POSITIVE_INFINITY : undefined;
+    debugPierreDiff("expand click intercepted", {
+      path: renderFile.path,
+      hunkIndex,
+      direction,
+      expansionLineCount: expansionLineCount ?? "default",
+      fullContextLoaded: Boolean(fullContext),
+      fullContextRendered,
+      sparseCacheKey: pierreFile?.cacheKey,
+    });
     void loadFullContextAndExpand(hunkIndex, direction, expansionLineCount)
       .catch((err: unknown) => {
         contextError = err instanceof Error ? err.message : String(err);
+        debugPierreDiff("expand failed", {
+          path: renderFile.path,
+          hunkIndex,
+          error: contextError,
+        });
       });
   }
 
@@ -691,12 +736,25 @@
   ): Promise<void> {
     const requestFileKey = fileKey;
     const alreadyRendered = fullContextRendered;
+    debugPierreDiff("expand loading full context", {
+      path: renderFile.path,
+      hunkIndex,
+      direction,
+      alreadyRendered,
+    });
     const context = await loadFullContext(requestFileKey);
     if (!context || fileKey !== requestFileKey) return;
     await tick();
     if (fileKey !== requestFileKey) return;
     if (!alreadyRendered && !fullContextRendered) {
       const didRender = renderFullContext(context);
+      debugPierreDiff("expand full context render result", {
+        path: renderFile.path,
+        hunkIndex,
+        didRender,
+        fullCacheKey: fullContextFileDiff?.cacheKey,
+        sparseCacheKey: pierreFile?.cacheKey,
+      });
       if (fileKey !== requestFileKey) return;
       if (!didRender) {
         if (!fullContextFileDiff) return;
@@ -711,6 +769,11 @@
       }
     }
     expandRenderedHunk(hunkIndex, direction, expansionLineCount);
+    debugPierreDiff("expand complete", {
+      path: renderFile.path,
+      hunkIndex,
+      rows: pierreDiffDebugEnabled() ? expandedContextDebugRows() : [],
+    });
   }
 
   function expandRenderedHunk(
@@ -720,10 +783,15 @@
   ): void {
     clearRenderedDomState();
     pierreDiff?.expandHunk(hunkIndex, direction, expansionLineCount);
-    if (pierreDiff instanceof VirtualizedFileDiff && fullContext && fullContextFileDiff) {
-      pierreDiff.rerender();
-    } else if (fullContext && fullContextFileDiff) {
+    if (fullContext && fullContextFileDiff) {
       const didRender = renderFullContextRange(fullContext, fullContextFileDiff);
+      debugPierreDiff("expand rerendered full context range", {
+        path: renderFile.path,
+        hunkIndex,
+        didRender,
+        fullCacheKey: fullContextFileDiff.cacheKey,
+        rows: pierreDiffDebugEnabled() ? expandedContextDebugRows() : [],
+      });
       if (!didRender) scheduleRenderRetry();
     }
     removeStalePlaceholderPres();
@@ -742,21 +810,21 @@
     rendered = false;
     clearRenderedDomState();
     fullContextFileDiff = parsePierreFileDiffWithContents(renderFile, context) ?? pierreFile;
+    debugPierreDiff("render full context prepared", {
+      path: renderFile.path,
+      sparseCacheKey: pierreFile?.cacheKey,
+      fullCacheKey: fullContextFileDiff?.cacheKey,
+      oldCacheKey: context.oldFile.cacheKey,
+      newCacheKey: context.newFile.cacheKey,
+      oldLength: context.oldFile.contents.length,
+      newLength: context.newFile.contents.length,
+    });
     if (!fullContextFileDiff) return false;
     const didRender = renderFullContextRange(context, fullContextFileDiff);
     pierreDiff.setSelectedLines(selectedRange);
     if (didRender) {
       fullContextRendered = true;
-      removeStalePlaceholderPres();
-      applyLineTargetAttributes();
-      applyHunkHeaderLabels();
-      applyLineCommentButtons();
-      syncLineAnnotationWrappers();
-      rendered = true;
-      installDemandContextHandler();
-      scheduleSelectedRangesApplication();
-      restoreAnnotationFocus();
-      replayPendingContextExpansion();
+      finalizeRenderedDom();
     }
     return didRender;
   }
@@ -806,6 +874,37 @@
     return pierreDiff.render(props);
   }
 
+  function finalizeRenderedDom(): boolean {
+    removeStalePlaceholderPres();
+    applyLineTargetAttributes();
+    applyHunkHeaderLabels();
+    applyLineCommentButtons();
+    syncLineAnnotationWrappers();
+
+    const ready = renderedDomReady();
+    rendered = ready;
+    if (!ready) return false;
+
+    installDemandContextHandler();
+    scheduleSelectedRangesApplication();
+    restoreAnnotationFocus();
+    if (fullContextRendered) {
+      replayPendingContextExpansion();
+    }
+    return true;
+  }
+
+  function renderedDomReady(): boolean {
+    if (!syntaxHighlightWorkerActive) return true;
+    if (host?.shadowRoot?.querySelector("[data-line] span[style]") != null) return true;
+    return !syntaxHighlightWorkerHasPendingWork();
+  }
+
+  function syntaxHighlightWorkerHasPendingWork(): boolean {
+    const stats = syntaxHighlightWorkerPool?.getStats();
+    return Boolean(stats && (stats.queuedTasks > 0 || stats.activeTasks > 0));
+  }
+
   async function loadFullContext(
     requestFileKey: string,
   ): Promise<{ oldFile: FileContents; newFile: FileContents } | undefined> {
@@ -825,19 +924,45 @@
     return fullContext;
   }
 
+  async function loadFullContextForSyntax(requestFileKey: string): Promise<void> {
+    try {
+      const context = await loadFullContext(requestFileKey);
+      if (!context || fileKey !== requestFileKey) return;
+      await tick();
+      if (fileKey !== requestFileKey || fullContextRendered) return;
+      renderFullContext(context);
+    } catch (err) {
+      if (fileKey !== requestFileKey) return;
+      syntaxContextLoadFailedFileKey = requestFileKey;
+      contextError = err instanceof Error ? err.message : "unknown error";
+    }
+  }
+
   async function fetchFullContext(): Promise<{ oldFile: FileContents; newFile: FileContents }> {
     if (!loadFileText) {
       throw new Error("Context loading is unavailable");
     }
     contextError = null;
+    debugPierreDiff("fetch full context start", {
+      path: renderFile.path,
+      status: renderFile.status,
+    });
     const [oldContents, newContents] = await Promise.all([
       renderFile.status === "added" ? Promise.resolve("") : loadFileText("old"),
       renderFile.status === "deleted" ? Promise.resolve("") : loadFileText("new"),
     ]);
-    return {
+    const context = {
       oldFile: pierreFileContents(renderFile.old_path || renderFile.path, oldContents, "full-old"),
       newFile: pierreFileContents(renderFile.path, newContents, "full-new"),
     };
+    debugPierreDiff("fetch full context complete", {
+      path: renderFile.path,
+      oldLength: oldContents.length,
+      newLength: newContents.length,
+      oldCacheKey: context.oldFile.cacheKey,
+      newCacheKey: context.newFile.cacheKey,
+    });
+    return context;
   }
 
   function annotationKey(annotations: DiffLineAnnotation<unknown>[]): string {
@@ -894,14 +1019,26 @@
     for (const hunk of fileHunks) {
       for (const line of hunk.lines) {
         if (line.old_num != null) {
-          markLineTarget(pre, getLineIndex(line.old_num, "deletions"), split, {
-            "data-diff-old-line": String(line.old_num),
-          });
+          markLineTarget(
+            pre,
+            getLineIndex(line.old_num, "deletions"),
+            split,
+            "deletions",
+            {
+              "data-diff-old-line": String(line.old_num),
+            },
+          );
         }
         if (line.new_num != null) {
-          markLineTarget(pre, getLineIndex(line.new_num, "additions"), split, {
-            "data-diff-new-line": String(line.new_num),
-          });
+          markLineTarget(
+            pre,
+            getLineIndex(line.new_num, "additions"),
+            split,
+            "additions",
+            {
+              "data-diff-new-line": String(line.new_num),
+            },
+          );
         }
       }
     }
@@ -1084,9 +1221,19 @@
   }
 
   function clearTransientLineAnnotation(): void {
-    transientAnnotationRow?.wrapper.remove();
-    transientAnnotationRow?.content?.remove();
-    transientAnnotationRow?.gutter?.remove();
+    const row = transientAnnotationRow;
+    row?.wrapper.remove();
+    const insertedRows = row?.insertedRows ?? (
+      row?.content && row.gutter ? [{ content: row.content, gutter: row.gutter }] : []
+    );
+    const adjustedColumns = new Map<HTMLElement, number>();
+    for (const insertedRow of insertedRows) {
+      queueColumnSpanAdjustment(adjustedColumns, insertedRow.content.parentElement, -1);
+      queueColumnSpanAdjustment(adjustedColumns, insertedRow.gutter.parentElement, -1);
+      insertedRow.content.remove();
+      insertedRow.gutter.remove();
+    }
+    applyColumnSpanAdjustments(adjustedColumns);
     transientAnnotationRow = undefined;
   }
 
@@ -1140,7 +1287,7 @@
 
   function insertTransientAnnotationRow(
     annotation: DiffLineAnnotation<unknown>,
-  ): { content: HTMLElement; gutter: HTMLElement } | undefined {
+  ): { content: HTMLElement; gutter: HTMLElement; insertedRows: TransientInsertedAnnotationRow[] } | undefined {
     const root = host?.shadowRoot;
     const pre = renderedDiffPre(root);
     if (!pre || !pierreDiff) return undefined;
@@ -1153,26 +1300,110 @@
     if (!indexes) return undefined;
 
     const lineIndex = split ? indexes[1] : indexes[0];
-    const target = renderedLinePair(pre, lineIndex, split);
+    const target = renderedLinePair(pre, lineIndex, split, annotation.side as PierreSide);
     if (!target) return undefined;
 
+    const insertedRows: TransientInsertedAnnotationRow[] = [];
+    const adjustedColumns = new Map<HTMLElement, number>();
+    const targets = transientAnnotationInsertionTargets(pre, target, split);
+    const annotationLine = `0,${lineIndex}`;
+    const slotName = annotationSlotName(annotation);
+    let primaryRow: TransientInsertedAnnotationRow | undefined;
+    for (const insertionTarget of targets) {
+      const insertedRow = insertAnnotationRowAfter(
+        insertionTarget,
+        annotationLine,
+        insertionTarget.content === target.content ? slotName : undefined,
+      );
+      if (!insertedRow) continue;
+      insertedRows.push(insertedRow);
+      if (insertionTarget.content === target.content) {
+        primaryRow = insertedRow;
+      }
+      queueColumnSpanAdjustment(adjustedColumns, insertedRow.content.parentElement, 1);
+      queueColumnSpanAdjustment(adjustedColumns, insertedRow.gutter.parentElement, 1);
+    }
+    applyColumnSpanAdjustments(adjustedColumns);
+    primaryRow ??= insertedRows[0];
+    if (!primaryRow) return undefined;
+    return { ...primaryRow, insertedRows };
+  }
+
+  function transientAnnotationInsertionTargets(
+    pre: HTMLPreElement,
+    target: RenderedLinePair,
+    split: boolean,
+  ): RenderedLinePair[] {
+    if (!split) return [target];
+    const targetContentColumn = target.content.parentElement;
+    if (!targetContentColumn) return [target];
+    const rowIndex = Array.prototype.indexOf.call(targetContentColumn.children, target.content);
+    if (rowIndex < 0) return [target];
+
+    const targets: RenderedLinePair[] = [];
+    for (const code of renderedCodeColumns(pre)) {
+      const [gutter, content] = Array.from(code.children);
+      if (!(gutter instanceof HTMLElement) || !(content instanceof HTMLElement)) continue;
+      const contentElement = content.children[rowIndex];
+      const gutterElement = gutter.children[rowIndex];
+      if (!(contentElement instanceof HTMLElement) || !(gutterElement instanceof HTMLElement)) continue;
+      targets.push({
+        content: contentElement,
+        gutter: gutterElement,
+        side: renderedPierreCodeSide(code),
+      });
+    }
+    return targets.length > 0 ? targets : [target];
+  }
+
+  function insertAnnotationRowAfter(
+    target: RenderedLinePair,
+    annotationLine: string,
+    slotName: string | undefined,
+  ): TransientInsertedAnnotationRow | undefined {
+    if (!target.content.parentElement || !target.gutter.parentElement) return undefined;
     const gutter = document.createElement("div");
     gutter.setAttribute("data-gutter-buffer", "annotation");
     gutter.setAttribute("data-buffer-size", "1");
     gutter.style.gridRow = "span 1";
 
     const content = document.createElement("div");
-    content.setAttribute("data-line-annotation", `0,${lineIndex}`);
+    content.setAttribute("data-line-annotation", annotationLine);
     const annotationContent = document.createElement("div");
     annotationContent.setAttribute("data-annotation-content", "");
-    const slot = document.createElement("slot");
-    slot.name = annotationSlotName(annotation);
-    annotationContent.appendChild(slot);
+    if (slotName) {
+      const slot = document.createElement("slot");
+      slot.name = slotName;
+      annotationContent.appendChild(slot);
+    }
     content.appendChild(annotationContent);
 
     target.gutter.after(gutter);
     target.content.after(content);
     return { content, gutter };
+  }
+
+  function queueColumnSpanAdjustment(
+    adjustments: Map<HTMLElement, number>,
+    column: Element | null,
+    delta: number,
+  ): void {
+    if (!(column instanceof HTMLElement)) return;
+    adjustments.set(column, (adjustments.get(column) ?? 0) + delta);
+  }
+
+  function applyColumnSpanAdjustments(adjustments: Map<HTMLElement, number>): void {
+    for (const [column, delta] of adjustments) {
+      const nextSpan = Math.max(1, currentGridRowSpan(column) + delta);
+      column.style.setProperty("grid-row", `span ${nextSpan}`);
+    }
+  }
+
+  function currentGridRowSpan(column: HTMLElement): number {
+    const span = /^span\s+(\d+)/.exec(column.style.getPropertyValue("grid-row").trim());
+    const rowSpan = span?.[1];
+    if (rowSpan) return Number.parseInt(rowSpan, 10);
+    return Math.max(1, column.children.length);
   }
 
   function annotationSlotName(annotation: DiffLineAnnotation<unknown>): string {
@@ -1183,12 +1414,13 @@
     pre: HTMLPreElement,
     indexes: [number, number] | undefined,
     split: boolean,
+    side: PierreSide,
     attributes: Record<string, string>,
   ): void {
     if (!indexes) return;
     const lineIndex = split ? indexes[1] : indexes[0];
     if (!Number.isFinite(lineIndex)) return;
-    const pair = renderedLinePair(pre, lineIndex, split);
+    const pair = renderedLinePair(pre, lineIndex, split, side);
     if (!pair) return;
     pair.content.tabIndex = -1;
     pair.gutter.tabIndex = -1;
@@ -1215,6 +1447,24 @@
     return root?.querySelector<HTMLPreElement>("pre[data-diff]") ?? null;
   }
 
+  function expandedContextDebugRows(): Array<{
+    altLine: string | null;
+    line: string | null;
+    text: string;
+    type: string | null;
+  }> {
+    const root = host?.shadowRoot;
+    if (!root) return [];
+    return Array.from(root.querySelectorAll<HTMLElement>("[data-line-type='context-expanded'][data-line]"))
+      .slice(0, 12)
+      .map((row) => ({
+        altLine: row.getAttribute("data-alt-line"),
+        line: row.getAttribute("data-line"),
+        text: (row.textContent ?? "").trim().slice(0, 120),
+        type: row.getAttribute("data-line-type"),
+      }));
+  }
+
   function removeStalePlaceholderPres(): void {
     const root = host?.shadowRoot;
     if (!root) return;
@@ -1227,7 +1477,8 @@
 
   function refreshRenderedLineRows(pre: HTMLPreElement, split: boolean): void {
     const next = new Map<number, RenderedLinePair[]>();
-    for (const code of Array.from(pre.children)) {
+    for (const code of renderedCodeColumns(pre)) {
+      const side = split ? renderedPierreCodeSide(code) : undefined;
       const [gutter, content] = Array.from(code.children);
       if (!gutter || !content) continue;
       const contentRows = Array.from(content.children);
@@ -1241,21 +1492,34 @@
         const lineIndex = parseRenderedLineIndex(contentElement, split);
         if (lineIndex == null) continue;
         const rows = next.get(lineIndex) ?? [];
-        rows.push({ content: contentElement, gutter: gutterElement });
+        rows.push({ content: contentElement, gutter: gutterElement, side });
         next.set(lineIndex, rows);
       }
     }
     renderedLineRows = next;
   }
 
+  function linePairMatchesSide(
+    pair: RenderedLinePair,
+    split: boolean,
+    side: PierreSide | undefined,
+  ): boolean {
+    return !split || side == null || pair.side === side;
+  }
+
   function renderedLinePair(
     pre: HTMLPreElement,
     targetIndex: number,
     split: boolean,
+    side?: PierreSide,
   ): RenderedLinePair | undefined {
-    const cached = renderedLineRows.get(targetIndex)?.[0];
+    const cached = renderedLineRows.get(targetIndex)?.find((pair) =>
+      linePairMatchesSide(pair, split, side)
+    );
     if (cached) return cached;
-    for (const code of Array.from(pre.children)) {
+    for (const code of renderedCodeColumns(pre)) {
+      const codeSide = split ? renderedPierreCodeSide(code) : undefined;
+      if (split && side != null && codeSide !== side) continue;
       const [gutter, content] = Array.from(code.children);
       if (!gutter || !content) continue;
       const gutterRows = Array.from(gutter.children);
@@ -1266,7 +1530,7 @@
           const index = Array.prototype.indexOf.call(content.children, contentElement);
           const gutterElement = gutterRows[index];
           if (gutterElement instanceof HTMLElement) {
-            return { content: contentElement, gutter: gutterElement };
+            return { content: contentElement, gutter: gutterElement, side: codeSide };
           }
         }
         if ((lineIndex ?? 0) > targetIndex) return undefined;

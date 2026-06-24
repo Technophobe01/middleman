@@ -3,6 +3,7 @@
   import {
     DEFAULT_TERMINAL_SETTINGS,
     getStores,
+    SelectDropdown,
   } from "@middleman/ui";
   import XIcon from "@lucide/svelte/icons/x";
   import type { TerminalSettings as TerminalSettingsType } from "@middleman/ui/api/types";
@@ -47,6 +48,10 @@
     "Consolas",
     "Courier New",
   ];
+  const rendererOptions = [
+    { value: "xterm", label: "xterm.js" },
+    { value: "ghostty-web", label: "ghostty-web" },
+  ];
 
   let draftReady = $state(false);
   let saving = $state(false);
@@ -70,6 +75,9 @@
     DEFAULT_TERMINAL_SETTINGS.font_ligatures,
   );
   let rendererDraft = $state<TerminalSettingsType["renderer"]>("xterm");
+  let hideTmuxStatusDraft = $state(
+    DEFAULT_TERMINAL_SETTINGS.hide_tmux_status,
+  );
   let fontDialogOpen = $state(false);
   let localFonts = $state<FontData[] | null>(null);
   let fontLoadError = $state<string | null>(null);
@@ -144,6 +152,7 @@
       cursor_blink: cursorBlinkDraft,
       font_ligatures: fontLigaturesDraft,
       renderer: rendererDraft,
+      hide_tmux_status: hideTmuxStatusDraft,
     };
   }
 
@@ -160,7 +169,8 @@
       pendingTerminal.letter_spacing !== currentTerminal.letter_spacing ||
       pendingTerminal.cursor_blink !== currentTerminal.cursor_blink ||
       pendingTerminal.font_ligatures !== currentTerminal.font_ligatures ||
-      pendingTerminal.renderer !== currentTerminal.renderer,
+      pendingTerminal.renderer !== currentTerminal.renderer ||
+      pendingTerminal.hide_tmux_status !== currentTerminal.hide_tmux_status
   );
   const isDefaultDraft = $derived(
     pendingTerminal.font_family === DEFAULT_TERMINAL_SETTINGS.font_family &&
@@ -173,7 +183,9 @@
         DEFAULT_TERMINAL_SETTINGS.cursor_blink &&
       pendingTerminal.font_ligatures ===
         DEFAULT_TERMINAL_SETTINGS.font_ligatures &&
-      pendingTerminal.renderer === DEFAULT_TERMINAL_SETTINGS.renderer,
+      pendingTerminal.renderer === DEFAULT_TERMINAL_SETTINGS.renderer &&
+      pendingTerminal.hide_tmux_status ===
+        DEFAULT_TERMINAL_SETTINGS.hide_tmux_status
   );
   const xtermOnlyControlsEnabled = $derived(rendererDraft === "xterm");
   const canSave = $derived(!saving && isDirty);
@@ -205,6 +217,7 @@
     cursorBlinkDraft = value.cursor_blink;
     fontLigaturesDraft = value.font_ligatures;
     rendererDraft = value.renderer;
+    hideTmuxStatusDraft = value.hide_tmux_status;
   }
 
   $effect(() => {
@@ -375,18 +388,19 @@
       />
     </label>
 
-    <label class="renderer-field" for="terminal-renderer">
+    <div class="renderer-field">
       <span class="setting-label">Terminal renderer</span>
-      <select
-        id="terminal-renderer"
-        class="renderer-select"
-        bind:value={rendererDraft}
+      <SelectDropdown
+        class="renderer-dropdown"
+        value={rendererDraft}
+        options={rendererOptions}
+        onchange={(value) => {
+          rendererDraft = value as TerminalSettingsType["renderer"];
+        }}
+        title="Terminal renderer"
         disabled={saving}
-      >
-        <option value="xterm">xterm.js</option>
-        <option value="ghostty-web">ghostty-web</option>
-      </select>
-    </label>
+      />
+    </div>
   </div>
 
   <label class="toggle-field">
@@ -405,6 +419,15 @@
       disabled={saving || !xtermOnlyControlsEnabled}
     />
     <span>Font ligatures</span>
+  </label>
+
+  <label class="toggle-field">
+    <input
+      type="checkbox"
+      bind:checked={hideTmuxStatusDraft}
+      disabled={saving}
+    />
+    <span>Hide tmux status line in new sessions</span>
   </label>
 
   <div class="setting-actions">
@@ -559,8 +582,7 @@
   }
 
   .font-input,
-  .number-input,
-  .renderer-select {
+  .number-input {
     width: 100%;
     height: 28px;
     border: 1px solid var(--border-default);
@@ -574,6 +596,11 @@
 
   .font-input {
     font-family: var(--font-mono);
+  }
+
+  .renderer-field :global(.renderer-dropdown) {
+    width: 100%;
+    min-width: 0;
   }
 
   .toggle-field {

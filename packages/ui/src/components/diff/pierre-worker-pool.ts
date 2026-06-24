@@ -19,7 +19,7 @@ export function getPierreDiffWorkerPool(): WorkerPoolManager | undefined {
   return getOrCreateWorkerPoolSingleton({
     poolOptions: {
       workerFactory: () =>
-        new Worker(new URL("@pierre/diffs/worker/worker.js", import.meta.url), {
+        new Worker(new URL("./pierre-diff-worker-entry.js", import.meta.url), {
           type: "module",
         }),
       poolSize: 4,
@@ -29,7 +29,6 @@ export function getPierreDiffWorkerPool(): WorkerPoolManager | undefined {
       theme: { dark: "pierre-dark", light: "pierre-light" },
       lineDiffType: "word",
       tokenizeMaxLineLength: diffTokenizeMaxLineLength,
-      langs: ["bash", "css", "go", "html", "javascript", "json", "markdown", "sql", "toml", "typescript", "yaml"],
     },
   });
 }

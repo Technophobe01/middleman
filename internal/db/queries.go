@@ -11,13 +11,18 @@ import (
 )
 
 // listSearchCondition returns a SQL condition and args for a free-text search.
-// The title is searched as "#{number} {title}" so substring queries can match
-// the number, the title, or both at once (e.g. "278" hits "#278 fix bug").
-// Author is matched separately. Labels are matched by name for list aliases
-// with item-label join tables. The alias is the table alias used in the
-// surrounding query (e.g. "p" for merge requests, "i" for issues).
+// Unquoted whitespace-separated terms are ANDed. Within each term, the title
+// is searched as "#{number} {title}" so substring queries can match the
+// number, the title, or both at once (e.g. "278" hits "#278 fix bug").
+// Author and repository path/name are matched separately. Labels are matched
+// by name for list aliases with item-label join tables. The alias is the table
+// alias used in the surrounding query (e.g. "p" for merge requests, "i" for
+// issues), and the repository table must be joined as alias "r".
 func listSearchCondition(alias, search string) (string, []any) {
-	like := "%" + search + "%"
+	terms := listSearchTerms(search)
+	if len(terms) == 0 {
+		return "", nil
+	}
 	labelCondition := ""
 	switch alias {
 	case "p":
@@ -41,15 +46,58 @@ func listSearchCondition(alias, search string) (string, []any) {
 			alias,
 		)
 	}
-	cond := fmt.Sprintf(
-		"(('#' || %s.number || ' ' || %s.title) LIKE ? OR %s.author LIKE ?%s)",
+	termCondition := fmt.Sprintf(
+		"(('#' || %s.number || ' ' || %s.title) LIKE ? OR %s.author LIKE ? OR r.repo_path LIKE ? OR r.owner LIKE ? OR r.name LIKE ?%s)",
 		alias, alias, alias, labelCondition,
 	)
-	args := []any{like, like}
-	if labelCondition != "" {
-		args = append(args, like)
+	conds := make([]string, 0, len(terms))
+	args := make([]any, 0, len(terms)*6)
+	for _, term := range terms {
+		conds = append(conds, termCondition)
+		like := "%" + term + "%"
+		args = append(args, like, like, like, like, like)
+		if labelCondition != "" {
+			args = append(args, like)
+		}
 	}
-	return cond, args
+	return "(" + strings.Join(conds, " AND ") + ")", args
+}
+
+func listSearchTerms(search string) []string {
+	var terms []string
+	var b strings.Builder
+	var quote rune
+
+	flush := func() {
+		term := strings.TrimSpace(b.String())
+		if term != "" {
+			terms = append(terms, term)
+		}
+		b.Reset()
+	}
+
+	for _, r := range search {
+		switch {
+		case quote != 0:
+			if r == quote {
+				quote = 0
+				continue
+			}
+			b.WriteRune(r)
+		case r == '"' || r == '\'':
+			if b.Len() == 0 {
+				quote = r
+				continue
+			}
+			b.WriteRune(r)
+		case r == ' ' || r == '\t' || r == '\n' || r == '\r':
+			flush()
+		default:
+			b.WriteRune(r)
+		}
+	}
+	flush()
+	return terms
 }
 
 func appendLimitOffset(query string, args *[]any, limit, offset int) string {
@@ -93,6 +141,14 @@ func canonicalRepoLookupIdentifier(host, owner, name string) (string, string, st
 		strings.ToLower(strings.TrimSpace(name))
 }
 
+func canonicalRepoPlatform(platform string) string {
+	platform = strings.ToLower(strings.TrimSpace(platform))
+	if platform == "" {
+		return "github"
+	}
+	return platform
+}
+
 func canonicalRepoPathKey(path string) string {
 	parts := strings.Split(strings.Trim(path, "/ "), "/")
 	kept := parts[:0]
@@ -122,6 +178,10 @@ func repoListFilterCondition(repoAlias string, filters []RepoFilter, args *[]any
 	for _, filter := range filters {
 		var clauses []string
 		if filter.RepoPath != "" {
+			if filter.Platform != "" {
+				clauses = append(clauses, repoAlias+".platform = ?")
+				*args = append(*args, strings.ToLower(strings.TrimSpace(filter.Platform)))
+			}
 			if filter.PlatformHost != "" {
 				host, _, _ := canonicalRepoLookupIdentifier(filter.PlatformHost, "", "")
 				clauses = append(clauses, repoAlias+".platform_host = ?")
@@ -133,6 +193,10 @@ func repoListFilterCondition(repoAlias string, filters []RepoFilter, args *[]any
 			_, owner, name := canonicalRepoLookupIdentifier(
 				"", filter.RepoOwner, filter.RepoName,
 			)
+			if filter.Platform != "" {
+				clauses = append(clauses, repoAlias+".platform = ?")
+				*args = append(*args, strings.ToLower(strings.TrimSpace(filter.Platform)))
+			}
 			if filter.PlatformHost != "" {
 				host, _, _ := canonicalRepoLookupIdentifier(filter.PlatformHost, "", "")
 				clauses = append(clauses, repoAlias+".platform_host = ?")
@@ -161,10 +225,7 @@ func GitHubRepoIdentity(host, owner, name string) RepoIdentity {
 }
 
 func canonicalRepoIdentity(identity RepoIdentity) RepoIdentity {
-	identity.Platform = strings.ToLower(strings.TrimSpace(identity.Platform))
-	if identity.Platform == "" {
-		identity.Platform = "github"
-	}
+	identity.Platform = canonicalRepoPlatform(identity.Platform)
 	identity.PlatformHost = strings.ToLower(strings.TrimSpace(identity.PlatformHost))
 	if identity.PlatformHost == "" && identity.Platform == "github" {
 		identity.PlatformHost = "github.com"
@@ -2438,7 +2499,11 @@ func (d *DB) ListMergeRequests(ctx context.Context, opts ListMergeRequestsOpts) 
 		args = append(args, owner, name)
 	}
 	if opts.KanbanState != "" {
-		conds = append(conds, "COALESCE(k.status, '') = ?")
+		if opts.KanbanState == string(KanbanStatusNew) {
+			conds = append(conds, "COALESCE(k.status, 'new') = ?")
+		} else {
+			conds = append(conds, "k.status = ?")
+		}
 		args = append(args, opts.KanbanState)
 	}
 	if opts.Starred {
@@ -2446,8 +2511,10 @@ func (d *DB) ListMergeRequests(ctx context.Context, opts ListMergeRequestsOpts) 
 	}
 	if opts.Search != "" {
 		cond, condArgs := listSearchCondition("p", opts.Search)
-		conds = append(conds, cond)
-		args = append(args, condArgs...)
+		if cond != "" {
+			conds = append(conds, cond)
+			args = append(args, condArgs...)
+		}
 	}
 
 	where := ""
@@ -3116,6 +3183,54 @@ func (d *DB) UpdateMRState(
 	return nil
 }
 
+// UpdateMRDraftState records a provider-confirmed draft flag without
+// treating the mutation response as a full merge-request snapshot.
+func (d *DB) UpdateMRDraftState(ctx context.Context, repoID int64, number int, isDraft bool) error {
+	tx, err := d.rw.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin update mr draft state: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var updatedAt time.Time
+	var lastActivityAt time.Time
+	if err := tx.QueryRowContext(ctx, `
+		SELECT updated_at, last_activity_at
+		FROM middleman_merge_requests
+		WHERE repo_id = ? AND number = ?`,
+		repoID, number,
+	).Scan(&updatedAt, &lastActivityAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("update mr draft state: %w", sql.ErrNoRows)
+		}
+		return fmt.Errorf("load mr draft state timestamps: %w", err)
+	}
+
+	mutationAt := time.Now().UTC()
+	if !mutationAt.After(updatedAt) {
+		mutationAt = updatedAt.Add(time.Nanosecond)
+	}
+	activityAt := mutationAt
+	if lastActivityAt.After(activityAt) {
+		activityAt = lastActivityAt
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+			UPDATE middleman_merge_requests
+			SET is_draft = ?,
+			    updated_at = ?,
+			    last_activity_at = ?
+			WHERE repo_id = ? AND number = ?`,
+		isDraft, mutationAt, activityAt, repoID, number,
+	); err != nil {
+		return fmt.Errorf("update mr draft state: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit update mr draft state: %w", err)
+	}
+	return nil
+}
+
 // --- Issues ---
 
 // UpsertIssue inserts or updates an issue, returning its internal ID. Before
@@ -3299,8 +3414,10 @@ func (d *DB) ListIssues(
 	}
 	if opts.Search != "" {
 		cond, condArgs := listSearchCondition("i", opts.Search)
-		conds = append(conds, cond)
-		args = append(args, condArgs...)
+		if cond != "" {
+			conds = append(conds, cond)
+			args = append(args, condArgs...)
+		}
 	}
 	if opts.Assignee != "" {
 		// Query JSON array structurally to avoid LIKE wildcard injection.
@@ -3871,9 +3988,10 @@ func (d *DB) ListIssueEvents(ctx context.Context, issueID int64) ([]IssueEvent, 
 // ListCommentAutocompleteUsers returns repo-scoped username suggestions for comment mentions.
 func (d *DB) ListCommentAutocompleteUsers(
 	ctx context.Context,
-	platformHost, owner, name, query string,
+	platform, platformHost, owner, name, query string,
 	limit int,
 ) ([]string, error) {
+	platform = canonicalRepoPlatform(platform)
 	platformHost, owner, name = canonicalRepoLookupIdentifier(platformHost, owner, name)
 	if limit <= 0 {
 		limit = 10
@@ -3886,7 +4004,7 @@ func (d *DB) ListCommentAutocompleteUsers(
 		WITH repo AS (
 			SELECT id
 			FROM middleman_repos
-			WHERE platform_host = ? AND owner_key = ? AND name_key = ?
+			WHERE platform = ? AND platform_host = ? AND owner_key = ? AND name_key = ?
 		), candidates AS (
 			SELECT mr.author AS login, mr.last_activity_at AS last_seen
 			FROM middleman_merge_requests mr
@@ -3919,7 +4037,7 @@ func (d *DB) ListCommentAutocompleteUsers(
 			last_seen DESC,
 			login ASC
 		LIMIT ?`,
-		platformHost, owner, name,
+		platform, platformHost, owner, name,
 		query, containsQuery,
 		query, prefixQuery,
 		limit,
@@ -3946,9 +4064,10 @@ func (d *DB) ListCommentAutocompleteUsers(
 // ListCommentAutocompleteReferences returns repo-scoped item reference suggestions.
 func (d *DB) ListCommentAutocompleteReferences(
 	ctx context.Context,
-	platformHost, owner, name, query, itemKind string,
+	platform, platformHost, owner, name, query, itemKind string,
 	limit int,
 ) ([]CommentAutocompleteReference, error) {
+	platform = canonicalRepoPlatform(platform)
 	platformHost, owner, name = canonicalRepoLookupIdentifier(platformHost, owner, name)
 	if limit <= 0 {
 		limit = 10
@@ -3962,7 +4081,7 @@ func (d *DB) ListCommentAutocompleteReferences(
 		WITH repo AS (
 			SELECT id
 			FROM middleman_repos
-			WHERE platform_host = ? AND owner_key = ? AND name_key = ?
+			WHERE platform = ? AND platform_host = ? AND owner_key = ? AND name_key = ?
 		), candidates AS (
 			SELECT 'pull' AS kind, mr.number, mr.title, mr.state, mr.last_activity_at
 			FROM middleman_merge_requests mr
@@ -3986,7 +4105,7 @@ func (d *DB) ListCommentAutocompleteReferences(
 			last_activity_at DESC,
 			number DESC
 		LIMIT ?`,
-		platformHost, owner, name,
+		platform, platformHost, owner, name,
 		itemKind, itemKind,
 		query, numberPrefix, titleQuery,
 		query, numberPrefix,
@@ -4334,6 +4453,26 @@ func (d *DB) GetRepoByHostOwnerName(
 	return &r, nil
 }
 
+// CountReposByHostOwnerName returns how many provider identities share a
+// host/owner/name lookup key.
+func (d *DB) CountReposByHostOwnerName(
+	ctx context.Context,
+	host, owner, name string,
+) (int, error) {
+	host, owner, name = canonicalRepoIdentifier(host, owner, name)
+	var count int
+	err := d.ro.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM middleman_repos
+		WHERE platform_host = ? AND owner_key = ? AND name_key = ?`,
+		host, owner, name,
+	).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count repos by host/owner/name: %w", err)
+	}
+	return count, nil
+}
+
 // --- Workspaces ---
 
 func canonicalWorkspacePlatform(provider string) string {
@@ -4446,6 +4585,27 @@ func (d *DB) GetWorkspaceByMR(
 	platformHost, owner, name string,
 	mrNumber int,
 ) (*Workspace, error) {
+	return d.getWorkspaceByMR(ctx, "", platformHost, owner, name, mrNumber)
+}
+
+// GetWorkspaceByMRForProvider returns the workspace for a specific MR within a
+// provider identity, or nil if not found.
+func (d *DB) GetWorkspaceByMRForProvider(
+	ctx context.Context,
+	provider, platformHost, owner, name string,
+	mrNumber int,
+) (*Workspace, error) {
+	return d.getWorkspaceByMR(
+		ctx, provider, platformHost, owner, name, mrNumber,
+	)
+}
+
+func (d *DB) getWorkspaceByMR(
+	ctx context.Context,
+	provider, platformHost, owner, name string,
+	mrNumber int,
+) (*Workspace, error) {
+	provider = strings.ToLower(strings.TrimSpace(provider))
 	platformHost, owner, name = canonicalRepoLookupIdentifier(platformHost, owner, name)
 	var ws Workspace
 	err := d.ro.QueryRowContext(ctx, `
@@ -4454,10 +4614,12 @@ func (d *DB) GetWorkspaceByMR(
 		       git_head_ref, mr_head_repo, workspace_branch,
 		       worktree_path, tmux_session, terminal_backend, status,
 		       error_message, created_at
-		FROM middleman_workspaces
-		WHERE platform_host = ? AND repo_owner_key = ?
-		  AND repo_name_key = ? AND item_type = ? AND item_number = ?`,
+			FROM middleman_workspaces
+			WHERE platform_host = ? AND repo_owner_key = ?
+			  AND repo_name_key = ? AND item_type = ? AND item_number = ?
+			  AND (? = '' OR platform = ?)`,
 		platformHost, owner, name, WorkspaceItemTypePullRequest, mrNumber,
+		provider, provider,
 	).Scan(
 		&ws.ID, &ws.Platform, &ws.PlatformHost, &ws.RepoOwner, &ws.RepoName,
 		&ws.ItemType, &ws.ItemNumber, &ws.AssociatedPRNumber,
@@ -4482,6 +4644,27 @@ func (d *DB) GetWorkspaceByIssue(
 	platformHost, owner, name string,
 	issueNumber int,
 ) (*Workspace, error) {
+	return d.getWorkspaceByIssue(ctx, "", platformHost, owner, name, issueNumber)
+}
+
+// GetWorkspaceByIssueForProvider returns the workspace for a specific issue
+// within a provider identity, or nil if not found.
+func (d *DB) GetWorkspaceByIssueForProvider(
+	ctx context.Context,
+	provider, platformHost, owner, name string,
+	issueNumber int,
+) (*Workspace, error) {
+	return d.getWorkspaceByIssue(
+		ctx, provider, platformHost, owner, name, issueNumber,
+	)
+}
+
+func (d *DB) getWorkspaceByIssue(
+	ctx context.Context,
+	provider, platformHost, owner, name string,
+	issueNumber int,
+) (*Workspace, error) {
+	provider = strings.ToLower(strings.TrimSpace(provider))
 	platformHost, owner, name = canonicalRepoLookupIdentifier(platformHost, owner, name)
 	var ws Workspace
 	err := d.ro.QueryRowContext(ctx, `
@@ -4492,8 +4675,10 @@ func (d *DB) GetWorkspaceByIssue(
 		       error_message, created_at
 		FROM middleman_workspaces
 		WHERE platform_host = ? AND repo_owner_key = ?
-		  AND repo_name_key = ? AND item_type = ? AND item_number = ?`,
+		  AND repo_name_key = ? AND item_type = ? AND item_number = ?
+		  AND (? = '' OR platform = ?)`,
 		platformHost, owner, name, WorkspaceItemTypeIssue, issueNumber,
+		provider, provider,
 	).Scan(
 		&ws.ID, &ws.Platform, &ws.PlatformHost, &ws.RepoOwner, &ws.RepoName,
 		&ws.ItemType, &ws.ItemNumber, &ws.AssociatedPRNumber,
@@ -4704,19 +4889,20 @@ func (d *DB) UpsertWorkspaceRuntimeSession(
 	}
 	_, err := d.rw.ExecContext(ctx, `
 		INSERT INTO middleman_workspace_runtime_sessions
-		    (workspace_id, session_key, target_key, label, kind, scope,
+		    (workspace_id, session_key, target_key, label, kind, display_region, scope,
 		     tmux_session, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(workspace_id, session_key) DO UPDATE SET
 		    target_key = excluded.target_key,
 		    label = excluded.label,
 		    kind = excluded.kind,
+		    display_region = excluded.display_region,
 		    scope = excluded.scope,
 		    tmux_session = excluded.tmux_session,
 		    created_at = excluded.created_at`,
 		session.WorkspaceID, session.SessionKey, session.TargetKey,
-		session.Label, session.Kind, session.Scope, session.TmuxSession,
-		createdAt,
+		session.Label, session.Kind, session.DisplayRegion, session.Scope,
+		session.TmuxSession, createdAt,
 	)
 	if err != nil {
 		return fmt.Errorf("upsert workspace runtime session: %w", err)
@@ -4731,7 +4917,7 @@ func (d *DB) ListWorkspaceRuntimeSessions(
 	workspaceID string,
 ) ([]WorkspaceRuntimeSession, error) {
 	rows, err := d.ro.QueryContext(ctx, `
-		SELECT workspace_id, session_key, target_key, label, kind, scope,
+		SELECT workspace_id, session_key, target_key, label, kind, display_region, scope,
 		       tmux_session, created_at
 		FROM middleman_workspace_runtime_sessions
 		WHERE workspace_id = ?
@@ -4751,7 +4937,7 @@ func (d *DB) ListAllWorkspaceRuntimeSessions(
 	ctx context.Context,
 ) ([]WorkspaceRuntimeSession, error) {
 	rows, err := d.ro.QueryContext(ctx, `
-		SELECT workspace_id, session_key, target_key, label, kind, scope,
+		SELECT workspace_id, session_key, target_key, label, kind, display_region, scope,
 		       tmux_session, created_at
 		FROM middleman_workspace_runtime_sessions
 		ORDER BY workspace_id, created_at, session_key`,
@@ -4771,7 +4957,7 @@ func (d *DB) ListWorkspaceRuntimeTmuxSessions(
 	workspaceID string,
 ) ([]WorkspaceRuntimeSession, error) {
 	rows, err := d.ro.QueryContext(ctx, `
-		SELECT workspace_id, session_key, target_key, label, kind, scope,
+		SELECT workspace_id, session_key, target_key, label, kind, display_region, scope,
 		       tmux_session, created_at
 		FROM middleman_workspace_runtime_sessions
 		WHERE workspace_id = ? AND tmux_session != ''
@@ -4791,7 +4977,7 @@ func (d *DB) ListAllWorkspaceRuntimeTmuxSessions(
 	ctx context.Context,
 ) ([]WorkspaceRuntimeSession, error) {
 	rows, err := d.ro.QueryContext(ctx, `
-		SELECT workspace_id, session_key, target_key, label, kind, scope,
+		SELECT workspace_id, session_key, target_key, label, kind, display_region, scope,
 		       tmux_session, created_at
 		FROM middleman_workspace_runtime_sessions
 		WHERE tmux_session != ''
@@ -4838,7 +5024,8 @@ func scanWorkspaceRuntimeSessions(
 		if err := rows.Scan(
 			&session.WorkspaceID, &session.SessionKey,
 			&session.TargetKey, &session.Label, &session.Kind,
-			&session.Scope, &session.TmuxSession, &session.CreatedAt,
+			&session.DisplayRegion, &session.Scope, &session.TmuxSession,
+			&session.CreatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("scan workspace runtime session: %w", err)
 		}

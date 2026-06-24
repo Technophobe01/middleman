@@ -89,11 +89,21 @@ afterAll(() => {
 });
 
 import DiffFile from "./DiffFile.svelte";
+import diffRichPreviewSource from "./DiffRichPreview.svelte?raw";
 import type { DiffFile as DiffFileType, FilePreview } from "../../api/types.js";
 import { STORES_KEY } from "../../context.js";
 import type { DiffReviewDraftComment, DiffReviewLineRange } from "../../stores/diff-review-draft.svelte.js";
 import { createDiffStore } from "../../stores/diff.svelte.js";
+import { renderedCodeSide } from "./pierre-dom.js";
 import type { ReviewThread } from "./review-thread-context.js";
+
+type LoadFilePreview = (
+  owner: string,
+  name: string,
+  number: number,
+  path: string,
+  side?: "old" | "new",
+) => Promise<FilePreview>;
 
 function makeFile(overrides: Partial<DiffFileType> = {}): DiffFileType {
   return {
@@ -132,6 +142,82 @@ function makeFile(overrides: Partial<DiffFileType> = {}): DiffFileType {
     ],
     ...overrides,
   };
+}
+
+function makeTwoAdditionFile(): DiffFileType {
+  return makeFile({
+    additions: 2,
+    deletions: 1,
+    patch: `diff --git a/src/foo.ts b/src/foo.ts
+--- a/src/foo.ts
++++ b/src/foo.ts
+@@ -1,2 +1,3 @@
+ line 1
+-old line
++new line
++newer line
+`,
+    hunks: [
+      {
+        old_start: 1,
+        old_count: 2,
+        new_start: 1,
+        new_count: 3,
+        lines: [
+          {
+            type: "context",
+            content: "line 1",
+            old_num: 1,
+            new_num: 1,
+          },
+          { type: "delete", content: "old line", old_num: 2 },
+          { type: "add", content: "new line", new_num: 2 },
+          { type: "add", content: "newer line", new_num: 3 },
+        ],
+      },
+    ],
+  });
+}
+
+function makeAddedConfigFile(): DiffFileType {
+  return makeFile({
+    path: ".github/ISSUE_TEMPLATE/config.yml",
+    old_path: ".github/ISSUE_TEMPLATE/config.yml",
+    status: "added",
+    additions: 4,
+    deletions: 0,
+    patch: `diff --git a/.github/ISSUE_TEMPLATE/config.yml b/.github/ISSUE_TEMPLATE/config.yml
+--- /dev/null
++++ b/.github/ISSUE_TEMPLATE/config.yml
+@@ -0,0 +1,4 @@
++# Route every new issue through one of the templates above.
++# Discussions is enabled for this repo, add a contact_links entry pointing
++# usage/"how do I" questions there instead of the issue tracker.
++blank_issues_enabled: false
+`,
+    hunks: [
+      {
+        old_start: 0,
+        old_count: 0,
+        new_start: 1,
+        new_count: 4,
+        lines: [
+          { type: "add", content: "# Route every new issue through one of the templates above.", new_num: 1 },
+          {
+            type: "add",
+            content: "# Discussions is enabled for this repo, add a contact_links entry pointing",
+            new_num: 2,
+          },
+          {
+            type: "add",
+            content: '# usage/"how do I" questions there instead of the issue tracker.',
+            new_num: 3,
+          },
+          { type: "add", content: "blank_issues_enabled: false", new_num: 4 },
+        ],
+      },
+    ],
+  });
 }
 
 function makeReviewThread(overrides: Partial<ReviewThread> = {}): ReviewThread {
@@ -173,6 +259,8 @@ function renderDiffFile(
     reviewThreads?: ReviewThread[];
     createComment?: (body: string, range: DiffReviewLineRange) => Promise<boolean>;
     canReplyToThreads?: boolean;
+    viewMode?: "unified" | "split";
+    loadFilePreview?: LoadFilePreview;
     replyToDiscussion?: (
       owner: string,
       name: string,
@@ -184,6 +272,8 @@ function renderDiffFile(
 ) {
   const diff = createDiffStore();
   if (options.richPreview) diff.setRichPreview(true);
+  if (options.viewMode) diff.setViewMode(options.viewMode);
+  if (options.loadFilePreview) vi.spyOn(diff, "loadFilePreview").mockImplementation(options.loadFilePreview);
   const diffReviewDraft = {
     getComments: () => options.draftComments ?? [],
     isSubmitting: () => false,
@@ -252,6 +342,8 @@ function textPreview(path: string, text: string): FilePreview {
 describe("DiffFile", () => {
   afterEach(() => {
     cleanup();
+    localStorage.removeItem("diff-rich-preview");
+    localStorage.removeItem("diff-view-mode");
   });
 
   async function expectPierreDiffText(pattern: RegExp): Promise<void> {
@@ -345,6 +437,129 @@ describe("DiffFile", () => {
     await expectPierreDiffText(/old linenew line/);
   });
 
+  it("renders markdown rich preview as a unified annotated document by default", async () => {
+    renderDiffFile(makeFile({ path: "README.md", old_path: "README.md" }), {
+      richPreview: true,
+    });
+
+    await waitFor(() => {
+      expect(screen.queryByLabelText("Before markdown preview")).toBeNull();
+      expect(screen.queryByLabelText("After markdown preview")).toBeNull();
+      expect(document.querySelector(".markdown-rich-diff--unified del")?.textContent).toBe("old");
+      expect(document.querySelector(".markdown-rich-diff--unified ins")?.textContent).toBe("new");
+    });
+  });
+
+  it("keeps structural markdown rich preview changes visibly highlighted", async () => {
+    renderDiffFile(
+      makeFile({
+        path: "README.md",
+        old_path: "README.md",
+        hunks: [
+          {
+            old_start: 1,
+            old_count: 2,
+            new_start: 1,
+            new_count: 2,
+            lines: [
+              { type: "delete", content: "- Removed", old_num: 1 },
+              { type: "context", content: "- Keep", old_num: 2, new_num: 1 },
+              { type: "add", content: "- Added", new_num: 2 },
+            ],
+          },
+        ],
+      }),
+      { richPreview: true },
+    );
+
+    await waitFor(() => {
+      const preview = document.querySelector(".markdown-rich-diff--unified");
+      expect(preview?.querySelector('li.markdown-diff__structural[data-diff-kind="delete"] > del')?.textContent).toBe(
+        "Removed",
+      );
+      expect(preview?.querySelector('li.markdown-diff__structural[data-diff-kind="insert"] > ins')?.textContent).toBe(
+        "Added",
+      );
+    });
+    expect(diffRichPreviewSource).toMatch(
+      /\.markdown-diff__structural\[data-diff-kind="delete"\][\s\S]*background: var\(--diff-del-bg\);/,
+    );
+    expect(diffRichPreviewSource).toMatch(
+      /\.markdown-diff__structural\[data-diff-kind="insert"\][\s\S]*background: var\(--diff-add-bg\);/,
+    );
+  });
+
+  it("keeps markdown rich preview side by side when split diff mode is enabled", async () => {
+    renderDiffFile(makeFile({ path: "README.md", old_path: "README.md" }), {
+      richPreview: true,
+      viewMode: "split",
+    });
+
+    await waitFor(() => {
+      const beforePreview = document.querySelector('[data-markdown-rich-side="before"]');
+      const afterPreview = document.querySelector('[data-markdown-rich-side="after"]');
+
+      expect(beforePreview?.querySelector("del")?.textContent).toBe("old");
+      expect(beforePreview?.querySelector("ins")).toBeNull();
+      expect(afterPreview?.querySelector("del")).toBeNull();
+      expect(afterPreview?.querySelector("ins")?.textContent).toBe("new");
+    });
+    expect(diffRichPreviewSource).toMatch(
+      /@media \(max-width: 760px\)[\s\S]*\.markdown-rich-diff__split-header,\s*\.markdown-rich-diff__split-row[\s\S]*grid-template-columns: minmax\(0, 1fr\);/,
+    );
+  });
+
+  it("keeps non-Markdown rich preview review cards visible while loading", async () => {
+    let resolvePreview: (preview: FilePreview) => void = () => {};
+    renderDiffFile(makeFile({ path: "assets/chart.png", old_path: "assets/chart.png" }), {
+      richPreview: true,
+      diffHeadSHA: "diff-head",
+      loadFilePreview: () =>
+        new Promise<FilePreview>((resolve) => {
+          resolvePreview = resolve;
+        }),
+      reviewThreads: [
+        makeReviewThread({
+          path: "assets/chart.png",
+          old_path: "assets/chart.png",
+          body: "Loading non-markdown review note",
+          diff_head_sha: "diff-head",
+        }),
+      ],
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText("Loading preview")).toBeTruthy();
+    });
+    expect(screen.getByText("Loading non-markdown review note")).toBeTruthy();
+
+    resolvePreview(textPreview("assets/chart.png", "preview content"));
+    await waitFor(() => {
+      expect(screen.getByText("preview content")).toBeTruthy();
+    });
+  });
+
+  it("keeps non-Markdown rich preview review cards visible after preview errors", async () => {
+    renderDiffFile(makeFile({ path: "assets/chart.png", old_path: "assets/chart.png" }), {
+      richPreview: true,
+      diffHeadSHA: "diff-head",
+      loadFilePreview: () => Promise.reject(new Error("preview failed")),
+      reviewThreads: [
+        makeReviewThread({
+          path: "assets/chart.png",
+          old_path: "assets/chart.png",
+          body: "Error non-markdown review note",
+          diff_head_sha: "diff-head",
+        }),
+      ],
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText("preview failed")).toBeTruthy();
+    });
+    expect(screen.getByText("Error non-markdown review note")).toBeTruthy();
+  });
+
   it("hides content after clicking the header to collapse", async () => {
     renderDiffFile(makeFile());
 
@@ -423,6 +638,11 @@ describe("DiffFile", () => {
     return document.querySelector(".pierre-diff")?.shadowRoot?.querySelectorAll("[data-selected-line]");
   }
 
+  function splitColumnSide(element: Element | null | undefined): "additions" | "deletions" | null {
+    const code = element?.closest("code");
+    return code ? (renderedCodeSide(code) ?? null) : null;
+  }
+
   function expandedContextLineTexts(): string[] {
     return Array.from(
       document
@@ -476,6 +696,66 @@ describe("DiffFile", () => {
 
     expect(screen.queryByPlaceholderText("Leave a comment")).toBeNull();
     expect(selectedPierreLines()).toHaveLength(0);
+  });
+
+  it("keeps the final line visible when opening an inline composer", async () => {
+    renderDiffFile(makeAddedConfigFile(), {
+      reviewEnabled: true,
+      diffHeadSHA: "diff-head",
+    });
+
+    await clickLineCommentButton(4, "right");
+    await waitFor(() => expect(screen.getByPlaceholderText("Leave a comment")).toBeTruthy());
+
+    const root = document.querySelector(".pierre-diff")?.shadowRoot;
+    const lineTargets = Array.from(root?.querySelectorAll<HTMLElement>('[data-diff-new-line="4"]') ?? []);
+    expect(lineTargets.some((line) => line.textContent?.includes("blank_issues_enabled: false"))).toBe(true);
+
+    await waitFor(() => {
+      const slot = root?.querySelector<HTMLSlotElement>('slot[name="annotation-additions-4"]');
+      expect(slot).toBeTruthy();
+      expect(slot?.closest('[data-diff-new-line="4"]')).toBeNull();
+    });
+  });
+
+  it("keeps right-side inline composers in the additions column in split mode", async () => {
+    renderDiffFile(makeTwoAdditionFile(), {
+      reviewEnabled: true,
+      diffHeadSHA: "diff-head",
+      viewMode: "split",
+    });
+
+    async function assertRightSideComposer(line: number): Promise<void> {
+      const button = await findLineCommentButton(line, "right");
+      expect(splitColumnSide(button)).toBe("additions");
+
+      await clickLineCommentButton(line, "right");
+
+      await waitFor(() => {
+        expect(screen.getByPlaceholderText("Leave a comment")).toBeTruthy();
+        const slot = document
+          .querySelector(".pierre-diff")
+          ?.shadowRoot?.querySelector<HTMLSlotElement>(`slot[name="annotation-additions-${line}"]`);
+        expect(splitColumnSide(slot)).toBe("additions");
+      });
+
+      await fireEvent.click(screen.getByText("Cancel"));
+      await waitFor(() => expect(screen.queryByPlaceholderText("Leave a comment")).toBeNull());
+    }
+
+    await assertRightSideComposer(2);
+    await assertRightSideComposer(3);
+  });
+
+  it("infers split column side from code-column order when non-code siblings are present", () => {
+    const pre = document.createElement("pre");
+    const deletions = document.createElement("code");
+    const separator = document.createElement("span");
+    const additions = document.createElement("code");
+    pre.append(deletions, separator, additions);
+
+    expect(renderedCodeSide(deletions)).toBe("deletions");
+    expect(renderedCodeSide(additions)).toBe("additions");
   });
 
   it("focuses the inline composer textarea exactly once after opening", async () => {
@@ -693,6 +973,863 @@ describe("DiffFile", () => {
       .querySelector("[data-review-thread-id='thread-1']")
       ?.closest("[slot='annotation-additions-2']");
     expect(host).toBeTruthy();
+  });
+
+  it("renders published review thread cards in markdown rich preview", async () => {
+    renderDiffFile(
+      makeFile({
+        path: "README.md",
+        old_path: "README.md",
+      }),
+      {
+        richPreview: true,
+        diffHeadSHA: "diff-head",
+        canReplyToThreads: true,
+        reviewThreads: [
+          makeReviewThread({
+            path: "README.md",
+            old_path: "README.md",
+            body: "Published review note in rich preview",
+            diff_head_sha: "diff-head",
+          }),
+        ],
+      },
+    );
+
+    await waitFor(() => {
+      expect(document.querySelector(".markdown-rich-diff--unified")).toBeTruthy();
+    });
+    expect(screen.getByText("Published review note in rich preview")).toBeTruthy();
+    const comment = document.querySelector("[data-review-thread-id='thread-1']");
+    expect(comment?.closest("[slot^='annotation-']")).toBeNull();
+    expect(comment?.closest(".markdown-rich-diff--unified")).toBeTruthy();
+  });
+
+  it("keeps markdown rich preview review threads visible when hunk lines are null", async () => {
+    renderDiffFile(
+      makeFile({
+        path: "README.md",
+        old_path: "README.md",
+        additions: 0,
+        deletions: 0,
+        patch: "",
+        hunks: [
+          {
+            old_start: 1,
+            old_count: 0,
+            new_start: 1,
+            new_count: 0,
+            lines: null as unknown as DiffFileType["hunks"][number]["lines"],
+          },
+        ],
+      }),
+      {
+        richPreview: true,
+        diffHeadSHA: "diff-head",
+        reviewThreads: [
+          makeReviewThread({
+            path: "README.md",
+            old_path: "README.md",
+            line: 1,
+            new_line: 1,
+            body: "Nullable rich preview note",
+            diff_head_sha: "diff-head",
+          }),
+        ],
+      },
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("Nullable rich preview note")).toBeTruthy();
+    });
+    const comment = document.querySelector("[data-review-thread-id='thread-1']");
+    expect(comment?.closest(".markdown-rich-diff--unified")).toBeNull();
+    expect(comment?.classList.contains("inline-review-thread--file-level")).toBe(true);
+  });
+
+  it("orders markdown rich preview review cards by their target source line", async () => {
+    renderDiffFile(
+      makeFile({
+        path: "README.md",
+        old_path: "README.md",
+        hunks: [
+          {
+            old_start: 1,
+            old_count: 4,
+            new_start: 1,
+            new_count: 4,
+            lines: [
+              { type: "context", content: "- Issues", old_num: 1, new_num: 1 },
+              { type: "context", content: "- Actions", old_num: 2, new_num: 2 },
+              { type: "context", content: "- Statuses", old_num: 3, new_num: 3 },
+              { type: "context", content: "- Members", old_num: 4, new_num: 4 },
+            ],
+          },
+        ],
+      }),
+      {
+        richPreview: true,
+        diffHeadSHA: "diff-head",
+        reviewThreads: [
+          makeReviewThread({
+            id: "thread-actions",
+            provider_comment_id: "comment-actions",
+            path: "README.md",
+            old_path: "README.md",
+            line: 2,
+            new_line: 2,
+            body: "Actions review note",
+            diff_head_sha: "diff-head",
+          }),
+          makeReviewThread({
+            id: "thread-issues",
+            provider_comment_id: "comment-issues",
+            path: "README.md",
+            old_path: "README.md",
+            line: 1,
+            new_line: 1,
+            body: "Issues review note",
+            diff_head_sha: "diff-head",
+          }),
+        ],
+      },
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("Actions review note")).toBeTruthy();
+      expect(screen.getByText("Issues review note")).toBeTruthy();
+    });
+    const reviewBodies = Array.from(
+      document.querySelectorAll<HTMLElement>(".markdown-rich-diff--unified .review-thread-body"),
+    ).map((element) => element.textContent?.trim());
+    expect(reviewBodies).toEqual(["Issues review note", "Actions review note"]);
+    const issuesComment = document.querySelector("[data-review-thread-id='thread-issues']");
+    const actionsComment = document.querySelector("[data-review-thread-id='thread-actions']");
+    const splitLists = Array.from(document.querySelectorAll<HTMLElement>("ul.markdown-rich-diff__split-list"));
+    expect(splitLists).toHaveLength(3);
+    expect(splitLists.at(-1)?.textContent).toContain("Statuses");
+    expect(splitLists.at(-1)?.textContent).toContain("Members");
+    expect(issuesComment?.previousElementSibling?.textContent).toContain("Issues");
+    expect(issuesComment?.previousElementSibling?.textContent).not.toContain("Actions");
+    expect(actionsComment?.previousElementSibling?.textContent).toContain("Actions");
+    expect(actionsComment?.previousElementSibling?.textContent).not.toContain("Statuses");
+  });
+
+  it("keeps unchanged list siblings aligned when a review targets an added list item", async () => {
+    renderDiffFile(
+      makeFile({
+        path: "README.md",
+        old_path: "README.md",
+        hunks: [
+          {
+            old_start: 1,
+            old_count: 2,
+            new_start: 1,
+            new_count: 3,
+            lines: [
+              { type: "context", content: "- Issues", old_num: 1, new_num: 1 },
+              { type: "add", content: "- Actions", new_num: 2 },
+              { type: "context", content: "- Statuses", old_num: 2, new_num: 3 },
+            ],
+          },
+        ],
+      }),
+      {
+        richPreview: true,
+        diffHeadSHA: "diff-head",
+        reviewThreads: [
+          makeReviewThread({
+            id: "thread-actions",
+            provider_comment_id: "comment-actions",
+            path: "README.md",
+            old_path: "README.md",
+            line: 2,
+            new_line: 2,
+            body: "Actions review note",
+            diff_head_sha: "diff-head",
+          }),
+        ],
+      },
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("Actions review note")).toBeTruthy();
+    });
+    const preview = document.querySelector(".markdown-rich-diff--unified");
+    expect(preview?.querySelector("ins")?.textContent).toContain("Actions");
+    expect(preview?.querySelector("del")?.textContent ?? "").not.toContain("Statuses");
+    expect(preview?.querySelector("ins")?.textContent ?? "").not.toContain("Issues");
+    const actionsComment = document.querySelector("[data-review-thread-id='thread-actions']");
+    expect(actionsComment?.previousElementSibling?.textContent).toContain("Actions");
+    expect(actionsComment?.previousElementSibling?.textContent).not.toContain("Statuses");
+  });
+
+  it("keeps unchanged list siblings aligned when added list item review targets an edge", async () => {
+    for (const scenario of [
+      {
+        name: "prepended",
+        targetLine: 1,
+        oldCount: 2,
+        newCount: 3,
+        lines: [
+          { type: "add" as const, content: "- Actions", new_num: 1 },
+          { type: "context" as const, content: "- Issues", old_num: 1, new_num: 2 },
+          { type: "context" as const, content: "- Statuses", old_num: 2, new_num: 3 },
+        ],
+      },
+      {
+        name: "prepended continuation",
+        targetLine: 2,
+        oldCount: 2,
+        newCount: 4,
+        lines: [
+          { type: "add" as const, content: "- Actions", new_num: 1 },
+          { type: "add" as const, content: "still needs details", new_num: 2 },
+          { type: "context" as const, content: "- Issues", old_num: 1, new_num: 3 },
+          { type: "context" as const, content: "- Statuses", old_num: 2, new_num: 4 },
+        ],
+      },
+      {
+        name: "appended",
+        targetLine: 3,
+        oldCount: 2,
+        newCount: 3,
+        lines: [
+          { type: "context" as const, content: "- Issues", old_num: 1, new_num: 1 },
+          { type: "context" as const, content: "- Statuses", old_num: 2, new_num: 2 },
+          { type: "add" as const, content: "- Actions", new_num: 3 },
+        ],
+      },
+    ]) {
+      cleanup();
+      renderDiffFile(
+        makeFile({
+          path: "README.md",
+          old_path: "README.md",
+          hunks: [
+            {
+              old_start: 1,
+              old_count: scenario.oldCount,
+              new_start: 1,
+              new_count: scenario.newCount,
+              lines: scenario.lines,
+            },
+          ],
+        }),
+        {
+          richPreview: true,
+          diffHeadSHA: "diff-head",
+          reviewThreads: [
+            makeReviewThread({
+              id: `thread-actions-${scenario.name}`,
+              provider_comment_id: `comment-actions-${scenario.name}`,
+              path: "README.md",
+              old_path: "README.md",
+              line: scenario.targetLine,
+              new_line: scenario.targetLine,
+              body: `Actions ${scenario.name} review note`,
+              diff_head_sha: "diff-head",
+            }),
+          ],
+        },
+      );
+
+      await waitFor(() => {
+        expect(screen.getByText(`Actions ${scenario.name} review note`)).toBeTruthy();
+      });
+      const preview = document.querySelector(".markdown-rich-diff--unified");
+      expect(preview?.querySelector("ins")?.textContent).toContain("Actions");
+      expect(preview?.querySelector("ins")?.textContent ?? "").not.toContain("Issues");
+      expect(preview?.querySelector("ins")?.textContent ?? "").not.toContain("Statuses");
+      expect(preview?.querySelector("del")?.textContent ?? "").not.toContain("Issues");
+      expect(preview?.querySelector("del")?.textContent ?? "").not.toContain("Statuses");
+      const actionsComment = document.querySelector(`[data-review-thread-id='thread-actions-${scenario.name}']`);
+      expect(actionsComment?.previousElementSibling?.textContent).toContain("Actions");
+    }
+  });
+
+  it("keeps unchanged list siblings aligned when a review targets a deleted list item", async () => {
+    renderDiffFile(
+      makeFile({
+        path: "README.md",
+        old_path: "README.md",
+        hunks: [
+          {
+            old_start: 1,
+            old_count: 3,
+            new_start: 1,
+            new_count: 2,
+            lines: [
+              { type: "context", content: "- Issues", old_num: 1, new_num: 1 },
+              { type: "delete", content: "- Actions", old_num: 2 },
+              { type: "context", content: "- Statuses", old_num: 3, new_num: 2 },
+            ],
+          },
+        ],
+      }),
+      {
+        richPreview: true,
+        diffHeadSHA: "diff-head",
+        reviewThreads: [
+          makeReviewThread({
+            id: "thread-actions",
+            provider_comment_id: "comment-actions",
+            path: "README.md",
+            old_path: "README.md",
+            side: "left",
+            line: 2,
+            old_line: 2,
+            new_line: undefined,
+            line_type: "delete",
+            body: "Actions review note",
+            diff_head_sha: "diff-head",
+          }),
+        ],
+      },
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("Actions review note")).toBeTruthy();
+    });
+    const preview = document.querySelector(".markdown-rich-diff--unified");
+    expect(preview?.querySelector("del")?.textContent).toContain("Actions");
+    expect(preview?.querySelector("del")?.textContent ?? "").not.toContain("Statuses");
+    expect(preview?.querySelector("ins")?.textContent ?? "").not.toContain("Issues");
+    const actionsComment = document.querySelector("[data-review-thread-id='thread-actions']");
+    expect(actionsComment?.previousElementSibling?.textContent).toContain("Actions");
+    expect(actionsComment?.previousElementSibling?.textContent).not.toContain("Statuses");
+  });
+
+  it("keeps unchanged list siblings aligned when deleted list item review targets an edge", async () => {
+    for (const scenario of [
+      {
+        name: "first",
+        targetLine: 1,
+        oldCount: 3,
+        newCount: 2,
+        lines: [
+          { type: "delete" as const, content: "- Actions", old_num: 1 },
+          { type: "context" as const, content: "- Issues", old_num: 2, new_num: 1 },
+          { type: "context" as const, content: "- Statuses", old_num: 3, new_num: 2 },
+        ],
+      },
+      {
+        name: "first continuation",
+        targetLine: 2,
+        oldCount: 4,
+        newCount: 2,
+        lines: [
+          { type: "delete" as const, content: "- Actions", old_num: 1 },
+          { type: "delete" as const, content: "still needs details", old_num: 2 },
+          { type: "context" as const, content: "- Issues", old_num: 3, new_num: 1 },
+          { type: "context" as const, content: "- Statuses", old_num: 4, new_num: 2 },
+        ],
+      },
+      {
+        name: "last",
+        targetLine: 3,
+        oldCount: 3,
+        newCount: 2,
+        lines: [
+          { type: "context" as const, content: "- Issues", old_num: 1, new_num: 1 },
+          { type: "context" as const, content: "- Statuses", old_num: 2, new_num: 2 },
+          { type: "delete" as const, content: "- Actions", old_num: 3 },
+        ],
+      },
+    ]) {
+      cleanup();
+      renderDiffFile(
+        makeFile({
+          path: "README.md",
+          old_path: "README.md",
+          hunks: [
+            {
+              old_start: 1,
+              old_count: scenario.oldCount,
+              new_start: 1,
+              new_count: scenario.newCount,
+              lines: scenario.lines,
+            },
+          ],
+        }),
+        {
+          richPreview: true,
+          diffHeadSHA: "diff-head",
+          reviewThreads: [
+            makeReviewThread({
+              id: `thread-actions-${scenario.name}`,
+              provider_comment_id: `comment-actions-${scenario.name}`,
+              path: "README.md",
+              old_path: "README.md",
+              side: "left",
+              line: scenario.targetLine,
+              old_line: scenario.targetLine,
+              new_line: undefined,
+              line_type: "delete",
+              body: `Actions ${scenario.name} review note`,
+              diff_head_sha: "diff-head",
+            }),
+          ],
+        },
+      );
+
+      await waitFor(() => {
+        expect(screen.getByText(`Actions ${scenario.name} review note`)).toBeTruthy();
+      });
+      const preview = document.querySelector(".markdown-rich-diff--unified");
+      expect(preview?.querySelector("del")?.textContent).toContain("Actions");
+      expect(preview?.querySelector("del")?.textContent ?? "").not.toContain("Issues");
+      expect(preview?.querySelector("del")?.textContent ?? "").not.toContain("Statuses");
+      expect(preview?.querySelector("ins")?.textContent ?? "").not.toContain("Issues");
+      expect(preview?.querySelector("ins")?.textContent ?? "").not.toContain("Statuses");
+      const actionsComment = document.querySelector(`[data-review-thread-id='thread-actions-${scenario.name}']`);
+      expect(actionsComment?.previousElementSibling?.textContent).toContain("Actions");
+    }
+  });
+
+  it("keeps modified list item pairs aligned when a review targets the added item", async () => {
+    renderDiffFile(
+      makeFile({
+        path: "README.md",
+        old_path: "README.md",
+        hunks: [
+          {
+            old_start: 1,
+            old_count: 3,
+            new_start: 1,
+            new_count: 3,
+            lines: [
+              { type: "context", content: "- Issues", old_num: 1, new_num: 1 },
+              { type: "delete", content: "- Legacy action", old_num: 2 },
+              { type: "add", content: "- Updated action", new_num: 2 },
+              { type: "context", content: "- Statuses", old_num: 3, new_num: 3 },
+            ],
+          },
+        ],
+      }),
+      {
+        richPreview: true,
+        diffHeadSHA: "diff-head",
+        reviewThreads: [
+          makeReviewThread({
+            id: "thread-new-action",
+            provider_comment_id: "comment-new-action",
+            path: "README.md",
+            old_path: "README.md",
+            line: 2,
+            new_line: 2,
+            body: "Updated action review note",
+            diff_head_sha: "diff-head",
+          }),
+        ],
+      },
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("Updated action review note")).toBeTruthy();
+    });
+    const preview = document.querySelector(".markdown-rich-diff--unified");
+    const deletedText = Array.from(preview?.querySelectorAll("del") ?? [])
+      .map((element) => element.textContent ?? "")
+      .join("\n");
+    const insertedText = Array.from(preview?.querySelectorAll("ins") ?? [])
+      .map((element) => element.textContent ?? "")
+      .join("\n");
+    expect(deletedText).toContain("Legacy");
+    expect(deletedText).not.toContain("Issues");
+    expect(deletedText).not.toContain("Statuses");
+    expect(insertedText).toContain("Updated");
+    expect(insertedText).not.toContain("Issues");
+    expect(insertedText).not.toContain("Statuses");
+    const actionComment = document.querySelector("[data-review-thread-id='thread-new-action']");
+    expect(actionComment?.previousElementSibling?.textContent).toContain("Updated action");
+  });
+
+  it("keeps modified list item pairs aligned when a review targets an added continuation", async () => {
+    renderDiffFile(
+      makeFile({
+        path: "README.md",
+        old_path: "README.md",
+        hunks: [
+          {
+            old_start: 1,
+            old_count: 4,
+            new_start: 1,
+            new_count: 4,
+            lines: [
+              { type: "context", content: "- Issues", old_num: 1, new_num: 1 },
+              { type: "delete", content: "- Action", old_num: 2 },
+              { type: "delete", content: "legacy details", old_num: 3 },
+              { type: "add", content: "- Action", new_num: 2 },
+              { type: "add", content: "updated details", new_num: 3 },
+              { type: "context", content: "- Statuses", old_num: 4, new_num: 4 },
+            ],
+          },
+        ],
+      }),
+      {
+        richPreview: true,
+        diffHeadSHA: "diff-head",
+        reviewThreads: [
+          makeReviewThread({
+            id: "thread-new-details",
+            provider_comment_id: "comment-new-details",
+            path: "README.md",
+            old_path: "README.md",
+            line: 3,
+            new_line: 3,
+            body: "Updated details review note",
+            diff_head_sha: "diff-head",
+          }),
+        ],
+      },
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("Updated details review note")).toBeTruthy();
+    });
+    const preview = document.querySelector(".markdown-rich-diff--unified");
+    const deletedText = Array.from(preview?.querySelectorAll("del") ?? [])
+      .map((element) => element.textContent ?? "")
+      .join("\n");
+    const insertedText = Array.from(preview?.querySelectorAll("ins") ?? [])
+      .map((element) => element.textContent ?? "")
+      .join("\n");
+    expect(deletedText).toContain("legacy");
+    expect(deletedText).not.toContain("Issues");
+    expect(deletedText).not.toContain("Statuses");
+    expect(insertedText).toContain("updated");
+    expect(insertedText).not.toContain("Issues");
+    expect(insertedText).not.toContain("Statuses");
+    const detailsComment = document.querySelector("[data-review-thread-id='thread-new-details']");
+    expect(detailsComment?.previousElementSibling?.textContent).toContain("updated details");
+  });
+
+  it("keeps context-owned list items aligned when a review targets a changed detail line", async () => {
+    renderDiffFile(
+      makeFile({
+        path: "README.md",
+        old_path: "README.md",
+        hunks: [
+          {
+            old_start: 1,
+            old_count: 3,
+            new_start: 1,
+            new_count: 3,
+            lines: [
+              { type: "context", content: "- Action", old_num: 1, new_num: 1 },
+              { type: "delete", content: "legacy details", old_num: 2 },
+              { type: "add", content: "updated details", new_num: 2 },
+              { type: "context", content: "- Statuses", old_num: 3, new_num: 3 },
+            ],
+          },
+        ],
+      }),
+      {
+        richPreview: true,
+        diffHeadSHA: "diff-head",
+        reviewThreads: [
+          makeReviewThread({
+            id: "thread-context-details",
+            provider_comment_id: "comment-context-details",
+            path: "README.md",
+            old_path: "README.md",
+            line: 2,
+            new_line: 2,
+            body: "Context-owned details review note",
+            diff_head_sha: "diff-head",
+          }),
+        ],
+      },
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("Context-owned details review note")).toBeTruthy();
+    });
+    const preview = document.querySelector(".markdown-rich-diff--unified");
+    const deletedText = Array.from(preview?.querySelectorAll("del") ?? [])
+      .map((element) => element.textContent ?? "")
+      .join("\n");
+    const insertedText = Array.from(preview?.querySelectorAll("ins") ?? [])
+      .map((element) => element.textContent ?? "")
+      .join("\n");
+    expect(deletedText).toContain("legacy");
+    expect(deletedText).not.toContain("Statuses");
+    expect(insertedText).toContain("updated");
+    expect(insertedText).not.toContain("Statuses");
+    const detailsComment = document.querySelector("[data-review-thread-id='thread-context-details']");
+    expect(detailsComment?.previousElementSibling?.textContent).toContain("updated details");
+  });
+
+  it("preserves spacing between consecutive markdown rich preview paragraph blocks", async () => {
+    renderDiffFile(
+      makeFile({
+        path: "README.md",
+        old_path: "README.md",
+        hunks: [
+          {
+            old_start: 1,
+            old_count: 3,
+            new_start: 1,
+            new_count: 3,
+            lines: [
+              { type: "context", content: "First paragraph", old_num: 1, new_num: 1 },
+              { type: "context", content: "", old_num: 2, new_num: 2 },
+              { type: "context", content: "Second paragraph", old_num: 3, new_num: 3 },
+            ],
+          },
+        ],
+      }),
+      {
+        richPreview: true,
+        diffHeadSHA: "diff-head",
+      },
+    );
+
+    await waitFor(() => {
+      expect(document.querySelector(".markdown-rich-diff--unified")).toBeTruthy();
+    });
+    const blocks = Array.from(document.querySelectorAll<HTMLElement>(".markdown-rich-diff__anchored-block"));
+    expect(blocks).toHaveLength(2);
+    expect(blocks[0]!.classList.contains("markdown-rich-diff__anchored-block--spaced")).toBe(true);
+  });
+
+  it("keeps markdown document semantics when review cards are anchored in rich preview", async () => {
+    renderDiffFile(
+      makeFile({
+        path: "README.md",
+        old_path: "README.md",
+        hunks: [
+          {
+            old_start: 1,
+            old_count: 6,
+            new_start: 1,
+            new_count: 7,
+            lines: [
+              { type: "context", content: "- first", old_num: 1, new_num: 1 },
+              { type: "context", content: "", old_num: 2, new_num: 2 },
+              { type: "context", content: "- second", old_num: 3, new_num: 3 },
+              { type: "context", content: "", old_num: 4, new_num: 4 },
+              { type: "context", content: "[ref]: https://example.com", old_num: 5, new_num: 5 },
+              { type: "context", content: "", old_num: 6, new_num: 6 },
+              { type: "add", content: "See [the ref][ref]", new_num: 7 },
+            ],
+          },
+        ],
+      }),
+      {
+        richPreview: true,
+        diffHeadSHA: "diff-head",
+        reviewThreads: [
+          makeReviewThread({
+            path: "README.md",
+            old_path: "README.md",
+            line: 7,
+            new_line: 7,
+            body: "Anchored semantic note",
+            diff_head_sha: "diff-head",
+          }),
+        ],
+      },
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("Anchored semantic note")).toBeTruthy();
+    });
+    const preview = document.querySelector(".markdown-rich-diff--unified");
+    expect(preview?.querySelectorAll("ul")).toHaveLength(1);
+    expect(preview?.querySelectorAll("ul.markdown-rich-diff__split-list")).toHaveLength(0);
+    expect(preview?.querySelector('a[href="https://example.com"]')?.textContent).toBe("the ref");
+    const comment = document.querySelector("[data-review-thread-id='thread-1']");
+    expect(comment?.previousElementSibling?.classList.contains("markdown-rich-diff__anchored-block")).toBe(true);
+  });
+
+  it("anchors markdown rich preview review cards in the matching split pane", async () => {
+    renderDiffFile(
+      makeFile({
+        path: "README.md",
+        old_path: "README.md",
+        hunks: [
+          {
+            old_start: 1,
+            old_count: 2,
+            new_start: 1,
+            new_count: 3,
+            lines: [
+              { type: "context", content: "## Title", old_num: 1, new_num: 1 },
+              { type: "context", content: "", old_num: 2, new_num: 2 },
+              { type: "add", content: "Added split-pane paragraph", new_num: 3 },
+            ],
+          },
+        ],
+      }),
+      {
+        richPreview: true,
+        viewMode: "split",
+        diffHeadSHA: "diff-head",
+        reviewThreads: [
+          makeReviewThread({
+            path: "README.md",
+            old_path: "README.md",
+            line: 3,
+            new_line: 3,
+            body: "Split pane review note",
+            diff_head_sha: "diff-head",
+          }),
+        ],
+      },
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("Split pane review note")).toBeTruthy();
+    });
+    const comment = document.querySelector("[data-review-thread-id='thread-1']");
+    expect(comment?.closest('[data-markdown-rich-side="before"]')).toBeNull();
+    expect(comment?.closest('[data-markdown-rich-side="after"]')).toBeTruthy();
+    expect(comment?.previousElementSibling?.classList.contains("markdown-rich-diff__anchored-block")).toBe(true);
+    expect(document.querySelector(".preview-shell > .inline-review-thread")).toBeNull();
+  });
+
+  it("keeps split rich preview blocks paired after a side-specific review card", async () => {
+    renderDiffFile(
+      makeFile({
+        path: "README.md",
+        old_path: "README.md",
+        hunks: [
+          {
+            old_start: 1,
+            old_count: 3,
+            new_start: 1,
+            new_count: 5,
+            lines: [
+              { type: "context", content: "Opening paragraph", old_num: 1, new_num: 1 },
+              { type: "context", content: "", old_num: 2, new_num: 2 },
+              { type: "add", content: "Added reviewed paragraph", new_num: 3 },
+              { type: "context", content: "", old_num: 3, new_num: 4 },
+              { type: "context", content: "Following paragraph", old_num: 4, new_num: 5 },
+            ],
+          },
+        ],
+      }),
+      {
+        richPreview: true,
+        viewMode: "split",
+        diffHeadSHA: "diff-head",
+        reviewThreads: [
+          makeReviewThread({
+            path: "README.md",
+            old_path: "README.md",
+            line: 3,
+            new_line: 3,
+            body: "Split row review note",
+            diff_head_sha: "diff-head",
+          }),
+        ],
+      },
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("Split row review note")).toBeTruthy();
+    });
+    const comment = document.querySelector("[data-review-thread-id='thread-1']");
+    const commentRow = comment?.closest(".markdown-rich-diff__split-row");
+    expect(commentRow).toBeTruthy();
+    expect(commentRow?.querySelector('[data-markdown-rich-side="before"]')).toBeTruthy();
+    expect(commentRow?.querySelector('[data-markdown-rich-side="after"]')?.textContent).toContain(
+      "Added reviewed paragraph",
+    );
+    const followingRow = Array.from(document.querySelectorAll(".markdown-rich-diff__split-row")).find((row) =>
+      row.textContent?.includes("Following paragraph"),
+    );
+    expect(followingRow?.querySelector('[data-markdown-rich-side="before"]')?.textContent).toContain(
+      "Following paragraph",
+    );
+    expect(followingRow?.querySelector('[data-markdown-rich-side="after"]')?.textContent).toContain(
+      "Following paragraph",
+    );
+  });
+
+  it("keeps unmapped markdown rich preview threads in file-level fallback cards", async () => {
+    renderDiffFile(
+      makeFile({
+        path: "README.md",
+        old_path: "README.md",
+      }),
+      {
+        richPreview: true,
+        diffHeadSHA: "diff-head",
+        reviewThreads: [
+          makeReviewThread({
+            path: "README.md",
+            old_path: "README.md",
+            line: 99,
+            new_line: 99,
+            body: "Unmapped rich preview note",
+            diff_head_sha: "diff-head",
+          }),
+        ],
+      },
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("Unmapped rich preview note")).toBeTruthy();
+    });
+    const comment = document.querySelector("[data-review-thread-id='thread-1']");
+    expect(comment?.closest(".markdown-rich-diff--unified")).toBeNull();
+    expect(comment?.classList.contains("inline-review-thread--file-level")).toBe(true);
+    expect(comment?.textContent).toContain("File");
+  });
+
+  it("does not anchor markdown rich preview threads to hidden source gaps inside spanning blocks", async () => {
+    renderDiffFile(
+      makeFile({
+        path: "README.md",
+        old_path: "README.md",
+        hunks: [
+          {
+            old_start: 1,
+            old_count: 2,
+            new_start: 1,
+            new_count: 2,
+            lines: [
+              { type: "context", content: "```text", old_num: 1, new_num: 1 },
+              { type: "context", content: "first hunk code", old_num: 2, new_num: 2 },
+            ],
+          },
+          {
+            old_start: 10,
+            old_count: 2,
+            new_start: 10,
+            new_count: 2,
+            lines: [
+              { type: "context", content: "second hunk code", old_num: 10, new_num: 10 },
+              { type: "context", content: "```", old_num: 11, new_num: 11 },
+            ],
+          },
+        ],
+      }),
+      {
+        richPreview: true,
+        diffHeadSHA: "diff-head",
+        reviewThreads: [
+          makeReviewThread({
+            path: "README.md",
+            old_path: "README.md",
+            line: 6,
+            new_line: 6,
+            body: "Gap line review note",
+            diff_head_sha: "diff-head",
+          }),
+        ],
+      },
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("Gap line review note")).toBeTruthy();
+    });
+    const comment = document.querySelector("[data-review-thread-id='thread-1']");
+    expect(comment?.closest(".markdown-rich-diff--unified")).toBeNull();
+    expect(comment?.classList.contains("inline-review-thread--file-level")).toBe(true);
   });
 
   it("lets published inline review threads be replied to", async () => {

@@ -71,38 +71,42 @@ const {
   };
 });
 
-vi.mock("@middleman/ui", () => ({
-  DEFAULT_MODE_VISIBILITY: {
-    activity: true,
-    repos: true,
-    kata: false,
-    docs: false,
-    messages: false,
-    pulls: true,
-    issues: true,
-    board: true,
-    reviews: true,
-    workspaces: true,
-  },
-  DEFAULT_TERMINAL_SETTINGS: {
-    font_family: "",
-    font_size: 14,
-    scrollback: 1000,
-    line_height: 1,
-    letter_spacing: 0,
-    cursor_blink: true,
-    font_ligatures: false,
-    renderer: "xterm",
-  },
-  getStores: () => ({
-    settings: {
-      getTerminalSettings: () => currentTerminal.value,
-      getModeVisibility: () => currentModes.value,
-      setModeVisibility: mockSetModeVisibility,
-      setTerminalSettings: mockSetTerminalSettings,
+vi.mock("@middleman/ui", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@middleman/ui")>();
+  return {
+    ...actual,
+    DEFAULT_MODE_VISIBILITY: {
+      activity: true,
+      repos: true,
+      kata: false,
+      docs: false,
+      messages: false,
+      pulls: true,
+      issues: true,
+      board: true,
+      reviews: true,
+      workspaces: true,
     },
-  }),
-}));
+    DEFAULT_TERMINAL_SETTINGS: {
+      font_family: "",
+      font_size: 14,
+      scrollback: 1000,
+      line_height: 1,
+      letter_spacing: 0,
+      cursor_blink: true,
+      font_ligatures: false,
+      renderer: "xterm",
+    },
+    getStores: () => ({
+      settings: {
+        getTerminalSettings: () => currentTerminal.value,
+        getModeVisibility: () => currentModes.value,
+        setModeVisibility: mockSetModeVisibility,
+        setTerminalSettings: mockSetTerminalSettings,
+      },
+    }),
+  };
+});
 
 vi.mock("../../api/settings.js", () => ({
   updateSettings: mockUpdateSettings,
@@ -165,31 +169,13 @@ describe("TerminalOptionsMenu", () => {
     expect(currentTerminal.value.font_size).toBe(19);
   });
 
-  it("persists mode visibility from the options popover", async () => {
-    const updatedModes = {
-      ...defaultModes,
-      kata: true,
-      docs: true,
-      messages: true,
-    };
-    mockUpdateSettings.mockResolvedValue({ modes: updatedModes });
-
+  it("omits global mode visibility from the options popover", async () => {
     render(TerminalOptionsMenu);
 
     await fireEvent.click(screen.getByRole("button", { name: "Terminal options" }));
 
-    expect((screen.getByLabelText("Kata") as HTMLInputElement).checked).toBe(false);
-    expect((screen.getByLabelText("Docs") as HTMLInputElement).checked).toBe(false);
-    expect((screen.getByLabelText("Messages") as HTMLInputElement).checked).toBe(false);
-
-    await fireEvent.click(screen.getByLabelText("Kata"));
-    await fireEvent.click(screen.getByLabelText("Docs"));
-    await fireEvent.click(screen.getByLabelText("Messages"));
-    await fireEvent.click(screen.getByRole("button", { name: "Save visible modes" }));
-
-    await waitFor(() => {
-      expect(mockUpdateSettings).toHaveBeenCalledWith({ modes: updatedModes });
-    });
-    expect(mockSetModeVisibility).toHaveBeenCalledWith(updatedModes);
+    expect(screen.queryByText("Visible modes")).toBeNull();
+    expect(screen.queryByLabelText("Kata")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Save visible modes" })).toBeNull();
   });
 });

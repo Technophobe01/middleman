@@ -2,6 +2,7 @@ import { describe, expect, it } from "vite-plus/test";
 import type { ActivityItem } from "../api/types.js";
 import { collapseActivityRuns, isCollapsedActivityRow } from "./activityRows.js";
 import { activityBranchKey, activityItemKey, activityRepoKey } from "./activityRows.js";
+import { activitySubjectState, isClosedOrMergedActivity } from "./activityRows.js";
 
 function item(id: string, activity_type: string, author: string): ActivityItem {
   return {
@@ -41,13 +42,26 @@ function branchItem(id: string, activity_type: string, author: string, branchNam
   } as ActivityItem;
 }
 
+function providerItem(id: string, provider: string): ActivityItem {
+  return {
+    ...item(id, "commit", "alice"),
+    platform_host: "github.com",
+    repo: {
+      provider,
+      platform_host: "github.com",
+      owner: "acme",
+      name: "widgets",
+      repo_path: "acme/widgets",
+    },
+  } as ActivityItem;
+}
+
 describe("collapseActivityRuns", () => {
   it("collapses three consecutive commits from the same author", () => {
-    const rows = collapseActivityRuns([
-      item("7", "commit", "alice"),
-      item("6", "commit", "alice"),
-      item("5", "commit", "alice"),
-    ]);
+    const rows = collapseActivityRuns(
+      [item("7", "commit", "alice"), item("6", "commit", "alice"), item("5", "commit", "alice")],
+      { rollUpCommits: true },
+    );
 
     expect(rows).toHaveLength(1);
     expect(isCollapsedActivityRow(rows[0]!)).toBe(true);
@@ -75,6 +89,23 @@ describe("collapseActivityRuns", () => {
     expect(rows).toHaveLength(1);
     expect(isCollapsedActivityRow(rows[0]!)).toBe(true);
     expect(isCollapsedActivityRow(rows[0]!) ? rows[0].representative.activity_type : undefined).toBe("review");
+  });
+
+  it("can keep consecutive comments and reviews expanded", () => {
+    const rows = collapseActivityRuns(
+      [
+        item("9", "comment", "alice"),
+        item("8", "comment", "alice"),
+        item("7", "comment", "alice"),
+        item("6", "review", "alice"),
+        item("5", "review", "alice"),
+        item("4", "review", "alice"),
+      ],
+      { rollUpNonCommitActivity: false },
+    );
+
+    expect(rows).toHaveLength(6);
+    expect(rows.every((row) => !isCollapsedActivityRow(row))).toBe(true);
   });
 
   it("does not merge runs of different event types", () => {
@@ -106,15 +137,18 @@ describe("collapseActivityRuns", () => {
   });
 
   it("does not collapse across a force-push boundary", () => {
-    const rows = collapseActivityRuns([
-      item("9", "commit", "alice"),
-      item("8", "commit", "alice"),
-      item("7", "commit", "alice"),
-      item("6", "force_push", "alice"),
-      item("5", "commit", "alice"),
-      item("4", "commit", "alice"),
-      item("3", "commit", "alice"),
-    ]);
+    const rows = collapseActivityRuns(
+      [
+        item("9", "commit", "alice"),
+        item("8", "commit", "alice"),
+        item("7", "commit", "alice"),
+        item("6", "force_push", "alice"),
+        item("5", "commit", "alice"),
+        item("4", "commit", "alice"),
+        item("3", "commit", "alice"),
+      ],
+      { rollUpCommits: true },
+    );
 
     expect(rows).toHaveLength(3);
     expect(isCollapsedActivityRow(rows[0]!)).toBe(true);
@@ -123,26 +157,76 @@ describe("collapseActivityRuns", () => {
   });
 
   it("rolls up branch commit runs by repo branch and author", () => {
-    const rows = collapseActivityRuns([
-      branchItem("9", "default_branch_commit", "alice"),
-      branchItem("8", "default_branch_commit", "alice"),
-      branchItem("7", "default_branch_commit", "alice"),
-    ]);
+    const rows = collapseActivityRuns(
+      [
+        branchItem("9", "default_branch_commit", "alice"),
+        branchItem("8", "default_branch_commit", "alice"),
+        branchItem("7", "default_branch_commit", "alice"),
+      ],
+      { rollUpCommits: true },
+    );
 
     expect(rows).toHaveLength(1);
     expect(isCollapsedActivityRow(rows[0]!)).toBe(true);
     expect(isCollapsedActivityRow(rows[0]!) ? rows[0].representative.branch_name : undefined).toBe("main");
   });
 
+  it("keeps commit runs expanded when commit roll-up is disabled", () => {
+    const rows = collapseActivityRuns(
+      [
+        item("9", "commit", "alice"),
+        item("8", "commit", "alice"),
+        item("7", "commit", "alice"),
+        item("6", "comment", "alice"),
+        item("5", "comment", "alice"),
+        item("4", "comment", "alice"),
+        branchItem("3", "default_branch_commit", "alice"),
+        branchItem("2", "default_branch_commit", "alice"),
+        branchItem("1", "default_branch_commit", "alice"),
+      ],
+      { rollUpCommits: false },
+    );
+
+    expect(rows).toHaveLength(7);
+    expect(isCollapsedActivityRow(rows[0]!)).toBe(false);
+    expect(isCollapsedActivityRow(rows[1]!)).toBe(false);
+    expect(isCollapsedActivityRow(rows[2]!)).toBe(false);
+    expect(isCollapsedActivityRow(rows[3]!)).toBe(true);
+    expect(isCollapsedActivityRow(rows[4]!)).toBe(false);
+    expect(isCollapsedActivityRow(rows[5]!)).toBe(false);
+    expect(isCollapsedActivityRow(rows[6]!)).toBe(false);
+  });
+
   it("does not collapse branch commits across branches", () => {
-    const rows = collapseActivityRuns([
-      branchItem("9", "default_branch_commit", "alice", "main"),
-      branchItem("8", "default_branch_commit", "alice", "main"),
-      branchItem("7", "default_branch_commit", "alice", "main"),
-      branchItem("6", "default_branch_commit", "alice", "release"),
-      branchItem("5", "default_branch_commit", "alice", "release"),
-      branchItem("4", "default_branch_commit", "alice", "release"),
-    ]);
+    const rows = collapseActivityRuns(
+      [
+        branchItem("9", "default_branch_commit", "alice", "main"),
+        branchItem("8", "default_branch_commit", "alice", "main"),
+        branchItem("7", "default_branch_commit", "alice", "main"),
+        branchItem("6", "default_branch_commit", "alice", "release"),
+        branchItem("5", "default_branch_commit", "alice", "release"),
+        branchItem("4", "default_branch_commit", "alice", "release"),
+      ],
+      { rollUpCommits: true },
+    );
+
+    expect(rows).toHaveLength(2);
+    expect(isCollapsedActivityRow(rows[0]!)).toBe(true);
+    expect(isCollapsedActivityRow(rows[1]!)).toBe(true);
+  });
+
+  it("does not collapse commit runs across providers with the same host and repo path", () => {
+    const rows = collapseActivityRuns(
+      [
+        providerItem("9", "github"),
+        providerItem("8", "github"),
+        providerItem("7", "github"),
+        providerItem("6", "gitea"),
+        providerItem("5", "gitea"),
+        providerItem("4", "gitea"),
+      ],
+      { rollUpCommits: true },
+    );
 
     expect(rows).toHaveLength(2);
     expect(isCollapsedActivityRow(rows[0]!)).toBe(true);
@@ -189,5 +273,44 @@ describe("activityRepoKey / activityItemKey", () => {
     const release = { ...base, branchName: "release" };
     expect(activityBranchKey(main)).toBe(`${activityRepoKey(base)}:branch:main`);
     expect(activityBranchKey(main)).not.toBe(activityBranchKey(release));
+  });
+});
+
+describe("activitySubjectState / isClosedOrMergedActivity", () => {
+  function notification(overrides: Partial<ActivityItem>): ActivityItem {
+    return {
+      ...item("1", "notification", "alice"),
+      // Notifications carry unread/read in item_state, never a lifecycle state.
+      item_state: "unread",
+      ...overrides,
+    } as ActivityItem;
+  }
+
+  it("reads item_state for non-notification rows", () => {
+    expect(activitySubjectState(item("1", "comment", "alice"))).toBe("open");
+    expect(isClosedOrMergedActivity(item("1", "comment", "alice"))).toBe(false);
+    const merged = { ...item("1", "comment", "alice"), item_state: "merged" } as ActivityItem;
+    expect(isClosedOrMergedActivity(merged)).toBe(true);
+  });
+
+  it("reads subject_state for notification rows, not their unread/read item_state", () => {
+    const merged = notification({ subject_state: "merged" });
+    expect(activitySubjectState(merged)).toBe("merged");
+    // A notifications-only feed has no sibling PR row, yet the merged subject
+    // is still hidden because subject_state rides on the notification row.
+    expect(isClosedOrMergedActivity(merged)).toBe(true);
+
+    const open = notification({ subject_state: "open" });
+    expect(isClosedOrMergedActivity(open)).toBe(false);
+
+    const closed = notification({ subject_state: "closed" });
+    expect(isClosedOrMergedActivity(closed)).toBe(true);
+  });
+
+  it("falls back to item_state when a notification has no subject_state", () => {
+    // Unanchored or unknown-subject notification: empty subject_state, unread
+    // item_state, so it is treated as not closed/merged.
+    expect(isClosedOrMergedActivity(notification({ subject_state: "" }))).toBe(false);
+    expect(activitySubjectState(notification({ subject_state: undefined }))).toBe("unread");
   });
 });

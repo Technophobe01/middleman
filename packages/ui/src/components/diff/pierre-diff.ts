@@ -7,6 +7,9 @@ interface ParsePierreFileDiffOptions {
   enableDemandContextExpansion?: boolean;
 }
 
+type PierreDiffDebugDetails = Record<string, unknown>;
+
+const debugDiffStorageKey = "middleman:debug:diff";
 const maxSparseContextLine = 50_000;
 const syntheticPatchFiles = new WeakSet<DiffFile>();
 
@@ -32,16 +35,26 @@ export function parsePierreFileDiff(
   if (!patchedFile.patch) return undefined;
   if (options.enableDemandContextExpansion && canBuildSparsePatchContents(patchedFile)) {
     const contents = sparsePatchContents(patchedFile);
-    return withAutomationLanguage(
+    const meta = withAutomationLanguage(
       withRenderMetadata(
         patchedFile,
         withSyntheticPatchCacheKey(patchedFile, processPatchWithContext(patchedFile, contents)),
+        contextRenderCacheIdentity(patchedFile, "sparse", contents),
       ),
     );
+    debugPierreDiff("parse sparse context diff", contextDebugDetails(patchedFile, "sparse", contents, meta));
+    return meta;
   }
-  return withAutomationLanguage(
+  const meta = withAutomationLanguage(
     withRenderMetadata(patchedFile, withSyntheticPatchCacheKey(patchedFile, parsePatchOnly(patchedFile))),
   );
+  debugPierreDiff("parse patch diff", {
+    path: patchedFile.path,
+    status: patchedFile.status,
+    cacheKey: meta?.cacheKey,
+    hunkCount: meta?.hunks.length,
+  });
+  return meta;
 }
 
 export function parsePierreFileDiffWithContents(
@@ -49,12 +62,15 @@ export function parsePierreFileDiffWithContents(
   contents: { oldFile: FileContents; newFile: FileContents },
 ): FileDiffMetadata | undefined {
   const patchedFile = diffFileWithPatch(file);
-  return withAutomationLanguage(
+  const meta = withAutomationLanguage(
     withRenderMetadata(
       patchedFile,
       withSyntheticPatchCacheKey(patchedFile, processPatchWithContext(patchedFile, contents)),
+      contextRenderCacheIdentity(patchedFile, "full", contents),
     ),
   );
+  debugPierreDiff("parse full context diff", contextDebugDetails(patchedFile, "full", contents, meta));
+  return meta;
 }
 
 export function pierreFileContents(name: string, contents: string, cacheIdentity: string): FileContents {
@@ -65,12 +81,38 @@ export function pierreFileContents(name: string, contents: string, cacheIdentity
   };
 }
 
+export function debugPierreDiff(message: string, details?: PierreDiffDebugDetails): void {
+  if (!pierreDiffDebugEnabled()) return;
+  console.debug("[middleman:diff]", message, details ?? {});
+}
+
+export function pierreDiffDebugEnabled(): boolean {
+  if (typeof window === "undefined") return false;
+  try {
+    if (new URLSearchParams(window.location.search).get("debugDiff") === "1") return true;
+    return window.localStorage?.getItem(debugDiffStorageKey) === "1";
+  } catch {
+    return false;
+  }
+}
+
 export function diffFileWithPatch(file: DiffFile): DiffFile {
   const patch = file.patch && patchHasFileHeader(file.patch) ? file.patch : synthesizePatch(file) || file.patch;
   if (patch === file.patch) return file;
   const patchedFile = { ...file, patch };
   syntheticPatchFiles.add(patchedFile);
   return patchedFile;
+}
+
+export function sparseContextMayDistortSyntax(file: DiffFile): boolean {
+  const hunks = file.hunks ?? [];
+  for (let index = 0; index < hunks.length - 1; index += 1) {
+    const current = hunks[index];
+    const next = hunks[index + 1];
+    if (!current || !next || !hasCollapsedGap(current, next)) continue;
+    if (hunkMayCarrySyntaxState(current)) return true;
+  }
+  return false;
 }
 
 function processPatchWithContext(
@@ -98,7 +140,7 @@ function tryProcessPatch(
     return processFile(patch, {
       oldFile: contents.oldFile,
       newFile: contents.newFile,
-      throwOnError: true,
+      throwOnError: false,
     });
   } catch {
     return undefined;
@@ -116,7 +158,7 @@ function parsePatchOnly(file: DiffFile): FileDiffMetadata | undefined {
 
 function tryParsePatch(patch: string): FileDiffMetadata | undefined {
   try {
-    return parsePatchFiles(patch, undefined, true)[0]?.files[0];
+    return parsePatchFiles(patch, undefined, false)[0]?.files[0];
   } catch {
     return undefined;
   }
@@ -134,18 +176,57 @@ function withSyntheticPatchCacheKey(file: DiffFile, meta: FileDiffMetadata | und
   };
 }
 
-function withRenderMetadata(file: DiffFile, meta: FileDiffMetadata | undefined): FileDiffMetadata | undefined {
+function withRenderMetadata(
+  file: DiffFile,
+  meta: FileDiffMetadata | undefined,
+  cacheIdentity?: string,
+): FileDiffMetadata | undefined {
   if (!meta) return meta;
   return {
     ...meta,
     cacheKey:
-      meta.cacheKey ??
-      fileContentsCacheKey(
-        file.path,
-        file.patch,
-        `${syntheticPatchFiles.has(file) ? "synthetic" : "provider"}-diff:${file.status}:${file.old_path || ""}`,
-      ),
+      cacheIdentity != null
+        ? fileContentsCacheKey(file.path, file.patch, cacheIdentity)
+        : (meta.cacheKey ??
+          fileContentsCacheKey(
+            file.path,
+            file.patch,
+            `${syntheticPatchFiles.has(file) ? "synthetic" : "provider"}-diff:${file.status}:${file.old_path || ""}`,
+          )),
     lang: meta.lang ?? getFiletypeFromFileName(file.path),
+  };
+}
+
+function contextRenderCacheIdentity(
+  file: DiffFile,
+  kind: "full" | "sparse",
+  contents: { oldFile: FileContents; newFile: FileContents },
+): string {
+  return [
+    `${kind}-diff`,
+    file.status,
+    file.old_path || "",
+    contents.oldFile.cacheKey ?? "",
+    contents.newFile.cacheKey ?? "",
+  ].join(":");
+}
+
+function contextDebugDetails(
+  file: DiffFile,
+  kind: "full" | "sparse",
+  contents: { oldFile: FileContents; newFile: FileContents },
+  meta: FileDiffMetadata | undefined,
+): PierreDiffDebugDetails {
+  return {
+    path: file.path,
+    status: file.status,
+    kind,
+    cacheKey: meta?.cacheKey,
+    hunkCount: meta?.hunks.length,
+    oldCacheKey: contents.oldFile.cacheKey,
+    newCacheKey: contents.newFile.cacheKey,
+    oldLength: contents.oldFile.contents.length,
+    newLength: contents.newFile.contents.length,
   };
 }
 
@@ -254,6 +335,77 @@ function canBuildSparsePatchContents(file: DiffFile): boolean {
     }
   }
   return true;
+}
+
+function hasCollapsedGap(
+  current: NonNullable<DiffFile["hunks"]>[number],
+  next: NonNullable<DiffFile["hunks"]>[number],
+): boolean {
+  const oldGap = next.old_start - (current.old_start + current.old_count);
+  const newGap = next.new_start - (current.new_start + current.new_count);
+  return oldGap > 0 || newGap > 0;
+}
+
+function hunkMayCarrySyntaxState(hunk: NonNullable<DiffFile["hunks"]>[number]): boolean {
+  const oldState = syntaxStateAfterHunkSide(hunk, "old");
+  const newState = syntaxStateAfterHunkSide(hunk, "new");
+
+  return syntaxStateOpen(oldState) || syntaxStateOpen(newState);
+}
+
+function syntaxStateAfterHunkSide(
+  hunk: NonNullable<DiffFile["hunks"]>[number],
+  side: "old" | "new",
+): { templateBacktickCount: number; blockCommentOpen: boolean } {
+  let templateBacktickCount = 0;
+  let blockCommentOpen = false;
+  for (const line of hunk.lines) {
+    if (side === "old" && line.type === "add") continue;
+    if (side === "new" && line.type === "delete") continue;
+    const content = line.content;
+    templateBacktickCount += countUnescapedBackticks(content);
+    blockCommentOpen = blockCommentStateAfterLine(content, blockCommentOpen);
+  }
+
+  return { templateBacktickCount, blockCommentOpen };
+}
+
+function syntaxStateOpen(state: { templateBacktickCount: number; blockCommentOpen: boolean }): boolean {
+  return state.templateBacktickCount % 2 === 1 || state.blockCommentOpen;
+}
+
+function countUnescapedBackticks(line: string): number {
+  let count = 0;
+  let backslashes = 0;
+  for (const char of line) {
+    if (char === "\\") {
+      backslashes += 1;
+      continue;
+    }
+    if (char === "`" && backslashes % 2 === 0) count += 1;
+    backslashes = 0;
+  }
+  return count;
+}
+
+function blockCommentStateAfterLine(line: string, open: boolean): boolean {
+  let index = 0;
+  while (index < line.length) {
+    if (open) {
+      const close = line.indexOf("*/", index);
+      if (close < 0) return true;
+      open = false;
+      index = close + 2;
+      continue;
+    }
+
+    const start = line.indexOf("/*", index);
+    if (start < 0) return false;
+    const close = line.indexOf("*/", start + 2);
+    if (close < 0) return true;
+    index = close + 2;
+  }
+  return open;
 }
 
 function lineRangeFits(start: number, count: number): boolean {
