@@ -109,11 +109,17 @@ Write the API contract in server request/response types before handlers:
 - error/state contract:
   use existing camelCase problem codes for failures; put repo-browser reasons such as `clone_unavailable`, `unavailable_ref`, and `missing_path` in `details.reason`; model truncation, stale-token, binary, oversized, and unsupported-SVG cases as successful response states
 - caps:
-  `RepoBrowserTreeEntryLimit`, `RepoBrowserBlobSizeLimit`, `RepoBrowserLastChangedBatchMax`, `RepoBrowserHistoryLimit`
+  `RepoBrowserRefLimit`, `RepoBrowserTreeEntryLimit`, `RepoBrowserBlobSizeLimit`, `RepoBrowserLastChangedBatchMax`, `RepoBrowserLastChangedLogLimit`, `RepoBrowserHistoryLimit`
+- truncation semantics:
+  ref lists are sorted by refname before applying `RepoBrowserRefLimit`; `refs/remotes/origin/HEAD` is not displayable and must not consume the cap; `default_ref` is returned separately and may be absent from a truncated `refs` array; tree truncation is bounded by Git traversal order before UI sorting and the UI must present it as a partial tree
+- pathspec safety:
+  every caller-controlled repo path passed to Git must use a shared literal pathspec helper after `--`; `--` alone is not sufficient because filenames can begin with Git pathspec magic such as `:(glob)`
 - Markdown asset contract:
   separate `asset-metadata` JSON preflight and `asset-bytes` byte routes; metadata emits commit-pinned byte URLs only for renderable assets; path/ref validation, MIME detection, unsupported SVG state with no byte URL, byte route problem envelopes for SVG/non-renderable assets, blob-size caps, conservative branch/tag metadata cache headers, immutable byte cache headers
 - fetch behavior:
-  repo-browser ensure/fetch/read and manual refresh hot paths must fetch branch/tag updates without pruning tags from the middleman-owned clone; deleted remote tags can remain visible until a separate cache maintenance or repair path cleans them up
+  repo-browser ensure/fetch/read and manual refresh hot paths must fetch branch/tag updates without pruning tags from the middleman-owned clone; deleted remote tags can remain visible until an explicit cache maintenance path such as clone repair/rebuild cleans them up, and no request-time or periodic sync path should add tag pruning implicitly
+- last-changed fallback budget:
+  the batch scan is capped by `RepoBrowserLastChangedLogLimit`; fallback may run at most one `git log --max-count=1` process per requested path missed by the batch, so total fallback processes are bounded by `RepoBrowserLastChangedBatchMax`. This returns complete metadata for the requested batch under that process cap but can still traverse deep history inside Git; UI callers must request visible/filtered rows rather than entire truncated trees.
 
 - [ ] **Step 3: Write failing gitclone tests**
 
@@ -126,6 +132,7 @@ func TestRepoBrowserListTreeCapsAndIncludesTrackedDotfiles(t *testing.T)
 func TestRepoBrowserReadBlobWorksWhenTreeIsTruncated(t *testing.T)
 func TestRepoBrowserReadBlobRejectsTraversalAndReportsLargeState(t *testing.T)
 func TestRepoBrowserLastChangedBatchCapsPaths(t *testing.T)
+func TestRepoBrowserLastChangedFallsBackPastBatchLogLimit(t *testing.T)
 func TestRepoBrowserFileHistoryIsBoundedAtSelectedSHA(t *testing.T)
 func TestRepoBrowserResponsesIncludeRefMetadata(t *testing.T)
 func TestRepoBrowserCloneIdentitySeparatesProvidersAndNestedPaths(t *testing.T)
@@ -143,9 +150,11 @@ envelopes, status codes, and response headers belong in `internal/server`
 tests.
 `TestRepoBrowserFetchDoesNotPruneTagsOnHotPath` must prove repo-browser
 ensure/fetch and manual refresh behavior does not pass tag-pruning options and
-does not remove an existing local tag when the remote tag has disappeared.
-Deleted remote tags are allowed to remain visible until a separate maintenance
-path handles cache cleanup.
+does not remove an existing local tag when the remote tag has disappeared. It
+must also prove new remote tags pointing at already-present objects are fetched
+without pruning tags. Deleted remote tags are allowed to remain visible until a
+explicit cache maintenance path such as clone repair/rebuild handles cleanup.
+Do not add request-time or periodic tag pruning as part of repo-browser fetch.
 `TestRepoBrowserCloneIdentitySeparatesProvidersAndNestedPaths` must cover two
 repositories with the same `platform_host` and `repo_path` but different
 providers, plus slash-containing nested `repo_path` values. It must prove clone
@@ -170,6 +179,7 @@ const (
 	RepoBrowserTreeEntryLimit      = 20000
 	RepoBrowserBlobSizeLimit       = 1 << 20
 	RepoBrowserLastChangedBatchMax = 250
+	RepoBrowserLastChangedLogLimit = 500
 	RepoBrowserHistoryLimit        = 50
 )
 
@@ -261,7 +271,7 @@ type RepoBrowserCommitDetail struct {
 Add methods on `*Manager`:
 
 ```go
-ListRepoBrowserRefs(ctx context.Context, repo RepoBrowserRepoRef, defaultBranch string) ([]RepoBrowserRef, RepoBrowserRef, error)
+ListRepoBrowserRefs(ctx context.Context, repo RepoBrowserRepoRef, defaultBranch string) ([]RepoBrowserRef, RepoBrowserRef, bool, error)
 ListRepoBrowserTree(ctx context.Context, repo RepoBrowserRepoRef, ref RepoBrowserRef) (RepoBrowserTree, error)
 ProbeRepoBrowserREADME(ctx context.Context, repo RepoBrowserRepoRef, ref RepoBrowserRef) (RepoBrowserREADMEProbe, error)
 ReadRepoBrowserBlob(ctx context.Context, repo RepoBrowserRepoRef, ref RepoBrowserRef, path string) (RepoBrowserBlob, error)
@@ -271,17 +281,23 @@ RepoBrowserFileHistory(ctx context.Context, repo RepoBrowserRepoRef, ref RepoBro
 RepoBrowserCommitDetail(ctx context.Context, repo RepoBrowserRepoRef, root RepoBrowserRef, path string, sha string) (RepoBrowserCommitDetail, error)
 ```
 
-All methods must validate repo-relative paths, use `--` before paths, resolve
-refs statelessly through typed ref inputs, and return typed errors for missing
-refs/paths. Every successful read operation after `ListRepoBrowserRefs` must
-return `RepoBrowserResolvedRef` so the server can emit `resolvedSha`,
-`requestedSha`, and `stale` without separately re-resolving the branch or tag.
-Clone/cache identity must use `(Provider, PlatformHost, RepoPath)` from
-`RepoBrowserRepoRef`; owner/name are display hints only and must not participate
-in clone paths or cache keys. The shared identity helper must be the only place
-that encodes provider, canonical platform host, and slash-containing repo path
-for clone paths and fetch singleflight keys. Last-changed batches must use a
-single bounded Git history walk per batch, not one process per path.
+All methods must validate repo-relative paths, pass caller-controlled paths only
+through the shared literal pathspec helper after `--`, resolve refs statelessly
+through typed ref inputs, and return typed errors for missing refs/paths. Every
+successful read operation after `ListRepoBrowserRefs` must return
+`RepoBrowserResolvedRef` so the server can emit `resolvedSha`, `requestedSha`,
+and `stale` without separately re-resolving the branch or tag. Clone/cache
+identity must use `(Provider, PlatformHost, RepoPath)` from `RepoBrowserRepoRef`;
+owner/name are display hints only and must not participate in clone paths or
+cache keys. The shared identity helper must be the only place that encodes
+provider, canonical platform host, and slash-containing repo path for clone
+paths and fetch singleflight keys. Last-changed batches should use one bounded
+Git history walk for the batch, then a `--max-count=1` per-path fallback only
+for requested paths not found in that capped batch so old paths do not look
+historyless. The fallback process count is bounded by
+`RepoBrowserLastChangedBatchMax`, but each fallback can still traverse deep
+history inside Git; frontend callers must keep last-changed batches scoped to
+visible/filtered rows, not whole large repositories.
 
 - [ ] **Step 6: Run gitclone tests green**
 
@@ -304,6 +320,7 @@ func TestRepoBrowserRoutesRequireRepoPathForNestedRepos(t *testing.T)
 func TestRepoBrowserBranchSHAReportsStaleRef(t *testing.T)
 func TestRepoBrowserTreeTruncationKeepsDirectBlobReadable(t *testing.T)
 func TestRepoBrowserBlobReturnsTypedLargeAndBinaryStates(t *testing.T)
+func TestRepoBrowserLastChangedFallsBackPastBatchLogLimit(t *testing.T)
 func TestRepoBrowserMarkdownAssetReturnsSafeMimeAndCacheHeaders(t *testing.T)
 func TestRepoBrowserAssetBytesRejectsNonRenderableStates(t *testing.T)
 func TestRepoBrowserRejectsUnknownRefAndUnsafePath(t *testing.T)
