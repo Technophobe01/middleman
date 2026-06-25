@@ -6,12 +6,14 @@
     createRepoBrowserStore,
     diffFileCategoryOptions,
     PierreFileTree,
+    SplitResizeHandle,
     type DiffFileCategoryFilter,
     type FileTreeEntry,
     type MiddlemanClient,
     type RepoBrowserRouteRef,
     type RepoBrowserViewMode,
     type SourceBrowserFileEntry,
+    type SplitResizeEvent,
   } from "@middleman/ui";
   import type { RepoBrowserCommit, RepoBrowserRef } from "@middleman/ui/api/types";
   import { providerDefaultHost } from "@middleman/ui/api/provider-routes";
@@ -54,6 +56,12 @@
   };
   type RefPickerType = "branch" | "tag";
 
+  const DEFAULT_FILES_WIDTH = 340;
+  const DEFAULT_HISTORY_WIDTH = 320;
+  const MIN_RAIL_WIDTH = 260;
+  const MIN_VIEWER_WIDTH = 360;
+  const RESIZE_HANDLE_WIDTH = 4;
+
   let { client, route, onRouteChange }: Props = $props();
 
   // svelte-ignore state_referenced_locally
@@ -75,6 +83,14 @@
   let refPickerSelectionInFlight = false;
   const refPickerListID = `repo-browser-ref-${Math.random().toString(36).slice(2)}`;
   const refPickerRenderLimit = 100;
+  let contentEl = $state<HTMLElement | null>(null);
+  let sidebarEl = $state<HTMLElement | null>(null);
+  let contentWidth = $state(0);
+  let filesWidth = $state(DEFAULT_FILES_WIDTH);
+  let filesResizeStartWidth = DEFAULT_FILES_WIDTH;
+  let historyWidth = $state(DEFAULT_HISTORY_WIDTH);
+  let historyResizeStartWidth = DEFAULT_HISTORY_WIDTH;
+  let historyRailVisible = $state(true);
 
   const selectedPath = $derived(store.getSelectedPath());
   const selectedRef = $derived(store.getSelectedRef());
@@ -101,6 +117,28 @@
   const tagRefs = $derived(store.getRefs().filter((ref) => refPickerRefType(ref) === "tag"));
   const filteredRefs = $derived.by(() => filterRefs(refPickerType === "branch" ? branchRefs : tagRefs, refPickerQuery));
   const visibleFilteredRefs = $derived(filteredRefs.slice(0, refPickerRenderLimit));
+
+  $effect(() => {
+    if (!contentEl || !sidebarEl) return;
+
+    updateSplitMeasurements();
+
+    const observers: ResizeObserver[] = [];
+    if (typeof ResizeObserver !== "undefined") {
+      const observer = new ResizeObserver(updateSplitMeasurements);
+      observer.observe(contentEl);
+      observer.observe(sidebarEl);
+      observers.push(observer);
+    }
+
+    window.addEventListener("resize", updateSplitMeasurements);
+    return () => {
+      window.removeEventListener("resize", updateSplitMeasurements);
+      for (const observer of observers) {
+        observer.disconnect();
+      }
+    };
+  });
 
   $effect(() => {
     const nextRepoLoadKey = routeKey(route);
@@ -349,6 +387,96 @@
 
   function selectHistoryCommit(commit: RepoBrowserCommit): void {
     void store.selectCommit(commit.sha);
+  }
+
+  function updateSplitMeasurements(): void {
+    const nextContentWidth = contentEl?.clientWidth ?? 0;
+    historyRailVisible =
+      typeof window === "undefined" || typeof window.matchMedia !== "function"
+        ? true
+        : window.matchMedia("(min-width: 981px)").matches;
+    contentWidth = nextContentWidth;
+    if (nextContentWidth <= 0) return;
+    const nextFilesWidth = clampFilesWidth(filesWidth, nextContentWidth, historyWidth, historyRailVisible);
+    if (nextFilesWidth !== filesWidth) {
+      filesWidth = nextFilesWidth;
+    }
+    const nextHistoryWidth = clampHistoryWidth(historyWidth, nextContentWidth, nextFilesWidth, historyRailVisible);
+    if (nextHistoryWidth !== historyWidth) {
+      historyWidth = nextHistoryWidth;
+    }
+  }
+
+  function railHandleCount(nextHistoryRailVisible = historyRailVisible): number {
+    return nextHistoryRailVisible ? 2 : 1;
+  }
+
+  function maxFilesWidth(
+    nextContentWidth = contentWidth,
+    nextHistoryWidth = historyWidth,
+    nextHistoryRailVisible = historyRailVisible,
+  ): number {
+    if (nextContentWidth <= 0) return Math.max(DEFAULT_FILES_WIDTH, MIN_RAIL_WIDTH);
+    const visibleHistoryWidth = nextHistoryRailVisible ? nextHistoryWidth : 0;
+    const availableForFiles =
+      nextContentWidth - visibleHistoryWidth - railHandleCount(nextHistoryRailVisible) * RESIZE_HANDLE_WIDTH;
+    if (availableForFiles <= 0) return MIN_RAIL_WIDTH;
+    return Math.max(MIN_RAIL_WIDTH, availableForFiles - MIN_VIEWER_WIDTH);
+  }
+
+  function maxHistoryWidth(
+    nextContentWidth = contentWidth,
+    nextFilesWidth = filesWidth,
+    nextHistoryRailVisible = historyRailVisible,
+  ): number {
+    if (!nextHistoryRailVisible) return Math.max(DEFAULT_HISTORY_WIDTH, MIN_RAIL_WIDTH);
+    if (nextContentWidth <= 0) return Math.max(DEFAULT_HISTORY_WIDTH, MIN_RAIL_WIDTH);
+    const availableForHistory =
+      nextContentWidth - nextFilesWidth - railHandleCount(nextHistoryRailVisible) * RESIZE_HANDLE_WIDTH;
+    if (availableForHistory <= 0) return MIN_RAIL_WIDTH;
+    return Math.max(MIN_RAIL_WIDTH, availableForHistory - MIN_VIEWER_WIDTH);
+  }
+
+  function clampFilesWidth(
+    width: number,
+    nextContentWidth = contentWidth,
+    nextHistoryWidth = historyWidth,
+    nextHistoryRailVisible = historyRailVisible,
+  ): number {
+    const maxWidth = maxFilesWidth(nextContentWidth, nextHistoryWidth, nextHistoryRailVisible);
+    const minWidth = Math.min(MIN_RAIL_WIDTH, maxWidth);
+    return Math.max(minWidth, Math.min(maxWidth, width));
+  }
+
+  function clampHistoryWidth(
+    width: number,
+    nextContentWidth = contentWidth,
+    nextFilesWidth = filesWidth,
+    nextHistoryRailVisible = historyRailVisible,
+  ): number {
+    const maxWidth = maxHistoryWidth(nextContentWidth, nextFilesWidth, nextHistoryRailVisible);
+    const minWidth = Math.min(MIN_RAIL_WIDTH, maxWidth);
+    return Math.max(minWidth, Math.min(maxWidth, width));
+  }
+
+  function startFilesResize(): void {
+    updateSplitMeasurements();
+    filesWidth = clampFilesWidth(filesWidth);
+    filesResizeStartWidth = filesWidth;
+  }
+
+  function resizeFiles(event: SplitResizeEvent): void {
+    filesWidth = clampFilesWidth(filesResizeStartWidth + event.deltaX);
+  }
+
+  function startHistoryResize(): void {
+    updateSplitMeasurements();
+    historyWidth = clampHistoryWidth(historyWidth);
+    historyResizeStartWidth = historyWidth;
+  }
+
+  function resizeHistory(event: SplitResizeEvent): void {
+    historyWidth = clampHistoryWidth(historyResizeStartWidth - event.deltaX);
   }
 
   function toTreeEntry(file: SourceBrowserFileEntry): FileTreeEntry {
@@ -623,8 +751,13 @@
     </div>
   </header>
 
-  <div class="repo-browser__content">
-    <aside class="repo-browser__sidebar" aria-label="Files">
+  <div class="repo-browser__content" bind:this={contentEl}>
+    <aside
+      class="repo-browser__sidebar"
+      aria-label="Files"
+      bind:this={sidebarEl}
+      style:width={`${Math.round(filesWidth)}px`}
+    >
       <div class="repo-browser__filter">
         <input
           type="search"
@@ -657,6 +790,13 @@
         />
       </div>
     </aside>
+
+    <SplitResizeHandle
+      class="repo-browser__files-resize"
+      ariaLabel="Resize file tree"
+      onResizeStart={startFilesResize}
+      onResize={resizeFiles}
+    />
 
     <main class="repo-browser__viewer" aria-label="Selected file">
       <div class="repo-browser__filebar">
@@ -719,7 +859,14 @@
       {/if}
     </main>
 
-    <aside class="repo-browser__history" aria-label="File history">
+    <SplitResizeHandle
+      class="repo-browser__history-resize"
+      ariaLabel="Resize file history"
+      onResizeStart={startHistoryResize}
+      onResize={resizeHistory}
+    />
+
+    <aside class="repo-browser__history" aria-label="File history" style:width={`${Math.round(historyWidth)}px`}>
       <header class="repo-browser__history-header">
         <span>History</span>
         <span>{store.getFileHistory().length}</span>
@@ -993,8 +1140,7 @@
   .repo-browser__content {
     flex: 1 1 auto;
     min-height: 0;
-    display: grid;
-    grid-template-columns: minmax(260px, 340px) minmax(0, 1fr) minmax(250px, 320px);
+    display: flex;
     overflow: hidden;
   }
 
@@ -1009,11 +1155,18 @@
   }
 
   .repo-browser__sidebar {
+    flex: 0 0 auto;
     border-right: thin solid var(--border-default);
   }
 
   .repo-browser__history {
+    flex: 0 0 auto;
     border-left: thin solid var(--border-default);
+  }
+
+  :global(.repo-browser__files-resize),
+  :global(.repo-browser__history-resize) {
+    background: var(--border-default);
   }
 
   .repo-browser__filter {
@@ -1066,6 +1219,7 @@
   }
 
   .repo-browser__viewer {
+    flex: 1 1 0;
     min-width: 0;
     min-height: 0;
     display: flex;
@@ -1253,20 +1407,15 @@
   }
 
   @media (max-width: 980px) {
-    .repo-browser__content {
-      grid-template-columns: minmax(220px, 300px) minmax(0, 1fr);
-    }
-
+    :global(.repo-browser__history-resize),
     .repo-browser__history {
       display: none;
     }
+
   }
 
   @media (max-width: 720px) {
-    .repo-browser__content {
-      grid-template-columns: 1fr;
-    }
-
+    :global(.repo-browser__files-resize),
     .repo-browser__sidebar {
       display: none;
     }

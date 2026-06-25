@@ -400,12 +400,78 @@ describe("RepoBrowserFeature", () => {
     expect(viewer.getAttribute("data-path")).toBe(sourceFile.path);
     expect(viewer.textContent).toContain("package main");
   });
+
+  it("resizes both side rails within usable viewer constraints across view modes", async () => {
+    render(RepoBrowserFeature, {
+      props: {
+        client: testClient(),
+        route,
+        onRouteChange: vi.fn(),
+      },
+    });
+
+    const history = await screen.findByLabelText("File history");
+    const content = document.querySelector(".repo-browser__content") as HTMLElement | null;
+    const sidebar = document.querySelector(".repo-browser__sidebar") as HTMLElement | null;
+    expect(content).not.toBeNull();
+    expect(sidebar).not.toBeNull();
+    setReadonlyNumber(content!, "clientWidth", 1200);
+    sidebar!.getBoundingClientRect = () => ({ width: Number.parseInt(sidebar!.style.width || "340", 10) }) as DOMRect;
+
+    const filesHandle = screen.getByRole("button", { name: "Resize file tree" });
+    expect(sidebar!.getAttribute("style")).toContain("width: 340px");
+
+    await fireEvent.mouseDown(filesHandle, { clientX: 200 });
+    await fireEvent.mouseMove(window, { clientX: 300 });
+    expect(sidebar!.getAttribute("style")).toContain("width: 440px");
+
+    await fireEvent.mouseMove(window, { clientX: 700 });
+    expect(sidebar!.getAttribute("style")).toContain("width: 512px");
+
+    await fireEvent.mouseMove(window, { clientX: -100 });
+    expect(sidebar!.getAttribute("style")).toContain("width: 260px");
+    await fireEvent.mouseUp(window, { clientX: -100 });
+
+    await fireEvent.keyDown(filesHandle, { key: "ArrowRight" });
+    expect(sidebar!.getAttribute("style")).toContain("width: 284px");
+
+    const historyHandle = screen.getByRole("button", { name: "Resize file history" });
+    expect(history.getAttribute("style")).toContain("width: 320px");
+
+    await fireEvent.mouseDown(historyHandle, { clientX: 800 });
+    await fireEvent.mouseMove(window, { clientX: 700 });
+    expect(history.getAttribute("style")).toContain("width: 420px");
+
+    await fireEvent.mouseMove(window, { clientX: 350 });
+    expect(history.getAttribute("style")).toContain("width: 548px");
+
+    await fireEvent.mouseMove(window, { clientX: 1200 });
+    expect(history.getAttribute("style")).toContain("width: 260px");
+    await fireEvent.mouseUp(window, { clientX: 1200 });
+
+    await fireEvent.keyDown(historyHandle, { key: "ArrowLeft" });
+    expect(history.getAttribute("style")).toContain("width: 284px");
+
+    await fireEvent.click(screen.getByRole("button", { name: "Source" }));
+    expect(history.getAttribute("style")).toContain("width: 284px");
+    expect(sidebar!.getAttribute("style")).toContain("width: 284px");
+    await fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    expect(history.getAttribute("style")).toContain("width: 284px");
+    expect(sidebar!.getAttribute("style")).toContain("width: 284px");
+  });
 });
 
 function scrolledHeadingIDs(scrollIntoView: ReturnType<typeof vi.fn>): string[] {
   return scrollIntoView.mock.contexts.flatMap((context) => {
     if (context instanceof HTMLElement && context.id) return [context.id];
     return [];
+  });
+}
+
+function setReadonlyNumber(element: HTMLElement, property: "clientWidth", value: number): void {
+  Object.defineProperty(element, property, {
+    configurable: true,
+    get: () => value,
   });
 }
 
