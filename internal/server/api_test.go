@@ -36,7 +36,7 @@ import (
 	gh "github.com/google/go-github/v84/github"
 	shellquote "github.com/kballard/go-shellquote"
 	"github.com/shurcooL/githubv4"
-	Assert "github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	gitcmd "go.kenn.io/kit/git/cmd"
 	"go.kenn.io/middleman/internal/apiclient"
@@ -874,21 +874,6 @@ func setupNotificationsEnabledTestServer(t *testing.T) (*Server, *db.DB) {
 	return srv, database
 }
 
-func setupTestServerWithDatabase(
-	t *testing.T, database *db.DB, repos []ghclient.RepoRef,
-) *Server {
-	t.Helper()
-
-	syncer := ghclient.NewSyncer(map[string]ghclient.Client{"github.com": &mockGH{}}, database, nil, repos, time.Minute, nil, nil)
-	t.Cleanup(syncer.Stop)
-	srv := New(
-		database, syncer, nil, "/",
-		nil, ServerOptions{},
-	)
-	t.Cleanup(func() { gracefulShutdown(t, srv) })
-	return srv
-}
-
 func setupTestServerWithMock(t *testing.T, mock *mockGH) (*Server, *db.DB) {
 	t.Helper()
 	return setupTestServerWithRepos(t, mock, defaultTestRepos)
@@ -995,8 +980,8 @@ func assertRFC3339UTC(t *testing.T, got string, want time.Time) {
 	t.Helper()
 	parsed, err := time.Parse(time.RFC3339, got)
 	require.NoError(t, err)
-	Assert.Equal(t, want.UTC(), parsed.UTC())
-	Assert.True(t, strings.HasSuffix(got, "Z"), "expected UTC RFC3339 with trailing Z: %s", got)
+	assert.Equal(t, want.UTC(), parsed.UTC())
+	assert.True(t, strings.HasSuffix(got, "Z"), "expected UTC RFC3339 with trailing Z: %s", got)
 }
 
 func setTestServerNow(t *testing.T, srv *Server, now time.Time) {
@@ -1012,13 +997,13 @@ func testEDTTime(hour, minute int) time.Time {
 func assertTimePtrUTC(t *testing.T, got *time.Time) {
 	t.Helper()
 	require.NotNil(t, got)
-	Assert.Equal(t, time.UTC, got.Location())
+	assert.Equal(t, time.UTC, got.Location())
 }
 
 func assertTimePtrEqualsUTC(t *testing.T, got *time.Time, want time.Time) {
 	t.Helper()
 	assertTimePtrUTC(t, got)
-	Assert.Equal(t, want.UTC(), got.UTC())
+	assert.Equal(t, want.UTC(), got.UTC())
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -1171,7 +1156,7 @@ func seedPRWithHeadSHA(t *testing.T, database *db.DB, owner, name string, number
 
 func TestAPIReplyToGitHubReviewThreadUsesProviderCommentID(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 
 	var gotCommentID int64
@@ -1445,7 +1430,7 @@ func TestAPIMergePR5xxReturns502WithGitHubMessage(t *testing.T) {
 
 func TestAPIMergePRForwardsGitHubErrorDetailsAndLogsError(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	logBuf := &lockedBuffer{}
 	origLogger := slog.Default()
@@ -1545,7 +1530,7 @@ func TestAPIListPulls(t *testing.T) {
 	require.Equal(http.StatusOK, resp.StatusCode())
 	require.NotNil(resp.JSON200)
 	require.Len(*resp.JSON200, 1)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	assert.Equal("acme", (*resp.JSON200)[0].RepoOwner)
 	assert.Equal("widget", (*resp.JSON200)[0].RepoName)
 	assert.Equal("github.com", (*resp.JSON200)[0].PlatformHost)
@@ -1564,7 +1549,7 @@ func TestAPIListPulls(t *testing.T) {
 
 func TestAPIPullResponsesNormalizeMissingKanbanStateToNew(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	srv, database := setupTestServer(t)
 	ctx := t.Context()
 
@@ -1614,7 +1599,7 @@ func TestAPIPullResponsesNormalizeMissingKanbanStateToNew(t *testing.T) {
 
 func TestAPIListItemsIncludeWorkspaceRefs(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	srv, database := setupTestServer(t)
 	ctx := t.Context()
 
@@ -1688,14 +1673,14 @@ func TestAPIListPullsOrdersByLastActivityDescending(t *testing.T) {
 	require.Equal(http.StatusOK, resp.StatusCode())
 	require.NotNil(resp.JSON200)
 	require.Len(*resp.JSON200, 3)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	assert.Equal(int64(2), (*resp.JSON200)[0].Number)
 	assert.Equal(int64(3), (*resp.JSON200)[1].Number)
 	assert.Equal(int64(1), (*resp.JSON200)[2].Number)
 }
 
 func TestAPIListPullsPreservesNewerActivityAfterIndexSync(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	ctx := t.Context()
 	base := time.Date(2026, 5, 20, 12, 0, 0, 0, time.UTC)
@@ -1761,7 +1746,7 @@ func TestAPIListPullsPreservesNewerActivityAfterIndexSync(t *testing.T) {
 }
 
 func TestAPIListPullsKeepsCachedCIDecorationsAfterIndexSync(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	ctx := t.Context()
 	now := time.Date(2026, 5, 20, 12, 0, 0, 0, time.UTC)
@@ -1811,7 +1796,7 @@ func TestAPIListPullsKeepsCachedCIDecorationsAfterIndexSync(t *testing.T) {
 }
 
 func TestAPIGitHubSyncPersistsReviewThreadsThroughPullDetail(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	ctx := t.Context()
 	now := time.Date(2026, 5, 27, 16, 1, 31, 0, time.UTC)
@@ -1904,7 +1889,7 @@ func TestAPIGitHubSyncPersistsReviewThreadsThroughPullDetail(t *testing.T) {
 
 func TestAPIRepoFilterAcceptsMultipleRepos(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	srv, database := setupTestServer(t)
 
 	seedPROnHost(t, database, "github.com", "acme", "widget", 1)
@@ -1949,7 +1934,7 @@ func TestAPIRepoFilterAcceptsMultipleRepos(t *testing.T) {
 
 func TestAPIGetPullIsDBOnly(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	mock := &mockGH{
 		getPullRequestFn: func(_ context.Context, _, _ string, _ int) (*gh.PullRequest, error) {
 			require.Fail("GET pull detail should not call GitHub API")
@@ -1985,7 +1970,7 @@ func TestAPIGetPullIsDBOnly(t *testing.T) {
 
 func TestAPIGetPullIncludesLifecycleTimelineEvents(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	srv, database := setupTestServer(t)
 	client := setupTestClient(t, srv)
 	ctx := t.Context()
@@ -2134,7 +2119,7 @@ func TestAPIGetPullIncludesLifecycleTimelineEvents(t *testing.T) {
 
 func TestAPIGetPullIncludesDeletedCommentTimelineEvent(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	srv, database := setupTestServer(t)
 	mrID := seedPRWithHeadSHA(t, database, "acme", "widget", 1, "deadbeef")
 	createdAt := time.Date(2024, 6, 1, 12, 18, 0, 0, time.UTC)
@@ -2167,7 +2152,7 @@ func TestAPIGetPullIncludesDeletedCommentTimelineEvent(t *testing.T) {
 
 func TestAPISyncPRIncludesWorkflowApproval(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	mock := &mockGH{
 		getPullRequestFn: func(_ context.Context, owner, repo string, number int) (*gh.PullRequest, error) {
 			id := int64(1001)
@@ -2222,7 +2207,7 @@ func TestAPISyncPRIncludesWorkflowApproval(t *testing.T) {
 
 func TestAPISyncPRPersistsMergeableState(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	now := time.Now().UTC().Truncate(time.Second)
 	mergeableState := "dirty"
 	mock := &mockGH{
@@ -2283,7 +2268,7 @@ func TestAPISyncPRPreservesMergeableStateWhenRefreshHasNoAnswer(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			require := require.New(t)
-			assert := Assert.New(t)
+			assert := assert.New(t)
 			mock := &mockGH{
 				getPullRequestFn: func(_ context.Context, _ string, _ string, number int) (*gh.PullRequest, error) {
 					id := int64(1001)
@@ -2338,7 +2323,7 @@ func TestAPISyncPRPreservesMergeableStateWhenRefreshHasNoAnswer(t *testing.T) {
 // persistence the Approve Workflows button never appears.
 func TestAPIEnqueuePRSyncPersistsWorkflowApproval(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	mock := &mockGH{
 		getPullRequestFn: func(_ context.Context, _, _ string, number int) (*gh.PullRequest, error) {
 			id := int64(2001)
@@ -2411,7 +2396,7 @@ func TestAPIEnqueuePRSyncPersistsWorkflowApproval(t *testing.T) {
 // finds no pending runs), GET must report checked=true, required=false.
 func TestAPIGetPullClearsWorkflowApprovalWhenHeadMoves(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	var headSHA atomic.Value
 	headSHA.Store("abc123")
@@ -2485,7 +2470,7 @@ func TestAPIGetPullClearsWorkflowApprovalWhenHeadMoves(t *testing.T) {
 
 func TestAPIApproveWorkflows(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	approvedRunIDs := []int64{}
 	mock := &mockGH{
 		getPullRequestFn: func(_ context.Context, owner, repo string, number int) (*gh.PullRequest, error) {
@@ -2572,7 +2557,7 @@ func TestAPIApproveWorkflows(t *testing.T) {
 
 func TestAPIApproveWorkflowsZeroMatchesStillSyncsPR(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	mock := &mockGH{
 		getPullRequestFn: func(_ context.Context, _, _ string, number int) (*gh.PullRequest, error) {
 			id := int64(1002)
@@ -2620,7 +2605,7 @@ func TestAPIApproveWorkflowsZeroMatchesStillSyncsPR(t *testing.T) {
 
 func TestAPIApproveWorkflowsReturnsUnderlyingApprovalErrorAfterPartialFailure(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	approvedRunIDs := []int64{}
 	mock := &mockGH{
 		getPullRequestFn: func(_ context.Context, _, _ string, number int) (*gh.PullRequest, error) {
@@ -2695,7 +2680,7 @@ func TestAPIApproveWorkflowsReturnsUnderlyingApprovalErrorAfterPartialFailure(t 
 // UI never shows the approve button for the exact case it was built for.
 func TestAPISyncPRIncludesWorkflowApprovalForForkPR(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	mock := &mockGH{
 		getPullRequestFn: func(_ context.Context, _, _ string, number int) (*gh.PullRequest, error) {
 			id := int64(2001)
@@ -2758,7 +2743,7 @@ func TestAPISyncPRIncludesWorkflowApprovalForForkPR(t *testing.T) {
 // branch match the PR.
 func TestAPIApproveWorkflowsForForkPR(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	approvedRunIDs := []int64{}
 	mock := &mockGH{
 		getPullRequestFn: func(_ context.Context, _, _ string, number int) (*gh.PullRequest, error) {
@@ -2826,7 +2811,7 @@ func TestAPIApproveWorkflowsForForkPR(t *testing.T) {
 // required for the wrong PR.
 func TestAPISyncPRIgnoresWorkflowRunsForOtherPRAtSameSHA(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	mock := &mockGH{
 		getPullRequestFn: func(_ context.Context, _, _ string, number int) (*gh.PullRequest, error) {
 			id := int64(3001)
@@ -2882,7 +2867,7 @@ func TestAPISyncPRIgnoresWorkflowRunsForOtherPRAtSameSHA(t *testing.T) {
 // association points at a different PR sharing the same head SHA.
 func TestAPIApproveWorkflowsIgnoresRunsForOtherPRAtSameSHA(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	approvedRunIDs := []int64{}
 	mock := &mockGH{
 		getPullRequestFn: func(_ context.Context, _, _ string, number int) (*gh.PullRequest, error) {
@@ -2949,7 +2934,7 @@ func TestAPIApproveWorkflowsIgnoresRunsForOtherPRAtSameSHA(t *testing.T) {
 // bob/widget. ApproveWorkflowRun must not be called.
 func TestAPIApproveWorkflowsRejectsRunFromDifferentForkAtSameSHA(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	approvedRunIDs := []int64{}
 	mock := &mockGH{
 		getPullRequestFn: func(_ context.Context, _, _ string, number int) (*gh.PullRequest, error) {
@@ -3028,7 +3013,7 @@ func TestAPIGetPullNotFound(t *testing.T) {
 // test pins that behavior so the warning can't silently disappear.
 func TestAPIGetPullEmitsDiffWarningWhenSHAsMissing(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	database := dbtest.Open(t)
 
@@ -3071,7 +3056,7 @@ func TestAPIGetPullEmitsDiffWarningWhenSHAsMissing(t *testing.T) {
 // latest platform head.
 func TestAPIGetPullNoDiffWarningWhenSHAsPresent(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 
 	database := dbtest.Open(t)
@@ -3120,7 +3105,7 @@ func TestAPIGetPullNoDiffWarningWhenSHAsPresent(t *testing.T) {
 // fire in that case.
 func TestAPIGetPullEmitsStaleDiffWarning(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 
 	database := dbtest.Open(t)
@@ -3171,7 +3156,7 @@ func TestAPIGetPullEmitsStaleDiffWarning(t *testing.T) {
 // for open PRs.
 func TestAPIGetPullEmitsStaleDiffWarningOnBaseDrift(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 
 	database := dbtest.Open(t)
@@ -3225,7 +3210,7 @@ func TestAPIGetPullEmitsStaleDiffWarningOnBaseDrift(t *testing.T) {
 // indication.
 func TestAPIGetPullEmitsStaleDiffWarningOnMergedPR(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 
 	database := dbtest.Open(t)
@@ -3278,7 +3263,7 @@ func TestAPIGetPullEmitsStaleDiffWarningOnMergedPR(t *testing.T) {
 // non-open/non-merged state and the user would silently see no diff.
 func TestAPIGetPullEmitsDiffWarningWhenSHAsMissingClosed(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 
 	database := dbtest.Open(t)
@@ -3325,7 +3310,7 @@ func TestAPIGetPullEmitsDiffWarningWhenSHAsMissingClosed(t *testing.T) {
 // diff.
 func TestAPIGetPullEmitsStaleDiffWarningOnClosedPR(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 
 	database := dbtest.Open(t)
@@ -3376,7 +3361,7 @@ func TestAPIGetPullEmitsStaleDiffWarningOnClosedPR(t *testing.T) {
 // emit a warning.
 func TestAPIGetPullNoDiffWarningOnMergedPRWithBaseDrift(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 
 	database := dbtest.Open(t)
@@ -3432,7 +3417,7 @@ func TestAPIGetPullNoDiffWarningOnMergedPRWithBaseDrift(t *testing.T) {
 // only the sanitized warning.
 func TestAPISyncPRSanitizesDiffFailureWarning(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	database := dbtest.Open(t)
 
@@ -3571,7 +3556,7 @@ func TestAPIListRepos(t *testing.T) {
 
 func TestAPIConfiguredRepoFiltersUseProviderIdentity(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 	srv, database, _ := setupTestServerWithConfig(t)
 	client := setupTestClientWithBaseURL(t, srv, "http://127.0.0.1:8091")
@@ -3622,7 +3607,7 @@ func TestAPIConfiguredRepoFiltersUseProviderIdentity(t *testing.T) {
 }
 
 func TestAPIGitLabConfiguredRepoSyncThroughProviderRegistry(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	ctx := t.Context()
 	now := time.Now().UTC().Truncate(time.Second)
@@ -3736,7 +3721,7 @@ func TestAPIGitLabConfiguredRepoSyncThroughProviderRegistry(t *testing.T) {
 }
 
 func TestAPIGitLabSyncReadsTokenFileAfterRotation(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	ctx := t.Context()
 	dir := t.TempDir()
@@ -3853,7 +3838,7 @@ func TestAPIGitLabSyncReadsTokenFileAfterRotation(t *testing.T) {
 }
 
 func TestAPIGitHubSyncReadsCloneTokenFileAfterRotation(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	ctx := t.Context()
 	dir := t.TempDir()
@@ -4011,7 +3996,7 @@ name = "widget"
 // host; the reload drops one provider's token and rotates the other's,
 // and git fetches must follow the surviving effective chain.
 func TestAPISharedHostCloneFetchFollowsReloadedHostToken(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	ctx := t.Context()
 	dir := t.TempDir()
@@ -4227,7 +4212,7 @@ func parseCapturedCredentials(raw string) []string {
 }
 
 func TestGitLabSyncCoversRepositoryItemsEventsOverviewAndCI(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	ctx := t.Context()
 	now := time.Now().UTC().Truncate(time.Second)
@@ -4460,7 +4445,7 @@ func TestGitLabSyncCoversRepositoryItemsEventsOverviewAndCI(t *testing.T) {
 
 func TestAPICIRefreshWarnsAndPreservesCIWhenProviderFails(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 	now := time.Now().UTC().Truncate(time.Second)
 	database := dbtest.Open(t)
@@ -4550,7 +4535,7 @@ func TestAPICIRefreshWarnsAndPreservesCIWhenProviderFails(t *testing.T) {
 
 func TestAPISyncRefreshesStaleCachedChecksWhenAggregateCIChanges(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 	now := time.Now().UTC().Truncate(time.Second)
 	fetchedAt := now
@@ -4667,7 +4652,7 @@ func TestAPISyncRefreshesStaleCachedChecksWhenAggregateCIChanges(t *testing.T) {
 
 func TestAPISyncRefreshesCachedPendingChecksThroughDetailDrain(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 	now := time.Now().UTC().Truncate(time.Second)
 	fetchedAt := now
@@ -4784,7 +4769,7 @@ func TestAPISyncRefreshesCachedPendingChecksThroughDetailDrain(t *testing.T) {
 }
 
 func TestProviderRefSyncEndpointsUseGitLabNestedRepoPath(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	ctx := t.Context()
 	now := time.Now().UTC().Truncate(time.Second)
@@ -5069,14 +5054,14 @@ func TestGitLabSyncUsesTagsForRepoOverviewWhenReleasesAreAbsent(t *testing.T) {
 	require.Len(*resp.JSON200, 1)
 	require.NotNil((*resp.JSON200)[0].LatestRelease)
 
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	assert.Equal("v0.9.0", (*resp.JSON200)[0].LatestRelease.TagName)
 	assert.Equal("https://gitlab-tags.example.com/team/service/-/tree/v0.9.0", (*resp.JSON200)[0].LatestRelease.Url)
 }
 
 func TestAPIListRepoSummaries(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	repos := []ghclient.RepoRef{
 		{Platform: "github", Owner: "acme", Name: "widgets", PlatformHost: "github.com"},
@@ -5177,7 +5162,7 @@ func TestAPIListRepoSummaries(t *testing.T) {
 
 func TestAPIListRepoSummariesIncludesDefaultPlatformHost(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	srv, database, _ := setupTestServerWithConfigContent(t, `
 default_platform_host = "ghe.example.com"
@@ -5210,7 +5195,7 @@ platform_host = "ghe.example.com"
 
 func TestAPIListRepoSummariesIncludesSyncedReleaseTimeline(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 	dir := t.TempDir()
 	database := dbtest.Open(t)
@@ -5342,7 +5327,7 @@ func TestAPIListRepoSummariesIncludesSyncedReleaseTimeline(t *testing.T) {
 
 func TestAPIListRepoSummariesUsesTagsWhenNoReleases(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 	database := dbtest.Open(t)
 
@@ -5410,7 +5395,7 @@ func TestAPIListRepoSummariesUsesTagsWhenNoReleases(t *testing.T) {
 
 func TestAPIListRepoSummariesClearsStaleOverviewWhenTagFallbackFails(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 
 	database := dbtest.Open(t)
@@ -5498,7 +5483,7 @@ func TestAPIListRepoSummariesClearsStaleOverviewWhenTagFallbackFails(t *testing.
 
 func TestAPICreateIssue(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	createdAt := time.Date(2026, 4, 17, 12, 0, 0, 0, time.UTC)
 	mock := &mockGH{
@@ -5617,7 +5602,7 @@ func TestAPICreateIssueRejectsNilProviderPayload(t *testing.T) {
 
 func TestAPIEditPRContentRejectsNilProviderPayload(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	mock := &mockGH{
 		editPullRequestFn: func(
@@ -5708,7 +5693,7 @@ func TestAPIPostIssueCommentRejectsNilProviderPayload(t *testing.T) {
 
 func TestAPIEditPRCommentRejectsNilProviderPayload(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	mock := &mockGH{
 		editIssueCommentFn: func(context.Context, string, string, int64, string) (*gh.IssueComment, error) {
@@ -5747,7 +5732,7 @@ func TestAPIEditPRCommentRejectsNilProviderPayload(t *testing.T) {
 
 func TestAPIEditIssueCommentRejectsNilProviderPayload(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	mock := &mockGH{
 		editIssueCommentFn: func(context.Context, string, string, int64, string) (*gh.IssueComment, error) {
@@ -5786,7 +5771,7 @@ func TestAPIEditIssueCommentRejectsNilProviderPayload(t *testing.T) {
 
 func TestAPIApprovePRSubmitsGitHubReview(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	var providerCalled atomic.Bool
 	var reviewCommitID string
@@ -5838,7 +5823,7 @@ func TestAPIApprovePRSubmitsGitHubReview(t *testing.T) {
 
 func TestAPIMergePRRejectsNilProviderPayload(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	mock := &mockGH{
 		mergePullRequestFn: func(
@@ -5880,7 +5865,7 @@ func TestAPIMergePRRejectsNilProviderPayload(t *testing.T) {
 
 func TestAPICreateIssueUsesPlatformHost(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	database := dbtest.Open(t)
 
@@ -5991,7 +5976,7 @@ func TestAPIPostPrCommentAllowsMixedCaseTrackedRepo(t *testing.T) {
 }
 
 func TestAPIEditPrCommentUpdatesGitHubAndLocalTimeline(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	commentID := int64(9876)
 	createdAt := time.Date(2026, 4, 29, 12, 0, 0, 0, time.UTC)
@@ -6082,7 +6067,7 @@ func TestAPIEditPrCommentRejectsCommentFromDifferentPR(t *testing.T) {
 }
 
 func TestAPIEditIssueCommentUpdatesGitHubAndLocalTimeline(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	commentID := int64(1234)
 	createdAt := time.Date(2026, 4, 29, 13, 0, 0, 0, time.UTC)
@@ -6173,7 +6158,7 @@ func TestAPIEditIssueCommentRejectsCommentFromDifferentIssue(t *testing.T) {
 }
 
 func TestAPICommentAutocomplete(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	srv, database := setupTestServer(t)
 	ctx := t.Context()
@@ -6305,7 +6290,7 @@ func TestAPICommentAutocomplete(t *testing.T) {
 }
 
 func TestAPICommentAutocompleteUsesRepoPlatformHost(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	srv, database := setupTestServer(t)
 	ctx := t.Context()
@@ -6357,7 +6342,7 @@ func TestAPICommentAutocompleteUsesRepoPlatformHost(t *testing.T) {
 }
 
 func TestAPICommentAutocompleteReferencesScopesByProvider(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	srv, database := setupTestServer(t)
 	ctx := t.Context()
@@ -6421,7 +6406,7 @@ func TestAPICommentAutocompleteReferencesScopesByProvider(t *testing.T) {
 }
 
 func TestAPICommentAutocompleteGitLabMergeRequestReferencesScopesByProvider(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	srv, database := setupTestServer(t)
 	ctx := t.Context()
@@ -6501,7 +6486,7 @@ func TestAPISyncStatus(t *testing.T) {
 	require.NotNil(resp.JSON200)
 	require.False(resp.JSON200.Running)
 	require.NotNil(resp.JSON200.LastRunAt)
-	Assert.Equal(t, time.UTC, resp.JSON200.LastRunAt.Location())
+	assert.Equal(t, time.UTC, resp.JSON200.LastRunAt.Location())
 }
 
 func TestAPITriggerSyncIgnoresRequestCancellation(t *testing.T) {
@@ -6549,8 +6534,8 @@ func TestAPITriggerSyncIgnoresRequestCancellation(t *testing.T) {
 	repos, err := database.ListRepos(t.Context())
 	require.NoError(err)
 	require.Len(repos, 1)
-	Assert.Equal(t, "acme", repos[0].Owner)
-	Assert.Equal(t, "widget", repos[0].Name)
+	assert.Equal(t, "acme", repos[0].Owner)
+	assert.Equal(t, "widget", repos[0].Name)
 }
 
 func TestAPITriggerSyncBypassesNextSyncAfter(t *testing.T) {
@@ -6614,7 +6599,7 @@ func TestAPITriggerSyncBypassesNextSyncAfter(t *testing.T) {
 }
 
 func TestMatchPriorityRepoRequiresProviderQualifiedRepoPaths(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	tracked := []ghclient.RepoRef{
 		{
@@ -6920,7 +6905,7 @@ func seedIssueForRepo(
 
 func TestAPIClosePR(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	srv, database := setupTestServer(t)
 	handlerNow := testEDTTime(9, 15)
@@ -7069,7 +7054,7 @@ func TestAPIReopenIssue(t *testing.T) {
 
 func TestAPISyncPRDoesNotOverwriteNewerStateChange(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	staleUpdatedAt := time.Date(2026, 4, 12, 1, 0, 0, 0, time.UTC)
 	syncStarted := make(chan struct{}, 1)
@@ -7160,7 +7145,7 @@ func TestAPISyncPRDoesNotOverwriteNewerStateChange(t *testing.T) {
 
 func TestAPISyncPRPreservesCIStatusWhileRefreshingCI(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	ciRefreshStarted := make(chan struct{}, 1)
 	releaseCIRefresh := make(chan struct{})
@@ -7262,7 +7247,7 @@ func TestAPISyncPRPreservesCIStatusWhileRefreshingCI(t *testing.T) {
 
 func TestAPISyncPRBypassesPullRequestETagForCIRefresh(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	headSHA := "abc123"
 	success := "success"
@@ -7346,7 +7331,7 @@ func TestAPISyncPRBypassesPullRequestETagForCIRefresh(t *testing.T) {
 // attached to a different commit.
 func TestAPISyncPRClearsCIWhenHeadSHAChanges(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	mock := &mockGH{
 		getPullRequestFn: func(_ context.Context, _, _ string, number int) (*gh.PullRequest, error) {
@@ -7535,7 +7520,7 @@ func TestAPIEnqueueIssueSyncReturnsBeforeGitHubFetchCompletes(t *testing.T) {
 
 func TestAPIReadyForReviewDoesNotGetRevertedByStaleSync(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	staleUpdatedAt := time.Date(2026, 4, 12, 1, 0, 0, 0, time.UTC)
 	readyUpdatedAt := staleUpdatedAt.Add(30 * time.Minute)
@@ -7682,7 +7667,7 @@ func TestAPIReadyForReviewDoesNotGetRevertedByStaleSync(t *testing.T) {
 
 func TestAPIMarkDraftDoesNotGetRevertedByStaleSync(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	staleUpdatedAt := time.Date(2026, 4, 12, 1, 0, 0, 0, time.UTC)
 	syncStarted := make(chan struct{}, 1)
@@ -7813,7 +7798,7 @@ func TestAPIMarkDraftDoesNotGetRevertedByStaleSync(t *testing.T) {
 
 func TestAPISyncIssueDoesNotOverwriteNewerStateChange(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	staleUpdatedAt := time.Date(2026, 4, 12, 1, 0, 0, 0, time.UTC)
 	syncStarted := make(chan struct{}, 1)
@@ -7904,7 +7889,7 @@ func TestAPISyncIssueDoesNotOverwriteNewerStateChange(t *testing.T) {
 // covers the request path users actually hit in production.
 func TestAPISyncIssueNilUpdatedAtFallsBackToCreatedAt(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 
 	createdAt := time.Date(2025, 3, 14, 9, 0, 0, 0, time.UTC)
@@ -7960,7 +7945,7 @@ func TestAPISyncIssueNilUpdatedAtFallsBackToCreatedAt(t *testing.T) {
 
 func TestAPIListPullsSearchByNumber(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	srv, database := setupTestServer(t)
 	ctx := t.Context()
 
@@ -8025,7 +8010,7 @@ func TestAPIListPullsSearchByNumber(t *testing.T) {
 
 func TestAPIListIssuesSearchByNumber(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	srv, database := setupTestServer(t)
 	ctx := t.Context()
 
@@ -8090,7 +8075,7 @@ func TestAPIListIssuesSearchByNumber(t *testing.T) {
 
 func TestAPIListItemsHonorsLimit(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	srv, database := setupTestServer(t)
 	ctx := t.Context()
 
@@ -8133,7 +8118,7 @@ func TestAPIListItemsHonorsLimit(t *testing.T) {
 }
 
 func TestAPIListPullsReportsBackfilledMergedPRFromMergedAt(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	ctx := t.Context()
 
@@ -8212,7 +8197,7 @@ func TestAPIListPullsReportsBackfilledMergedPRFromMergedAt(t *testing.T) {
 }
 
 func TestAPIListPullsCasefoldsRepoNames(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	srv, database := setupTestServerWithRepos(t, &mockGH{}, []ghclient.RepoRef{
 		{Owner: "org", Name: "foo", PlatformHost: "github.com"},
@@ -8232,7 +8217,7 @@ func TestAPIListPullsCasefoldsRepoNames(t *testing.T) {
 }
 
 func TestAPIListPullsFiltersProviderQualifiedHostedNestedRepoPath(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	srv, database := setupTestServerWithRepos(t, &mockGH{}, []ghclient.RepoRef{
 		{Owner: "Group/SubGroup", Name: "Project.Special", PlatformHost: "ghe.example.com"},
@@ -8256,7 +8241,7 @@ func TestAPIListPullsFiltersProviderQualifiedHostedNestedRepoPath(t *testing.T) 
 }
 
 func TestAPIListPullsAcceptsProviderQualifiedRepoFilter(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	srv, database := setupTestServer(t)
 	client := setupTestClient(t, srv)
@@ -8351,7 +8336,7 @@ func TestAPIListIssuesAcceptsMixedCaseProviderQualifiedRepoFilter(t *testing.T) 
 
 func TestAPIListIssuesAcceptsProviderAndHostQualifiedRepoFilter(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	srv, database := setupTestServer(t)
 	seedIssueOnHost(t, database, "github.com", "acme", "widget", 5, "open", "GitHub issue")
@@ -8373,7 +8358,7 @@ func TestAPIListIssuesAcceptsProviderAndHostQualifiedRepoFilter(t *testing.T) {
 }
 
 func TestAPIListIssuesFiltersProviderQualifiedHostedNestedRepoPath(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	srv, database := setupTestServerWithRepos(t, &mockGH{}, []ghclient.RepoRef{
@@ -8407,7 +8392,7 @@ func TestAPIListIssuesFiltersProviderQualifiedHostedNestedRepoPath(t *testing.T)
 }
 
 func TestAPIListIssuesAcceptsProviderQualifiedRepoFilter(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	srv, database := setupTestServer(t)
 	client := setupTestClient(t, srv)
@@ -8445,7 +8430,7 @@ func TestAPIListIssuesAcceptsProviderQualifiedRepoFilter(t *testing.T) {
 
 func TestAPIGetIssueUsesPlatformHostQuery(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	database := dbtest.Open(t)
 
@@ -8507,7 +8492,7 @@ func TestAPIGetIssueUsesPlatformHostQuery(t *testing.T) {
 
 func TestAPIGetIssueWorkspaceUsesProviderScopedLookup(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 
 	database := dbtest.Open(t)
@@ -8589,7 +8574,7 @@ func TestAPIGetIssueWorkspaceUsesProviderScopedLookup(t *testing.T) {
 
 func TestAPIGetPRWorkspaceUsesProviderScopedLookup(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 
 	database := dbtest.Open(t)
@@ -8673,7 +8658,7 @@ func TestAPIGetPRWorkspaceUsesProviderScopedLookup(t *testing.T) {
 
 func TestAPICreateWorkspaceRejectsEmptyProviderForAmbiguousRepo(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 
 	srv, database := setupTestServer(t)
@@ -8769,7 +8754,7 @@ func TestAPICreateWorkspaceRejectsOmittedProviderForUnambiguousRepo(t *testing.T
 
 func TestAPISyncIssueUsesPlatformHostQuery(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := context.Background()
 
 	database := dbtest.Open(t)
@@ -8901,7 +8886,7 @@ func TestAPISyncIssueUsesPlatformHostQuery(t *testing.T) {
 
 func TestAPISetIssueStateUsesPlatformHostBody(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := context.Background()
 
 	database := dbtest.Open(t)
@@ -9020,7 +9005,7 @@ func TestAPISetIssueStateUsesPlatformHostBody(t *testing.T) {
 // internal/github/sync_test.go; this test covers the DB → API layer.
 func TestAPIIssueDataFromGraphQLSync(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 
 	mock := &mockGH{}
@@ -9099,7 +9084,7 @@ func TestAPIIssueDataFromGraphQLSync(t *testing.T) {
 // UpsertIssue → HTTP API handler → JSON response.
 func TestE2EGraphQLIssueSyncThroughAPI(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 
 	now := time.Now().UTC().Truncate(time.Second).Format(time.RFC3339)
@@ -9200,7 +9185,7 @@ func TestE2EGraphQLIssueSyncThroughAPI(t *testing.T) {
 
 func TestE2ELargeRepoSkipsGraphQLAndUsesConditionalPRDetail(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 
 	unchangedAt := time.Date(2026, 4, 12, 10, 0, 0, 0, time.UTC)
@@ -9367,7 +9352,7 @@ func TestE2ELargeRepoSkipsGraphQLAndUsesConditionalPRDetail(t *testing.T) {
 
 func TestE2ELargeRepoSkipsGraphQLAndUsesConditionalIssueDetail(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 
 	unchangedAt := time.Date(2026, 4, 12, 10, 0, 0, 0, time.UTC)
@@ -9535,7 +9520,7 @@ func TestE2ELargeRepoSkipsGraphQLAndUsesConditionalIssueDetail(t *testing.T) {
 // Regression test for the "preserve existing.CommentCount" overwrite.
 func TestE2EGraphQLIssueSyncTrustsTotalCount(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 
 	now := time.Date(2026, 4, 12, 14, 0, 0, 0, time.UTC)
@@ -9648,7 +9633,7 @@ func TestE2EGraphQLIssueSyncTrustsTotalCount(t *testing.T) {
 
 func TestE2EPRDetailRefreshesEditedCommentBody(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 
 	now := time.Date(2026, 4, 12, 14, 0, 0, 0, time.UTC)
@@ -9778,7 +9763,7 @@ func TestE2EPRDetailRefreshesEditedCommentBody(t *testing.T) {
 
 func TestE2EPRDetailRemovesDeletedCommentWhenPRListIsUnchanged(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 
 	now := time.Date(2026, 4, 12, 14, 0, 0, 0, time.UTC)
@@ -9904,7 +9889,7 @@ func TestE2EPRDetailRemovesDeletedCommentWhenPRListIsUnchanged(t *testing.T) {
 
 func TestE2EPRDetailRemovesDeletedCommentWhenAnotherPRChanges(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 
 	now := time.Date(2026, 4, 12, 15, 0, 0, 0, time.UTC)
@@ -10053,7 +10038,7 @@ func TestE2EPRDetailRemovesDeletedCommentWhenAnotherPRChanges(t *testing.T) {
 
 func TestE2EIssueDetailRefreshesEditedCommentBody(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 
 	now := time.Date(2026, 4, 12, 14, 0, 0, 0, time.UTC)
@@ -10168,7 +10153,7 @@ func TestE2EIssueDetailRefreshesEditedCommentBody(t *testing.T) {
 
 func TestE2EIssueDetailRemovesDeletedCommentWhenIssueListIsUnchanged(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 
 	now := time.Date(2026, 4, 12, 14, 0, 0, 0, time.UTC)
@@ -10279,7 +10264,7 @@ func TestE2EIssueDetailRemovesDeletedCommentWhenIssueListIsUnchanged(t *testing.
 
 func TestE2EIssueDetailRemovesDeletedCommentWhenAnotherIssueChanges(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 
 	now := time.Date(2026, 4, 12, 16, 0, 0, 0, time.UTC)
@@ -10419,7 +10404,7 @@ func TestE2EIssueDetailRemovesDeletedCommentWhenAnotherIssueChanges(t *testing.T
 
 func TestE2EPRDetailRemovesDeletedCommentOnFullRefresh(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 
 	now := time.Date(2026, 4, 13, 10, 0, 0, 0, time.UTC)
@@ -10523,7 +10508,7 @@ func TestE2EPRDetailRemovesDeletedCommentOnFullRefresh(t *testing.T) {
 
 func TestE2EIssueDetailRemovesDeletedCommentOnFullRefresh(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 
 	now := time.Date(2026, 4, 13, 10, 0, 0, 0, time.UTC)
@@ -10619,7 +10604,7 @@ func TestE2EIssueDetailRemovesDeletedCommentOnFullRefresh(t *testing.T) {
 
 func TestE2EIssueDetailRemovesDeletedCommentOnGraphQLBulkSync(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 
 	now := time.Date(2026, 4, 13, 11, 0, 0, 0, time.UTC)
@@ -10736,7 +10721,7 @@ func TestE2EIssueDetailRemovesDeletedCommentOnGraphQLBulkSync(t *testing.T) {
 
 func TestE2EGraphQLBulkSyncPersistsIssueTimelineEvents(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 
 	now := time.Date(2026, 4, 13, 12, 0, 0, 0, time.UTC)
@@ -10881,7 +10866,7 @@ func TestE2EGraphQLBulkSyncPersistsIssueTimelineEvents(t *testing.T) {
 
 func TestE2EGraphQLBulkSyncPersistsIssueLifecycleTimelineAfterReopen(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 
 	now := time.Now().UTC().Truncate(time.Second)
@@ -11059,7 +11044,7 @@ func TestE2EGraphQLBulkSyncPersistsIssueLifecycleTimelineAfterReopen(t *testing.
 
 func TestE2EPRDetailRemovesDeletedCommentOnGraphQLBulkSync(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 
 	now := time.Date(2026, 4, 13, 11, 30, 0, 0, time.UTC)
@@ -11189,7 +11174,7 @@ func TestE2EPRDetailRemovesDeletedCommentOnGraphQLBulkSync(t *testing.T) {
 // DB-only GET unable to surface the Approve workflows button.
 func TestE2EGraphQLBulkSyncPersistsWorkflowApproval(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 
 	now := time.Date(2026, 4, 14, 10, 0, 0, 0, time.UTC)
@@ -11305,7 +11290,7 @@ func TestE2EGraphQLBulkSyncPersistsWorkflowApproval(t *testing.T) {
 // hidden for every fork PR synced through bulk.
 func TestE2EGraphQLBulkSyncPersistsWorkflowApprovalForForkPR(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 
 	now := time.Date(2026, 4, 14, 10, 0, 0, 0, time.UTC)
@@ -11422,7 +11407,7 @@ func TestE2EGraphQLBulkSyncPersistsWorkflowApprovalForForkPR(t *testing.T) {
 
 func TestE2EGraphQLBulkSyncKeepsNewestCICheckBySuiteCreatedAt(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := context.Background()
 
 	older := time.Date(2026, 4, 9, 12, 0, 0, 0, time.UTC)
@@ -11580,7 +11565,7 @@ func TestAPISetIssueGitHubStateReturns404WhenNoClientConfigured(t *testing.T) {
 
 func TestAPIClosePR422NilFallbackPayloadDoesNotCorruptDB(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	mock := &mockGH{
 		editPullRequestFn: func(_ context.Context, _, _ string, _ int, _ ghclient.EditPullRequestOpts) (*gh.PullRequest, error) {
 			return nil, make422Error()
@@ -11613,7 +11598,7 @@ func TestAPIClosePR422NilFallbackPayloadDoesNotCorruptDB(t *testing.T) {
 
 func TestAPICloseIssue422NilFallbackPayloadDoesNotCorruptDB(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	mock := &mockGH{
 		editIssueFn: func(_ context.Context, _, _ string, _ int, _ string) (*gh.Issue, error) {
 			return nil, make422Error()
@@ -11684,7 +11669,7 @@ func TestAPIClosePR422AlreadyClosed(t *testing.T) {
 
 func TestAPIMarkPRDraftPersistsDraftFlag(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	var gotOwner string
 	var gotRepo string
 	var gotNumber int
@@ -12307,7 +12292,7 @@ func TestMRDetailIncludesWorktreeLinks(t *testing.T) {
 
 func TestProviderPullRouteResolvesEscapedGitLabRepoPath(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	srv, database := setupTestServer(t)
 	ctx := t.Context()
 	now := time.Now().UTC().Truncate(time.Second)
@@ -12354,7 +12339,7 @@ func TestProviderPullRouteResolvesEscapedGitLabRepoPath(t *testing.T) {
 
 func TestAPIGitLabProviderCapabilitiesExposeOnResponses(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	srv, database := setupGitLabCapabilityServer(t)
 	ctx := t.Context()
 
@@ -12623,7 +12608,7 @@ func TestAPIGitLabUnsupportedMutationsReturnCodedCapabilityErrors(t *testing.T) 
 func TestAPIUnsupportedCapabilityEnvelope(t *testing.T) {
 	srv, _ := setupGitLabCapabilityServer(t)
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	rr := doJSON(
 		t,
@@ -12669,7 +12654,7 @@ func TestAPICapabilityGatedRouteReturnsLookupProblemBeforeCapabilityProblem(t *t
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			require := require.New(t)
-			assert := Assert.New(t)
+			assert := assert.New(t)
 
 			rr := doJSON(
 				t,
@@ -12834,7 +12819,7 @@ func TestAPIRateLimitedEnvelope(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			require := require.New(t)
-			assert := Assert.New(t)
+			assert := assert.New(t)
 
 			rr := doJSON(t, srv, tt.method, tt.path, tt.body)
 			require.Equal(http.StatusTooManyRequests, rr.Code, rr.Body.String())
@@ -12863,7 +12848,7 @@ func TestAPIRateLimitedEnvelope(t *testing.T) {
 // details.allowed.
 func TestAPIValidationErrorEnvelope(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	srv, database := setupTestServer(t)
 	ctx := t.Context()
@@ -13026,7 +13011,7 @@ func (p *issueMutatorGitLabProvider) EditMergeRequestContent(
 
 func TestAPIDiffReviewDraftCRUDUsesLocalStorage(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	caps := platform.Capabilities{
 		ReadRepositories:       true,
 		ReadMergeRequests:      true,
@@ -13132,7 +13117,7 @@ func TestAPIDiffReviewDraftCRUDUsesLocalStorage(t *testing.T) {
 
 func TestAPIDiffReviewDraftRejectsInvalidLineCoordinates(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	caps := platform.Capabilities{
 		ReadRepositories:       true,
 		ReadMergeRequests:      true,
@@ -13254,7 +13239,7 @@ func TestAPIDiffReviewDraftRejectsInvalidLineCoordinates(t *testing.T) {
 
 func TestAPIGitHubPublishReviewDraftSendsCommentsThroughServer(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 	type capturedReview struct {
 		owner    string
@@ -13397,7 +13382,7 @@ func TestAPIPublishReviewDraftRejectsStoredCommentWithoutDiffHeadSHA(t *testing.
 
 func TestAPIPublishReviewDraftUsesPlatformHeadSHAWhenDiffHeadIsUnavailable(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	caps := platform.Capabilities{
 		ReadRepositories:       true,
 		ReadMergeRequests:      true,
@@ -13450,7 +13435,7 @@ func TestAPIPublishReviewDraftUsesPlatformHeadSHAWhenDiffHeadIsUnavailable(t *te
 
 func TestAPIPublishReviewDraftMapsStaleProviderErrorToConflict(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	caps := platform.Capabilities{
 		ReadRepositories:       true,
 		ReadMergeRequests:      true,
@@ -13528,7 +13513,7 @@ func TestAPIPublishReviewDraftMapsStaleProviderErrorToConflict(t *testing.T) {
 
 func TestAPIPublishReviewDraftMapsPartialStaleProviderErrorToConflict(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	caps := platform.Capabilities{
 		ReadRepositories:       true,
 		ReadMergeRequests:      true,
@@ -13656,7 +13641,7 @@ func TestAPIPublishReviewDraftRejectsMultilineRangeWithoutCapability(t *testing.
 
 func TestAPIGitLabPublishReviewDraftApprovesWithDiffPositionSHAs(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	caps := platform.Capabilities{
 		ReadRepositories:      true,
 		ReadMergeRequests:     true,
@@ -13801,7 +13786,7 @@ func TestAPIPublishReviewDraftPreservesDraftWhenPartialStatusIsUnknown(t *testin
 
 func TestAPIGitLabPublishReviewDraftSurfacesCleanupFailureAsPartial(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 	now := time.Now().UTC().Truncate(time.Second)
 	var createAttempts atomic.Int32
@@ -13986,7 +13971,7 @@ func TestAPIGitLabPublishReviewDraftSurfacesCleanupFailureAsPartial(t *testing.T
 
 func TestAPIGitLabPublishReviewDraftSendsSummaryThroughServer(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 	now := time.Now().UTC().Truncate(time.Second)
 	var order []string
@@ -14168,7 +14153,7 @@ func writeRawJSONForTest(w http.ResponseWriter, body string) {
 
 func TestAPIPublishReviewDraftPersistsProviderReviewThreads(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	caps := platform.Capabilities{
 		ReadRepositories:       true,
 		ReadMergeRequests:      true,
@@ -14311,7 +14296,7 @@ func TestAPIPublishReviewDraftPersistsProviderReviewThreads(t *testing.T) {
 
 func TestAPIForgejoPublishReviewDraftIngestsTimelineThread(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	caps := platform.Capabilities{
 		ReadRepositories:       true,
 		ReadMergeRequests:      true,
@@ -14390,7 +14375,7 @@ func TestAPIForgejoPublishReviewDraftIngestsTimelineThread(t *testing.T) {
 
 func TestAPIForgejoSyncRecoversReviewThreadTimelineMetadata(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	caps := platform.Capabilities{
 		ReadRepositories:       true,
 		ReadMergeRequests:      true,
@@ -14454,7 +14439,7 @@ func TestAPIForgejoSyncRecoversReviewThreadTimelineMetadata(t *testing.T) {
 
 func TestAPIGitLabSyncKeepsCanonicalReviewThreadWhenProviderReturnsReplies(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	caps := platform.Capabilities{
 		ReadRepositories:  true,
 		ReadMergeRequests: true,
@@ -14614,7 +14599,7 @@ func TestAPIGitLabSyncPrunesMissingReviewThreadTimelineEvents(t *testing.T) {
 
 func TestAPIGitLabSyncPrunesLegacyPositionedNoteCommentEvents(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	caps := platform.Capabilities{
 		ReadRepositories:  true,
 		ReadMergeRequests: true,
@@ -14740,7 +14725,7 @@ func TestAPIPublishReviewDraftDeletesDraftBeforeReviewThreadIngest(t *testing.T)
 
 func TestAPIResolveReviewThreadPersistsProviderState(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	caps := platform.Capabilities{
 		ReadRepositories:       true,
 		ReadMergeRequests:      true,
@@ -14877,7 +14862,7 @@ func TestAPIResolveReviewThreadReturnsServerErrorForCorruptStoredThread(t *testi
 
 func TestAPIPullDetailAttachesReviewThreadMetadata(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	srv, database := setupGitLabCapabilityServer(t)
 	ctx := t.Context()
 
@@ -14948,7 +14933,7 @@ func draftIDFromResponse(t *testing.T, draft map[string]any) int64 {
 }
 
 func TestAPIGitealikeReadSyncPersistsThroughServer(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	ctx := t.Context()
 	base := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
@@ -15117,7 +15102,7 @@ func TestAPIGitealikeHTTPMergeabilityPersistsThroughServer(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert := Assert.New(t)
+			assert := assert.New(t)
 			require := require.New(t)
 			ctx := t.Context()
 			base := time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC)
@@ -15224,7 +15209,7 @@ func TestAPIGitealikeHTTPMergeabilityPersistsThroughServer(t *testing.T) {
 }
 
 func TestAPIGitealikeMutationsPersistThroughServer(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	ctx := t.Context()
 	base := time.Date(2026, 5, 3, 12, 0, 0, 0, time.UTC)
@@ -15589,7 +15574,7 @@ func setupGitealikeCloneFixture(t *testing.T) (cloneURL, baseSHA, headSHA string
 // sync path that never writes it would leave every head-bound action
 // permanently rejected with 409 head_unknown.
 func TestAPIGitealikeNormalSyncEnablesHeadBoundMutations(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	ctx := t.Context()
 	cloneURL, baseSHA, headSHA := setupGitealikeCloneFixture(t)
@@ -15671,7 +15656,7 @@ func TestAPIGitealikeNormalSyncEnablesHeadBoundMutations(t *testing.T) {
 }
 
 func TestAPIGitealikePinnedMergeHeadMismatchIsStale(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	transport := &apiTestGitealikeTransport{
 		mergeErr: &gitealike.HTTPError{
@@ -15703,7 +15688,7 @@ func TestAPIGitealikePinnedMergeHeadMismatchIsStale(t *testing.T) {
 }
 
 func TestAPIGitealikePinnedMergeGenericConflictStaysConflict(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	transport := &apiTestGitealikeTransport{
 		mergeErr: &gitealike.HTTPError{
@@ -15733,7 +15718,7 @@ func TestAPIGitealikePinnedMergeGenericConflictStaysConflict(t *testing.T) {
 }
 
 func TestAPIGitealikeApproveSubmitsReview(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	transport := &apiTestGitealikeTransport{}
 	client := setupGitealikeHeadPinServer(t, transport)
@@ -15752,7 +15737,7 @@ func TestAPIGitealikeApproveSubmitsReview(t *testing.T) {
 }
 
 func TestAPIGitealikeApproveDoesNotReadRacingHead(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	transport := &apiTestGitealikeTransport{}
 	client := setupGitealikeHeadPinServer(t, transport)
@@ -15773,7 +15758,7 @@ func TestAPIGitealikeApproveDoesNotReadRacingHead(t *testing.T) {
 }
 
 func TestAPIGiteaActionsSyncPersistsThroughServer(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	ctx := t.Context()
 	base := time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC)
@@ -15954,7 +15939,7 @@ func requireIssue(t *testing.T, database *db.DB, repoID int64, number int) *db.I
 }
 
 func TestAPIGitealikeMergeConflictReturnsConflict(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	ctx := t.Context()
 	base := time.Date(2026, 5, 3, 12, 0, 0, 0, time.UTC)
@@ -16128,7 +16113,7 @@ func newAPIGitealikeHeadPinTransport(t *testing.T) *apiTestGitealikeTransport {
 
 func TestAPIGitealikeMergePassesReviewedHeadPinToProvider(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 	transport := newAPIGitealikeHeadPinTransport(t)
 	client, database := setupAPIGitealikeHeadPinServer(t, transport)
@@ -16159,7 +16144,7 @@ func TestAPIGitealikeMergePassesReviewedHeadPinToProvider(t *testing.T) {
 
 func TestAPIGitealikeMergeHeadMismatchMapsToStaleState(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 	transport := newAPIGitealikeHeadPinTransport(t)
 	transport.mergeErr = &gitealike.HTTPError{
@@ -16190,7 +16175,7 @@ func TestAPIGitealikeMergeHeadMismatchMapsToStaleState(t *testing.T) {
 
 func TestAPIGitealikeApproveBeforeHeadRace(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 	transport := newAPIGitealikeHeadPinTransport(t)
 	client, _ := setupAPIGitealikeHeadPinServer(t, transport)
@@ -16759,7 +16744,7 @@ func assertUnsupportedCapabilityProblem(
 ) {
 	t.Helper()
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	var problem struct {
 		Title   string         `json:"title"`
@@ -16781,7 +16766,7 @@ func assertUnsupportedCapabilityProblem(
 }
 
 func TestAPIGitealikeLockedPRPersistsThroughServer(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	ctx := t.Context()
 	base := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
@@ -16865,7 +16850,7 @@ func TestAPIGitealikeLockedPRPersistsThroughServer(t *testing.T) {
 }
 
 func TestAPIGitealikeDraftPRFieldsPersistThroughServer(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	ctx := t.Context()
 	base := time.Date(2026, 5, 2, 12, 0, 0, 0, time.UTC)
@@ -17109,7 +17094,7 @@ func (t *lockedGitealikeTransport) ListStatuses(
 
 func TestProviderIssueRouteGeneratedClientEscapesGitLabRepoPath(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	srv, database := setupTestServer(t)
 	client := setupTestClient(t, srv)
 	ctx := t.Context()
@@ -17158,7 +17143,7 @@ func TestProviderIssueRouteGeneratedClientEscapesGitLabRepoPath(t *testing.T) {
 
 func TestProviderIssueRouteHandlesNestedGitLabRepoPathOverHTTP(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	srv, database := setupTestServer(t)
 	ctx := t.Context()
 	now := time.Now().UTC().Truncate(time.Second)
@@ -17248,7 +17233,7 @@ func TestAPIGetFiles503WhenCloneManagerNil(t *testing.T) {
 
 func TestAPIGetFilesAndDiffMarkGeneratedFilesE2E(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 
 	dir := t.TempDir()
@@ -17367,7 +17352,7 @@ func (s *countingTokenFileSource) Descriptor() tokenauth.Descriptor {
 // diff views for repos that are already on disk.
 func TestAPILocalReadEndpointsServeDuringTokenRotationE2E(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 
 	dir := t.TempDir()
@@ -17470,7 +17455,7 @@ func TestAPILocalReadEndpointsServeDuringTokenRotationE2E(t *testing.T) {
 }
 
 func TestSetActiveWorktreeKey(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	srv, _ := setupTestServer(t)
 
 	key, set := srv.ActiveWorktreeKey()
@@ -17489,7 +17474,7 @@ func TestSetActiveWorktreeKey(t *testing.T) {
 }
 
 func TestAPIRateLimits(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	database := dbtest.Open(t)
 
@@ -17537,7 +17522,7 @@ func TestAPIRateLimits(t *testing.T) {
 
 func TestAPISyncPRIncrementsRequestCount(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	database := dbtest.Open(t)
 
@@ -17595,7 +17580,7 @@ func TestAPISyncPRIncrementsRequestCount(t *testing.T) {
 }
 
 func TestAPIRateLimitsWithBudget(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	database := dbtest.Open(t)
 
@@ -17639,7 +17624,7 @@ func TestAPIRateLimitsWithBudget(t *testing.T) {
 }
 
 func TestAPIRateLimitsResetExpiredBudgetWindow(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	database := dbtest.Open(t)
 
@@ -17688,7 +17673,7 @@ func TestAPIRateLimitsResetExpiredBudgetWindow(t *testing.T) {
 }
 
 func TestAPIRateLimitsWithGQL(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	database := dbtest.Open(t)
 
@@ -17743,7 +17728,7 @@ func TestAPIRateLimitsWithGQL(t *testing.T) {
 }
 
 func TestAPIRateLimitsReadsLocalStateWithoutRefreshingGitHubRateLimit(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	database := dbtest.Open(t)
 	now := time.Now().UTC().Truncate(time.Second)
@@ -17831,7 +17816,7 @@ func TestAPIRateLimitsReadsLocalStateWithoutRefreshingGitHubRateLimit(t *testing
 }
 
 func TestAPIRateLimitsGQLDefaultsUnknown(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	database := dbtest.Open(t)
 
@@ -17870,7 +17855,7 @@ func TestAPIRateLimitsGQLDefaultsUnknown(t *testing.T) {
 }
 
 func TestAPIRateLimitsMultiHostMixed(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	database := dbtest.Open(t)
 
@@ -17937,7 +17922,7 @@ func TestAPIRateLimitsMultiHostMixed(t *testing.T) {
 }
 
 func TestAPIRateLimitsScopesSameHostByProvider(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	database := dbtest.Open(t)
 
@@ -17992,7 +17977,7 @@ func TestAPIRateLimitsScopesSameHostByProvider(t *testing.T) {
 
 func TestAPIGetPullDetailLoaded(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	srv, database := setupTestServer(t)
 	seedPR(t, database, "acme", "widget", 1)
@@ -18084,7 +18069,7 @@ func TestAPIGetPullDetailIncludesDiffSummaryRevisionFields(t *testing.T) {
 
 func TestAPIActivityReturnsUTCCreatedAt(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	srv, database := setupTestServer(t)
 	client := setupTestClient(t, srv)
@@ -18129,7 +18114,7 @@ func TestAPIActivityReturnsUTCCreatedAt(t *testing.T) {
 
 func TestAPIActivityCommentCarriesPRAuthor(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	srv, database := setupTestServer(t)
 	client := setupTestClient(t, srv)
@@ -18169,238 +18154,6 @@ func TestAPIActivityCommentCarriesPRAuthor(t *testing.T) {
 	require.NotNil(commentItem.ItemAuthor)
 	assert.Equal("testuser", *commentItem.ItemAuthor)
 	assert.Equal("pr-reviewer", commentItem.Author)
-}
-
-func TestAPIActivityStartupRepairsLegacyTimestampStorage(t *testing.T) {
-	require := require.New(t)
-	assert := Assert.New(t)
-	ctx := t.Context()
-	dir := t.TempDir()
-	path := filepath.Join(dir, "test.db")
-
-	database := dbtest.OpenAt(t, path)
-
-	repoID, err := database.UpsertRepo(ctx, db.GitHubRepoIdentity("github.com", "acme", "widget"))
-	require.NoError(err)
-	prID, err := database.UpsertMergeRequest(ctx, &db.MergeRequest{
-		RepoID:            repoID,
-		PlatformID:        101,
-		Number:            1,
-		URL:               "https://github.com/acme/widget/pull/1",
-		Title:             "Legacy PR",
-		Author:            "octocat",
-		AuthorDisplayName: "octocat",
-		State:             "open",
-		HeadBranch:        "feature",
-		BaseBranch:        "main",
-		CreatedAt:         time.Date(2026, 4, 11, 12, 0, 0, 0, time.UTC),
-		UpdatedAt:         time.Date(2026, 4, 11, 12, 0, 0, 0, time.UTC),
-		LastActivityAt:    time.Date(2026, 4, 11, 12, 0, 0, 0, time.UTC),
-	})
-	require.NoError(err)
-	issueID, err := database.UpsertIssue(ctx, &db.Issue{
-		RepoID:         repoID,
-		PlatformID:     201,
-		Number:         2,
-		URL:            "https://github.com/acme/widget/issues/2",
-		Title:          "Legacy issue",
-		Author:         "octocat",
-		State:          "open",
-		CreatedAt:      time.Date(2026, 4, 11, 12, 0, 0, 0, time.UTC),
-		UpdatedAt:      time.Date(2026, 4, 11, 12, 0, 0, 0, time.UTC),
-		LastActivityAt: time.Date(2026, 4, 11, 12, 0, 0, 0, time.UTC),
-	})
-	require.NoError(err)
-	require.NoError(database.UpsertMREvents(ctx, []db.MREvent{{
-		MergeRequestID: prID,
-		EventType:      "issue_comment",
-		Author:         "pr-reviewer",
-		Body:           "PR comment",
-		CreatedAt:      time.Date(2026, 4, 11, 12, 0, 0, 0, time.UTC),
-		DedupeKey:      "comment-pr-legacy",
-	}}))
-	require.NoError(database.UpsertIssueEvents(ctx, []db.IssueEvent{{
-		IssueID:   issueID,
-		EventType: "issue_comment",
-		Author:    "issue-reporter",
-		Body:      "Issue comment",
-		CreatedAt: time.Date(2026, 4, 11, 13, 0, 0, 0, time.UTC),
-		DedupeKey: "comment-issue-legacy",
-	}}))
-	require.NoError(database.Close())
-
-	raw, err := sql.Open("sqlite", path)
-	require.NoError(err)
-	_, err = raw.ExecContext(ctx,
-		`UPDATE middleman_mr_events SET created_at = ? WHERE dedupe_key = ?`,
-		"2026-04-11 08:00:00 -0400 EDT",
-		"comment-pr-legacy",
-	)
-	require.NoError(err)
-	_, err = raw.ExecContext(ctx,
-		`UPDATE middleman_issue_events SET created_at = ? WHERE dedupe_key = ?`,
-		"2026-04-11 09:00:00 -0400 EDT",
-		"comment-issue-legacy",
-	)
-	require.NoError(err)
-	_, err = raw.ExecContext(ctx, `
-		DROP TRIGGER IF EXISTS middleman_workspaces_casefold_update;
-		DROP TRIGGER IF EXISTS middleman_workspaces_casefold_insert;
-
-		DROP INDEX IF EXISTS middleman_workspace_setup_events_workspace_id_idx;
-		DROP TABLE IF EXISTS middleman_workspace_setup_events;
-
-		ALTER TABLE middleman_workspaces
-			RENAME TO middleman_workspaces_v11;
-
-		CREATE TABLE middleman_workspaces (
-		    id            TEXT PRIMARY KEY,
-		    platform_host TEXT NOT NULL,
-		    repo_owner    TEXT NOT NULL,
-		    repo_name     TEXT NOT NULL,
-		    mr_number     INTEGER NOT NULL,
-		    mr_head_ref   TEXT NOT NULL,
-		    mr_head_repo  TEXT,
-		    worktree_path TEXT NOT NULL,
-		    tmux_session  TEXT NOT NULL,
-		    status        TEXT NOT NULL DEFAULT 'creating',
-		    error_message TEXT,
-		    created_at    DATETIME NOT NULL DEFAULT (datetime('now')),
-		    UNIQUE(platform_host, repo_owner, repo_name, mr_number)
-		);
-
-		INSERT INTO middleman_workspaces (
-		    id, platform_host, repo_owner, repo_name,
-		    mr_number, mr_head_ref, mr_head_repo,
-		    worktree_path, tmux_session, status,
-		    error_message, created_at
-		)
-		SELECT
-		    id, platform_host, repo_owner, repo_name,
-		    item_number, git_head_ref, mr_head_repo,
-		    worktree_path, tmux_session, status,
-		    error_message, created_at
-		FROM middleman_workspaces_v11;
-
-		DROP TABLE middleman_workspaces_v11;
-
-		CREATE TRIGGER middleman_workspaces_casefold_insert
-		BEFORE INSERT ON middleman_workspaces
-		WHEN NEW.platform_host <> lower(NEW.platform_host)
-		  OR NEW.repo_owner <> lower(NEW.repo_owner)
-		  OR NEW.repo_name <> lower(NEW.repo_name)
-		BEGIN
-		    SELECT RAISE(ABORT, 'workspace repo identifiers must be lowercase');
-		END;
-
-		CREATE TRIGGER middleman_workspaces_casefold_update
-		BEFORE UPDATE OF platform_host, repo_owner, repo_name ON middleman_workspaces
-		WHEN NEW.platform_host <> lower(NEW.platform_host)
-		  OR NEW.repo_owner <> lower(NEW.repo_owner)
-		  OR NEW.repo_name <> lower(NEW.repo_name)
-			BEGIN
-			    SELECT RAISE(ABORT, 'workspace repo identifiers must be lowercase');
-			END;
-
-			DROP TRIGGER IF EXISTS middleman_repos_casefold_update;
-			DROP TRIGGER IF EXISTS middleman_repos_casefold_insert;
-			DROP INDEX IF EXISTS idx_issue_events_platform_external_id;
-			DROP INDEX IF EXISTS idx_mr_events_platform_external_id;
-			DROP INDEX IF EXISTS idx_labels_repo_platform_external_id;
-			DROP INDEX IF EXISTS idx_issues_repo_platform_external_id;
-			DROP INDEX IF EXISTS idx_merge_requests_repo_platform_external_id;
-			DROP INDEX IF EXISTS idx_repos_provider_path_key;
-			DROP INDEX IF EXISTS idx_repos_platform_repo_id;
-			DROP INDEX IF EXISTS idx_labels_repo_catalog_name;
-			ALTER TABLE middleman_repos DROP COLUMN label_catalog_sync_error;
-			ALTER TABLE middleman_repos DROP COLUMN label_catalog_checked_at;
-			ALTER TABLE middleman_repos DROP COLUMN label_catalog_synced_at;
-			ALTER TABLE middleman_repos DROP COLUMN viewer_can_merge;
-			ALTER TABLE middleman_labels DROP COLUMN catalog_seen_at;
-			ALTER TABLE middleman_labels DROP COLUMN catalog_present;
-			ALTER TABLE middleman_merge_requests DROP COLUMN is_locked;
-			ALTER TABLE middleman_mr_events DROP COLUMN platform_external_id;
-			ALTER TABLE middleman_labels DROP COLUMN platform_external_id;
-			ALTER TABLE middleman_issues DROP COLUMN platform_external_id;
-			ALTER TABLE middleman_merge_requests DROP COLUMN platform_external_id;
-			ALTER TABLE middleman_merge_requests DROP COLUMN workflow_approval_checked_at;
-			ALTER TABLE middleman_merge_requests DROP COLUMN workflow_approval_head_sha;
-			ALTER TABLE middleman_merge_requests DROP COLUMN workflow_approval_required;
-			ALTER TABLE middleman_merge_requests DROP COLUMN workflow_approval_count;
-			ALTER TABLE middleman_repos DROP COLUMN default_branch;
-			ALTER TABLE middleman_repos DROP COLUMN clone_url;
-			ALTER TABLE middleman_repos DROP COLUMN web_url;
-			ALTER TABLE middleman_repos DROP COLUMN repo_path_key;
-			ALTER TABLE middleman_repos DROP COLUMN name_key;
-			ALTER TABLE middleman_repos DROP COLUMN owner_key;
-			ALTER TABLE middleman_repos DROP COLUMN repo_path;
-			ALTER TABLE middleman_repos DROP COLUMN platform_repo_id;
-
-			DROP INDEX IF EXISTS idx_mr_events_thread;
-			ALTER TABLE middleman_mr_events DROP COLUMN thread_id;
-			ALTER TABLE middleman_mr_events DROP COLUMN position_json;
-			ALTER TABLE middleman_mr_events DROP COLUMN resolvable;
-			ALTER TABLE middleman_mr_events DROP COLUMN resolved;
-			ALTER TABLE middleman_issue_events DROP COLUMN thread_id;
-			ALTER TABLE middleman_mr_events DROP COLUMN direct_url;
-			ALTER TABLE middleman_issue_events DROP COLUMN direct_url;
-			ALTER TABLE middleman_issues DROP COLUMN assignees_json;
-			ALTER TABLE middleman_merge_requests DROP COLUMN assignees_json;
-			ALTER TABLE middleman_merge_requests DROP COLUMN reviewers_json;
-			DROP TABLE middleman_host_runtime_sessions;
-			DROP TABLE middleman_worktree_stats;
-			DROP INDEX middleman_project_worktree_runtime_sessions_worktree_id_idx;
-			DROP TABLE middleman_project_worktree_runtime_sessions;
-			ALTER TABLE middleman_project_worktrees DROP COLUMN linked_issue_numbers;
-			ALTER TABLE middleman_project_worktrees DROP COLUMN session_backend;
-			ALTER TABLE middleman_project_worktrees DROP COLUMN is_stale;
-			ALTER TABLE middleman_project_worktrees DROP COLUMN is_hidden;
-			ALTER TABLE middleman_projects DROP COLUMN repository_kind;
-			ALTER TABLE middleman_projects DROP COLUMN is_stale;
-		`)
-	require.NoError(err)
-	_, err = raw.ExecContext(ctx,
-		`UPDATE schema_migrations SET version = ?, dirty = FALSE`,
-		9,
-	)
-	require.NoError(err)
-	require.NoError(raw.Close())
-
-	reopened := dbtest.OpenWithMigrationsAt(t, path)
-
-	srv := setupTestServerWithDatabase(t, reopened, defaultTestRepos)
-	client := setupTestClient(t, srv)
-
-	since := "2026-04-11T11:30:00Z"
-	resp, err := client.HTTP.ListActivityWithResponse(
-		ctx, &generated.ListActivityParams{Since: &since},
-	)
-	require.NoError(err)
-	require.Equal(http.StatusOK, resp.StatusCode())
-	require.NotNil(resp.JSON200)
-	require.NotNil(resp.JSON200.Items)
-	commentItems := make([]generated.ActivityItemResponse, 0, 2)
-	for _, item := range *resp.JSON200.Items {
-		if item.ActivityType == "comment" {
-			commentItems = append(commentItems, item)
-		}
-	}
-	require.Len(commentItems, 2)
-	assert.Equal("issue-reporter", commentItems[0].Author)
-	assert.Equal("pr-reviewer", commentItems[1].Author)
-	assertRFC3339UTC(t, commentItems[0].CreatedAt, time.Date(2026, 4, 11, 13, 0, 0, 0, time.UTC))
-	assertRFC3339UTC(t, commentItems[1].CreatedAt, time.Date(2026, 4, 11, 12, 0, 0, 0, time.UTC))
-
-	since = "2026-04-11T12:30:00Z"
-	resp, err = client.HTTP.ListActivityWithResponse(
-		ctx, &generated.ListActivityParams{Since: &since},
-	)
-	require.NoError(err)
-	require.Equal(http.StatusOK, resp.StatusCode())
-	require.NotNil(resp.JSON200)
-	require.NotNil(resp.JSON200.Items)
-	require.Len(*resp.JSON200.Items, 1)
-	assert.Equal("issue-reporter", (*resp.JSON200.Items)[0].Author)
 }
 
 func runGit(t *testing.T, dir string, args ...string) {
@@ -18496,7 +18249,7 @@ func setupTestServerWithClonesAndServer(t *testing.T) (
 
 func TestAPIGetCommits(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	client, _, _, _, commitSHAs := setupTestServerWithClones(t)
 	resp, err := client.HTTP.GetPullCommitsWithResponse(
@@ -18537,7 +18290,7 @@ func TestAPIGetDiff_SingleCommit(t *testing.T) {
 
 func TestAPIGetRepoCommitDiff(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	_, _, _, _, commitSHAs, srv := setupTestServerWithClonesAndServer(t)
 	req := httptest.NewRequest(
@@ -18588,7 +18341,7 @@ func TestAPIGetRepoCommitDiffRejectsOptionLikeSHA(t *testing.T) {
 
 func TestAPIGetFilePreview_ReturnsHeadContent(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	_, _, _, _, _, srv := setupTestServerWithClonesAndServer(t)
 	req := httptest.NewRequest(
@@ -18608,7 +18361,7 @@ func TestAPIGetFilePreview_ReturnsHeadContent(t *testing.T) {
 
 func TestAPIGetFilePreview_ReturnsDeletedFileContent(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 
 	dir := t.TempDir()
@@ -18650,7 +18403,7 @@ func TestAPIGetFilePreview_ReturnsDeletedFileContent(t *testing.T) {
 
 func TestAPIGetFilePreview_ReturnsRequestedDiffSideContent(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 
 	dir := t.TempDir()
@@ -18706,7 +18459,7 @@ func TestAPIGetFilePreview_ReturnsRequestedDiffSideContent(t *testing.T) {
 
 func TestAPIGetFilePreviewOnHost_ReturnsRequestedDiffSideContent(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 
 	dir := t.TempDir()
@@ -18871,7 +18624,7 @@ func TestAPIGetDiff_RootCommit(t *testing.T) {
 }
 
 func TestAPIListActivity(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	srv, database := setupTestServer(t)
 	client := setupTestClient(t, srv)
@@ -18904,7 +18657,7 @@ func TestAPIListActivity(t *testing.T) {
 }
 
 func TestAPIListActivityIncludesNotificationSyncedBeforeRepo(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	srv, database := setupNotificationsEnabledTestServer(t)
 	client := setupTestClient(t, srv)
@@ -18954,7 +18707,7 @@ func TestAPIListActivityIncludesNotificationSyncedBeforeRepo(t *testing.T) {
 }
 
 func TestAPIListActivityScopesNotificationsToTrackedRepos(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	srv, database := setupNotificationsEnabledTestServer(t)
 	client := setupTestClient(t, srv)
@@ -19024,7 +18777,7 @@ func TestAPIListActivityScopesNotificationsToTrackedRepos(t *testing.T) {
 }
 
 func TestAPIListActivityReturnsDefaultBranchActivity(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	srv, database := setupTestServer(t)
 	ctx := t.Context()
@@ -19087,7 +18840,7 @@ func TestAPIListActivityReturnsDefaultBranchActivity(t *testing.T) {
 }
 
 func TestAPIListActivityCapsDefaultBranchCommitMetadata(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	srv, database := setupTestServer(t)
 	ctx := t.Context()
@@ -19136,7 +18889,7 @@ func TestAPIListActivityCapsDefaultBranchCommitMetadata(t *testing.T) {
 }
 
 func TestAPIListActivityReflectsConfiguredDefaultBranchCommitCap(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	ctx := t.Context()
 	dir := t.TempDir()
@@ -19230,7 +18983,7 @@ func TestAPIListActivityReflectsConfiguredDefaultBranchCommitCap(t *testing.T) {
 }
 
 func TestAPIListActivityReturnsProviderCompareURLsForDefaultBranchForcePushes(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	srv, database := setupTestServer(t)
 	ctx := t.Context()
@@ -19323,7 +19076,7 @@ func TestAPIListActivityReturnsProviderCompareURLsForDefaultBranchForcePushes(t 
 }
 
 func TestAPIListActivityCanHideDefaultBranchActivity(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	srv, database := setupTestServer(t)
 	client := setupTestClient(t, srv)
@@ -19367,7 +19120,7 @@ func TestAPIListActivityCanHideDefaultBranchActivity(t *testing.T) {
 }
 
 func TestAPIListActivityAcceptsProviderAndHostQualifiedRepoFilter(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	srv, database := setupTestServer(t)
 	client := setupTestClient(t, srv)
@@ -19393,7 +19146,7 @@ func TestAPIListActivityAcceptsProviderAndHostQualifiedRepoFilter(t *testing.T) 
 }
 
 func TestAPIListActivityAcceptsProviderQualifiedRepoFilter(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	srv, database := setupTestServer(t)
 	client := setupTestClient(t, srv)
@@ -19435,7 +19188,7 @@ func TestAPIListActivityAcceptsProviderQualifiedRepoFilter(t *testing.T) {
 }
 
 func TestAPIListActivityKeepsProviderNamedHostsProviderQualified(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	srv, database := setupTestServer(t)
 	client := setupTestClient(t, srv)
@@ -19470,7 +19223,7 @@ func TestAPIListActivityKeepsProviderNamedHostsProviderQualified(t *testing.T) {
 }
 
 func TestAPIListActivityFiltersConfiguredReposByHost(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	srv, database, _ := setupTestServerWithConfig(t)
 
@@ -19568,7 +19321,7 @@ func runStackDetection(t *testing.T, database *db.DB, owner, name string) {
 }
 
 func TestAPIListStacks(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	srv, database := setupTestServer(t)
 	client := setupTestClient(t, srv)
@@ -19592,7 +19345,7 @@ func TestAPIListStacks(t *testing.T) {
 }
 
 func TestAPIListStacks_RepoFilter(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	repos := []ghclient.RepoRef{
 		{Platform: "github", Owner: "acme", Name: "widget", PlatformHost: "github.com"},
@@ -19633,7 +19386,7 @@ func TestAPIListStacks_RepoFilter(t *testing.T) {
 }
 
 func TestAPIGetStackForPR(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	srv, database := setupTestServer(t)
 	client := setupTestClient(t, srv)
@@ -19659,7 +19412,7 @@ func TestAPIGetStackForPR(t *testing.T) {
 }
 
 func TestAPIGetPullDetailIncludesStackContext(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	srv, database := setupTestServer(t)
 	client := setupTestClient(t, srv)
@@ -19690,7 +19443,7 @@ func TestAPIGetPullDetailIncludesStackContext(t *testing.T) {
 }
 
 func TestAPIStackBaseConflictMarksDownstreamPRsDirty(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	srv, database := setupTestServer(t)
 	client := setupTestClient(t, srv)
@@ -19736,7 +19489,7 @@ func TestAPIStackBaseConflictMarksDownstreamPRsDirty(t *testing.T) {
 }
 
 func TestAPIGetStackForPR_DraftNotBaseReady(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	srv, database := setupTestServer(t)
 	client := setupTestClient(t, srv)
 
@@ -19754,7 +19507,7 @@ func TestAPIGetStackForPR_DraftNotBaseReady(t *testing.T) {
 }
 
 func TestAPIListStacks_DraftNotAllGreen(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	srv, database := setupTestServer(t)
 	client := setupTestClient(t, srv)
@@ -19781,7 +19534,7 @@ func TestAPIListStacks_DraftNotAllGreen(t *testing.T) {
 // GET /stacks and GET /repos/{owner}/{name}/pulls/{number}/stack return
 // data produced entirely by the sync-completion callback path.
 func TestAPIStacks_DetectionViaSyncHook(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	ctx := t.Context()
 
@@ -19855,7 +19608,7 @@ func TestAPIStacks_DetectionViaSyncHook(t *testing.T) {
 }
 
 func TestAPIStacks_DetectionViaSyncHookIgnoresForkHeadBranchCollision(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	ctx := t.Context()
 
@@ -19928,7 +19681,7 @@ func TestAPIStacks_DetectionViaSyncHookIgnoresForkHeadBranchCollision(t *testing
 }
 
 func TestAPIStacks_GitLabUnknownForkHeadSyncsButSkipsStackEdges(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	ctx := t.Context()
 
@@ -20038,7 +19791,7 @@ func TestAPIStacks_GitLabUnknownForkHeadSyncsButSkipsStackEdges(t *testing.T) {
 }
 
 func TestAPIStacks_DetectionViaSyncHookIgnoresSameRepoSelfEdge(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	ctx := t.Context()
 
@@ -20118,7 +19871,7 @@ func stackMemberNumbers(members []generated.StackMemberResponse) []int64 {
 }
 
 func TestAPIGetStackForPR_SingleFailingIsInProgress(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	srv, database := setupTestServer(t)
 	client := setupTestClient(t, srv)
 
@@ -20137,7 +19890,7 @@ func TestAPIGetStackForPR_SingleFailingIsInProgress(t *testing.T) {
 }
 
 func TestAPIGetStackForPR_BaseBranchNotMain(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	srv, database := setupTestServer(t)
 	client := setupTestClient(t, srv)
@@ -20158,7 +19911,7 @@ func TestAPIGetStackForPR_BaseBranchNotMain(t *testing.T) {
 }
 
 func TestAPIListStacks_Empty(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	srv, _ := setupTestServer(t)
 	client := setupTestClient(t, srv)
 
@@ -20238,7 +19991,7 @@ func TestDisplayNameCacheE2E(t *testing.T) {
 
 func TestCICheckDedupLatestRunWinsE2E(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	older := time.Date(2026, 4, 9, 12, 0, 0, 0, time.UTC)
 	newer := older.Add(10 * time.Minute)
@@ -20811,7 +20564,7 @@ func waitForWorkspaceStatus(
 }
 
 func TestListWorkspacesIncludesItemLastActivityAt(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	client, database, _, _ := setupTestServerWithWorkspaces(t)
 	ctx := t.Context()
@@ -20921,6 +20674,78 @@ func TestListWorkspacesIncludesItemLastActivityAt(t *testing.T) {
 		*byID["ws-issue-activity"].ItemLastActivityAt,
 	)
 	assert.Nil(byID["ws-unsynced-activity"].ItemLastActivityAt)
+}
+
+func TestListWorkspacesIncludesKataMetadata(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	client, database, _, _ := setupTestServerWithWorkspaces(t)
+	ctx := t.Context()
+
+	repo, err := database.GetRepoByIdentity(ctx, db.GitHubRepoIdentity("github.com", "acme", "widget"))
+	require.NoError(err)
+	require.NotNil(repo)
+
+	metadata := db.WorkspaceKataMetadata{
+		DaemonID:    "desktop",
+		ProjectUID:  "project-kata",
+		ProjectName: "Widget",
+		IssueUID:    "issue-kata-1",
+		ShortID:     "task-123",
+		QualifiedID: "Kata#task-123",
+		Title:       "Wire kata workspace sidebar",
+	}
+	itemKey := db.KataWorkspaceItemKey(metadata)
+	require.NotEmpty(itemKey)
+	require.NoError(database.InsertWorkspace(ctx, &db.Workspace{
+		ID:           "ws-kata-list",
+		Platform:     "github",
+		PlatformHost: "github.com",
+		RepoOwner:    "acme",
+		RepoName:     "widget",
+		ItemType:     db.WorkspaceItemTypeKataTask,
+		ItemKey:      itemKey,
+		GitHeadRef:   "middleman/kata/task-123-abcd1234",
+		WorktreePath: filepath.Join(t.TempDir(), "ws-kata-list"),
+		TmuxSession:  "middleman-ws-kata-list",
+		Status:       "creating",
+		CreatedAt:    time.Date(2026, 6, 15, 10, 0, 0, 0, time.UTC),
+		KataMetadata: &metadata,
+	}))
+
+	// The workspace list UI reloads from GET /workspaces, so the kata owner
+	// metadata it renders must survive the DB summary hydration on that path,
+	// not just the create response.
+	resp, err := client.HTTP.ListWorkspacesWithResponse(ctx)
+	require.NoError(err)
+	require.Equal(http.StatusOK, resp.StatusCode())
+	require.NotNil(resp.JSON200)
+	require.NotNil(resp.JSON200.Workspaces)
+
+	var kata *generated.WorkspaceResponse
+	for i := range *resp.JSON200.Workspaces {
+		if (*resp.JSON200.Workspaces)[i].Id == "ws-kata-list" {
+			kata = &(*resp.JSON200.Workspaces)[i]
+			break
+		}
+	}
+	require.NotNil(kata)
+	assert.Equal(db.WorkspaceItemTypeKataTask, kata.ItemType)
+	assert.Equal(itemKey, kata.ItemKey)
+	// item_number is always emitted and is 0 (ignored) for Kata workspaces.
+	assert.Equal(int64(0), kata.ItemNumber)
+	require.NotNil(kata.Kata)
+	assert.Equal("desktop", kata.Kata.DaemonId)
+	assert.Equal("issue-kata-1", kata.Kata.IssueUid)
+	assert.Equal("project-kata", kata.Kata.ProjectUid)
+	require.NotNil(kata.Kata.ProjectName)
+	assert.Equal("Widget", *kata.Kata.ProjectName)
+	require.NotNil(kata.Kata.ShortId)
+	assert.Equal("task-123", *kata.Kata.ShortId)
+	require.NotNil(kata.Kata.QualifiedId)
+	assert.Equal("Kata#task-123", *kata.Kata.QualifiedId)
+	require.NotNil(kata.Kata.Title)
+	assert.Equal("Wire kata workspace sidebar", *kata.Kata.Title)
 }
 
 func TestWorkspaceServerFixtureCleansUpTmuxSessions(t *testing.T) {
@@ -21068,7 +20893,7 @@ func TestWorkspaceRuntimeTargetsRefreshAfterSettingsUpdateE2E(t *testing.T) {
 	t.Parallel()
 
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	dir := t.TempDir()
 	cfg := &config.Config{
@@ -21136,7 +20961,7 @@ func TestWorkspaceCreatesPtyOwnerSessionWhenTmuxUnavailableE2E(t *testing.T) {
 	runParallelPTYE2E(t)
 
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	fixture, dir, ptyOwnerDir := setupPtyOwnerWorkspaceFixture(t)
 	ctx := context.Background()
@@ -21224,7 +21049,7 @@ func TestWorkspacePtyOwnerTitleMarksWorkspaceWorkingE2E(t *testing.T) {
 	runParallelPTYE2E(t)
 
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	fixture, _, ptyOwnerDir := setupPtyOwnerWorkspaceFixture(t)
 	ctx := context.Background()
@@ -21279,7 +21104,7 @@ func TestWorkspaceCreatesRustPtyManagerSessionE2E(t *testing.T) {
 	t.Cleanup(releasePTYSlot)
 
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	managerPath := buildRustPtyManagerForTest(t)
 	ptyOwnerDir := longRustPtyOwnerDirForTest(t)
@@ -21349,7 +21174,7 @@ func TestWorkspaceRuntimeLaunchesRustPtyManagerSessionE2E(t *testing.T) {
 	t.Cleanup(releasePTYSlot)
 
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	managerPath := buildRustPtyManagerForTest(t)
 	ptyOwnerDir := longRustPtyOwnerDirForTest(t)
@@ -21410,7 +21235,7 @@ func TestWorkspaceRuntimePlainShellUsesPtyOwnerWhenTmuxUnavailableE2E(t *testing
 	runParallelPTYE2E(t)
 
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	fixture, _, ptyOwnerDir := setupPtyOwnerWorkspaceFixture(t)
 	ctx := context.Background()
@@ -21451,7 +21276,7 @@ func TestWorkspaceRuntimePtyOwnerShellReattachesAfterServerRestartE2E(t *testing
 	runParallelPTYE2E(t)
 
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	fixture, dir, ptyOwnerDir := setupPtyOwnerWorkspaceFixture(t)
 	ctx := context.Background()
@@ -21564,7 +21389,7 @@ func TestWorkspaceRuntimeUnavailablePtyOwnerSessionStaysUntilUserStopE2E(t *test
 	runParallelPTYE2E(t)
 
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	fixture, dir, ptyOwnerDir := setupPtyOwnerWorkspaceFixture(t)
 	ctx := context.Background()
@@ -21660,7 +21485,7 @@ func TestWorkspaceDeleteStopsPtyOwnerAgentAfterServerRestartE2E(t *testing.T) {
 	runParallelPTYE2E(t)
 
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	dir := t.TempDir()
 	ptyOwnerDir := filepath.Join(dir, "pty-owner")
@@ -21721,7 +21546,7 @@ func TestRustPtyManagerRejectsConcurrentAttachmentsE2E(t *testing.T) {
 	runParallelPTYE2E(t)
 
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	managerPath := buildRustPtyManagerForTest(t)
 	ptyOwnerDir := longRustPtyOwnerDirForTest(t)
@@ -21818,7 +21643,7 @@ func TestWorkspacePtyOwnerTerminalRejectsConcurrentAttachmentsE2E(t *testing.T) 
 	runParallelPTYE2E(t)
 
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	fixture, _, ptyOwnerDir := setupPtyOwnerWorkspaceFixture(t)
 	ctx := context.Background()
@@ -22025,7 +21850,7 @@ func TestWorkspaceRuntimeLaunchPlainShellCreatesRuntimeSessionE2E(t *testing.T) 
 	t.Parallel()
 
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	client, _, _, _, _ := setupTestServerWithWorkspacesServer(t, nil)
 	ctx := context.Background()
@@ -22061,7 +21886,7 @@ func TestWorkspaceRuntimeExistingSessionsAvailableWhenWorkspaceErroredE2E(t *tes
 	t.Parallel()
 
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	client, database, _, _, _ := setupTestServerWithWorkspacesServer(t, nil)
 	ctx := context.Background()
@@ -22110,7 +21935,7 @@ func TestWorkspaceRuntimeLaunchMultipleAndStopOneE2E(t *testing.T) {
 	runParallelPTYE2E(t)
 
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	disableTmuxAgentSessions := false
 	cfg := &config.Config{Agents: []config.Agent{{
 		Key:     "helper",
@@ -22195,7 +22020,7 @@ func TestWorkspaceRuntimeNaturalAgentExitRemovesSessionE2E(t *testing.T) {
 	runParallelPTYE2E(t)
 
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	disableTmuxAgentSessions := false
 	cfg := &config.Config{Agents: []config.Agent{{
 		Key:     "helper",
@@ -22238,7 +22063,7 @@ func TestWorkspaceRuntimePtyOwnerQuickExitLaunchSucceedsE2E(t *testing.T) {
 	runParallelPTYE2E(t)
 
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	disableTmuxAgentSessions := false
 	cfg := &config.Config{Agents: []config.Agent{{
 		Key:     "helper",
@@ -22281,7 +22106,7 @@ func TestWorkspaceRuntimeNaturalTmuxAgentExitForgetsStoredSessionE2E(
 	t *testing.T,
 ) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	dir := t.TempDir()
 	record := filepath.Join(dir, "tmux-record")
 	tmuxPath := filepath.Join(dir, "fake-tmux")
@@ -22345,7 +22170,7 @@ exit 0
 func TestWorkspaceRuntimeIncludesStoredRuntimeSessionsAfterReloadE2E(t *testing.T) {
 	requirePTYAvailable(t)
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	dir := t.TempDir()
 	tmuxPath := filepath.Join(dir, "fake-tmux")
 	require.NoError(os.WriteFile(tmuxPath, []byte(`#!/bin/sh
@@ -22440,7 +22265,7 @@ exit 0
 
 func TestWorkspaceRuntimeLaunchAgentCreatesProbeableTmuxSessionE2E(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	dir := t.TempDir()
 	record := filepath.Join(dir, "record")
 	tmuxPath := filepath.Join(dir, "fake-tmux")
@@ -22573,7 +22398,7 @@ func TestServerStartupReapsUnrecordedRuntimeTmuxSessionE2E(t *testing.T) {
 	}
 
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	previousStartupCleanupTimeout := startupTmuxCleanupTimeout
 	startupTmuxCleanupTimeout = 10 * time.Second
 	t.Cleanup(func() { startupTmuxCleanupTimeout = previousStartupCleanupTimeout })
@@ -22661,7 +22486,7 @@ func TestWorkspaceResponseProbesStoredRuntimeTmuxSessionWithoutBaseE2E(
 	}
 
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	dir := t.TempDir()
 	record := filepath.Join(dir, "record")
 	tmuxPath := filepath.Join(dir, "fake-tmux")
@@ -22753,7 +22578,7 @@ func TestWorkspaceRuntimeLaunchTmuxOwnerMarkerFailureRejectsSessionE2E(
 	t *testing.T,
 ) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	dir := t.TempDir()
 	record := filepath.Join(dir, "record")
 	tmuxPath := filepath.Join(dir, "fake-tmux")
@@ -22966,7 +22791,7 @@ func TestWorkspaceRuntimeTmuxSessionsHashUnsafeTargetKeysE2E(
 	t *testing.T,
 ) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	dir := t.TempDir()
 	record := filepath.Join(dir, "record")
 	tmuxPath := writeRuntimeTmuxLifecycleRecorder(t, dir, record)
@@ -23038,7 +22863,7 @@ func TestWorkspaceRuntimeStopClearsStoredWrappedAgentSessionAfterRuntimeForgetE2
 	t *testing.T,
 ) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	dir := t.TempDir()
 	record := filepath.Join(dir, "record")
 	tmuxPath := writeRuntimeTmuxLifecycleRecorder(t, dir, record)
@@ -23094,7 +22919,7 @@ func TestWorkspaceRuntimeStopTmuxCleanupFailureRetainsStoredSessionE2E(
 	t *testing.T,
 ) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	dir := t.TempDir()
 	tmuxPath := filepath.Join(dir, "fake-tmux")
 	agentPath := filepath.Join(dir, "helper-agent")
@@ -23191,7 +23016,7 @@ func TestWorkspaceResponseUsesStoredRuntimeTmuxSessionsAfterRestartE2E(
 	t *testing.T,
 ) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	dir := t.TempDir()
 	tmuxPath := filepath.Join(dir, "fake-tmux")
 	require.NoError(os.WriteFile(tmuxPath, []byte(`#!/bin/sh
@@ -23265,7 +23090,7 @@ func TestWorkspaceDeleteStopsRuntimeSessionsE2E(t *testing.T) {
 	runParallelPTYE2E(t)
 
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	disableTmuxAgentSessions := false
 	cfg := &config.Config{Agents: []config.Agent{{
 		Key:     "helper",
@@ -23312,7 +23137,7 @@ func TestWorkspaceForceDeleteToleratesCorruptWorktreeGitfileE2E(t *testing.T) {
 	t.Parallel()
 
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	client, database, _, _ := setupTestServerWithWorkspaces(t)
 	ctx := context.Background()
@@ -23346,7 +23171,7 @@ func TestWorkspaceDeleteDirtyKeepsRuntimeSessionsE2E(t *testing.T) {
 	runParallelPTYE2E(t)
 
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	disableTmuxAgentSessions := false
 	cfg := &config.Config{Agents: []config.Agent{{
 		Key:     "helper",
@@ -23408,7 +23233,7 @@ func TestWorkspaceListReportsCommitsAheadBehindE2E(t *testing.T) {
 	t.Parallel()
 
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	client, _, _, _, _ := setupTestServerWithWorkspacesServer(t, nil)
 	ctx := context.Background()
@@ -23466,7 +23291,7 @@ func TestWorkspaceDiffEndpointsReportHeadAndPushedE2E(t *testing.T) {
 	t.Parallel()
 
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	client, _, _, _, srv := setupTestServerWithWorkspacesServer(t, nil)
 	ctx := context.Background()
@@ -23558,7 +23383,7 @@ func TestWorkspaceFilePreviewEndpointReturnsRequestedDiffSideContentE2E(t *testi
 	t.Parallel()
 
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	client, _, _, _, srv := setupTestServerWithWorkspacesServer(t, nil)
 	ctx := context.Background()
@@ -23669,7 +23494,7 @@ func TestWorkspaceCommitsEndpointListsBranchCommitsE2E(t *testing.T) {
 	t.Parallel()
 
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	client, _, _, _, srv := setupTestServerWithWorkspacesServer(t, nil)
 	ctx := context.Background()
@@ -23775,7 +23600,7 @@ func TestWorkspaceDiffEndpointReportsMergeTargetE2E(t *testing.T) {
 	t.Parallel()
 
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	client, _, _, remote, srv := setupTestServerWithWorkspacesServer(t, nil)
 	ctx := context.Background()
@@ -23824,6 +23649,69 @@ func TestWorkspaceDiffEndpointReportsMergeTargetE2E(t *testing.T) {
 	assert.NotContains(diffPaths, "target-only.txt")
 }
 
+func TestWorkspaceDiffEndpointReportsMergeTargetForAssociatedKataWorkspaceE2E(t *testing.T) {
+	t.Parallel()
+
+	require := require.New(t)
+	assert := assert.New(t)
+
+	client, database, _, remote, srv := setupTestServerWithWorkspacesServer(t, nil)
+	ctx := context.Background()
+	ws := createReadyWorkspace(t, ctx, client)
+
+	targetWork := filepath.Join(t.TempDir(), "target")
+	runGit(t, filepath.Dir(targetWork), "clone", remote, targetWork)
+	runGit(t, targetWork, "config", "user.email", "test@test.com")
+	runGit(t, targetWork, "config", "user.name", "Test")
+	require.NoError(os.WriteFile(
+		filepath.Join(targetWork, "target-only.txt"),
+		[]byte("target\n"), 0o644,
+	))
+	runGit(t, targetWork, "add", ".")
+	runGit(t, targetWork, "commit", "-m", "advance main")
+	runGit(t, targetWork, "push", "origin", "main")
+	runGit(t, ws.WorktreePath, "fetch", "origin", "main")
+
+	runGit(t, ws.WorktreePath, "config", "user.email", "test@test.com")
+	runGit(t, ws.WorktreePath, "config", "user.name", "Test")
+	require.NoError(os.WriteFile(
+		filepath.Join(ws.WorktreePath, "kata-local.go"),
+		[]byte("package kata\n"), 0o644,
+	))
+	runGit(t, ws.WorktreePath, "add", ".")
+	runGit(t, ws.WorktreePath, "commit", "-m", "kata workspace commit")
+
+	associatedPRNumber := 1
+	require.NoError(database.InsertWorkspace(ctx, &db.Workspace{
+		ID:                 "ws-kata-merge-target",
+		Platform:           "github",
+		PlatformHost:       "github.com",
+		RepoOwner:          "acme",
+		RepoName:           "widget",
+		ItemType:           db.WorkspaceItemTypeKataTask,
+		ItemKey:            "kata:desktop:project-kata:issue-kata-1",
+		AssociatedPRNumber: &associatedPRNumber,
+		GitHeadRef:         ws.GitHeadRef,
+		WorkspaceBranch:    ws.GitHeadRef,
+		WorktreePath:       ws.WorktreePath,
+		TmuxSession:        "middleman-ws-kata-merge-target",
+		Status:             "ready",
+		KataMetadata: &db.WorkspaceKataMetadata{
+			DaemonID:   "desktop",
+			ProjectUID: "project-kata",
+			IssueUID:   "issue-kata-1",
+			ShortID:    "task-123",
+			Title:      "Fix widget",
+		},
+	}))
+
+	mergeTargetFiles := requestWorkspaceFiles(t, srv, "ws-kata-merge-target", "merge-target")
+	require.NotNil(mergeTargetFiles.Files)
+	filePaths := workspaceDiffPaths(*mergeTargetFiles.Files)
+	assert.Contains(filePaths, "kata-local.go")
+	assert.NotContains(filePaths, "target-only.txt")
+}
+
 func TestWorkspaceDiffEndpointRejectsOriginBaseE2E(t *testing.T) {
 	t.Parallel()
 
@@ -23854,7 +23742,7 @@ func TestWorkspaceDiffEndpointHandlesUntrackedSymlinkAndLargeFileE2E(t *testing.
 	t.Parallel()
 
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	client, _, _, _, srv := setupTestServerWithWorkspacesServer(t, nil)
 	ctx := context.Background()
@@ -23900,7 +23788,7 @@ func TestWorkspaceDiffEndpointMarksGeneratedFilesE2E(t *testing.T) {
 	t.Parallel()
 
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	client, _, _, _, srv := setupTestServerWithWorkspacesServer(t, nil)
 	ctx := context.Background()
@@ -23941,7 +23829,7 @@ func TestWorkspaceDiffEndpointScopesPatchByPathE2E(t *testing.T) {
 	t.Parallel()
 
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	client, _, _, _, srv := setupTestServerWithWorkspacesServer(t, nil)
 	ctx := context.Background()
@@ -23974,7 +23862,7 @@ func TestWorkspaceDiffEndpointQuotesDangerousPathsE2E(t *testing.T) {
 	t.Parallel()
 
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	dir := t.TempDir()
 	worktreePath := filepath.Join(dir, "worktree")
@@ -24269,7 +24157,7 @@ func assertWorkspaceDiffPaths(
 ) {
 	t.Helper()
 
-	Assert.Equal(t, want, workspaceDiffPaths(files))
+	assert.Equal(t, want, workspaceDiffPaths(files))
 }
 
 func workspaceDiffPaths(files []generated.DiffFile) []string {
@@ -24282,7 +24170,7 @@ func workspaceDiffPaths(files []generated.DiffFile) []string {
 
 func TestWorkspaceListPrunesMissingTmuxSessionsE2E(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	if testing.Short() {
 		t.Skip("workspace e2e tests skipped in short mode")
 	}
@@ -24353,7 +24241,7 @@ func TestWorkspaceRuntimePlainShellRecordsTmuxSessionE2E(t *testing.T) {
 		t.Skip("fake tmux fixture uses Unix shell semantics")
 	}
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	tmuxPath := writeFakeWorkspaceRuntimeTmux(t)
 	cfg := &config.Config{
@@ -24460,7 +24348,7 @@ func TestWorkspaceRuntimeRestoresTmuxShellAfterRestartE2E(t *testing.T) {
 		t.Skip("fake tmux fixture uses Unix shell semantics")
 	}
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	tmuxPath := writeFakeWorkspaceRuntimeTmux(t)
 	cfg := &config.Config{
@@ -24543,7 +24431,7 @@ func TestWorkspaceRuntimeRestoreKeepsStoredTmuxShellWithDifferentOwnerMarkerE2E(
 		t.Skip("fake tmux fixture uses Unix shell semantics")
 	}
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	tmuxPath := writeFakeWorkspaceRuntimeTmux(t)
 	cfg := &config.Config{
@@ -24804,7 +24692,7 @@ func TestWorkspaceRuntimePlainShellAfterExitStartsFreshE2E(t *testing.T) {
 	runParallelPTYE2E(t)
 
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	cfg := &config.Config{
 		Tmux: config.Tmux{
 			Command: []string{filepath.Join(t.TempDir(), "missing-tmux")},
@@ -25167,7 +25055,7 @@ func TestWorkspaceRuntimeSessionTerminalSkipsAltScreenReplayE2E(t *testing.T) {
 	runParallelPTYE2E(t)
 
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	disableTmuxAgentSessions := false
 	cfg := &config.Config{Agents: []config.Agent{{
 		Key:     "helper",
@@ -25327,7 +25215,7 @@ func TestWorkspaceRuntimeSessionTerminalTmuxBackedWebSocketE2E(
 	t.Cleanup(releasePTYSlot)
 
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	dir := t.TempDir()
 	tmuxCommand := isolatedRealTmuxCommand(t, tmuxPath)
 	agentPath := filepath.Join(dir, "size-agent")
@@ -25780,7 +25668,7 @@ func TestWorkspaceCRUDE2E(t *testing.T) {
 	t.Parallel()
 
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	client, _, _, _ := setupTestServerWithWorkspaces(t)
 	ctx := t.Context()
@@ -25866,7 +25754,7 @@ func TestWorkspaceRetryErroredWorkspaceE2E(t *testing.T) {
 	t.Parallel()
 
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	client, database, _, _ := setupTestServerWithWorkspaces(t)
 	ctx := context.Background()
@@ -25909,7 +25797,7 @@ func TestWorkspaceRetryReadyWorkspaceConflictE2E(t *testing.T) {
 	t.Parallel()
 
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	client, database, _, _ := setupTestServerWithWorkspaces(t)
 	ctx := context.Background()
@@ -26043,7 +25931,7 @@ func TestWorkspaceMRDetailHasWorkspace(t *testing.T) {
 	t.Parallel()
 
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	client, _, _, _ := setupTestServerWithWorkspaces(t)
 	ctx := t.Context()
@@ -26118,7 +26006,7 @@ func TestWorkspaceCreateFetchesCloneThroughAPI(t *testing.T) {
 	t.Parallel()
 
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	fixture := setupWorkspaceServerFixture(t, nil)
 	ctx := t.Context()
@@ -26159,7 +26047,7 @@ func TestWorkspaceCreateFetchesCloneThroughAPI(t *testing.T) {
 func TestWorkspaceCreateIssueE2E(t *testing.T) {
 	t.Parallel()
 
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	fixture := setupWorkspaceServerFixture(t, nil)
@@ -26213,7 +26101,7 @@ func TestWorkspaceCreateIssueE2E(t *testing.T) {
 func TestWorkspaceCreateIssueUsesTitleSlugInBranch(t *testing.T) {
 	t.Parallel()
 
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	fixture := setupWorkspaceServerFixture(t, nil)
@@ -26249,7 +26137,7 @@ func TestWorkspaceCreateIssueUsesTitleSlugInBranch(t *testing.T) {
 func TestWorkspaceCreateIssueBareStyleConfigOptOut(t *testing.T) {
 	t.Parallel()
 
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	cfg := &config.Config{
@@ -26286,7 +26174,7 @@ func TestWorkspaceCreateIssueBareStyleConfigOptOut(t *testing.T) {
 func TestWorkspaceCreateIssueIsIdempotent(t *testing.T) {
 	t.Parallel()
 
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	fixture := setupWorkspaceServerFixture(t, nil)
@@ -26321,7 +26209,7 @@ func TestWorkspaceCreateIssueIsIdempotent(t *testing.T) {
 func TestWorkspaceCreateIssueAfterDeleteRecreatesBranch(t *testing.T) {
 	t.Parallel()
 
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	fixture := setupWorkspaceServerFixture(t, nil)
@@ -26376,7 +26264,7 @@ func TestWorkspaceCreateIssueAfterDeleteRecreatesBranch(t *testing.T) {
 func TestWorkspaceCreatePRAndIssueCanCoexistForSameRepoNumber(t *testing.T) {
 	t.Parallel()
 
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	fixture := setupWorkspaceServerFixture(t, nil)
@@ -26426,7 +26314,7 @@ func TestWorkspaceCreatePRAndIssueCanCoexistForSameRepoNumber(t *testing.T) {
 func TestWorkspaceCreateIssueBranchConflictReturnsTyped409(t *testing.T) {
 	t.Parallel()
 
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	fixture := setupWorkspaceServerFixture(t, nil)
@@ -26584,7 +26472,7 @@ func prepareIssueWorkspaceAssociationFixture(
 func TestWorkspaceIssueMonitorAssociatesPRAndKeepsIssueOwnership(t *testing.T) {
 	t.Parallel()
 
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	ctx := context.Background()
 
@@ -26645,7 +26533,7 @@ func TestWorkspaceIssueMonitorAssociatesPRAndKeepsIssueOwnership(t *testing.T) {
 func TestWorkspaceMonitorPassBroadcastsInvalidationEvents(t *testing.T) {
 	t.Parallel()
 
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 
 	fixture, created := prepareIssueWorkspaceAssociationFixture(t)
@@ -26669,7 +26557,7 @@ func TestWorkspaceMonitorPassBroadcastsInvalidationEvents(t *testing.T) {
 func TestWorkspaceManualRefreshDiscoversAndSyncsAssociatedPR(t *testing.T) {
 	t.Parallel()
 
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	ctx := t.Context()
 
@@ -26815,7 +26703,7 @@ func TestWorkspaceManualRefreshDiscoversAndSyncsAssociatedPR(t *testing.T) {
 func TestWorkspaceManualRefreshReturnsAssociationInspectionError(t *testing.T) {
 	t.Parallel()
 
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	ctx := t.Context()
 
@@ -26907,7 +26795,7 @@ func readEventMatching(
 func TestWorkspaceCreateUsesPRBranchAndFallbackBranch(t *testing.T) {
 	t.Parallel()
 
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	client, database, clonePath, _ := setupTestServerWithWorkspaces(t)
@@ -26980,7 +26868,7 @@ func TestWorkspaceCreateWithLocalBaseUsesPullRefWhenHeadBranchDeleted(
 ) {
 	t.Parallel()
 
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	const prNumber = 43
@@ -27043,7 +26931,7 @@ func TestWorkspaceCreateGitLabUsesSpecificMergeRequestHeadRefE2E(
 ) {
 	t.Parallel()
 
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	const mrNumber = 57
@@ -27114,7 +27002,7 @@ func TestWorkspaceCreateGitLabUsesSpecificMergeRequestHeadRefE2E(
 func TestWorkspaceCreateReusesExistingWorktreeThroughAPI(t *testing.T) {
 	t.Parallel()
 
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	const prNumber = 44
@@ -27175,7 +27063,7 @@ func TestWorkspaceCreateReusesExistingWorktreeThroughAPI(t *testing.T) {
 func TestWorkspaceRetryReusesExistingLocalHeadBranchThroughAPI(t *testing.T) {
 	t.Parallel()
 
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	const prNumber = 45
@@ -27304,7 +27192,7 @@ func TestWorkspaceCreateSameRepoHeadCloneURLTracksOriginBranchE2E(t *testing.T) 
 	t.Parallel()
 
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	client, database, clonePath, remotePath := setupTestServerWithWorkspaces(t)
 	ctx := t.Context()
@@ -27361,7 +27249,7 @@ func TestWorkspaceCreatePortQualifiedHostTracksOriginBranchE2E(t *testing.T) {
 	t.Parallel()
 
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	fixture := setupWorkspaceServerFixtureWithHost(
 		t, nil, "ghe.example.com:8443",
@@ -27411,7 +27299,7 @@ func TestWorkspaceCreatePortQualifiedHostTracksOriginBranchE2E(t *testing.T) {
 func TestWorkspaceDeleteRecreatesForkBranchName(t *testing.T) {
 	t.Parallel()
 
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	client, database, _, remotePath := setupTestServerWithWorkspaces(t)
@@ -27501,7 +27389,7 @@ func TestWorkspaceDeleteRecreatesForkBranchName(t *testing.T) {
 func TestWorkspaceDeletePreservesUserCreatedBranch(t *testing.T) {
 	t.Parallel()
 
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	client, _, clonePath, _ := setupTestServerWithWorkspaces(t)
@@ -27542,7 +27430,7 @@ func TestWorkspaceDeletePreservesUserCreatedBranch(t *testing.T) {
 func TestWorkspaceDeleteDoesNotCleanupReplacementCloneE2E(t *testing.T) {
 	t.Parallel()
 
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	client, database, _, remotePath := setupTestServerWithWorkspaces(t)
@@ -27589,7 +27477,7 @@ func TestWorkspaceDeleteDoesNotCleanupReplacementCloneE2E(t *testing.T) {
 func TestWorkspaceDeleteDoesNotCleanupReplacementCloneFromStaleLocalBaseE2E(t *testing.T) {
 	t.Parallel()
 
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	cfg := &config.Config{}
@@ -27655,7 +27543,7 @@ func TestWorkspaceDeleteDoesNotCleanupReplacementCloneFromStaleLocalBaseE2E(t *t
 func TestWorkspaceCreatePreservesExistingLocalPreferredBranch(t *testing.T) {
 	t.Parallel()
 
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	client, _, clonePath, remotePath := setupTestServerWithWorkspaces(t)
@@ -27716,7 +27604,7 @@ func TestWorkspaceCreatePreservesExistingLocalPreferredBranch(t *testing.T) {
 func TestWorkspaceDeleteLegacySyntheticBranchAllowsRecreate(t *testing.T) {
 	t.Parallel()
 
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	client, database, clonePath, remotePath := setupTestServerWithWorkspaces(t)
@@ -27799,7 +27687,7 @@ func TestWorkspaceDeleteLegacySyntheticBranchAllowsRecreate(t *testing.T) {
 }
 
 func TestWorkspacePRDetailPlatformHost(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	database := dbtest.Open(t)
@@ -27920,7 +27808,7 @@ func TestWorkspaceDeleteDirty(t *testing.T) {
 	t.Parallel()
 
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	client, database, _, _ := setupTestServerWithWorkspaces(t)
 	ctx := t.Context()

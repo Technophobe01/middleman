@@ -5321,6 +5321,9 @@ func (s *Server) refreshWorkspace(
 	case db.WorkspaceItemTypePullRequest:
 		// The PR detail sync runs after the repo index refresh below so the
 		// workspace response reflects the latest indexed PR row and diff.
+	case db.WorkspaceItemTypeKataTask:
+		// Kata tasks are not provider issues. The live task pane refreshes
+		// through the Kata daemon; this route only refreshes the mapped repo.
 	default:
 		return nil, problemInternal("workspace has unsupported item type")
 	}
@@ -5931,11 +5934,14 @@ func (s *Server) workspaceMergeTargetBranch(
 	summary *db.WorkspaceSummary,
 ) (string, bool, error) {
 	prNumber := summary.ItemNumber
-	if summary.ItemType == db.WorkspaceItemTypeIssue {
+	if summary.ItemType != db.WorkspaceItemTypePullRequest {
 		if summary.AssociatedPRNumber == nil {
 			return "", false, nil
 		}
 		prNumber = *summary.AssociatedPRNumber
+	}
+	if prNumber <= 0 {
+		return "", false, nil
 	}
 
 	repo, err := s.db.GetRepoByIdentity(ctx, db.RepoIdentity{

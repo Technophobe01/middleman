@@ -7,12 +7,12 @@ import (
 	"testing"
 	"time"
 
-	Assert "github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func TestStartWorkspaceRetryTransitionsOnlyOneConcurrentCaller(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	d := openTestDB(t)
@@ -77,7 +77,7 @@ func TestStartWorkspaceRetryTransitionsOnlyOneConcurrentCaller(t *testing.T) {
 }
 
 func TestStartWorkspaceRetryPreservesBranchUntilCleanupSucceeds(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	d := openTestDB(t)
@@ -129,7 +129,7 @@ func insertTestRepoWithHost(
 }
 
 func TestPurgeOtherHosts(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -269,7 +269,7 @@ func TestPurgeOtherHosts(t *testing.T) {
 // TestCascadeDeleteRepo verifies that deleting a repo on a fresh DB
 // cascades to all dependent tables (mr_events, kanban_state, issue_events).
 func TestCascadeDeleteRepo(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -342,7 +342,7 @@ func TestCascadeDeleteRepo(t *testing.T) {
 }
 
 func TestUpsertMREventsUpdatesExistingEventBody(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -379,7 +379,7 @@ func TestUpsertMREventsUpdatesExistingEventBody(t *testing.T) {
 }
 
 func TestUpsertMREventsUpdatesExistingReviewState(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -417,7 +417,7 @@ func TestUpsertMREventsUpdatesExistingReviewState(t *testing.T) {
 }
 
 func TestUpsertMREventsWithThreadID(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -457,7 +457,7 @@ func TestUpsertMREventsWithThreadID(t *testing.T) {
 // stored thread id must survive such updates instead of detaching the
 // comment from its discussion until the next sync.
 func TestUpsertMREventsKeepsThreadIDWhenIncomingIsNil(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -529,7 +529,7 @@ func TestUpsertMREventsKeepsThreadIDWhenIncomingIsNil(t *testing.T) {
 }
 
 func TestUpsertIssueEventsKeepsThreadIDWhenIncomingIsNil(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -582,7 +582,7 @@ func TestUpsertIssueEventsKeepsThreadIDWhenIncomingIsNil(t *testing.T) {
 }
 
 func TestUpsertIssueEventsUpdatesExistingEventBody(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -631,7 +631,7 @@ func TestUpsertIssueEventsUpdatesExistingEventBody(t *testing.T) {
 }
 
 func TestIssueEventsDedupeIsScopedToIssue(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -679,7 +679,7 @@ func TestIssueEventsDedupeIsScopedToIssue(t *testing.T) {
 }
 
 func TestUpsertIssueEventsWithThreadID(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -722,7 +722,7 @@ func TestUpsertIssueEventsWithThreadID(t *testing.T) {
 }
 
 func TestItemsPersistPlatformExternalID(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -770,7 +770,7 @@ func TestItemsPersistPlatformExternalID(t *testing.T) {
 }
 
 func TestUpsertAndListRepos(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -797,7 +797,7 @@ func TestUpsertAndListRepos(t *testing.T) {
 }
 
 func TestUpsertRepoDefaultsToGitHubIdentity(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -823,7 +823,7 @@ func TestUpsertRepoDefaultsToGitHubIdentity(t *testing.T) {
 }
 
 func TestUpsertRepoSupportsProviderIdentity(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -860,7 +860,7 @@ func TestUpsertRepoSupportsProviderIdentity(t *testing.T) {
 }
 
 func TestUpsertRepoPreservesNonGitHubDisplayIdentity(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -886,7 +886,7 @@ func TestUpsertRepoPreservesNonGitHubDisplayIdentity(t *testing.T) {
 }
 
 func TestProviderCanonicalReadPathsUseLookupKeys(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -992,7 +992,7 @@ func TestProviderCanonicalReadPathsUseLookupKeys(t *testing.T) {
 }
 
 func TestUpdateRepoProviderMetadataPreservesIdentity(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -1027,7 +1027,7 @@ func TestUpdateRepoProviderMetadataPreservesIdentity(t *testing.T) {
 }
 
 func TestUpsertRepoByProviderIDUpdatesRenamedRepo(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -1064,7 +1064,7 @@ func TestUpsertRepoByProviderIDUpdatesRenamedRepo(t *testing.T) {
 }
 
 func TestUpsertRepoByProviderIDUpdatesRenamedRepoWorkspaces(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -1117,7 +1117,7 @@ func TestUpsertRepoByProviderIDUpdatesRenamedRepoWorkspaces(t *testing.T) {
 }
 
 func TestUpsertRepoByProviderIDMergesExistingDestinationPathRow(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -1183,7 +1183,7 @@ func TestUpsertRepoByProviderIDMergesExistingDestinationPathRow(t *testing.T) {
 }
 
 func TestUpsertRepoByProviderIDMergesExistingDestinationPathRowWorkspaces(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -1246,7 +1246,7 @@ func TestUpsertRepoByProviderIDMergesExistingDestinationPathRowWorkspaces(t *tes
 }
 
 func TestUpsertRepoByProviderIDMergesCollidingWorkspaceRows(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -1366,7 +1366,7 @@ func TestUpsertRepoByProviderIDMergesCollidingWorkspaceRows(t *testing.T) {
 }
 
 func TestUpsertRepoByProviderIDMergesMovedItemLabelLinksIntoDestinationLabels(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -1447,7 +1447,7 @@ func TestUpsertRepoByProviderIDMergesMovedItemLabelLinksIntoDestinationLabels(t 
 }
 
 func TestReplaceRepoLabelCatalogKeepsAssignedHistoricalLabels(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -1490,7 +1490,7 @@ func TestReplaceRepoLabelCatalogKeepsAssignedHistoricalLabels(t *testing.T) {
 }
 
 func TestLabelMergePreservesCatalogMembership(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -1527,7 +1527,7 @@ func TestLabelMergePreservesCatalogMembership(t *testing.T) {
 }
 
 func TestRepoMergePreservesLabelCatalogFreshnessAndMembership(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -1582,7 +1582,7 @@ func TestRepoMergePreservesLabelCatalogFreshnessAndMembership(t *testing.T) {
 }
 
 func TestLabelMergeDoesNotLetItemRowOverwriteCatalogMetadata(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -1609,7 +1609,7 @@ func TestLabelMergeDoesNotLetItemRowOverwriteCatalogMetadata(t *testing.T) {
 }
 
 func TestCatalogMetadataOverridesItemMetadata(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -1652,7 +1652,7 @@ func TestCatalogMetadataOverridesItemMetadata(t *testing.T) {
 }
 
 func TestLabelMergeKeepsFresherCatalogMetadata(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -1692,7 +1692,7 @@ func TestLabelMergeKeepsFresherCatalogMetadata(t *testing.T) {
 }
 
 func TestRepoMergeUsesNewerSourceLabelCatalogFreshness(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -1742,7 +1742,7 @@ func TestRepoMergeUsesNewerSourceLabelCatalogFreshness(t *testing.T) {
 }
 
 func TestRepoMergeUsesFresherSourceCatalogMembership(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -1779,7 +1779,7 @@ func TestRepoMergeUsesFresherSourceCatalogMembership(t *testing.T) {
 }
 
 func TestRepoMergeUsesFresherDestinationCatalogMembership(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -1816,7 +1816,7 @@ func TestRepoMergeUsesFresherDestinationCatalogMembership(t *testing.T) {
 }
 
 func TestRepoMergeKeepsSuccessfulSyncWhenNewerCheckFailed(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -1856,7 +1856,7 @@ func TestRepoMergeKeepsSuccessfulSyncWhenNewerCheckFailed(t *testing.T) {
 }
 
 func TestRepoMergeCopiesFresherDuplicateLabelMetadata(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -1884,7 +1884,7 @@ func TestRepoMergeCopiesFresherDuplicateLabelMetadata(t *testing.T) {
 }
 
 func TestRepoMergeCoalescesPlatformExternalIDDuplicateLabels(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -1912,7 +1912,7 @@ func TestRepoMergeCoalescesPlatformExternalIDDuplicateLabels(t *testing.T) {
 }
 
 func TestRepoMergeCoalescesDestinationNameConflictBeforeCatalogRename(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -1940,7 +1940,7 @@ func TestRepoMergeCoalescesDestinationNameConflictBeforeCatalogRename(t *testing
 }
 
 func TestRepoMergeCopiesFresherNameOnlyDuplicateLabelMetadata(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -1968,7 +1968,7 @@ func TestRepoMergeCopiesFresherNameOnlyDuplicateLabelMetadata(t *testing.T) {
 }
 
 func TestRepoLabelCatalogWritesIgnoreStaleResults(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -1994,7 +1994,7 @@ func TestRepoLabelCatalogWritesIgnoreStaleResults(t *testing.T) {
 }
 
 func TestRepoLabelCatalogOlderSuccessKeepsNewerFailedCheck(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -2017,7 +2017,7 @@ func TestRepoLabelCatalogOlderSuccessKeepsNewerFailedCheck(t *testing.T) {
 }
 
 func TestRepoLabelCatalogFreshnessTracksCheckedSyncedAndErrors(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -2042,7 +2042,7 @@ func TestRepoLabelCatalogFreshnessTracksCheckedSyncedAndErrors(t *testing.T) {
 }
 
 func TestUpsertRepoCasefoldsOwnerAndName(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -2062,7 +2062,7 @@ func TestUpsertRepoCasefoldsOwnerAndName(t *testing.T) {
 }
 
 func TestUpdateRepoSync(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -2091,7 +2091,7 @@ func TestUpdateRepoSync(t *testing.T) {
 }
 
 func TestUpsertAndGetPullRequest(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -2161,7 +2161,7 @@ func TestUpsertAndGetPullRequest(t *testing.T) {
 }
 
 func TestUpsertMergeRequestPreservesNewerLastActivity(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -2215,7 +2215,7 @@ func TestListPullRequests(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, prs, 3)
 	// Newest first.
-	Assert.Equal(t, []int{3, 2, 1}, []int{prs[0].Number, prs[1].Number, prs[2].Number})
+	assert.Equal(t, []int{3, 2, 1}, []int{prs[0].Number, prs[1].Number, prs[2].Number})
 }
 
 func TestListPullRequestsFilterByRepo(t *testing.T) {
@@ -2231,11 +2231,11 @@ func TestListPullRequestsFilterByRepo(t *testing.T) {
 	prs, err := d.ListMergeRequests(t.Context(), ListMergeRequestsOpts{RepoOwner: "owner", RepoName: "repo1"})
 	require.NoError(t, err)
 	require.Len(t, prs, 1)
-	Assert.Equal(t, repo1, prs[0].RepoID)
+	assert.Equal(t, repo1, prs[0].RepoID)
 }
 
 func TestListPullRequestsFilterByRepoID(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -2268,7 +2268,7 @@ func TestListPullRequestsFilterByRepoID(t *testing.T) {
 }
 
 func TestListPullRequestsFilterByMultipleRepos(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -2296,7 +2296,7 @@ func TestListPullRequestsFilterByMultipleRepos(t *testing.T) {
 }
 
 func TestListPullRequestsFilterByRepoIncludesAllHostsByDefault(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -2331,7 +2331,7 @@ func TestListPullRequestsFilterByRepoIncludesAllHostsByDefault(t *testing.T) {
 }
 
 func TestListPullRequestsFilterByHostedRepoPath(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -2356,7 +2356,7 @@ func TestListPullRequestsFilterByHostedRepoPath(t *testing.T) {
 }
 
 func TestPullRequestRepoScopedQueriesCanonicalizeOwnerName(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -2386,7 +2386,7 @@ func TestPullRequestRepoScopedQueriesCanonicalizeOwnerName(t *testing.T) {
 
 func TestListPullRequestsFilterBySearch(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	d := openTestDB(t)
 
 	repoID := insertTestRepo(t, d, "owner", "repo")
@@ -2409,7 +2409,7 @@ func TestListPullRequestsFilterBySearch(t *testing.T) {
 
 func TestListPullRequestsFilterBySearchPreservesApostrophesInTerms(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	d := openTestDB(t)
 
 	repoID := insertTestRepo(t, d, "owner", "repo")
@@ -2431,7 +2431,7 @@ func TestListPullRequestsFilterBySearchPreservesApostrophesInTerms(t *testing.T)
 
 func TestListPullRequestsFilterBySearchRepoFragment(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	d := openTestDB(t)
 
 	apiRepoID := insertTestRepo(t, d, "acme", "api")
@@ -2454,7 +2454,7 @@ func TestListPullRequestsFilterBySearchRepoFragment(t *testing.T) {
 
 func TestListPullRequestsFilterBySearchNumber(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	d := openTestDB(t)
 
 	repoID := insertTestRepo(t, d, "owner", "repo")
@@ -2482,7 +2482,7 @@ func TestListPullRequestsFilterBySearchNumber(t *testing.T) {
 
 func TestListPullRequestsFilterBySearchLabel(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
 
@@ -2506,7 +2506,7 @@ func TestListPullRequestsFilterBySearchLabel(t *testing.T) {
 
 func TestListPullRequestsPaginationUsesStableTieBreaker(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	d := openTestDB(t)
 
 	repoID := insertTestRepo(t, d, "owner", "repo")
@@ -2527,7 +2527,7 @@ func TestListPullRequestsPaginationUsesStableTieBreaker(t *testing.T) {
 }
 
 func TestListPullRequestsFilterByKanban(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -2867,7 +2867,7 @@ func TestUpsertLabels_RejectsAmbiguousNameAndPlatformIDMatch(t *testing.T) {
 }
 
 func TestKanbanState(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -2901,7 +2901,7 @@ func TestKanbanState(t *testing.T) {
 }
 
 func TestPREvents(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -2955,7 +2955,7 @@ func TestPREvents(t *testing.T) {
 }
 
 func TestMREventsDedupeIsScopedToMergeRequest(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -3003,7 +3003,7 @@ func TestMREventsDedupeIsScopedToMergeRequest(t *testing.T) {
 }
 
 func TestMREventsPersistPlatformExternalID(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -3029,7 +3029,7 @@ func TestMREventsPersistPlatformExternalID(t *testing.T) {
 }
 
 func TestListMREventsHandlesNonUTCTimes(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -3078,7 +3078,7 @@ func TestListMREventsHandlesNonUTCTimes(t *testing.T) {
 }
 
 func TestGetDiffSHAsByRepoIDScopesDuplicateProviderRepos(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	ctx := t.Context()
 	d := openTestDB(t)
@@ -3142,7 +3142,7 @@ func TestGetDiffSHAsByRepoIDScopesDuplicateProviderRepos(t *testing.T) {
 }
 
 func TestUpdateMRCIStatusForHeadSkipsStaleHead(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	ctx := t.Context()
 	d := openTestDB(t)
@@ -3197,11 +3197,11 @@ func TestGetPreviouslyOpenPRNumbers(t *testing.T) {
 	stillOpen := map[int]bool{1: true, 3: true}
 	closed, err := d.GetPreviouslyOpenMRNumbers(t.Context(), repoID, stillOpen)
 	require.NoError(t, err)
-	Assert.Equal(t, []int{2}, closed)
+	assert.Equal(t, []int{2}, closed)
 }
 
 func TestUpsertPullRequestMergeableState(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	ctx := t.Context()
 	d := openTestDB(t)
@@ -3237,7 +3237,7 @@ func TestUpsertPullRequestMergeableState(t *testing.T) {
 }
 
 func TestRateLimitCRUD(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 
@@ -3294,7 +3294,7 @@ func TestRateLimitCRUD(t *testing.T) {
 }
 
 func TestRateLimitCRUDScopesByPlatform(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 
@@ -3338,7 +3338,7 @@ func TestRateLimitCRUDScopesByPlatform(t *testing.T) {
 }
 
 func TestUpdatePRState(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -3358,7 +3358,7 @@ func TestUpdatePRState(t *testing.T) {
 }
 
 func TestUpdateMRDraftStateAdvancesTimestampToRejectStaleSync(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -3476,7 +3476,7 @@ func TestGetIssue_AttachesLabels(t *testing.T) {
 }
 
 func TestIssueRepoScopedQueriesCanonicalizeOwnerName(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -3500,7 +3500,7 @@ func TestIssueRepoScopedQueriesCanonicalizeOwnerName(t *testing.T) {
 }
 
 func TestListIssuesFilterByHostedRepoPath(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -3525,7 +3525,7 @@ func TestListIssuesFilterByHostedRepoPath(t *testing.T) {
 }
 
 func TestListIssuesFilterByMultipleRepos(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -3554,7 +3554,7 @@ func TestListIssuesFilterByMultipleRepos(t *testing.T) {
 
 func TestListIssuesFilterBySearch(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	d := openTestDB(t)
 
 	repoID := insertTestRepo(t, d, "owner", "repo")
@@ -3592,7 +3592,7 @@ func TestListIssuesFilterBySearch(t *testing.T) {
 
 func TestListIssuesFilterBySearchRepoFragment(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	d := openTestDB(t)
 
 	apiRepoID := insertTestRepo(t, d, "acme", "api")
@@ -3615,7 +3615,7 @@ func TestListIssuesFilterBySearchRepoFragment(t *testing.T) {
 
 func TestListIssuesFilterBySearchLabel(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
 
@@ -3639,7 +3639,7 @@ func TestListIssuesFilterBySearchLabel(t *testing.T) {
 
 func TestListIssuesPaginationUsesStableTieBreaker(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	d := openTestDB(t)
 
 	repoID := insertTestRepo(t, d, "owner", "repo")
@@ -3745,7 +3745,7 @@ func TestListIssues_UsesRepoScopedLabels(t *testing.T) {
 }
 
 func TestSetWorktreeLinks(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -3783,7 +3783,7 @@ func TestSetWorktreeLinks(t *testing.T) {
 }
 
 func TestGetWorktreeLinksForMR(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -3811,7 +3811,7 @@ func TestGetWorktreeLinksForMR(t *testing.T) {
 }
 
 func TestListCommentAutocompleteUsers(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -3874,7 +3874,7 @@ func TestListCommentAutocompleteUsers(t *testing.T) {
 }
 
 func TestListCommentAutocompleteUsersScopesByProvider(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -3915,7 +3915,7 @@ func TestListCommentAutocompleteUsersScopesByProvider(t *testing.T) {
 }
 
 func TestListCommentAutocompleteReferences(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -3954,7 +3954,7 @@ func TestListCommentAutocompleteReferences(t *testing.T) {
 }
 
 func TestListCommentAutocompleteReferencesScopesByProvider(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -4071,7 +4071,7 @@ func TestRepoIdentifierCasefoldTriggers(t *testing.T) {
 }
 
 func TestWorkspaceCRUD(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -4133,13 +4133,13 @@ func TestWorkspaceCRUD(t *testing.T) {
 	_, err = d.WriteDB().ExecContext(ctx, `
 		INSERT INTO middleman_workspaces
 		    (id, platform_host, repo_owner, repo_name,
-		     item_type, item_number, git_head_ref,
+		     item_type, item_number, item_key, git_head_ref,
 		     worktree_path, tmux_session, status,
 		     created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
 		        datetime('now', '+1 minute'))`,
 		"ws-def-456", "github.com", "acme", "gadget",
-		WorkspaceItemTypePullRequest, 7, "fix/bug",
+		WorkspaceItemTypePullRequest, 7, "7", "fix/bug",
 		"/tmp/ws-def-456", "ws-def-456", "ready",
 	)
 	require.NoError(err)
@@ -4260,8 +4260,96 @@ func TestWorkspaceCRUD(t *testing.T) {
 	assert.Nil(noSuch)
 }
 
+func TestWorkspaceItemKeyDefaultsFromItemNumber(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	d := openTestDB(t)
+	ctx := t.Context()
+
+	require.NoError(d.InsertWorkspace(ctx, &Workspace{
+		ID:              "ws-provider-issue",
+		PlatformHost:    "github.com",
+		RepoOwner:       "acme",
+		RepoName:        "widget",
+		ItemType:        WorkspaceItemTypeIssue,
+		ItemNumber:      42,
+		GitHeadRef:      "middleman/issue-42",
+		WorkspaceBranch: "middleman/issue-42",
+		WorktreePath:    "/tmp/ws-provider-issue",
+		TmuxSession:     "ws-provider-issue",
+		Status:          "ready",
+	}))
+
+	got, err := d.GetWorkspace(ctx, "ws-provider-issue")
+	require.NoError(err)
+	require.NotNil(got)
+	assert.Equal(WorkspaceItemTypeIssue, got.ItemType)
+	assert.Equal(42, got.ItemNumber)
+	assert.Equal("42", got.ItemKey)
+
+	byIssue, err := d.GetWorkspaceByIssue(ctx, "github.com", "acme", "widget", 42)
+	require.NoError(err)
+	require.NotNil(byIssue)
+	assert.Equal("42", byIssue.ItemKey)
+}
+
+func TestKataWorkspaceMetadata(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	d := openTestDB(t)
+	ctx := t.Context()
+
+	metadata := WorkspaceKataMetadata{
+		DaemonID:    "main",
+		ProjectUID:  "project-kata",
+		ProjectName: "Kata",
+		IssueUID:    "kata-uid-1",
+		ShortID:     "task-123",
+		QualifiedID: "Kata#task-123",
+		Title:       "Fix widget",
+	}
+	itemKey := KataWorkspaceItemKey(metadata)
+	require.NoError(d.InsertWorkspace(ctx, &Workspace{
+		ID:              "ws-kata-task",
+		PlatformHost:    "github.com",
+		RepoOwner:       "acme",
+		RepoName:        "widget",
+		ItemType:        WorkspaceItemTypeKataTask,
+		ItemKey:         itemKey,
+		GitHeadRef:      "middleman/kata/task-123-fix-widget",
+		WorkspaceBranch: "middleman/kata/task-123-fix-widget",
+		WorktreePath:    "/tmp/ws-kata-task",
+		TmuxSession:     "ws-kata-task",
+		Status:          "ready",
+		KataMetadata:    &metadata,
+	}))
+
+	got, err := d.GetWorkspace(ctx, "ws-kata-task")
+	require.NoError(err)
+	require.NotNil(got)
+	assert.Equal(WorkspaceItemTypeKataTask, got.ItemType)
+	assert.Equal(0, got.ItemNumber)
+	assert.Equal(itemKey, got.ItemKey)
+	require.NotNil(got.KataMetadata)
+	assert.Equal("main", got.KataMetadata.DaemonID)
+	assert.Equal("project-kata", got.KataMetadata.ProjectUID)
+	assert.Equal("Kata", got.KataMetadata.ProjectName)
+	assert.Equal("kata-uid-1", got.KataMetadata.IssueUID)
+	assert.Equal("task-123", got.KataMetadata.ShortID)
+	assert.Equal("Kata#task-123", got.KataMetadata.QualifiedID)
+	assert.Equal("Fix widget", got.KataMetadata.Title)
+
+	summary, err := d.GetWorkspaceSummary(ctx, "ws-kata-task")
+	require.NoError(err)
+	require.NotNil(summary)
+	assert.Equal(itemKey, summary.ItemKey)
+	require.NotNil(summary.KataMetadata)
+	require.NotNil(summary.MRTitle)
+	assert.Equal("Fix widget", *summary.MRTitle)
+}
+
 func TestGetWorkspaceByIssueForProviderDisambiguatesProvider(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -4320,7 +4408,7 @@ func TestGetWorkspaceByIssueForProviderDisambiguatesProvider(t *testing.T) {
 }
 
 func TestGetWorkspaceByMRForProviderDisambiguatesProvider(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -4379,7 +4467,7 @@ func TestGetWorkspaceByMRForProviderDisambiguatesProvider(t *testing.T) {
 }
 
 func TestFreshWorkspaceRuntimeSessionSchemaIncludesTmuxSession(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	d := openTestDB(t)
@@ -4420,8 +4508,8 @@ func TestWorkspaceIdentifierCasefoldTriggers(t *testing.T) {
 	_, err := d.WriteDB().ExecContext(ctx, `
 		INSERT INTO middleman_workspaces
 		    (id, platform_host, repo_owner, repo_name,
-		     item_type, item_number, git_head_ref, worktree_path, tmux_session)
-		VALUES ('mixed', 'github.com', 'Acme', 'widget', 'pull_request', 1, 'feature',
+		     item_type, item_number, item_key, git_head_ref, worktree_path, tmux_session)
+		VALUES ('mixed', 'github.com', 'Acme', 'widget', 'pull_request', 1, '1', 'feature',
 		        '/tmp/mixed', 'mixed')`)
 	require.Error(err)
 	require.Contains(err.Error(), "workspace repo identifiers must be provider-canonical")
@@ -4446,7 +4534,7 @@ func TestWorkspaceIdentifierCasefoldTriggers(t *testing.T) {
 }
 
 func TestWorkspaceCanonicalizationPreservesGitLabRepoDisplay(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -4637,7 +4725,7 @@ func TestWorkspaceUniqueConstraintIncludesPlatform(t *testing.T) {
 }
 
 func TestWorkspaceSummariesDoNotJoinAcrossProviders(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -4681,7 +4769,7 @@ func TestWorkspaceSummariesDoNotJoinAcrossProviders(t *testing.T) {
 }
 
 func TestWorkspaceSummaries(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -4719,12 +4807,12 @@ func TestWorkspaceSummaries(t *testing.T) {
 	_, err = d.WriteDB().ExecContext(ctx, `
 		INSERT INTO middleman_workspaces
 		    (id, platform_host, repo_owner, repo_name,
-		     item_type, item_number, git_head_ref,
+		     item_type, item_number, item_key, git_head_ref,
 		     worktree_path, tmux_session, status,
 		     created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		"ws-with-mr", "github.com", "acme", "widget",
-		WorkspaceItemTypePullRequest, 42, "feat/workspace",
+		WorkspaceItemTypePullRequest, 42, "42", "feat/workspace",
 		"/tmp/ws-with-mr", "ws-with-mr", "ready",
 		base,
 	)
@@ -4734,12 +4822,12 @@ func TestWorkspaceSummaries(t *testing.T) {
 	_, err = d.WriteDB().ExecContext(ctx, `
 		INSERT INTO middleman_workspaces
 		    (id, platform_host, repo_owner, repo_name,
-		     item_type, item_number, associated_pr_number, git_head_ref,
+		     item_type, item_number, item_key, associated_pr_number, git_head_ref,
 		     worktree_path, tmux_session, status,
 		     created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		"ws-issue-with-pr", "github.com", "acme", "widget",
-		WorkspaceItemTypeIssue, 7, 42, "feature/from-issue",
+		WorkspaceItemTypeIssue, 7, "7", 42, "feature/from-issue",
 		"/tmp/ws-issue-with-pr", "ws-issue-with-pr", "ready",
 		base.Add(30*time.Minute),
 	)
@@ -4749,12 +4837,12 @@ func TestWorkspaceSummaries(t *testing.T) {
 	_, err = d.WriteDB().ExecContext(ctx, `
 		INSERT INTO middleman_workspaces
 		    (id, platform_host, repo_owner, repo_name,
-		     item_type, item_number, git_head_ref,
+		     item_type, item_number, item_key, git_head_ref,
 		     worktree_path, tmux_session, status,
 		     created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		"ws-no-mr", "github.com", "acme", "gadget",
-		WorkspaceItemTypePullRequest, 99, "fix/thing",
+		WorkspaceItemTypePullRequest, 99, "99", "fix/thing",
 		"/tmp/ws-no-mr", "ws-no-mr", "creating",
 		base.Add(time.Hour),
 	)
@@ -4837,7 +4925,7 @@ func TestWorkspaceSummaries(t *testing.T) {
 }
 
 func TestSetWorkspaceAssociatedPRNumberIfNull(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := context.Background()
@@ -4845,11 +4933,11 @@ func TestSetWorkspaceAssociatedPRNumberIfNull(t *testing.T) {
 	_, err := d.WriteDB().ExecContext(ctx, `
 		INSERT INTO middleman_workspaces
 		    (id, platform_host, repo_owner, repo_name,
-		     item_type, item_number, git_head_ref,
+		     item_type, item_number, item_key, git_head_ref,
 		     worktree_path, tmux_session, status)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		"ws-issue", "github.com", "acme", "widget",
-		WorkspaceItemTypeIssue, 7, "feature/issue-7",
+		WorkspaceItemTypeIssue, 7, "7", "feature/issue-7",
 		"/tmp/ws-issue", "ws-issue", "ready",
 	)
 	require.NoError(err)
@@ -5036,7 +5124,7 @@ func TestHTTPEtagPersistence(t *testing.T) {
 
 func TestUpsertIssue_StoresAssignees(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
 	now := baseTime()
@@ -5071,7 +5159,7 @@ func TestUpsertIssue_StoresAssignees(t *testing.T) {
 
 func TestListIssues_FilterByAssignee(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
 	now := baseTime()
@@ -5174,7 +5262,7 @@ func TestListIssues_PopulatesAssignees(t *testing.T) {
 // malformed JSON. Repro for roborev finding on commit 2b9ca4d.
 func TestUpsertIssue_NormalizesEmptyAssigneesJSON(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
 	now := baseTime()
@@ -5231,53 +5319,4 @@ func TestUpsertIssue_NormalizesEmptyAssigneesJSON(t *testing.T) {
 	issues, err := d.ListIssues(ctx, ListIssuesOpts{Assignee: "anyone", State: "all"})
 	require.NoError(err)
 	assert.Empty(issues)
-}
-
-// TestListIssues_FilterByAssigneeToleratesLegacyEmptyJSON simulates rows that
-// were written before the empty-string normalization was added (e.g. by a
-// downgrade-then-upgrade path). The filter must not 500 on json_each over an
-// empty string.
-func TestListIssues_FilterByAssigneeToleratesLegacyEmptyJSON(t *testing.T) {
-	require := require.New(t)
-	assert := Assert.New(t)
-	d := openTestDB(t)
-	ctx := t.Context()
-	now := baseTime()
-	repoID := insertTestRepo(t, d, "owner", "repo")
-
-	// Bypass UpsertIssue and write a literal empty string directly.
-	_, err := d.WriteDB().ExecContext(ctx, `
-		INSERT INTO middleman_issues
-		    (repo_id, platform_id, platform_external_id, number, url, title, author, state,
-		     body, comment_count, labels_json, assignees_json,
-		     created_at, updated_at, last_activity_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		repoID, 1, "", 1,
-		"https://github.com/owner/repo/issues/1",
-		"Issue 1", "author", "open",
-		"", 0, "[]", "",
-		now, now, now,
-	)
-	require.NoError(err)
-
-	// The well-formed row alongside it.
-	_, err = d.UpsertIssue(ctx, &Issue{
-		RepoID:         repoID,
-		PlatformID:     2,
-		Number:         2,
-		URL:            "https://github.com/owner/repo/issues/2",
-		Title:          "Issue 2",
-		Author:         "author",
-		State:          "open",
-		AssigneesJSON:  `["alice"]`,
-		CreatedAt:      now,
-		UpdatedAt:      now,
-		LastActivityAt: now,
-	})
-	require.NoError(err)
-
-	issues, err := d.ListIssues(ctx, ListIssuesOpts{Assignee: "alice", State: "all"})
-	require.NoError(err)
-	require.Len(issues, 1)
-	assert.Equal(2, issues[0].Number)
 }
