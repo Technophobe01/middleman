@@ -1072,6 +1072,48 @@ repository_selection = "all"
 	assert.Equal(int64(4242), apps[0].AppID)
 }
 
+func TestValidateReloadProviderTokenSourcesScopesGitHubAppByOwner(t *testing.T) {
+	require := require.New(t)
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.toml")
+	require.NoError(os.WriteFile(filepath.Join(dir, "app.pem"), []byte("pem"), 0o600))
+	writeConfigToml(t, cfgPath, `
+sync_interval = "5m"
+github_token_env = "UNUSED_RELOAD_GITHUB_TOKEN"
+
+[[repos]]
+owner = "acme"
+name = "widget"
+
+[[github_apps]]
+host = "github.com"
+app_id = 4242
+private_key_path = "app.pem"
+installation_id = 7
+installation_account = "acme"
+repository_selection = "all"
+`)
+	cfg, err := config.Load(cfgPath)
+	require.NoError(err)
+
+	var minted []tokenauth.Candidate
+	set := tokenauth.NewSourceSet(tokenauth.Options{
+		GitHubApp: func(_ context.Context, c tokenauth.Candidate) (string, time.Time, error) {
+			minted = append(minted, c)
+			return "app-token", time.Now().Add(time.Hour), nil
+		},
+	})
+	for _, plan := range cfg.ProviderTokenSources() {
+		set.Upsert(plan.Descriptor)
+	}
+
+	srv := &Server{tokenSources: set}
+	require.NoError(srv.validateReloadProviderTokenSources(t.Context(), cfg))
+	require.Len(minted, 1)
+	assert.Equal(t, int64(4242), minted[0].AppID)
+	assert.Equal(t, "acme", minted[0].InstallationAccount)
+}
+
 // newReloadServerWithTokenSources mirrors startup: one source per
 // provider token plan, registered in a SourceSet the server reloads
 // against.
@@ -1660,6 +1702,8 @@ func TestRestartRequiredForNotificationIntervals(t *testing.T) {
 	base := func() *config.Config {
 		cfg := &config.Config{}
 		cfg.SyncInterval = "5m"
+		cfg.ActivePRRefreshInterval = "2m"
+		cfg.ActivePRWindow = "4h"
 		cfg.Notifications.SyncInterval = "30s"
 		cfg.Notifications.PropagationInterval = "1m"
 		cfg.Notifications.BatchSize = 25
@@ -1684,6 +1728,16 @@ func TestRestartRequiredForNotificationIntervals(t *testing.T) {
 	batchSizeChanged.Notifications.BatchSize = 50
 	require.True(snap.restartRequiredFor(batchSizeChanged),
 		"notification batch_size is snapped by the loop")
+
+	activeRefreshChanged := base()
+	activeRefreshChanged.ActivePRRefreshInterval = "30s"
+	require.False(snap.restartRequiredFor(activeRefreshChanged),
+		"active PR refresh interval is hot-reloadable by the syncer")
+
+	activeWindowChanged := base()
+	activeWindowChanged.ActivePRWindow = "8h"
+	require.False(snap.restartRequiredFor(activeWindowChanged),
+		"active PR window is hot-reloadable by the syncer")
 }
 
 const validReloadConfigAuthGate = `

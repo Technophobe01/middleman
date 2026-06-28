@@ -45,8 +45,10 @@
     platform_host: string;
     repo_owner: string;
     repo_name: string;
-    item_type: "pull_request" | "issue";
+    item_type: "pull_request" | "issue" | "kata_task";
     item_number: number;
+    item_key?: string;
+    kata?: KataWorkspaceMetadata | null;
     git_head_ref: string;
     worktree_path: string;
     tmux_session: string;
@@ -77,17 +79,27 @@
   }
 
   type HostSummary = components["schemas"]["HostSummary"];
+  type KataWorkspaceMetadata = components["schemas"]["WorkspaceKataMetadata"];
 
   interface Props {
     selectedId: string;
     selectedHostKey?: string | undefined;
     onOpenItemSidebar?: (
       workspaceId: string,
-      tab: "pr" | "issue",
+      tab: "pr" | "issue" | "kata_task",
       hostKey?: string,
     ) => void;
     onWorkspaceListStateChange?: (
       state: { status: "loading" | "retrying" | "loaded"; total: number },
+    ) => void;
+    isWorkspaceActionDisabled?: (
+      workspaceId: string,
+      hostKey?: string,
+    ) => boolean;
+    onWorkspaceDeletePendingChange?: (
+      workspaceId: string,
+      hostKey: string | undefined,
+      pending: boolean,
     ) => void;
     isSidebarToggleEnabled?: boolean;
     onCollapseSidebar?: (() => void) | undefined;
@@ -98,6 +110,8 @@
     selectedHostKey = undefined,
     onOpenItemSidebar,
     onWorkspaceListStateChange,
+    isWorkspaceActionDisabled,
+    onWorkspaceDeletePendingChange,
     isSidebarToggleEnabled = false,
     onCollapseSidebar,
   }: Props = $props();
@@ -449,7 +463,34 @@
   }
 
   function displayName(ws: Workspace): string {
+    if (ws.item_type === "kata_task") {
+      return ws.kata?.title?.trim() || ws.git_head_ref;
+    }
     return ws.mr_title ?? ws.git_head_ref;
+  }
+
+  function kataIdentityLabel(ws: Workspace): string {
+    return (
+      ws.kata?.short_id?.trim() ||
+      ws.kata?.qualified_id?.trim() ||
+      "Kata"
+    );
+  }
+
+  function itemBubbleLabel(ws: Workspace): string {
+    if (ws.item_type === "kata_task") return kataIdentityLabel(ws);
+    return `#${ws.item_number}`;
+  }
+
+  function itemBubbleTitle(ws: Workspace): string {
+    if (ws.item_type === "kata_task") {
+      const title = ws.kata?.title?.trim();
+      const identity = kataIdentityLabel(ws);
+      return title ? `Open Kata task ${identity}: ${title}` : `Open Kata task ${identity}`;
+    }
+    return ws.item_type === "issue"
+      ? `Open issue #${ws.item_number}`
+      : `Open PR #${ws.item_number}`;
   }
 
   function updateSearch(event: Event): void {
@@ -462,8 +503,6 @@
     ws: Workspace,
     query: string,
   ): boolean {
-    const itemKind = ws.item_type === "issue" ? "issue" : "pr";
-    const itemNumber = String(ws.item_number);
     const haystack = [
       displayName(ws),
       ws.git_head_ref,
@@ -474,11 +513,32 @@
       ws.repo?.repo_path,
       `${ws.repo_owner}/${ws.repo_name}`,
       `${ws.platform_host}/${ws.repo_owner}/${ws.repo_name}`,
-      itemNumber,
-      `#${itemNumber}`,
-      `${itemKind} ${itemNumber}`,
-      `${itemKind} #${itemNumber}`,
     ];
+
+    if (ws.item_type === "kata_task") {
+      haystack.push(
+        "kata",
+        ws.kata?.short_id,
+        ws.kata?.qualified_id,
+        ws.kata?.title,
+        ws.kata?.project_name,
+        // Durable identifiers so a Kata workspace stays findable by its task
+        // key even when it has no short/qualified ID to display.
+        ws.kata?.daemon_id,
+        ws.kata?.project_uid,
+        ws.kata?.issue_uid,
+        ws.item_key,
+      );
+    } else {
+      const itemKind = ws.item_type === "issue" ? "issue" : "pr";
+      const itemNumber = String(ws.item_number);
+      haystack.push(
+        itemNumber,
+        `#${itemNumber}`,
+        `${itemKind} ${itemNumber}`,
+        `${itemKind} #${itemNumber}`,
+      );
+    }
 
     return haystack.some((value) =>
       value?.toLowerCase().includes(query),
@@ -504,6 +564,9 @@
   }
 
   function itemStateClass(ws: Workspace): string {
+    if (ws.item_type === "kata_task") {
+      return "kata";
+    }
     if (ws.item_type === "issue") {
       return ws.mr_state === "closed" ? "closed" : "open";
     }
@@ -560,6 +623,9 @@
   }
 
   function providerItemURL(ws: Workspace): string | null {
+    // Kata workspaces are owned by an external Kata task, not a provider
+    // PR/issue, so there is no provider item URL (item_number is 0).
+    if (ws.item_type === "kata_task") return null;
     const provider = workspaceProvider(ws)?.toLowerCase();
     const repoPath = ws.repo?.repo_path ?? `${ws.repo_owner}/${ws.repo_name}`;
     const encodedPath = repoPath
@@ -661,6 +727,7 @@
   }
 
   async function refreshWorkspaceStatus(ws: Workspace): Promise<void> {
+    if (workspaceActionsDisabled(ws)) return;
     closeContextMenu();
     const { error, response } = ws.fleet_host_key
       ? await client.POST("/fleet/hosts/{host_key}/workspaces/{id}/refresh", {
@@ -688,7 +755,12 @@
     );
   }
 
+  function workspaceActionsDisabled(ws: Workspace): boolean {
+    return isWorkspaceActionDisabled?.(ws.id, ws.fleet_host_key) ?? false;
+  }
+
   function workspaceBusyLabel(ws: Workspace): string {
+    if (workspaceActionsDisabled(ws)) return "Deleting workspace";
     if (!workspaceActionMatches(ws)) return "";
     if (workspaceAction?.action === "push") return "Pushing branch";
     if (workspaceAction?.action === "pull") return "Pulling branch";
@@ -701,7 +773,7 @@
     ws: Workspace,
     action: "push" | "pull" | "reveal" | "delete",
   ): boolean {
-    if (workspaceAction !== null) return false;
+    if (workspaceAction !== null || workspaceActionsDisabled(ws)) return false;
     workspaceAction = { workspaceKey: workspaceRowKey(ws), action };
     return true;
   }
@@ -786,7 +858,8 @@
 
   async function confirmDeleteWorkspaceFromList(): Promise<void> {
     const ws = deleteConfirmWorkspace;
-    if (!ws || !startWorkspaceAction(ws, "delete")) return;
+    if (!ws || workspaceActionsDisabled(ws) || !startWorkspaceAction(ws, "delete")) return;
+    onWorkspaceDeletePendingChange?.(ws.id, ws.fleet_host_key, true);
     try {
       const { error, response } = ws.fleet_host_key
         ? await client.DELETE("/fleet/hosts/{host_key}/workspaces/{id}", {
@@ -812,6 +885,7 @@
     } catch (err) {
       showFlash(err instanceof Error ? err.message : "Delete failed.");
     } finally {
+      onWorkspaceDeletePendingChange?.(ws.id, ws.fleet_host_key, false);
       finishWorkspaceAction(ws);
       deleteConfirmWorkspace = null;
     }
@@ -861,7 +935,12 @@
   ): void {
     e.stopPropagation();
     e.preventDefault();
-    const tab = ws.item_type === "issue" ? "issue" : "pr";
+    const tab =
+      ws.item_type === "kata_task"
+        ? "kata_task"
+        : ws.item_type === "issue"
+          ? "issue"
+          : "pr";
 
     if (onOpenItemSidebar) {
       onOpenItemSidebar(ws.id, tab, ws.fleet_host_key);
@@ -1063,7 +1142,7 @@
                     title={workingTitle(ws)}
                     aria-label={workingTitle(ws)}
                   ></span>
-                {:else if workspaceActionMatches(ws)}
+                {:else if workspaceActionMatches(ws) || workspaceActionsDisabled(ws)}
                   <span
                     class="working-pulse"
                     title={workspaceBusyLabel(ws)}
@@ -1144,7 +1223,11 @@
               </div>
             </div>
             <button
-              class={["item-bubble", itemStateClass(ws)]}
+              class={[
+                "item-bubble",
+                itemStateClass(ws),
+                ws.item_type === "kata_task" && "item-bubble--kata",
+              ]}
               onclick={(e) => handleItemBubbleClick(e, ws)}
               onkeydown={(e) => {
                 // Stop Enter/Space from bubbling to the row,
@@ -1153,11 +1236,9 @@
                   e.stopPropagation();
                 }
               }}
-              title={ws.item_type === "issue"
-                ? `Open issue #${ws.item_number}`
-                : `Open PR #${ws.item_number}`}
+              title={itemBubbleTitle(ws)}
             >
-              #{ws.item_number}
+              {itemBubbleLabel(ws)}
             </button>
           </div>
     {/snippet}
@@ -1179,6 +1260,7 @@
   {@const localWorkspace = !isRemoteWorkspace(menuWorkspace)}
   {@const itemURL = providerItemURL(menuWorkspace)}
   {@const actionBusy = workspaceAction !== null}
+  {@const actionDisabled = actionBusy || workspaceActionsDisabled(menuWorkspace)}
   <div
     class="workspace-context-menu filter-dropdown"
     bind:this={contextMenuEl}
@@ -1203,7 +1285,7 @@
         class="filter-item active"
         role="menuitem"
         type="button"
-        disabled={actionBusy}
+        disabled={actionDisabled}
         onclick={() => {
           void syncWorkspaceBranch(menuWorkspace, "push");
         }}
@@ -1217,7 +1299,7 @@
         class="filter-item active"
         role="menuitem"
         type="button"
-        disabled={actionBusy}
+        disabled={actionDisabled}
         onclick={() => {
           void syncWorkspaceBranch(menuWorkspace, "pull");
         }}
@@ -1231,7 +1313,7 @@
       class="filter-item active"
       role="menuitem"
       type="button"
-      disabled={actionBusy}
+      disabled={actionDisabled}
       onclick={() => {
         void refreshWorkspaceStatus(menuWorkspace);
       }}
@@ -1276,7 +1358,7 @@
         class="filter-item active"
         role="menuitem"
         type="button"
-        disabled={actionBusy}
+        disabled={actionDisabled}
         onclick={() => {
           void revealWorkspacePath(menuWorkspace);
         }}
@@ -1315,7 +1397,7 @@
       class="filter-item active workspace-context-danger"
       role="menuitem"
       type="button"
-      disabled={actionBusy}
+      disabled={actionDisabled}
       onclick={() => {
         openDeleteWorkspaceDialog(menuWorkspace);
       }}
@@ -1884,6 +1966,21 @@
   .item-bubble.draft {
     --bubble-bg: color-mix(in srgb, var(--text-muted) 55%, #ffffff);
     --bubble-fg: #0a0d14;
+  }
+
+  .item-bubble.kata {
+    --bubble-bg: color-mix(in srgb, var(--accent-blue) 70%, #ffffff);
+    --bubble-fg: color-mix(in srgb, var(--accent-blue) 25%, #0a0d14);
+  }
+
+  /* Kata identity labels are short slugs/qualified IDs rather than a
+   * fixed-width number, so cap the width and ellipsize to keep the row
+   * layout stable. */
+  .item-bubble--kata {
+    max-width: 9rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .item-bubble:hover {

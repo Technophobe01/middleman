@@ -22,22 +22,24 @@
   import { createTmuxMouseDragFilter } from "./tmuxMouseDragFilter.js";
 
   interface TerminalPaneProps {
-    workspaceId?: string;
-    websocketPath?: string;
-    reconnectOnExit?: boolean;
-    active?: boolean;
-    onExit?: (code: number) => void;
+    workspaceId?: string | undefined;
+    websocketPath?: string | undefined;
+    reconnectOnExit?: boolean | undefined;
+    active?: boolean | undefined;
+    disabled?: boolean;
+    onExit?: ((code: number) => void) | undefined;
     // When the session is not attachable at mount time, skip the
     // WebSocket connect — the server's attach endpoint returns 404
     // for non-running sessions, which would loop scheduleReconnect.
-    initialStatus?: string;
+    initialStatus?: string | undefined;
   }
 
-  const {
+  let {
     workspaceId,
     websocketPath,
     reconnectOnExit = true,
     active = true,
+    disabled = false,
     onExit,
     initialStatus,
   }: TerminalPaneProps = $props();
@@ -180,6 +182,7 @@
   }
 
   function sendTerminalInput(data: TerminalInputData): void {
+    if (disabled) return;
     if (ws?.readyState !== WebSocket.OPEN) return;
 
     if (typeof data === "string") {
@@ -206,6 +209,11 @@
   }
 
   function handleTerminalPaste(event: ClipboardEvent): void {
+    if (disabled) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      return;
+    }
     if (ws?.readyState !== WebSocket.OPEN || !terminal) return;
 
     const pastedText =
@@ -363,7 +371,13 @@
     terminal.options.fontSize = terminalFontSize;
     terminal.options.scrollback = terminalScrollback;
     terminal.options.cursorBlink = terminalCursorBlink;
+    terminal.options.disableStdin = disabled;
     fitAddon?.fit();
+  });
+
+  $effect(() => {
+    if (!terminal) return;
+    terminal.options.disableStdin = disabled;
   });
 
   $effect(() => {
@@ -392,6 +406,7 @@
         fontFamily: terminalFontFamily,
         fontSize: terminalFontSize,
         scrollback: terminalScrollback,
+        disableStdin: disabled,
       });
       terminal = term;
 

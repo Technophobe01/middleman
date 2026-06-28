@@ -390,7 +390,8 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get?: never;
+        /** Get project on fleet host */
+        get: operations["get-fleet-project"];
         put?: never;
         post?: never;
         /** Delete project on fleet host */
@@ -424,7 +425,8 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get?: never;
+        /** List project worktrees on fleet host */
+        get: operations["list-fleet-project-worktrees"];
         put?: never;
         /** Create project worktree on fleet host */
         post: operations["create-fleet-project-worktree"];
@@ -1632,6 +1634,128 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/host/{platform_host}/repo/{provider}/{owner}/{name}/browser/asset": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get repository browser asset
+         * @description Returns raw image bytes for a repository file. Asset reads require ref_type=commit with ref_sha set to a full 40-character commit SHA; branch and tag refs are rejected with mutable_ref_not_allowed.
+         */
+        get: operations["get-repo-browser-asset-on-host"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/host/{platform_host}/repo/{provider}/{owner}/{name}/browser/blob": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get repository browser blob */
+        get: operations["get-repo-browser-blob-on-host"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/host/{platform_host}/repo/{provider}/{owner}/{name}/browser/commit": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get repository browser commit */
+        get: operations["get-repo-browser-commit-on-host"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/host/{platform_host}/repo/{provider}/{owner}/{name}/browser/history": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get repository browser file history */
+        get: operations["get-repo-browser-history-on-host"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/host/{platform_host}/repo/{provider}/{owner}/{name}/browser/last-changed": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get repository browser last changed commits */
+        get: operations["get-repo-browser-last-changed-on-host"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/host/{platform_host}/repo/{provider}/{owner}/{name}/browser/refs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List repository browser refs */
+        get: operations["list-repo-browser-refs-on-host"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/host/{platform_host}/repo/{provider}/{owner}/{name}/browser/tree": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List repository browser tree */
+        get: operations["list-repo-browser-tree-on-host"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/host/{platform_host}/repo/{provider}/{owner}/{name}/comment-autocomplete": {
         parameters: {
             query?: never;
@@ -1933,6 +2057,40 @@ export interface paths {
         get: operations["list-kata-daemons"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/kata/workspace-target": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Resolve Kata workspace target */
+        post: operations["resolve-kata-workspace-target"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/kata/workspaces": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Create Kata workspace */
+        post: operations["create-kata-workspace"];
         delete?: never;
         options?: never;
         head?: never;
@@ -3086,6 +3244,128 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/repo/{provider}/{owner}/{name}/browser/asset": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get repository browser asset
+         * @description Returns raw image bytes for a repository file. Asset reads require ref_type=commit with ref_sha set to a full 40-character commit SHA; branch and tag refs are rejected with mutable_ref_not_allowed.
+         */
+        get: operations["get-repo-browser-asset"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/repo/{provider}/{owner}/{name}/browser/blob": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get repository browser blob */
+        get: operations["get-repo-browser-blob"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/repo/{provider}/{owner}/{name}/browser/commit": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get repository browser commit */
+        get: operations["get-repo-browser-commit"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/repo/{provider}/{owner}/{name}/browser/history": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get repository browser file history */
+        get: operations["get-repo-browser-history"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/repo/{provider}/{owner}/{name}/browser/last-changed": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get repository browser last changed commits */
+        get: operations["get-repo-browser-last-changed"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/repo/{provider}/{owner}/{name}/browser/refs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List repository browser refs */
+        get: operations["list-repo-browser-refs"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/repo/{provider}/{owner}/{name}/browser/tree": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List repository browser tree */
+        get: operations["list-repo-browser-tree"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/repo/{provider}/{owner}/{name}/comment-autocomplete": {
         parameters: {
             query?: never;
@@ -4060,6 +4340,8 @@ export interface components {
             authored_at: string;
             /** @description First line of commit message */
             message: string;
+            /** @description Whether the commit is reachable from the workspace branch's upstream tracking ref; false means it has not been pushed. Omitted when push status is unknown, such as pull request commits. */
+            pushed?: boolean;
             /** @description Full commit SHA */
             sha: string;
         };
@@ -4177,7 +4459,7 @@ export interface components {
             name: string;
             owner: string;
             platform_host: string;
-            provider?: string;
+            provider: string;
         };
         CreateWorktreeFromMergeRequestInputBody: {
             /**
@@ -4950,6 +5232,41 @@ export interface components {
             readonly $schema?: string;
             daemons: components["schemas"]["KataDaemonResponse"][] | null;
             source?: string;
+        };
+        KataProjectRepoMapping: {
+            daemon_id?: string;
+            platform_host: string;
+            project_uid: string;
+            provider: string;
+            repo_path: string;
+        };
+        KataWorkspaceTargetResponse: {
+            /**
+             * Format: uri
+             * @description A URL to the JSON Schema for this object.
+             * @example /api/v1/schemas/KataWorkspaceTargetResponse.json
+             */
+            readonly $schema?: string;
+            available: boolean;
+            existing_workspace?: components["schemas"]["WorkspaceRef"];
+            item_key?: string;
+            item_type?: string;
+            repo?: components["schemas"]["RepoRefResponse"];
+        };
+        KataWorkspaceTaskRequest: {
+            /**
+             * Format: uri
+             * @description A URL to the JSON Schema for this object.
+             * @example /api/v1/schemas/KataWorkspaceTaskRequest.json
+             */
+            readonly $schema?: string;
+            daemon_id: string;
+            issue_uid: string;
+            project_name?: string;
+            project_uid: string;
+            qualified_id?: string;
+            short_id?: string;
+            title?: string;
         };
         Label: {
             color: string;
@@ -6017,6 +6334,116 @@ export interface components {
             readonly $schema?: string;
             body: string;
         };
+        RepoBrowserBlob: {
+            binary: boolean;
+            content: string;
+            encoding: string;
+            media_type: string;
+            path: string;
+            sha: string;
+            /** Format: int64 */
+            size: number;
+            too_large: boolean;
+        };
+        RepoBrowserBlobResponse: {
+            /**
+             * Format: uri
+             * @description A URL to the JSON Schema for this object.
+             * @example /api/v1/schemas/RepoBrowserBlobResponse.json
+             */
+            readonly $schema?: string;
+            blob: components["schemas"]["RepoBrowserBlob"];
+            ref: components["schemas"]["RepoBrowserRef"];
+            repo: components["schemas"]["RepoRefResponse"];
+        };
+        RepoBrowserCommit: {
+            author_email: string;
+            author_name: string;
+            /** Format: date-time */
+            authored_at: string;
+            body: string;
+            sha: string;
+            subject: string;
+        };
+        RepoBrowserCommitResponse: {
+            /**
+             * Format: uri
+             * @description A URL to the JSON Schema for this object.
+             * @example /api/v1/schemas/RepoBrowserCommitResponse.json
+             */
+            readonly $schema?: string;
+            commit: components["schemas"]["RepoBrowserCommit"];
+            path: string;
+            ref: components["schemas"]["RepoBrowserRef"];
+            repo: components["schemas"]["RepoRefResponse"];
+        };
+        RepoBrowserHistoryResponse: {
+            /**
+             * Format: uri
+             * @description A URL to the JSON Schema for this object.
+             * @example /api/v1/schemas/RepoBrowserHistoryResponse.json
+             */
+            readonly $schema?: string;
+            commits: components["schemas"]["RepoBrowserCommit"][] | null;
+            path: string;
+            ref: components["schemas"]["RepoBrowserRef"];
+            repo: components["schemas"]["RepoRefResponse"];
+        };
+        RepoBrowserLastChangedResponse: {
+            /**
+             * Format: uri
+             * @description A URL to the JSON Schema for this object.
+             * @example /api/v1/schemas/RepoBrowserLastChangedResponse.json
+             */
+            readonly $schema?: string;
+            commits: {
+                [key: string]: components["schemas"]["RepoBrowserCommit"];
+            };
+            ref: components["schemas"]["RepoBrowserRef"];
+            repo: components["schemas"]["RepoRefResponse"];
+        };
+        RepoBrowserRef: {
+            /** @description Selected branch or tag name. Commit refs leave this empty. */
+            name: string;
+            /** @description Caller-supplied branch or tag SHA when it differs from the resolved SHA. */
+            requested_sha?: string;
+            /** @description Resolved commit SHA used for the read. */
+            sha: string;
+            /** @description True when a caller-supplied branch or tag SHA no longer matches the current ref target. */
+            stale: boolean;
+            /** @description Selected ref type: branch, tag, or commit. */
+            type: string;
+        };
+        RepoBrowserRefsResponse: {
+            /**
+             * Format: uri
+             * @description A URL to the JSON Schema for this object.
+             * @example /api/v1/schemas/RepoBrowserRefsResponse.json
+             */
+            readonly $schema?: string;
+            default_ref: components["schemas"]["RepoBrowserRef"];
+            refs: components["schemas"]["RepoBrowserRef"][] | null;
+            repo: components["schemas"]["RepoRefResponse"];
+            truncated: boolean;
+        };
+        RepoBrowserTreeEntry: {
+            path: string;
+            /** Format: int64 */
+            size: number;
+            type: string;
+        };
+        RepoBrowserTreeResponse: {
+            /**
+             * Format: uri
+             * @description A URL to the JSON Schema for this object.
+             * @example /api/v1/schemas/RepoBrowserTreeResponse.json
+             */
+            readonly $schema?: string;
+            entries: components["schemas"]["RepoBrowserTreeEntry"][] | null;
+            ref: components["schemas"]["RepoBrowserRef"];
+            repo: components["schemas"]["RepoRefResponse"];
+            truncated: boolean;
+        };
         RepoLabelsResponse: {
             /**
              * Format: uri
@@ -6397,6 +6824,7 @@ export interface components {
             activity: components["schemas"]["Activity"];
             agents: components["schemas"]["Agent"][];
             fleet: components["schemas"]["FleetSettingsResponse"];
+            kata_projects: components["schemas"]["KataProjectRepoMapping"][];
             launch_targets?: components["schemas"]["LaunchTarget"][] | null;
             modes?: components["schemas"]["ModeVisibility"];
             notifications: components["schemas"]["NotificationsSettingsResponse"];
@@ -6483,7 +6911,8 @@ export interface components {
             /** Format: int64 */
             number: number;
             owner: string;
-            platform_host?: string;
+            platform_host: string;
+            provider: string;
         };
         SyncStatus: {
             /**
@@ -6615,6 +7044,7 @@ export interface components {
             readonly $schema?: string;
             activity?: components["schemas"]["Activity"];
             agents?: components["schemas"]["Agent"][];
+            kata_projects?: components["schemas"]["KataProjectRepoMapping"][];
             modes?: components["schemas"]["ModeVisibility"];
             terminal?: components["schemas"]["Terminal"];
         };
@@ -6638,6 +7068,15 @@ export interface components {
             count: number;
             required: boolean;
         };
+        WorkspaceKataMetadata: {
+            daemon_id: string;
+            issue_uid: string;
+            project_name?: string;
+            project_uid: string;
+            qualified_id?: string;
+            short_id?: string;
+            title?: string;
+        };
         WorkspaceRef: {
             id: string;
             status: string;
@@ -6659,10 +7098,12 @@ export interface components {
             error_message?: string;
             git_head_ref: string;
             id: string;
+            item_key: string;
             item_last_activity_at?: string;
             /** Format: int64 */
             item_number: number;
             item_type: string;
+            kata?: components["schemas"]["WorkspaceKataMetadata"];
             /** Format: int64 */
             mr_additions?: number;
             mr_ci_status?: string;
@@ -6716,6 +7157,7 @@ export interface components {
             updated_at: string;
         };
         WorktreeLinkResponse: {
+            host_key?: string;
             worktree_branch?: string;
             worktree_key: string;
             worktree_path?: string;
@@ -6784,7 +7226,7 @@ export interface operations {
     "list-activity": {
         parameters: {
             query?: {
-                /** @description Repository filter. Accepts owner/name, platform_host/repo_path, comma-separated values, or provider|platform_host/repo_path for provider-qualified matches. */
+                /** @description Repository filter. Accepts provider|platform_host/repo_path, with comma-separated values for multiple repositories. */
                 repo?: string;
                 types?: string[] | null;
                 search?: string;
@@ -7661,6 +8103,32 @@ export interface operations {
             };
         };
     };
+    "get-fleet-project": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                host_key: string;
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Response returned by the owning fleet host. */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                    "application/problem+json": components["schemas"]["ProblemError"];
+                };
+            };
+        };
+    };
     "delete-fleet-project": {
         parameters: {
             query?: never;
@@ -7688,6 +8156,32 @@ export interface operations {
         };
     };
     "list-fleet-project-branches": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                host_key: string;
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Response returned by the owning fleet host. */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                    "application/problem+json": components["schemas"]["ProblemError"];
+                };
+            };
+        };
+    };
+    "list-fleet-project-worktrees": {
         parameters: {
             query?: never;
             header?: never;
@@ -10405,6 +10899,291 @@ export interface operations {
             };
         };
     };
+    "get-repo-browser-asset-on-host": {
+        parameters: {
+            query?: {
+                repo_path?: string;
+                ref_type?: string;
+                ref_name?: string;
+                ref_sha?: string;
+                path?: string;
+            };
+            header?: never;
+            path: {
+                provider: string;
+                platform_host: string;
+                owner: string;
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Image response */
+            200: {
+                headers: {
+                    "Cache-Control"?: string;
+                    "Content-Length"?: string;
+                    "Content-Type"?: string;
+                    "X-Content-Type-Options"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "image/avif": string;
+                    "image/bmp": string;
+                    "image/gif": string;
+                    "image/jpeg": string;
+                    "image/png": string;
+                    "image/webp": string;
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemError"];
+                };
+            };
+        };
+    };
+    "get-repo-browser-blob-on-host": {
+        parameters: {
+            query?: {
+                repo_path?: string;
+                ref_type?: string;
+                ref_name?: string;
+                ref_sha?: string;
+                path?: string;
+            };
+            header?: never;
+            path: {
+                provider: string;
+                platform_host: string;
+                owner: string;
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RepoBrowserBlobResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemError"];
+                };
+            };
+        };
+    };
+    "get-repo-browser-commit-on-host": {
+        parameters: {
+            query?: {
+                repo_path?: string;
+                ref_type?: string;
+                ref_name?: string;
+                ref_sha?: string;
+                path?: string;
+                sha?: string;
+            };
+            header?: never;
+            path: {
+                provider: string;
+                platform_host: string;
+                owner: string;
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RepoBrowserCommitResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemError"];
+                };
+            };
+        };
+    };
+    "get-repo-browser-history-on-host": {
+        parameters: {
+            query?: {
+                repo_path?: string;
+                ref_type?: string;
+                ref_name?: string;
+                ref_sha?: string;
+                path?: string;
+            };
+            header?: never;
+            path: {
+                provider: string;
+                platform_host: string;
+                owner: string;
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RepoBrowserHistoryResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemError"];
+                };
+            };
+        };
+    };
+    "get-repo-browser-last-changed-on-host": {
+        parameters: {
+            query?: {
+                repo_path?: string;
+                ref_type?: string;
+                ref_name?: string;
+                ref_sha?: string;
+                path?: string[] | null;
+            };
+            header?: never;
+            path: {
+                provider: string;
+                platform_host: string;
+                owner: string;
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RepoBrowserLastChangedResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemError"];
+                };
+            };
+        };
+    };
+    "list-repo-browser-refs-on-host": {
+        parameters: {
+            query?: {
+                repo_path?: string;
+            };
+            header?: never;
+            path: {
+                provider: string;
+                platform_host: string;
+                owner: string;
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RepoBrowserRefsResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemError"];
+                };
+            };
+        };
+    };
+    "list-repo-browser-tree-on-host": {
+        parameters: {
+            query?: {
+                repo_path?: string;
+                ref_type?: string;
+                ref_name?: string;
+                ref_sha?: string;
+            };
+            header?: never;
+            path: {
+                provider: string;
+                platform_host: string;
+                owner: string;
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RepoBrowserTreeResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemError"];
+                };
+            };
+        };
+    };
     "get-comment-autocomplete-on-host": {
         parameters: {
             query?: {
@@ -10627,7 +11406,7 @@ export interface operations {
     "list-issues": {
         parameters: {
             query?: {
-                /** @description Repository filter. Accepts owner/name, platform_host/repo_path, comma-separated values, or provider|platform_host/repo_path for provider-qualified matches. */
+                /** @description Repository filter. Accepts provider|platform_host/repo_path, with comma-separated values for multiple repositories. */
                 repo?: string;
                 state?: string;
                 starred?: boolean;
@@ -11082,6 +11861,72 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["KataDaemonRosterResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemError"];
+                };
+            };
+        };
+    };
+    "resolve-kata-workspace-target": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["KataWorkspaceTaskRequest"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["KataWorkspaceTargetResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemError"];
+                };
+            };
+        };
+    };
+    "create-kata-workspace": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["KataWorkspaceTaskRequest"];
+            };
+        };
+        responses: {
+            /** @description Accepted */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceResponse"];
                 };
             };
             /** @description Error */
@@ -12360,7 +13205,7 @@ export interface operations {
     "list-pulls": {
         parameters: {
             query?: {
-                /** @description Repository filter. Accepts owner/name, platform_host/repo_path, comma-separated values, or provider|platform_host/repo_path for provider-qualified matches. */
+                /** @description Repository filter. Accepts provider|platform_host/repo_path, with comma-separated values for multiple repositories. */
                 repo?: string;
                 state?: string;
                 kanban?: string;
@@ -13686,6 +14531,284 @@ export interface operations {
             };
         };
     };
+    "get-repo-browser-asset": {
+        parameters: {
+            query?: {
+                repo_path?: string;
+                ref_type?: string;
+                ref_name?: string;
+                ref_sha?: string;
+                path?: string;
+            };
+            header?: never;
+            path: {
+                provider: string;
+                owner: string;
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Image response */
+            200: {
+                headers: {
+                    "Cache-Control"?: string;
+                    "Content-Length"?: string;
+                    "Content-Type"?: string;
+                    "X-Content-Type-Options"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "image/avif": string;
+                    "image/bmp": string;
+                    "image/gif": string;
+                    "image/jpeg": string;
+                    "image/png": string;
+                    "image/webp": string;
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemError"];
+                };
+            };
+        };
+    };
+    "get-repo-browser-blob": {
+        parameters: {
+            query?: {
+                repo_path?: string;
+                ref_type?: string;
+                ref_name?: string;
+                ref_sha?: string;
+                path?: string;
+            };
+            header?: never;
+            path: {
+                provider: string;
+                owner: string;
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RepoBrowserBlobResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemError"];
+                };
+            };
+        };
+    };
+    "get-repo-browser-commit": {
+        parameters: {
+            query?: {
+                repo_path?: string;
+                ref_type?: string;
+                ref_name?: string;
+                ref_sha?: string;
+                path?: string;
+                sha?: string;
+            };
+            header?: never;
+            path: {
+                provider: string;
+                owner: string;
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RepoBrowserCommitResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemError"];
+                };
+            };
+        };
+    };
+    "get-repo-browser-history": {
+        parameters: {
+            query?: {
+                repo_path?: string;
+                ref_type?: string;
+                ref_name?: string;
+                ref_sha?: string;
+                path?: string;
+            };
+            header?: never;
+            path: {
+                provider: string;
+                owner: string;
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RepoBrowserHistoryResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemError"];
+                };
+            };
+        };
+    };
+    "get-repo-browser-last-changed": {
+        parameters: {
+            query?: {
+                repo_path?: string;
+                ref_type?: string;
+                ref_name?: string;
+                ref_sha?: string;
+                path?: string[] | null;
+            };
+            header?: never;
+            path: {
+                provider: string;
+                owner: string;
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RepoBrowserLastChangedResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemError"];
+                };
+            };
+        };
+    };
+    "list-repo-browser-refs": {
+        parameters: {
+            query?: {
+                repo_path?: string;
+            };
+            header?: never;
+            path: {
+                provider: string;
+                owner: string;
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RepoBrowserRefsResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemError"];
+                };
+            };
+        };
+    };
+    "list-repo-browser-tree": {
+        parameters: {
+            query?: {
+                repo_path?: string;
+                ref_type?: string;
+                ref_name?: string;
+                ref_sha?: string;
+            };
+            header?: never;
+            path: {
+                provider: string;
+                owner: string;
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RepoBrowserTreeResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemError"];
+                };
+            };
+        };
+    };
     "get-comment-autocomplete": {
         parameters: {
             query?: {
@@ -14579,7 +15702,7 @@ export interface operations {
     "trigger-sync": {
         parameters: {
             query?: {
-                /** @description Optional repository filters to sync first. Accepts repeated values or comma-separated values. Each value may be provider-qualified as provider|platform_host/owner/name, host-qualified as platform_host/owner/name, or bare as owner/name; bare values match the first tracked repo with that repo path. */
+                /** @description Optional repository filters to sync first. Accepts repeated provider|platform_host/repo_path values or comma-separated values. */
                 priority_repo?: string[] | null;
             };
             header?: never;

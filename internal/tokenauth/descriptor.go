@@ -49,6 +49,10 @@ type Candidate struct {
 	// Host carries the platform host; FilePath the private key path.
 	AppID          int64
 	InstallationID int64
+	// InstallationAccount is the GitHub owner/org account the
+	// installation belongs to. App candidates are only valid for
+	// requests scoped to this owner.
+	InstallationAccount string
 }
 
 func (c Candidate) SafeString() string {
@@ -60,6 +64,9 @@ func (c Candidate) SafeString() string {
 	case SourceKindGitHubCLI:
 		return fmt.Sprintf("github_cli:%s", c.Host)
 	case SourceKindGitHubApp:
+		if c.InstallationAccount != "" {
+			return fmt.Sprintf("github_app:%d@%s/%s", c.AppID, c.Host, c.InstallationAccount)
+		}
 		return fmt.Sprintf("github_app:%d@%s", c.AppID, c.Host)
 	default:
 		return string(c.Kind)
@@ -92,6 +99,30 @@ func (d Descriptor) SafeString() string {
 func (d Descriptor) HasActiveGitHubApp() bool {
 	for _, candidate := range d.Candidates {
 		if candidate.Kind == SourceKindGitHubApp && candidate.InstallationID != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// HasActiveGitHubAppForOwner reports whether reads for owner resolve
+// through a GitHub App installation token. It mirrors the owner scoping
+// in app-token resolution (see githubAppToken): an installed app
+// candidate applies when it is unscoped (no installation account, so it
+// serves every owner) or its installation account matches owner. Gate
+// installation-token-only endpoints on this rather than
+// HasActiveGitHubApp so a PAT-backed owner sharing a host with another
+// owner's app is not routed to an endpoint its credential cannot use.
+func (d Descriptor) HasActiveGitHubAppForOwner(owner string) bool {
+	owner = strings.TrimSpace(owner)
+	for _, candidate := range d.Candidates {
+		if candidate.Kind != SourceKindGitHubApp || candidate.InstallationID == 0 {
+			continue
+		}
+		if candidate.InstallationAccount == "" {
+			return true
+		}
+		if owner != "" && strings.EqualFold(owner, candidate.InstallationAccount) {
 			return true
 		}
 	}
@@ -147,11 +178,12 @@ func canonicalCandidate(candidate Candidate) Candidate {
 		return Candidate{Kind: candidate.Kind, Host: candidate.Host}
 	case SourceKindGitHubApp:
 		return Candidate{
-			Kind:           candidate.Kind,
-			Host:           candidate.Host,
-			FilePath:       candidate.FilePath,
-			AppID:          candidate.AppID,
-			InstallationID: candidate.InstallationID,
+			Kind:                candidate.Kind,
+			Host:                candidate.Host,
+			FilePath:            candidate.FilePath,
+			AppID:               candidate.AppID,
+			InstallationID:      candidate.InstallationID,
+			InstallationAccount: candidate.InstallationAccount,
 		}
 	default:
 		return candidate

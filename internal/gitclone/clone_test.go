@@ -199,6 +199,35 @@ func TestEnsureCloneFetchesNewBranchCommits(t *testing.T) {
 	assert.Equal(newSHA, got)
 }
 
+func TestEnsureCloneDoesNotRefreshMovedRemoteTags(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+
+	remote, work := setupTestRepo(t)
+	initialSHA := gitSHA(t, work, "HEAD")
+	run(t, work, "git", "tag", "v1.0.0", initialSHA)
+	run(t, work, "git", "push", "origin", "refs/tags/v1.0.0")
+	clonesDir := t.TempDir()
+	mgr := New(clonesDir, nil)
+
+	ctx := t.Context()
+	require.NoError(mgr.EnsureClone(
+		ctx, "github.com", "testowner", "testrepo", remote))
+
+	movedSHA := commitAndPush(t, work, "retag.go", "package main\n", "retag target")
+	run(t, work, "git", "tag", "-f", "v1.0.0", movedSHA)
+	run(t, work, "git", "push", "--force", "origin", "refs/tags/v1.0.0")
+
+	require.NoError(mgr.EnsureClone(
+		ctx, "github.com", "testowner", "testrepo", remote))
+
+	got, err := mgr.RevParse(ctx, "github.com", "testowner", "testrepo", "refs/tags/v1.0.0")
+	require.NoError(err)
+	assert.Equal(initialSHA, got)
+	_, err = mgr.RevParse(ctx, "github.com", "testowner", "testrepo", movedSHA)
+	require.NoError(err)
+}
+
 func TestEnsureCloneDoesNotFetchGitLabMergeRequestHeadsByDefault(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)

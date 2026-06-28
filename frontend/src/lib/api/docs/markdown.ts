@@ -1,5 +1,6 @@
 import DOMPurify, { type UponSanitizeElementHook, type UponSanitizeElementHookEvent } from "dompurify";
 import { Marked, type MarkedExtension, type Tokens } from "marked";
+import { providerItemRefExtension, type RepoContext } from "@middleman/ui/utils/markdown";
 import {
   joinFolderPath,
   parseWikilink,
@@ -26,6 +27,12 @@ export interface DocsMarkdownOptions {
   // Resolves an image path (relative or absolute within the folder) to a
   // network URL the browser can fetch.
   buildBlobURL: (folderID: string, relPath: string) => string;
+  // Repository previews disable this so contributor-controlled Markdown
+  // cannot make the maintainer's browser fetch arbitrary network URLs.
+  allowExternalImages?: boolean;
+  // Repository previews provide this so #123-style references render like
+  // issue/PR comments instead of Docs/Kata short-id links.
+  repoContext?: RepoContext | undefined;
 }
 
 export interface FrontmatterSplit {
@@ -87,12 +94,20 @@ const ALLOWED_ATTR = [
   "data-doc-link",
   "data-doc-image-token",
   "data-doc-path",
+  "data-external-url",
   "data-kata-link",
   "data-kata-mention",
   "data-kata-project",
   "data-kata-short-id",
   "data-kata-uid",
   "data-folder",
+  "data-item-type",
+  "data-name",
+  "data-number",
+  "data-owner",
+  "data-platform-host",
+  "data-provider",
+  "data-repo-path",
   "data-wikilink",
   "decoding",
   "href",
@@ -111,7 +126,12 @@ export function renderDocsMarkdown(source: string, options: DocsMarkdownOptions)
   const md = new Marked();
   md.use({ gfm: true, breaks: false, async: false } satisfies MarkedExtension);
   md.use({
-    extensions: [wikilinkExtension(options, imageToken), kataLinkExtension(), mentionExtension()],
+    extensions: [
+      wikilinkExtension(options, imageToken),
+      ...(options.repoContext ? [providerItemRefExtension(options.repoContext)] : []),
+      ...(options.repoContext ? [] : [kataLinkExtension()]),
+      mentionExtension(),
+    ],
   });
   md.use({ renderer: docsRenderer(options, imageToken) });
   const rawHtml = md.parse(body) as string;
@@ -393,7 +413,8 @@ function docsRenderer(options: DocsMarkdownOptions, imageToken: string) {
       }
       if (isUnsafeUri(href)) return `<span>${inner}</span>`;
       if (isExternal(href)) {
-        return `<a href="${escapeAttr(href)}" target="_blank" rel="noreferrer"${title}>${inner}</a>`;
+        const externalHref = cleanURIForScheme(href);
+        return `<a href="${escapeAttr(externalHref)}" target="_blank" rel="noreferrer"${title}>${inner}</a>`;
       }
       if (href.startsWith("#")) {
         // In-page anchor — pass through. The viewer wires up scroll behavior.
@@ -437,7 +458,12 @@ function docsRenderer(options: DocsMarkdownOptions, imageToken: string) {
       }
       const imgAttrs = `loading="lazy" decoding="async"`;
       if (isExternal(href)) {
-        return `<img ${trustedImageAttr(imageToken)} src="${escapeAttr(href)}" alt="${alt}" ${imgAttrs}${title}>`;
+        const externalHref = cleanURIForScheme(href);
+        if (options.allowExternalImages === false) {
+          const label = token.text ? escapeHtml(token.text) : escapeHtml(href);
+          return `<a href="${escapeAttr(externalHref)}" target="_blank" rel="noreferrer"${title}>${label}</a>`;
+        }
+        return `<img ${trustedImageAttr(imageToken)} src="${escapeAttr(externalHref)}" alt="${alt}" ${imgAttrs}${title}>`;
       }
       if (!isAssetRef(href)) {
         return `<img ${trustedImageAttr(imageToken)} src="${escapeAttr(href)}" alt="${alt}" ${imgAttrs}${title}>`;
@@ -460,7 +486,7 @@ function isMermaidFence(lang: string | undefined): boolean {
 }
 
 function isExternal(href: string): boolean {
-  return /^(https?:|mailto:)/i.test(href);
+  return /^(https?:|mailto:)/i.test(normalizeURIForScheme(href));
 }
 
 // URI schemes we refuse to render. javascript:/vbscript: are always
@@ -472,10 +498,7 @@ function isUnsafeUri(href: string): boolean {
   // as forward slashes, so normalize before classifying — otherwise
   // `/<tab>/evil.com` or `/\evil.com` smuggles a protocol-relative
   // navigation past the leading-slash checks below.
-  const trimmed = href
-    .replace(/[\t\n\r]/g, "")
-    .trim()
-    .toLowerCase();
+  const trimmed = normalizeURIForScheme(href);
   // Protocol-relative references (//host, \\host, and mixed-slash variants)
   // navigate same-tab to an arbitrary host with no explicit scheme, bypassing
   // the external-link handling that adds target/rel. A single leading slash is
@@ -489,6 +512,14 @@ function isUnsafeUri(href: string): boolean {
     return !/^(https?:|mailto:)/i.test(trimmed);
   }
   return false;
+}
+
+function normalizeURIForScheme(href: string): string {
+  return cleanURIForScheme(href).toLowerCase();
+}
+
+function cleanURIForScheme(href: string): string {
+  return href.replace(/[\t\n\r]/g, "").trim();
 }
 
 // Only treat hrefs that clearly point at folder-bundled assets as blobs.

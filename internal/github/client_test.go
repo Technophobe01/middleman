@@ -16,7 +16,7 @@ import (
 	"time"
 
 	gh "github.com/google/go-github/v84/github"
-	Assert "github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/middleman/internal/tokenauth"
@@ -158,7 +158,7 @@ func TestListTagsTracksRate(t *testing.T) {
 }
 
 func TestTrackGraphQLRateHeadersUsesGraphQLTracker(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	database := openTestDB(t)
 	restRT := NewRateTracker(database, "github.example.com", "rest")
 	gqlRT := NewRateTracker(database, "github.example.com", "graphql")
@@ -183,7 +183,7 @@ func TestTrackGraphQLRateHeadersUsesGraphQLTracker(t *testing.T) {
 
 func TestListOpenIssuesLogsFetchProgressForLargeIssueSet(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	now := time.Date(2026, 5, 20, 12, 0, 0, 0, time.UTC).Format(time.RFC3339)
 
 	var buf bytes.Buffer
@@ -266,7 +266,7 @@ func testIssuePage(page int, now string) []map[string]any {
 
 func TestListOpenPullRequestsLogsFetchProgressForLargePullRequestSet(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	now := time.Date(2026, 5, 20, 12, 0, 0, 0, time.UTC).Format(time.RFC3339)
 
 	var buf bytes.Buffer
@@ -471,6 +471,62 @@ func TestListRepositoriesByOwnerUsesInstallationReposWithAppToken(t *testing.T) 
 	}, paths)
 }
 
+// A host can carry an app installation for one owner while other owners
+// on the same host stay on the PAT/gh chain. Listing repos for such an
+// owner must not route to the installation-token-only endpoint: an app
+// candidate scoped to a different account is skipped during token
+// resolution, so /installation/repositories would 403 on the PAT.
+func TestListRepositoriesByOwnerSkipsInstallationReposForUnmatchedOwner(t *testing.T) {
+	require := require.New(t)
+	var installationEndpointUsed bool
+	var orgEndpointUsed bool
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/installation/repositories", func(w http.ResponseWriter, _ *http.Request) {
+		installationEndpointUsed = true
+		http.Error(w, "installation token cannot serve another owner", http.StatusForbidden)
+	})
+	mux.HandleFunc("/api/v3/user", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"login":"mariusvniekerk"}`))
+	})
+	mux.HandleFunc("/api/v3/orgs/acme/repos", func(w http.ResponseWriter, _ *http.Request) {
+		orgEndpointUsed = true
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode([]map[string]any{{
+			"name":  "infra",
+			"owner": map[string]string{"login": "acme"},
+		}})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	ghClient, err := gh.NewClient(srv.Client()).WithEnterpriseURLs(
+		srv.URL+"/api/v3/", srv.URL+"/api/uploads/",
+	)
+	require.NoError(err)
+	c := &liveClient{
+		gh: ghClient,
+		source: tokenauth.NewManagedSource(tokenauth.Descriptor{
+			Candidates: []tokenauth.Candidate{{
+				Kind:                tokenauth.SourceKindGitHubApp,
+				Host:                "github.com",
+				AppID:               123,
+				InstallationID:      456,
+				InstallationAccount: "kenn-io",
+			}},
+		}, tokenauth.Options{}),
+	}
+
+	repos, err := c.ListRepositoriesByOwner(t.Context(), "acme")
+	require.NoError(err)
+	require.Len(repos, 1)
+	require.Equal("infra", repos[0].GetName())
+	require.True(orgEndpointUsed)
+	require.False(installationEndpointUsed,
+		"a PAT-backed owner must not be routed to the installation-token-only endpoint")
+}
+
 func TestListRepositoriesByOwnerUsesPublicUserEndpointForOtherUsers(t *testing.T) {
 	require := require.New(t)
 	var paths []string
@@ -619,7 +675,7 @@ func TestListPullRequestTimelineEvents(t *testing.T) {
 }
 
 func TestListPullRequestReviewThreads(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	var calls int
 	var methods []string
@@ -677,6 +733,62 @@ func TestListPullRequestReviewThreads(t *testing.T) {
 	assert.Equal(3, calls)
 	assert.Equal([]string{http.MethodPost, http.MethodPost, http.MethodPost}, methods)
 	assert.Equal([]string{"application/json", "application/json", "application/json"}, contentTypes)
+}
+
+func TestListPullRequestReviewThreadsScopesPaginatedCommentAuthByOwner(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	var calls int
+	var minted int
+	mux := http.NewServeMux()
+	mux.HandleFunc("/graphql", func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		assert.Equal("Bearer app-token", r.Header.Get("Authorization"))
+		w.Header().Set("Content-Type", "application/json")
+		if calls == 1 {
+			_, _ = w.Write([]byte(`{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"id":"PRRT_1","isResolved":false,"isOutdated":false,"path":"src/main.go","line":12,"originalLine":12,"diffSide":"RIGHT","comments":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":"comment-cursor-1"}}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"data":{"node":{"comments":{"nodes":[{"id":"PRRC_1","databaseId":101,"fullDatabaseId":101,"body":"reply","path":"src/main.go","line":12,"originalLine":12,"subjectType":"LINE","diffHunk":"@@","url":"https://github.example/pr#discussion_r101","author":{"login":"reviewer"},"createdAt":"2026-05-27T16:01:31Z","updatedAt":"2026-05-27T16:02:31Z"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	src := tokenauth.NewManagedSource(tokenauth.Descriptor{
+		Key: tokenauth.Key{Platform: "github", Host: "github.com"},
+		Candidates: []tokenauth.Candidate{{
+			Kind:                tokenauth.SourceKindGitHubApp,
+			Host:                "github.com",
+			AppID:               42,
+			InstallationID:      7,
+			InstallationAccount: "owner",
+		}},
+	}, tokenauth.Options{
+		GitHubApp: func(_ context.Context, c tokenauth.Candidate) (string, time.Time, error) {
+			minted++
+			assert.Equal("owner", c.InstallationAccount)
+			return "app-token", time.Now().Add(time.Hour), nil
+		},
+	})
+	auth := tokenauth.AuthTransport{
+		Source:        src,
+		Base:          http.DefaultTransport,
+		SetHeader:     tokenauth.BearerAuthHeader,
+		AllowedOrigin: srv.URL,
+		GitHubOwner:   githubOwnerFromRequest,
+	}
+	c := &liveClient{
+		httpClient:      &http.Client{Transport: auth},
+		graphQLEndpoint: srv.URL + "/graphql",
+	}
+
+	threads, err := c.ListPullRequestReviewThreads(t.Context(), "owner", "repo", 42)
+	require.NoError(err)
+	require.Len(threads, 1)
+	require.Len(threads[0].Comments, 1)
+	assert.Equal("reply", threads[0].Comments[0].Body)
+	assert.Equal(2, calls)
+	assert.Equal(1, minted)
 }
 
 func TestListPullRequestTimelineEventsReturnsGraphQLErrors(t *testing.T) {

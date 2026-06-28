@@ -9,6 +9,7 @@ import (
 )
 
 type worktreeLinkResponse struct {
+	HostKey        string `json:"host_key,omitempty"`
 	WorktreeKey    string `json:"worktree_key"`
 	WorktreePath   string `json:"worktree_path,omitempty"`
 	WorktreeBranch string `json:"worktree_branch,omitempty"`
@@ -210,6 +211,46 @@ type repoSummaryResponse struct {
 	Operations           RepoOperations                   `json:"operations"`
 }
 
+type repoBrowserRefsResponse struct {
+	Repo       repoRefResponse           `json:"repo"`
+	Refs       []gitclone.RepoBrowserRef `json:"refs"`
+	DefaultRef gitclone.RepoBrowserRef   `json:"default_ref"`
+	Truncated  bool                      `json:"truncated"`
+}
+
+type repoBrowserTreeResponse struct {
+	Repo      repoRefResponse                 `json:"repo"`
+	Ref       gitclone.RepoBrowserRef         `json:"ref"`
+	Entries   []gitclone.RepoBrowserTreeEntry `json:"entries"`
+	Truncated bool                            `json:"truncated"`
+}
+
+type repoBrowserBlobResponse struct {
+	Repo repoRefResponse          `json:"repo"`
+	Ref  gitclone.RepoBrowserRef  `json:"ref"`
+	Blob gitclone.RepoBrowserBlob `json:"blob"`
+}
+
+type repoBrowserLastChangedResponse struct {
+	Repo    repoRefResponse                       `json:"repo"`
+	Ref     gitclone.RepoBrowserRef               `json:"ref"`
+	Commits map[string]gitclone.RepoBrowserCommit `json:"commits"`
+}
+
+type repoBrowserHistoryResponse struct {
+	Repo    repoRefResponse              `json:"repo"`
+	Ref     gitclone.RepoBrowserRef      `json:"ref"`
+	Path    string                       `json:"path"`
+	Commits []gitclone.RepoBrowserCommit `json:"commits"`
+}
+
+type repoBrowserCommitResponse struct {
+	Repo   repoRefResponse            `json:"repo"`
+	Ref    gitclone.RepoBrowserRef    `json:"ref"`
+	Path   string                     `json:"path"`
+	Commit gitclone.RepoBrowserCommit `json:"commit"`
+}
+
 type commentAutocompleteResponse struct {
 	Users      []string                          `json:"users,omitempty"`
 	References []db.CommentAutocompleteReference `json:"references,omitempty"`
@@ -405,6 +446,7 @@ type commitResponse struct {
 	Message    string    `json:"message"     doc:"First line of commit message"`
 	AuthorName string    `json:"author_name" doc:"Commit author display name"`
 	AuthoredAt time.Time `json:"authored_at" doc:"Commit author date (RFC3339)"`
+	Pushed     *bool     `json:"pushed,omitempty" doc:"Whether the commit is reachable from the workspace branch's upstream tracking ref; false means it has not been pushed. Omitted when push status is unknown, such as pull request commits."`
 }
 
 type commitsResponse struct {
@@ -417,34 +459,36 @@ type commitsResponse struct {
 // the correct item-specific presentation around it. It represents middleman's
 // own persisted workspace model, not an arbitrary host worktree inventory.
 type workspaceResponse struct {
-	ID                 string          `json:"id"`
-	Repo               repoRefResponse `json:"repo"`
-	PlatformHost       string          `json:"platform_host"`
-	RepoOwner          string          `json:"repo_owner"`
-	RepoName           string          `json:"repo_name"`
-	ItemType           string          `json:"item_type"`
-	ItemNumber         int             `json:"item_number"`
-	GitHeadRef         string          `json:"git_head_ref"`
-	WorktreePath       string          `json:"worktree_path"`
-	TmuxSession        string          `json:"tmux_session"`
-	TmuxPaneTitle      *string         `json:"tmux_pane_title,omitempty"`
-	TmuxWorking        bool            `json:"tmux_working"`
-	TmuxActivitySource string          `json:"tmux_activity_source"`
-	TmuxLastOutputAt   *string         `json:"tmux_last_output_at"`
-	Status             string          `json:"status"`
-	ErrorMessage       *string         `json:"error_message,omitempty"`
-	CreatedAt          string          `json:"created_at"`
-	ItemLastActivityAt *string         `json:"item_last_activity_at,omitempty"`
-	MRTitle            *string         `json:"mr_title,omitempty"`
-	MRState            *string         `json:"mr_state,omitempty"`
-	MRIsDraft          *bool           `json:"mr_is_draft,omitempty"`
-	MRCIStatus         *string         `json:"mr_ci_status,omitempty"`
-	MRReviewDecision   *string         `json:"mr_review_decision,omitempty"`
-	MRAdditions        *int            `json:"mr_additions,omitempty"`
-	MRDeletions        *int            `json:"mr_deletions,omitempty"`
-	CommitsAhead       *int            `json:"commits_ahead,omitempty"`
-	CommitsBehind      *int            `json:"commits_behind,omitempty"`
-	AssociatedPRNumber *int            `json:"associated_pr_number,omitempty"`
+	ID                 string                    `json:"id"`
+	Repo               repoRefResponse           `json:"repo"`
+	PlatformHost       string                    `json:"platform_host"`
+	RepoOwner          string                    `json:"repo_owner"`
+	RepoName           string                    `json:"repo_name"`
+	ItemType           string                    `json:"item_type"`
+	ItemNumber         int                       `json:"item_number"`
+	ItemKey            string                    `json:"item_key"`
+	GitHeadRef         string                    `json:"git_head_ref"`
+	WorktreePath       string                    `json:"worktree_path"`
+	TmuxSession        string                    `json:"tmux_session"`
+	TmuxPaneTitle      *string                   `json:"tmux_pane_title,omitempty"`
+	TmuxWorking        bool                      `json:"tmux_working"`
+	TmuxActivitySource string                    `json:"tmux_activity_source"`
+	TmuxLastOutputAt   *string                   `json:"tmux_last_output_at"`
+	Status             string                    `json:"status"`
+	ErrorMessage       *string                   `json:"error_message,omitempty"`
+	CreatedAt          string                    `json:"created_at"`
+	ItemLastActivityAt *string                   `json:"item_last_activity_at,omitempty"`
+	MRTitle            *string                   `json:"mr_title,omitempty"`
+	MRState            *string                   `json:"mr_state,omitempty"`
+	MRIsDraft          *bool                     `json:"mr_is_draft,omitempty"`
+	MRCIStatus         *string                   `json:"mr_ci_status,omitempty"`
+	MRReviewDecision   *string                   `json:"mr_review_decision,omitempty"`
+	MRAdditions        *int                      `json:"mr_additions,omitempty"`
+	MRDeletions        *int                      `json:"mr_deletions,omitempty"`
+	CommitsAhead       *int                      `json:"commits_ahead,omitempty"`
+	CommitsBehind      *int                      `json:"commits_behind,omitempty"`
+	AssociatedPRNumber *int                      `json:"associated_pr_number,omitempty"`
+	Kata               *db.WorkspaceKataMetadata `json:"kata,omitempty"`
 }
 
 type workspaceRuntimeResponse struct {
@@ -490,6 +534,7 @@ func toWorkspaceResponse(
 		RepoName:           s.RepoName,
 		ItemType:           s.ItemType,
 		ItemNumber:         s.ItemNumber,
+		ItemKey:            s.ItemKey,
 		GitHeadRef:         s.GitHeadRef,
 		WorktreePath:       s.WorktreePath,
 		TmuxSession:        s.TmuxSession,
@@ -506,6 +551,7 @@ func toWorkspaceResponse(
 		MRAdditions:        s.MRAdditions,
 		MRDeletions:        s.MRDeletions,
 		AssociatedPRNumber: s.AssociatedPRNumber,
+		Kata:               s.KataMetadata,
 	}
 }
 

@@ -23,6 +23,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/middleman/internal/config"
+	"go.kenn.io/middleman/internal/githubapp"
 	"go.kenn.io/middleman/internal/githubapp/githubapptest"
 	"go.kenn.io/middleman/internal/tokenauth"
 )
@@ -104,26 +105,21 @@ func scriptBrowserWithInstall(
 ) func(string) error {
 	t.Helper()
 	return func(target string) error {
-		go func() {
-			if m := installSlugRe.FindStringSubmatch(target); m != nil {
-				app, ok := fake.AppBySlug(m[1])
-				if !assert.True(t, ok, "install URL for unknown app slug %q", m[1]) {
-					return
-				}
-				assert.NoError(t, install(app.ID))
-				return
+		if m := installSlugRe.FindStringSubmatch(target); m != nil {
+			app, ok := fake.AppBySlug(m[1])
+			if !ok {
+				return fmt.Errorf("install URL for unknown app slug %q", m[1])
 			}
-			if m := settingsSlugRe.FindStringSubmatch(target); m != nil {
-				app, ok := fake.AppBySlug(m[1])
-				if !assert.True(t, ok, "settings URL for unknown app slug %q", m[1]) {
-					return
-				}
-				assert.NoError(t, fake.DeleteApp(app.ID))
-				return
+			return install(app.ID)
+		}
+		if m := settingsSlugRe.FindStringSubmatch(target); m != nil {
+			app, ok := fake.AppBySlug(m[1])
+			if !ok {
+				return fmt.Errorf("settings URL for unknown app slug %q", m[1])
 			}
-			assert.NoError(t, submitManifestForm(target))
-		}()
-		return nil
+			return fake.DeleteApp(app.ID)
+		}
+		return submitManifestForm(target)
 	}
 }
 
@@ -184,6 +180,17 @@ func createTestApp(t *testing.T, fake *githubapptest.Fake, configPath, name stri
 	}, env))
 }
 
+func createOrgTestApp(
+	t *testing.T, fake *githubapptest.Fake, configPath, name, org string,
+) {
+	t.Helper()
+	env, _ := newTestEnv(t, fake, configPath)
+	env.openBrowser = scriptBrowser(t, fake, org)
+	require.NoError(t, runCLI([]string{
+		"create", "--name", name, "--org", org, "--timeout", "10s",
+	}, env))
+}
+
 func TestCreateFlowEndToEnd(t *testing.T) {
 	t.Parallel()
 	fake := githubapptest.NewFake()
@@ -230,13 +237,17 @@ func TestCreateFlowEndToEnd(t *testing.T) {
 	manifests := fake.Manifests()
 	require.Len(manifests, 1)
 	var sent struct {
-		Public         bool `json:"public"`
+		URL            string `json:"url"`
+		Public         bool   `json:"public"`
 		HookAttributes struct {
-			Active bool `json:"active"`
+			URL    string `json:"url"`
+			Active bool   `json:"active"`
 		} `json:"hook_attributes"`
 		DefaultPermissions map[string]string `json:"default_permissions"`
 	}
 	require.NoError(json.Unmarshal([]byte(manifests[0]), &sent))
+	assert.Equal(githubapp.DefaultHomepageURL, sent.URL)
+	assert.Equal(githubapp.DefaultHomepageURL, sent.HookAttributes.URL)
 	assert.False(sent.Public)
 	// The app stays read-only; mutations use the user's PAT chain.
 	for scope, level := range sent.DefaultPermissions {
@@ -259,6 +270,26 @@ func TestCreateRefusesSecondAppForSameHost(t *testing.T) {
 	assert.ErrorContains(t, err, "already exists")
 }
 
+func TestCreateAllowsOrgOwnedAppForSameHost(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	fake := githubapptest.NewFake()
+	t.Cleanup(fake.Close)
+	configPath := writeTestConfig(t)
+	createTestApp(t, fake, configPath, "middleman-user")
+	createOrgTestApp(t, fake, configPath, "middleman-org", "acme")
+
+	cfg, err := config.Load(configPath)
+	require.NoError(err)
+	require.Len(cfg.GitHubApps, 2)
+	assert := assert.New(t)
+	assert.Equal("fake-owner", cfg.GitHubApps[0].Owner)
+	assert.Equal("User", cfg.GitHubApps[0].OwnerType)
+	assert.Equal("acme", cfg.GitHubApps[1].Owner)
+	assert.Equal("Organization", cfg.GitHubApps[1].OwnerType)
+	assert.Equal("acme", cfg.GitHubApps[1].InstallationAccount)
+}
+
 func TestListReportsInstallationAndRateBudget(t *testing.T) {
 	t.Parallel()
 	fake := githubapptest.NewFake()
@@ -275,12 +306,106 @@ func TestListReportsInstallationAndRateBudget(t *testing.T) {
 	require.Len(t, statuses, 1)
 	assert := assert.New(t)
 	assert.Equal("middleman-list", statuses[0].Slug)
+	assert.Equal("fake-owner", statuses[0].Owner)
+	assert.Equal("User", statuses[0].OwnerType)
 	assert.Equal("kenn-io", statuses[0].InstallationAccount)
 	assert.Equal(5000, statuses[0].RateLimit)
 	assert.Empty(statuses[0].Error)
 	// Rate numbers come from a freshly minted installation token; the
 	// fake mints with zero usage unless configured otherwise.
 	assert.Equal(5000, statuses[0].RateRemaining)
+}
+
+func TestManageSameHostAppsByOwnerOrAppID(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	assert := assert.New(t)
+	fake := githubapptest.NewFake()
+	t.Cleanup(fake.Close)
+	configPath := writeTestConfig(t)
+	createTestApp(t, fake, configPath, "middleman-user")
+	createOrgTestApp(t, fake, configPath, "middleman-org", "acme")
+
+	cfg, err := config.Load(configPath)
+	require.NoError(err)
+	require.Len(cfg.GitHubApps, 2)
+	userApp := cfg.GitHubApps[0]
+	orgApp := cfg.GitHubApps[1]
+
+	env, _ := newTestEnv(t, fake, configPath)
+	err = runCLI([]string{"open"}, env)
+	require.Error(err)
+	require.ErrorContains(err, "--owner or --app-id")
+
+	var opened string
+	env, _ = newTestEnv(t, fake, configPath)
+	env.openBrowser = func(target string) error {
+		opened = target
+		return nil
+	}
+	require.NoError(runCLI([]string{"open", "--host", "https://github.com/", "--owner", "acme"}, env))
+	assert.Contains(opened, "/organizations/acme/settings/apps/middleman-org")
+
+	env, _ = newTestEnv(t, fake, configPath)
+	require.NoError(runCLI([]string{"uninstall", "--owner", "acme", "--yes"}, env))
+	cfg, err = config.LoadForGitHubAppRepair(configPath)
+	require.NoError(err)
+	require.Len(cfg.GitHubApps, 2)
+	assert.NotZero(cfg.GitHubApps[0].InstallationID)
+	assert.Equal(userApp.AppID, cfg.GitHubApps[0].AppID)
+	assert.Zero(cfg.GitHubApps[1].InstallationID)
+	assert.Equal(orgApp.AppID, cfg.GitHubApps[1].AppID)
+
+	env, _ = newTestEnv(t, fake, configPath)
+	env.openBrowser = scriptBrowser(t, fake, "acme")
+	require.NoError(runCLI([]string{
+		"install", "--app-id", fmt.Sprint(orgApp.AppID), "--timeout", "10s",
+	}, env))
+	cfg, err = config.Load(configPath)
+	require.NoError(err)
+	require.Len(cfg.GitHubApps, 2)
+	assert.NotZero(cfg.GitHubApps[1].InstallationID)
+	assert.Equal("acme", cfg.GitHubApps[1].InstallationAccount)
+
+	env, _ = newTestEnv(t, fake, configPath)
+	env.openBrowser = scriptBrowser(t, fake, "acme")
+	require.NoError(runCLI([]string{"delete", "--owner", "acme", "--yes", "--timeout", "10s"}, env))
+	cfg, err = config.Load(configPath)
+	require.NoError(err)
+	require.Len(cfg.GitHubApps, 1)
+	assert.Equal(userApp.AppID, cfg.GitHubApps[0].AppID)
+}
+
+func TestInstallRejectsDuplicateInstallationAccountAcrossApps(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	fake := githubapptest.NewFake()
+	t.Cleanup(fake.Close)
+	configPath := writeTestConfig(t)
+	createTestApp(t, fake, configPath, "middleman-user")
+	createOrgTestApp(t, fake, configPath, "middleman-org", "acme")
+
+	env, _ := newTestEnv(t, fake, configPath)
+	require.NoError(runCLI([]string{"uninstall", "--owner", "acme", "--yes"}, env))
+
+	cfg, err := config.LoadForGitHubAppRepair(configPath)
+	require.NoError(err)
+	require.Len(cfg.GitHubApps, 2)
+	orgAppID := cfg.GitHubApps[1].AppID
+
+	env, _ = newTestEnv(t, fake, configPath)
+	env.openBrowser = scriptBrowser(t, fake, "kenn-io")
+	err = runCLI([]string{
+		"install", "--app-id", fmt.Sprint(orgAppID), "--timeout", "10s",
+	}, env)
+	require.Error(err)
+	require.ErrorContains(err, "duplicate github app installation")
+
+	cfg, err = config.LoadForGitHubAppRepair(configPath)
+	require.NoError(err)
+	require.Len(cfg.GitHubApps, 2)
+	assert.Zero(t, cfg.GitHubApps[1].InstallationID)
+	assert.Empty(t, cfg.GitHubApps[1].InstallationAccount)
 }
 
 func TestUninstallClearsInstallationButKeepsApp(t *testing.T) {
@@ -408,7 +533,7 @@ func TestInstallHydratesMinimalAppMetadataBeforeOpeningInstallURL(t *testing.T) 
 	assert.NotZero(cfg.GitHubApps[0].InstallationID)
 }
 
-func TestInstallRefusesInstallationThatMissesConfiguredRepos(t *testing.T) {
+func TestInstallRecordsInstallationForOtherAccountWithoutJudgingOtherRepos(t *testing.T) {
 	t.Parallel()
 	require := require.New(t)
 	fake := githubapptest.NewFake()
@@ -419,25 +544,20 @@ func TestInstallRefusesInstallationThatMissesConfiguredRepos(t *testing.T) {
 	env, _ := newTestEnv(t, fake, configPath)
 	require.NoError(runCLI([]string{"uninstall", "--yes"}, env))
 
-	// Installing on an account that does not own kenn-io/middleman
-	// must not be recorded: the installation token cannot reach the
-	// repo, so sync would 404 while the config looks healthy. The
-	// flow reports the uncovering installation and keeps waiting for
-	// one on the owning account instead of dead-ending.
+	// Installing on another account is valid: repo owner is part of the sync
+	// identity, so this installation simply will not be used for kenn-io repos.
 	env, out := newTestEnv(t, fake, configPath)
 	env.openBrowser = scriptBrowser(t, fake, "someone-else")
-	err := runCLI([]string{"install", "--timeout", "1s"}, env)
-	require.Error(err)
-	require.ErrorContains(err, "timed out")
-	require.Contains(out.String(), "someone-else")
-	require.Contains(out.String(), "kenn-io/middleman")
-	require.Contains(out.String(), "Still waiting for an installation on the owning account")
+	require.NoError(runCLI([]string{"install", "--timeout", "10s"}, env))
+	require.NotContains(out.String(), "cannot reach")
+	require.NotContains(out.String(), "kenn-io/middleman")
 
 	cfg, err := config.Load(configPath)
 	require.NoError(err)
 	require.Len(cfg.GitHubApps, 1)
-	assert.Zero(t, cfg.GitHubApps[0].InstallationID,
-		"uncovered installation must not be recorded")
+	assert := assert.New(t)
+	assert.NotZero(cfg.GitHubApps[0].InstallationID)
+	assert.Equal("someone-else", cfg.GitHubApps[0].InstallationAccount)
 }
 
 func TestDeleteRefusesWhenCredentialsCannotBeVerified(t *testing.T) {
@@ -525,8 +645,6 @@ func TestDeleteOpensSettingsForRepairInvalidConfig(t *testing.T) {
 	broken := strings.Replace(string(raw), `installation_account = "kenn-io"`, `installation_account = "other-org"`, 1)
 	require.NotEqual(string(raw), broken)
 	require.NoError(os.WriteFile(configPath, []byte(broken), 0o600))
-	_, err = config.Load(configPath)
-	require.ErrorContains(err, "not covered by the github app")
 
 	var opened string
 	env, _ := newTestEnv(t, fake, configPath)
@@ -692,27 +810,26 @@ name = "thing"
 	}, env))
 
 	// The user re-points middleman at repos the recorded installation's
-	// account does not own; the strict loader now rejects the config.
+	// account does not own; install must not refresh that no-longer-relevant
+	// installation.
 	raw, err := os.ReadFile(configPath)
 	require.NoError(err)
 	repointed := strings.Replace(string(raw), `owner = "wrongorg"`, `owner = "kenn-io"`, 1)
 	repointed = strings.Replace(repointed, `name = "thing"`, `name = "middleman"`, 1)
 	require.NoError(os.WriteFile(configPath, []byte(repointed), 0o600))
-	_, err = config.Load(configPath)
-	require.ErrorContains(err, "not covered by the github app")
 
-	// install must not dead-end on refreshing the wrong-account
-	// installation: it falls through to waiting for an installation on
-	// the owning account and records that one.
+	// The existing installation remains valid for wrongorg. It is refreshed
+	// rather than judged against kenn-io repos.
 	env, out := newTestEnv(t, fake, configPath)
 	env.openBrowser = scriptBrowser(t, fake, "kenn-io")
 	require.NoError(runCLI([]string{"install", "--timeout", "10s"}, env))
-	require.Contains(out.String(), "waiting for an installation on the right account")
+	require.Contains(out.String(), "Refreshing recorded installation")
+	require.NotContains(out.String(), "cannot reach")
 
 	cfg, err := config.Load(configPath)
 	require.NoError(err)
 	require.Len(cfg.GitHubApps, 1)
-	require.Equal("kenn-io", cfg.GitHubApps[0].InstallationAccount)
+	require.Equal("wrongorg", cfg.GitHubApps[0].InstallationAccount)
 }
 
 func TestInstallSkipsPreexistingUncoveringInstallation(t *testing.T) {
@@ -726,11 +843,9 @@ func TestInstallSkipsPreexistingUncoveringInstallation(t *testing.T) {
 	env, _ := newTestEnv(t, fake, configPath)
 	require.NoError(runCLI([]string{"uninstall", "--yes"}, env))
 
-	// An unrecorded installation on an account that does not own the
-	// configured repos already exists before install runs. The poll
-	// must not grab it as "the first new installation" and dead-end at
-	// the coverage check; it ignores it and keeps waiting for the
-	// installation the browser flow creates on the owning account.
+	// An unrecorded installation already exists before install runs. When the
+	// browser path is active, the poll waits for a newly-created installation
+	// instead of grabbing an old one.
 	app, ok := fake.AppBySlug("middleman-preexist")
 	require.True(ok)
 	_, err := fake.Install(app.ID, "someone-else")
@@ -739,10 +854,181 @@ func TestInstallSkipsPreexistingUncoveringInstallation(t *testing.T) {
 	env, out := newTestEnv(t, fake, configPath)
 	env.openBrowser = scriptBrowser(t, fake, "kenn-io")
 	require.NoError(runCLI([]string{"install", "--timeout", "10s"}, env))
-	require.Contains(out.String(), "Ignoring installation")
-	require.Contains(out.String(), "someone-else")
+	require.NotContains(out.String(), "Ignoring installation")
+	require.NotContains(out.String(), "cannot reach")
 
 	cfg, err := config.Load(configPath)
+	require.NoError(err)
+	require.Len(cfg.GitHubApps, 1)
+	require.Equal("kenn-io", cfg.GitHubApps[0].InstallationAccount)
+}
+
+func TestInstallAdoptsSoleExistingInstallationWhenNoNewAppears(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	fake := githubapptest.NewFake()
+	t.Cleanup(fake.Close)
+	configPath := writeTestConfig(t)
+	createTestApp(t, fake, configPath, "middleman-readopt")
+
+	env, _ := newTestEnv(t, fake, configPath)
+	require.NoError(runCLI([]string{"uninstall", "--yes"}, env))
+
+	// The installation exists on GitHub but was never recorded -- the
+	// shape left behind by a coverage failure or a restored config. The
+	// coverage error tells the user to edit repo access and re-run
+	// "install"; that reconfigures the existing installation without
+	// minting a new id, so the browser poll never sees a new one.
+	app, ok := fake.AppBySlug("middleman-readopt")
+	require.True(ok)
+	_, err := fake.Install(app.ID, "kenn-io")
+	require.NoError(err)
+
+	env, out := newTestEnv(t, fake, configPath)
+	// The browser opens but no new installation is created.
+	env.openBrowser = func(string) error { return nil }
+	require.NoError(runCLI([]string{"install", "--timeout", "200ms"}, env))
+	require.Contains(out.String(), "No new installation appeared")
+
+	cfg, err := config.Load(configPath)
+	require.NoError(err)
+	require.Len(cfg.GitHubApps, 1)
+	assert := assert.New(t)
+	assert.NotZero(cfg.GitHubApps[0].InstallationID)
+	assert.Equal("kenn-io", cfg.GitHubApps[0].InstallationAccount)
+}
+
+func TestInstallSurfacesProbeErrorWithoutAdoptingStaleInstallation(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	fake := githubapptest.NewFake()
+	t.Cleanup(fake.Close)
+	configPath := writeTestConfig(t)
+	createTestApp(t, fake, configPath, "middleman-probeerr")
+
+	env, _ := newTestEnv(t, fake, configPath)
+	require.NoError(runCLI([]string{"uninstall", "--yes"}, env))
+
+	// A sole unrecorded installation exists, so adoption recovery would
+	// grab it. But a transient list failure during the poll is a probe
+	// error, not a clean "nothing appeared in time"; it must surface
+	// rather than silently recording the stale installation.
+	app, ok := fake.AppBySlug("middleman-probeerr")
+	require.True(ok)
+	_, err := fake.Install(app.ID, "kenn-io")
+	require.NoError(err)
+	fake.FailNextListInstallations(1)
+
+	env, _ = newTestEnv(t, fake, configPath)
+	err = runCLI([]string{"install", "--no-browser", "--timeout", "10s"}, env)
+	require.Error(err)
+	// The probe failure must surface unchanged, not be rewritten as a
+	// timeout that triggers stale adoption.
+	require.ErrorContains(err, "listing app installations")
+	require.NotErrorIs(err, errPollDeadline)
+
+	cfg, err := config.LoadForGitHubAppRepair(configPath)
+	require.NoError(err)
+	require.Len(cfg.GitHubApps, 1)
+	require.Zero(cfg.GitHubApps[0].InstallationID,
+		"a transient probe error must not adopt a stale installation")
+}
+
+func TestInstallKeepsTimeoutWhenSoleInstallationIsUnrelated(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	fake := githubapptest.NewFake()
+	t.Cleanup(fake.Close)
+	configPath := writeTestConfig(t) // configures kenn-io/middleman
+	createTestApp(t, fake, configPath, "middleman-unrelated")
+
+	env, _ := newTestEnv(t, fake, configPath)
+	require.NoError(runCLI([]string{"uninstall", "--yes"}, env))
+
+	// The app's only installation is on an account that owns none of the
+	// configured repos. A browser timeout must not adopt it as if it were
+	// the intended install -- the user still needs to install on the
+	// owning account -- so the timeout surfaces unchanged.
+	app, ok := fake.AppBySlug("middleman-unrelated")
+	require.True(ok)
+	_, err := fake.Install(app.ID, "unrelated-org")
+	require.NoError(err)
+
+	env, _ = newTestEnv(t, fake, configPath)
+	env.openBrowser = func(string) error { return nil } // no new installation
+	err = runCLI([]string{"install", "--timeout", "200ms"}, env)
+	require.Error(err)
+	require.ErrorContains(err, "timed out")
+
+	cfg, err := config.LoadForGitHubAppRepair(configPath)
+	require.NoError(err)
+	require.Len(cfg.GitHubApps, 1)
+	require.Zero(cfg.GitHubApps[0].InstallationID,
+		"an unrelated sole installation must not be adopted on timeout")
+}
+
+func TestInstallKeepsTimeoutWhenMultipleInstallationsExist(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	fake := githubapptest.NewFake()
+	t.Cleanup(fake.Close)
+	configPath := writeTestConfig(t)
+	createTestApp(t, fake, configPath, "middleman-multi")
+
+	env, _ := newTestEnv(t, fake, configPath)
+	require.NoError(runCLI([]string{"uninstall", "--yes"}, env))
+
+	// Two installations exist, one of them on a configured-repo owner.
+	// Which one to record is ambiguous, so a browser timeout keeps
+	// waiting instead of guessing.
+	app, ok := fake.AppBySlug("middleman-multi")
+	require.True(ok)
+	_, err := fake.Install(app.ID, "kenn-io")
+	require.NoError(err)
+	_, err = fake.Install(app.ID, "acme")
+	require.NoError(err)
+
+	env, _ = newTestEnv(t, fake, configPath)
+	env.openBrowser = func(string) error { return nil } // no new installation
+	err = runCLI([]string{"install", "--timeout", "200ms"}, env)
+	require.Error(err)
+	require.ErrorContains(err, "timed out")
+
+	cfg, err := config.LoadForGitHubAppRepair(configPath)
+	require.NoError(err)
+	require.Len(cfg.GitHubApps, 1)
+	require.Zero(cfg.GitHubApps[0].InstallationID,
+		"ambiguous multiple installations must not be adopted on timeout")
+}
+
+func TestInstallRecordsOrgInstallationWithoutCoveringOtherOwners(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	fake := githubapptest.NewFake()
+	t.Cleanup(fake.Close)
+	configPath := writeTestConfig(t)
+
+	createTestApp(t, fake, configPath, "middleman-scoped")
+	cfg, err := config.Load(configPath)
+	require.NoError(err)
+	appID := cfg.GitHubApps[0].AppID
+	raw, err := os.ReadFile(configPath)
+	require.NoError(err)
+	require.NoError(os.WriteFile(configPath, append(raw, []byte(`
+
+[[repos]]
+owner = "mariusvniekerk"
+name = "skills"
+`)...), 0o600))
+	_, err = fake.Install(appID, "kenn-io")
+	require.NoError(err)
+
+	env, _ := newTestEnv(t, fake, configPath)
+	require.NoError(runCLI([]string{
+		"install", "--no-browser", "--timeout", "10s",
+	}, env))
+
+	cfg, err = config.Load(configPath)
 	require.NoError(err)
 	require.Len(cfg.GitHubApps, 1)
 	require.Equal("kenn-io", cfg.GitHubApps[0].InstallationAccount)
@@ -947,8 +1233,6 @@ func TestOpenOpensSettingsForRepairInvalidConfig(t *testing.T) {
 	broken := strings.Replace(string(raw), `installation_account = "kenn-io"`, `installation_account = "other-org"`, 1)
 	require.NotEqual(string(raw), broken)
 	require.NoError(os.WriteFile(configPath, []byte(broken), 0o600))
-	_, err = config.Load(configPath)
-	require.ErrorContains(err, "not covered by the github app")
 
 	var opened string
 	env, _ := newTestEnv(t, fake, configPath)

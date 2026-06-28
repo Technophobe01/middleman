@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	Assert "github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/middleman/internal/config"
 	"go.kenn.io/middleman/internal/server"
@@ -25,7 +25,7 @@ import (
 )
 
 func TestPrepareEphemeralConfigOverridesPortAndDataDir(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	dir := t.TempDir()
 	sourcePath := filepath.Join(dir, "source.toml")
@@ -63,7 +63,7 @@ func TestPrepareEphemeralConfigOverridesPortAndDataDir(t *testing.T) {
 }
 
 func TestPrepareEphemeralConfigForcesBackendToLoopback(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	dir := t.TempDir()
 	sourcePath := filepath.Join(dir, "source.toml")
@@ -95,7 +95,7 @@ func TestPrepareEphemeralConfigForcesBackendToLoopback(t *testing.T) {
 }
 
 func TestPrepareEphemeralConfigDisablesReverseProxyTrustForDirectBackend(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	dir := t.TempDir()
 	sourcePath := filepath.Join(dir, "source.toml")
@@ -164,7 +164,7 @@ func TestPrepareEphemeralConfigCopiesSourceDatabaseByDefault(t *testing.T) {
 	})
 	require.NoError(err)
 
-	Assert.Equal(t, "copied state", readSQLiteMarker(t, filepath.Join(prepared.dataDir, "middleman.db")))
+	assert.Equal(t, "copied state", readSQLiteMarker(t, filepath.Join(prepared.dataDir, "middleman.db")))
 }
 
 func TestPrepareEphemeralDatabaseRejectsSourceDestinationMatch(t *testing.T) {
@@ -176,8 +176,8 @@ func TestPrepareEphemeralDatabaseRejectsSourceDestinationMatch(t *testing.T) {
 	err := prepareEphemeralDatabase(dbPath, dbPath, true)
 	require.Error(err)
 
-	Assert.Contains(t, err.Error(), "source and destination database are the same")
-	Assert.Equal(t, "preserve me", readSQLiteMarker(t, dbPath))
+	assert.Contains(t, err.Error(), "source and destination database are the same")
+	assert.Equal(t, "preserve me", readSQLiteMarker(t, dbPath))
 }
 
 func TestPrepareEphemeralDatabaseRejectsSymlinkedSourceDestinationMatch(t *testing.T) {
@@ -195,8 +195,8 @@ func TestPrepareEphemeralDatabaseRejectsSymlinkedSourceDestinationMatch(t *testi
 	err := prepareEphemeralDatabase(sourcePath, destPath, true)
 	require.Error(err)
 
-	Assert.Contains(t, err.Error(), "source and destination database are the same")
-	Assert.Equal(t, "preserve me", readSQLiteMarker(t, sourcePath))
+	assert.Contains(t, err.Error(), "source and destination database are the same")
+	assert.Equal(t, "preserve me", readSQLiteMarker(t, sourcePath))
 }
 
 func TestPrepareEphemeralConfigCanStartWithFreshDatabase(t *testing.T) {
@@ -257,11 +257,11 @@ func TestPrepareEphemeralConfigKeepsBasePathInBackendURL(t *testing.T) {
 	})
 	require.NoError(err)
 
-	Assert.Equal(t, "http://127.0.0.1:39201/middleman", prepared.backendURL)
+	assert.Equal(t, "http://127.0.0.1:39201/middleman", prepared.backendURL)
 }
 
 func TestBuildCommandSpecsWiresEphemeralEnvironment(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	t.Setenv("PATH", "/bin")
 	t.Setenv("HOME", "/tmp/home")
 	t.Setenv("TMPDIR", "/tmp")
@@ -307,7 +307,7 @@ func TestBuildCommandSpecsWiresEphemeralEnvironment(t *testing.T) {
 }
 
 func TestBuildCommandSpecsPreservesExplicitTelemetrySetting(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	t.Setenv("TELEMETRY_ENABLED", "1")
 
 	specs := buildCommandSpecs(ephemeralRun{
@@ -327,7 +327,7 @@ func TestBuildCommandSpecsReferenceExecutableScripts(t *testing.T) {
 }
 
 func TestWriteStatusFileRecordsPIDsAndPortsNextToConfig(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	dir := t.TempDir()
 	statusPath := filepath.Join(dir, "dev-ephemeral.json")
@@ -362,14 +362,14 @@ func TestResolveRunWorkDirDefaultsToStableDirectory(t *testing.T) {
 	workDir, err := resolveRunWorkDir("")
 	require.NoError(t, err)
 
-	Assert.Equal(t, filepath.Join("tmp", "dev-ephemeral"), workDir)
+	assert.Equal(t, filepath.Join("tmp", "dev-ephemeral"), workDir)
 }
 
 func TestResolveStopStatusPathDefaultsToStableStatusPath(t *testing.T) {
 	statusPath, err := resolveStopStatusPath("", "")
 	require.NoError(t, err)
 
-	Assert.Equal(t, filepath.Join("tmp", "dev-ephemeral", "dev-ephemeral.json"), statusPath)
+	assert.Equal(t, filepath.Join("tmp", "dev-ephemeral", "dev-ephemeral.json"), statusPath)
 }
 
 func TestLockEphemeralWorkDirRejectsConcurrentLock(t *testing.T) {
@@ -381,12 +381,164 @@ func TestLockEphemeralWorkDirRejectsConcurrentLock(t *testing.T) {
 
 	_, err = lockEphemeralWorkDir(dir)
 	require.Error(err)
-	Assert.Contains(t, err.Error(), "ephemeral work directory is locked")
+	assert.Contains(t, err.Error(), "ephemeral work directory is locked")
 
 	require.NoError(release())
 	release, err = lockEphemeralWorkDir(dir)
 	require.NoError(err)
 	require.NoError(release())
+}
+
+func TestRunWaitsForWorkDirLockBeforeReusingLiveStatus(t *testing.T) {
+	require := require.New(t)
+	dir := t.TempDir()
+	statusPath := filepath.Join(dir, "dev-ephemeral.json")
+	scriptPath := filepath.Join(dir, "blocking.sh")
+	writeBlockingScript(t, scriptPath)
+	backend, _ := startTestCommand(t, commandSpec{name: scriptPath})
+	frontend, _ := startTestCommand(t, commandSpec{name: scriptPath})
+	launcherStartedAt, err := processStartTime(os.Getpid())
+	require.NoError(err)
+	backendStartedAt, err := processStartTime(backend.Process.Pid)
+	require.NoError(err)
+	frontendStartedAt, err := processStartTime(frontend.Process.Pid)
+	require.NoError(err)
+	release, err := lockEphemeralWorkDir(dir)
+	require.NoError(err)
+	lockReleased := false
+	t.Cleanup(func() {
+		if !lockReleased {
+			require.NoError(release())
+		}
+	})
+	require.NoError(writeStatusFile(statusPath, ephemeralStatus{
+		PID:               os.Getpid(),
+		PIDStartedAt:      launcherStartedAt,
+		BackendPID:        backend.Process.Pid,
+		BackendStartedAt:  backendStartedAt,
+		FrontendPID:       frontend.Process.Pid,
+		FrontendStartedAt: frontendStartedAt,
+		BackendURL:        "http://127.0.0.1:39411",
+		FrontendURL:       "http://127.0.0.1:39412",
+	}))
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- run(context.Background(), []string{"-work-dir", dir})
+	}()
+	select {
+	case err := <-errCh:
+		require.Failf("run returned while the workdir lock was held", "err: %v", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	require.NoError(release())
+	lockReleased = true
+	select {
+	case err := <-errCh:
+		require.NoError(err)
+	case <-time.After(5 * time.Second):
+		require.Fail("timed out waiting for run to reuse live status after lock release")
+	}
+}
+
+func TestRunWaitsForStopLockBeforeStartingReplacementStack(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	dir := t.TempDir()
+	sourcePath := filepath.Join(dir, "source.toml")
+	sourceDataDir := filepath.Join(dir, "source-data")
+	workDir := filepath.Join(dir, "run")
+	statusPath := filepath.Join(workDir, "dev-ephemeral.json")
+
+	source := config.Config{
+		SyncInterval:        "5m",
+		GitHubTokenEnv:      "MIDDLEMAN_GITHUB_TOKEN",
+		DefaultPlatformHost: "github.com",
+		Host:                "127.0.0.1",
+		Port:                8091,
+		DataDir:             sourceDataDir,
+		Activity:            config.Activity{ViewMode: "threaded", TimeRange: "7d"},
+	}
+	require.NoError(os.MkdirAll(sourceDataDir, 0o700))
+	require.NoError(source.Save(sourcePath))
+
+	commandDir := filepath.Join(dir, "commands")
+	writeBlockingScript(t, filepath.Join(commandDir, "scripts", "dev-stack-backend.sh"))
+	writeBlockingScript(t, filepath.Join(commandDir, "scripts", "frontend-dev.sh"))
+
+	oldScriptPath := filepath.Join(dir, "old-stack.sh")
+	writeBlockingScript(t, oldScriptPath)
+	oldLauncher, _ := startTestCommand(t, commandSpec{name: oldScriptPath})
+	oldBackend, _ := startTestCommand(t, commandSpec{name: oldScriptPath})
+	oldFrontend, _ := startTestCommand(t, commandSpec{name: oldScriptPath})
+	oldLauncherStartedAt, err := processStartTime(oldLauncher.Process.Pid)
+	require.NoError(err)
+	oldBackendStartedAt, err := processStartTime(oldBackend.Process.Pid)
+	require.NoError(err)
+	oldFrontendStartedAt, err := processStartTime(oldFrontend.Process.Pid)
+	require.NoError(err)
+	require.NoError(writeStatusFile(statusPath, ephemeralStatus{
+		PID:               oldLauncher.Process.Pid,
+		PIDStartedAt:      oldLauncherStartedAt,
+		BackendPID:        oldBackend.Process.Pid,
+		BackendStartedAt:  oldBackendStartedAt,
+		FrontendPID:       oldFrontend.Process.Pid,
+		FrontendStartedAt: oldFrontendStartedAt,
+		BackendURL:        "http://127.0.0.1:39411",
+		FrontendURL:       "http://127.0.0.1:39412",
+	}))
+
+	release, err := lockEphemeralWorkDir(workDir)
+	require.NoError(err)
+	lockReleased := false
+	t.Cleanup(func() {
+		if !lockReleased {
+			require.NoError(release())
+		}
+	})
+
+	oldDir, err := os.Getwd()
+	require.NoError(err)
+	require.NoError(os.Chdir(commandDir))
+	t.Cleanup(func() {
+		require.NoError(os.Chdir(oldDir))
+	})
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- run(context.Background(), []string{
+			"-config", sourcePath,
+			"-work-dir", workDir,
+			"-backend-port", "39511",
+			"-frontend-port", "39512",
+		})
+	}()
+	select {
+	case err := <-errCh:
+		require.Failf("run returned while stop held the workdir lock", "err: %v", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	require.NoError(stopEphemeralStack(statusPath))
+	require.NoError(release())
+	lockReleased = true
+
+	status := waitForStatusFile(t, statusPath)
+	assert.NotEqual(oldBackend.Process.Pid, status.BackendPID)
+	assert.NotEqual(oldFrontend.Process.Pid, status.FrontendPID)
+	assert.Equal("http://127.0.0.1:39511", status.BackendURL)
+	assert.Equal("http://127.0.0.1:39512", status.FrontendURL)
+
+	status.PID = 0
+	require.NoError(writeStatusFile(statusPath, status))
+	require.NoError(stopEphemeralStack(statusPath))
+	select {
+	case err := <-errCh:
+		require.NoError(err)
+	case <-time.After(5 * time.Second):
+		require.Fail("timed out waiting for replacement dev-ephemeral run to stop")
+	}
 }
 
 func TestReadRunningEphemeralStatusReturnsLiveStatus(t *testing.T) {
@@ -418,7 +570,7 @@ func TestReadRunningEphemeralStatusReturnsLiveStatus(t *testing.T) {
 	status, running, err := readRunningEphemeralStatus(statusPath)
 	require.NoError(err)
 
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	assert.True(running)
 	assert.Equal(os.Getpid(), status.PID)
 	assert.Equal("http://127.0.0.1:39411", status.BackendURL)
@@ -438,14 +590,14 @@ func TestReadRunningEphemeralStatusRemovesStaleStatus(t *testing.T) {
 	_, running, err := readRunningEphemeralStatus(statusPath)
 	require.NoError(err)
 
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	assert.False(running)
 	_, err = os.Stat(statusPath)
 	assert.ErrorIs(err, os.ErrNotExist)
 }
 
 func TestReadRunningEphemeralStatusStopsPartialStackAndRemovesStatus(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	dir := t.TempDir()
 	statusPath := filepath.Join(dir, "dev-ephemeral.json")
@@ -479,7 +631,7 @@ func TestStopEphemeralStackTreatsMissingStatusAsStopped(t *testing.T) {
 }
 
 func TestStopEphemeralStackWaitsForProcessesBeforeRemovingStatus(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	dir := t.TempDir()
 	statusPath := filepath.Join(dir, "dev-ephemeral.json")
@@ -504,7 +656,7 @@ func TestStopEphemeralStackWaitsForProcessesBeforeRemovingStatus(t *testing.T) {
 }
 
 func TestStopEphemeralStackDoesNotSignalMismatchedProcessIdentity(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	dir := t.TempDir()
 	statusPath := filepath.Join(dir, "dev-ephemeral.json")
@@ -557,8 +709,8 @@ func TestWaitForCommandsEscalatesIgnoredInterrupt(t *testing.T) {
 	require.NoError(err)
 	frontendRunning, err := processRunning(frontend.Process.Pid)
 	require.NoError(err)
-	Assert.False(t, backendRunning)
-	Assert.False(t, frontendRunning)
+	assert.False(t, backendRunning)
+	assert.False(t, frontendRunning)
 }
 
 func TestStopStartedCommandsEscalatesAndWaits(t *testing.T) {
@@ -575,11 +727,11 @@ func TestStopStartedCommandsEscalatesAndWaits(t *testing.T) {
 
 	running, err := processRunning(cmd.Process.Pid)
 	require.NoError(err)
-	Assert.False(t, running)
+	assert.False(t, running)
 }
 
 func TestRunWritesStatusAndReusesLiveDefaultStack(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	dir := t.TempDir()
 	sourcePath := filepath.Join(dir, "source.toml")
@@ -632,12 +784,16 @@ func TestRunWritesStatusAndReusesLiveDefaultStack(t *testing.T) {
 	assert.Equal("http://127.0.0.1:39502", status.FrontendURL)
 	assert.Equal("workflow state", readSQLiteMarker(t, filepath.Join(workDir, "data", "middleman.db")))
 
-	require.NoError(run(context.Background(), []string{
-		"-config", sourcePath,
-		"-work-dir", workDir,
-		"-backend-port", "39503",
-		"-frontend-port", "39504",
-	}))
+	var reuseErr error
+	require.Eventually(func() bool {
+		reuseErr = run(context.Background(), []string{
+			"-config", sourcePath,
+			"-work-dir", workDir,
+			"-backend-port", "39503",
+			"-frontend-port", "39504",
+		})
+		return reuseErr == nil
+	}, 2*time.Second, 10*time.Millisecond, "reuse run failed: %v", reuseErr)
 	reused := readStatusFile(t, statusPath)
 	assert.Equal(status.BackendPID, reused.BackendPID)
 	assert.Equal(status.FrontendPID, reused.FrontendPID)
@@ -657,7 +813,7 @@ func assertExecutable(t *testing.T, path string) {
 	t.Helper()
 	info, err := os.Stat(path)
 	require.NoError(t, err)
-	Assert.NotZero(t, info.Mode().Perm()&0o111, "%s must be executable", path)
+	assert.NotZero(t, info.Mode().Perm()&0o111, "%s must be executable", path)
 }
 
 func repoRoot(t *testing.T) string {

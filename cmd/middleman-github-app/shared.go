@@ -2,13 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	"go.kenn.io/middleman/internal/config"
 	"go.kenn.io/middleman/internal/githubapp"
-	"go.kenn.io/middleman/internal/platform"
 )
 
 // loadConfig loads with GitHub App coverage validation relaxed: every
@@ -38,28 +38,66 @@ func (env *appEnv) webBaseFor(host string) string {
 	return githubapp.WebBaseForHost(host)
 }
 
-// selectApp picks the configured app for host. With one configured
-// app and no --host flag, that app is selected.
-func selectApp(cfg *config.Config, host string) (config.GitHubAppConfig, error) {
-	if host == "" {
-		switch len(cfg.GitHubApps) {
-		case 0:
-			return config.GitHubAppConfig{}, fmt.Errorf(
-				"no github apps configured; run \"middleman-github-app create\" first",
-			)
-		case 1:
-			return cfg.GitHubApps[0], nil
-		default:
-			return config.GitHubAppConfig{}, fmt.Errorf(
-				"multiple github apps configured; pass --host to pick one",
-			)
+// selectApp picks a configured app credential. Same-host configs can carry
+// multiple private apps, so management commands must disambiguate by owner or
+// app id when a host alone is not unique.
+func selectApp(
+	cfg *config.Config, host, owner string, appID int64,
+) (config.GitHubAppConfig, error) {
+	if cfg == nil || len(cfg.GitHubApps) == 0 {
+		return config.GitHubAppConfig{}, fmt.Errorf(
+			"no github apps configured; run \"middleman-github-app create\" first",
+		)
+	}
+	normalizedHost := ""
+	if strings.TrimSpace(host) != "" {
+		var err error
+		normalizedHost, err = normalizeHostFlag(host)
+		if err != nil {
+			return config.GitHubAppConfig{}, err
 		}
 	}
-	app, ok := cfg.GitHubAppForHost(host)
-	if !ok {
-		return config.GitHubAppConfig{}, fmt.Errorf("no github app configured for host %q", host)
+	owner = strings.TrimSpace(owner)
+	var matches []config.GitHubAppConfig
+	for _, app := range cfg.GitHubApps {
+		if normalizedHost != "" && app.Host != normalizedHost {
+			continue
+		}
+		if appID != 0 && app.AppID != appID {
+			continue
+		}
+		if owner != "" &&
+			!strings.EqualFold(app.Owner, owner) &&
+			!strings.EqualFold(app.InstallationAccount, owner) {
+			continue
+		}
+		matches = append(matches, app)
 	}
-	return app, nil
+	if len(matches) == 0 {
+		if normalizedHost != "" && owner != "" {
+			return config.GitHubAppConfig{}, fmt.Errorf(
+				"no github app configured for host %q and owner %q", normalizedHost, owner,
+			)
+		}
+		if normalizedHost != "" && appID != 0 {
+			return config.GitHubAppConfig{}, fmt.Errorf(
+				"no github app configured for host %q and app id %d", normalizedHost, appID,
+			)
+		}
+		if normalizedHost != "" {
+			return config.GitHubAppConfig{}, fmt.Errorf("no github app configured for host %q", normalizedHost)
+		}
+		if appID != 0 {
+			return config.GitHubAppConfig{}, fmt.Errorf("no github app configured for app id %d", appID)
+		}
+		return config.GitHubAppConfig{}, fmt.Errorf("no github app configured for owner %q", owner)
+	}
+	if len(matches) > 1 {
+		return config.GitHubAppConfig{}, fmt.Errorf(
+			"multiple github apps match; pass --owner or --app-id to select one",
+		)
+	}
+	return matches[0], nil
 }
 
 func appJWT(app config.GitHubAppConfig, now time.Time) (string, error) {
@@ -85,12 +123,17 @@ func installURL(webBase string, app config.GitHubAppConfig) string {
 	return fmt.Sprintf("%s/apps/%s/installations/new", webBase, app.Slug)
 }
 
-// updateAppInConfig replaces the entry for app.Host and saves.
+// updateAppInConfig replaces the matching app credential and saves. Same-host
+// entries are distinct apps, usually one private app per GitHub account.
 func updateAppInConfig(
 	cfg *config.Config, configPath string, app config.GitHubAppConfig,
 ) error {
 	for i := range cfg.GitHubApps {
-		if cfg.GitHubApps[i].Host == app.Host {
+		existing := cfg.GitHubApps[i]
+		if existing.Host != app.Host {
+			continue
+		}
+		if existing.AppID == app.AppID {
 			cfg.GitHubApps[i] = app
 			return cfg.Save(configPath)
 		}
@@ -99,14 +142,31 @@ func updateAppInConfig(
 	return cfg.Save(configPath)
 }
 
-func removeAppFromConfig(
-	cfg *config.Config, configPath, host string,
+func updateAppSlotInConfig(
+	cfg *config.Config,
+	configPath string,
+	oldApp config.GitHubAppConfig,
+	newApp config.GitHubAppConfig,
 ) error {
-	kept := cfg.GitHubApps[:0]
-	for _, app := range cfg.GitHubApps {
-		if app.Host != host {
-			kept = append(kept, app)
+	for i := range cfg.GitHubApps {
+		existing := cfg.GitHubApps[i]
+		if existing.Host == oldApp.Host &&
+			existing.AppID == oldApp.AppID &&
+			strings.EqualFold(existing.InstallationAccount, oldApp.InstallationAccount) {
+			cfg.GitHubApps[i] = newApp
+			return cfg.Save(configPath)
 		}
+	}
+	return updateAppInConfig(cfg, configPath, newApp)
+}
+
+func removeAppFromConfig(cfg *config.Config, configPath string, app config.GitHubAppConfig) error {
+	kept := cfg.GitHubApps[:0]
+	for _, existing := range cfg.GitHubApps {
+		if existing.Host == app.Host && existing.AppID == app.AppID {
+			continue
+		}
+		kept = append(kept, existing)
 	}
 	cfg.GitHubApps = kept
 	return cfg.Save(configPath)
@@ -148,8 +208,36 @@ func missingSelectedRepos(
 	return missing
 }
 
+// errPollDeadline is the sentinel a pollTimeoutError matches via Is, so
+// callers can recognize a clean deadline with errors.Is(err,
+// errPollDeadline) without the marker text leaking into the user-facing
+// message. It marks a pollUntil return that ended on its own timeout
+// deadline, as opposed to a probe error or context cancellation: callers
+// that recover from a clean "nothing appeared in time" (for example
+// adopting an existing installation when no new one shows up) must match
+// this so a transient probe failure or interrupt surfaces instead of
+// being treated as a timeout.
+var errPollDeadline = errors.New("poll deadline reached")
+
+// pollTimeoutError is pollUntil's deadline result. Its message stays the
+// plain "timed out after <d>" the CLIs have always shown, while Is
+// reports a match against errPollDeadline so recovery paths can branch on
+// a clean timeout without changing what the user sees.
+type pollTimeoutError struct{ timeout time.Duration }
+
+func (e pollTimeoutError) Error() string {
+	return fmt.Sprintf("timed out after %s", e.timeout)
+}
+
+func (e pollTimeoutError) Is(target error) bool {
+	return target == errPollDeadline
+}
+
 // pollUntil runs probe at the env's poll interval until it reports
-// done, the context ends, or timeout elapses.
+// done, the context ends, or timeout elapses. A timeout returns a
+// pollTimeoutError (errors.Is(err, errPollDeadline) is true); probe
+// errors and context cancellation are returned as-is so callers can tell
+// them apart.
 func (env *appEnv) pollUntil(
 	ctx context.Context,
 	timeout time.Duration,
@@ -171,16 +259,17 @@ func (env *appEnv) pollUntil(
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-deadline.C:
-			return fmt.Errorf("timed out after %s", timeout)
+			return pollTimeoutError{timeout: timeout}
 		case <-ticker.C:
 		}
 	}
 }
 
-func normalizeHostFlag(host string) string {
+func normalizeHostFlag(host string) (string, error) {
 	host = strings.TrimSpace(host)
-	if host == "" {
-		return platform.DefaultGitHubHost
+	normalized, err := config.NormalizePlatformHost("github", host)
+	if err != nil {
+		return "", err
 	}
-	return host
+	return normalized, nil
 }

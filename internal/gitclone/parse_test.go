@@ -120,6 +120,117 @@ index abc..def 100644
 	assert.Contains(files[0].Patch, "\\ No newline at end of file\n")
 }
 
+func TestParsePatchMatchesPatchEntriesByPath(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+
+	patch := `diff --git a/docs/guide.md b/docs/guide.md
+deleted file mode 120000
+index 1111111..0000000
+--- a/docs/guide.md
++++ /dev/null
+@@ -1 +0,0 @@
+-README.md
+diff --git a/docs/guide.md b/docs/guide.md
+new file mode 100644
+index 0000000..2222222
+--- /dev/null
++++ b/docs/guide.md
+@@ -0,0 +1,2 @@
++# Example Guide
++Use generic fixture data.
+diff --git a/src/report.go b/src/report.go
+index 3333333..4444444 100644
+--- a/src/report.go
++++ b/src/report.go
+@@ -1,3 +1,2 @@
+ package src
+-func oldReport() {}
+-func removedReport() {}
++func newReport() {}
+`
+
+	rawFiles := []DiffFile{
+		{Path: "docs/guide.md", OldPath: "docs/guide.md", Status: "modified"},
+		{Path: "src/report.go", OldPath: "src/report.go", Status: "modified"},
+	}
+
+	files := ParsePatch([]byte(patch), rawFiles)
+	require.Len(files, 2)
+
+	assert.Equal("docs/guide.md", files[0].Path)
+	assert.Equal(2, files[0].Additions)
+	assert.Equal(1, files[0].Deletions)
+	assert.Contains(files[0].Patch, "+# Example Guide\n")
+
+	assert.Equal("src/report.go", files[1].Path)
+	assert.Equal(1, files[1].Additions)
+	assert.Equal(2, files[1].Deletions)
+	assert.Contains(files[1].Patch, "+func newReport() {}\n")
+	assert.NotContains(files[1].Patch, "# Example Guide")
+	assert.NotContains(files[1].Patch, "Use generic fixture data.")
+}
+
+func TestParsePatchKeepsModifiedSourcePatchSeparateFromCopy(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+
+	patch := `diff --git a/src/source.txt b/src/source.txt
+index 1111111..2222222 100644
+--- a/src/source.txt
++++ b/src/source.txt
+@@ -1,2 +1,2 @@
+-base line
++changed line
+ shared line
+diff --git a/src/source.txt b/src/copied.txt
+similarity index 100%
+copy from src/source.txt
+copy to src/copied.txt
+`
+
+	rawFiles := []DiffFile{
+		{Path: "src/source.txt", OldPath: "src/source.txt", Status: "modified"},
+		{Path: "src/copied.txt", OldPath: "src/source.txt", Status: "copied"},
+	}
+
+	files := ParsePatch([]byte(patch), rawFiles)
+	require.Len(files, 2)
+
+	source := files[0]
+	assert.Equal("src/source.txt", source.Path)
+	assert.Equal(1, source.Additions)
+	assert.Equal(1, source.Deletions)
+	assert.Contains(source.Patch, "diff --git a/src/source.txt b/src/source.txt\n")
+	assert.Contains(source.Patch, "+changed line\n")
+	assert.NotContains(source.Patch, "copy to src/copied.txt")
+
+	copied := files[1]
+	assert.Equal("src/copied.txt", copied.Path)
+	assert.Zero(copied.Additions)
+	assert.Zero(copied.Deletions)
+	assert.Empty(copied.Patch)
+	assert.Empty(copied.Hunks)
+}
+
+func TestParsePatchReturnsEmptySliceWithoutRawMetadata(t *testing.T) {
+	assert := assert.New(t)
+
+	patch := `diff --git a/src/example.go b/src/example.go
+index 1111111..2222222 100644
+--- a/src/example.go
++++ b/src/example.go
+@@ -1 +1 @@
+-old
++new
+`
+
+	files := ParsePatch([]byte(patch), nil)
+
+	assert.NotNil(files)
+	assert.Empty(files)
+}
+
 func TestSortDiffFilesUsesBytewisePathOrder(t *testing.T) {
 	assert := assert.New(t)
 

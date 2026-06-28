@@ -6,7 +6,7 @@ import (
 	"time"
 
 	gh "github.com/google/go-github/v84/github"
-	Assert "github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/middleman/internal/apiclient/generated"
 	"go.kenn.io/middleman/internal/db"
@@ -73,13 +73,13 @@ func TestAPIGetPullAcceptsMixedCaseRepoPath(t *testing.T) {
 	require.Equal("widget", resp.JSON200.RepoName)
 }
 
-func TestAPIListPullsAcceptsMixedCaseRepoFilter(t *testing.T) {
+func TestAPIListPullsAcceptsMixedCaseProviderQualifiedRepoFilter(t *testing.T) {
 	require := require.New(t)
 	srv, database := setupTestServer(t)
 	seedPR(t, database, "acme", "widget", 1)
 	client := setupTestClient(t, srv)
 
-	repo := "Acme/Widget"
+	repo := "github|github.com/Acme/Widget"
 	resp, err := client.HTTP.ListPullsWithResponse(
 		t.Context(), &generated.ListPullsParams{Repo: &repo},
 	)
@@ -91,16 +91,16 @@ func TestAPIListPullsAcceptsMixedCaseRepoFilter(t *testing.T) {
 	require.Equal("widget", (*resp.JSON200)[0].RepoName)
 }
 
-func TestAPIListPullsAcceptsHostQualifiedRepoFilter(t *testing.T) {
+func TestAPIListPullsAcceptsProviderAndHostQualifiedRepoFilter(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	srv, database := setupTestServer(t)
 	seedPROnHost(t, database, "github.com", "acme", "widget", 1)
 	seedPROnHost(t, database, "ghe.example.com", "acme", "widget", 2)
 	client := setupTestClient(t, srv)
 
-	repo := "ghe.example.com/acme/widget"
+	repo := "github|ghe.example.com/acme/widget"
 	resp, err := client.HTTP.ListPullsWithResponse(
 		t.Context(), &generated.ListPullsParams{Repo: &repo},
 	)
@@ -165,7 +165,7 @@ func TestAPIListPullsStateFilter(t *testing.T) {
 	seedPR(t, database, "acme", "widget", 2)
 	seedPR(t, database, "acme", "widget", 3)
 
-	repo, _ := database.GetRepoByOwnerName(ctx, "acme", "widget")
+	repo, _ := database.GetRepoByIdentity(ctx, db.GitHubRepoIdentity("github.com", "acme", "widget"))
 	now := time.Now()
 	require.NoError(database.UpdateMRState(ctx, repo.ID, 2, "closed", nil, &now))
 	require.NoError(database.UpdateMRState(ctx, repo.ID, 3, "merged", &now, &now))
@@ -280,7 +280,7 @@ func TestAPIGetIssueIncludesAssignees(t *testing.T) {
 
 func TestAPISyncIssuePersistsAssigneesFromProvider(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 	now := time.Now().UTC().Truncate(time.Second)
 
@@ -309,7 +309,7 @@ func TestAPISyncIssuePersistsAssigneesFromProvider(t *testing.T) {
 
 	require.NoError(syncer.SyncIssue(ctx, "acme", "widget", issueNumber))
 
-	repo, err := database.GetRepoByOwnerName(ctx, "acme", "widget")
+	repo, err := database.GetRepoByIdentity(ctx, db.GitHubRepoIdentity("github.com", "acme", "widget"))
 	require.NoError(err)
 	require.NotNil(repo)
 	persisted, err := database.GetIssueByRepoIDAndNumber(ctx, repo.ID, issueNumber)

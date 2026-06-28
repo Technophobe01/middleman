@@ -386,12 +386,40 @@ describe("RepoSummaryPage", () => {
     expect(screen.queryByRole("button", { name: "View issues" })).toBeNull();
 
     await fireEvent.click(screen.getByRole("button", { name: /3\s+Open PRs/ }));
-    expect(mockSetGlobalRepo).toHaveBeenCalledWith("github.com/acme/widgets");
+    expect(mockSetGlobalRepo).toHaveBeenCalledWith("github|github.com/acme/widgets");
     expect(mockNavigate).toHaveBeenCalledWith("/pulls");
 
     await fireEvent.click(screen.getByRole("button", { name: /2\s+Open issues/ }));
-    expect(mockSetGlobalRepo).toHaveBeenCalledWith("github.com/acme/widgets");
+    expect(mockSetGlobalRepo).toHaveBeenCalledWith("github|github.com/acme/widgets");
     expect(mockNavigate).toHaveBeenCalledWith("/issues");
+  });
+
+  it("opens the source browser from repository cards", async () => {
+    mockGet.mockResolvedValue({
+      data: [
+        repoSummaryFixture({
+          provider: "github",
+          platformHost: "github.com",
+          owner: "acme",
+          name: "widgets",
+        }),
+      ],
+      error: undefined,
+    });
+
+    render(RepoSummaryPage);
+
+    await screen.findByRole("button", { name: /acme\s*\/\s*widgets/ });
+    await fireEvent.click(
+      screen.getByRole("button", {
+        name: "View repository source for acme widgets on github.com",
+      }),
+    );
+
+    expect(mockSetGlobalRepo).toHaveBeenCalledWith("github|github.com/acme/widgets");
+    expect(mockNavigate).toHaveBeenCalledWith(
+      "/repo/browser?provider=github&platform_host=github.com&repo_path=acme%2Fwidgets",
+    );
   });
 
   it("filters repositories by search and stale release state", async () => {
@@ -656,7 +684,7 @@ describe("RepoSummaryPage", () => {
           },
         }),
       );
-      expect(mockSetGlobalRepo).toHaveBeenCalledWith("github.com/acme/widgets");
+      expect(mockSetGlobalRepo).toHaveBeenCalledWith("github|github.com/acme/widgets");
       expect(mockNavigate).toHaveBeenCalledWith("/issues/github/acme/widgets/27");
     });
   });
@@ -829,7 +857,7 @@ describe("RepoSummaryPage", () => {
           }),
         }),
       );
-      expect(mockSetGlobalRepo).toHaveBeenCalledWith("ghe.example.com/acme/widgets");
+      expect(mockSetGlobalRepo).toHaveBeenCalledWith("github|ghe.example.com/acme/widgets");
       expect(mockNavigate).toHaveBeenCalledWith("/host/ghe.example.com/issues/github/acme/widgets/42");
     });
   });

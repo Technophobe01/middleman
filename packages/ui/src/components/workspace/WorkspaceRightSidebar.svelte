@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy } from "svelte";
+  import { onDestroy, type Snippet } from "svelte";
   import { getStores } from "../../context.js";
   import {
     createRoborevClient,
@@ -38,7 +38,7 @@
     components["schemas"]["RepoWithCount"];
 
   interface Props {
-    activeTab: "diff" | "pr" | "issue" | "reviews";
+    activeTab: "diff" | "pr" | "issue" | "reviews" | "kata_task";
     workspaceID: string;
     workspaceHostKey?: string | undefined;
     provider: string;
@@ -46,12 +46,14 @@
     repoOwner: string;
     repoName: string;
     repoPath: string;
-    ownerItemType: "pull_request" | "issue";
+    ownerItemType: "pull_request" | "issue" | "kata_task";
     ownerItemNumber: number;
     associatedPRNumber: number | null;
     branch: string;
     roborevBaseUrl: string;
     refreshToken?: number;
+    disabled?: boolean;
+    kataTaskPanel?: Snippet | undefined;
   }
 
   let {
@@ -69,6 +71,8 @@
     branch,
     roborevBaseUrl,
     refreshToken = 0,
+    disabled = false,
+    kataTaskPanel = undefined,
   }: Props = $props();
 
   const parentStores = getStores();
@@ -258,6 +262,12 @@
     ownerItemNumber > 0 &&
     hasRepo
   );
+  const hasKataTask = $derived(ownerItemType === "kata_task");
+  const hasMergeTarget = $derived(
+    ownerItemType === "pull_request"
+      ? ownerItemNumber > 0 && hasRepo
+      : hasPR
+  );
 
   // Connect/disconnect SSE based on daemon availability
   let sseConnected = $state(false);
@@ -294,12 +304,14 @@
         itemNumber={ownerItemNumber}
         active={activeTab === "diff"}
         {refreshToken}
+        {disabled}
+        showMergeTarget={hasMergeTarget}
       />
     {/key}
   {:else if activeTab === "pr"}
     {#if hasPR}
       {#key `pr:${provider}:${platformHost ?? ""}:${repoPath}:${associatedPRNumber ?? 0}:${refreshToken}`}
-        <div class="pr-scroll">
+        <div class="pr-scroll" inert={disabled}>
           <PullDetail
             {provider}
             {platformHost}
@@ -318,7 +330,7 @@
   {:else if activeTab === "issue"}
     {#if hasIssue}
       {#key `issue:${provider}:${platformHost ?? ""}:${repoPath}:${ownerItemNumber}:${refreshToken}`}
-        <div class="pr-scroll">
+        <div class="pr-scroll" inert={disabled}>
           <IssueDetail
             {provider}
             {platformHost}
@@ -331,6 +343,12 @@
       {/key}
     {:else}
       <div class="empty-state">No linked issue</div>
+    {/if}
+  {:else if activeTab === "kata_task"}
+    {#if hasKataTask && kataTaskPanel}
+      {@render kataTaskPanel()}
+    {:else}
+      <div class="empty-state">No linked Kata task</div>
     {/if}
   {:else if activeTab === "reviews"}
     {#if !hasRepo}
@@ -351,9 +369,9 @@
       </div>
     {:else}
       <SidebarStoreScope stores={sidebarStores}>
-        <div class="sidebar-reviews">
+        <div class="sidebar-reviews" inert={disabled}>
           <div class="sidebar-reviews-header">
-            <FilterBar disabled={!parentStores.roborevDaemon?.isAvailable()} />
+            <FilterBar disabled={disabled || !parentStores.roborevDaemon?.isAvailable()} />
             <DaemonStatus />
           </div>
           <div class="sidebar-reviews-body">

@@ -27,6 +27,20 @@ export type Route =
   | { page: "kata"; issue?: string; view?: KataTaskViewName; scope?: string }
   | { page: "docs"; folder: string | null; doc: string | null }
   | { page: "messages"; q: string | null; message: string | null; view?: "linked" }
+  | {
+      page: "repo-browser";
+      provider: string;
+      platformHost?: string | undefined;
+      repoPath: string;
+      owner: string;
+      name: string;
+      refType?: string | undefined;
+      refName?: string | undefined;
+      refSHA?: string | undefined;
+      path?: string | undefined;
+      mode?: "source" | "preview" | undefined;
+      anchor?: string | undefined;
+    }
   | { page: "workspaces" }
   | {
       page: "pulls";
@@ -45,6 +59,7 @@ export type Route =
   | { page: "focus"; itemType: "mrs"; repo?: string }
   | { page: "focus"; itemType: "issues"; repo?: string }
   | { page: "reviews"; jobId?: number }
+  | { page: "project-intake"; hostKey?: string }
   | { page: "terminal"; workspaceId: string; hostKey?: string }
   // Embed-targetable workspace surfaces. Hosts mount these
   // routes to render a single component of the workspaces UX
@@ -67,7 +82,11 @@ export type Route =
     }
   | { page: "embed-workspace-empty"; reason: EmbedEmptyReason }
   | { page: "embed-workspace-first-run" }
-  | { page: "embed-workspace-project"; projectId: string };
+  | {
+      page: "embed-workspace-project";
+      projectId: string;
+      hostKey?: string;
+    };
 
 export type Page = Route["page"];
 
@@ -104,7 +123,7 @@ function stripBase(path: string): string {
 }
 
 function currentLocationPath(): string {
-  return window.location.pathname + window.location.search;
+  return window.location.pathname + window.location.search + window.location.hash;
 }
 
 const defaultPlatformHosts: Record<string, string> = {
@@ -125,6 +144,15 @@ function decodeRouteSegment(segment: string): string | undefined {
     return decodeURIComponent(segment);
   } catch {
     return undefined;
+  }
+}
+
+function decodeRouteHash(hash: string): string | undefined {
+  if (!hash) return undefined;
+  try {
+    return decodeURIComponent(hash);
+  } catch {
+    return hash;
   }
 }
 
@@ -188,9 +216,12 @@ function splitRepoPath(repoPath: string): { owner: string; name: string } | unde
 }
 
 function parseRoute(fullPath: string): Route {
-  const qIdx = fullPath.indexOf("?");
-  const pathname = qIdx >= 0 ? fullPath.slice(0, qIdx) : fullPath;
-  const search = qIdx >= 0 ? fullPath.slice(qIdx + 1) : "";
+  const hashIdx = fullPath.indexOf("#");
+  const routePath = hashIdx >= 0 ? fullPath.slice(0, hashIdx) : fullPath;
+  const anchor = hashIdx >= 0 ? decodeRouteHash(fullPath.slice(hashIdx + 1)) : undefined;
+  const qIdx = routePath.indexOf("?");
+  const pathname = qIdx >= 0 ? routePath.slice(0, qIdx) : routePath;
+  const search = qIdx >= 0 ? routePath.slice(qIdx + 1) : "";
   const path = stripBase(pathname).replace(/\/+$/, "") || "/";
   const parts = path.split("/").filter(Boolean);
   if (path === "/m" || path === "/m/activity") {
@@ -259,6 +290,33 @@ function parseRoute(fullPath: string): Route {
   }
   if (path === "/repos") {
     return { page: "repos" };
+  }
+  if (path === "/repo/browser") {
+    const sp = new URLSearchParams(search);
+    const provider = emptyToNull(sp.get("provider"));
+    const repoPath = emptyToNull(sp.get("repo_path"))?.replace(/^\/+|\/+$/g, "");
+    const repo = repoPath ? splitRepoPath(repoPath) : undefined;
+    if (!provider || !repoPath || !repo) return { page: "repos" };
+    const platformHost = emptyToNull(sp.get("platform_host")) ?? defaultPlatformHost(provider);
+    const refType = parseRepoBrowserRefType(sp.get("ref_type"));
+    const refName = emptyToNull(sp.get("ref_name"));
+    const refSHA = emptyToNull(sp.get("ref_sha"));
+    const selectedPath = emptyToNull(sp.get("path"));
+    const mode = parseRepoBrowserViewMode(sp.get("mode"));
+    return {
+      page: "repo-browser",
+      provider,
+      ...(platformHost ? { platformHost } : {}),
+      repoPath,
+      owner: repo.owner,
+      name: repo.name,
+      ...(refType ? { refType } : {}),
+      ...(refName ? { refName } : {}),
+      ...(refSHA ? { refSHA } : {}),
+      ...(selectedPath ? { path: selectedPath } : {}),
+      ...(mode ? { mode } : {}),
+      ...(anchor ? { anchor } : {}),
+    };
   }
   if (path === "/kata") {
     const sp = new URLSearchParams(search);
@@ -331,6 +389,14 @@ function parseRoute(fullPath: string): Route {
       };
     }
     return { page: "reviews" };
+  }
+  if (path === "/project-intake") {
+    const sp = new URLSearchParams(search);
+    const hostKey = emptyToNull(sp.get("host"));
+    return {
+      page: "project-intake",
+      ...(hostKey ? { hostKey } : {}),
+    };
   }
   const fleetTerminalMatch = path.match(/^\/terminal\/fleet\/([^/]+)\/([^/]+)$/);
   if (fleetTerminalMatch) {
@@ -448,9 +514,12 @@ function parseRoute(fullPath: string): Route {
   }
   const embedProjectMatch = path.match(/^\/workspaces\/embed\/project\/([A-Za-z0-9_-]+)$/);
   if (embedProjectMatch) {
+    const sp = new URLSearchParams(search);
+    const hostKey = emptyToNull(sp.get("host"));
     return {
       page: "embed-workspace-project",
       projectId: embedProjectMatch[1]!,
+      ...(hostKey ? { hostKey } : {}),
     };
   }
   if (path === "/workspaces" || path.startsWith("/workspaces/")) {
@@ -533,7 +602,7 @@ export function navigate(path: string, state?: Record<string, unknown>): void {
 
 function buildRouteEvent(r: Route): MiddlemanNavigateEvent {
   const focus = r.page === "focus";
-  let navType: MiddlemanNavigateEvent["type"];
+  let navType: MiddlemanNavigateType;
   if (r.page === "focus") {
     if (r.itemType === "mrs") {
       navType = "pull";
@@ -552,7 +621,7 @@ function buildRouteEvent(r: Route): MiddlemanNavigateEvent {
     navType = r.view === "board" ? "board" : "pull";
   } else if (r.page === "issues") {
     navType = "issue";
-  } else if (r.page === "repos") {
+  } else if (r.page === "repos" || r.page === "repo-browser") {
     navType = "repos";
   } else if (r.page === "kata") {
     navType = "kata";
@@ -562,7 +631,7 @@ function buildRouteEvent(r: Route): MiddlemanNavigateEvent {
     navType = "messages";
   } else if (r.page === "reviews") {
     navType = "reviews";
-  } else if (isWorkspacePage(r.page)) {
+  } else if (r.page === "project-intake" || isWorkspacePage(r.page)) {
     navType = "workspaces";
   } else if (r.page === "design-system") {
     navType = "activity";
@@ -570,33 +639,48 @@ function buildRouteEvent(r: Route): MiddlemanNavigateEvent {
     navType = "activity";
   }
 
+  let page: MiddlemanNavigatePage;
+  if (navType === "pull") {
+    page = "pulls";
+  } else if (navType === "issue") {
+    page = "issues";
+  } else {
+    page = navType;
+  }
+
   const event: MiddlemanNavigateEvent = {
+    page,
     type: navType,
     focus,
-    view: stripBase(window.location.pathname) + window.location.search,
+    view: stripBase(currentLocationPath()),
   };
 
-  if (r.page === "focus" && "owner" in r) {
-    event.owner = r.owner;
-    event.name = r.name;
+  if (r.page === "focus" && "repoPath" in r) {
+    applyRouteRepoIdentity(event, r);
     event.number = r.number;
   } else if (r.page === "pulls" && "selected" in r && r.selected) {
-    event.owner = r.selected.owner;
-    event.name = r.selected.name;
+    applyRouteRepoIdentity(event, r.selected);
     event.number = r.selected.number;
   } else if (r.page === "issues" && "selected" in r && r.selected) {
-    event.owner = r.selected.owner;
-    event.name = r.selected.name;
+    applyRouteRepoIdentity(event, r.selected);
     event.number = r.selected.number;
+  } else if ("repoPath" in r) {
+    applyRouteRepoIdentity(event, r);
   }
 
   // Populate repo from focus list route or global config.
   if (r.page === "focus" && "repo" in r && r.repo) {
-    event.repo = r.repo;
-  } else {
+    const repoIdentity = parseFocusListRepoIdentity(r.repo);
+    if (repoIdentity) {
+      applyRouteRepoIdentity(event, repoIdentity);
+    } else {
+      event.repo = r.repo;
+    }
+  } else if (!event.repo_path) {
     const cfgRepo = getEmbedUIConfig().repo;
     if (cfgRepo) {
-      event.repo = `${cfgRepo.owner}/${cfgRepo.name}`;
+      const repo = embedConfigRepoName(cfgRepo);
+      if (repo) event.repo = repo;
     }
   }
 
@@ -608,6 +692,48 @@ function buildRouteEvent(r: Route): MiddlemanNavigateEvent {
   return event;
 }
 
+function applyRouteRepoIdentity(event: MiddlemanNavigateEvent, ref: RepoRef): void {
+  event.provider = ref.provider;
+  if (ref.platformHost) event.platform_host = ref.platformHost;
+  event.repo_path = ref.repoPath;
+  event.repo = ref.repoPath;
+  event.owner = ref.owner;
+  event.name = ref.name;
+}
+
+function parseFocusListRepoIdentity(repo: string): RepoRef | undefined {
+  const raw = repo.trim();
+  if (!raw || raw.includes(",")) return undefined;
+  const pipeIndex = raw.indexOf("|");
+  if (pipeIndex <= 0) return undefined;
+  const provider = raw.slice(0, pipeIndex).trim();
+  const hostAndPath = raw.slice(pipeIndex + 1);
+  const slashIndex = hostAndPath.indexOf("/");
+  if (!provider || slashIndex <= 0) return undefined;
+  const platformHost = hostAndPath.slice(0, slashIndex).trim();
+  const repoPath = hostAndPath
+    .slice(slashIndex + 1)
+    .trim()
+    .replace(/^\/+|\/+$/g, "");
+  const repoParts = repoPath ? splitRepoPath(repoPath) : undefined;
+  if (!platformHost || !repoPath || !repoParts) return undefined;
+  return {
+    provider,
+    platformHost,
+    repoPath,
+    owner: repoParts.owner,
+    name: repoParts.name,
+  };
+}
+
+function embedConfigRepoName(repo: NonNullable<ReturnType<typeof getEmbedUIConfig>["repo"]>): string | undefined {
+  const repoPath = repo.repo_path?.trim().replace(/^\/+|\/+$/g, "");
+  if (repoPath) return repoPath;
+  const owner = repo.owner?.trim().replace(/^\/+|\/+$/g, "");
+  const name = repo.name?.trim().replace(/^\/+|\/+$/g, "");
+  return owner && name ? `${owner}/${name}` : undefined;
+}
+
 function emptyToNull(value: string | null): string | null {
   return value && value.length > 0 ? value : null;
 }
@@ -615,6 +741,14 @@ function emptyToNull(value: string | null): string | null {
 function parseKataView(value: string | null): KataTaskViewName | undefined {
   if (value === null) return undefined;
   return kataViewNames.has(value as KataTaskViewName) ? (value as KataTaskViewName) : undefined;
+}
+
+function parseRepoBrowserRefType(value: string | null): "branch" | "tag" | "commit" | undefined {
+  return value === "branch" || value === "tag" || value === "commit" ? value : undefined;
+}
+
+function parseRepoBrowserViewMode(value: string | null): "source" | "preview" | undefined {
+  return value === "source" || value === "preview" ? value : undefined;
 }
 
 export function isWorkspacePage(page: Page): boolean {

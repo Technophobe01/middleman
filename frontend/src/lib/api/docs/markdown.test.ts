@@ -135,6 +135,43 @@ describe("renderDocsMarkdown", () => {
     expect(html).toMatch(/see #abc/);
   });
 
+  test("renders numeric repo references as provider item links when repo context is present", () => {
+    const html = renderDocsMarkdown("See #12 and group/project!13.", {
+      ...baseOptions,
+      repoContext: {
+        provider: "gitlab",
+        platformHost: "gitlab.example.com",
+        owner: "group",
+        name: "project",
+        repoPath: "group/project",
+      },
+    });
+
+    expect(html).toContain('class="item-ref" href="/host/gitlab.example.com/issues/gitlab/group/project/12"');
+    expect(html).toContain('data-number="12" data-item-type="issue"');
+    expect(html).toContain('data-external-url="https://gitlab.example.com/group/project/-/issues/12"');
+    expect(html).toContain('href="/host/gitlab.example.com/pulls/gitlab/group/project/13"');
+    expect(html).toContain('data-number="13" data-item-type="pr"');
+    expect(html).not.toContain('data-kata-short-id="12"');
+  });
+
+  test("does not turn repo references inside raw code into provider item links", () => {
+    const html = renderDocsMarkdown("<code>#12</code>", {
+      ...baseOptions,
+      repoContext: {
+        provider: "github",
+        platformHost: "",
+        owner: "acme",
+        name: "widgets",
+        repoPath: "acme/widgets",
+      },
+    });
+
+    expect(html).toContain("<code>#12</code>");
+    expect(html).not.toContain("item-ref");
+    expect(html).not.toContain('data-number="12"');
+  });
+
   test("mention regex stops on trailing sentence punctuation", () => {
     const html = renderDocsMarkdown("Hello @wes.", baseOptions);
     expect(html).toMatch(/data-kata-mention="wes"/);
@@ -223,6 +260,24 @@ describe("hardened rendering", () => {
   test("renders external https images as-is", () => {
     const html = renderDocsMarkdown("![](https://example.com/logo.png)", baseOptions);
     expect(html).toMatch(/<img[^>]+src="https:\/\/example.com\/logo.png"/);
+  });
+
+  test("renders external https images as links when image loading is disabled", () => {
+    const html = renderDocsMarkdown("![Logo](https://example.com/logo.png)", {
+      ...baseOptions,
+      allowExternalImages: false,
+    });
+    expect(html).not.toContain("<img");
+    expect(html).toMatch(/<a[^>]+href="https:\/\/example.com\/logo.png"[^>]*>Logo<\/a>/);
+  });
+
+  test("renders obfuscated external images as links when image loading is disabled", () => {
+    const html = renderDocsMarkdown("![Logo](<h\tttps://example.com/logo.png>)", {
+      ...baseOptions,
+      allowExternalImages: false,
+    });
+    expect(html).not.toContain("<img");
+    expect(html).toContain(">Logo</a>");
   });
 
   test("drops protocol-relative markdown link and image", () => {

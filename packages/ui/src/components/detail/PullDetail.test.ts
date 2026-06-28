@@ -3,6 +3,28 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 import type { PullDetail } from "../../api/types.js";
 import { ACTIONS_KEY, API_CLIENT_KEY, NAVIGATE_KEY, STORES_KEY, UI_CONFIG_KEY } from "../../context.js";
 import { createDetailActivityViewStore } from "../../stores/detail-activity-view.svelte.js";
+
+const markdownMockState = vi.hoisted(() => ({
+  pending: false,
+  pendingPromise: new Promise<string>(() => undefined),
+}));
+
+vi.mock("../../utils/markdown.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../utils/markdown.js")>();
+  return {
+    ...actual,
+    renderMarkdown: vi.fn((raw: string, repo?: unknown, opts?: unknown) =>
+      markdownMockState.pending
+        ? markdownMockState.pendingPromise
+        : actual.renderMarkdown(
+            raw,
+            repo as Parameters<typeof actual.renderMarkdown>[1],
+            opts as Parameters<typeof actual.renderMarkdown>[2],
+          ),
+    ),
+  };
+});
+
 import PullDetailComponent from "./PullDetail.svelte";
 
 const capabilities = {
@@ -137,10 +159,12 @@ function renderPullDetail(
       data: {},
     })),
   },
-  options = {
-    hideWorkspaceAction: true,
-  },
+  options: {
+    hideWorkspaceAction?: boolean;
+    actions?: { pull: unknown[] };
+  } = {},
 ) {
+  const actions = options.actions ?? { pull: [] };
   const detailStore = {
     loadDetail: vi.fn(async () => undefined),
     startDetailPolling: vi.fn(),
@@ -166,7 +190,7 @@ function renderPullDetail(
       provider: "github",
       platformHost: "github.com",
       repoPath: "acme/widget",
-      hideWorkspaceAction: options.hideWorkspaceAction,
+      hideWorkspaceAction: options.hideWorkspaceAction ?? true,
     },
     context: new Map<symbol, unknown>([
       [API_CLIENT_KEY, apiClient],
@@ -179,7 +203,7 @@ function renderPullDetail(
           detailActivityView: createDetailActivityViewStore(),
         },
       ],
-      [ACTIONS_KEY, { pull: [] }],
+      [ACTIONS_KEY, actions],
       [UI_CONFIG_KEY, { hideStar: true }],
       [NAVIGATE_KEY, vi.fn()],
     ]),
@@ -201,6 +225,8 @@ describe("PullDetail approvals", () => {
   });
 
   afterEach(() => {
+    markdownMockState.pending = false;
+    markdownMockState.pendingPromise = new Promise<string>(() => undefined);
     cleanup();
     vi.useRealTimers();
   });
@@ -222,6 +248,19 @@ describe("PullDetail approvals", () => {
     expect(document.querySelector(".approval-popup")).toBeNull();
   });
 
+  it("keeps task checkboxes disabled while highlighted markdown is pending", () => {
+    markdownMockState.pending = true;
+    const detail = pullDetail();
+    detail.merge_request.Body = ["- [ ] pending task", "", "```toml", 'model_provider = "my-custom"', "```"].join("\n");
+
+    const { container } = renderPullDetail(detail);
+
+    const checkbox = container.querySelector<HTMLInputElement>(".markdown-body input[type='checkbox']");
+    expect(checkbox).not.toBeNull();
+    expect(checkbox?.disabled).toBe(true);
+    expect(checkbox?.dataset.taskIndex).toBeUndefined();
+  });
+
   it("explains that creating a workspace enables agent sessions", () => {
     renderPullDetail(pullDetail(), undefined, undefined, { hideWorkspaceAction: false });
 
@@ -235,6 +274,48 @@ describe("PullDetail approvals", () => {
       expect(descriptionId).toBeTruthy();
       expect(document.getElementById(descriptionId ?? "")?.textContent).toContain(button.getAttribute("title"));
     }
+  });
+
+  it("forwards worktree link host key to navigate actions", async () => {
+    const detail = pullDetail();
+    detail.worktree_links = [
+      {
+        host_key: "hub",
+        worktree_key: "worktree:/srv/widget-feature",
+        worktree_path: "/srv/widget-feature",
+        worktree_branch: "feature",
+      },
+    ];
+    const navigate = vi.fn();
+
+    renderPullDetail(detail, undefined, undefined, {
+      actions: {
+        pull: [
+          {
+            id: "navigate-worktree",
+            label: "Open Worktree",
+            handler: navigate,
+          },
+        ],
+      },
+    });
+
+    await fireEvent.click(
+      screen.getByRole("button", {
+        name: "Open Worktree: worktree:/srv/widget-feature",
+      }),
+    );
+
+    expect(navigate).toHaveBeenCalledWith({
+      surface: "pull-detail",
+      owner: "acme",
+      name: "widget",
+      number: 1,
+      meta: {
+        host_key: "hub",
+        worktree_key: "worktree:/srv/widget-feature",
+      },
+    });
   });
 
   it("normalizes backend review decision casing before enabling approver popup", async () => {

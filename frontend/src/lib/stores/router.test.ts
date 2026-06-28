@@ -229,6 +229,43 @@ describe("router basic routes", () => {
     expect(getRoute()).toEqual({ page: "repos" });
   });
 
+  it("parses repo browser routes with selected ref, path, and view mode", () => {
+    navigate(
+      "/repo/browser?provider=gitlab&platform_host=gitlab.example.com&repo_path=Group%2FSub%20Team%2FProject&ref_type=branch&ref_name=feature%2Frepo-browser&ref_sha=abc123&path=docs%2FREADME.md&mode=preview",
+    );
+
+    expect(getRoute()).toEqual({
+      page: "repo-browser",
+      provider: "gitlab",
+      platformHost: "gitlab.example.com",
+      repoPath: "Group/Sub Team/Project",
+      owner: "Group/Sub Team",
+      name: "Project",
+      refType: "branch",
+      refName: "feature/repo-browser",
+      refSHA: "abc123",
+      path: "docs/README.md",
+      mode: "preview",
+    });
+    expect(getPage()).toBe("repo-browser");
+  });
+
+  it("parses repo browser routes without letting URL fragments corrupt query params", () => {
+    navigate("/repo/browser?provider=github&repo_path=acme%2Fwidgets&path=docs%2Fguide.md&mode=preview#api-reference");
+
+    expect(getRoute()).toEqual({
+      page: "repo-browser",
+      provider: "github",
+      platformHost: "github.com",
+      repoPath: "acme/widgets",
+      owner: "acme",
+      name: "widgets",
+      path: "docs/guide.md",
+      mode: "preview",
+      anchor: "api-reference",
+    });
+  });
+
   it("parses /kata", () => {
     navigate("/kata");
     expect(getRoute()).toEqual({ page: "kata" });
@@ -477,6 +514,24 @@ describe("router embed-workspace routes", () => {
       projectId: "prj_abc123",
     });
     expect(getPage()).toBe("embed-workspace-project");
+
+    navigate("/workspaces/embed/project/prj_abc123?host=epyc");
+    expect(getRoute()).toEqual({
+      page: "embed-workspace-project",
+      projectId: "prj_abc123",
+      hostKey: "epyc",
+    });
+  });
+
+  it("parses /project-intake with an optional host", () => {
+    navigate("/project-intake");
+    expect(getRoute()).toEqual({ page: "project-intake" });
+
+    navigate("/project-intake?host=epyc");
+    expect(getRoute()).toEqual({
+      page: "project-intake",
+      hostKey: "epyc",
+    });
   });
 
   it("falls back to the standalone workspaces page for unknown project_id shapes", () => {
@@ -499,8 +554,9 @@ describe("router navigation events", () => {
     ).__middleman_notify_config_changed?.();
   });
 
-  function installOnNavigate(spy: ReturnType<typeof vi.fn>): void {
+  function installOnNavigate(spy: ReturnType<typeof vi.fn>, config: Record<string, unknown> = {}): void {
     (window as unknown as { __middleman_config?: unknown }).__middleman_config = {
+      ...config,
       onNavigate: spy,
     };
     (
@@ -518,11 +574,16 @@ describe("router navigation events", () => {
 
     expect(spy).toHaveBeenCalledTimes(1);
     const payload = spy.mock.calls[0]![0];
+    expect(payload.page).toBe("pulls");
     expect(payload.type).toBe("pull");
     expect(payload.focus).toBe(false);
     expect(payload.owner).toBe("acme");
     expect(payload.name).toBe("widgets");
     expect(payload.number).toBe(42);
+    expect(payload.provider).toBe("github");
+    expect(payload.platform_host).toBe("github.com");
+    expect(payload.repo_path).toBe("acme/widgets");
+    expect(payload.repo).toBe("acme/widgets");
   });
 
   it("fires onNavigate with pull payload for conversation route", () => {
@@ -533,10 +594,61 @@ describe("router navigation events", () => {
 
     expect(spy).toHaveBeenCalledTimes(1);
     const payload = spy.mock.calls[0]![0];
+    expect(payload.page).toBe("pulls");
     expect(payload.type).toBe("pull");
     expect(payload.owner).toBe("acme");
     expect(payload.name).toBe("widgets");
     expect(payload.number).toBe(42);
+  });
+
+  it("fires onNavigate with pulls page for focus pull route", () => {
+    const spy = vi.fn();
+    installOnNavigate(spy);
+
+    navigate(focusPrRoute);
+
+    expect(spy).toHaveBeenCalledTimes(1);
+    const payload = spy.mock.calls[0]![0];
+    expect(payload.page).toBe("pulls");
+    expect(payload.type).toBe("pull");
+    expect(payload.focus).toBe(true);
+    expect(payload.owner).toBe("acme");
+    expect(payload.name).toBe("widgets");
+    expect(payload.number).toBe(42);
+  });
+
+  it("fires provider-aware repo payloads for focus list repo filters", () => {
+    const spy = vi.fn();
+    installOnNavigate(spy);
+
+    navigate("/focus/mrs?repo=gitlab%7Cgitlab.example.com%2Fgroup%2Fsubgroup%2Fproject");
+
+    const payload = spy.mock.calls[spy.mock.calls.length - 1]![0];
+    expect(payload.page).toBe("pulls");
+    expect(payload.type).toBe("pull");
+    expect(payload.focus).toBe(true);
+    expect(payload.provider).toBe("gitlab");
+    expect(payload.platform_host).toBe("gitlab.example.com");
+    expect(payload.repo_path).toBe("group/subgroup/project");
+    expect(payload.owner).toBe("group/subgroup");
+    expect(payload.name).toBe("project");
+    expect(payload.repo).toBe("group/subgroup/project");
+  });
+
+  it("keeps legacy focus list repo filters opaque in navigation events", () => {
+    const spy = vi.fn();
+    installOnNavigate(spy);
+
+    navigate("/focus/issues?repo=acme%2Fwidgets");
+
+    const payload = spy.mock.calls[spy.mock.calls.length - 1]![0];
+    expect(payload.page).toBe("issues");
+    expect(payload.type).toBe("issue");
+    expect(payload.focus).toBe(true);
+    expect(payload.repo).toBe("acme/widgets");
+    expect(payload.provider).toBeUndefined();
+    expect(payload.platform_host).toBeUndefined();
+    expect(payload.repo_path).toBeUndefined();
   });
 
   it("fires onNavigate without owner/name/number for /pulls list", () => {
@@ -547,7 +659,38 @@ describe("router navigation events", () => {
 
     expect(spy).toHaveBeenCalledTimes(1);
     const payload = spy.mock.calls[0]![0];
-    expect(payload).toEqual({ type: "pull", focus: false, view: "/pulls" });
+    expect(payload).toEqual({
+      page: "pulls",
+      type: "pull",
+      focus: false,
+      view: "/pulls",
+    });
+  });
+
+  it("fires onNavigate with board page for /pulls/board", () => {
+    const spy = vi.fn();
+    installOnNavigate(spy);
+
+    navigate("/pulls/board");
+
+    expect(spy).toHaveBeenCalledTimes(1);
+    const payload = spy.mock.calls[0]![0];
+    expect(payload.page).toBe("board");
+    expect(payload.type).toBe("board");
+    expect(payload.focus).toBe(false);
+  });
+
+  it("fires onNavigate with issues page for issue list route", () => {
+    const spy = vi.fn();
+    installOnNavigate(spy);
+
+    navigate("/issues");
+
+    expect(spy).toHaveBeenCalledTimes(1);
+    const payload = spy.mock.calls[0]![0];
+    expect(payload.page).toBe("issues");
+    expect(payload.type).toBe("issue");
+    expect(payload.focus).toBe(false);
   });
 
   it("maps /design-system to activity navigation events", () => {
@@ -558,6 +701,7 @@ describe("router navigation events", () => {
 
     expect(spy).toHaveBeenCalledTimes(1);
     const payload = spy.mock.calls[0]![0];
+    expect(payload.page).toBe("activity");
     expect(payload.type).toBe("activity");
     expect(payload.view).toBe("/design-system");
   });
@@ -569,6 +713,7 @@ describe("router navigation events", () => {
     navigate("/kata");
 
     const payload = spy.mock.calls[spy.mock.calls.length - 1]![0];
+    expect(payload.page).toBe("kata");
     expect(payload.type).toBe("kata");
     expect(payload.view).toBe("/kata");
   });
@@ -580,6 +725,7 @@ describe("router navigation events", () => {
     navigate("/docs?folder=notes&doc=Daily%2Ftoday.md");
 
     const payload = spy.mock.calls[spy.mock.calls.length - 1]![0];
+    expect(payload.page).toBe("docs");
     expect(payload.type).toBe("docs");
     expect(payload.view).toBe("/docs?folder=notes&doc=Daily%2Ftoday.md");
   });
@@ -591,8 +737,72 @@ describe("router navigation events", () => {
     navigate("/messages?q=from%3Aops");
 
     const payload = spy.mock.calls[spy.mock.calls.length - 1]![0];
+    expect(payload.page).toBe("messages");
     expect(payload.type).toBe("messages");
     expect(payload.view).toBe("/messages?q=from%3Aops");
+  });
+
+  it("maps repo browser routes to provider-aware repos navigation events and preserves URL fragments", () => {
+    const spy = vi.fn();
+    installOnNavigate(spy);
+
+    navigate(
+      "/repo/browser?provider=gitlab&platform_host=gitlab.example.com&repo_path=group%2Fsubgroup%2Fproject&path=README.md&mode=preview#install",
+    );
+
+    const payload = spy.mock.calls[spy.mock.calls.length - 1]![0];
+    expect(payload.type).toBe("repos");
+    expect(payload.provider).toBe("gitlab");
+    expect(payload.platform_host).toBe("gitlab.example.com");
+    expect(payload.repo_path).toBe("group/subgroup/project");
+    expect(payload.owner).toBe("group/subgroup");
+    expect(payload.name).toBe("project");
+    expect(payload.repo).toBe("group/subgroup/project");
+    expect(payload.view).toBe(
+      "/repo/browser?provider=gitlab&platform_host=gitlab.example.com&repo_path=group%2Fsubgroup%2Fproject&path=README.md&mode=preview#install",
+    );
+  });
+
+  it("prefers route repo identity over embed repo config for repo browser navigation events", () => {
+    const spy = vi.fn();
+    installOnNavigate(spy, {
+      ui: {
+        repo: {
+          provider: "gitlab",
+          platform_host: "gitlab.example.com",
+          repo_path: "other/group/project",
+        },
+      },
+    });
+
+    navigate("/repo/browser?provider=gitlab&platform_host=gitlab.example.com&repo_path=group%2Fsubgroup%2Fproject");
+
+    const payload = spy.mock.calls[spy.mock.calls.length - 1]![0];
+    expect(payload.type).toBe("repos");
+    expect(payload.repo).toBe("group/subgroup/project");
+    expect(payload.provider).toBe("gitlab");
+    expect(payload.platform_host).toBe("gitlab.example.com");
+    expect(payload.repo_path).toBe("group/subgroup/project");
+  });
+
+  it("falls back to embed owner and name for navigation event repo names", () => {
+    const spy = vi.fn();
+    installOnNavigate(spy, {
+      ui: {
+        repo: {
+          provider: "github",
+          platform_host: "github.com",
+          owner: "acme",
+          name: "widgets",
+        },
+      },
+    });
+
+    navigate("/repos");
+
+    const payload = spy.mock.calls[spy.mock.calls.length - 1]![0];
+    expect(payload.type).toBe("repos");
+    expect(payload.repo).toBe("acme/widgets");
   });
 
   it("maps every embed-workspace route to a workspaces navigation event", () => {
@@ -606,12 +816,14 @@ describe("router navigation events", () => {
       "/workspaces/embed/empty/noWorkspace",
       "/workspaces/embed/first-run",
       "/workspaces/embed/project/prj_abc123",
+      "/project-intake?host=epyc",
     ];
 
     for (const path of embedPaths) {
       spy.mockClear();
       navigate(path);
       const payload = spy.mock.calls[spy.mock.calls.length - 1]![0];
+      expect(payload.page, `page for ${path}`).toBe("workspaces");
       expect(payload.type, `type for ${path}`).toBe("workspaces");
       expect(payload.focus, `focus for ${path}`).toBe(false);
     }

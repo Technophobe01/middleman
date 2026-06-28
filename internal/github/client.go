@@ -241,6 +241,7 @@ func NewClient(
 		SetHeader:           tokenauth.BearerAuthHeader,
 		RetryOnUnauthorized: true,
 		AllowedOrigin:       allowedOrigin,
+		GitHubOwner:         githubOwnerFromRequest,
 	}
 	et := &etagTransport{base: authRT}
 	var transport http.RoundTripper = et
@@ -317,6 +318,44 @@ func NewClient(
 		graphQLEndpoint:        graphQLEndpoint,
 		etag:                   et,
 	}, nil
+}
+
+func githubOwnerFromRequest(req *http.Request) string {
+	if req == nil || req.URL == nil {
+		return ""
+	}
+	if owner := githubOwnerFromPath(req.URL.Path); owner != "" {
+		return owner
+	}
+	if req.GetBody == nil {
+		return ""
+	}
+	body, err := req.GetBody()
+	if err != nil {
+		return ""
+	}
+	defer body.Close()
+	var payload struct {
+		Variables map[string]any `json:"variables"`
+	}
+	if err := json.NewDecoder(body).Decode(&payload); err != nil {
+		return ""
+	}
+	owner, _ := payload.Variables["owner"].(string)
+	return owner
+}
+
+func githubOwnerFromPath(path string) string {
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	for i, part := range parts {
+		if part == "repos" && i+2 < len(parts) {
+			return parts[i+1]
+		}
+		if (part == "orgs" || part == "users") && i+2 < len(parts) && parts[i+2] == "repos" {
+			return parts[i+1]
+		}
+	}
+	return ""
 }
 
 // mutationAuthTransport marks every request's context with
@@ -427,6 +466,20 @@ func (c *liveClient) splitAuthActive() bool {
 		return false
 	}
 	return c.source.Descriptor().HasActiveGitHubApp()
+}
+
+// splitAuthActiveForOwner is splitAuthActive scoped to a single owner:
+// it reports whether reads for owner actually resolve through an app
+// installation token. A host descriptor may carry app candidates for
+// several owners, but a candidate scoped to one installation account is
+// skipped for any other owner during token resolution. Gate
+// installation-token-only endpoints on this so a PAT-backed owner on a
+// host that also hosts another owner's app is not routed there.
+func (c *liveClient) splitAuthActiveForOwner(owner string) bool {
+	if c.source == nil {
+		return false
+	}
+	return c.source.Descriptor().HasActiveGitHubAppForOwner(owner)
 }
 
 func (c *liveClient) bypassNotificationReadRateReserve() bool {
@@ -1333,7 +1386,8 @@ func (c *liveClient) ListOpenIssues(
 func (c *liveClient) ListRepositoriesByOwner(
 	ctx context.Context, owner string,
 ) ([]*gh.Repository, error) {
-	if c.splitAuthActive() {
+	if c.splitAuthActiveForOwner(owner) {
+		ctx = tokenauth.WithGitHubOwner(ctx, owner)
 		repos, err := collectPages(
 			ctx,
 			func(opts *gh.ListOptions) ([]*gh.Repository, *gh.Response, error) {
@@ -1597,6 +1651,7 @@ func (c *liveClient) ListPullRequestReviewThreads(
 	repo string,
 	number int,
 ) ([]PullRequestReviewThread, error) {
+	ctx = tokenauth.WithGitHubOwner(ctx, owner)
 	type graphQLResponse struct {
 		Errors []graphQLError `json:"errors"`
 		Data   struct {

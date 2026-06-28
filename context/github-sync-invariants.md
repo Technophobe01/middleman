@@ -61,6 +61,26 @@ For pull requests, that means:
   persisted activity, not just one subset of the detail payload.
 - Background sync cooldowns are allowed, but user-initiated refreshes must still
   be able to promote a stronger sync intent over an in-flight background fetch.
+- Recently active open PRs in the fast-sync lane are cadence-gated by activity
+  age, not just by membership in `active_pr_window`
+  (`internal/github/sync.go::activeMRRefreshInterval`). Hot PRs use
+  `active_pr_refresh_interval`; older PRs still inside the window fall back to
+  a slower cadence so the Activity view stays fresh without spending the same
+  request rate on hours-old rows. A missing `detail_fetched_at` remains due
+  immediately (`internal/github/sync.go::activeMRDueForFastSync`).
+- GitHub detail ETags reduce both payload work and middleman's eager-refresh
+  budget spend for unchanged PRs; the sync budget transport does not count
+  `304 Not Modified` responses (`internal/github/budget_transport.go::budgetTransport`).
+  Active watched-PR sync must use the same persisted pull-request ETag path as
+  detail drain (`internal/github/sync.go::syncMRForRepo`,
+  `internal/github/sync.go::getPullRequestForDetail`,
+  `internal/github/sync.go::markUnchangedMRDetailFetched`). Manual/API PR
+  refreshes must bypass that PR ETag gate so rerun checks, workflow approval,
+  comments, reviews, and commits can refresh even when GitHub's PR resource is
+  unchanged (`internal/github/sync.go::SyncMR`,
+  `internal/server/huma_routes.go::syncPR`). Cadence control is still required
+  because changed PRs correctly fall through to comments, reviews, commits, CI,
+  and workflow approval refreshes.
 
 ## Timeline Event Rules
 
@@ -104,6 +124,46 @@ Use fallback paths to keep user-visible GitHub features working, not to silently
 change what a field means. Provider-neutral persistence should receive the same
 semantic shape regardless of whether data came from GraphQL, REST, tags, or
 fallback repository listing.
+
+## GitHub App Manifest Flow
+
+`middleman-github-app create` uses GitHub's App Manifest flow so sync can read
+with installation tokens. Even though middleman disables webhooks and polls,
+the manifest must still include a syntactically valid `hook_attributes.url`;
+GitHub's live manifest validator can report the missing hook URL as a generic
+`"url" wasn't supplied` error. Do not remove that hook URL from
+`internal/githubapp/manifest.go::NewManifest`; keep
+`cmd/middleman-github-app/e2e_test.go::TestCreateFlowEndToEnd` asserting the
+serialized manifest shape so the fake cannot accept a payload GitHub rejects.
+
+GitHub App installation tokens are account-scoped, not host-scoped. An app
+installation for one owner must not authenticate reads for another owner just
+because both repos share the same host. Repo-scoped GitHub reads must resolve app
+tokens with the repository owner in context, and ownerless contexts such as
+clone auth must fall through to PAT/`gh` credentials. This owner scoping governs
+endpoint selection, not just token resolution: choose an installation-token-only
+read endpoint (such as installation-repositories listing) only when the requested
+owner actually resolves to an app installation. Gating it on whether the host has
+any active app sends a PAT-backed owner that shares the host with another owner's
+app to an endpoint its credential cannot use, which fails even though the token
+chain "correctly" falls back to the PAT.
+Config may carry multiple `[[github_apps]]` rows for one host, but those rows
+represent distinct app credentials. Management commands must target one row by
+app owner/installation account or app id, and duplicate installation accounts on
+the same host are invalid. Selected-repository coverage applies only to repos
+owned by that row's `installation_account`, and the install CLI must not warn
+that an installation on one account "cannot reach" repos owned by another
+account. Re-running `install` after a coverage failure (or against a restored
+config) reconfigures the existing installation instead of minting a new
+installation id, so on a clean install-poll timeout the flow adopts an
+already-present installation rather than only ever waiting for a newly created
+one. Adoption runs only after a clean poll deadline and is bounded by intent:
+adopt only the app's sole installation when its account is the recorded
+installation account or owns a configured repo that resolves to the app.
+Multiple installations or a lone installation on an unrelated account leave the
+deadline as a timeout instead of recording the wrong account. A transient probe
+error or a user interrupt is not a clean deadline: it surfaces the original
+error or cancellation unchanged and never adopts.
 
 ## Testing Expectations
 

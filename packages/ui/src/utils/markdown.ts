@@ -1,6 +1,8 @@
 import { Marked } from "marked";
 import type { RendererObject, TokenizerAndRendererExtension, Tokens } from "marked";
 import DOMPurify from "dompurify";
+import type { UponSanitizeAttributeHook } from "dompurify";
+import { getSingletonHighlighter, type BundledLanguage, type Highlighter } from "shiki";
 import { canonicalProvider } from "../api/provider-routes.js";
 import { itemReferenceAnchorAttributes } from "./item-reference.js";
 import type { ItemReferenceType } from "./item-reference.js";
@@ -48,7 +50,7 @@ function renderItemRefToken(token: Tokens.Generic): string {
   return `<a ${itemReferenceAnchorAttributes(token)}>${token.text}</a>`;
 }
 
-function itemRefExtension(repo?: RepoContext): TokenizerAndRendererExtension {
+export function providerItemRefExtension(repo?: RepoContext): TokenizerAndRendererExtension {
   const supportsBangMR = canonicalProvider(repo?.provider ?? "") === "gitlab";
   return {
     name: "itemRef",
@@ -63,8 +65,12 @@ function itemRefExtension(repo?: RepoContext): TokenizerAndRendererExtension {
       const adjustedMR = mrBareIdx >= 0 && src[mrBareIdx] !== "!" ? mrBareIdx + 1 : mrBareIdx;
       return [crossIdx, adjusted, adjustedMR].filter((idx) => idx >= 0).sort((a, b) => a - b)[0];
     },
-    tokenizer(this: { lexer: { state: { inLink: boolean } } }, src: string): ItemRefToken | undefined {
-      if (this.lexer.state.inLink || !repo) return undefined;
+    tokenizer(
+      this: { lexer?: { state?: { inLink?: boolean; inRawBlock?: boolean } } },
+      src: string,
+    ): ItemRefToken | undefined {
+      const state = this.lexer?.state;
+      if (state?.inLink || state?.inRawBlock || !repo) return undefined;
 
       const crossMatch = src.match(/^([\w.-]+(?:\/[\w.-]+)+)([#!])(\d+)(?!\w)/);
       if (crossMatch) {
@@ -150,6 +156,9 @@ type ListItemFrame = { checkboxIndex: number };
 let renderState: {
   taskIndex: number;
   interactiveTasks: boolean;
+  highlightCode: boolean;
+  highlightedCodeTokens?: WeakSet<Tokens.Code> | undefined;
+  shikiNonce: string;
   itemStack: ListItemFrame[];
   // Counts blockquote nesting depth so listitem can detect when it
   // sits inside `> ...`. The source-side task helpers don't see
@@ -161,13 +170,17 @@ let renderState: {
 } = {
   taskIndex: 0,
   interactiveTasks: false,
+  highlightCode: true,
+  highlightedCodeTokens: undefined,
+  shikiNonce: "",
   itemStack: [],
   blockquoteDepth: 0,
 };
 
-const htmlCache = new Map<string, string>();
+const htmlCache = new Map<string, Promise<string>>();
 const markedCache = new Map<string, Marked>();
 const MARKDOWN_ALLOWED_ATTRS = [
+  "style",
   "target",
   "data-provider",
   "data-platform-host",
@@ -178,6 +191,7 @@ const MARKDOWN_ALLOWED_ATTRS = [
   "data-item-type",
   "data-external-url",
   "data-task-index",
+  "data-middleman-shiki",
   "draggable",
 ];
 
@@ -193,8 +207,66 @@ const DRAG_HANDLE_SVG =
   `<circle cx="9" cy="13" r="1.2"/>` +
   `</svg>`;
 
+const SHIKI_LIGHT_THEME = "github-light-default";
+const SHIKI_DARK_THEME = "github-dark-default";
+const SHIKI_THEMES = {
+  light: SHIKI_LIGHT_THEME,
+  dark: SHIKI_DARK_THEME,
+} as const;
+const SHIKI_PLAINTEXT_LANG = "text";
+const SHIKI_GENERATED_ATTR = "data-middleman-shiki";
+const SHIKI_MAX_HIGHLIGHTED_FENCES = 20;
+const SHIKI_MAX_DISTINCT_LANGUAGES = 8;
+const SHIKI_MAX_HIGHLIGHTED_BYTES = 100_000;
+let shikiHighlighter: Highlighter | undefined;
+let shikiHighlighterPromise: Promise<Highlighter> | undefined;
+let shikiNonceFallbackCounter = 0;
+
+function getShikiHighlighter(): Promise<Highlighter> {
+  shikiHighlighterPromise ??= getSingletonHighlighter({
+    themes: [SHIKI_LIGHT_THEME, SHIKI_DARK_THEME],
+    langs: [],
+  }).then((highlighter) => {
+    shikiHighlighter = highlighter;
+    return highlighter;
+  });
+  return shikiHighlighterPromise;
+}
+
 function isMermaidFence(lang: string | undefined): boolean {
   return (lang ?? "").trim().split(/\s+/, 1)[0]?.toLowerCase() === "mermaid";
+}
+
+function codeFenceLanguage(lang: string | undefined): string {
+  return (lang ?? "").trim().split(/\s+/, 1)[0]?.toLowerCase() || SHIKI_PLAINTEXT_LANG;
+}
+
+function plainCodeBlock(text: string): string {
+  return `<pre><code>${escapeHtml(text)}</code></pre>`;
+}
+
+function renderHighlightedCode(token: Tokens.Code): string {
+  if (!renderState.highlightCode || !shikiHighlighter) return plainCodeBlock(token.text);
+  if (!renderState.highlightedCodeTokens?.has(token)) return plainCodeBlock(token.text);
+  const lang = codeFenceLanguage(token.lang);
+  try {
+    return markTrustedShikiHtml(
+      shikiHighlighter.codeToHtml(token.text, { lang, themes: SHIKI_THEMES, defaultColor: false }),
+    );
+  } catch {
+    return markTrustedShikiHtml(
+      shikiHighlighter.codeToHtml(token.text, {
+        lang: SHIKI_PLAINTEXT_LANG,
+        themes: SHIKI_THEMES,
+        defaultColor: false,
+      }),
+    );
+  }
+}
+
+function markTrustedShikiHtml(html: string): string {
+  const marker = `${SHIKI_GENERATED_ATTR}="${renderState.shikiNonce}"`;
+  return html.replace("<pre ", `<pre ${marker} `).replaceAll("<span ", `<span ${marker} `);
 }
 
 function escapeHtml(value: string): string {
@@ -209,8 +281,10 @@ const taskListRenderer: RendererObject = {
     return `<blockquote>\n${inner}</blockquote>\n`;
   },
   code(token: Tokens.Code): string | false {
-    if (!isMermaidFence(token.lang)) return false;
-    return `<pre class="mermaid">${escapeHtml(token.text)}</pre>`;
+    if (isMermaidFence(token.lang)) {
+      return `<pre class="mermaid">${escapeHtml(token.text)}</pre>`;
+    }
+    return renderHighlightedCode(token);
   },
   // The checkbox renderer is called during the recursive parse
   // of a listitem's inner tokens. It allocates the next task
@@ -267,7 +341,7 @@ function getMarked(repo?: RepoContext): Marked {
   let instance = markedCache.get(key);
   if (!instance) {
     instance = new Marked({ breaks: true, gfm: true });
-    instance.use({ extensions: [itemRefExtension(repo)] });
+    instance.use({ extensions: [providerItemRefExtension(repo)] });
     instance.use({
       renderer: taskListRenderer,
     });
@@ -283,20 +357,74 @@ export interface RenderedMarkdownBlock {
   html: string;
 }
 
-function resetRenderState(opts: RenderMarkdownOpts): void {
+function resetRenderState(
+  opts: RenderMarkdownOpts,
+  highlightCode = true,
+  highlightedCodeTokens?: WeakSet<Tokens.Code>,
+): void {
   renderState = {
     taskIndex: 0,
     interactiveTasks: !!opts.interactiveTasks,
+    highlightCode,
+    highlightedCodeTokens,
+    shikiNonce: shikiNonce(),
     itemStack: [],
     blockquoteDepth: 0,
   };
 }
 
 function sanitizeMarkdownHtml(html: string): string {
-  return DOMPurify.sanitize(html, {
-    ADD_ATTR: MARKDOWN_ALLOWED_ATTRS,
+  DOMPurify.addHook("uponSanitizeAttribute", shikiStyleSanitizer);
+  try {
+    const sanitized = DOMPurify.sanitize(html, {
+      ADD_ATTR: MARKDOWN_ALLOWED_ATTRS,
+    });
+    return sanitized.replaceAll(new RegExp(`\\s${SHIKI_GENERATED_ATTR}="[^"]*"`, "g"), "");
+  } finally {
+    DOMPurify.removeHook("uponSanitizeAttribute", shikiStyleSanitizer);
+  }
+}
+
+function shikiNonce(): string {
+  const crypto = globalThis.crypto;
+  if (crypto?.randomUUID) return crypto.randomUUID();
+  if (crypto?.getRandomValues) {
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  }
+  return `${Date.now()}-${shikiNonceFallbackCounter++}`;
+}
+
+const SHIKI_STYLE_PROPERTY = /^--shiki-(?:light|dark)(?:-bg)?$/;
+const SHIKI_STYLE_VALUE = /^#[0-9a-fA-F]{3,8}$/;
+
+function shikiStyleIsAllowed(value: string): boolean {
+  const declarations = value
+    .split(";")
+    .map((declaration) => declaration.trim())
+    .filter(Boolean);
+  if (declarations.length === 0) return false;
+  return declarations.every((declaration) => {
+    const separator = declaration.indexOf(":");
+    if (separator <= 0) return false;
+    const property = declaration.slice(0, separator).trim();
+    const styleValue = declaration.slice(separator + 1).trim();
+    return SHIKI_STYLE_PROPERTY.test(property) && SHIKI_STYLE_VALUE.test(styleValue);
   });
 }
+
+const shikiStyleSanitizer: UponSanitizeAttributeHook = (node, data) => {
+  if (data.attrName !== "style") return;
+  const tagName = node.tagName.toLowerCase();
+  const trustedShikiNode = node.getAttribute(SHIKI_GENERATED_ATTR) === renderState.shikiNonce;
+  const isStyledShikiNode =
+    trustedShikiNode &&
+    ((tagName === "pre" && node.classList.contains("shiki")) || (tagName === "span" && node.closest("pre.shiki")));
+  if (!isStyledShikiNode || !shikiStyleIsAllowed(data.attrValue)) {
+    data.keepAttr = false;
+  }
+};
 
 function visibleTokenLineCount(raw: string): number {
   if (!raw) return 0;
@@ -330,6 +458,86 @@ function tokenRaw(tokens: Tokens.Generic[]): string {
   return tokens.map((token) => token.raw).join("");
 }
 
+function isCodeToken(token: Tokens.Generic): token is Tokens.Code {
+  return token.type === "code" && typeof token.text === "string";
+}
+
+function utf8ByteLength(value: string): number {
+  let bytes = 0;
+  for (let i = 0; i < value.length; i++) {
+    const code = value.charCodeAt(i);
+    if (code <= 0x7f) {
+      bytes += 1;
+    } else if (code <= 0x7ff) {
+      bytes += 2;
+    } else if (code >= 0xd800 && code <= 0xdbff && i + 1 < value.length) {
+      const next = value.charCodeAt(i + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        bytes += 4;
+        i++;
+      } else {
+        bytes += 3;
+      }
+    } else {
+      bytes += 3;
+    }
+  }
+  return bytes;
+}
+
+interface CodeHighlightPlan {
+  tokens: WeakSet<Tokens.Code>;
+  languages: string[];
+}
+
+function codeHighlightPlan(marked: Marked, tokens: Tokens.Generic[]): CodeHighlightPlan {
+  const highlightedTokens = new WeakSet<Tokens.Code>();
+  const languages = new Set<string>();
+  let highlightedFences = 0;
+  let highlightedBytes = 0;
+
+  marked.walkTokens(tokens, (token) => {
+    if (!isCodeToken(token) || isMermaidFence(token.lang)) return;
+    if (highlightedFences >= SHIKI_MAX_HIGHLIGHTED_FENCES) return;
+
+    const textBytes = utf8ByteLength(token.text);
+    if (highlightedBytes + textBytes > SHIKI_MAX_HIGHLIGHTED_BYTES) return;
+
+    const lang = codeFenceLanguage(token.lang);
+    if (lang !== SHIKI_PLAINTEXT_LANG && !languages.has(lang) && languages.size >= SHIKI_MAX_DISTINCT_LANGUAGES) {
+      return;
+    }
+
+    highlightedTokens.add(token);
+    highlightedFences++;
+    highlightedBytes += textBytes;
+    if (lang !== SHIKI_PLAINTEXT_LANG) {
+      languages.add(lang);
+    }
+  });
+
+  return { tokens: highlightedTokens, languages: [...languages] };
+}
+
+async function loadCodeFenceLanguage(lang: string, highlighter: Highlighter): Promise<void> {
+  if (lang === SHIKI_PLAINTEXT_LANG) return;
+  try {
+    const resolvedLang = highlighter.resolveLangAlias(lang);
+    if (highlighter.getLoadedLanguages().includes(resolvedLang)) return;
+    await highlighter.loadLanguage(lang as BundledLanguage);
+  } catch {
+    // Unknown fence info strings render as escaped plain text.
+  }
+}
+
+async function loadCodeFenceLanguages(languages: string[]): Promise<void> {
+  if (languages.length === 0) return;
+  const highlighter = shikiHighlighter ?? (await getShikiHighlighter());
+  for (const lang of languages) {
+    await loadCodeFenceLanguage(lang, highlighter);
+  }
+}
+
 export function renderMarkdownBlocks(
   raw: string,
   repo?: RepoContext,
@@ -338,7 +546,9 @@ export function renderMarkdownBlocks(
   if (!raw) return [];
   const marked = getMarked(repo);
   const tokens = marked.lexer(raw) as Tokens.Generic[];
-  resetRenderState(opts);
+  // Rich-preview block slicing is synchronous by design; keep code fences
+  // plain here instead of making output depend on prior async Shiki loads.
+  resetRenderState(opts, false);
   const blocks: RenderedMarkdownBlock[] = [];
   let line = 1;
   for (let i = 0; i < tokens.length; i++) {
@@ -392,17 +602,49 @@ export function extractMarkdownDefinitionLines(raw: string, repo?: RepoContext):
   return lines;
 }
 
-export function renderMarkdown(raw: string, repo?: RepoContext, opts: RenderMarkdownOpts = {}): string {
-  if (!raw) return "";
+export function renderMarkdown(raw: string, repo?: RepoContext, opts: RenderMarkdownOpts = {}): Promise<string> {
+  if (!raw) return Promise.resolve("");
   const interactiveTasks = !!opts.interactiveTasks;
   const repoKey = repo ? `${repo.provider}/${repo.platformHost ?? ""}/${repo.repoPath}` : "";
   const key = `${repoKey}\0${interactiveTasks ? 1 : 0}\0${raw}`;
   const cached = htmlCache.get(key);
   if (cached !== undefined) return cached;
 
-  resetRenderState(opts);
-  const html = sanitizeMarkdownHtml(getMarked(repo).parse(raw) as string);
+  const html = renderMarkdownUncached(raw, repo, opts);
   if (htmlCache.size > 500) htmlCache.clear();
   htmlCache.set(key, html);
+  html.catch(() => {
+    htmlCache.delete(key);
+  });
   return html;
+}
+
+async function renderMarkdownUncached(
+  raw: string,
+  repo: RepoContext | undefined,
+  opts: RenderMarkdownOpts,
+): Promise<string> {
+  const marked = getMarked(repo);
+  const tokens = marked.lexer(raw) as Tokens.Generic[];
+  const highlightPlan = codeHighlightPlan(marked, tokens);
+  await loadCodeFenceLanguages(highlightPlan.languages);
+  return renderMarkdownTokens(marked, tokens, opts, true, highlightPlan.tokens);
+}
+
+export function renderMarkdownSync(raw: string, repo?: RepoContext, opts: RenderMarkdownOpts = {}): string {
+  if (!raw) return "";
+  const marked = getMarked(repo);
+  const tokens = marked.lexer(raw) as Tokens.Generic[];
+  return renderMarkdownTokens(marked, tokens, opts, false);
+}
+
+function renderMarkdownTokens(
+  marked: Marked,
+  tokens: Tokens.Generic[],
+  opts: RenderMarkdownOpts,
+  highlightCode = true,
+  highlightedCodeTokens?: WeakSet<Tokens.Code>,
+): string {
+  resetRenderState(opts, highlightCode, highlightedCodeTokens);
+  return sanitizeMarkdownHtml(marked.parser(tokens) as string);
 }

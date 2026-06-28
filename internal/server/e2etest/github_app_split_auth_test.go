@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	Assert "github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/middleman/internal/config"
@@ -35,7 +35,7 @@ import (
 // (posting a PR comment) must carry the user's PAT so GitHub
 // attributes it to the user instead of the app bot.
 func TestGitHubAppSplitAuthE2E(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	t.Setenv("MIDDLEMAN_GITHUB_TOKEN", "user-pat-e2e")
 
@@ -192,7 +192,11 @@ repository_selection = "all"
 	var source tokenauth.Source
 	for _, plan := range cfg.ProviderTokenSources() {
 		src := sourceSet.Upsert(plan.Descriptor)
-		if _, err := src.Token(t.Context()); err != nil {
+		tokenCtx := t.Context()
+		if plan.GitHubOwner != "" {
+			tokenCtx = tokenauth.WithGitHubOwner(tokenCtx, plan.GitHubOwner)
+		}
+		if _, err := src.Token(tokenCtx); err != nil {
 			if !plan.Required && errors.Is(err, tokenauth.ErrMissingToken) {
 				continue
 			}
@@ -312,7 +316,7 @@ repository_selection = "all"
 
 	// The repo settings refresh resolved with the PAT, so the stored
 	// merge permission must reflect the user, not the read-only app.
-	dbRepo, err := database.GetRepoByOwnerName(t.Context(), "kenn-io", "middleman")
+	dbRepo, err := database.GetRepoByIdentity(t.Context(), db.GitHubRepoIdentity("github.com", "kenn-io", "middleman"))
 	require.NoError(err)
 	assert.True(dbRepo.ViewerCanMerge,
 		"viewer_can_merge must come from the PAT-visible permissions, not the app's")
@@ -360,7 +364,7 @@ repository_selection = "all"
 }
 
 func TestGitHubAppGlobDiscoveryUsesInstallationRepositoriesE2E(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	t.Setenv("MIDDLEMAN_GITHUB_TOKEN", "user-pat-e2e")
 
@@ -502,7 +506,11 @@ repository_selection = "all"
 	var source tokenauth.Source
 	for _, plan := range cfg.ProviderTokenSources() {
 		src := sourceSet.Upsert(plan.Descriptor)
-		if _, err := src.Token(t.Context()); err != nil {
+		tokenCtx := t.Context()
+		if plan.GitHubOwner != "" {
+			tokenCtx = tokenauth.WithGitHubOwner(tokenCtx, plan.GitHubOwner)
+		}
+		if _, err := src.Token(tokenCtx); err != nil {
 			if !plan.Required && errors.Is(err, tokenauth.ErrMissingToken) {
 				continue
 			}
@@ -591,7 +599,7 @@ func decodeRepoOperations(t *testing.T, body io.Reader) map[string]repoOperation
 // app every write must be reported unavailable up front and the
 // mutation endpoint must refuse rather than write as the app bot.
 func TestGitHubAppNoUserCredentialGatesWritesE2E(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	// The configured PAT env var is present but empty: only the app
 	// candidate can resolve a token.
@@ -665,7 +673,11 @@ repository_selection = "all"
 	var source tokenauth.Source
 	for _, plan := range cfg.ProviderTokenSources() {
 		src := sourceSet.Upsert(plan.Descriptor)
-		if _, err := src.Token(t.Context()); err != nil {
+		tokenCtx := t.Context()
+		if plan.GitHubOwner != "" {
+			tokenCtx = tokenauth.WithGitHubOwner(tokenCtx, plan.GitHubOwner)
+		}
+		if _, err := src.Token(tokenCtx); err != nil {
 			if !plan.Required && errors.Is(err, tokenauth.ErrMissingToken) {
 				continue
 			}

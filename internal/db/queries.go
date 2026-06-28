@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -1240,7 +1241,7 @@ func mergeWorkspaceRowsForIdentityChangeTx(
 		   ON target.platform_host = ?
 		  AND target.repo_path_key = ?
 		  AND target.item_type = source.item_type
-		  AND target.item_number = source.item_number
+		  AND target.item_key = source.item_key
 		 WHERE source.platform_host = ?
 		   AND source.repo_path_key = ?
 		   AND source.id <> target.id`,
@@ -1969,57 +1970,6 @@ func (d *DB) UpdateRepoProviderMetadata(
 	return nil
 }
 
-// GetRepoByOwnerName returns the repo for the given owner/name, or nil if not found.
-// Config validation rejects duplicate owner/name across hosts, so this should
-// always be unambiguous. The ORDER BY provides deterministic results as a
-// safety net if stale data from a previous config exists in the database.
-func (d *DB) GetRepoByOwnerName(ctx context.Context, owner, name string) (*Repo, error) {
-	_, owner, name = canonicalRepoIdentifier("", owner, name)
-	var r Repo
-	err := d.ro.QueryRowContext(ctx,
-		`SELECT id, platform, platform_host, platform_repo_id,
-		        owner, name, repo_path,
-		        owner_key, name_key, repo_path_key,
-		        web_url, clone_url, default_branch,
-		        last_sync_started_at, last_sync_completed_at,
-		        last_sync_error, allow_squash_merge, allow_merge_commit,
-		        allow_rebase_merge, viewer_can_merge,
-		        backfill_pr_page, backfill_pr_complete,
-		        backfill_pr_completed_at,
-		        backfill_issue_page, backfill_issue_complete,
-		        backfill_issue_completed_at,
-		        label_catalog_synced_at, label_catalog_checked_at,
-		        label_catalog_sync_error,
-		        created_at
-		 FROM middleman_repos WHERE owner_key = ? AND name_key = ?
-		 ORDER BY platform_host ASC LIMIT 1`, owner, name,
-	).Scan(
-		&r.ID, &r.Platform, &r.PlatformHost, &r.PlatformRepoID,
-		&r.Owner, &r.Name, &r.RepoPath,
-		&r.OwnerKey, &r.NameKey, &r.RepoPathKey,
-		&r.WebURL, &r.CloneURL, &r.DefaultBranch,
-		&r.LastSyncStartedAt, &r.LastSyncCompletedAt,
-		&r.LastSyncError,
-		&r.AllowSquashMerge, &r.AllowMergeCommit, &r.AllowRebaseMerge,
-		&r.ViewerCanMerge,
-		&r.BackfillPRPage, &r.BackfillPRComplete,
-		&r.BackfillPRCompletedAt,
-		&r.BackfillIssuePage, &r.BackfillIssueComplete,
-		&r.BackfillIssueCompletedAt,
-		&r.LabelCatalogSyncedAt, &r.LabelCatalogCheckedAt,
-		&r.LabelCatalogSyncError,
-		&r.CreatedAt,
-	)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("get repo by owner/name: %w", err)
-	}
-	normalizeRepoTimestamps(&r)
-	return &r, nil
-}
-
 // GetRepoByIdentity returns the repo for the provider-qualified identity,
 // or nil if not found.
 func (d *DB) GetRepoByIdentity(ctx context.Context, identity RepoIdentity) (*Repo, error) {
@@ -2335,9 +2285,14 @@ func (d *DB) UpsertMergeRequest(ctx context.Context, mr *MergeRequest) (int64, e
 	return id, nil
 }
 
-// GetMergeRequest returns a merge request by repo owner/name and MR number, or nil if not found.
-func (d *DB) GetMergeRequest(ctx context.Context, owner, name string, number int) (*MergeRequest, error) {
-	_, owner, name = canonicalRepoLookupIdentifier("", owner, name)
+// GetMergeRequest returns a merge request by repository identity and MR number, or nil if not found.
+func (d *DB) GetMergeRequest(
+	ctx context.Context,
+	platform, platformHost, owner, name string,
+	number int,
+) (*MergeRequest, error) {
+	platform = canonicalRepoPlatform(platform)
+	platformHost, owner, name = canonicalRepoLookupIdentifier(platformHost, owner, name)
 	var mr MergeRequest
 	err := d.ro.QueryRowContext(ctx, `
 		SELECT p.id, p.repo_id, p.platform_id, p.platform_external_id, p.number, p.url, p.title,
@@ -2361,8 +2316,10 @@ func (d *DB) GetMergeRequest(ctx context.Context, owner, name string, number int
 		LEFT JOIN middleman_kanban_state k ON k.merge_request_id = p.id
 		LEFT JOIN middleman_starred_items s
 		    ON s.item_type = 'pr' AND s.repo_id = p.repo_id AND s.number = p.number
-		WHERE r.owner_key = ? AND r.name_key = ? AND p.number = ?`,
-		owner, name, number,
+		WHERE r.platform = ? AND r.platform_host = ?
+		  AND r.owner_key = ? AND r.name_key = ?
+		  AND p.number = ?`,
+		platform, platformHost, owner, name, number,
 	).Scan(
 		&mr.ID, &mr.RepoID, &mr.PlatformID, &mr.PlatformExternalID, &mr.Number, &mr.URL, &mr.Title,
 		&mr.Author, &mr.AuthorDisplayName, &mr.State, &mr.IsDraft, &mr.IsLocked,
@@ -2813,27 +2770,6 @@ func (d *DB) GetKanbanState(ctx context.Context, mrID int64) (*KanbanState, erro
 	return &k, nil
 }
 
-// --- Helpers ---
-
-// GetMRIDByRepoAndNumber returns the internal MR ID for a given repo+number.
-func (d *DB) GetMRIDByRepoAndNumber(ctx context.Context, owner, name string, number int) (int64, error) {
-	_, owner, name = canonicalRepoLookupIdentifier("", owner, name)
-	var id int64
-	err := d.ro.QueryRowContext(ctx, `
-		SELECT p.id FROM middleman_merge_requests p
-		JOIN middleman_repos r ON r.id = p.repo_id
-		WHERE r.owner_key = ? AND r.name_key = ? AND p.number = ?`,
-		owner, name, number,
-	).Scan(&id)
-	if errors.Is(err, sql.ErrNoRows) {
-		return 0, fmt.Errorf("MR %s/%s#%d not found", owner, name, number)
-	}
-	if err != nil {
-		return 0, fmt.Errorf("get mr id by repo and number: %w", err)
-	}
-	return id, nil
-}
-
 // GetPreviouslyOpenMRNumbers returns MR numbers that are open in the DB but
 // not in the stillOpen set — i.e. MRs that were closed/merged since the last sync.
 func (d *DB) GetPreviouslyOpenMRNumbers(
@@ -3124,13 +3060,20 @@ func (s *DiffSHAs) Stale() bool {
 }
 
 // GetDiffSHAs returns the diff-related SHAs for a merge request.
-func (d *DB) GetDiffSHAs(ctx context.Context, owner, name string, number int) (*DiffSHAs, error) {
-	_, owner, name = canonicalRepoLookupIdentifier("", owner, name)
+func (d *DB) GetDiffSHAs(
+	ctx context.Context,
+	platform, platformHost, owner, name string,
+	number int,
+) (*DiffSHAs, error) {
+	platform = canonicalRepoPlatform(platform)
+	platformHost, owner, name = canonicalRepoLookupIdentifier(platformHost, owner, name)
 	return d.getDiffSHAs(
 		ctx,
 		`JOIN middleman_repos r ON r.id = p.repo_id
-		 WHERE r.owner_key = ? AND r.name_key = ? AND p.number = ?`,
-		owner, name, number,
+		 WHERE r.platform = ? AND r.platform_host = ?
+		   AND r.owner_key = ? AND r.name_key = ?
+		   AND p.number = ?`,
+		platform, platformHost, owner, name, number,
 	)
 }
 
@@ -3281,11 +3224,14 @@ func (d *DB) UpsertIssue(ctx context.Context, issue *Issue) (int64, error) {
 	return id, nil
 }
 
-// GetIssue returns an issue by repo owner/name and issue number, or nil if not found.
+// GetIssue returns an issue by repository identity and issue number, or nil if not found.
 func (d *DB) GetIssue(
-	ctx context.Context, owner, name string, number int,
+	ctx context.Context,
+	platform, platformHost, owner, name string,
+	number int,
 ) (*Issue, error) {
-	_, owner, name = canonicalRepoLookupIdentifier("", owner, name)
+	platform = canonicalRepoPlatform(platform)
+	platformHost, owner, name = canonicalRepoLookupIdentifier(platformHost, owner, name)
 	var issue Issue
 	err := d.ro.QueryRowContext(ctx, `
 		SELECT i.id, i.repo_id, i.platform_id, i.platform_external_id, i.number, i.url, i.title,
@@ -3297,8 +3243,10 @@ func (d *DB) GetIssue(
 		JOIN middleman_repos r ON r.id = i.repo_id
 		LEFT JOIN middleman_starred_items s
 		    ON s.item_type = 'issue' AND s.repo_id = i.repo_id AND s.number = i.number
-		WHERE r.owner_key = ? AND r.name_key = ? AND i.number = ?`,
-		owner, name, number,
+		WHERE r.platform = ? AND r.platform_host = ?
+		  AND r.owner_key = ? AND r.name_key = ?
+		  AND i.number = ?`,
+		platform, platformHost, owner, name, number,
 	).Scan(
 		&issue.ID, &issue.RepoID, &issue.PlatformID, &issue.PlatformExternalID, &issue.Number,
 		&issue.URL, &issue.Title, &issue.Author, &issue.State,
@@ -3489,27 +3437,6 @@ func (d *DB) ListIssues(
 	return issues, nil
 }
 
-// GetIssueIDByRepoAndNumber returns the internal issue ID for a given repo+number.
-func (d *DB) GetIssueIDByRepoAndNumber(
-	ctx context.Context, owner, name string, number int,
-) (int64, error) {
-	_, owner, name = canonicalRepoLookupIdentifier("", owner, name)
-	var id int64
-	err := d.ro.QueryRowContext(ctx, `
-		SELECT i.id FROM middleman_issues i
-		JOIN middleman_repos r ON r.id = i.repo_id
-		WHERE r.owner_key = ? AND r.name_key = ? AND i.number = ?`,
-		owner, name, number,
-	).Scan(&id)
-	if errors.Is(err, sql.ErrNoRows) {
-		return 0, fmt.Errorf("issue %s/%s#%d not found", owner, name, number)
-	}
-	if err != nil {
-		return 0, fmt.Errorf("get issue id by repo and number: %w", err)
-	}
-	return id, nil
-}
-
 // ResolveItemNumber checks whether the given number in a repo is a MR
 // or issue. Returns the item type ("pr" or "issue") and whether it was
 // found. MRs take precedence if both somehow exist.
@@ -3692,9 +3619,10 @@ func (d *DB) UpsertHTTPEtag(
 // detail fetched and records whether CI had pending checks.
 func (d *DB) UpdateMRDetailFetched(
 	ctx context.Context,
-	platformHost, repoOwner, repoName string,
+	platform, platformHost, repoOwner, repoName string,
 	number int, ciHadPending bool,
 ) error {
+	platform = canonicalRepoPlatform(platform)
 	platformHost, repoOwner, repoName = canonicalRepoLookupIdentifier(
 		platformHost, repoOwner, repoName,
 	)
@@ -3704,9 +3632,9 @@ func (d *DB) UpdateMRDetailFetched(
 		    ci_had_pending = ?
 		WHERE repo_id = (
 		    SELECT id FROM middleman_repos
-		    WHERE platform_host = ? AND owner_key = ? AND name_key = ?
+		    WHERE platform = ? AND platform_host = ? AND owner_key = ? AND name_key = ?
 		) AND number = ?`,
-		ciHadPending, platformHost, repoOwner, repoName, number,
+		ciHadPending, platform, platformHost, repoOwner, repoName, number,
 	)
 	if err != nil {
 		return fmt.Errorf("update mr detail fetched: %w", err)
@@ -3787,8 +3715,9 @@ func (d *DB) UpdateMRWorkflowApproval(
 // detail fetched.
 func (d *DB) UpdateIssueDetailFetched(
 	ctx context.Context,
-	platformHost, repoOwner, repoName string, number int,
+	platform, platformHost, repoOwner, repoName string, number int,
 ) error {
+	platform = canonicalRepoPlatform(platform)
 	platformHost, repoOwner, repoName = canonicalRepoLookupIdentifier(
 		platformHost, repoOwner, repoName,
 	)
@@ -3797,9 +3726,9 @@ func (d *DB) UpdateIssueDetailFetched(
 		SET detail_fetched_at = datetime('now')
 		WHERE repo_id = (
 		    SELECT id FROM middleman_repos
-		    WHERE platform_host = ? AND owner_key = ? AND name_key = ?
+		    WHERE platform = ? AND platform_host = ? AND owner_key = ? AND name_key = ?
 		) AND number = ?`,
-		platformHost, repoOwner, repoName, number,
+		platform, platformHost, repoOwner, repoName, number,
 	)
 	if err != nil {
 		return fmt.Errorf("update issue detail fetched: %w", err)
@@ -4397,82 +4326,6 @@ func (d *DB) GetAllWorktreeLinks(
 	return scanWorktreeLinks(rows)
 }
 
-// GetRepoByHostOwnerName returns the repo for the given
-// host/owner/name triple, or nil if not found.
-func (d *DB) GetRepoByHostOwnerName(
-	ctx context.Context,
-	host, owner, name string,
-) (*Repo, error) {
-	host, owner, name = canonicalRepoIdentifier(host, owner, name)
-	var r Repo
-	err := d.ro.QueryRowContext(ctx,
-		`SELECT id, platform, platform_host, platform_repo_id,
-		        owner, name, repo_path,
-		        owner_key, name_key, repo_path_key,
-		        web_url, clone_url, default_branch,
-		        last_sync_started_at, last_sync_completed_at,
-		        last_sync_error, allow_squash_merge, allow_merge_commit,
-		        allow_rebase_merge, viewer_can_merge,
-		        backfill_pr_page, backfill_pr_complete,
-		        backfill_pr_completed_at,
-		        backfill_issue_page, backfill_issue_complete,
-		        backfill_issue_completed_at,
-		        label_catalog_synced_at, label_catalog_checked_at,
-		        label_catalog_sync_error,
-		        created_at
-		 FROM middleman_repos
-		 WHERE platform_host = ? AND owner_key = ? AND name_key = ?
-		 ORDER BY platform ASC LIMIT 1`,
-		host, owner, name,
-	).Scan(
-		&r.ID, &r.Platform, &r.PlatformHost, &r.PlatformRepoID,
-		&r.Owner, &r.Name, &r.RepoPath,
-		&r.OwnerKey, &r.NameKey, &r.RepoPathKey,
-		&r.WebURL, &r.CloneURL, &r.DefaultBranch,
-		&r.LastSyncStartedAt, &r.LastSyncCompletedAt,
-		&r.LastSyncError,
-		&r.AllowSquashMerge, &r.AllowMergeCommit, &r.AllowRebaseMerge,
-		&r.ViewerCanMerge,
-		&r.BackfillPRPage, &r.BackfillPRComplete,
-		&r.BackfillPRCompletedAt,
-		&r.BackfillIssuePage, &r.BackfillIssueComplete,
-		&r.BackfillIssueCompletedAt,
-		&r.LabelCatalogSyncedAt, &r.LabelCatalogCheckedAt,
-		&r.LabelCatalogSyncError,
-		&r.CreatedAt,
-	)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf(
-			"get repo by host/owner/name: %w", err,
-		)
-	}
-	normalizeRepoTimestamps(&r)
-	return &r, nil
-}
-
-// CountReposByHostOwnerName returns how many provider identities share a
-// host/owner/name lookup key.
-func (d *DB) CountReposByHostOwnerName(
-	ctx context.Context,
-	host, owner, name string,
-) (int, error) {
-	host, owner, name = canonicalRepoIdentifier(host, owner, name)
-	var count int
-	err := d.ro.QueryRowContext(ctx, `
-		SELECT COUNT(*)
-		FROM middleman_repos
-		WHERE platform_host = ? AND owner_key = ? AND name_key = ?`,
-		host, owner, name,
-	).Scan(&count)
-	if err != nil {
-		return 0, fmt.Errorf("count repos by host/owner/name: %w", err)
-	}
-	return count, nil
-}
-
 // --- Workspaces ---
 
 func canonicalWorkspacePlatform(provider string) string {
@@ -4510,6 +4363,55 @@ func (d *DB) canonicalizeWorkspaceRepo(
 	return matchedProvider, host, displayOwner, displayName, repoOwnerKey, repoNameKey, repoPathKey, nil
 }
 
+func workspaceItemKeyForInsert(ws *Workspace) (string, error) {
+	itemKey := strings.TrimSpace(ws.ItemKey)
+	if itemKey != "" {
+		return itemKey, nil
+	}
+	if ws.ItemType == WorkspaceItemTypeKataTask {
+		return "", errors.New("kata task workspace item_key is required")
+	}
+	return strconv.Itoa(ws.ItemNumber), nil
+}
+
+func workspaceKataMetadataJSON(ws *Workspace) (string, error) {
+	if ws.KataMetadata == nil {
+		return "", nil
+	}
+	data, err := json.Marshal(ws.KataMetadata)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+func scanWorkspace(scanner interface{ Scan(...any) error }) (*Workspace, error) {
+	var ws Workspace
+	var kataMetadataJSON string
+	err := scanner.Scan(
+		&ws.ID, &ws.Platform, &ws.PlatformHost, &ws.RepoOwner, &ws.RepoName,
+		&ws.ItemType, &ws.ItemNumber, &ws.ItemKey, &ws.AssociatedPRNumber,
+		&ws.GitHeadRef, &ws.MRHeadRepo, &ws.WorkspaceBranch,
+		&ws.WorktreePath, &ws.TmuxSession, &ws.TerminalBackend, &ws.Status,
+		&ws.ErrorMessage, &ws.CreatedAt, &kataMetadataJSON,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if ws.ItemKey == "" && ws.ItemType != WorkspaceItemTypeKataTask {
+		ws.ItemKey = strconv.Itoa(ws.ItemNumber)
+	}
+	ws.CreatedAt = ws.CreatedAt.UTC()
+	if strings.TrimSpace(kataMetadataJSON) != "" {
+		var metadata WorkspaceKataMetadata
+		if err := json.Unmarshal([]byte(kataMetadataJSON), &metadata); err != nil {
+			return nil, fmt.Errorf("decode workspace kata metadata: %w", err)
+		}
+		ws.KataMetadata = &metadata
+	}
+	return &ws, nil
+}
+
 // InsertWorkspace inserts a new workspace row.
 func (d *DB) InsertWorkspace(
 	ctx context.Context, ws *Workspace,
@@ -4527,25 +4429,34 @@ func (d *DB) InsertWorkspace(
 	if ws.TerminalBackend == "" {
 		ws.TerminalBackend = "tmux"
 	}
+	itemKey, err := workspaceItemKeyForInsert(ws)
+	if err != nil {
+		return fmt.Errorf("insert workspace: %w", err)
+	}
+	kataMetadataJSON, err := workspaceKataMetadataJSON(ws)
+	if err != nil {
+		return fmt.Errorf("encode workspace kata metadata: %w", err)
+	}
 	_, err = d.rw.ExecContext(ctx, `
 		INSERT INTO middleman_workspaces
 		    (id, platform, platform_host, repo_owner, repo_name,
 		     repo_owner_key, repo_name_key, repo_path_key,
-		     item_type, item_number, associated_pr_number,
+		     item_type, item_number, item_key, associated_pr_number,
 		     git_head_ref, mr_head_repo, workspace_branch,
 		     worktree_path, tmux_session, terminal_backend, status,
-		     error_message)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		     error_message, kata_metadata)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		ws.ID, ws.Platform, ws.PlatformHost, ws.RepoOwner, ws.RepoName,
 		repoOwnerKey, repoNameKey, repoPathKey,
-		ws.ItemType, ws.ItemNumber, ws.AssociatedPRNumber,
+		ws.ItemType, ws.ItemNumber, itemKey, ws.AssociatedPRNumber,
 		ws.GitHeadRef, ws.MRHeadRepo, ws.WorkspaceBranch,
 		ws.WorktreePath, ws.TmuxSession, ws.TerminalBackend, ws.Status,
-		ws.ErrorMessage,
+		ws.ErrorMessage, kataMetadataJSON,
 	)
 	if err != nil {
 		return fmt.Errorf("insert workspace: %w", err)
 	}
+	ws.ItemKey = itemKey
 	return nil
 }
 
@@ -4553,29 +4464,21 @@ func (d *DB) InsertWorkspace(
 func (d *DB) GetWorkspace(
 	ctx context.Context, id string,
 ) (*Workspace, error) {
-	var ws Workspace
-	err := d.ro.QueryRowContext(ctx, `
+	ws, err := scanWorkspace(d.ro.QueryRowContext(ctx, `
 		SELECT id, platform, platform_host, repo_owner, repo_name,
-		       item_type, item_number, associated_pr_number,
+		       item_type, item_number, item_key, associated_pr_number,
 		       git_head_ref, mr_head_repo, workspace_branch,
 		       worktree_path, tmux_session, terminal_backend, status,
-		       error_message, created_at
+		       error_message, created_at, kata_metadata
 		FROM middleman_workspaces WHERE id = ?`, id,
-	).Scan(
-		&ws.ID, &ws.Platform, &ws.PlatformHost, &ws.RepoOwner, &ws.RepoName,
-		&ws.ItemType, &ws.ItemNumber, &ws.AssociatedPRNumber,
-		&ws.GitHeadRef, &ws.MRHeadRepo, &ws.WorkspaceBranch,
-		&ws.WorktreePath, &ws.TmuxSession, &ws.TerminalBackend, &ws.Status,
-		&ws.ErrorMessage, &ws.CreatedAt,
-	)
+	))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("get workspace: %w", err)
 	}
-	ws.CreatedAt = ws.CreatedAt.UTC()
-	return &ws, nil
+	return ws, nil
 }
 
 // GetWorkspaceByMR returns the workspace for a specific MR,
@@ -4607,34 +4510,26 @@ func (d *DB) getWorkspaceByMR(
 ) (*Workspace, error) {
 	provider = strings.ToLower(strings.TrimSpace(provider))
 	platformHost, owner, name = canonicalRepoLookupIdentifier(platformHost, owner, name)
-	var ws Workspace
-	err := d.ro.QueryRowContext(ctx, `
+	ws, err := scanWorkspace(d.ro.QueryRowContext(ctx, `
 		SELECT id, platform, platform_host, repo_owner, repo_name,
-		       item_type, item_number, associated_pr_number,
+		       item_type, item_number, item_key, associated_pr_number,
 		       git_head_ref, mr_head_repo, workspace_branch,
 		       worktree_path, tmux_session, terminal_backend, status,
-		       error_message, created_at
+		       error_message, created_at, kata_metadata
 			FROM middleman_workspaces
 			WHERE platform_host = ? AND repo_owner_key = ?
 			  AND repo_name_key = ? AND item_type = ? AND item_number = ?
 			  AND (? = '' OR platform = ?)`,
 		platformHost, owner, name, WorkspaceItemTypePullRequest, mrNumber,
 		provider, provider,
-	).Scan(
-		&ws.ID, &ws.Platform, &ws.PlatformHost, &ws.RepoOwner, &ws.RepoName,
-		&ws.ItemType, &ws.ItemNumber, &ws.AssociatedPRNumber,
-		&ws.GitHeadRef, &ws.MRHeadRepo, &ws.WorkspaceBranch,
-		&ws.WorktreePath, &ws.TmuxSession, &ws.TerminalBackend, &ws.Status,
-		&ws.ErrorMessage, &ws.CreatedAt,
-	)
+	))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("get workspace by MR: %w", err)
 	}
-	ws.CreatedAt = ws.CreatedAt.UTC()
-	return &ws, nil
+	return ws, nil
 }
 
 // GetWorkspaceByIssue returns the workspace for a specific issue,
@@ -4666,34 +4561,58 @@ func (d *DB) getWorkspaceByIssue(
 ) (*Workspace, error) {
 	provider = strings.ToLower(strings.TrimSpace(provider))
 	platformHost, owner, name = canonicalRepoLookupIdentifier(platformHost, owner, name)
-	var ws Workspace
-	err := d.ro.QueryRowContext(ctx, `
+	ws, err := scanWorkspace(d.ro.QueryRowContext(ctx, `
 		SELECT id, platform, platform_host, repo_owner, repo_name,
-		       item_type, item_number, associated_pr_number,
+		       item_type, item_number, item_key, associated_pr_number,
 		       git_head_ref, mr_head_repo, workspace_branch,
 		       worktree_path, tmux_session, terminal_backend, status,
-		       error_message, created_at
+		       error_message, created_at, kata_metadata
 		FROM middleman_workspaces
 		WHERE platform_host = ? AND repo_owner_key = ?
 		  AND repo_name_key = ? AND item_type = ? AND item_number = ?
 		  AND (? = '' OR platform = ?)`,
 		platformHost, owner, name, WorkspaceItemTypeIssue, issueNumber,
 		provider, provider,
-	).Scan(
-		&ws.ID, &ws.Platform, &ws.PlatformHost, &ws.RepoOwner, &ws.RepoName,
-		&ws.ItemType, &ws.ItemNumber, &ws.AssociatedPRNumber,
-		&ws.GitHeadRef, &ws.MRHeadRepo, &ws.WorkspaceBranch,
-		&ws.WorktreePath, &ws.TmuxSession, &ws.TerminalBackend, &ws.Status,
-		&ws.ErrorMessage, &ws.CreatedAt,
-	)
+	))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("get workspace by issue: %w", err)
 	}
-	ws.CreatedAt = ws.CreatedAt.UTC()
-	return &ws, nil
+	return ws, nil
+}
+
+func (d *DB) GetWorkspaceByItemKeyForProvider(
+	ctx context.Context,
+	provider, platformHost, owner, name, itemType, itemKey string,
+) (*Workspace, error) {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	itemType = strings.TrimSpace(itemType)
+	itemKey = strings.TrimSpace(itemKey)
+	if itemType == "" || itemKey == "" {
+		return nil, nil
+	}
+	platformHost, owner, name = canonicalRepoLookupIdentifier(platformHost, owner, name)
+	ws, err := scanWorkspace(d.ro.QueryRowContext(ctx, `
+		SELECT id, platform, platform_host, repo_owner, repo_name,
+		       item_type, item_number, item_key, associated_pr_number,
+		       git_head_ref, mr_head_repo, workspace_branch,
+		       worktree_path, tmux_session, terminal_backend, status,
+		       error_message, created_at, kata_metadata
+		FROM middleman_workspaces
+		WHERE platform_host = ? AND repo_owner_key = ?
+		  AND repo_name_key = ? AND item_type = ? AND item_key = ?
+		  AND (? = '' OR platform = ?)`,
+		platformHost, owner, name, itemType, itemKey, provider, provider,
+	))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get workspace by item key: %w", err)
+	}
+	return ws, nil
 }
 
 // ListWorkspaces returns all workspaces ordered by
@@ -4703,10 +4622,10 @@ func (d *DB) ListWorkspaces(
 ) ([]Workspace, error) {
 	rows, err := d.ro.QueryContext(ctx, `
 		SELECT id, platform, platform_host, repo_owner, repo_name,
-		       item_type, item_number, associated_pr_number,
+		       item_type, item_number, item_key, associated_pr_number,
 		       git_head_ref, mr_head_repo, workspace_branch,
 		       worktree_path, tmux_session, terminal_backend, status,
-		       error_message, created_at
+		       error_message, created_at, kata_metadata
 		FROM middleman_workspaces
 		ORDER BY created_at DESC`,
 	)
@@ -4717,20 +4636,11 @@ func (d *DB) ListWorkspaces(
 
 	var out []Workspace
 	for rows.Next() {
-		var ws Workspace
-		if err := rows.Scan(
-			&ws.ID, &ws.Platform, &ws.PlatformHost, &ws.RepoOwner,
-			&ws.RepoName, &ws.ItemType, &ws.ItemNumber,
-			&ws.AssociatedPRNumber,
-			&ws.GitHeadRef, &ws.MRHeadRepo,
-			&ws.WorkspaceBranch,
-			&ws.WorktreePath, &ws.TmuxSession,
-			&ws.TerminalBackend, &ws.Status, &ws.ErrorMessage, &ws.CreatedAt,
-		); err != nil {
+		ws, err := scanWorkspace(rows)
+		if err != nil {
 			return nil, fmt.Errorf("scan workspace: %w", err)
 		}
-		ws.CreatedAt = ws.CreatedAt.UTC()
-		out = append(out, ws)
+		out = append(out, *ws)
 	}
 	return out, rows.Err()
 }
@@ -5108,10 +5018,10 @@ func (d *DB) DeleteWorkspace(
 // ListWorkspaceSummaries and GetWorkspaceSummary.
 const workspaceSummaryColumns = `
 	w.id, w.platform, w.platform_host, w.repo_owner, w.repo_name,
-	w.item_type, w.item_number, w.associated_pr_number,
+	w.item_type, w.item_number, w.item_key, w.associated_pr_number,
 	w.git_head_ref, w.mr_head_repo, w.workspace_branch,
 	w.worktree_path, w.tmux_session, w.terminal_backend, w.status,
-	w.error_message, w.created_at,
+	w.error_message, w.created_at, w.kata_metadata,
 	CASE
 	    WHEN w.item_type = 'issue' THEN i.title
 	    ELSE m.title
@@ -5149,13 +5059,14 @@ func scanWorkspaceSummary(
 	scanner interface{ Scan(...any) error },
 ) (*WorkspaceSummary, error) {
 	var s WorkspaceSummary
+	var kataMetadataJSON string
 	var itemLastActivityAt sql.NullString
 	err := scanner.Scan(
 		&s.ID, &s.Platform, &s.PlatformHost, &s.RepoOwner, &s.RepoName,
-		&s.ItemType, &s.ItemNumber, &s.AssociatedPRNumber,
+		&s.ItemType, &s.ItemNumber, &s.ItemKey, &s.AssociatedPRNumber,
 		&s.GitHeadRef, &s.MRHeadRepo, &s.WorkspaceBranch,
 		&s.WorktreePath, &s.TmuxSession, &s.TerminalBackend, &s.Status,
-		&s.ErrorMessage, &s.CreatedAt,
+		&s.ErrorMessage, &s.CreatedAt, &kataMetadataJSON,
 		&s.MRTitle, &s.MRState, &s.MRIsDraft, &s.MRCIStatus,
 		&s.MRReviewDecision, &s.MRAdditions, &s.MRDeletions,
 		&itemLastActivityAt,
@@ -5164,6 +5075,20 @@ func scanWorkspaceSummary(
 		return nil, err
 	}
 	s.CreatedAt = s.CreatedAt.UTC()
+	if s.ItemKey == "" && s.ItemType != WorkspaceItemTypeKataTask {
+		s.ItemKey = strconv.Itoa(s.ItemNumber)
+	}
+	if strings.TrimSpace(kataMetadataJSON) != "" {
+		var metadata WorkspaceKataMetadata
+		if err := json.Unmarshal([]byte(kataMetadataJSON), &metadata); err != nil {
+			return nil, fmt.Errorf("decode workspace kata metadata: %w", err)
+		}
+		s.KataMetadata = &metadata
+		if s.ItemType == WorkspaceItemTypeKataTask && s.MRTitle == nil && metadata.Title != "" {
+			title := metadata.Title
+			s.MRTitle = &title
+		}
+	}
 	if itemLastActivityAt.Valid {
 		parsed, err := parseDBTime(itemLastActivityAt.String)
 		if err != nil {

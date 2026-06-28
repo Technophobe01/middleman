@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	Assert "github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/middleman/internal/apiclient/generated"
 	"go.kenn.io/middleman/internal/config"
@@ -21,7 +21,7 @@ import (
 
 func TestWorkspaceRuntimeTargetsE2E(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	fixture := setupWorkspaceServerFixture(t, nil)
 	ctx := t.Context()
@@ -43,7 +43,7 @@ func TestWorkspaceRuntimeTargetsE2E(t *testing.T) {
 
 func TestWorkspaceRuntimeTargetsHideInternalShellTargetE2E(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	dir := t.TempDir()
 	tmuxPath := filepath.Join(dir, "tmux-wrapper")
@@ -103,7 +103,7 @@ func TestWorkspaceRuntimeLaunchUnavailableTargetE2E(t *testing.T) {
 
 func TestWorkspaceRuntimeLaunchPlainShellCreatesRuntimeSessionE2E(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	fixture := setupWorkspaceServerFixture(t, nil)
 	ctx := t.Context()
@@ -134,7 +134,7 @@ func TestWorkspaceRuntimeLaunchPlainShellCreatesRuntimeSessionE2E(t *testing.T) 
 
 func TestWorkspaceRuntimeAttachSpecUsesStoredTmuxSessionE2E(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	tmuxPath := writeWorkspaceRuntimeTmuxProbe(t, "workspace-runtime-live", 0, "")
 	cfg := &config.Config{Tmux: config.Tmux{
@@ -189,6 +189,73 @@ func TestWorkspaceRuntimeAttachSpecUsesStoredTmuxSessionE2E(t *testing.T) {
 		spec.Command,
 	)
 	assert.True(spec.RequiresLocalHost)
+}
+
+func TestWorkspaceCommitsFlagsUnpushedCommitsE2E(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+
+	fixture := setupWorkspaceServerFixture(t, nil)
+	ctx := t.Context()
+	ws := createReadyWorkspace(t, ctx, fixture.client)
+	require.NotEmpty(ws.WorktreePath)
+
+	// Commit locally without pushing. A brand-new commit is unpushed no matter
+	// how the worktree tracks its upstream, so the commits endpoint must flag
+	// it - this proves the push status reaches the wire for a real workspace.
+	runGit(t, ws.WorktreePath, "config", "user.email", "ws@test.com")
+	runGit(t, ws.WorktreePath, "config", "user.name", "Workspace")
+	require.NoError(os.WriteFile(
+		filepath.Join(ws.WorktreePath, "local-only.txt"),
+		[]byte("local\n"), 0o644,
+	))
+	runGit(t, ws.WorktreePath, "add", ".")
+	runGit(t, ws.WorktreePath, "commit", "-m", "local only commit")
+	localSHA := testGitSHA(t, ws.WorktreePath, "HEAD")
+
+	resp, err := fixture.client.HTTP.GetWorkspaceCommitsWithResponse(ctx, ws.Id)
+	require.NoError(err)
+	require.Equal(http.StatusOK, resp.StatusCode())
+	require.NotNil(resp.JSON200)
+	require.NotNil(resp.JSON200.Commits)
+	require.NotEmpty(*resp.JSON200.Commits)
+
+	top := (*resp.JSON200.Commits)[0]
+	assert.Equal(localSHA, top.Sha, "newest commit should be the local-only commit")
+	require.NotNil(top.Pushed, "workspace commits should carry push status")
+	assert.False(*top.Pushed, "freshly committed local commit must be unpushed")
+}
+
+func TestWorkspaceCommitsOmitsPushStatusWithoutUpstreamE2E(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+
+	fixture := setupWorkspaceServerFixture(t, nil)
+	ctx := t.Context()
+	ws := createReadyWorkspace(t, ctx, fixture.client)
+	require.NotEmpty(ws.WorktreePath)
+	require.NotEmpty(ws.GitHeadRef)
+
+	// Drop the branch's upstream so the worktree mimics a fork PR head: the
+	// commits exist but @{upstream} no longer resolves. Push status is then
+	// unknowable, so the endpoint must omit it rather than report every commit
+	// as unpushed (the false "Not pushed to remote" regression roborev flagged).
+	runGit(t, ws.WorktreePath,
+		"config", "--unset", "branch."+ws.GitHeadRef+".remote")
+	runGit(t, ws.WorktreePath,
+		"config", "--unset", "branch."+ws.GitHeadRef+".merge")
+
+	resp, err := fixture.client.HTTP.GetWorkspaceCommitsWithResponse(ctx, ws.Id)
+	require.NoError(err)
+	require.Equal(http.StatusOK, resp.StatusCode())
+	require.NotNil(resp.JSON200)
+	require.NotNil(resp.JSON200.Commits)
+	require.NotEmpty(*resp.JSON200.Commits)
+
+	for _, c := range *resp.JSON200.Commits {
+		assert.Nil(c.Pushed,
+			"push status must be omitted when the branch has no upstream")
+	}
 }
 
 func writeWorkspaceRuntimeTmuxProbe(

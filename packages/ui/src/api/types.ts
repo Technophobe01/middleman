@@ -28,6 +28,11 @@ export type NotificationBulkResponse = components["schemas"]["NotificationBulkRe
 export type NotificationParams = NonNullable<operations["list-notifications"]["parameters"]["query"]>;
 export type CommentAutocompleteResponse = components["schemas"]["CommentAutocompleteResponse"];
 export type CommentAutocompleteReference = components["schemas"]["CommentAutocompleteReference"];
+export type RepoBrowserBlob = components["schemas"]["RepoBrowserBlob"];
+export type RepoBrowserCommit = components["schemas"]["RepoBrowserCommit"];
+export type RepoBrowserRef = components["schemas"]["RepoBrowserRef"];
+export type RepoBrowserRefsResponse = components["schemas"]["RepoBrowserRefsResponse"];
+export type RepoBrowserTreeEntry = components["schemas"]["RepoBrowserTreeEntry"];
 export type ActivityParams = NonNullable<operations["list-activity"]["parameters"]["query"]>;
 export type PullsParams = operations["list-pulls"]["parameters"]["query"];
 export type IssuesParams = operations["list-issues"]["parameters"]["query"];
@@ -88,6 +93,8 @@ export const DEFAULT_MODE_VISIBILITY: ModeVisibility = {
 
 export type AgentSettings = components["schemas"]["Agent"];
 export type ConfigRepo = components["schemas"]["ConfiguredRepoStatus"];
+export type KataProjectRepoMapping = components["schemas"]["KataProjectRepoMapping"];
+export type WorkspaceKataMetadata = components["schemas"]["WorkspaceKataMetadata"];
 type SettingsResponse = components["schemas"]["SettingsResponse"];
 export type Settings = Omit<SettingsResponse, "notifications"> & {
   notifications?: SettingsResponse["notifications"];
@@ -147,6 +154,10 @@ export interface CommitInfo {
   message: string;
   author_name: string;
   authored_at: string;
+  // True when the commit is reachable from the workspace branch's upstream
+  // tracking ref; false means it is local-only. Absent when push status is
+  // unknown, such as pull request commits.
+  pushed?: boolean;
 }
 
 export interface WorkspaceHost {

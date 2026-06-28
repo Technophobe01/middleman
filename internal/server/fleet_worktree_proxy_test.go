@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	Assert "github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/middleman/internal/config"
@@ -60,6 +60,20 @@ func TestFleetWorktreeLifecycleProxiesToPeer(t *testing.T) {
 		wantPath   string
 	}{
 		{
+			name:       "get project",
+			method:     http.MethodGet,
+			path:       "/fleet/hosts/member/projects/prj_1",
+			wantMethod: http.MethodGet,
+			wantPath:   "/api/v1/projects/prj_1",
+		},
+		{
+			name:       "list worktrees",
+			method:     http.MethodGet,
+			path:       "/fleet/hosts/member/projects/prj_1/worktrees",
+			wantMethod: http.MethodGet,
+			wantPath:   "/api/v1/projects/prj_1/worktrees",
+		},
+		{
 			name:       "create worktree",
 			method:     http.MethodPost,
 			path:       "/fleet/hosts/member/projects/prj_1/worktrees",
@@ -111,7 +125,7 @@ func TestFleetWorktreeLifecycleProxiesToPeer(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			require := require.New(t)
-			assert := Assert.New(t)
+			assert := assert.New(t)
 			got = nil
 			req := httptest.NewRequest(
 				tc.method, tc.path, strings.NewReader(tc.body),

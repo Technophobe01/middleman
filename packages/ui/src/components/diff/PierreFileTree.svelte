@@ -3,11 +3,14 @@
   import type { FileTreeOptions } from "@pierre/trees";
   import { onMount, untrack } from "svelte";
   import type { DiffFile } from "../../api/types.js";
+  import type { FileTreeEntry } from "./file-tree-entry.js";
 
   type TreeGitStatus = NonNullable<FileTreeOptions["gitStatus"]>[number];
+  type TreeRowDecoration = NonNullable<FileTreeOptions["renderRowDecoration"]>;
 
   interface Props {
     files: readonly DiffFile[] | null | undefined;
+    entries?: readonly FileTreeEntry[] | null | undefined;
     selectedPath?: string | null;
     selectedPathRevealKey?: number;
     ariaLabel?: string;
@@ -16,6 +19,7 @@
 
   const {
     files,
+    entries = undefined,
     selectedPath = null,
     selectedPathRevealKey = 0,
     ariaLabel = "Changed files",
@@ -29,18 +33,34 @@
   let selectedPathScrollFrame = 0;
   let lastSelectedPathRevealKey: number | null = null;
 
-  const safeFiles = $derived(files ?? []);
-  const treePaths = $derived(safeFiles.map((file) => file.path));
-  const preparedTreeInput = $derived(preparePresortedFileTreeInput(treePaths));
-  const treeGitStatus = $derived(
-    safeFiles.map((file): TreeGitStatus => ({
+  const safeEntries = $derived.by<FileTreeEntry[]>(() => {
+    if (entries) return [...entries];
+    return (files ?? []).map((file) => ({
       path: file.path,
       status: file.status === "copied" ? "renamed" : file.status,
-    })),
+    }));
+  });
+  const treePaths = $derived(safeEntries.map((file) => file.path));
+  const preparedTreeInput = $derived(preparePresortedFileTreeInput(treePaths));
+  const treeGitStatus = $derived(
+    safeEntries.flatMap((file): TreeGitStatus[] => file.status ? [{
+      path: file.path,
+      status: file.status,
+    }] : []),
   );
+  const treeDecorations = $derived(new Map(safeEntries.map((file) => [file.path, file])));
   const treeKey = $derived(
-    `${treePaths.join("\0")}\n${treeGitStatus.map((item) => `${item.path}:${item.status}`).join("\0")}`,
+    `${treePaths.join("\0")}\n${treeGitStatus.map((item) => `${item.path}:${item.status}`).join("\0")}\n${safeEntries.map((item) => `${item.path}:${item.decoration ?? ""}`).join("\0")}`,
   );
+  const renderRowDecoration = $derived.by<TreeRowDecoration>(() => (context) => {
+    if (context.row.kind !== "file") return null;
+    const entry = treeDecorations.get(context.item.path);
+    if (!entry?.decoration) return null;
+    return {
+      text: entry.decoration,
+      ...(entry.decorationTitle && { title: entry.decorationTitle }),
+    };
+  });
   const treeOptions = $derived<FileTreeOptions>({
     preparedInput: preparedTreeInput,
     initialExpansion: "open",
@@ -50,6 +70,7 @@
     density: "compact",
     icons: { set: "complete", colored: false },
     gitStatus: treeGitStatus,
+    renderRowDecoration,
     onSelectionChange: handleTreeSelection,
     unsafeCSS: `
       [data-type='item'] {
@@ -59,8 +80,15 @@
       }
       [data-item-section='icon'],
       [data-item-section='git'],
+      [data-item-section='decoration'],
       [data-item-section='action'] {
         flex-shrink: 0;
+      }
+      [data-item-section='decoration'] {
+        max-width: 4ch;
+        overflow: hidden;
+        color: var(--text-muted);
+        text-overflow: ellipsis;
       }
       [data-item-section='content'] {
         flex: 1 1 auto;

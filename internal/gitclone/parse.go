@@ -86,18 +86,25 @@ func rawStatusToString(s string) (status string, isRenameOrCopy bool) {
 }
 
 // ParsePatch parses unified diff patch output and merges it with
-// pre-populated file metadata from ParseRawZ. Files are correlated by
-// output order (git emits them in the same order).
+// pre-populated file metadata from ParseRawZ.
 func ParsePatch(patch []byte, rawFiles []DiffFile) []DiffFile {
 	fileDiffs, _ := godiff.ParseMultiFileDiff(patch)
 	if len(fileDiffs) == 0 {
 		return rawFiles
 	}
+	if rawFiles == nil {
+		rawFiles = []DiffFile{}
+	}
 
-	for i, fd := range fileDiffs {
-		if i >= len(rawFiles) {
-			break
+	pathIndex := newDiffFilePathIndex(rawFiles)
+	touched := make(map[int]bool, len(fileDiffs))
+
+	for _, fd := range fileDiffs {
+		i, ok := matchFileDiff(rawFiles, pathIndex, fd)
+		if !ok {
+			continue
 		}
+		touched[i] = true
 
 		// Detect binary from extended headers.
 		for _, ext := range fd.Extended {
@@ -176,8 +183,119 @@ func ParsePatch(patch []byte, rawFiles []DiffFile) []DiffFile {
 			}
 			rawFiles[i].Hunks = append(rawFiles[i].Hunks, hunk)
 		}
+	}
+
+	for i := range touched {
 		rawFiles[i].Patch = buildPatch(rawFiles[i])
 	}
 
 	return rawFiles
+}
+
+type diffFilePathIndex struct {
+	paths    map[string][]int
+	oldPaths map[string][]int
+}
+
+func newDiffFilePathIndex(files []DiffFile) diffFilePathIndex {
+	index := diffFilePathIndex{
+		paths:    make(map[string][]int, len(files)),
+		oldPaths: make(map[string][]int, len(files)),
+	}
+	for i, file := range files {
+		if file.Path != "" {
+			index.paths[file.Path] = append(index.paths[file.Path], i)
+		}
+		if file.OldPath != "" {
+			index.oldPaths[file.OldPath] = append(index.oldPaths[file.OldPath], i)
+		}
+	}
+	return index
+}
+
+func matchFileDiff(
+	rawFiles []DiffFile,
+	pathIndex diffFilePathIndex,
+	fd *godiff.FileDiff,
+) (int, bool) {
+	newPath := normalizeDiffHeaderPath(fd.NewName)
+	oldPath := normalizeDiffHeaderPath(fd.OrigName)
+
+	if newPath != "" {
+		candidates := pathIndex.paths[newPath]
+		if len(candidates) == 0 {
+			return 0, false
+		}
+		if oldPath != "" {
+			exact := filterDiffFileCandidates(candidates, func(i int) bool {
+				return rawFiles[i].OldPath == oldPath
+			})
+			if i, ok := uniqueDiffFileCandidate(exact); ok {
+				return i, true
+			}
+			if len(exact) > 0 || candidatesHaveOldPaths(rawFiles, candidates) || oldPath != newPath {
+				return 0, false
+			}
+		}
+		return uniqueDiffFileCandidate(candidates)
+	}
+
+	if oldPath == "" {
+		return 0, false
+	}
+
+	candidates := pathIndex.oldPaths[oldPath]
+	if len(candidates) > 0 {
+		samePath := filterDiffFileCandidates(candidates, func(i int) bool {
+			return rawFiles[i].Path == oldPath
+		})
+		if i, ok := uniqueDiffFileCandidate(samePath); ok {
+			return i, true
+		}
+		if len(samePath) > 0 {
+			return 0, false
+		}
+		return uniqueDiffFileCandidate(candidates)
+	}
+
+	return uniqueDiffFileCandidate(pathIndex.paths[oldPath])
+}
+
+func filterDiffFileCandidates(
+	candidates []int,
+	keep func(int) bool,
+) []int {
+	filtered := make([]int, 0, len(candidates))
+	for _, i := range candidates {
+		if keep(i) {
+			filtered = append(filtered, i)
+		}
+	}
+	return filtered
+}
+
+func uniqueDiffFileCandidate(candidates []int) (int, bool) {
+	if len(candidates) != 1 {
+		return 0, false
+	}
+	return candidates[0], true
+}
+
+func candidatesHaveOldPaths(files []DiffFile, candidates []int) bool {
+	for _, i := range candidates {
+		if files[i].OldPath != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeDiffHeaderPath(path string) string {
+	if path == "" || path == "/dev/null" {
+		return ""
+	}
+	if strings.HasPrefix(path, "a/") || strings.HasPrefix(path, "b/") {
+		return path[2:]
+	}
+	return path
 }

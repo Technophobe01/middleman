@@ -203,7 +203,7 @@ const browserTestProject = defineProject(async () => {
         headless: true,
       },
     },
-  };
+  } satisfies TestProjectInlineConfiguration;
 });
 
 const config = {
@@ -329,6 +329,7 @@ const config = {
       "@middleman/ui > @tiptap/extension-text",
       "@middleman/ui > @tiptap/suggestion",
       "@middleman/ui > prosemirror-state",
+      "@middleman/ui > shiki",
       "@middleman/ui > svelte-tiptap",
       // Frontend-resolvable deps the barrel also pulls in.
       "openapi-fetch",

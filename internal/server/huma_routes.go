@@ -32,7 +32,7 @@ import (
 )
 
 type listPullsInput struct {
-	Repo    string `query:"repo" doc:"Repository filter. Accepts owner/name, platform_host/repo_path, comma-separated values, or provider|platform_host/repo_path for provider-qualified matches."`
+	Repo    string `query:"repo" doc:"Repository filter. Accepts provider|platform_host/repo_path, with comma-separated values for multiple repositories."`
 	State   string `query:"state"`
 	Kanban  string `query:"kanban"`
 	Starred bool   `query:"starred"`
@@ -173,7 +173,7 @@ type resolveDiffReviewThreadInput struct {
 }
 
 type listIssuesInput struct {
-	Repo     string `query:"repo" doc:"Repository filter. Accepts owner/name, platform_host/repo_path, comma-separated values, or provider|platform_host/repo_path for provider-qualified matches."`
+	Repo     string `query:"repo" doc:"Repository filter. Accepts provider|platform_host/repo_path, with comma-separated values for multiple repositories."`
 	State    string `query:"state"`
 	Starred  bool   `query:"starred"`
 	Q        string `query:"q"`
@@ -465,7 +465,7 @@ type getStackForPROutput = bodyOutput[stackContextResponse]
 
 type createWorkspaceInput struct {
 	Body struct {
-		Provider     string `json:"provider,omitempty"`
+		Provider     string `json:"provider"`
 		PlatformHost string `json:"platform_host"`
 		Owner        string `json:"owner"`
 		Name         string `json:"name"`
@@ -600,7 +600,7 @@ type workspaceDiffRequest struct {
 }
 
 type listActivityInput struct {
-	Repo   string   `query:"repo" doc:"Repository filter. Accepts owner/name, platform_host/repo_path, comma-separated values, or provider|platform_host/repo_path for provider-qualified matches."`
+	Repo   string   `query:"repo" doc:"Repository filter. Accepts provider|platform_host/repo_path, with comma-separated values for multiple repositories."`
 	Types  []string `query:"types"`
 	Search string   `query:"search"`
 	After  string   `query:"after"`
@@ -608,7 +608,7 @@ type listActivityInput struct {
 }
 
 type triggerSyncInput struct {
-	PriorityRepos []string `query:"priority_repo" doc:"Optional repository filters to sync first. Accepts repeated values or comma-separated values. Each value may be provider-qualified as provider|platform_host/owner/name, host-qualified as platform_host/owner/name, or bare as owner/name; bare values match the first tracked repo with that repo path."`
+	PriorityRepos []string `query:"priority_repo" doc:"Optional repository filters to sync first. Accepts repeated provider|platform_host/repo_path values or comma-separated values."`
 }
 
 type listActivityOutput = bodyOutput[activityResponse]
@@ -662,6 +662,22 @@ func documentOperation(
 		o.OperationID = operationID
 		o.Summary = summary
 		o.Tags = tags
+	}
+}
+
+func repoBrowserAssetResponses() map[string]*huma.Response {
+	return map[string]*huma.Response{
+		"200": {
+			Description: "Image response",
+			Content: map[string]*huma.MediaType{
+				"image/avif": {Schema: &huma.Schema{Type: "string", Format: "binary"}},
+				"image/bmp":  {Schema: &huma.Schema{Type: "string", Format: "binary"}},
+				"image/gif":  {Schema: &huma.Schema{Type: "string", Format: "binary"}},
+				"image/jpeg": {Schema: &huma.Schema{Type: "string", Format: "binary"}},
+				"image/png":  {Schema: &huma.Schema{Type: "string", Format: "binary"}},
+				"image/webp": {Schema: &huma.Schema{Type: "string", Format: "binary"}},
+			},
+		},
 	}
 }
 
@@ -1232,6 +1248,50 @@ func (s *Server) registerProviderRepoAPI(api huma.API) {
 		documentOperation("get-repo", "Get repository", "Repositories"))
 	huma.Get(api, hostRepoPath, s.getRepoOnHost,
 		documentOperation("get-repo-on-host", "Get repository", "Repositories"))
+	huma.Get(api, repoPath+"/browser/refs", s.listRepoBrowserRefs,
+		documentOperation("list-repo-browser-refs", "List repository browser refs", "Repositories"))
+	huma.Get(api, hostRepoPath+"/browser/refs", s.listRepoBrowserRefsOnHost,
+		documentOperation("list-repo-browser-refs-on-host", "List repository browser refs", "Repositories"))
+	huma.Get(api, repoPath+"/browser/tree", s.listRepoBrowserTree,
+		documentOperation("list-repo-browser-tree", "List repository browser tree", "Repositories"))
+	huma.Get(api, hostRepoPath+"/browser/tree", s.listRepoBrowserTreeOnHost,
+		documentOperation("list-repo-browser-tree-on-host", "List repository browser tree", "Repositories"))
+	huma.Get(api, repoPath+"/browser/blob", s.getRepoBrowserBlob,
+		documentOperation("get-repo-browser-blob", "Get repository browser blob", "Repositories"))
+	huma.Get(api, hostRepoPath+"/browser/blob", s.getRepoBrowserBlobOnHost,
+		documentOperation("get-repo-browser-blob-on-host", "Get repository browser blob", "Repositories"))
+	huma.Register(api, huma.Operation{
+		OperationID:   "get-repo-browser-asset",
+		Method:        http.MethodGet,
+		Path:          repoPath + "/browser/asset",
+		DefaultStatus: http.StatusOK,
+		Summary:       "Get repository browser asset",
+		Description:   "Returns raw image bytes for a repository file. Asset reads require ref_type=commit with ref_sha set to a full 40-character commit SHA; branch and tag refs are rejected with mutable_ref_not_allowed.",
+		Tags:          []string{"Repositories"},
+		Responses:     repoBrowserAssetResponses(),
+	}, s.getRepoBrowserAsset)
+	huma.Register(api, huma.Operation{
+		OperationID:   "get-repo-browser-asset-on-host",
+		Method:        http.MethodGet,
+		Path:          hostRepoPath + "/browser/asset",
+		DefaultStatus: http.StatusOK,
+		Summary:       "Get repository browser asset",
+		Description:   "Returns raw image bytes for a repository file. Asset reads require ref_type=commit with ref_sha set to a full 40-character commit SHA; branch and tag refs are rejected with mutable_ref_not_allowed.",
+		Tags:          []string{"Repositories"},
+		Responses:     repoBrowserAssetResponses(),
+	}, s.getRepoBrowserAssetOnHost)
+	huma.Get(api, repoPath+"/browser/last-changed", s.getRepoBrowserLastChanged,
+		documentOperation("get-repo-browser-last-changed", "Get repository browser last changed commits", "Repositories"))
+	huma.Get(api, hostRepoPath+"/browser/last-changed", s.getRepoBrowserLastChangedOnHost,
+		documentOperation("get-repo-browser-last-changed-on-host", "Get repository browser last changed commits", "Repositories"))
+	huma.Get(api, repoPath+"/browser/history", s.getRepoBrowserHistory,
+		documentOperation("get-repo-browser-history", "Get repository browser file history", "Repositories"))
+	huma.Get(api, hostRepoPath+"/browser/history", s.getRepoBrowserHistoryOnHost,
+		documentOperation("get-repo-browser-history-on-host", "Get repository browser file history", "Repositories"))
+	huma.Get(api, repoPath+"/browser/commit", s.getRepoBrowserCommit,
+		documentOperation("get-repo-browser-commit", "Get repository browser commit", "Repositories"))
+	huma.Get(api, hostRepoPath+"/browser/commit", s.getRepoBrowserCommitOnHost,
+		documentOperation("get-repo-browser-commit-on-host", "Get repository browser commit", "Repositories"))
 	huma.Get(api, repoPath+"/commits/{sha}/diff", s.getRepoCommitDiff,
 		documentOperation("get-repo-commit-diff", "Get repository commit diff", "Repositories"))
 	huma.Get(api, hostRepoPath+"/commits/{sha}/diff", s.getRepoCommitDiffOnHost,
@@ -1341,6 +1401,9 @@ func (s *Server) listPulls(ctx context.Context, input *listPullsInput) (*listPul
 			)
 		}
 	}
+	if hasInvalidRepoFilter(input.Repo) {
+		return nil, problemValidation("query.repo", "repo filter must be provider|platform_host/repo_path")
+	}
 
 	opts := db.ListMergeRequestsOpts{
 		State:       input.State,
@@ -1350,16 +1413,6 @@ func (s *Server) listPulls(ctx context.Context, input *listPullsInput) (*listPul
 		Limit:       input.Limit,
 		Offset:      input.Offset,
 		RepoFilters: parseRepoFilters(input.Repo),
-	}
-	if len(opts.RepoFilters) == 0 {
-		if _, platformHost, owner, name, repoPath := parseRepoFilter(input.Repo); repoPath != "" {
-			opts.PlatformHost = platformHost
-			opts.RepoPath = repoPath
-		} else if owner != "" {
-			opts.PlatformHost = platformHost
-			opts.RepoOwner = owner
-			opts.RepoName = name
-		}
 	}
 
 	mrs, err := s.db.ListMergeRequests(ctx, opts)
@@ -1384,7 +1437,10 @@ func (s *Server) listPulls(ctx context.Context, input *listPullsInput) (*listPul
 	if err != nil {
 		return nil, problemInternal("load worktree links failed")
 	}
-	linksByMR := indexWorktreeLinksByMR(links)
+	linksByMR := indexWorktreeLinksByMR(
+		links,
+		s.fleetSelfKey(""),
+	)
 	workspacesByItem, err := s.buildWorkspaceRefLookup(ctx)
 	if err != nil {
 		return nil, problemInternal("load workspace refs failed")
@@ -1577,7 +1633,7 @@ func (s *Server) buildPullDetailResponse(
 		ReviewedHeadSHA:  verifiedReviewedHeadSHA(mr),
 		DiffHeadSHA:      mr.DiffHeadSHA,
 		MergeBaseSHA:     mr.MergeBaseSHA,
-		WorktreeLinks:    toWorktreeLinkResponses(dbLinks),
+		WorktreeLinks:    toWorktreeLinkResponses(dbLinks, s.fleetSelfKey("")),
 		WorkflowApproval: s.workflowApprovalState(ctx, repo.Owner, repo.Name, mr),
 		Warnings:         s.diffWarnings(mr),
 		DetailLoaded:     mr.DetailFetchedAt != nil,
@@ -1834,6 +1890,7 @@ func (s *Server) setKanbanState(ctx context.Context, input *setKanbanStateInput)
 		return nil, providerRouteLookupError(err)
 	}
 	ref := repoNumberPathRef{
+		repoID:       repo.ID,
 		owner:        repo.Owner,
 		name:         repo.Name,
 		number:       input.Number,
@@ -2056,6 +2113,7 @@ func (s *Server) postComment(ctx context.Context, input *postCommentInput) (*pos
 	}
 
 	ref := repoNumberPathRef{
+		repoID:       repo.ID,
 		owner:        repo.Owner,
 		name:         repo.Name,
 		number:       input.Number,
@@ -2099,6 +2157,7 @@ func (s *Server) editComment(ctx context.Context, input *editCommentInput) (*edi
 	}
 
 	ref := repoNumberPathRef{
+		repoID:       repo.ID,
 		owner:        repo.Owner,
 		name:         repo.Name,
 		number:       input.Number,
@@ -2316,6 +2375,9 @@ func (s *Server) listIssues(ctx context.Context, input *listIssuesInput) (*listI
 			)
 		}
 	}
+	if hasInvalidRepoFilter(input.Repo) {
+		return nil, problemValidation("query.repo", "repo filter must be provider|platform_host/repo_path")
+	}
 
 	opts := db.ListIssuesOpts{
 		State:       input.State,
@@ -2325,16 +2387,6 @@ func (s *Server) listIssues(ctx context.Context, input *listIssuesInput) (*listI
 		Limit:       input.Limit,
 		Offset:      input.Offset,
 		RepoFilters: parseRepoFilters(input.Repo),
-	}
-	if len(opts.RepoFilters) == 0 {
-		if _, platformHost, owner, name, repoPath := parseRepoFilter(input.Repo); repoPath != "" {
-			opts.PlatformHost = platformHost
-			opts.RepoPath = repoPath
-		} else if owner != "" {
-			opts.PlatformHost = platformHost
-			opts.RepoOwner = owner
-			opts.RepoName = name
-		}
 	}
 
 	issues, err := s.db.ListIssues(ctx, opts)
@@ -2546,8 +2598,9 @@ func (s *Server) postIssueComment(ctx context.Context, input *postIssueCommentIn
 	}
 
 	ref := repoNumberPathRef{
-		owner:        input.Owner,
-		name:         input.Name,
+		repoID:       repo.ID,
+		owner:        repo.Owner,
+		name:         repo.Name,
 		number:       input.Number,
 		platformHost: repo.PlatformHost,
 	}
@@ -2590,8 +2643,9 @@ func (s *Server) editIssueComment(ctx context.Context, input *editIssueCommentIn
 	}
 
 	ref := repoNumberPathRef{
-		owner:        input.Owner,
-		name:         input.Name,
+		repoID:       repo.ID,
+		owner:        repo.Owner,
+		name:         repo.Name,
 		number:       input.Number,
 		platformHost: repo.PlatformHost,
 	}
@@ -3691,26 +3745,6 @@ func matchPriorityRepo(
 		}
 		return ghclient.RepoRef{}, false
 	}
-
-	for _, repo := range tracked {
-		if strings.EqualFold(repoPathForPriority(repo), filter) {
-			return repo, true
-		}
-	}
-
-	parts := strings.Split(filter, "/")
-	if len(parts) < 3 {
-		return ghclient.RepoRef{}, false
-	}
-
-	host := parts[0]
-	path := strings.Join(parts[1:], "/")
-	for _, repo := range tracked {
-		if strings.EqualFold(repoHostForPriority(repo), host) &&
-			strings.EqualFold(repoPathForPriority(repo), path) {
-			return repo, true
-		}
-	}
 	return ghclient.RepoRef{}, false
 }
 
@@ -4050,6 +4084,10 @@ func (s *Server) enqueueIssueSync(ctx context.Context, input *issueRepoNumberInp
 }
 
 func (s *Server) listActivity(ctx context.Context, input *listActivityInput) (*listActivityOutput, error) {
+	if hasInvalidRepoFilter(input.Repo) {
+		return nil, problemValidation("query.repo", "repo filter must be provider|platform_host/repo_path")
+	}
+
 	opts := db.ListActivityOpts{
 		Repo:        input.Repo,
 		RepoFilters: parseRepoFilters(input.Repo),
@@ -4387,26 +4425,21 @@ func (s *Server) lookupStarredRepoID(ctx context.Context, body starredRequest) (
 		return 0, problemValidation("body.item_type",
 			"item_type must be 'pr' or 'issue'", "pr", "issue")
 	}
-
-	var (
-		repoID int64
-		err    error
-	)
-	if body.PlatformHost != "" {
-		repoID, err = s.lookupRepoIDOnHost(
-			ctx, body.Owner, body.Name, body.PlatformHost,
-		)
-	} else {
-		repoID, err = s.lookupRepoID(ctx, body.Owner, body.Name)
+	if strings.TrimSpace(body.Provider) == "" {
+		return 0, problemValidation("body.provider", "provider is required")
 	}
+
+	repo, err := s.lookupRepoByProviderRoute(
+		ctx, body.Provider, body.PlatformHost, body.Owner, body.Name,
+	)
 	if err != nil {
 		if errors.Is(err, errRepoNotFound) {
 			return 0, problemNotFound(CodeRepoNotFound, err.Error(), nil)
 		}
-		return 0, problemInternal("repo lookup failed")
+		return 0, providerRouteLookupError(err)
 	}
 
-	return repoID, nil
+	return repo.ID, nil
 }
 
 // --- Commits ---
@@ -4945,28 +4978,8 @@ func (s *Server) createWorkspaceProvider(
 		}
 		return provider, nil
 	}
-	count, err := s.db.CountReposByHostOwnerName(
-		ctx, input.Body.PlatformHost, input.Body.Owner, input.Body.Name,
-	)
-	if err != nil {
-		return "", problemInternal("count matching repos: " + err.Error())
-	}
-	if count > 1 {
-		return "", problemValidation(
-			"body.provider",
-			"provider is required when multiple providers share this host and repository",
-		)
-	}
-	repo, err := s.db.GetRepoByHostOwnerName(
-		ctx, input.Body.PlatformHost, input.Body.Owner, input.Body.Name,
-	)
-	if err != nil {
-		return "", problemInternal("lookup workspace repo: " + err.Error())
-	}
-	if repo == nil {
-		return "", nil
-	}
-	return repo.Platform, nil
+	_ = ctx
+	return "", problemValidation("body.provider", "provider is required")
 }
 
 func (s *Server) runWorkspaceSetup(ws *workspace.Workspace) {
@@ -5308,6 +5321,9 @@ func (s *Server) refreshWorkspace(
 	case db.WorkspaceItemTypePullRequest:
 		// The PR detail sync runs after the repo index refresh below so the
 		// workspace response reflects the latest indexed PR row and diff.
+	case db.WorkspaceItemTypeKataTask:
+		// Kata tasks are not provider issues. The live task pane refreshes
+		// through the Kata daemon; this route only refreshes the mapped repo.
 	default:
 		return nil, problemInternal("workspace has unsupported item type")
 	}
@@ -5461,14 +5477,37 @@ func (s *Server) getWorkspaceCommits(
 			"commits not available for this workspace", nil)
 	}
 
+	// Annotate each commit with whether it has reached the branch's upstream so
+	// the UI can flag local-only commits. Push status is an enhancement over the
+	// commit list, so a probe failure degrades to omitting the flag rather than
+	// failing the request. When the branch has no upstream we cannot tell pushed
+	// from unpushed (a fork PR head has no upstream yet already exists on its
+	// remote), so the flag is omitted rather than guessed.
+	unpushed, hasUpstream, pushErr := workspace.WorktreeUnpushedSHAs(
+		ctx, req.Summary.WorktreePath,
+	)
+	if pushErr != nil {
+		slog.Warn(
+			"failed to determine unpushed workspace commits",
+			"workspace_id", input.ID,
+			"err", pushErr,
+		)
+	}
+
 	resp := commitsResponse{Commits: make([]commitResponse, len(commits))}
 	for i, c := range commits {
-		resp.Commits[i] = commitResponse{
+		cr := commitResponse{
 			SHA:        c.SHA,
 			Message:    c.Message,
 			AuthorName: c.AuthorName,
 			AuthoredAt: c.AuthoredAt.UTC(),
 		}
+		if pushErr == nil && hasUpstream {
+			_, isUnpushed := unpushed[c.SHA]
+			pushed := !isUnpushed
+			cr.Pushed = &pushed
+		}
+		resp.Commits[i] = cr
 	}
 	return &getWorkspaceCommitsOutput{Body: resp}, nil
 }
@@ -5918,19 +5957,22 @@ func (s *Server) workspaceMergeTargetBranch(
 	summary *db.WorkspaceSummary,
 ) (string, bool, error) {
 	prNumber := summary.ItemNumber
-	if summary.ItemType == db.WorkspaceItemTypeIssue {
+	if summary.ItemType != db.WorkspaceItemTypePullRequest {
 		if summary.AssociatedPRNumber == nil {
 			return "", false, nil
 		}
 		prNumber = *summary.AssociatedPRNumber
 	}
+	if prNumber <= 0 {
+		return "", false, nil
+	}
 
-	repo, err := s.db.GetRepoByHostOwnerName(
-		ctx,
-		summary.PlatformHost,
-		summary.RepoOwner,
-		summary.RepoName,
-	)
+	repo, err := s.db.GetRepoByIdentity(ctx, db.RepoIdentity{
+		Platform:     summary.Platform,
+		PlatformHost: summary.PlatformHost,
+		Owner:        summary.RepoOwner,
+		Name:         summary.RepoName,
+	})
 	if err != nil {
 		return "", false, problemInternal("get workspace repo failed")
 	}

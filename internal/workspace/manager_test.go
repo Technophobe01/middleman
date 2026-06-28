@@ -19,7 +19,7 @@ import (
 	"testing"
 	"time"
 
-	Assert "github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	gitcmd "go.kenn.io/kit/git/cmd"
@@ -131,7 +131,7 @@ func recordRuntimeTmuxSessionForTest(
 }
 
 func TestCreate(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -175,7 +175,7 @@ func TestListSummariesUsesCacheWhenStoreHasNoRows(t *testing.T) {
 	t.Parallel()
 
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 	d := openTestDB(t)
 	mgr := NewManager(d, t.TempDir())
@@ -203,7 +203,7 @@ func TestWorkspaceSummaryCacheDoesNotResurrectDeletedWorkspace(t *testing.T) {
 	t.Parallel()
 
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ctx := t.Context()
 	d := openTestDB(t)
 	repoID := seedRepo(t, d, "github.com", "acme", "widget")
@@ -255,7 +255,7 @@ func TestCreatePRHeadRepoClassification(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert := Assert.New(t)
+			assert := assert.New(t)
 			d := openTestDB(t)
 			platformHost := tt.platformHost
 			if platformHost == "" {
@@ -324,7 +324,7 @@ func TestCreateIssueDefaultBranchSluggified(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert := Assert.New(t)
+			assert := assert.New(t)
 			require := require.New(t)
 
 			d := openTestDB(t)
@@ -337,7 +337,7 @@ func TestCreateIssueDefaultBranchSluggified(t *testing.T) {
 
 			ws, err := mgr.CreateIssue(
 				ctx, "github.com", "acme", "widget", 7,
-				CreateIssueOptions{},
+				CreateIssueOptions{Provider: "github"},
 			)
 			require.NoError(err)
 			require.NotNil(ws)
@@ -349,7 +349,7 @@ func TestCreateIssueDefaultBranchSluggified(t *testing.T) {
 }
 
 func TestCreateIssueExplicitGitHeadRefBypassesSlug(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	d := openTestDB(t)
@@ -361,15 +361,128 @@ func TestCreateIssueExplicitGitHeadRefBypassesSlug(t *testing.T) {
 
 	ws, err := mgr.CreateIssue(
 		ctx, "github.com", "acme", "widget", 7,
-		CreateIssueOptions{GitHeadRef: "custom/branch"},
+		CreateIssueOptions{Provider: "github", GitHeadRef: "custom/branch"},
 	)
 	require.NoError(err)
 	require.NotNil(ws)
 	assert.Equal("custom/branch", ws.GitHeadRef)
 }
 
+func TestCreateKataTaskDoesNotRequireProviderIssue(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+
+	d := openTestDB(t)
+	ctx := t.Context()
+	seedRepo(t, d, "github.com", "acme", "widget")
+
+	mgr := NewManager(d, t.TempDir())
+	metadata := db.WorkspaceKataMetadata{
+		DaemonID:    "desktop",
+		ProjectUID:  "project-kata",
+		ProjectName: "Kata",
+		IssueUID:    "issue-kata-1",
+		ShortID:     "task-123",
+		QualifiedID: "Kata#task-123",
+		Title:       "Fix widget",
+	}
+	ws, err := mgr.CreateKataTask(ctx, "github", "github.com", "acme", "widget", metadata)
+	require.NoError(err)
+	require.NotNil(ws)
+
+	assert.Equal(db.WorkspaceItemTypeKataTask, ws.ItemType)
+	assert.Equal(0, ws.ItemNumber)
+	assert.Equal(db.KataWorkspaceItemKey(metadata), ws.ItemKey)
+	assert.Contains(ws.GitHeadRef, "middleman/kata/task-123-")
+	assert.Contains(ws.GitHeadRef, "-fix-widget")
+	assert.Equal(ws.GitHeadRef, ws.WorkspaceBranch)
+	assert.Contains(ws.WorktreePath, "kata-task-123-")
+	require.NotNil(ws.KataMetadata)
+	assert.Equal("issue-kata-1", ws.KataMetadata.IssueUID)
+
+	got, err := d.GetWorkspace(ctx, ws.ID)
+	require.NoError(err)
+	require.NotNil(got)
+	assert.Equal(db.WorkspaceItemTypeKataTask, got.ItemType)
+	assert.Equal(db.KataWorkspaceItemKey(metadata), got.ItemKey)
+	require.NotNil(got.KataMetadata)
+	assert.Equal("Fix widget", got.KataMetadata.Title)
+}
+
+func TestCreateKataTaskNormalizesRelativeWorktreeDir(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+
+	cwd := filepath.Join(t.TempDir(), "cwd")
+	require.NoError(os.MkdirAll(cwd, 0o755))
+	t.Chdir(cwd)
+
+	d := openTestDB(t)
+	ctx := t.Context()
+	seedRepo(t, d, "github.com", "acme", "widget")
+
+	mgr := NewManager(d, "relative-worktrees")
+	metadata := db.WorkspaceKataMetadata{
+		DaemonID:   "desktop",
+		ProjectUID: "project-kata",
+		IssueUID:   "issue-kata-1",
+		ShortID:    "task-123",
+		Title:      "Fix widget",
+	}
+	ws, err := mgr.CreateKataTask(ctx, "github", "github.com", "acme", "widget", metadata)
+	require.NoError(err)
+	require.NotNil(ws)
+
+	assert.True(filepath.IsAbs(ws.WorktreePath))
+	assert.Equal(
+		filepath.Join(
+			cwd, "relative-worktrees", "github", "github.com",
+			"acme", "widget", "kata-"+kataTaskBranchID(metadata),
+		),
+		ws.WorktreePath,
+	)
+}
+
+func TestCreateKataTaskScopesItemKeyByDaemonAndProject(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+
+	d := openTestDB(t)
+	ctx := t.Context()
+	seedRepo(t, d, "github.com", "acme", "widget")
+
+	mgr := NewManager(d, t.TempDir())
+	first := db.WorkspaceKataMetadata{
+		DaemonID:   "desktop",
+		ProjectUID: "project-kata",
+		IssueUID:   "shared-issue",
+		ShortID:    "task-1",
+		Title:      "Fix desktop task",
+	}
+	second := db.WorkspaceKataMetadata{
+		DaemonID:   "laptop",
+		ProjectUID: "project-kata",
+		IssueUID:   "shared-issue",
+		ShortID:    "task-1",
+		Title:      "Fix laptop task",
+	}
+
+	ws1, err := mgr.CreateKataTask(ctx, "github", "github.com", "acme", "widget", first)
+	require.NoError(err)
+	ws2, err := mgr.CreateKataTask(ctx, "github", "github.com", "acme", "widget", second)
+	require.NoError(err)
+
+	assert.NotEqual(ws1.ItemKey, ws2.ItemKey)
+	assert.Equal(db.KataWorkspaceItemKey(first), ws1.ItemKey)
+	assert.Equal(db.KataWorkspaceItemKey(second), ws2.ItemKey)
+	assert.NotEqual(ws1.GitHeadRef, ws2.GitHeadRef)
+	assert.NotEqual(ws1.WorktreePath, ws2.WorktreePath)
+	assert.Contains(ws1.GitHeadRef, "middleman/kata/task-1-")
+	assert.Contains(ws2.GitHeadRef, "middleman/kata/task-1-")
+}
+
 func TestCreateIssueReuseLocalBaseBranchCheckedOutReturnsConflict(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	d := openTestDB(t)
@@ -390,7 +503,7 @@ func TestCreateIssueReuseLocalBaseBranchCheckedOutReturnsConflict(t *testing.T) 
 
 	ws, err := mgr.CreateIssue(
 		ctx, "github.com", "acme", "widget", 7,
-		CreateIssueOptions{ReuseExistingBranch: true},
+		CreateIssueOptions{Provider: "github", ReuseExistingBranch: true},
 	)
 
 	require.Nil(ws)
@@ -455,7 +568,7 @@ func TestCreateMRNotSynced(t *testing.T) {
 }
 
 func TestSetupFailurePersistsStatusWhenContextCanceled(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	wtDir := t.TempDir()
@@ -499,7 +612,7 @@ func TestSetupFailurePersistsStatusWhenContextCanceled(t *testing.T) {
 }
 
 func TestSetupUsesConfiguredWorktreeBasePath(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	wtDir := t.TempDir()
@@ -540,7 +653,7 @@ func TestSetupUsesConfiguredWorktreeBasePath(t *testing.T) {
 }
 
 func TestSetupReusesExistingWorkspaceWorktree(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	wtDir := t.TempDir()
@@ -582,7 +695,7 @@ func TestSetupReusesExistingWorkspaceWorktree(t *testing.T) {
 }
 
 func TestSetupDoesNotReuseUnconfiguredMatchingOriginWorktree(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	wtDir := t.TempDir()
@@ -618,7 +731,7 @@ func TestSetupDoesNotReuseUnconfiguredMatchingOriginWorktree(t *testing.T) {
 }
 
 func TestSetupRejectsExistingLocalBaseWorktreeWithExecutableConfig(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	wtDir := t.TempDir()
@@ -661,7 +774,7 @@ func TestSetupRejectsExistingLocalBaseWorktreeWithExecutableConfig(t *testing.T)
 }
 
 func TestSetupRejectsExistingSyntheticPRWorktreeOnStaleHead(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	wtDir := t.TempDir()
@@ -717,7 +830,7 @@ func TestSetupRejectsExistingSyntheticPRWorktreeOnStaleHead(t *testing.T) {
 }
 
 func TestSetupReusesExistingLocalBasePRHeadBranchWithoutManagingIt(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	wtDir := t.TempDir()
@@ -760,7 +873,7 @@ func TestSetupReusesExistingLocalBasePRHeadBranchWithoutManagingIt(t *testing.T)
 }
 
 func TestSetupRejectsExistingPRWorktreeOnUnexpectedBranch(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	wtDir := t.TempDir()
@@ -797,7 +910,7 @@ func TestSetupRejectsExistingPRWorktreeOnUnexpectedBranch(t *testing.T) {
 }
 
 func TestValidateWorktreeBasePathRejectsLocalRemotes(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	tests := []struct {
@@ -826,7 +939,7 @@ func TestValidateWorktreeBasePathRejectsLocalRemotes(t *testing.T) {
 }
 
 func TestValidateWorktreeBasePathRejectsExecutableLocalConfig(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	tests := []struct {
@@ -879,7 +992,7 @@ func TestValidateWorktreeBasePathRejectsExecutableLocalConfig(t *testing.T) {
 }
 
 func TestValidateWorktreeBasePathAcceptsConfiguredHooksPath(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	localRepo := setupLocalWorktreeBaseForWorkspaceGitTest(t, "feature/thing")
@@ -902,7 +1015,7 @@ func TestValidateWorktreeBasePathAcceptsConfiguredHooksPath(t *testing.T) {
 }
 
 func TestValidateWorktreeBasePathRejectsUnsafeOriginSchemes(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	tests := []struct {
@@ -993,7 +1106,7 @@ func TestValidateWorktreeBasePathAcceptsSCPStyleSSHOrigin(t *testing.T) {
 }
 
 func TestValidateWorktreeBasePathCanonicalizesSymlinkPath(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	localRepo := setupLocalWorktreeBaseForWorkspaceGitTest(t, "feature/thing")
@@ -1031,7 +1144,7 @@ func TestValidateWorktreeBasePathCanonicalizesSymlinkPath(t *testing.T) {
 }
 
 func TestValidateWorktreeBasePathRejectsAdditionalOriginURLs(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	localRepo := setupLocalWorktreeBaseForWorkspaceGitTest(t, "feature/thing")
@@ -1050,7 +1163,7 @@ func TestValidateWorktreeBasePathRejectsAdditionalOriginURLs(t *testing.T) {
 }
 
 func TestValidateWorktreeBasePathRejectsUnsafeOriginFetchRefspec(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	localRepo := setupLocalWorktreeBaseForWorkspaceGitTest(t, "feature/thing")
@@ -1099,7 +1212,7 @@ func TestValidateWorktreeBasePathAcceptsSingleBranchOriginFetchRefspec(t *testin
 }
 
 func TestValidateWorktreeBasePathRejectsBareRepositories(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	dir := t.TempDir()
@@ -1120,7 +1233,7 @@ func TestValidateWorktreeBasePathRejectsBareRepositories(t *testing.T) {
 }
 
 func TestValidateWorktreeBasePathRejectsExecutableWorktreeConfig(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	localRepo := setupLocalWorktreeBaseForWorkspaceGitTest(t, "feature/thing")
@@ -1141,7 +1254,7 @@ func TestValidateWorktreeBasePathRejectsExecutableWorktreeConfig(t *testing.T) {
 }
 
 func TestCreateIssueUsesProviderQualifiedRepo(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -1174,7 +1287,7 @@ func TestCreateIssueUsesProviderQualifiedRepo(t *testing.T) {
 }
 
 func TestCreateIssueUsesProviderCloneURLForNamespacedManagedClone(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -1223,7 +1336,7 @@ func TestCreateIssueUsesProviderCloneURLForNamespacedManagedClone(t *testing.T) 
 }
 
 func TestCreateUsesProviderQualifiedRepo(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -1263,7 +1376,7 @@ func TestCreateUsesProviderQualifiedRepo(t *testing.T) {
 }
 
 func TestSetupUsesManagedCloneForForkPRWithConfiguredWorktreeBasePath(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	wtDir := t.TempDir()
@@ -1335,7 +1448,7 @@ func TestSetupUsesManagedCloneForForkPRWithConfiguredWorktreeBasePath(t *testing
 }
 
 func TestSetupFetchesConfiguredWorktreeBasePathBeforeAdd(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	wtDir := t.TempDir()
@@ -1378,7 +1491,7 @@ func TestSetupFetchesConfiguredWorktreeBasePathBeforeAdd(t *testing.T) {
 }
 
 func TestSetupRefreshesConfiguredWorktreeBaseOriginHead(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	wtDir := t.TempDir()
@@ -1396,7 +1509,7 @@ func TestSetupRefreshesConfiguredWorktreeBaseOriginHead(t *testing.T) {
 	mgr.SetWorktreeBasePathResolver(staticBaseResolver(localRepo))
 
 	ws, err := mgr.CreateIssue(
-		t.Context(), platformHost, "acme", "widget", 7, CreateIssueOptions{},
+		t.Context(), platformHost, "acme", "widget", 7, CreateIssueOptions{Provider: "github"},
 	)
 	require.NoError(err)
 	require.NoError(mgr.Setup(t.Context(), ws))
@@ -1452,7 +1565,7 @@ func TestFetchWorkspaceBaseRequiresOriginHeadOnlyForIssueWorkspaces(t *testing.T
 }
 
 func TestFetchWorkspaceBaseConstrainsNegotiationTips(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	var calls [][]string
@@ -1472,7 +1585,7 @@ func TestFetchWorkspaceBaseConstrainsNegotiationTips(t *testing.T) {
 }
 
 func TestFetchWorkspaceBaseDisablesGitHooks(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	var calls [][]string
@@ -1496,7 +1609,7 @@ func TestFetchWorkspaceBaseDisablesGitHooks(t *testing.T) {
 }
 
 func TestCleanupUsesExistingWorktreeGitDirWhenConfiguredBaseChanges(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	const branch = "middleman/pr-99"
@@ -1536,7 +1649,7 @@ func TestCleanupUsesExistingWorktreeGitDirWhenConfiguredBaseChanges(t *testing.T
 }
 
 func TestCleanupDoesNotTrustReplacementCloneAtWorkspacePath(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	const branch = "middleman/pr-42"
@@ -1574,7 +1687,7 @@ func TestCleanupDoesNotTrustReplacementCloneAtWorkspacePath(t *testing.T) {
 }
 
 func TestCleanupDoesNotTrustStaleLocalBaseRegistrationForReplacementClone(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	const branch = "middleman/pr-42"
@@ -1699,7 +1812,7 @@ func TestCleanupSucceedsWhenWorkspacePathReplacedByNonGitDirectory(t *testing.T)
 }
 
 func TestCleanupFallsBackToManagedCloneWhenConfiguredBaseInvalid(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	const branch = "middleman/pr-99"
@@ -1743,7 +1856,7 @@ func TestCleanupFallsBackToManagedCloneWhenConfiguredBaseInvalid(t *testing.T) {
 }
 
 func TestCleanupUsesProviderScopedManagedClone(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	const branch = "middleman/pr-99"
@@ -1789,7 +1902,7 @@ func TestCleanupUsesProviderScopedManagedClone(t *testing.T) {
 }
 
 func TestCleanupSkipsReplacedWorktreeFromWrongRepo(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	const branch = "middleman/pr-99"
@@ -1822,7 +1935,7 @@ func TestCleanupSkipsReplacedWorktreeFromWrongRepo(t *testing.T) {
 }
 
 func TestFailSetupUsesSinglePersistenceBudget(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	wtDir := t.TempDir()
@@ -1864,7 +1977,7 @@ func TestFailSetupUsesSinglePersistenceBudget(t *testing.T) {
 }
 
 func TestFailSetupRespectsParentDeadline(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	wtDir := t.TempDir()
@@ -1957,7 +2070,7 @@ func TestValidateLocalBranchNameIgnoresBrokenWorkingTreeCwd(t *testing.T) {
 }
 
 func TestAddWorktreeUsesFallbackWhenLocalBasePreferredBranchCheckedOut(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	const branch = "feature/thing"
@@ -1988,7 +2101,7 @@ func TestAddWorktreeUsesFallbackWhenLocalBasePreferredBranchCheckedOut(t *testin
 }
 
 func TestAddWorktreeLocalBaseFetchesPullRefWhenHeadBranchDeleted(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	const branch = "feature/deleted"
@@ -2038,7 +2151,7 @@ func TestAddWorktreeLocalBaseFetchesPullRefWhenHeadBranchDeleted(t *testing.T) {
 }
 
 func TestAddWorktreeLocalBaseIgnoresStalePullRefWhenFetchFails(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	const branch = "feature/live"
@@ -2086,7 +2199,7 @@ func TestAddWorktreeLocalBaseIgnoresStalePullRefWhenFetchFails(t *testing.T) {
 }
 
 func TestLocalBaseExistingPRBranchIsNotDeletedOnCleanup(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	const branch = "feature/thing"
@@ -2121,7 +2234,7 @@ func TestLocalBaseExistingPRBranchIsNotDeletedOnCleanup(t *testing.T) {
 }
 
 func TestLocalBaseExistingPRBranchPreservesUpstream(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	const branch = "feature/thing"
@@ -2223,7 +2336,7 @@ func TestAddPreferredWorktreeHeadRepoRouting(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert := Assert.New(t)
+			assert := assert.New(t)
 			require := require.New(t)
 			cloneDir := setupBareCloneForWorkspaceGitTest(t)
 			want := tt.configure(t, cloneDir, tt.headBranch, tt.number)
@@ -2267,7 +2380,7 @@ func TestAddPreferredWorktreeHeadRepoRouting(t *testing.T) {
 }
 
 func TestAddWorktreeGitLabForkMRFetchesHeadBeforePreferredBranch(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	cloneDir := setupBareCloneForWorkspaceGitTest(t)
@@ -2314,7 +2427,7 @@ func TestAddWorktreeGitLabForkMRFetchesHeadBeforePreferredBranch(t *testing.T) {
 func TestAddWorktreeMergedSameRepoPRUsesPullRefWhenHeadBranchDeleted(
 	t *testing.T,
 ) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	cloneDir := setupBareCloneForWorkspaceGitTest(t)
@@ -2358,7 +2471,7 @@ func TestAddWorktreeMergedSameRepoPRUsesPullRefWhenHeadBranchDeleted(
 func TestAddWorktreeGitLabMRUsesMergeRequestRefWhenHeadBranchDeleted(
 	t *testing.T,
 ) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	cloneDir := setupBareCloneForWorkspaceGitTest(t)
@@ -2400,7 +2513,7 @@ func TestAddWorktreeGitLabMRUsesMergeRequestRefWhenHeadBranchDeleted(
 }
 
 func TestAddWorktreeGitLabMRFetchesSpecificMergeRequestRef(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	cloneDir := setupBareCloneForWorkspaceGitTest(t)
@@ -2449,7 +2562,7 @@ func TestAddWorktreeGitLabMRFetchesSpecificMergeRequestRef(t *testing.T) {
 }
 
 func TestRollbackWorktreeDeletesBranchWhenContextCanceled(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	cloneDir := setupBareCloneForWorkspaceGitTest(t)
@@ -2479,7 +2592,7 @@ func TestRollbackWorktreeDeletesBranchWhenContextCanceled(t *testing.T) {
 }
 
 func TestLocalBranchExistsIgnoresInheritedGitEnv(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	targetClone := setupBareCloneForWorkspaceGitTest(t)
@@ -2917,7 +3030,7 @@ func normalizeRecordedTmuxArg(arg string) string {
 }
 
 func TestManagerEnsureTmuxHasSessionPrefix(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	script, record := writeRecorderScript(t)
 
@@ -2939,7 +3052,7 @@ func TestManagerEnsureTmuxHasSessionPrefix(t *testing.T) {
 }
 
 func TestManagerEnsureTerminalUsesPtyOwnerWhenConfigured(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	script, record := writeRecorderScript(t)
@@ -2963,7 +3076,7 @@ func TestManagerEnsureTerminalUsesPtyOwnerWhenConfigured(t *testing.T) {
 
 func TestManagerTerminalPaneSnapshotIncludesPtyOwnerTitle(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	owner := &fakePtyOwnerClient{
 		SnapshotOutput: []byte("recent output"),
@@ -2987,7 +3100,7 @@ func TestManagerTerminalPaneSnapshotIncludesPtyOwnerTitle(t *testing.T) {
 }
 
 func TestManagerCleanupTerminalUsesPtyOwnerForBaseSession(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	script, record := writeRecorderScript(t)
@@ -3012,7 +3125,7 @@ func TestManagerCleanupTerminalUsesPtyOwnerForBaseSession(t *testing.T) {
 }
 
 func TestManagerCleanupPtyOwnerWorkspaceStopsStoredRuntimeTmuxSessions(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	script, record := writeRecorderScript(t)
@@ -3050,7 +3163,7 @@ func TestManagerCleanupPtyOwnerWorkspaceStopsStoredRuntimeTmuxSessions(t *testin
 }
 
 func TestManagerDeleteUsesTmuxPrefix(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	script, record := writeRecorderScript(t)
 
@@ -3084,7 +3197,7 @@ func TestManagerDeleteUsesTmuxPrefix(t *testing.T) {
 }
 
 func TestManagerDeleteAllowsMissingTmuxSession(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	dir := t.TempDir()
@@ -3130,7 +3243,7 @@ func TestManagerDeleteAllowsMissingTmuxSession(t *testing.T) {
 }
 
 func TestManagerDeleteFailsWhenTmuxKillFails(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	dir := t.TempDir()
@@ -3180,7 +3293,7 @@ func TestManagerDeleteFailsWhenTmuxKillFails(t *testing.T) {
 }
 
 func TestManagerDeleteTreatsTmuxServerExitDuringKillAsGone(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	dir := t.TempDir()
@@ -3227,7 +3340,7 @@ func TestManagerDeleteTreatsTmuxServerExitDuringKillAsGone(t *testing.T) {
 }
 
 func TestManagerDeleteAllowsErroredWorkspaceWhenTmuxUnavailable(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	d := openTestDB(t)
@@ -3272,7 +3385,7 @@ func TestManagerReapOrphanTmuxSessionsIgnoresUnavailableTmux(t *testing.T) {
 }
 
 func TestManagerReapOrphanTmuxSessionsKillsUnknownManagedSessions(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	dir := t.TempDir()
@@ -3344,7 +3457,7 @@ func TestManagerReapOrphanTmuxSessionsKillsUnknownManagedSessions(t *testing.T) 
 func TestManagerReapOrphanTmuxSessionsKeepsStoredRuntimeSessions(
 	t *testing.T,
 ) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	dir := t.TempDir()
@@ -3403,7 +3516,7 @@ func TestManagerReapOrphanTmuxSessionsKeepsStoredRuntimeSessions(
 func TestManagerPruneMissingTmuxSessionsRemovesStaleRecords(
 	t *testing.T,
 ) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	dir := t.TempDir()
@@ -3521,7 +3634,7 @@ func TestManagerPruneMissingTmuxSessionsRemovesStaleRecords(
 // tmux 3.6 does, including the tab-to-underscore substitution, so this
 // fails if the list format ever reverts to a control-character separator.
 func TestManagerTmuxSessionListSurvivesTmux36Sanitization(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	dir := t.TempDir()
@@ -3599,7 +3712,7 @@ func TestManagerListTmuxSessionInfosRealTmux(t *testing.T) {
 		t.Skipf("tmux unavailable in this test environment: %v", err)
 	}
 
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	dir, err := os.MkdirTemp("/tmp", "middleman-tmux-list-*")
@@ -3649,7 +3762,7 @@ func TestManagerListTmuxSessionInfosRealTmux(t *testing.T) {
 func TestManagerTmuxSessionsForWorkspaceReadsStoredRuntimeSessions(
 	t *testing.T,
 ) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	d := openTestDB(t)
@@ -3723,7 +3836,7 @@ func TestManagerTmuxSessionsForWorkspaceReadsStoredRuntimeSessions(
 func TestManagerCleanupTmuxSessionKillsRuntimeSessionsForWorkspace(
 	t *testing.T,
 ) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	dir := t.TempDir()
@@ -3788,7 +3901,7 @@ func TestManagerCleanupTmuxSessionKillsRuntimeSessionsForWorkspace(
 func TestManagerCleanupTmuxSessionPreservesStoredRowsAfterRuntimeKillFailure(
 	t *testing.T,
 ) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	dir := t.TempDir()
@@ -3874,7 +3987,7 @@ func TestManagerCleanupTmuxSessionPreservesStoredRowsAfterRuntimeKillFailure(
 func TestManagerForgetRuntimeSessionCreatedAtPreservesRecreatedRow(
 	t *testing.T,
 ) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	d := openTestDB(t)
@@ -3918,7 +4031,7 @@ func TestManagerForgetRuntimeSessionCreatedAtPreservesRecreatedRow(
 func TestManagerForgetRuntimeSessionAfterExitKeepsLiveTmuxSession(
 	t *testing.T,
 ) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	d := openTestDB(t)
@@ -3985,7 +4098,7 @@ func TestManagerForgetRuntimeSessionAfterExitKeepsLiveTmuxSession(
 }
 
 func TestManagerRequestRetryFailsWhenTmuxCleanupFails(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	dir := t.TempDir()
@@ -4055,7 +4168,7 @@ func TestManagerRequestRetryFailsWhenTmuxCleanupFails(t *testing.T) {
 }
 
 func TestManagerRequestRetryConsumesQueuedRetryWhenCleanupFails(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	dir := t.TempDir()
@@ -4166,7 +4279,7 @@ func TestManagerRequestRetryConsumesQueuedRetryWhenCleanupFails(t *testing.T) {
 }
 
 func TestManagerRequestRetrySkipsGitCleanupWhenCloneMissing(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	dir := t.TempDir()
@@ -4219,7 +4332,7 @@ func TestManagerRequestRetrySkipsGitCleanupWhenCloneMissing(t *testing.T) {
 }
 
 func TestIssueRetryCleansLeakedUnknownBranchAndUsesIssueBranch(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	host, owner, name := "github.com", "acme", "widget"
@@ -4279,7 +4392,7 @@ func TestIssueRetryCleansLeakedUnknownBranchAndUsesIssueBranch(t *testing.T) {
 }
 
 func TestManagerRequestRetryQueuesWhileCreatingAndStartsIfErrored(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	d := openTestDB(t)
@@ -4330,7 +4443,7 @@ func TestManagerRequestRetryQueuesWhileCreatingAndStartsIfErrored(t *testing.T) 
 }
 
 func TestManagerRequestRetryPreservesReusedIssueBranchSentinel(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	d := openTestDB(t)
@@ -4370,7 +4483,7 @@ func TestManagerRequestRetryPreservesReusedIssueBranchSentinel(t *testing.T) {
 }
 
 func TestManagerRequestRetryStartsWhenSetupFailedBeforeQueue(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	d := openTestDB(t)
@@ -4415,7 +4528,7 @@ func TestManagerRequestRetryStartsWhenSetupFailedBeforeQueue(t *testing.T) {
 }
 
 func TestManagerRequestRetryDiscardsQueuedRetryWhenSetupSucceeds(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	d := openTestDB(t)
@@ -4457,7 +4570,7 @@ func TestManagerRequestRetryDiscardsQueuedRetryWhenSetupSucceeds(t *testing.T) {
 
 func TestManagerEnsureTmuxCreatesSessionOnMiss(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	// Script: "has-session" emits tmux's canonical "can't find
 	// session" stderr and exits 1 (so isTmuxSessionAbsent classifies
@@ -4518,7 +4631,7 @@ func TestManagerEnsureTmuxCreatesSessionOnMiss(t *testing.T) {
 
 func TestManagerEnsureTmuxCreatesSessionOnMacOSMissingServer(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	dir := t.TempDir()
 	record := filepath.Join(dir, "record")
@@ -4564,7 +4677,7 @@ func TestManagerEnsureTmuxCreatesSessionOnMacOSMissingServer(t *testing.T) {
 // parser must keep interior and trailing empties rather than
 // collapsing them.
 func TestReadRecorderArgvPreservesEmptyArgs(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	path := filepath.Join(t.TempDir(), "record")
 
@@ -4740,7 +4853,7 @@ func TestWorkspaceBranchCandidatesDoesNotIncludeBareForSluggedWorkspace(t *testi
 	// be a user-owned local branch unrelated to middleman. Cleanup
 	// must return only the persisted GitHeadRef so the unrelated
 	// branch is not deleted.
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ws := &Workspace{
 		ItemType:   db.WorkspaceItemTypeIssue,
 		ItemNumber: 10,
@@ -4754,7 +4867,7 @@ func TestWorkspaceBranchCandidatesUsesBareFallbackOnlyForLegacyWorkspace(t *test
 	// Pre-feature issue workspaces have no recorded GitHeadRef.
 	// Cleanup must still find the bare middleman/issue-<n> branch
 	// those workspaces actually use.
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	ws := &Workspace{
 		ItemType:   db.WorkspaceItemTypeIssue,
 		ItemNumber: 10,
@@ -4771,7 +4884,7 @@ func TestIsGitWorktreeAbsentClassifiesCorruptGitfile(t *testing.T) {
 	// dead worktree as absent rather than failing, so the workspace
 	// stays deletable. These are the verbatim phrases git emits,
 	// wrapped the way runGit wraps subprocess failures.
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	cases := []struct {
 		name string
 		err  error
@@ -4903,7 +5016,7 @@ func TestFileLockManagerCtxCancelWhileWaiting(t *testing.T) {
 }
 
 func TestFileLockManagerDoubleUnlock(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	mgr := NewFileLockManager()
 	lock, err := mgr.Acquire(t.Context(), t.TempDir())

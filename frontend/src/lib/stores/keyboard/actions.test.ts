@@ -39,9 +39,59 @@ const selected = {
   number: 1,
 };
 
+const staleSelected = {
+  ...selected,
+  owner: "stale",
+  name: "selection",
+  repoPath: "stale/selection",
+};
+
+function command(id: string) {
+  const action = defaultActions.find((a) => a.id === id);
+  expect(action).toBeDefined();
+  return action!;
+}
+
+function locationPath(): string {
+  return window.location.pathname + window.location.search;
+}
+
+function configuredRepo(overrides: {
+  provider?: string;
+  platformHost?: string;
+  owner: string;
+  name: string;
+  repoPath?: string;
+  isGlob?: boolean;
+}) {
+  const repoPath = overrides.repoPath ?? `${overrides.owner}/${overrides.name}`;
+  return {
+    provider: overrides.provider ?? "github",
+    platform_host: overrides.platformHost ?? "github.com",
+    owner: overrides.owner,
+    name: overrides.name,
+    repo_path: repoPath,
+    is_glob: overrides.isGlob ?? false,
+    matched_repo_count: 1,
+  };
+}
+
+function setConfiguredRepos(repos: ReturnType<typeof configuredRepo>[]): void {
+  setStoreInstances(
+    () =>
+      ({
+        settings: {
+          getConfiguredRepos: () => repos,
+        },
+      }) as never,
+  );
+}
+
 describe("defaultActions", () => {
   afterEach(() => {
     setSidebarCollapsed(false);
+    delete window.__middleman_config;
+    window.history.replaceState(null, "", "/");
   });
 
   it("includes the migrated globals", () => {
@@ -57,6 +107,7 @@ describe("defaultActions", () => {
         "nav.pulls.board",
         "sidebar.toggle",
         "palette.open",
+        "repo.browser.open",
         "cheatsheet.open",
         "sync.repos",
         "theme.toggle",
@@ -251,5 +302,257 @@ describe("defaultActions", () => {
     expect(board!.when(ctx("kata"))).toBe(false);
     expect(list!.when(ctx("pulls"))).toBe(true);
     expect(board!.when(ctx("pulls"))).toBe(true);
+  });
+
+  it("opens the repo browser from a selected pull request", () => {
+    const action = command("repo.browser.open");
+    const context = ctx("pulls", { selectedPR: selected });
+
+    expect(action.when(context)).toBe(true);
+    action.handler(context);
+
+    expect(locationPath()).toBe("/repo/browser?provider=github&platform_host=github.com&repo_path=octo%2Frepo");
+  });
+
+  it("opens the repo browser from selected issue and activity contexts", () => {
+    const action = command("repo.browser.open");
+
+    const issueContext = ctx("issues", {
+      selectedPR: staleSelected,
+      selectedIssue: selected,
+    });
+    expect(action.when(issueContext)).toBe(true);
+    action.handler(issueContext);
+    expect(locationPath()).toBe("/repo/browser?provider=github&platform_host=github.com&repo_path=octo%2Frepo");
+
+    window.history.replaceState(
+      null,
+      "",
+      "/?selected=issue:8&provider=gitlab&platform_host=gitlab.example.com&repo_path=group%2Fproject",
+    );
+    const context = ctx("activity", { selectedPR: staleSelected });
+    expect(action.when(context)).toBe(true);
+    action.handler(context);
+
+    expect(locationPath()).toBe(
+      "/repo/browser?provider=gitlab&platform_host=gitlab.example.com&repo_path=group%2Fproject",
+    );
+  });
+
+  it("opens the repo browser from the route-selected issue before stale issue store state", () => {
+    const action = command("repo.browser.open");
+    const context = ctx("issues", {
+      selectedIssue: staleSelected,
+      route: {
+        page: "issues",
+        selected,
+      },
+    });
+
+    expect(action.when(context)).toBe(true);
+    action.handler(context);
+
+    expect(locationPath()).toBe("/repo/browser?provider=github&platform_host=github.com&repo_path=octo%2Frepo");
+  });
+
+  it("opens the repo browser for the current repo-browser route", () => {
+    const action = command("repo.browser.open");
+    const context = ctx("repo-browser", {
+      route: {
+        page: "repo-browser",
+        provider: "forgejo",
+        platformHost: "code.example.com",
+        owner: "team",
+        name: "tools",
+        repoPath: "team/tools",
+      },
+    });
+
+    expect(action.when(context)).toBe(true);
+    action.handler(context);
+
+    expect(locationPath()).toBe("/repo/browser?provider=forgejo&platform_host=code.example.com&repo_path=team%2Ftools");
+  });
+
+  it("opens the repo browser from focus routes without stale selected item state", () => {
+    const action = command("repo.browser.open");
+    const pullContext = ctx("focus", {
+      selectedPR: staleSelected,
+      route: {
+        page: "focus",
+        itemType: "pr",
+        provider: "gitlab",
+        platformHost: "gitlab.example.com",
+        owner: "group",
+        name: "project",
+        repoPath: "group/project",
+        number: 42,
+      } as never,
+    });
+
+    expect(action.when(pullContext)).toBe(true);
+    action.handler(pullContext);
+    expect(locationPath()).toBe(
+      "/repo/browser?provider=gitlab&platform_host=gitlab.example.com&repo_path=group%2Fproject",
+    );
+
+    const issueContext = ctx("focus", {
+      selectedIssue: staleSelected,
+      route: {
+        page: "focus",
+        itemType: "issue",
+        provider: "forgejo",
+        platformHost: "code.example.com",
+        owner: "team",
+        name: "docs",
+        repoPath: "team/docs",
+        number: 7,
+      } as never,
+    });
+
+    action.handler(issueContext);
+    expect(locationPath()).toBe("/repo/browser?provider=forgejo&platform_host=code.example.com&repo_path=team%2Fdocs");
+  });
+
+  it("opens the repo browser for a uniquely configured workspace repo", () => {
+    const action = command("repo.browser.open");
+    window.__middleman_config = {
+      ui: {
+        repo: { owner: "acme", name: "widgets" },
+      },
+    };
+    setConfiguredRepos([
+      configuredRepo({
+        owner: "acme",
+        name: "widgets",
+        repoPath: "acme/widgets",
+      }),
+    ]);
+    const context = ctx("workspaces", { selectedPR: staleSelected });
+
+    expect(action.when(context)).toBe(true);
+    action.handler(context);
+
+    expect(locationPath()).toBe("/repo/browser?provider=github&platform_host=github.com&repo_path=acme%2Fwidgets");
+  });
+
+  it("opens the repo browser from fully qualified workspace repo config", () => {
+    const action = command("repo.browser.open");
+    window.__middleman_config = {
+      ui: {
+        repo: {
+          provider: "gitea",
+          platform_host: "code.example.com",
+          repo_path: "team/widgets",
+          owner: "acme",
+          name: "widgets",
+        },
+      },
+    };
+    setConfiguredRepos([
+      configuredRepo({
+        provider: "github",
+        platformHost: "github.com",
+        owner: "acme",
+        name: "widgets",
+        repoPath: "acme/widgets",
+      }),
+      configuredRepo({
+        provider: "gitlab",
+        platformHost: "gitlab.example.com",
+        owner: "acme",
+        name: "widgets",
+        repoPath: "acme/widgets",
+      }),
+    ]);
+    const context = ctx("workspaces", { selectedPR: staleSelected });
+
+    expect(action.when(context)).toBe(true);
+    action.handler(context);
+
+    expect(locationPath()).toBe("/repo/browser?provider=gitea&platform_host=code.example.com&repo_path=team%2Fwidgets");
+  });
+
+  it("opens the repo browser from canonical workspace repo identity", () => {
+    const action = command("repo.browser.open");
+    window.__middleman_config = {
+      ui: {
+        repo: {
+          provider: "gitlab",
+          platform_host: "gitlab.example.com",
+          repo_path: "group/subgroup/widgets",
+        },
+      },
+    };
+    setConfiguredRepos([]);
+    const context = ctx("workspaces", { selectedPR: staleSelected });
+
+    expect(action.when(context)).toBe(true);
+    action.handler(context);
+
+    expect(locationPath()).toBe(
+      "/repo/browser?provider=gitlab&platform_host=gitlab.example.com&repo_path=group%2Fsubgroup%2Fwidgets",
+    );
+  });
+
+  it("uses workspace provider and host hints when matching configured repos", () => {
+    const action = command("repo.browser.open");
+    window.__middleman_config = {
+      ui: {
+        repo: {
+          provider: "gitlab",
+          platform_host: "gitlab.example.com",
+          owner: "acme",
+          name: "widgets",
+        },
+      },
+    };
+    setConfiguredRepos([
+      configuredRepo({
+        provider: "github",
+        platformHost: "github.com",
+        owner: "acme",
+        name: "widgets",
+        repoPath: "acme/widgets",
+      }),
+      configuredRepo({
+        provider: "gitlab",
+        platformHost: "gitlab.example.com",
+        owner: "acme",
+        name: "widgets",
+        repoPath: "group/widgets",
+      }),
+    ]);
+    const context = ctx("workspaces", { selectedPR: staleSelected });
+
+    expect(action.when(context)).toBe(true);
+    action.handler(context);
+
+    expect(locationPath()).toBe(
+      "/repo/browser?provider=gitlab&platform_host=gitlab.example.com&repo_path=group%2Fwidgets",
+    );
+  });
+
+  it("hides the repo browser command when workspace repo context is ambiguous", () => {
+    const action = command("repo.browser.open");
+    window.__middleman_config = {
+      ui: {
+        repo: { owner: "acme", name: "widgets" },
+      },
+    };
+    setConfiguredRepos([
+      configuredRepo({
+        owner: "acme",
+        name: "widgets",
+        platformHost: "github.com",
+      }),
+      configuredRepo({
+        owner: "acme",
+        name: "widgets",
+        platformHost: "ghe.example.com",
+      }),
+    ]);
+
+    expect(action.when(ctx("workspaces"))).toBe(false);
   });
 });

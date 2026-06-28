@@ -40,7 +40,10 @@ func runCreate(args []string, env *appEnv) error {
 		return err
 	}
 	env.configPath = *configPath
-	h := normalizeHostFlag(*host)
+	h, err := normalizeHostFlag(*host)
+	if err != nil {
+		return err
+	}
 
 	if err := config.EnsureDefault(env.configPath); err != nil {
 		return fmt.Errorf("ensuring middleman config exists: %w", err)
@@ -49,12 +52,22 @@ func runCreate(args []string, env *appEnv) error {
 	if err != nil {
 		return err
 	}
-	if existing, ok := cfg.GitHubAppForHost(h); ok {
-		return fmt.Errorf(
-			"a github app for host %q already exists (app id %d, slug %q); "+
-				"use \"install\" to add an installation or \"delete\" to replace it",
-			h, existing.AppID, existing.Slug,
-		)
+	for _, existing := range cfg.GitHubAppsForHost(h) {
+		if *org != "" && strings.EqualFold(existing.Owner, *org) {
+			return fmt.Errorf(
+				"a github app for host %q and owner %q already exists (app id %d, slug %q); "+
+					"use \"install --owner %s\" to add an installation or \"delete --owner %s\" to replace it",
+				h, existing.Owner, existing.AppID, existing.Slug, existing.Owner, existing.Owner,
+			)
+		}
+		if *org == "" && strings.EqualFold(existing.OwnerType, "User") {
+			return fmt.Errorf(
+				"a user-owned github app for host %q already exists (app id %d, slug %q); "+
+					"use \"install --owner %s\" to add an installation, \"create --org\" for an org-owned app, "+
+					"or \"delete --owner %s\" to replace it",
+				h, existing.AppID, existing.Slug, existing.Owner, existing.Owner,
+			)
+		}
 	}
 
 	appName := strings.TrimSpace(*name)
@@ -397,21 +410,6 @@ func (env *appEnv) runInstallFlow(
 			}
 		}
 		if refreshed {
-			// Refreshing cannot help when the installation sits on an
-			// account that does not own the configured repos — the
-			// repair for that is installing on the right account, so
-			// fall through to waiting for a new installation.
-			candidate := app
-			candidate.InstallationAccount = picked.Account.Login
-			if uncovered := reposNotCoveredByInstallation(cfg, candidate); len(uncovered) > 0 {
-				fmt.Fprintf(env.stdout,
-					"Recorded installation %d on %q cannot reach %s; waiting for an installation on the right account.\n",
-					picked.ID, picked.Account.Login, strings.Join(uncovered, ", "),
-				)
-				refreshed = false
-			}
-		}
-		if refreshed {
 			fmt.Fprintf(env.stdout,
 				"Refreshing recorded installation %d on %s.\n",
 				picked.ID, picked.Account.Login,
@@ -428,17 +426,29 @@ func (env *appEnv) runInstallFlow(
 		fmt.Fprintf(env.stdout,
 			"Install the app on the account that owns your synced repos:\n  %s\n", url,
 		)
+		known := make(map[int64]struct{})
+		if app.InstallationID != 0 {
+			known[app.InstallationID] = struct{}{}
+		}
+		if open {
+			jwt, err := appJWT(app, env.now())
+			if err != nil {
+				return err
+			}
+			installs, err := client.ListInstallations(ctx, jwt)
+			if err != nil {
+				return err
+			}
+			for _, install := range installs {
+				known[install.ID] = struct{}{}
+			}
+		}
 		if open {
 			if err := env.openBrowser(url); err != nil {
 				fmt.Fprintf(env.stdout, "could not open browser: %v\n", err)
 			}
 		}
 		fmt.Fprintln(env.stdout, "Waiting for the installation to appear...")
-
-		known := make(map[int64]struct{})
-		if app.InstallationID != 0 {
-			known[app.InstallationID] = struct{}{}
-		}
 		err := env.pollUntil(ctx, timeout, func(ctx context.Context) (bool, error) {
 			jwt, err := appJWT(app, env.now())
 			if err != nil {
@@ -452,47 +462,41 @@ func (env *appEnv) runInstallFlow(
 				if _, ok := known[install.ID]; ok {
 					continue
 				}
-				// A pre-existing installation on an account that does
-				// not own the configured repos is not the one we are
-				// waiting for; report it once and keep polling so the
-				// user can install on the right account.
-				candidate := app
-				candidate.InstallationAccount = install.Account.Login
-				if uncovered := reposNotCoveredByInstallation(cfg, candidate); len(uncovered) > 0 {
-					fmt.Fprintf(env.stdout,
-						"Ignoring installation %d on %q: it cannot reach %s. Still waiting for an installation on the owning account.\n",
-						install.ID, install.Account.Login, strings.Join(uncovered, ", "),
-					)
-					known[install.ID] = struct{}{}
-					continue
-				}
 				picked = install
 				return true, nil
 			}
 			return false, nil
 		})
 		if err != nil {
-			return err
+			// Editing an installation's repository access or re-running
+			// after a coverage failure reconfigures the existing
+			// installation instead of minting a new ID, so no new
+			// installation ever appears and the poll times out -- the
+			// dead-end the coverage error's own "re-run install" guidance
+			// would otherwise hit. When exactly one installation exists
+			// for this app the intent is unambiguous, so adopt it. Only a
+			// clean deadline qualifies: a probe error (transient API
+			// failure) or a user interrupt must surface, not silently
+			// adopt a stale installation.
+			if !errors.Is(err, errPollDeadline) {
+				return err
+			}
+			adopted, adoptErr := env.adoptSoleInstallation(ctx, cfg, app, &picked)
+			if adoptErr != nil {
+				return adoptErr
+			}
+			if !adopted {
+				return err
+			}
+			fmt.Fprintf(env.stdout,
+				"No new installation appeared; recording the existing installation %d on %s.\n",
+				picked.ID, picked.Account.Login,
+			)
 		}
 	}
 
 	app.InstallationID = picked.ID
 	app.InstallationAccount = picked.Account.Login
-	// Installation tokens only reach repos owned by the installed
-	// account. Surface uncovered repos before saving: config
-	// validation would reject the entry anyway, and the user needs to
-	// know the GitHub-side installation exists but was not recorded.
-	if uncovered := reposNotCoveredByInstallation(cfg, app); len(uncovered) > 0 {
-		return fmt.Errorf(
-			"the app was installed on %q on GitHub, but that installation cannot reach "+
-				"configured repos %s; not recording it in config. Uninstall it in the "+
-				"browser and install on the account that owns those repos, or remove "+
-				"them from middleman's config before using an app on this host "+
-				"(middleman resolves one credential chain per host, so per-repo token "+
-				"overrides cannot mix with an app)",
-			picked.Account.Login, strings.Join(uncovered, ", "),
-		)
-	}
 	// Account ownership is not enough for an "Only select repositories"
 	// install: the token reaches only the chosen repos, and anything
 	// else 404s during sync while the config looks healthy. The
@@ -512,10 +516,74 @@ func (env *appEnv) runInstallFlow(
 		return fmt.Errorf("saving installation to config: %w", err)
 	}
 	fmt.Fprintf(env.stdout,
-		"Installed on %s (installation %d). middleman will now sync %s with app tokens.\n",
-		picked.Account.Login, picked.ID, app.Host,
+		"Installed on %s (installation %d). middleman will now sync %s repos on %s with app tokens.\n",
+		picked.Account.Login, picked.ID, picked.Account.Login, app.Host,
 	)
 	return nil
+}
+
+// adoptSoleInstallation recovers the install flow after the poll reached
+// its deadline without a new installation appearing. The caller gates
+// this on errPollDeadline, so probe errors and user interrupts never
+// reach it and are surfaced instead. Re-running "install" after a
+// coverage failure or a restored config reconfigures the existing
+// installation rather than minting a new id, so the wait never
+// completes; when the app has exactly one GitHub-side installation that
+// belongs to an account this config actually intends the app to serve,
+// the target is unambiguous, so adopt it into picked and report true.
+//
+// Adoption is bounded by intent: the sole installation's account must be
+// the recorded installation account or own a configured repo that
+// resolves to the app. A lone installation on an unrelated account is
+// not what the user is waiting for, so it keeps the timeout rather than
+// recording the wrong account while reporting success. Multiple
+// installations stay ambiguous and also keep the timeout.
+func (env *appEnv) adoptSoleInstallation(
+	ctx context.Context,
+	cfg *config.Config,
+	app config.GitHubAppConfig,
+	picked *githubapp.Installation,
+) (bool, error) {
+	jwt, err := appJWT(app, env.now())
+	if err != nil {
+		return false, err
+	}
+	installs, err := env.apiClient(app.Host).ListInstallations(ctx, jwt)
+	if err != nil {
+		return false, err
+	}
+	if len(installs) != 1 {
+		return false, nil
+	}
+	inst := installs[0]
+	account := inst.Account.Login
+	if !strings.EqualFold(account, app.InstallationAccount) &&
+		!accountServesConfiguredRepos(cfg, app.Host, account) {
+		return false, nil
+	}
+	*picked = inst
+	return true, nil
+}
+
+// accountServesConfiguredRepos reports whether account owns at least one
+// configured github repo on host that resolves to the app token (no
+// per-repo credential override). It marks an account the app is actually
+// meant to serve, so install recovery adopts a sole existing
+// installation only for an intended account instead of any account that
+// happens to be the app's only installation.
+func accountServesConfiguredRepos(cfg *config.Config, host, account string) bool {
+	for _, r := range cfg.Repos {
+		if r.PlatformOrDefault() != "github" || r.PlatformHostOrDefault() != host {
+			continue
+		}
+		if r.TokenEnv != "" || r.TokenFile != "" {
+			continue
+		}
+		if strings.EqualFold(r.Owner, account) {
+			return true
+		}
+	}
+	return false
 }
 
 func (env *appEnv) refreshAppMetadata(
@@ -537,11 +605,6 @@ func (env *appEnv) refreshAppMetadata(
 	return app, nil
 }
 
-// reposNotCoveredByInstallation lists configured github repos on the
-// app's host that would resolve to the app token but are owned by a
-// different account than the installation. Mirrors the config-level
-// coverage validation so the CLI can explain the problem instead of
-// failing a save.
 // verifySelectedInstallationCoverage checks an "Only select
 // repositories" installation against the configured repos it is
 // supposed to serve, by listing what an installation token can
@@ -578,25 +641,6 @@ func (env *appEnv) verifySelectedInstallationCoverage(
 		)
 	}
 	return names, nil
-}
-
-func reposNotCoveredByInstallation(
-	cfg *config.Config, app config.GitHubAppConfig,
-) []string {
-	var uncovered []string
-	for _, r := range cfg.Repos {
-		if r.PlatformOrDefault() != "github" || r.PlatformHostOrDefault() != app.Host {
-			continue
-		}
-		if r.TokenEnv != "" || r.TokenFile != "" {
-			continue
-		}
-		if strings.EqualFold(r.Owner, app.InstallationAccount) {
-			continue
-		}
-		uncovered = append(uncovered, r.Owner+"/"+r.Name)
-	}
-	return uncovered
 }
 
 // validAppSlug matches GitHub's app slug shape (letters, digits,

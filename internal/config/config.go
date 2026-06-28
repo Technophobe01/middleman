@@ -28,6 +28,8 @@ const (
 	defaultForgejoTokenEnv                 = "MIDDLEMAN_FORGEJO_TOKEN"
 	defaultGiteaTokenEnv                   = "MIDDLEMAN_GITEA_TOKEN"
 	defaultSyncInterval                    = "5m"
+	defaultActivePRRefreshInterval         = "2m"
+	defaultActivePRWindow                  = "4h"
 	defaultNotificationSyncInterval        = "2m"
 	defaultNotificationPropagationInterval = "1m"
 	defaultHost                            = "127.0.0.1"
@@ -66,6 +68,14 @@ type Repo struct {
 	TokenEnv         string `toml:"token_env,omitempty" json:"token_env,omitempty"`
 	TokenFile        string `toml:"token_file,omitempty" json:"token_file,omitempty"`
 	WorktreeBasePath string `toml:"worktree_base_path,omitempty" json:"worktree_base_path,omitempty"`
+}
+
+type KataProjectRepoMapping struct {
+	DaemonID     string `toml:"daemon_id,omitempty" json:"daemon_id,omitempty"`
+	ProjectUID   string `toml:"project_uid" json:"project_uid"`
+	Provider     string `toml:"provider" json:"provider"`
+	PlatformHost string `toml:"platform_host" json:"platform_host"`
+	RepoPath     string `toml:"repo_path" json:"repo_path"`
 }
 
 // DocFolder names a markdown folder registered for docs mode. Path
@@ -743,6 +753,8 @@ type Shell struct {
 
 type Config struct {
 	SyncInterval              string `toml:"sync_interval"`
+	ActivePRRefreshInterval   string `toml:"active_pr_refresh_interval"`
+	ActivePRWindow            string `toml:"active_pr_window"`
 	GitHubTokenEnv            string `toml:"github_token_env"`
 	DefaultPlatformHost       string `toml:"default_platform_host"`
 	Host                      string `toml:"host"`
@@ -762,22 +774,23 @@ type Config struct {
 	// Forwarded RFC 7239 host= for the Public Host validation step.
 	// The raw Host header must still pass the allowed_hosts gate
 	// before any forwarded header is read.
-	TrustReverseProxy bool              `toml:"trust_reverse_proxy"`
-	Repos             []Repo            `toml:"repos"`
-	Platforms         []PlatformConfig  `toml:"platforms"`
-	GitHubApps        []GitHubAppConfig `toml:"github_apps"`
-	Activity          Activity          `toml:"activity"`
-	Notifications     Notifications     `toml:"notifications"`
-	Terminal          Terminal          `toml:"terminal"`
-	Modes             ModeVisibility    `toml:"modes"`
-	Agents            []Agent           `toml:"agents"`
-	DocFolders        []DocFolder       `toml:"doc_folders"`
-	Roborev           Roborev           `toml:"roborev"`
-	Msgvault          *Msgvault         `toml:"msgvault"`
-	Tmux              Tmux              `toml:"tmux"`
-	Shell             Shell             `toml:"shell"`
-	Fleet             Fleet             `toml:"fleet"`
-	API               API               `toml:"api"`
+	TrustReverseProxy bool                     `toml:"trust_reverse_proxy"`
+	Repos             []Repo                   `toml:"repos"`
+	KataProjects      []KataProjectRepoMapping `toml:"kata_projects"`
+	Platforms         []PlatformConfig         `toml:"platforms"`
+	GitHubApps        []GitHubAppConfig        `toml:"github_apps"`
+	Activity          Activity                 `toml:"activity"`
+	Notifications     Notifications            `toml:"notifications"`
+	Terminal          Terminal                 `toml:"terminal"`
+	Modes             ModeVisibility           `toml:"modes"`
+	Agents            []Agent                  `toml:"agents"`
+	DocFolders        []DocFolder              `toml:"doc_folders"`
+	Roborev           Roborev                  `toml:"roborev"`
+	Msgvault          *Msgvault                `toml:"msgvault"`
+	Tmux              Tmux                     `toml:"tmux"`
+	Shell             Shell                    `toml:"shell"`
+	Fleet             Fleet                    `toml:"fleet"`
+	API               API                      `toml:"api"`
 
 	// parsedAllowedHosts is the canonicalised form of AllowedHosts,
 	// populated by Validate so the server constructor does not have
@@ -1129,11 +1142,13 @@ func Load(path string) (*Config, error) {
 // LoadForGitHubAppRepair pick the validation strictness.
 func load(path string) (*Config, error) {
 	cfg := &Config{
-		SyncInterval:        defaultSyncInterval,
-		GitHubTokenEnv:      defaultGitHubTokenEnv,
-		DefaultPlatformHost: defaultPlatformHost,
-		Host:                defaultHost,
-		Port:                defaultPort,
+		SyncInterval:            defaultSyncInterval,
+		ActivePRRefreshInterval: defaultActivePRRefreshInterval,
+		ActivePRWindow:          defaultActivePRWindow,
+		GitHubTokenEnv:          defaultGitHubTokenEnv,
+		DefaultPlatformHost:     defaultPlatformHost,
+		Host:                    defaultHost,
+		Port:                    defaultPort,
 		Activity: Activity{
 			CollapseThreads: true,
 		},
@@ -1313,6 +1328,9 @@ func (c *Config) validate(skipAppCoverage bool) error {
 		}
 		seen[key] = display
 	}
+	if err := c.validateKataProjectRepoMappings(seen); err != nil {
+		return err
+	}
 
 	if !skipAppCoverage {
 		if err := c.validateGitHubAppCoverage(); err != nil {
@@ -1340,6 +1358,22 @@ func (c *Config) validate(skipAppCoverage bool) error {
 
 	if _, err := time.ParseDuration(c.SyncInterval); err != nil {
 		return fmt.Errorf("config: invalid sync_interval %q: %w", c.SyncInterval, err)
+	}
+	if c.ActivePRRefreshInterval == "" {
+		c.ActivePRRefreshInterval = defaultActivePRRefreshInterval
+	}
+	if c.ActivePRWindow == "" {
+		c.ActivePRWindow = defaultActivePRWindow
+	}
+	if d, err := time.ParseDuration(c.ActivePRRefreshInterval); err != nil {
+		return fmt.Errorf("config: invalid active_pr_refresh_interval %q: %w", c.ActivePRRefreshInterval, err)
+	} else if d <= 0 {
+		return fmt.Errorf("config: active_pr_refresh_interval must be positive, got %q", c.ActivePRRefreshInterval)
+	}
+	if d, err := time.ParseDuration(c.ActivePRWindow); err != nil {
+		return fmt.Errorf("config: invalid active_pr_window %q: %w", c.ActivePRWindow, err)
+	} else if d <= 0 {
+		return fmt.Errorf("config: active_pr_window must be positive, got %q", c.ActivePRWindow)
 	}
 	if c.Notifications.SyncInterval == "" {
 		c.Notifications.SyncInterval = defaultNotificationSyncInterval
@@ -1682,7 +1716,8 @@ func (c *Config) validatePlatforms() error {
 }
 
 func (c *Config) validateGitHubApps() error {
-	seenHosts := make(map[string]struct{}, len(c.GitHubApps))
+	seenOwners := make(map[string]struct{}, len(c.GitHubApps))
+	seenInstallations := make(map[string]struct{}, len(c.GitHubApps))
 	for i := range c.GitHubApps {
 		app := &c.GitHubApps[i]
 		app.Host = strings.TrimSpace(app.Host)
@@ -1729,14 +1764,35 @@ func (c *Config) validateGitHubApps() error {
 					"installation_id is set", i,
 			)
 		}
-		// One app per host: the token source chain is host-scoped, so a
-		// second app for the same host could never be selected.
-		if _, ok := seenHosts[host]; ok {
+		// GitHub App credentials are host-shaped, but private apps are owned by
+		// one account. Multiple rows may share a host only when they describe
+		// distinct apps, selected by app owner or installation account.
+		owner := strings.ToLower(app.Owner)
+		if owner == "" {
+			owner = fmt.Sprintf("app:%d", app.AppID)
+		}
+		ownerKey := host + "\x00" + owner
+		if _, ok := seenOwners[ownerKey]; ok {
+			label := app.Owner
+			if label == "" {
+				label = fmt.Sprintf("app:%d", app.AppID)
+			}
 			return fmt.Errorf(
-				"config: github_apps[%d]: duplicate github app for host %q", i, host,
+				"config: github_apps[%d]: duplicate github app for host %q and owner %q",
+				i, host, label,
 			)
 		}
-		seenHosts[host] = struct{}{}
+		seenOwners[ownerKey] = struct{}{}
+		if app.InstallationAccount != "" {
+			installKey := host + "\x00" + strings.ToLower(app.InstallationAccount)
+			if _, ok := seenInstallations[installKey]; ok {
+				return fmt.Errorf(
+					"config: github_apps[%d]: duplicate github app installation for host %q and account %q",
+					i, host, app.InstallationAccount,
+				)
+			}
+			seenInstallations[installKey] = struct{}{}
+		}
 	}
 	return nil
 }
@@ -1744,10 +1800,9 @@ func (c *Config) validateGitHubApps() error {
 // validateGitHubAppCoverage rejects github repos that would resolve
 // to an app installation token without being reachable by it.
 // Installation tokens are scoped to the installed account, not the
-// host, so a repo owned by anyone else would 404 during sync while
-// the config looks healthy. Repos with their own token_env/token_file
-// override never reach the app candidate and are exempt. Runs after
-// repo normalization so owners are canonical.
+// host. Only repos owned by that account use the app candidate; other
+// owners on the same host fall through to the PAT/gh credential chain.
+// Runs after repo normalization so owners are canonical.
 func (c *Config) validateGitHubAppCoverage() error {
 	for _, app := range c.GitHubApps {
 		if app.InstallationID == 0 || app.InstallationAccount == "" {
@@ -1761,24 +1816,12 @@ func (c *Config) validateGitHubAppCoverage() error {
 			if r.TokenEnv != "" || r.TokenFile != "" {
 				continue
 			}
-			if strings.EqualFold(r.Owner, app.InstallationAccount) {
-				if err := validateSelectedRepoCoverage(i, r, app); err != nil {
-					return err
-				}
+			if !strings.EqualFold(r.Owner, app.InstallationAccount) {
 				continue
 			}
-			// Do not suggest per-repo token overrides here: middleman
-			// resolves one credential chain per host, so an override on
-			// only this repo would be rejected by the same-host conflict
-			// check. The real options are changing where the app is
-			// installed or not using an app for this host at all.
-			return fmt.Errorf(
-				"config: repos[%d]: %s/%s is not covered by the github app for %s "+
-					"(installed on %q): installation tokens only reach repos owned by the "+
-					"installed account. Install the app on %q instead, or remove the "+
-					"[[github_apps]] entry for %s so the host uses PAT auth for every repo",
-				i, r.Owner, r.Name, app.Host, app.InstallationAccount, r.Owner, app.Host,
-			)
+			if err := validateSelectedRepoCoverage(i, r, app); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -1821,21 +1864,33 @@ func validateSelectedRepoCoverage(i int, r Repo, app GitHubAppConfig) error {
 	)
 }
 
-// GitHubAppForHost returns the configured GitHub App for host, if any.
-func (c *Config) GitHubAppForHost(host string) (GitHubAppConfig, bool) {
+// GitHubAppsForHost returns the configured GitHub App installations for host.
+func (c *Config) GitHubAppsForHost(host string) []GitHubAppConfig {
 	if c == nil {
-		return GitHubAppConfig{}, false
+		return nil
 	}
 	h, err := normalizePlatformHost(defaultPlatform, host)
 	if err != nil {
-		return GitHubAppConfig{}, false
+		return nil
 	}
+	var apps []GitHubAppConfig
 	for _, app := range c.GitHubApps {
 		if app.Host == h {
-			return app, true
+			apps = append(apps, app)
 		}
 	}
-	return GitHubAppConfig{}, false
+	return apps
+}
+
+// GitHubAppForHost returns a configured GitHub App credential for host, if any.
+// Callers that manage app state should use GitHubAppsForHost and disambiguate
+// when multiple app credentials share one host.
+func (c *Config) GitHubAppForHost(host string) (GitHubAppConfig, bool) {
+	apps := c.GitHubAppsForHost(host)
+	if len(apps) == 0 {
+		return GitHubAppConfig{}, false
+	}
+	return apps[0], true
 }
 
 func (c *Config) validateAgents() error {
@@ -1904,6 +1959,67 @@ func repoPathOrFullName(r Repo) string {
 	return r.Owner + "/" + r.Name
 }
 
+func kataProjectMappingKey(mapping KataProjectRepoMapping) string {
+	return strings.TrimSpace(mapping.DaemonID) + "\x00" + strings.TrimSpace(mapping.ProjectUID)
+}
+
+func (c *Config) validateKataProjectRepoMappings(configuredExact map[string]string) error {
+	seen := make(map[string]struct{}, len(c.KataProjects))
+	for i := range c.KataProjects {
+		mapping := &c.KataProjects[i]
+		mapping.DaemonID = strings.TrimSpace(mapping.DaemonID)
+		mapping.ProjectUID = strings.TrimSpace(mapping.ProjectUID)
+		if mapping.ProjectUID == "" {
+			return fmt.Errorf("config: kata_projects[%d]: project_uid is required", i)
+		}
+		normalizedProvider, err := normalizePlatform(mapping.Provider)
+		if err != nil {
+			return fmt.Errorf("config: kata_projects[%d]: provider: %w", i, err)
+		}
+		mapping.Provider = normalizedProvider
+		mapping.PlatformHost, err = normalizePlatformHost(mapping.Provider, mapping.PlatformHost)
+		if err != nil {
+			return fmt.Errorf("config: kata_projects[%d]: platform_host: %w", i, err)
+		}
+
+		repo := Repo{
+			Platform:     mapping.Provider,
+			PlatformHost: mapping.PlatformHost,
+			RepoPath:     mapping.RepoPath,
+		}
+		if err := repo.normalize(c.DefaultPlatformHost); err != nil {
+			return fmt.Errorf("config: kata_projects[%d]: repo_path: %w", i, err)
+		}
+		if repo.HasNameGlob() {
+			return fmt.Errorf(
+				"config: kata_projects[%d]: repo_path does not match a configured exact repo",
+				i,
+			)
+		}
+		mapping.RepoPath = repoPathOrFullName(repo)
+
+		dupKey := kataProjectMappingKey(*mapping)
+		if _, ok := seen[dupKey]; ok {
+			return fmt.Errorf(
+				"config: kata_projects[%d]: duplicate kata project mapping for daemon %q project %q",
+				i,
+				mapping.DaemonID,
+				mapping.ProjectUID,
+			)
+		}
+		seen[dupKey] = struct{}{}
+
+		if _, ok := configuredExact[repoIdentityKey(repo)]; !ok {
+			return fmt.Errorf(
+				"config: kata_projects[%d]: repo_path %q does not match a configured exact repo",
+				i,
+				mapping.RepoPath,
+			)
+		}
+	}
+	return nil
+}
+
 var reservedSystemLaunchTargetKeys = map[string]bool{
 	"tmux":        true,
 	"plain_shell": true,
@@ -1921,6 +2037,24 @@ var (
 
 func (c *Config) SyncDuration() time.Duration {
 	d, _ := time.ParseDuration(c.SyncInterval)
+	return d
+}
+
+func (c *Config) ActivePRRefreshDuration() time.Duration {
+	if c == nil || c.ActivePRRefreshInterval == "" {
+		d, _ := time.ParseDuration(defaultActivePRRefreshInterval)
+		return d
+	}
+	d, _ := time.ParseDuration(c.ActivePRRefreshInterval)
+	return d
+}
+
+func (c *Config) ActivePRWindowDuration() time.Duration {
+	if c == nil || c.ActivePRWindow == "" {
+		d, _ := time.ParseDuration(defaultActivePRWindow)
+		return d
+	}
+	d, _ := time.ParseDuration(c.ActivePRWindow)
 	return d
 }
 
@@ -2025,8 +2159,9 @@ func (c *Config) ResolveRepoTokenSource(r Repo) tokenauth.Descriptor {
 }
 
 type ProviderTokenSource struct {
-	Descriptor tokenauth.Descriptor
-	Required   bool
+	Descriptor  tokenauth.Descriptor
+	Required    bool
+	GitHubOwner string
 }
 
 func (c *Config) ProviderTokenSources() []ProviderTokenSource {
@@ -2054,7 +2189,27 @@ func (c *Config) ProviderTokenSources() []ProviderTokenSource {
 		})
 	}
 	for _, repo := range c.Repos {
-		add(c.ResolveRepoTokenSource(repo), true)
+		plan := ProviderTokenSource{
+			Descriptor: c.ResolveRepoTokenSource(repo),
+			Required:   true,
+		}
+		if repo.PlatformOrDefault() == defaultPlatform {
+			plan.GitHubOwner = repo.Owner
+		}
+		key := plan.Descriptor.Key
+		if key.Host == "" {
+			continue
+		}
+		if _, ok := seen[key]; !ok {
+			seen[key] = struct{}{}
+			out = append(out, plan)
+			continue
+		}
+		// Keep same-host GitHub repo plans after the first so startup validates
+		// each owner against the owner-scoped app/PAT chain.
+		if plan.GitHubOwner != "" {
+			out = append(out, plan)
+		}
 	}
 	for _, p := range c.Platforms {
 		add(c.TokenSourceForPlatformHost(p.Type, p.Host, "", ""), false)
@@ -2130,13 +2285,17 @@ func (c *Config) TokenSourceForPlatformHost(
 	// validation exempts overridden repos and a fall-through would
 	// reopen the cross-account 404 hole when the override is unset.
 	if p == defaultPlatform && repoTokenEnv == "" && repoTokenFile == "" {
-		if app, ok := c.GitHubAppForHost(h); ok && app.AppID > 0 && app.PrivateKeyPath != "" {
+		for _, app := range c.GitHubAppsForHost(h) {
+			if app.AppID <= 0 || app.PrivateKeyPath == "" {
+				continue
+			}
 			desc.Candidates = append(desc.Candidates, tokenauth.Candidate{
-				Kind:           tokenauth.SourceKindGitHubApp,
-				Host:           h,
-				FilePath:       app.PrivateKeyPath,
-				AppID:          app.AppID,
-				InstallationID: app.InstallationID,
+				Kind:                tokenauth.SourceKindGitHubApp,
+				Host:                h,
+				FilePath:            app.PrivateKeyPath,
+				AppID:               app.AppID,
+				InstallationID:      app.InstallationID,
+				InstallationAccount: app.InstallationAccount,
 			})
 		}
 	}
@@ -2454,33 +2613,36 @@ func reposForSave(repos []Repo) []Repo {
 
 // configFile is the subset of Config written to disk.
 type configFile struct {
-	SyncInterval              string            `toml:"sync_interval"`
-	GitHubTokenEnv            string            `toml:"github_token_env"`
-	DefaultPlatformHost       string            `toml:"default_platform_host,omitempty"`
-	Host                      string            `toml:"host"`
-	Port                      int               `toml:"port"`
-	SyncBudgetPerHour         int               `toml:"sync_budget_per_hour,omitempty"`
-	SSEBufferSize             int               `toml:"sse_buffer_size,omitempty"`
-	BasePath                  string            `toml:"base_path,omitempty"`
-	DataDir                   string            `toml:"data_dir,omitempty"`
-	IssueWorkspaceBranchStyle string            `toml:"issue_workspace_branch_style,omitempty"`
-	AllowedHosts              []string          `toml:"allowed_hosts,omitempty"`
-	TrustReverseProxy         bool              `toml:"trust_reverse_proxy,omitempty"`
-	Repos                     []Repo            `toml:"repos"`
-	Platforms                 []PlatformConfig  `toml:"platforms,omitempty"`
-	GitHubApps                []GitHubAppConfig `toml:"github_apps,omitempty"`
-	Activity                  Activity          `toml:"activity"`
-	Notifications             Notifications     `toml:"notifications,omitempty"`
-	Terminal                  Terminal          `toml:"terminal,omitempty"`
-	Modes                     ModeVisibility    `toml:"modes,omitempty"`
-	Agents                    []Agent           `toml:"agents,omitempty"`
-	DocFolders                []DocFolder       `toml:"doc_folders,omitempty"`
-	Roborev                   Roborev           `toml:"roborev,omitempty"`
-	Msgvault                  *Msgvault         `toml:"msgvault,omitempty"`
-	Tmux                      Tmux              `toml:"tmux,omitempty"`
-	Shell                     Shell             `toml:"shell,omitempty"`
-	Fleet                     Fleet             `toml:"fleet,omitempty"`
-	API                       API               `toml:"api,omitempty"`
+	SyncInterval              string                   `toml:"sync_interval"`
+	ActivePRRefreshInterval   string                   `toml:"active_pr_refresh_interval"`
+	ActivePRWindow            string                   `toml:"active_pr_window"`
+	GitHubTokenEnv            string                   `toml:"github_token_env"`
+	DefaultPlatformHost       string                   `toml:"default_platform_host,omitempty"`
+	Host                      string                   `toml:"host"`
+	Port                      int                      `toml:"port"`
+	SyncBudgetPerHour         int                      `toml:"sync_budget_per_hour,omitempty"`
+	SSEBufferSize             int                      `toml:"sse_buffer_size,omitempty"`
+	BasePath                  string                   `toml:"base_path,omitempty"`
+	DataDir                   string                   `toml:"data_dir,omitempty"`
+	IssueWorkspaceBranchStyle string                   `toml:"issue_workspace_branch_style,omitempty"`
+	AllowedHosts              []string                 `toml:"allowed_hosts,omitempty"`
+	TrustReverseProxy         bool                     `toml:"trust_reverse_proxy,omitempty"`
+	Repos                     []Repo                   `toml:"repos"`
+	KataProjects              []KataProjectRepoMapping `toml:"kata_projects,omitempty"`
+	Platforms                 []PlatformConfig         `toml:"platforms,omitempty"`
+	GitHubApps                []GitHubAppConfig        `toml:"github_apps,omitempty"`
+	Activity                  Activity                 `toml:"activity"`
+	Notifications             Notifications            `toml:"notifications,omitempty"`
+	Terminal                  Terminal                 `toml:"terminal,omitempty"`
+	Modes                     ModeVisibility           `toml:"modes,omitempty"`
+	Agents                    []Agent                  `toml:"agents,omitempty"`
+	DocFolders                []DocFolder              `toml:"doc_folders,omitempty"`
+	Roborev                   Roborev                  `toml:"roborev,omitempty"`
+	Msgvault                  *Msgvault                `toml:"msgvault,omitempty"`
+	Tmux                      Tmux                     `toml:"tmux,omitempty"`
+	Shell                     Shell                    `toml:"shell,omitempty"`
+	Fleet                     Fleet                    `toml:"fleet,omitempty"`
+	API                       API                      `toml:"api,omitempty"`
 }
 
 // Save writes the current config to the given path.
@@ -2490,28 +2652,31 @@ func (c *Config) Save(path string) error {
 		return fmt.Errorf("validating config: %w", err)
 	}
 	f := configFile{
-		SyncInterval:        cfg.SyncInterval,
-		GitHubTokenEnv:      cfg.GitHubTokenEnv,
-		DefaultPlatformHost: cfg.DefaultPlatformHost,
-		Host:                cfg.Host,
-		Port:                cfg.Port,
-		AllowedHosts:        slices.Clone(cfg.AllowedHosts),
-		TrustReverseProxy:   cfg.TrustReverseProxy,
-		Repos:               reposForSave(cfg.Repos),
-		Platforms:           cfg.Platforms,
-		GitHubApps:          cfg.GitHubApps,
-		Activity:            cfg.Activity,
-		Notifications:       cfg.Notifications,
-		Terminal:            cfg.Terminal,
-		Modes:               cfg.Modes,
-		Agents:              cfg.Agents,
-		DocFolders:          cfg.DocFolders,
-		Roborev:             cfg.Roborev,
-		Msgvault:            cfg.Msgvault,
-		Tmux:                cfg.Tmux,
-		Shell:               cfg.Shell,
-		Fleet:               cfg.Fleet,
-		API:                 cfg.API,
+		SyncInterval:            cfg.SyncInterval,
+		ActivePRRefreshInterval: cfg.ActivePRRefreshInterval,
+		ActivePRWindow:          cfg.ActivePRWindow,
+		GitHubTokenEnv:          cfg.GitHubTokenEnv,
+		DefaultPlatformHost:     cfg.DefaultPlatformHost,
+		Host:                    cfg.Host,
+		Port:                    cfg.Port,
+		AllowedHosts:            slices.Clone(cfg.AllowedHosts),
+		TrustReverseProxy:       cfg.TrustReverseProxy,
+		Repos:                   reposForSave(cfg.Repos),
+		KataProjects:            slices.Clone(cfg.KataProjects),
+		Platforms:               cfg.Platforms,
+		GitHubApps:              cfg.GitHubApps,
+		Activity:                cfg.Activity,
+		Notifications:           cfg.Notifications,
+		Terminal:                cfg.Terminal,
+		Modes:                   cfg.Modes,
+		Agents:                  cfg.Agents,
+		DocFolders:              cfg.DocFolders,
+		Roborev:                 cfg.Roborev,
+		Msgvault:                cfg.Msgvault,
+		Tmux:                    cfg.Tmux,
+		Shell:                   cfg.Shell,
+		Fleet:                   cfg.Fleet,
+		API:                     cfg.API,
 	}
 	if cfg.DefaultPlatformHost == defaultPlatformHost {
 		f.DefaultPlatformHost = ""
@@ -2581,6 +2746,7 @@ func (c *Config) copyForSave() Config {
 	}
 	cfg := *c
 	cfg.Repos = slices.Clone(c.Repos)
+	cfg.KataProjects = slices.Clone(c.KataProjects)
 	cfg.Platforms = slices.Clone(c.Platforms)
 	cfg.AllowedHosts = slices.Clone(c.AllowedHosts)
 	cfg.GitHubApps = slices.Clone(c.GitHubApps)
@@ -2591,6 +2757,12 @@ func (c *Config) copyForSave() Config {
 	cfg.Agents = slices.Clone(c.Agents)
 	if cfg.SyncInterval == "" {
 		cfg.SyncInterval = defaultSyncInterval
+	}
+	if cfg.ActivePRRefreshInterval == "" {
+		cfg.ActivePRRefreshInterval = defaultActivePRRefreshInterval
+	}
+	if cfg.ActivePRWindow == "" {
+		cfg.ActivePRWindow = defaultActivePRWindow
 	}
 	if cfg.DefaultPlatformHost == "" {
 		cfg.DefaultPlatformHost = defaultPlatformHost

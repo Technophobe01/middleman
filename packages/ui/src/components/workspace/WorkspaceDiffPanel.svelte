@@ -16,6 +16,8 @@
     itemNumber: number;
     active?: boolean;
     refreshToken?: number;
+    disabled?: boolean;
+    showMergeTarget?: boolean;
   }
 
   const {
@@ -29,10 +31,15 @@
     itemNumber,
     active = false,
     refreshToken = 0,
+    disabled = false,
+    showMergeTarget = true,
   }: Props = $props();
   const { diff } = getStores();
 
-  let base = $state<WorkspaceDiffBase>("head");
+  let selectedBase = $state<WorkspaceDiffBase>("head");
+  const base = $derived(
+    !showMergeTarget && selectedBase === "merge-target" ? "head" : selectedBase
+  );
   let loadedKey = "";
 
   $effect(() => {
@@ -47,20 +54,27 @@
   });
 
   function selectBase(nextBase: WorkspaceDiffBase): void {
-    base = nextBase;
+    if (disabled) return;
+    selectedBase = nextBase;
   }
 </script>
 
 <section class="workspace-diff" aria-label="Workspace Diff">
   <div class="workspace-diff-scope">
     <span class="scope-label">Compare</span>
-    <div class="scope-toggle" role="group" aria-label="Workspace diff base">
+    <div
+      class="scope-toggle"
+      class:scope-toggle--two={!showMergeTarget}
+      role="group"
+      aria-label="Workspace diff base"
+    >
       <button
         class="scope-btn"
         class:scope-btn--active={base === "head"}
         aria-pressed={base === "head"}
         aria-label="Compare with HEAD"
         title="HEAD"
+        disabled={disabled}
         onclick={() => selectBase("head")}
       >
         HEAD
@@ -71,28 +85,35 @@
         aria-pressed={base === "pushed"}
         aria-label="Compare with pushed branch"
         title="Pushed branch"
+        disabled={disabled}
         onclick={() => selectBase("pushed")}
       >
         Branch
       </button>
-      <button
-        class="scope-btn scope-btn--wide"
-        class:scope-btn--active={base === "merge-target"}
-        aria-pressed={base === "merge-target"}
-        aria-label="Compare with merge target"
-        title="Merge target"
-        onclick={() => selectBase("merge-target")}
-      >
-        Target
-      </button>
+      {#if showMergeTarget}
+        <button
+          class="scope-btn scope-btn--wide"
+          class:scope-btn--active={base === "merge-target"}
+          aria-pressed={base === "merge-target"}
+          aria-label="Compare with merge target"
+          title="Merge target"
+          disabled={disabled}
+          onclick={() => selectBase("merge-target")}
+        >
+          Target
+        </button>
+      {/if}
     </div>
-    <DiffScopePicker compact />
+    {#if showMergeTarget}
+      <DiffScopePicker compact {disabled} />
+    {/if}
   </div>
   <DiffToolbar
     compact
     showRichPreview={false}
     showFileJump
     showScopePicker={false}
+    {disabled}
   />
   <div class="workspace-diff-layout">
     <div class="workspace-diff-main">
@@ -162,6 +183,13 @@
     background: var(--bg-inset);
   }
 
+  .scope-toggle--two {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    width: 128px;
+    flex-basis: 128px;
+    min-width: 116px;
+  }
+
   .scope-btn {
     min-width: 0;
     height: 22px;
@@ -178,17 +206,31 @@
     white-space: nowrap;
   }
 
-  .scope-btn:hover {
+  .scope-btn:hover:not(:disabled) {
     color: var(--text-primary);
   }
 
-  .scope-btn--active {
+  .scope-btn--active:not(:disabled) {
     background: var(--accent-blue);
     color: #fff;
   }
 
-  .scope-btn--active:hover {
+  .scope-btn--active:hover:not(:disabled) {
     color: #fff;
+  }
+
+  .scope-btn:disabled {
+    cursor: not-allowed;
+    color: color-mix(in srgb, var(--text-muted) 75%, var(--bg-surface));
+    background: var(--bg-surface);
+    opacity: 1;
+  }
+
+  .scope-btn--active:disabled {
+    background: color-mix(in srgb, rgb(128 128 128) 28%, var(--bg-surface));
+    color: color-mix(in srgb, rgb(115 115 115) 80%, var(--text-primary));
+    box-shadow: inset 0 0 0 1px
+      color-mix(in srgb, rgb(128 128 128) 35%, var(--border-muted));
   }
 
   .workspace-diff-layout {

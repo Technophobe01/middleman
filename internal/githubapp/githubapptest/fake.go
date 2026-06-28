@@ -36,6 +36,11 @@ type App struct {
 	Deleted       bool
 }
 
+type appOwner struct {
+	Login string
+	Type  string
+}
+
 type Installation struct {
 	ID      int64
 	Account string
@@ -58,23 +63,29 @@ type mintedToken struct {
 // Fake is an in-process GitHub stand-in. URL() serves both the web
 // surface (manifest form POST target) and the REST API.
 type Fake struct {
-	mu           sync.Mutex
-	srv          *httptest.Server
-	apps         map[int64]*App
-	pendingCodes map[string]string // conversion code -> manifest JSON
-	tokens       map[string]*mintedToken
-	nextID       int64
-	rateLimit    int
-	manifests    []string // every manifest JSON received, in order
+	mu            sync.Mutex
+	srv           *httptest.Server
+	apps          map[int64]*App
+	pendingCodes  map[string]string // conversion code -> manifest JSON
+	pendingOwners map[string]appOwner
+	tokens        map[string]*mintedToken
+	nextID        int64
+	rateLimit     int
+	manifests     []string // every manifest JSON received, in order
+	// failListInstallations, when > 0, makes that many upcoming
+	// /app/installations requests respond 500 before serving normally,
+	// so tests can exercise transient install-poll probe failures.
+	failListInstallations int
 }
 
 func NewFake() *Fake {
 	f := &Fake{
-		apps:         make(map[int64]*App),
-		pendingCodes: make(map[string]string),
-		tokens:       make(map[string]*mintedToken),
-		nextID:       100,
-		rateLimit:    5000,
+		apps:          make(map[int64]*App),
+		pendingCodes:  make(map[string]string),
+		pendingOwners: make(map[string]appOwner),
+		tokens:        make(map[string]*mintedToken),
+		nextID:        100,
+		rateLimit:     5000,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /settings/apps/new", f.handleManifestSubmit)
@@ -103,6 +114,15 @@ func (f *Fake) Manifests() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.manifests...)
+}
+
+// FailNextListInstallations makes the next n list-installations requests
+// respond 500 before subsequent ones serve normally, letting tests model
+// a transient probe failure during the install poll.
+func (f *Fake) FailNextListInstallations(n int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failListInstallations = n
 }
 
 // Install simulates the user completing the browser install flow for
@@ -216,15 +236,34 @@ func (f *Fake) handleManifestSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var parsed struct {
+		URL            string `json:"url"`
+		HookAttributes struct {
+			URL string `json:"url"`
+		} `json:"hook_attributes"`
 		RedirectURL string `json:"redirect_url"`
 	}
 	if err := json.Unmarshal([]byte(manifest), &parsed); err != nil || parsed.RedirectURL == "" {
 		http.Error(w, "manifest missing redirect_url", http.StatusBadRequest)
 		return
 	}
+	if parsed.URL == "" {
+		http.Error(w, "manifest missing url", http.StatusBadRequest)
+		return
+	}
+	if parsed.HookAttributes.URL == "" {
+		http.Error(w, "manifest missing hook_attributes.url", http.StatusBadRequest)
+		return
+	}
+	owner := "fake-owner"
+	ownerType := "User"
+	if org := r.PathValue("org"); org != "" {
+		owner = org
+		ownerType = "Organization"
+	}
 	code := randomHex(16)
 	f.mu.Lock()
 	f.pendingCodes[code] = manifest
+	f.pendingOwners[code] = appOwner{Login: owner, Type: ownerType}
 	f.manifests = append(f.manifests, manifest)
 	f.mu.Unlock()
 	redirect, err := url.Parse(parsed.RedirectURL)
@@ -245,13 +284,18 @@ func (f *Fake) handleConversion(w http.ResponseWriter, r *http.Request) {
 	code := r.PathValue("code")
 	f.mu.Lock()
 	manifest, ok := f.pendingCodes[code]
+	owner := f.pendingOwners[code]
 	if ok {
 		delete(f.pendingCodes, code)
+		delete(f.pendingOwners, code)
 	}
 	f.mu.Unlock()
 	if !ok {
 		writeJSONError(w, http.StatusNotFound, "unknown or used conversion code")
 		return
+	}
+	if owner.Login == "" {
+		owner = appOwner{Login: "fake-owner", Type: "User"}
 	}
 	var parsed struct {
 		Name string `json:"name"`
@@ -276,8 +320,8 @@ func (f *Fake) handleConversion(w http.ResponseWriter, r *http.Request) {
 		Name:      parsed.Name,
 		Key:       key,
 		PEM:       string(pemBytes),
-		Owner:     "fake-owner",
-		OwnerType: "User",
+		Owner:     owner.Login,
+		OwnerType: owner.Type,
 	}
 	f.apps[app.ID] = app
 	f.mu.Unlock()
@@ -313,6 +357,14 @@ func (f *Fake) handleGetApp(w http.ResponseWriter, r *http.Request) {
 }
 
 func (f *Fake) handleListInstallations(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	if f.failListInstallations > 0 {
+		f.failListInstallations--
+		f.mu.Unlock()
+		writeJSONError(w, http.StatusInternalServerError, "transient listing failure")
+		return
+	}
+	f.mu.Unlock()
 	app, ok := f.authenticateAppJWT(r)
 	if !ok {
 		writeJSONError(w, http.StatusUnauthorized, "bad app JWT")

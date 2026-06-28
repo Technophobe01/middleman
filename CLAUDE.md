@@ -34,7 +34,9 @@ This paragraph is the single place CLAUDE.md enumerates supported providers. Do 
 New features must work across every supported provider to the extent each provider's API allows. Concrete rules:
 
 - Provider-specific capability differences go behind the capability model in `internal/platform`. Declare capabilities in `Capabilities()`, check them before mutations, and return typed `unsupported_capability` errors when a provider can't satisfy an operation. Do not silently fall back to GitHub-only behavior for other providers.
-- Identity is `(platform, platform_host, owner, name)` everywhere; never owner/name/number alone. Repo-scoped routes use provider-aware paths like `/pulls/{provider}/{owner}/{name}/{number}`, with `/host/{platform_host}/...` for non-default or self-hosted instances.
+- Repository identity is always the quad `(provider, platform_host, owner, repo)`. In code and schema this same quad is always represented as `(platform, platform_host, owner, name)`. There is no repository identity without both provider and host. The host may be omitted from a user-facing route only when the route helper is intentionally using the provider's default host; the logical identity still includes the normalized host.
+- Never identify, route, cache, dedupe, query, persist, or compare repositories, pull requests, merge requests, issues, comments, checks, releases, workspaces, activity, or events by owner/repo/number alone. Every repo-scoped path and data structure must carry provider and host as well as owner and repo.
+- Repo-scoped routes use provider-aware paths like `/pulls/{provider}/{owner}/{name}/{number}`, with `/host/{platform_host}/...` for non-default or self-hosted instances.
 - GitHub-only optimizations (GraphQL bulk fetch, ETag recovery, detailed diff behavior) stay in `internal/github/` and remain optional around the neutral persistence path.
 - Frontend stores and components must thread the full provider ref (`provider`, `platformHost`, `owner`, `name`, `repoPath`) through the shared route helpers in `packages/ui/src/api/provider-routes.ts`. Do not hand-build `/api/v1` URLs or assume GitHub defaults inside components.
 
@@ -133,7 +135,7 @@ Coverage of real behavior is non-negotiable; the lane is chosen by the behavior 
 - Only pass `-count=N` when `N > 1` (e.g. `-count=10` for flake hunting)
 - Table-driven tests for Go code
 - Use `testify` consistently in Go tests; prefer `require` for setup/preconditions and `assert` for non-blocking checks
-- When a test function has more than 3 assertions, create a local helper with `assert := Assert.New(t)` and use the helper methods for the rest of the checks
+- When a test function has more than 3 assertions, create a local helper with `assert := assert.New(t)` and use the helper methods for the rest of the checks. Import `github.com/stretchr/testify/assert` without an alias; aliased assert imports are rejected by golangci-lint.
 - Do not use `t.Fatal`, `t.Fatalf`, `t.Error`, `t.Errorf`, `t.Fail`, or `t.FailNow` in tests; use testify assertions instead
 - Prefer the generated Go API client in `internal/apiclient` for integration-style API tests
 - For HTTP tests of user-visible behavior, follow the wire-level discipline in `context/testing.md`: route through `srv.ServeHTTP`, assert on what a client observes, and pick `internal/server/apitest/` or `internal/server/e2etest/` per the rules there.
@@ -164,6 +166,11 @@ Coverage of real behavior is non-negotiable; the lane is chosen by the behavior 
 - **Never use npm** — use `bun install` for frontend dependencies and invoke Vite+ directly via `./node_modules/.bin/vp ...` (or `../node_modules/.bin/vp ...` from `frontend/`). Never run `npm install` or `npm run` — this creates `package-lock.json` which conflicts with the bun lockfile
 - Tests should be fast and isolated
 - No emojis in code or output
+- Do not copy names, paths, prose, domain details, data values, or other
+  specifics from developers' private projects into tests, fixtures,
+  implementation, docs, commit messages, or PR text unless the user explicitly
+  asks for those exact details to be preserved. Reproduce bugs with generic
+  synthetic examples instead.
 - For database schema changes, follow `context/db-migrations.md`; `internal/db/migrations/` is the source of truth for schema evolution.
 - For HTTP API error envelopes and frontend error branching, follow `context/error-handling.md`; branch on stable codes/details rather than prose.
 - For retries, backoff, and single-flight dedup against flaky upstreams, follow `context/retries-and-backoffs.md`.

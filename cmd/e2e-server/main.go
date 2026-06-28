@@ -59,6 +59,10 @@ func main() {
 		"default-platform-host", "github.com",
 		"default platform host for seeded config",
 	)
+	fleetKey := flag.String(
+		"fleet-key", "",
+		"fleet self key for seeded config",
+	)
 	visibleImportedModes := flag.Bool(
 		"visible-imported-modes", false,
 		"show imported app modes in the seeded config",
@@ -87,6 +91,7 @@ func main() {
 		*roborev,
 		*serverInfoFile,
 		*defaultPlatformHost,
+		*fleetKey,
 		*visibleImportedModes,
 		*providerCollision,
 	); err != nil {
@@ -305,7 +310,9 @@ func seedLabelEditingFixture(
 	database *db.DB,
 	fc *testutil.FixtureClient,
 ) error {
-	repo, err := database.GetRepoByOwnerName(ctx, "acme", "widgets")
+	repo, err := database.GetRepoByIdentity(
+		ctx, db.GitHubRepoIdentity("github.com", "acme", "widgets"),
+	)
 	if err != nil {
 		return fmt.Errorf("get widgets repo: %w", err)
 	}
@@ -387,7 +394,9 @@ func seedAssigneeReviewerFixture(
 	database *db.DB,
 	fc *testutil.FixtureClient,
 ) error {
-	repo, err := database.GetRepoByOwnerName(ctx, "acme", "widgets")
+	repo, err := database.GetRepoByIdentity(
+		ctx, db.GitHubRepoIdentity("github.com", "acme", "widgets"),
+	)
 	if err != nil {
 		return fmt.Errorf("get widgets repo: %w", err)
 	}
@@ -615,7 +624,9 @@ func setPR1CIState(
 	label string,
 	opts ciFixtureOptions,
 ) {
-	repo, err := database.GetRepoByOwnerName(r.Context(), "acme", "widgets")
+	repo, err := database.GetRepoByIdentity(
+		r.Context(), db.GitHubRepoIdentity("github.com", "acme", "widgets"),
+	)
 	if err != nil || repo == nil {
 		http.Error(w, "repo not found", http.StatusNotFound)
 		return
@@ -671,6 +682,7 @@ func setPR1CIState(
 type appOptions struct {
 	roborevEndpoint      string
 	defaultPlatformHost  string
+	fleetKey             string
 	visibleImportedModes bool
 	providerCollision    bool
 }
@@ -861,7 +873,9 @@ func buildAppState(
 		{"acme", "widgets"},
 		{"acme", "tools"},
 	} {
-		repo, err := database.GetRepoByOwnerName(ctx, rp.owner, rp.name)
+		repo, err := database.GetRepoByIdentity(
+			ctx, db.GitHubRepoIdentity("github.com", rp.owner, rp.name),
+		)
 		if err != nil || repo == nil {
 			continue
 		}
@@ -925,6 +939,7 @@ func buildAppState(
 		// tests run unserialized.
 		Tmux: config.Tmux{Command: instanceTmuxCommand()},
 	}
+	cfg.Fleet.Key = strings.TrimSpace(opts.fleetKey)
 	if opts.visibleImportedModes {
 		modes := config.DefaultModeVisibility()
 		*modes.Kata = true
@@ -1035,7 +1050,9 @@ func buildAppState(
 		{owner: "acme", name: "widgets", number: 7},
 		{owner: "acme", name: "tools", number: 1},
 	} {
-		repo, err := database.GetRepoByOwnerName(ctx, target.owner, target.name)
+		repo, err := database.GetRepoByIdentity(
+			ctx, db.GitHubRepoIdentity("github.com", target.owner, target.name),
+		)
 		if err != nil {
 			return nil, fmt.Errorf("get %s/%s repo: %w", target.owner, target.name, err)
 		}
@@ -1305,8 +1322,8 @@ func buildAppState(
 	rootHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost &&
 			r.URL.Path == "/__e2e/pr-workflow-approval/required" {
-			repo, err := database.GetRepoByOwnerName(
-				r.Context(), "acme", "widgets",
+			repo, err := database.GetRepoByIdentity(
+				r.Context(), db.GitHubRepoIdentity("github.com", "acme", "widgets"),
 			)
 			if err != nil || repo == nil {
 				http.Error(w, "repo not found", http.StatusNotFound)
@@ -1362,8 +1379,8 @@ func buildAppState(
 		}
 		if r.Method == http.MethodPost &&
 			r.URL.Path == "/__e2e/repo-settings/viewer-can-merge/deny" {
-			repo, err := database.GetRepoByOwnerName(
-				r.Context(), "acme", "widgets",
+			repo, err := database.GetRepoByIdentity(
+				r.Context(), db.GitHubRepoIdentity("github.com", "acme", "widgets"),
 			)
 			if err != nil || repo == nil {
 				http.Error(w, "repo not found", http.StatusNotFound)
@@ -1627,8 +1644,8 @@ func buildAppState(
 		}
 		if r.Method == http.MethodPost &&
 			r.URL.Path == "/__e2e/pr-diff-summary/advance-head" {
-			repo, err := database.GetRepoByOwnerName(
-				r.Context(), "acme", "widgets",
+			repo, err := database.GetRepoByIdentity(
+				r.Context(), db.GitHubRepoIdentity("github.com", "acme", "widgets"),
 			)
 			if err != nil || repo == nil {
 				http.Error(w, "repo not found", http.StatusNotFound)
@@ -1662,8 +1679,8 @@ func buildAppState(
 		}
 		if r.Method == http.MethodPost &&
 			r.URL.Path == "/__e2e/pr-review-thread-regroup/add-reply" {
-			repo, err := database.GetRepoByOwnerName(
-				r.Context(), "acme", "widgets",
+			repo, err := database.GetRepoByIdentity(
+				r.Context(), db.GitHubRepoIdentity("github.com", "acme", "widgets"),
 			)
 			if err != nil || repo == nil {
 				http.Error(w, "repo not found", http.StatusNotFound)
@@ -1759,7 +1776,7 @@ func buildAppState(
 func run(
 	ctx context.Context,
 	port int,
-	roborevEndpoint, serverInfoFile, defaultPlatformHost string,
+	roborevEndpoint, serverInfoFile, defaultPlatformHost, fleetKey string,
 	visibleImportedModes bool,
 	providerCollision bool,
 ) error {
@@ -1771,6 +1788,7 @@ func run(
 	baseOpts := appOptions{
 		roborevEndpoint:      roborevEndpoint,
 		defaultPlatformHost:  defaultPlatformHost,
+		fleetKey:             fleetKey,
 		visibleImportedModes: visibleImportedModes,
 		providerCollision:    providerCollision,
 	}
@@ -1829,9 +1847,10 @@ func run(
 
 			opts := baseOpts
 			var req struct {
-				DefaultPlatformHost  string `json:"default_platform_host"`
-				VisibleImportedModes *bool  `json:"visible_imported_modes"`
-				ProviderCollision    *bool  `json:"provider_collision"`
+				DefaultPlatformHost  string  `json:"default_platform_host"`
+				FleetKey             *string `json:"fleet_key"`
+				VisibleImportedModes *bool   `json:"visible_imported_modes"`
+				ProviderCollision    *bool   `json:"provider_collision"`
 			}
 			// An empty body resets to the startup options; a
 			// non-empty body must be valid JSON so option typos
@@ -1853,6 +1872,9 @@ func run(
 			}
 			if strings.TrimSpace(req.DefaultPlatformHost) != "" {
 				opts.defaultPlatformHost = req.DefaultPlatformHost
+			}
+			if req.FleetKey != nil {
+				opts.fleetKey = strings.TrimSpace(*req.FleetKey)
 			}
 			if req.VisibleImportedModes != nil {
 				opts.visibleImportedModes = *req.VisibleImportedModes

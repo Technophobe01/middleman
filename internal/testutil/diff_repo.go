@@ -78,6 +78,10 @@ func SetupDiffRepo(
 		"README.md", readmeBase); err != nil {
 		return nil, err
 	}
+	if err := writeFile(workDir,
+		"docs/guide.md", guideMarkdownContent()); err != nil {
+		return nil, err
+	}
 
 	if err := git(ctx, workDir, "add", "-A"); err != nil {
 		return nil, err
@@ -178,6 +182,17 @@ func SetupDiffRepo(
 	if err := d.UpdatePlatformSHAs(
 		ctx, repoID, 1, headSHA, baseSHA); err != nil {
 		return nil, fmt.Errorf("update platform SHAs: %w", err)
+	}
+	if err := d.UpdateRepoProviderMetadata(
+		ctx,
+		repoID,
+		db.RepoProviderMetadata{
+			WebURL:        "https://github.com/acme/widgets",
+			CloneURL:      barePath,
+			DefaultBranch: "main",
+		},
+	); err != nil {
+		return nil, fmt.Errorf("update repo provider metadata: %w", err)
 	}
 
 	mgr := gitclone.New(cloneBase, nil)
@@ -434,6 +449,10 @@ const readmeBase = `# Widget Service
 
 A simple HTTP service for widget management.
 
+See the [API reference](docs/guide.md#api-reference).
+
+![Tracker](https://example.com/tracker.png)
+
 ## Getting Started
 
 Run the server with:
@@ -446,9 +465,37 @@ const readmeHead = `# Widget Service
 
 A simple HTTP service for widget management.
 
+See the [API reference](docs/guide.md#api-reference).
+
+![Tracker](https://example.com/tracker.png)
+
 ## Getting Started
 
 Run the server with:
 
       go run .
 `
+
+func guideMarkdownContent() string {
+	var b strings.Builder
+	b.WriteString(`# Widget Guide
+
+This guide is long enough for anchored navigation to require a scroll.
+
+## Overview
+
+The widget service keeps operational notes close to the code.
+`)
+	for i := 1; i <= 70; i++ {
+		fmt.Fprintf(&b, "\nParagraph %02d: background details for maintainers.\n", i)
+	}
+	b.WriteString(`
+## API Reference
+
+Use the widget API to list, cache, and refresh widget records.
+`)
+	for i := 1; i <= 20; i++ {
+		fmt.Fprintf(&b, "\nReference detail %02d: endpoint behavior.\n", i)
+	}
+	return b.String()
+}

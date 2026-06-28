@@ -3,7 +3,7 @@ package db
 import (
 	"testing"
 
-	Assert "github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -23,7 +23,7 @@ func insertTestMRWithBranches(
 }
 
 func TestListPRsForStackDetection(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	d := openTestDB(t)
 	repoID := insertTestRepo(t, d, "org", "repo")
 
@@ -42,7 +42,7 @@ func TestListPRsForStackDetection(t *testing.T) {
 }
 
 func TestUpsertStackAndReplaceMembers(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -82,7 +82,7 @@ func TestUpsertStackAndReplaceMembers(t *testing.T) {
 }
 
 func TestStackMembersIncludeMergeableState(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -108,7 +108,7 @@ func TestStackMembersIncludeMergeableState(t *testing.T) {
 }
 
 func TestListMRsBlockedByStackConflicts(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -136,7 +136,7 @@ func TestListMRsBlockedByStackConflicts(t *testing.T) {
 }
 
 func TestDeleteStaleStacks(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -173,7 +173,7 @@ func TestListStacksWithMembers_MalformedFilter(t *testing.T) {
 }
 
 func TestReplaceStackMembersReassignsAcrossStacks(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -216,7 +216,7 @@ func TestReplaceStackMembersReassignsAcrossStacks(t *testing.T) {
 }
 
 func TestGetStackForPR(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
 	ctx := t.Context()
@@ -234,14 +234,14 @@ func TestGetStackForPR(t *testing.T) {
 	require.NoError(err)
 
 	// Found
-	stack, members, err := d.GetStackForPR(ctx, "org", "repo", 10)
+	stack, members, err := d.GetStackForPR(ctx, "github", "github.com", "org", "repo", 10)
 	require.NoError(err)
 	require.NotNil(stack)
 	assert.Equal("feature", stack.Name)
 	assert.Len(members, 2)
 
 	// Not found
-	stack2, _, err := d.GetStackForPR(ctx, "org", "repo", 999)
+	stack2, _, err := d.GetStackForPR(ctx, "github", "github.com", "org", "repo", 999)
 	require.NoError(err)
 	assert.Nil(stack2)
 }

@@ -21,7 +21,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
-	Assert "github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/middleman/internal/apiclient"
@@ -316,12 +316,13 @@ func setupWrapperServerWithScriptAndDBAndServer(
 
 func TestTmuxWrapperNewSession(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	client, _, record := setupWrapperServer(t)
 
 	createResp, err := client.HTTP.CreateWorkspaceWithResponse(
 		t.Context(),
 		generated.CreateWorkspaceInputBody{
+			Provider:     "github",
 			PlatformHost: "github.com",
 			Owner:        "acme",
 			Name:         "widget",
@@ -372,7 +373,7 @@ func TestTmuxWrapperNewSession(t *testing.T) {
 
 func TestWorkspaceResponseIncludesTmuxWorkingState(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	t.Setenv("TMUX_PANE_TITLE", "⠴ t3code-b5014b03")
 	t.Setenv("TMUX_PANE_OUTPUT", "stable output")
 
@@ -382,6 +383,7 @@ func TestWorkspaceResponseIncludesTmuxWorkingState(t *testing.T) {
 	createResp, err := client.HTTP.CreateWorkspaceWithResponse(
 		ctx,
 		generated.CreateWorkspaceInputBody{
+			Provider:     "github",
 			PlatformHost: "github.com",
 			Owner:        "acme",
 			Name:         "widget",
@@ -431,7 +433,7 @@ func TestWorkspaceResponseIncludesTmuxWorkingState(t *testing.T) {
 
 func TestWorkspaceResponseTracksTmuxOutputActivity(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	dir := t.TempDir()
 	outputPath := filepath.Join(dir, "pane-output")
@@ -479,6 +481,7 @@ func TestWorkspaceResponseTracksTmuxOutputActivity(t *testing.T) {
 	createResp, err := client.HTTP.CreateWorkspaceWithResponse(
 		ctx,
 		generated.CreateWorkspaceInputBody{
+			Provider:     "github",
 			PlatformHost: "github.com",
 			Owner:        "acme",
 			Name:         "widget",
@@ -542,7 +545,7 @@ func TestWorkspaceResponseTracksTmuxOutputActivity(t *testing.T) {
 
 func TestListWorkspacesFetchesTmuxActivityConcurrently(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	dir := t.TempDir()
 	activeDir := filepath.Join(dir, "active")
@@ -594,6 +597,7 @@ func TestListWorkspacesFetchesTmuxActivityConcurrently(t *testing.T) {
 	createResp1, err := client.HTTP.CreateWorkspaceWithResponse(
 		ctx,
 		generated.CreateWorkspaceInputBody{
+			Provider:     "github",
 			PlatformHost: "github.com",
 			Owner:        "acme",
 			Name:         "widget",
@@ -608,6 +612,7 @@ func TestListWorkspacesFetchesTmuxActivityConcurrently(t *testing.T) {
 	createResp2, err := client.HTTP.CreateWorkspaceWithResponse(
 		ctx,
 		generated.CreateWorkspaceInputBody{
+			Provider:     "github",
 			PlatformHost: "github.com",
 			Owner:        "acme",
 			Name:         "widget",
@@ -653,7 +658,7 @@ func TestListWorkspacesFetchesTmuxActivityConcurrently(t *testing.T) {
 
 func TestWorkspaceListReturnsUnknownWhenTmuxActivityProbeTimesOut(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	dir := t.TempDir()
 	script := filepath.Join(dir, "fake-tmux")
@@ -712,7 +717,7 @@ func TestWorkspaceListReturnsUnknownWhenTmuxActivityProbeTimesOut(t *testing.T) 
 
 func TestConcurrentWorkspaceListsCoalesceTmuxActivityProbe(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	dir := t.TempDir()
 	record := filepath.Join(dir, "record")
@@ -810,7 +815,7 @@ func TestConcurrentWorkspaceListsCoalesceTmuxActivityProbe(t *testing.T) {
 
 func TestWorkspaceListTmuxActivityRefreshesEveryReadyWorkspace(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	dir := t.TempDir()
 	record := filepath.Join(dir, "record")
@@ -894,7 +899,7 @@ func TestWorkspaceListTmuxActivityRefreshesEveryReadyWorkspace(t *testing.T) {
 
 func TestWorkspaceListTmuxActivityStressDoesNotLeakProcesses(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	dir := t.TempDir()
 	activeDir := filepath.Join(dir, "active")
@@ -1021,7 +1026,7 @@ func getRawWorkspaceActivity(
 }
 
 func TestIsWorkingTmuxTitleDetectsCodexSpinner(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	cases := []struct {
 		name    string
@@ -1068,7 +1073,7 @@ func TestIsWorkingTmuxTitleDetectsCodexSpinner(t *testing.T) {
 }
 
 func TestWorkspaceCreateFailureLogsAndPersistsAuditEvent(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	dir := t.TempDir()
@@ -1100,6 +1105,7 @@ func TestWorkspaceCreateFailureLogsAndPersistsAuditEvent(t *testing.T) {
 	createResp, err := client.HTTP.CreateWorkspaceWithResponse(
 		ctx,
 		generated.CreateWorkspaceInputBody{
+			Provider:     "github",
 			PlatformHost: "github.com",
 			Owner:        "acme",
 			Name:         "widget",
@@ -1151,7 +1157,7 @@ func TestWorkspaceCreateFailureLogsAndPersistsAuditEvent(t *testing.T) {
 }
 
 func TestWorkspaceShutdownCancellationPersistsFailureViaAPI(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	dir := t.TempDir()
@@ -1180,6 +1186,7 @@ func TestWorkspaceShutdownCancellationPersistsFailureViaAPI(t *testing.T) {
 	createResp, err := client.HTTP.CreateWorkspaceWithResponse(
 		ctx,
 		generated.CreateWorkspaceInputBody{
+			Provider:     "github",
 			PlatformHost: "github.com",
 			Owner:        "acme",
 			Name:         "widget",
@@ -1264,7 +1271,7 @@ func TestWorkspaceShutdownCancellationPersistsFailureViaAPI(t *testing.T) {
 }
 
 func TestWorkspaceSetupFailureRollbackCleansWorktreeViaAPI(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	dir := t.TempDir()
@@ -1294,6 +1301,7 @@ func TestWorkspaceSetupFailureRollbackCleansWorktreeViaAPI(t *testing.T) {
 	createResp, err := client.HTTP.CreateWorkspaceWithResponse(
 		ctx,
 		generated.CreateWorkspaceInputBody{
+			Provider:     "github",
 			PlatformHost: "github.com",
 			Owner:        "acme",
 			Name:         "widget",
@@ -1344,7 +1352,7 @@ func TestWorkspaceSetupFailureRollbackCleansWorktreeViaAPI(t *testing.T) {
 }
 
 func TestWorkspaceRetryWhileCreatingQueuesAndRunsAfterFailureViaAPI(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	dir := t.TempDir()
@@ -1385,6 +1393,7 @@ func TestWorkspaceRetryWhileCreatingQueuesAndRunsAfterFailureViaAPI(t *testing.T
 	createResp, err := client.HTTP.CreateWorkspaceWithResponse(
 		ctx,
 		generated.CreateWorkspaceInputBody{
+			Provider:     "github",
 			PlatformHost: "github.com",
 			Owner:        "acme",
 			Name:         "widget",
@@ -1461,7 +1470,7 @@ func TestWorkspaceRetryWhileCreatingQueuesAndRunsAfterFailureViaAPI(t *testing.T
 }
 
 func TestWorkspaceShutdownCancellationDoesNotPersistAfterDeadlineBudgetExhausted(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	dir := t.TempDir()
@@ -1489,6 +1498,7 @@ func TestWorkspaceShutdownCancellationDoesNotPersistAfterDeadlineBudgetExhausted
 	createResp, err := client.HTTP.CreateWorkspaceWithResponse(
 		t.Context(),
 		generated.CreateWorkspaceInputBody{
+			Provider:     "github",
 			PlatformHost: "github.com",
 			Owner:        "acme",
 			Name:         "widget",
@@ -1587,13 +1597,14 @@ func TestWorkspaceShutdownCancellationDoesNotPersistAfterDeadlineBudgetExhausted
 
 func TestTmuxWrapperAttachSession(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	client, baseURL, record := setupWrapperServer(t)
 	ctx := t.Context()
 
 	createResp, err := client.HTTP.CreateWorkspaceWithResponse(
 		ctx,
 		generated.CreateWorkspaceInputBody{
+			Provider:     "github",
 			PlatformHost: "github.com",
 			Owner:        "acme",
 			Name:         "widget",
@@ -1671,7 +1682,7 @@ func TestTmuxWrapperAttachSession(t *testing.T) {
 }
 
 func TestTerminalRouteE2EPropagatesWorkspaceID(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	_, baseURL, _ := setupWrapperServer(t)
 
 	resp, err := http.Get(
@@ -1688,7 +1699,7 @@ func TestTerminalRouteE2EPropagatesWorkspaceID(t *testing.T) {
 }
 
 func TestWorkspaceSetupResourceExhaustionGetsHelpfulErrorViaAPI(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	dir := t.TempDir()
@@ -1716,6 +1727,7 @@ func TestWorkspaceSetupResourceExhaustionGetsHelpfulErrorViaAPI(t *testing.T) {
 	createResp, err := client.HTTP.CreateWorkspaceWithResponse(
 		ctx,
 		generated.CreateWorkspaceInputBody{
+			Provider:     "github",
 			PlatformHost: "github.com",
 			Owner:        "acme",
 			Name:         "widget",
@@ -1751,7 +1763,7 @@ func TestWorkspaceSetupResourceExhaustionGetsHelpfulErrorViaAPI(t *testing.T) {
 }
 
 func TestWorkspaceListWaitsForSubprocessCapacityThenCompletesViaAPI(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	restoreLimiter := procutil.SetDefaultLimiterForTest(
@@ -1765,6 +1777,7 @@ func TestWorkspaceListWaitsForSubprocessCapacityThenCompletesViaAPI(t *testing.T
 	createResp, err := client.HTTP.CreateWorkspaceWithResponse(
 		ctx,
 		generated.CreateWorkspaceInputBody{
+			Provider:     "github",
 			PlatformHost: "github.com",
 			Owner:        "acme",
 			Name:         "widget",
@@ -1823,7 +1836,7 @@ func TestWorkspaceListWaitsForSubprocessCapacityThenCompletesViaAPI(t *testing.T
 }
 
 func TestWorkspaceSetupLimiterTimeoutSurfacesResourceExhaustionViaAPI(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	restoreLimiter := procutil.SetDefaultLimiterForTest(
@@ -1843,6 +1856,7 @@ func TestWorkspaceSetupLimiterTimeoutSurfacesResourceExhaustionViaAPI(t *testing
 	createResp, err := client.HTTP.CreateWorkspaceWithResponse(
 		ctx,
 		generated.CreateWorkspaceInputBody{
+			Provider:     "github",
 			PlatformHost: "github.com",
 			Owner:        "acme",
 			Name:         "widget",
@@ -1883,7 +1897,7 @@ func TestWorkspaceSetupLimiterTimeoutSurfacesResourceExhaustionViaAPI(t *testing
 // parser must keep interior and trailing empties rather than
 // collapsing them.
 func TestReadTmuxRecordPreservesEmptyArgs(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	path := filepath.Join(t.TempDir(), "record")
 
@@ -1904,13 +1918,14 @@ func TestReadTmuxRecordPreservesEmptyArgs(t *testing.T) {
 // together they cover all three tmux verbs that cross the HTTP boundary.
 func TestTmuxWrapperKillSession(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	client, _, record := setupWrapperServer(t)
 	ctx := t.Context()
 
 	createResp, err := client.HTTP.CreateWorkspaceWithResponse(
 		ctx,
 		generated.CreateWorkspaceInputBody{
+			Provider:     "github",
 			PlatformHost: "github.com",
 			Owner:        "acme",
 			Name:         "widget",
@@ -1963,7 +1978,7 @@ func TestTmuxWrapperKillSession(t *testing.T) {
 
 func TestDeleteWorkspacePreservesRowWhenTmuxKillFails(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	dir := t.TempDir()
 	script := filepath.Join(dir, "fake-tmux")
@@ -1987,6 +2002,7 @@ func TestDeleteWorkspacePreservesRowWhenTmuxKillFails(t *testing.T) {
 	createResp, err := client.HTTP.CreateWorkspaceWithResponse(
 		ctx,
 		generated.CreateWorkspaceInputBody{
+			Provider:     "github",
 			PlatformHost: "github.com",
 			Owner:        "acme",
 			Name:         "widget",
@@ -2037,7 +2053,7 @@ func TestDeleteWorkspacePreservesRowWhenTmuxKillFails(t *testing.T) {
 
 func TestDeleteWorkspaceTreatsTmuxServerExitAsGoneE2E(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	dir := t.TempDir()
 	script := filepath.Join(dir, "fake-tmux")
@@ -2060,6 +2076,7 @@ func TestDeleteWorkspaceTreatsTmuxServerExitAsGoneE2E(t *testing.T) {
 	createResp, err := client.HTTP.CreateWorkspaceWithResponse(
 		t.Context(),
 		generated.CreateWorkspaceInputBody{
+			Provider:     "github",
 			PlatformHost: "github.com",
 			Owner:        "acme",
 			Name:         "widget",
@@ -2102,7 +2119,7 @@ func TestDeleteWorkspaceTreatsTmuxServerExitAsGoneE2E(t *testing.T) {
 
 func TestDeleteErroredWorkspaceAllowsUnavailableTmux(t *testing.T) {
 	require := require.New(t)
-	assert := Assert.New(t)
+	assert := assert.New(t)
 
 	dir := t.TempDir()
 	script := filepath.Join(dir, "fake-tmux")
@@ -2130,6 +2147,7 @@ func TestDeleteErroredWorkspaceAllowsUnavailableTmux(t *testing.T) {
 	createResp, err := client.HTTP.CreateWorkspaceWithResponse(
 		ctx,
 		generated.CreateWorkspaceInputBody{
+			Provider:     "github",
 			PlatformHost: "github.com",
 			Owner:        "acme",
 			Name:         "widget",
@@ -2194,7 +2212,7 @@ func TestTmuxWrapperAttachSurfacesWrapperFailure(t *testing.T) {
 // ready-polling, dial, and close-status assertion.
 func attachWebsocketAndExpectInternalError(t *testing.T, scriptBody string) {
 	t.Helper()
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	dir := t.TempDir()
@@ -2209,6 +2227,7 @@ func attachWebsocketAndExpectInternalError(t *testing.T, scriptBody string) {
 	createResp, err := client.HTTP.CreateWorkspaceWithResponse(
 		ctx,
 		generated.CreateWorkspaceInputBody{
+			Provider:     "github",
 			PlatformHost: "github.com",
 			Owner:        "acme",
 			Name:         "widget",

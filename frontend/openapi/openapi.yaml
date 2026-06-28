@@ -476,6 +476,9 @@ components:
         message:
           description: First line of commit message
           type: string
+        pushed:
+          description: Whether the commit is reachable from the workspace branch's upstream tracking ref; false means it has not been pushed. Omitted when push status is unknown, such as pull request commits.
+          type: boolean
         sha:
           description: Full commit SHA
           type: string
@@ -692,6 +695,7 @@ components:
         provider:
           type: string
       required:
+        - provider
         - platform_host
         - owner
         - name
@@ -2339,6 +2343,77 @@ components:
           type: string
       required:
         - daemons
+      type: object
+    KataProjectRepoMapping:
+      additionalProperties: false
+      properties:
+        daemon_id:
+          type: string
+        platform_host:
+          type: string
+        project_uid:
+          type: string
+        provider:
+          type: string
+        repo_path:
+          type: string
+      required:
+        - project_uid
+        - provider
+        - platform_host
+        - repo_path
+      type: object
+    KataWorkspaceTargetResponse:
+      additionalProperties: false
+      properties:
+        $schema:
+          description: A URL to the JSON Schema for this object.
+          examples:
+            - /api/v1/schemas/KataWorkspaceTargetResponse.json
+          format: uri
+          readOnly: true
+          type: string
+        available:
+          type: boolean
+        existing_workspace:
+          $ref: "#/components/schemas/WorkspaceRef"
+        item_key:
+          type: string
+        item_type:
+          type: string
+        repo:
+          $ref: "#/components/schemas/RepoRefResponse"
+      required:
+        - available
+      type: object
+    KataWorkspaceTaskRequest:
+      additionalProperties: false
+      properties:
+        $schema:
+          description: A URL to the JSON Schema for this object.
+          examples:
+            - /api/v1/schemas/KataWorkspaceTaskRequest.json
+          format: uri
+          readOnly: true
+          type: string
+        daemon_id:
+          type: string
+        issue_uid:
+          type: string
+        project_name:
+          type: string
+        project_uid:
+          type: string
+        qualified_id:
+          type: string
+        short_id:
+          type: string
+        title:
+          type: string
+      required:
+        - daemon_id
+        - project_uid
+        - issue_uid
       type: object
     Label:
       additionalProperties: false
@@ -4785,6 +4860,251 @@ components:
       required:
         - body
       type: object
+    RepoBrowserBlob:
+      additionalProperties: false
+      properties:
+        binary:
+          type: boolean
+        content:
+          type: string
+        encoding:
+          type: string
+        media_type:
+          type: string
+        path:
+          type: string
+        sha:
+          type: string
+        size:
+          format: int64
+          type: integer
+        too_large:
+          type: boolean
+      required:
+        - path
+        - sha
+        - size
+        - media_type
+        - encoding
+        - content
+        - binary
+        - too_large
+      type: object
+    RepoBrowserBlobResponse:
+      additionalProperties: false
+      properties:
+        $schema:
+          description: A URL to the JSON Schema for this object.
+          examples:
+            - /api/v1/schemas/RepoBrowserBlobResponse.json
+          format: uri
+          readOnly: true
+          type: string
+        blob:
+          $ref: "#/components/schemas/RepoBrowserBlob"
+        ref:
+          $ref: "#/components/schemas/RepoBrowserRef"
+        repo:
+          $ref: "#/components/schemas/RepoRefResponse"
+      required:
+        - repo
+        - ref
+        - blob
+      type: object
+    RepoBrowserCommit:
+      additionalProperties: false
+      properties:
+        author_email:
+          type: string
+        author_name:
+          type: string
+        authored_at:
+          format: date-time
+          type: string
+        body:
+          type: string
+        sha:
+          type: string
+        subject:
+          type: string
+      required:
+        - sha
+        - subject
+        - body
+        - author_name
+        - author_email
+        - authored_at
+      type: object
+    RepoBrowserCommitResponse:
+      additionalProperties: false
+      properties:
+        $schema:
+          description: A URL to the JSON Schema for this object.
+          examples:
+            - /api/v1/schemas/RepoBrowserCommitResponse.json
+          format: uri
+          readOnly: true
+          type: string
+        commit:
+          $ref: "#/components/schemas/RepoBrowserCommit"
+        path:
+          type: string
+        ref:
+          $ref: "#/components/schemas/RepoBrowserRef"
+        repo:
+          $ref: "#/components/schemas/RepoRefResponse"
+      required:
+        - repo
+        - ref
+        - path
+        - commit
+      type: object
+    RepoBrowserHistoryResponse:
+      additionalProperties: false
+      properties:
+        $schema:
+          description: A URL to the JSON Schema for this object.
+          examples:
+            - /api/v1/schemas/RepoBrowserHistoryResponse.json
+          format: uri
+          readOnly: true
+          type: string
+        commits:
+          items:
+            $ref: "#/components/schemas/RepoBrowserCommit"
+          type:
+            - array
+            - "null"
+        path:
+          type: string
+        ref:
+          $ref: "#/components/schemas/RepoBrowserRef"
+        repo:
+          $ref: "#/components/schemas/RepoRefResponse"
+      required:
+        - repo
+        - ref
+        - path
+        - commits
+      type: object
+    RepoBrowserLastChangedResponse:
+      additionalProperties: false
+      properties:
+        $schema:
+          description: A URL to the JSON Schema for this object.
+          examples:
+            - /api/v1/schemas/RepoBrowserLastChangedResponse.json
+          format: uri
+          readOnly: true
+          type: string
+        commits:
+          additionalProperties:
+            $ref: "#/components/schemas/RepoBrowserCommit"
+          type: object
+        ref:
+          $ref: "#/components/schemas/RepoBrowserRef"
+        repo:
+          $ref: "#/components/schemas/RepoRefResponse"
+      required:
+        - repo
+        - ref
+        - commits
+      type: object
+    RepoBrowserRef:
+      additionalProperties: false
+      properties:
+        name:
+          description: Selected branch or tag name. Commit refs leave this empty.
+          type: string
+        requested_sha:
+          description: Caller-supplied branch or tag SHA when it differs from the resolved SHA.
+          type: string
+        sha:
+          description: Resolved commit SHA used for the read.
+          type: string
+        stale:
+          description: True when a caller-supplied branch or tag SHA no longer matches the current ref target.
+          type: boolean
+        type:
+          description: "Selected ref type: branch, tag, or commit."
+          type: string
+      required:
+        - type
+        - name
+        - sha
+        - stale
+      type: object
+    RepoBrowserRefsResponse:
+      additionalProperties: false
+      properties:
+        $schema:
+          description: A URL to the JSON Schema for this object.
+          examples:
+            - /api/v1/schemas/RepoBrowserRefsResponse.json
+          format: uri
+          readOnly: true
+          type: string
+        default_ref:
+          $ref: "#/components/schemas/RepoBrowserRef"
+        refs:
+          items:
+            $ref: "#/components/schemas/RepoBrowserRef"
+          type:
+            - array
+            - "null"
+        repo:
+          $ref: "#/components/schemas/RepoRefResponse"
+        truncated:
+          type: boolean
+      required:
+        - repo
+        - refs
+        - default_ref
+        - truncated
+      type: object
+    RepoBrowserTreeEntry:
+      additionalProperties: false
+      properties:
+        path:
+          type: string
+        size:
+          format: int64
+          type: integer
+        type:
+          type: string
+      required:
+        - path
+        - type
+        - size
+      type: object
+    RepoBrowserTreeResponse:
+      additionalProperties: false
+      properties:
+        $schema:
+          description: A URL to the JSON Schema for this object.
+          examples:
+            - /api/v1/schemas/RepoBrowserTreeResponse.json
+          format: uri
+          readOnly: true
+          type: string
+        entries:
+          items:
+            $ref: "#/components/schemas/RepoBrowserTreeEntry"
+          type:
+            - array
+            - "null"
+        ref:
+          $ref: "#/components/schemas/RepoBrowserRef"
+        repo:
+          $ref: "#/components/schemas/RepoRefResponse"
+        truncated:
+          type: boolean
+      required:
+        - repo
+        - ref
+        - entries
+        - truncated
+      type: object
     RepoLabelsResponse:
       additionalProperties: false
       properties:
@@ -5641,6 +5961,10 @@ components:
           type: array
         fleet:
           $ref: "#/components/schemas/FleetSettingsResponse"
+        kata_projects:
+          items:
+            $ref: "#/components/schemas/KataProjectRepoMapping"
+          type: array
         launch_targets:
           items:
             $ref: "#/components/schemas/LaunchTarget"
@@ -5663,6 +5987,7 @@ components:
         - notifications
         - terminal
         - agents
+        - kata_projects
         - fleet
       type: object
     Snapshot:
@@ -5861,11 +6186,15 @@ components:
           type: string
         platform_host:
           type: string
+        provider:
+          type: string
       required:
         - item_type
+        - provider
         - owner
         - name
         - number
+        - platform_host
       type: object
     SyncStatus:
       additionalProperties: false
@@ -6132,6 +6461,10 @@ components:
           items:
             $ref: "#/components/schemas/Agent"
           type: array
+        kata_projects:
+          items:
+            $ref: "#/components/schemas/KataProjectRepoMapping"
+          type: array
         modes:
           $ref: "#/components/schemas/ModeVisibility"
         terminal:
@@ -6179,6 +6512,28 @@ components:
         - required
         - count
       type: object
+    WorkspaceKataMetadata:
+      additionalProperties: false
+      properties:
+        daemon_id:
+          type: string
+        issue_uid:
+          type: string
+        project_name:
+          type: string
+        project_uid:
+          type: string
+        qualified_id:
+          type: string
+        short_id:
+          type: string
+        title:
+          type: string
+      required:
+        - daemon_id
+        - project_uid
+        - issue_uid
+      type: object
     WorkspaceRef:
       additionalProperties: false
       properties:
@@ -6217,6 +6572,8 @@ components:
           type: string
         id:
           type: string
+        item_key:
+          type: string
         item_last_activity_at:
           type: string
         item_number:
@@ -6224,6 +6581,8 @@ components:
           type: integer
         item_type:
           type: string
+        kata:
+          $ref: "#/components/schemas/WorkspaceKataMetadata"
         mr_additions:
           format: int64
           type: integer
@@ -6272,6 +6631,7 @@ components:
         - repo_name
         - item_type
         - item_number
+        - item_key
         - git_head_ref
         - worktree_path
         - tmux_session
@@ -6362,6 +6722,8 @@ components:
     WorktreeLinkResponse:
       additionalProperties: false
       properties:
+        host_key:
+          type: string
         worktree_branch:
           type: string
         worktree_key:
@@ -6507,12 +6869,12 @@ paths:
     get:
       operationId: list-activity
       parameters:
-        - description: Repository filter. Accepts owner/name, platform_host/repo_path, comma-separated values, or provider|platform_host/repo_path for provider-qualified matches.
+        - description: Repository filter. Accepts provider|platform_host/repo_path, with comma-separated values for multiple repositories.
           explode: false
           in: query
           name: repo
           schema:
-            description: Repository filter. Accepts owner/name, platform_host/repo_path, comma-separated values, or provider|platform_host/repo_path for provider-qualified matches.
+            description: Repository filter. Accepts provider|platform_host/repo_path, with comma-separated values for multiple repositories.
             type: string
         - explode: false
           in: query
@@ -7367,6 +7729,33 @@ paths:
       summary: Delete project on fleet host
       tags:
         - Fleet
+    get:
+      operationId: get-fleet-project
+      parameters:
+        - in: path
+          name: host_key
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: project_id
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          content:
+            application/json:
+              schema:
+                additionalProperties: true
+                type: object
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemError"
+          description: Response returned by the owning fleet host.
+      summary: Get project on fleet host
+      tags:
+        - Fleet
   /fleet/hosts/{host_key}/projects/{project_id}/branches:
     get:
       operationId: list-fleet-project-branches
@@ -7396,6 +7785,33 @@ paths:
       tags:
         - Fleet
   /fleet/hosts/{host_key}/projects/{project_id}/worktrees:
+    get:
+      operationId: list-fleet-project-worktrees
+      parameters:
+        - in: path
+          name: host_key
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: project_id
+          required: true
+          schema:
+            type: string
+      responses:
+        default:
+          content:
+            application/json:
+              schema:
+                additionalProperties: true
+                type: object
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemError"
+          description: Response returned by the owning fleet host.
+      summary: List project worktrees on fleet host
+      tags:
+        - Fleet
     post:
       operationId: create-fleet-project-worktree
       parameters:
@@ -10853,6 +11269,486 @@ paths:
       summary: Get repository
       tags:
         - Repositories
+  /host/{platform_host}/repo/{provider}/{owner}/{name}/browser/asset:
+    get:
+      description: Returns raw image bytes for a repository file. Asset reads require ref_type=commit with ref_sha set to a full 40-character commit SHA; branch and tag refs are rejected with mutable_ref_not_allowed.
+      operationId: get-repo-browser-asset-on-host
+      parameters:
+        - in: path
+          name: provider
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: platform_host
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: owner
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: name
+          required: true
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: repo_path
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: ref_type
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: ref_name
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: ref_sha
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: path
+          schema:
+            type: string
+      responses:
+        "200":
+          content:
+            image/avif:
+              schema:
+                contentMediaType: application/octet-stream
+                format: binary
+                type: string
+            image/bmp:
+              schema:
+                contentMediaType: application/octet-stream
+                format: binary
+                type: string
+            image/gif:
+              schema:
+                contentMediaType: application/octet-stream
+                format: binary
+                type: string
+            image/jpeg:
+              schema:
+                contentMediaType: application/octet-stream
+                format: binary
+                type: string
+            image/png:
+              schema:
+                contentMediaType: application/octet-stream
+                format: binary
+                type: string
+            image/webp:
+              schema:
+                contentMediaType: application/octet-stream
+                format: binary
+                type: string
+          description: Image response
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+            Content-Length:
+              schema:
+                type: string
+            Content-Type:
+              schema:
+                type: string
+            X-Content-Type-Options:
+              schema:
+                type: string
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemError"
+          description: Error
+      summary: Get repository browser asset
+      tags:
+        - Repositories
+  /host/{platform_host}/repo/{provider}/{owner}/{name}/browser/blob:
+    get:
+      operationId: get-repo-browser-blob-on-host
+      parameters:
+        - in: path
+          name: provider
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: platform_host
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: owner
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: name
+          required: true
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: repo_path
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: ref_type
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: ref_name
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: ref_sha
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: path
+          schema:
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RepoBrowserBlobResponse"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemError"
+          description: Error
+      summary: Get repository browser blob
+      tags:
+        - Repositories
+  /host/{platform_host}/repo/{provider}/{owner}/{name}/browser/commit:
+    get:
+      operationId: get-repo-browser-commit-on-host
+      parameters:
+        - in: path
+          name: provider
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: platform_host
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: owner
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: name
+          required: true
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: repo_path
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: ref_type
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: ref_name
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: ref_sha
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: path
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: sha
+          schema:
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RepoBrowserCommitResponse"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemError"
+          description: Error
+      summary: Get repository browser commit
+      tags:
+        - Repositories
+  /host/{platform_host}/repo/{provider}/{owner}/{name}/browser/history:
+    get:
+      operationId: get-repo-browser-history-on-host
+      parameters:
+        - in: path
+          name: provider
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: platform_host
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: owner
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: name
+          required: true
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: repo_path
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: ref_type
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: ref_name
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: ref_sha
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: path
+          schema:
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RepoBrowserHistoryResponse"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemError"
+          description: Error
+      summary: Get repository browser file history
+      tags:
+        - Repositories
+  /host/{platform_host}/repo/{provider}/{owner}/{name}/browser/last-changed:
+    get:
+      operationId: get-repo-browser-last-changed-on-host
+      parameters:
+        - in: path
+          name: provider
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: platform_host
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: owner
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: name
+          required: true
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: repo_path
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: ref_type
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: ref_name
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: ref_sha
+          schema:
+            type: string
+        - explode: true
+          in: query
+          name: path
+          schema:
+            items:
+              type: string
+            type:
+              - array
+              - "null"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RepoBrowserLastChangedResponse"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemError"
+          description: Error
+      summary: Get repository browser last changed commits
+      tags:
+        - Repositories
+  /host/{platform_host}/repo/{provider}/{owner}/{name}/browser/refs:
+    get:
+      operationId: list-repo-browser-refs-on-host
+      parameters:
+        - in: path
+          name: provider
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: platform_host
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: owner
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: name
+          required: true
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: repo_path
+          schema:
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RepoBrowserRefsResponse"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemError"
+          description: Error
+      summary: List repository browser refs
+      tags:
+        - Repositories
+  /host/{platform_host}/repo/{provider}/{owner}/{name}/browser/tree:
+    get:
+      operationId: list-repo-browser-tree-on-host
+      parameters:
+        - in: path
+          name: provider
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: platform_host
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: owner
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: name
+          required: true
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: repo_path
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: ref_type
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: ref_name
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: ref_sha
+          schema:
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RepoBrowserTreeResponse"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemError"
+          description: Error
+      summary: List repository browser tree
+      tags:
+        - Repositories
   /host/{platform_host}/repo/{provider}/{owner}/{name}/comment-autocomplete:
     get:
       operationId: get-comment-autocomplete-on-host
@@ -11145,12 +12041,12 @@ paths:
     get:
       operationId: list-issues
       parameters:
-        - description: Repository filter. Accepts owner/name, platform_host/repo_path, comma-separated values, or provider|platform_host/repo_path for provider-qualified matches.
+        - description: Repository filter. Accepts provider|platform_host/repo_path, with comma-separated values for multiple repositories.
           explode: false
           in: query
           name: repo
           schema:
-            description: Repository filter. Accepts owner/name, platform_host/repo_path, comma-separated values, or provider|platform_host/repo_path for provider-qualified matches.
+            description: Repository filter. Accepts provider|platform_host/repo_path, with comma-separated values for multiple repositories.
             type: string
         - explode: false
           in: query
@@ -11715,6 +12611,56 @@ paths:
                 $ref: "#/components/schemas/ProblemError"
           description: Error
       summary: List Kata daemons
+      tags:
+        - Kata
+  /kata/workspace-target:
+    post:
+      operationId: resolve-kata-workspace-target
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/KataWorkspaceTaskRequest"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/KataWorkspaceTargetResponse"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemError"
+          description: Error
+      summary: Resolve Kata workspace target
+      tags:
+        - Kata
+  /kata/workspaces:
+    post:
+      operationId: create-kata-workspace
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/KataWorkspaceTaskRequest"
+        required: true
+      responses:
+        "202":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WorkspaceResponse"
+          description: Accepted
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemError"
+          description: Error
+      summary: Create Kata workspace
       tags:
         - Kata
   /messages/saved-searches:
@@ -12953,12 +13899,12 @@ paths:
     get:
       operationId: list-pulls
       parameters:
-        - description: Repository filter. Accepts owner/name, platform_host/repo_path, comma-separated values, or provider|platform_host/repo_path for provider-qualified matches.
+        - description: Repository filter. Accepts provider|platform_host/repo_path, with comma-separated values for multiple repositories.
           explode: false
           in: query
           name: repo
           schema:
-            description: Repository filter. Accepts owner/name, platform_host/repo_path, comma-separated values, or provider|platform_host/repo_path for provider-qualified matches.
+            description: Repository filter. Accepts provider|platform_host/repo_path, with comma-separated values for multiple repositories.
             type: string
         - explode: false
           in: query
@@ -14614,6 +15560,451 @@ paths:
       summary: Get repository
       tags:
         - Repositories
+  /repo/{provider}/{owner}/{name}/browser/asset:
+    get:
+      description: Returns raw image bytes for a repository file. Asset reads require ref_type=commit with ref_sha set to a full 40-character commit SHA; branch and tag refs are rejected with mutable_ref_not_allowed.
+      operationId: get-repo-browser-asset
+      parameters:
+        - in: path
+          name: provider
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: owner
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: name
+          required: true
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: repo_path
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: ref_type
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: ref_name
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: ref_sha
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: path
+          schema:
+            type: string
+      responses:
+        "200":
+          content:
+            image/avif:
+              schema:
+                contentMediaType: application/octet-stream
+                format: binary
+                type: string
+            image/bmp:
+              schema:
+                contentMediaType: application/octet-stream
+                format: binary
+                type: string
+            image/gif:
+              schema:
+                contentMediaType: application/octet-stream
+                format: binary
+                type: string
+            image/jpeg:
+              schema:
+                contentMediaType: application/octet-stream
+                format: binary
+                type: string
+            image/png:
+              schema:
+                contentMediaType: application/octet-stream
+                format: binary
+                type: string
+            image/webp:
+              schema:
+                contentMediaType: application/octet-stream
+                format: binary
+                type: string
+          description: Image response
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+            Content-Length:
+              schema:
+                type: string
+            Content-Type:
+              schema:
+                type: string
+            X-Content-Type-Options:
+              schema:
+                type: string
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemError"
+          description: Error
+      summary: Get repository browser asset
+      tags:
+        - Repositories
+  /repo/{provider}/{owner}/{name}/browser/blob:
+    get:
+      operationId: get-repo-browser-blob
+      parameters:
+        - in: path
+          name: provider
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: owner
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: name
+          required: true
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: repo_path
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: ref_type
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: ref_name
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: ref_sha
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: path
+          schema:
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RepoBrowserBlobResponse"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemError"
+          description: Error
+      summary: Get repository browser blob
+      tags:
+        - Repositories
+  /repo/{provider}/{owner}/{name}/browser/commit:
+    get:
+      operationId: get-repo-browser-commit
+      parameters:
+        - in: path
+          name: provider
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: owner
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: name
+          required: true
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: repo_path
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: ref_type
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: ref_name
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: ref_sha
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: path
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: sha
+          schema:
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RepoBrowserCommitResponse"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemError"
+          description: Error
+      summary: Get repository browser commit
+      tags:
+        - Repositories
+  /repo/{provider}/{owner}/{name}/browser/history:
+    get:
+      operationId: get-repo-browser-history
+      parameters:
+        - in: path
+          name: provider
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: owner
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: name
+          required: true
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: repo_path
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: ref_type
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: ref_name
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: ref_sha
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: path
+          schema:
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RepoBrowserHistoryResponse"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemError"
+          description: Error
+      summary: Get repository browser file history
+      tags:
+        - Repositories
+  /repo/{provider}/{owner}/{name}/browser/last-changed:
+    get:
+      operationId: get-repo-browser-last-changed
+      parameters:
+        - in: path
+          name: provider
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: owner
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: name
+          required: true
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: repo_path
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: ref_type
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: ref_name
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: ref_sha
+          schema:
+            type: string
+        - explode: true
+          in: query
+          name: path
+          schema:
+            items:
+              type: string
+            type:
+              - array
+              - "null"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RepoBrowserLastChangedResponse"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemError"
+          description: Error
+      summary: Get repository browser last changed commits
+      tags:
+        - Repositories
+  /repo/{provider}/{owner}/{name}/browser/refs:
+    get:
+      operationId: list-repo-browser-refs
+      parameters:
+        - in: path
+          name: provider
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: owner
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: name
+          required: true
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: repo_path
+          schema:
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RepoBrowserRefsResponse"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemError"
+          description: Error
+      summary: List repository browser refs
+      tags:
+        - Repositories
+  /repo/{provider}/{owner}/{name}/browser/tree:
+    get:
+      operationId: list-repo-browser-tree
+      parameters:
+        - in: path
+          name: provider
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: owner
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: name
+          required: true
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: repo_path
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: ref_type
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: ref_name
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: ref_sha
+          schema:
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RepoBrowserTreeResponse"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemError"
+          description: Error
+      summary: List repository browser tree
+      tags:
+        - Repositories
   /repo/{provider}/{owner}/{name}/comment-autocomplete:
     get:
       operationId: get-comment-autocomplete
@@ -15368,12 +16759,12 @@ paths:
     post:
       operationId: trigger-sync
       parameters:
-        - description: Optional repository filters to sync first. Accepts repeated values or comma-separated values. Each value may be provider-qualified as provider|platform_host/owner/name, host-qualified as platform_host/owner/name, or bare as owner/name; bare values match the first tracked repo with that repo path.
+        - description: Optional repository filters to sync first. Accepts repeated provider|platform_host/repo_path values or comma-separated values.
           explode: false
           in: query
           name: priority_repo
           schema:
-            description: Optional repository filters to sync first. Accepts repeated values or comma-separated values. Each value may be provider-qualified as provider|platform_host/owner/name, host-qualified as platform_host/owner/name, or bare as owner/name; bare values match the first tracked repo with that repo path.
+            description: Optional repository filters to sync first. Accepts repeated provider|platform_host/repo_path values or comma-separated values.
             items:
               type: string
             type:

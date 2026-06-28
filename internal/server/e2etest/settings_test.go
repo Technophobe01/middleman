@@ -16,7 +16,7 @@ import (
 	"time"
 
 	gh "github.com/google/go-github/v84/github"
-	Assert "github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	gitcmd "go.kenn.io/kit/git/cmd"
 	"go.kenn.io/middleman/internal/apiclient/generated"
@@ -54,7 +54,7 @@ func doServerJSON(
 }
 
 func TestSettingsAPIE2EReadUpdateAndValidation(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	srv, _, cfgPath := setupTestServerWithConfig(t)
 	ts := httptest.NewServer(srv)
@@ -175,7 +175,7 @@ func findSettingsLaunchTarget(
 }
 
 func TestSettingsAPIE2EHideTmuxStatusUpdateAffectsRuntimeSessions(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	dir := t.TempDir()
 	record := filepath.Join(dir, "tmux-record")
@@ -273,7 +273,7 @@ name = "widget"
 }
 
 func TestSettingsAPIE2EPreservesMsgvaultConfig(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	srv, _, cfgPath := setupTestServerWithConfigContent(t, `
 sync_interval = "5m"
@@ -320,7 +320,7 @@ api_key_env = "MSGVAULT_API_KEY_TEST"
 }
 
 func TestSettingsAPIE2EPreservesStartupConfigThroughSettingsSave(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	srv, _, cfgPath := setupTestServerWithConfigContent(t, `
 sync_interval = "10m"
@@ -397,7 +397,7 @@ command = ["systemd-run", "--user", "--scope", "--pty", "bash"]
 }
 
 func TestSettingsAPIE2EFleetReadUpdateAndValidation(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	srv, _, cfgPath := setupTestServerWithConfigContent(t, `
 sync_interval = "5m"
@@ -582,7 +582,7 @@ platform = "linux"
 }
 
 func TestRepoConfigAPIE2EAddDeleteAndErrors(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	srv, _, cfgPath := setupTestServerWithConfig(t)
 	ts := httptest.NewServer(srv)
@@ -641,7 +641,7 @@ func TestRepoConfigAPIE2EAddDeleteAndErrors(t *testing.T) {
 }
 
 func TestRepoConfigAPIE2EUpdatesWorktreeBasePath(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	srv, _, cfgPath := setupTestServerWithConfig(t)
 	ts := httptest.NewServer(srv)
@@ -687,7 +687,7 @@ func TestRepoConfigAPIE2EUpdatesWorktreeBasePath(t *testing.T) {
 }
 
 func TestRepoConfigAPIE2ERejectsUnsafeWorktreeScopedBaseConfig(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	srv, _, cfgPath := setupTestServerWithConfig(t)
 	ts := httptest.NewServer(srv)
@@ -816,7 +816,7 @@ func (env settingsWorkspaceEnv) setWorktreeBase(t *testing.T) {
 }
 
 func TestRepoConfigAPIE2EWorkspaceCreationUsesWorktreeBasePath(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	env := setupSettingsWorkspaceEnv(t, func(database *db.DB, repoID int64) {
@@ -836,6 +836,7 @@ func TestRepoConfigAPIE2EWorkspaceCreationUsesWorktreeBasePath(t *testing.T) {
 	createResp, err := client.CreateWorkspaceWithResponse(
 		t.Context(),
 		generated.CreateWorkspaceInputBody{
+			Provider:     "github",
 			PlatformHost: platformHost,
 			Owner:        "acme",
 			Name:         "widget",
@@ -863,7 +864,7 @@ func TestRepoConfigAPIE2EWorkspaceCreationUsesWorktreeBasePath(t *testing.T) {
 }
 
 func TestRepoConfigAPIE2EWorkspaceCreationUsesFallbackBranchWhenPreferredCheckedOut(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	env := setupSettingsWorkspaceEnv(t, func(database *db.DB, repoID int64) {
@@ -887,6 +888,7 @@ func TestRepoConfigAPIE2EWorkspaceCreationUsesFallbackBranchWhenPreferredChecked
 	createResp, err := client.CreateWorkspaceWithResponse(
 		t.Context(),
 		generated.CreateWorkspaceInputBody{
+			Provider:     "github",
 			PlatformHost: platformHost,
 			Owner:        "acme",
 			Name:         "widget",
@@ -917,7 +919,7 @@ func TestRepoConfigAPIE2EWorkspaceCreationUsesFallbackBranchWhenPreferredChecked
 }
 
 func TestWorkspaceAPIE2ERejectsEmptyProviderForAmbiguousRepo(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 	ctx := t.Context()
 
@@ -949,7 +951,7 @@ func TestWorkspaceAPIE2ERejectsEmptyProviderForAmbiguousRepo(t *testing.T) {
 	resp, err := client.CreateWorkspaceWithResponse(
 		ctx,
 		generated.CreateWorkspaceInputBody{
-			Provider:     &provider,
+			Provider:     provider,
 			PlatformHost: "forge.example.com",
 			Owner:        "acme",
 			Name:         "widget",
@@ -969,7 +971,7 @@ func TestWorkspaceAPIE2ERejectsEmptyProviderForAmbiguousRepo(t *testing.T) {
 }
 
 func TestRepoConfigAPIE2EDeleteReusedIssueBranchKeepsLocalBranch(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	require := require.New(t)
 
 	env := setupSettingsWorkspaceEnv(t, func(database *db.DB, repoID int64) {
@@ -1018,7 +1020,7 @@ func TestRepoConfigAPIE2EDeleteReusedIssueBranchKeepsLocalBranch(t *testing.T) {
 }
 
 func TestRepoConfigAPIE2ERefreshGlobAndErrors(t *testing.T) {
-	assert := Assert.New(t)
+	assert := assert.New(t)
 	mock := &mockGH{
 		listReposByOwnerFn: func(
 			_ context.Context, owner string,
