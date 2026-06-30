@@ -3,6 +3,8 @@
   import ChevronDownIcon from "@lucide/svelte/icons/chevron-down";
   import ChevronRightIcon from "@lucide/svelte/icons/chevron-right";
   import ChevronUpIcon from "@lucide/svelte/icons/chevron-up";
+  import ListChevronsDownUpIcon from "@lucide/svelte/icons/list-chevrons-down-up";
+  import ListChevronsUpDownIcon from "@lucide/svelte/icons/list-chevrons-up-down";
   import { relativeTime, shortDate } from "../../api/dates.js";
   import type { KataTaskAPI, KataTaskSearchFilters, KataTaskSummary } from "../../api/kata/taskTypes.js";
   import type { KataCurrentView } from "../../stores/kata-workspace.svelte.js";
@@ -46,6 +48,7 @@
   let expanded: Record<string, boolean> = $state({});
   let childrenByUID: Record<string, KataTaskSummary[]> = $state({});
   let loadingChildren: Record<string, boolean> = $state({});
+  let bulkExpanding = $state(false);
   let tableBody: HTMLDivElement | null = $state(null);
   let childLoadGeneration = 0;
   let lastResetGeneration = $state<number | null>(null);
@@ -94,6 +97,17 @@
   // so keep its labeled region instead of dropping it to a bare list.
   let shouldFlatten = $derived(!isProjectScoped && sort.key === "updated" && visibleGroups.length > 1);
   let globalSortedIssues = $derived(shouldFlatten ? sortKataTasks(visibleGroups.flatMap((group) => group.issues), sort) : []);
+  let visibleRootIssues = $derived.by(() => {
+    if (isProjectScoped) return sortKataTasks(flatIssues, sort);
+    if (shouldFlatten) return globalSortedIssues;
+    return visibleGroups.flatMap((group) => sortKataTasks(group.issues, sort));
+  });
+  let knownExpandableIssues = $derived.by(() => collectKnownExpandableIssues(visibleRootIssues));
+  let hasExpandableVisibleRows = $derived(knownExpandableIssues.length > 0);
+  let allKnownExpandableRowsExpanded = $derived(
+    hasExpandableVisibleRows && knownExpandableIssues.every((issue) => expanded[issue.uid] === true),
+  );
+  let hasAnyExpandedRows = $derived(Object.values(expanded).some(Boolean));
 
   function loadSort(): KataTaskSort {
     if (typeof window === "undefined") return DEFAULT_KATA_TASK_SORT;
@@ -137,10 +151,8 @@
     return view.groups.reduce((sum, group) => sum + group.issues.length, 0);
   }
 
-  function totalVisibleIssues(): number {
-    if (isProjectScoped) return flatIssues.length;
-    if (shouldFlatten) return globalSortedIssues.length;
-    return visibleGroups.reduce((sum, group) => sum + group.issues.length, 0);
+  function totalFilteredIssues(): number {
+    return statusVisibleGroups.reduce((sum, group) => sum + group.issues.length, 0);
   }
 
   function isSelected(issue: KataTaskSummary): boolean {
@@ -168,7 +180,13 @@
   }
 
   function parentHierarchyKey(issue: KataTaskSummary): string | null {
-    return issue.parent_short_id ? `${issue.project_uid}:${issue.parent_short_id}` : null;
+    if (issue.parent_short_id) return `${issue.project_uid}:${issue.parent_short_id}`;
+    for (const [parentUID, children] of Object.entries(childrenByUID)) {
+      if (!children.some((child) => child.uid === issue.uid)) continue;
+      const parent = findIssueByUID(parentUID);
+      if (parent) return issueHierarchyKey(parent);
+    }
+    return null;
   }
 
   function issueMatchesStatusFilter(issue: KataTaskSummary): boolean {
@@ -191,11 +209,93 @@
     issues: readonly KataTaskSummary[],
     allIssues: readonly KataTaskSummary[] = issues,
   ): KataTaskSummary[] {
+    // A child collapses into its parent only when that parent is actually
+    // present in the visible set. Search and filter results often surface a
+    // matching child without its parent; those rows must still render as
+    // their own top-level row instead of vanishing into a missing ancestor.
     const visibleKeys = new Set(allIssues.map(issueHierarchyKey));
     return issues.filter((issue) => {
       const parentKey = parentHierarchyKey(issue);
       return parentKey === null || !visibleKeys.has(parentKey);
     });
+  }
+
+  function collectKnownExpandableIssues(issues: readonly KataTaskSummary[]): KataTaskSummary[] {
+    const expandable: KataTaskSummary[] = [];
+    const seen = new Set<string>();
+
+    const visit = (issue: KataTaskSummary) => {
+      if (seen.has(issue.uid)) return;
+      seen.add(issue.uid);
+      if (hasChildren(issue)) expandable.push(issue);
+      if (expanded[issue.uid] !== true) return;
+      for (const child of visibleChildren(issue)) visit(child);
+    };
+
+    for (const issue of issues) visit(issue);
+    return expandable;
+  }
+
+  async function loadChildren(issue: KataTaskSummary, generation: number): Promise<KataTaskSummary[]> {
+    if (!hasChildren(issue)) return [];
+    if (childrenByUID[issue.uid]) return visibleChildren(issue);
+    if (!api) return [];
+
+    loadingChildren = { ...loadingChildren, [issue.uid]: true };
+    try {
+      const detail = await api.issue(issue.uid);
+      if (generation !== childLoadGeneration || !findIssueByUID(issue.uid)) return [];
+      const children = detail.children ?? [];
+      childrenByUID = { ...childrenByUID, [issue.uid]: children };
+      return children.filter(issueMatchesStatusFilter);
+    } finally {
+      if (generation === childLoadGeneration) {
+        loadingChildren = { ...loadingChildren, [issue.uid]: false };
+      }
+    }
+  }
+
+  async function expandIssueTree(
+    issue: KataTaskSummary,
+    generation: number,
+    nextExpanded: Record<string, boolean>,
+    seen: Set<string>,
+  ) {
+    if (!hasChildren(issue) || seen.has(issue.uid)) return;
+    seen.add(issue.uid);
+    nextExpanded[issue.uid] = true;
+    expanded = { ...expanded, ...nextExpanded };
+
+    const children = await loadChildren(issue, generation);
+    if (generation !== childLoadGeneration) return;
+    for (const child of children) {
+      await expandIssueTree(child, generation, nextExpanded, seen);
+    }
+  }
+
+  async function expandAllVisible() {
+    if (bulkExpanding || allKnownExpandableRowsExpanded) return;
+    const generation = childLoadGeneration;
+    bulkExpanding = true;
+    const nextExpanded = { ...expanded };
+    const seen = new Set<string>();
+    try {
+      for (const issue of visibleRootIssues) {
+        if (generation !== childLoadGeneration) return;
+        await expandIssueTree(issue, generation, nextExpanded, seen);
+      }
+    } finally {
+      if (generation === childLoadGeneration) bulkExpanding = false;
+    }
+  }
+
+  function collapseAllVisible() {
+    if (!hasAnyExpandedRows && !bulkExpanding) return;
+    childLoadGeneration += 1;
+    expanded = {};
+    loadingChildren = {};
+    bulkExpanding = false;
+    cancelPendingKeyboardSelect();
   }
 
   async function toggleExpand(issue: KataTaskSummary, event: MouseEvent | KeyboardEvent) {
@@ -399,6 +499,7 @@
     expanded = {};
     childrenByUID = {};
     loadingChildren = {};
+    bulkExpanding = false;
   });
 
   // A pending keyboard selection dies the moment the workspace starts
@@ -419,9 +520,34 @@
 
 <main class="issue-list" aria-label="Issues">
   <div class="pane-header">
-    <div class="heading">
-      <h2>{viewTitle(currentView)}</h2>
-      <span class="count">{totalVisibleIssues()} {totalVisibleIssues() === 1 ? "task" : "tasks"}</span>
+    <div class="heading-row">
+      <div class="heading">
+        <h2>{viewTitle(currentView)}</h2>
+        <span class="count">{totalFilteredIssues()} {totalFilteredIssues() === 1 ? "task" : "tasks"}</span>
+      </div>
+      {#if hasExpandableVisibleRows || hasAnyExpandedRows || bulkExpanding}
+        <div class="tree-actions" aria-label="Task tree controls">
+          <button
+            class="tree-action"
+            type="button"
+            disabled={bulkExpanding || allKnownExpandableRowsExpanded}
+            aria-busy={bulkExpanding ? "true" : undefined}
+            onclick={() => void expandAllVisible()}
+          >
+            <ListChevronsUpDownIcon size={13} strokeWidth={2} />
+            <span>{bulkExpanding ? "Expanding" : "Expand all"}</span>
+          </button>
+          <button
+            class="tree-action"
+            type="button"
+            disabled={!hasAnyExpandedRows}
+            onclick={collapseAllVisible}
+          >
+            <ListChevronsDownUpIcon size={13} strokeWidth={2} />
+            <span>Collapse all</span>
+          </button>
+        </div>
+      {/if}
     </div>
     {#if loading}
       <span class="sr-only" aria-live="polite">Loading snapshot</span>
@@ -512,7 +638,7 @@
         <span class="col col-tags col-static">Tags</span>
       </div>
 
-      {#if totalVisibleIssues() === 0}
+      {#if visibleRootIssues.length === 0}
         <div class="empty">No tasks</div>
       {/if}
 
@@ -541,17 +667,19 @@
   </div>
 </main>
 
-{#snippet row(issue: KataTaskSummary)}
+{#snippet row(issue: KataTaskSummary, depth = 0)}
   {@const priority = priorityLabel(issue.priority)}
   {@const labels = issue.labels?.join(" · ") ?? ""}
   {@const expandable = hasChildren(issue)}
   {@const isExpanded = expanded[issue.uid] === true}
   <button
     class="row issue-row"
+    class:row--child={depth > 0}
     class:selected={isSelected(issue)}
     aria-current={isSelected(issue) ? "true" : undefined}
     aria-expanded={expandable ? isExpanded : undefined}
     data-uid={issue.uid}
+    style:--task-depth={String(depth)}
     onclick={() => selectNow(issue)}
   >
     <span class="cell cell-id"><span class="id-badge">{displayId(issue)}</span></span>
@@ -599,47 +727,12 @@
 
   {#if isExpanded}
     {#if loadingChildren[issue.uid]}
-      <div class="children-status">Loading subtasks…</div>
+      <div class="children-status" style:--task-depth={String(depth + 1)}>Loading subtasks…</div>
     {:else if visibleChildren(issue).length === 0}
-      <div class="children-status">No subtasks.</div>
+      <div class="children-status" style:--task-depth={String(depth + 1)}>No subtasks.</div>
     {:else}
       {#each visibleChildren(issue) as child (child.uid)}
-        {@const childPriority = priorityLabel(child.priority)}
-        {@const childLabels = child.labels?.join(" · ") ?? ""}
-        <button
-          class="row issue-row row--child"
-          class:selected={isSelected(child)}
-          aria-current={isSelected(child) ? "true" : undefined}
-          data-uid={child.uid}
-          onclick={() => selectNow(child)}
-        >
-          <span class="cell cell-id"><span class="id-badge">{displayId(child)}</span></span>
-          <span class="cell cell-title">
-            <span class="chevron chevron--placeholder" aria-hidden="true"></span>
-            <span class="title-text">{child.title}</span>
-          </span>
-          <span class="cell cell-updated" title={child.updated_at}>
-            {relativeTime(child.updated_at)}
-          </span>
-          <span class="cell cell-priority">
-            {#if childPriority}
-              <span class={`pri-pill priority-${child.priority}`}>{childPriority}</span>
-            {/if}
-          </span>
-          <span class="cell cell-due" title={child.metadata.deadline_on ?? ""}>
-            {#if child.metadata.deadline_on}{shortDate(child.metadata.deadline_on)}{/if}
-          </span>
-          <span class="cell cell-owner">{child.owner ?? ""}</span>
-          <span class="cell cell-tags" title={childLabels}>
-            {#if childLabels}{childLabels}{/if}
-          </span>
-          <span class="sr-keywords">
-            <span>project: {child.project_name}</span>
-            {#if child.metadata.deadline_on}<span> · Due {shortDate(child.metadata.deadline_on)}</span>{/if}
-            {#if child.owner}<span> · owner: {child.owner}</span>{/if}
-            {#if child.priority !== undefined}<span> · priority: {child.priority}</span>{/if}
-          </span>
-        </button>
+        {@render row(child, depth + 1)}
       {/each}
     {/if}
   {/if}
@@ -664,7 +757,6 @@
     position: relative;
     flex-shrink: 0;
     padding: 10px 16px 8px;
-    padding-right: 96px;
     background: var(--bg-surface);
     border-bottom: 1px solid var(--border-default);
     display: flex;
@@ -672,10 +764,19 @@
     gap: 2px;
   }
 
+  .heading-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    min-width: 0;
+  }
+
   .heading {
     display: flex;
     align-items: baseline;
     gap: 10px;
+    min-width: 0;
   }
 
   .pane-header h2 {
@@ -689,6 +790,41 @@
     color: var(--text-muted);
     font-size: var(--font-size-xs);
     font-variant-numeric: tabular-nums;
+  }
+
+  .tree-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+  }
+
+  .tree-action {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 5px;
+    min-height: 26px;
+    padding: 0 8px;
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-sm);
+    background: var(--bg-elevated);
+    color: var(--text-secondary);
+    font-size: var(--font-size-xs);
+    font-weight: 500;
+    white-space: nowrap;
+    cursor: pointer;
+  }
+
+  .tree-action:hover:not(:disabled),
+  .tree-action:focus-visible {
+    border-color: var(--border-strong);
+    color: var(--text-primary);
+  }
+
+  .tree-action:disabled {
+    cursor: default;
+    opacity: 0.45;
   }
 
   .sr-only {
@@ -1026,11 +1162,11 @@
   }
 
   .row--child .cell-title {
-    padding-left: 18px;
+    padding-left: calc(var(--task-depth, 1) * 18px);
   }
 
   .children-status {
-    padding: 4px 14px 4px 32px;
+    padding: 4px 14px 4px calc(14px + (var(--task-depth, 1) * 18px));
     color: var(--text-muted);
     font-size: var(--font-size-2xs);
     font-style: italic;

@@ -900,6 +900,34 @@ describe("kata workspace store", () => {
     expect(store.selectedIssue?.issue.uid).toBe("issue-parent");
   });
 
+  test("search-backed views select a child whose parent is absent from the results", async () => {
+    const child = {
+      ...issue("issue-child", "Child task", "project-kata"),
+      short_id: "child",
+      qualified_id: "Kata#child",
+      parent_short_id: "parent",
+    };
+    const api = createFakeKataTaskAPI();
+    api.mocks.search.mockResolvedValueOnce({
+      filters: { scope: { kind: "all" }, status: "open", owner: "", label: "", query: "child" },
+      issues: [child],
+      fetched_at: fetchedAt,
+    });
+    api.mocks.issue.mockImplementation(async (uid: string) => ({
+      ...detailFor(uid),
+      issue: { ...child, body: `${uid} body` },
+    }));
+    const store = createKataWorkspaceStore({ api });
+    await store.bootstrap();
+
+    await store.updateSearchFilters({ query: "child" });
+
+    // The parent is not in the result set, so the child cannot fold into a
+    // missing ancestor: it stays a top-level row and is selected like one.
+    expect(store.currentView.groups.flatMap((group) => group.issues).map((item) => item.uid)).toEqual(["issue-child"]);
+    expect(store.selectedIssue?.issue.uid).toBe("issue-child");
+  });
+
   test("system view navigation keeps the selected project scope", async () => {
     const store = createKataWorkspaceStore({ api: createFakeKataTaskAPI() });
     await store.bootstrap();

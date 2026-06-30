@@ -82,6 +82,9 @@ function parentHierarchyKey(issue: KataTaskSummary): string | null {
 }
 
 function topLevelIssues(issues: readonly KataTaskSummary[], allIssues: readonly KataTaskSummary[]): KataTaskSummary[] {
+  // Mirror the list view: a child is only folded into its parent when that
+  // parent is present in the same result set. A search that returns a child
+  // without its parent keeps the child as a selectable top-level row.
   const visibleKeys = new Set(allIssues.map(issueHierarchyKey));
   return issues.filter((issue) => {
     const parentKey = parentHierarchyKey(issue);
