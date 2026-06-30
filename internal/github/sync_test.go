@@ -1661,7 +1661,7 @@ func TestSyncNotificationsStopsBeforeListingWhenSyncBudgetExhausted(t *testing.T
 	assert.Equal(int32(0), calls.Load())
 }
 
-func TestSyncNotificationsCapsRepositoryNotificationPages(t *testing.T) {
+func TestSyncNotificationsReadsAllRepositoryNotificationPages(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
 	d := openTestDB(t)
@@ -1670,6 +1670,8 @@ func TestSyncNotificationsCapsRepositoryNotificationPages(t *testing.T) {
 	var participatingCalls atomic.Int32
 	var listCalls atomic.Int32
 	var seen []NotificationListOptions
+	now := time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC)
+	prNumber := 7
 	syncer := NewSyncer(
 		map[string]Client{
 			"github.com": &mockClient{
@@ -1680,7 +1682,24 @@ func TestSyncNotificationsCapsRepositoryNotificationPages(t *testing.T) {
 						return nil, false, nil
 					}
 					listCalls.Add(1)
-					return nil, true, nil
+					if opts.Page < 6 {
+						return nil, true, nil
+					}
+					return []NotificationThread{
+						{
+							ID:           "thread-page-6",
+							RepoOwner:    "acme",
+							RepoName:     "widget",
+							SubjectType:  "PullRequest",
+							SubjectTitle: "Review requested",
+							WebURL:       "https://github.com/acme/widget/pull/7",
+							ItemNumber:   &prNumber,
+							ItemType:     "pr",
+							Reason:       "mention",
+							Unread:       true,
+							UpdatedAt:    now,
+						},
+					}, false, nil
 				},
 			},
 		},
@@ -1694,19 +1713,81 @@ func TestSyncNotificationsCapsRepositoryNotificationPages(t *testing.T) {
 
 	syncErr := syncer.SyncNotifications(t.Context())
 
-	require.Error(syncErr)
-	require.ErrorContains(syncErr, "notification sync page cap reached for acme/widget on github.com after 5 pages")
+	require.NoError(syncErr)
 	assert.Equal(int32(1), participatingCalls.Load())
-	assert.Equal(int32(notificationSyncMaxPages), listCalls.Load())
-	if assert.Len(seen, notificationSyncMaxPages+1) {
+	assert.Equal(int32(6), listCalls.Load())
+	if assert.Len(seen, 7) {
 		assert.Equal("acme", seen[0].RepoOwner)
 		assert.Equal("widget", seen[0].RepoName)
 		assert.True(seen[0].Participating)
 		last := seen[len(seen)-1]
-		assert.Equal(notificationSyncMaxPages, last.Page)
+		assert.Equal(6, last.Page)
 		assert.Equal("acme", last.RepoOwner)
 		assert.Equal("widget", last.RepoName)
 		assert.False(last.Participating)
+	}
+	items, err := d.ListNotifications(t.Context(), db.ListNotificationsOpts{State: "all"})
+	require.NoError(err)
+	if assert.Len(items, 1) {
+		assert.Equal("thread-page-6", items[0].PlatformNotificationID)
+	}
+}
+
+func TestSyncNotificationsReadsAllParticipatingNotificationPages(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	d := openTestDB(t)
+	_, err := d.UpsertRepo(t.Context(), db.GitHubRepoIdentity("github.com", "acme", "widget"))
+	require.NoError(err)
+	var participatingCalls atomic.Int32
+	var listCalls atomic.Int32
+	now := time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC)
+	prNumber := 7
+	syncer := NewSyncer(
+		map[string]Client{
+			"github.com": &mockClient{
+				listNotificationsFn: func(_ context.Context, opts NotificationListOptions) ([]NotificationThread, bool, error) {
+					if opts.Participating {
+						participatingCalls.Add(1)
+						if opts.Page < 6 {
+							return nil, true, nil
+						}
+						return []NotificationThread{{ID: "thread-pr"}}, false, nil
+					}
+					listCalls.Add(1)
+					return []NotificationThread{
+						{
+							ID:           "thread-pr",
+							RepoOwner:    "acme",
+							RepoName:     "widget",
+							SubjectType:  "PullRequest",
+							SubjectTitle: "Review requested",
+							WebURL:       "https://github.com/acme/widget/pull/7",
+							ItemNumber:   &prNumber,
+							ItemType:     "pr",
+							Reason:       "mention",
+							Unread:       true,
+							UpdatedAt:    now,
+						},
+					}, false, nil
+				},
+			},
+		},
+		d,
+		nil,
+		[]RepoRef{{Owner: "acme", Name: "widget", PlatformHost: "github.com"}},
+		time.Minute,
+		nil,
+		map[string]*SyncBudget{"github.com": NewSyncBudget(100)},
+	)
+
+	require.NoError(syncer.SyncNotifications(t.Context()))
+	assert.Equal(int32(6), participatingCalls.Load())
+	assert.Equal(int32(1), listCalls.Load())
+	items, err := d.ListNotifications(t.Context(), db.ListNotificationsOpts{State: "all"})
+	require.NoError(err)
+	if assert.Len(items, 1) {
+		assert.True(items[0].Participating)
 	}
 }
 
