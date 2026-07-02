@@ -4485,6 +4485,9 @@ func (s *Syncer) indexUpsertMergeRequest(
 	if err := s.replaceMergeRequestLabels(ctx, repoID, mrID, normalized.Labels); err != nil {
 		return fmt.Errorf("persist labels for MR #%d: %w", mr.Number, err)
 	}
+	if _, err := s.persistMergedActorEvent(ctx, mrID, mr.MergedBy, normalized.MergedAt); err != nil {
+		return fmt.Errorf("persist merged lifecycle event for MR #%d: %w", mr.Number, err)
+	}
 
 	if err := s.db.EnsureKanbanState(ctx, mrID); err != nil {
 		return fmt.Errorf(
@@ -4591,6 +4594,9 @@ func (s *Syncer) indexUpsertMR(
 	}
 	if err := s.replaceMergeRequestLabels(ctx, repoID, mrID, normalized.Labels); err != nil {
 		return fmt.Errorf("persist labels for MR #%d: %w", ghPR.GetNumber(), err)
+	}
+	if _, err := s.persistMergedTransitionEvent(ctx, mrID, ghPR, normalized.MergedAt); err != nil {
+		return fmt.Errorf("persist merged lifecycle event for MR #%d: %w", ghPR.GetNumber(), err)
 	}
 
 	if err := s.db.EnsureKanbanState(ctx, mrID); err != nil {
@@ -5208,6 +5214,10 @@ func (s *Syncer) syncOpenMRFromBulk(
 			events = append(events, *event)
 		}
 	}
+	events, err = s.filterDuplicateMergedLifecycleEvents(ctx, mrID, events)
+	if err != nil {
+		return fmt.Errorf("dedupe merged lifecycle events for MR #%d: %w", number, err)
+	}
 	if bulk.CommentsComplete {
 		if err := s.replacePRCommentEvents(ctx, mrID, bulk.Comments); err != nil {
 			return fmt.Errorf(
@@ -5219,6 +5229,9 @@ func (s *Syncer) syncOpenMRFromBulk(
 		return fmt.Errorf(
 			"upsert events for MR #%d: %w", number, err,
 		)
+	}
+	if _, err := s.persistMergedTransitionEvent(ctx, mrID, bulk.PR, normalized.MergedAt); err != nil {
+		return fmt.Errorf("persist merged lifecycle event for MR #%d: %w", number, err)
 	}
 
 	// CI status — only write if complete (don't write
@@ -5509,6 +5522,9 @@ func (s *Syncer) fetchMRDetail(
 		return calls, err
 	}
 	calls += 4
+	if _, err := s.persistMergedTransitionEvent(ctx, mrID, fullPR, normalized.MergedAt); err != nil {
+		return calls, fmt.Errorf("persist merged lifecycle event for MR #%d: %w", number, err)
+	}
 
 	ciHeadSHA := ""
 	if fullPR.GetHead() != nil {
@@ -5700,6 +5716,9 @@ func (s *Syncer) fetchProviderMRDetail(
 	if err != nil {
 		return calls, err
 	}
+	if _, err := s.persistMergedActorEvent(ctx, mrID, mr.MergedBy, normalized.MergedAt); err != nil {
+		return calls, fmt.Errorf("persist merged lifecycle event for MR #%d: %w", number, err)
+	}
 
 	if err := s.updateMRDetailFetchedByRepoID(ctx, repoID, number, pending); err != nil {
 		return calls, fmt.Errorf("mark detail fetched for MR #%d: %w", number, err)
@@ -5756,6 +5775,10 @@ func (s *Syncer) syncProviderMRDetailExtras(
 		}
 		if err := s.db.DeleteMissingMRCommentEvents(ctx, mrID, commentDedupeKeys); err != nil {
 			return calls, false, fmt.Errorf("delete missing comment events for MR #%d: %w", number, err)
+		}
+		dbEvents, err = s.filterDuplicateMergedLifecycleEvents(ctx, mrID, dbEvents)
+		if err != nil {
+			return calls, false, fmt.Errorf("dedupe merged lifecycle events for MR #%d: %w", number, err)
 		}
 		if err := s.db.UpsertMREvents(ctx, dbEvents); err != nil {
 			return calls, false, fmt.Errorf("upsert events for MR #%d: %w", number, err)
@@ -6175,6 +6198,10 @@ func (s *Syncer) refreshTimeline(
 			continue
 		}
 		events = append(events, *event)
+	}
+	events, err = s.filterDuplicateMergedLifecycleEvents(ctx, mrID, events)
+	if err != nil {
+		return fmt.Errorf("dedupe merged lifecycle events for MR #%d: %w", number, err)
 	}
 
 	if err := s.replacePRCommentEvents(ctx, mrID, comments); err != nil {
@@ -7724,6 +7751,7 @@ func (s *Syncer) syncMRForRepo(
 	}
 
 	var ghPR *gh.PullRequest
+	var platformMR platform.MergeRequest
 	var normalized *db.MergeRequest
 	var newETag string
 	if rawReader, ok := mrReader.(interface {
@@ -7747,14 +7775,12 @@ func (s *Syncer) syncMRForRepo(
 				normalized, err = NormalizePR(repoID, ghPR)
 			}
 		} else {
-			var platformMR platform.MergeRequest
 			ghPR, platformMR, err = rawReader.GetGitHubPullRequest(ctx, platformRepoRef(repo), number)
 			if err == nil {
 				normalized = platform.DBMergeRequest(repoID, platformMR)
 			}
 		}
 	} else {
-		var platformMR platform.MergeRequest
 		platformMR, err = mrReader.GetMergeRequest(ctx, platformRepoRef(repo), number)
 		if err == nil {
 			normalized = platform.DBMergeRequest(repoID, platformMR)
@@ -7838,6 +7864,9 @@ func (s *Syncer) syncMRForRepo(
 		if err := s.refreshTimeline(ctx, repo, repoID, mrID, ghPR); err != nil {
 			return fmt.Errorf("refresh timeline for MR #%d: %w", number, err)
 		}
+		if _, err := s.persistMergedTransitionEvent(ctx, mrID, ghPR, normalized.MergedAt); err != nil {
+			return fmt.Errorf("persist merged lifecycle event for MR #%d: %w", number, err)
+		}
 
 		syncMRHeadSHA := ""
 		if ghPR.GetHead() != nil {
@@ -7877,6 +7906,9 @@ func (s *Syncer) syncMRForRepo(
 		)
 		if err != nil {
 			return err
+		}
+		if _, err := s.persistMergedActorEvent(ctx, mrID, platformMR.MergedBy, normalized.MergedAt); err != nil {
+			return fmt.Errorf("persist merged lifecycle event for MR #%d: %w", number, err)
 		}
 		if err := s.updateMRDetailFetchedByRepoID(ctx, repoID, number, pending); err != nil {
 			return fmt.Errorf("mark detail fetched for MR #%d: %w", number, err)
@@ -8313,6 +8345,9 @@ func (s *Syncer) fetchAndUpdateClosed(ctx context.Context, repo RepoRef, repoID 
 		return fmt.Errorf("get closed MR #%d for labels: %w", number, err)
 	}
 	if mr != nil {
+		if _, err := s.persistMergedTransitionEvent(ctx, mr.ID, ghPR, mergedAt); err != nil {
+			return fmt.Errorf("persist merged lifecycle event for MR #%d: %w", number, err)
+		}
 		normalized, err := NormalizePR(repoID, ghPR)
 		if err != nil {
 			return fmt.Errorf("normalize closed PR #%d: %w", number, err)
@@ -8364,6 +8399,99 @@ func (s *Syncer) fetchAndUpdateClosed(ctx context.Context, repo RepoRef, repoID 
 	return s.markClosedLinkedNotificationsDone(ctx)
 }
 
+func (s *Syncer) filterDuplicateMergedLifecycleEvents(
+	ctx context.Context,
+	mrID int64,
+	events []db.MREvent,
+) ([]db.MREvent, error) {
+	if !slices.ContainsFunc(events, isAuthoredMergedLifecycleEvent) {
+		return events, nil
+	}
+	existing, err := s.db.ListMREvents(ctx, mrID)
+	if err != nil {
+		return nil, err
+	}
+	out := events[:0]
+	for _, event := range events {
+		if isAuthoredMergedLifecycleEvent(event) &&
+			authoredMergedLifecycleEventExists(existing) {
+			continue
+		}
+		out = append(out, event)
+	}
+	return out, nil
+}
+
+func (s *Syncer) authoredMergedLifecycleEventExists(
+	ctx context.Context,
+	mrID int64,
+) (bool, error) {
+	events, err := s.db.ListMREvents(ctx, mrID)
+	if err != nil {
+		return false, err
+	}
+	return authoredMergedLifecycleEventExists(events), nil
+}
+
+func authoredMergedLifecycleEventExists(events []db.MREvent) bool {
+	return slices.ContainsFunc(events, isAuthoredMergedLifecycleEvent)
+}
+
+func isAuthoredMergedLifecycleEvent(event db.MREvent) bool {
+	return event.EventType == "merged" &&
+		strings.TrimSpace(event.Author) != ""
+}
+
+func (s *Syncer) persistMergedTransitionEvent(
+	ctx context.Context,
+	mrID int64,
+	ghPR *gh.PullRequest,
+	mergedAt *time.Time,
+) (bool, error) {
+	if ghPR == nil || mergedAt == nil {
+		return false, nil
+	}
+	mergedBy := ghPR.GetMergedBy()
+	if mergedBy == nil {
+		return false, nil
+	}
+	return s.persistMergedActorEvent(ctx, mrID, mergedBy.GetLogin(), mergedAt)
+}
+
+func (s *Syncer) persistMergedActorEvent(
+	ctx context.Context,
+	mrID int64,
+	actor string,
+	mergedAt *time.Time,
+) (bool, error) {
+	if mergedAt == nil {
+		return false, nil
+	}
+	actor = strings.TrimSpace(actor)
+	if actor == "" {
+		return false, nil
+	}
+	exists, err := s.authoredMergedLifecycleEventExists(ctx, mrID)
+	if err != nil {
+		return false, err
+	}
+	if exists {
+		return false, nil
+	}
+	event := NormalizeTimelineEvent(mrID, PullRequestTimelineEvent{
+		EventType: "merged",
+		Actor:     actor,
+		CreatedAt: *mergedAt,
+	})
+	if event == nil {
+		return false, nil
+	}
+	if err := s.db.UpsertMREvents(ctx, []db.MREvent{*event}); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (s *Syncer) fetchAndUpdateClosedMergeRequest(
 	ctx context.Context,
 	reader platform.MergeRequestReader,
@@ -8389,6 +8517,9 @@ func (s *Syncer) fetchAndUpdateClosedMergeRequest(
 	}
 	if err := s.replaceMergeRequestLabels(ctx, repoID, mrID, normalized.Labels); err != nil {
 		return fmt.Errorf("persist labels for closed MR #%d: %w", number, err)
+	}
+	if _, err := s.persistMergedActorEvent(ctx, mrID, mr.MergedBy, normalized.MergedAt); err != nil {
+		return fmt.Errorf("persist merged lifecycle event for closed MR #%d: %w", number, err)
 	}
 	return nil
 }

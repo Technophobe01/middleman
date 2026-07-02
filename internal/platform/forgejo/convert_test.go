@@ -72,9 +72,14 @@ func TestConvertForgejoSDKRecords(t *testing.T) {
 		Updated: &updated,
 		Closed:  &closed,
 		Merged:  &closed,
+		MergedBy: &forgejosdk.User{
+			UserName: "merge-admin",
+			FullName: "Merge Admin",
+		},
 	}, &mergeable)
 	assert.Equal(4, pr.Index)
 	assert.Equal("alice", pr.User.UserName)
+	assert.Equal("merge-admin", pr.MergedBy.UserName)
 	assert.Equal("open", pr.State)
 	assert.True(pr.IsLocked)
 	assert.False(pr.Draft)
@@ -97,6 +102,11 @@ func TestConvertForgejoSDKRecords(t *testing.T) {
 	assert.Equal("main", pr.Base.Ref)
 	assert.Equal("feature", pr.Labels[0].Name)
 	assert.Equal(&closed, pr.MergedAt)
+
+	unmergedPR := convertPullRequest(&forgejosdk.PullRequest{
+		Index: 5,
+	}, nil)
+	assert.Empty(unmergedPR.MergedBy.UserName)
 
 	issue := convertIssue(&forgejosdk.Issue{
 		ID:          7,
