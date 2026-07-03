@@ -679,18 +679,25 @@ type Workspace struct {
 	KataMetadata    *WorkspaceKataMetadata
 }
 
-// WorkspaceSummary extends Workspace with joined MR metadata.
+// WorkspaceSummary extends Workspace with joined source-item metadata.
 type WorkspaceSummary struct {
 	Workspace
-	MRTitle            *string
-	MRState            *string
-	MRIsDraft          *bool
-	MRCIStatus         *string
-	MRReviewDecision   *string
-	MRAdditions        *int
-	MRDeletions        *int
-	MRCommentCount     *int
-	MRMergeableState   *string
+	SourceTitle      *string
+	SourceState      *string
+	SourceURL        *string
+	MRTitle          *string
+	MRState          *string
+	MRIsDraft        *bool
+	MRCIStatus       *string
+	MRReviewDecision *string
+	MRAdditions      *int
+	MRDeletions      *int
+	MRCommentCount   *int
+	MRMergeableState *string
+	// MRHeadBranch is the currently synced PR head branch, which can move
+	// after workspace creation (branch rename); prefer it over the
+	// creation-time GitHeadRef snapshot for push-target context.
+	MRHeadBranch       *string
 	ItemLastActivityAt *time.Time
 }
 

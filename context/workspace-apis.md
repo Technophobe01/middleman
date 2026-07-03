@@ -87,6 +87,25 @@ All workspace API timestamps are emitted as UTC RFC3339 strings. Keep timestamp
 normalization in the DB/server boundary; the Svelte UI can present local time
 where needed.
 
+## Agent Launch Context
+
+Agent launch writes rendered workspace context to the target's local
+instruction file (`AGENTS.local.md` for Codex, `CLAUDE.local.md` for Claude).
+It does not write during setup or create a generated worktree directory.
+
+The first-line marker owns refreshes: middleman updates only marked files.
+Unmarked files, symlinks, and root `AGENTS.md`/`CLAUDE.md` stay untouched. The
+content carries source identity (kind, repo, item number, URL) and PR push
+target facts agents cannot read from the worktree. Source-system prose (titles,
+Kata project names) is XML-escaped inside `<untrusted-source-text>` fences —
+the prompt-injection boundary. External identifiers are only normalized to one
+line, which preserves Markdown structure and is not a trust boundary; new
+free-prose fields must go through the fence.
+
+Before writing, middleman ignores the generated path through the worktree's
+private exclude file, not tracked `.gitignore`. If the path would remain
+visible to Git, the write fails.
+
 ## Diff Scopes
 
 Workspace diffs compare against local `HEAD`, the pushed branch, or a merge
