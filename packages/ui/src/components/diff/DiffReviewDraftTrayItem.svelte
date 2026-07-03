@@ -1,7 +1,12 @@
 <script lang="ts">
-  import { onMount, tick } from "svelte";
+  import { onDestroy, onMount, tick } from "svelte";
+  import CheckIcon from "@lucide/svelte/icons/check";
+  import PencilIcon from "@lucide/svelte/icons/pencil";
   import XIcon from "@lucide/svelte/icons/x";
-  import type { DiffReviewDraftComment } from "../../stores/diff-review-draft.svelte.js";
+  import type {
+    DiffReviewDraftComment,
+    DiffReviewDraftCommentEditState,
+  } from "../../stores/diff-review-draft.svelte.js";
   import ActionButton from "../shared/ActionButton.svelte";
 
   interface Props {
@@ -10,14 +15,23 @@
     disabled: boolean;
     onjump?: ((comment: DiffReviewDraftComment) => void) | undefined;
     ondelete: (id: string) => void;
+    onsave: (comment: DiffReviewDraftComment, body: string) => Promise<boolean> | boolean;
+    oneditstatechange: (id: string, state: DiffReviewDraftCommentEditState) => void;
   }
 
-  const { comment, location, disabled, onjump, ondelete }: Props = $props();
+  const { comment, location, disabled, onjump, ondelete, onsave, oneditstatechange }: Props = $props();
 
   let expanded = $state(false);
+  let editing = $state(false);
+  let draftBody = $state("");
+  let saving = $state(false);
   let truncated = $state(false);
   let bodyElement: HTMLParagraphElement | undefined = $state();
+  let editorElement: HTMLTextAreaElement | undefined = $state();
   let measureFrame: number | undefined;
+  const editStateID = $derived(`tray:${comment.id}`);
+  const editDisabled = $derived(disabled || saving);
+  const saveDisabled = $derived(editDisabled || draftBody.trim() === "");
 
   function measureTruncation(): void {
     if (!bodyElement) {
@@ -43,6 +57,56 @@
     void tick().then(queueMeasure);
   }
 
+  function draftDirty(body: string): boolean {
+    return body.trim() !== comment.body;
+  }
+
+  function reportEditState(active: boolean, body = draftBody): void {
+    oneditstatechange(editStateID, {
+      active,
+      dirty: active && draftDirty(body),
+    });
+  }
+
+  function beginEdit(): void {
+    draftBody = comment.body;
+    editing = true;
+    reportEditState(true);
+    expanded = true;
+    void tick().then(() => editorElement?.focus());
+  }
+
+  function cancelEdit(): void {
+    draftBody = comment.body;
+    editing = false;
+    reportEditState(false);
+  }
+
+  function handleDraftBodyInput(event: Event): void {
+    draftBody = (event.currentTarget as HTMLTextAreaElement).value;
+    reportEditState(true);
+  }
+
+  async function saveEdit(): Promise<void> {
+    const nextBody = draftBody.trim();
+    if (!nextBody || saveDisabled) return;
+    if (nextBody === comment.body) {
+      editing = false;
+      reportEditState(false);
+      return;
+    }
+    saving = true;
+    try {
+      const ok = await onsave(comment, nextBody);
+      if (ok) {
+        editing = false;
+        reportEditState(false);
+      }
+    } finally {
+      saving = false;
+    }
+  }
+
   function scheduleMeasure(_body: string, _expanded: boolean): void {
     void tick().then(queueMeasure);
   }
@@ -62,6 +126,10 @@
     };
   });
 
+  onDestroy(() => {
+    reportEditState(false);
+  });
+
   $effect(() => scheduleMeasure(comment.body, expanded));
 </script>
 
@@ -74,34 +142,81 @@
     >
       {location}
     </button>
-    <p
-      bind:this={bodyElement}
-      class={["draft-body", expanded && "draft-body--expanded"]}
-    >
-      {comment.body}
-    </p>
-    {#if truncated || expanded}
-      <button class="draft-expand" type="button" onclick={toggleExpanded}>
-        {expanded ? "Show less" : "Show full comment"}
-      </button>
+    {#if editing}
+      <textarea
+        bind:this={editorElement}
+        value={draftBody}
+        class="draft-editor"
+        aria-label="Draft comment body"
+        rows="3"
+        disabled={editDisabled}
+        oninput={handleDraftBodyInput}
+      ></textarea>
+    {:else}
+      <p
+        bind:this={bodyElement}
+        class={["draft-body", expanded && "draft-body--expanded"]}
+      >
+        {comment.body}
+      </p>
+      {#if truncated || expanded}
+        <button class="draft-expand" type="button" onclick={toggleExpanded}>
+          {expanded ? "Show less" : "Show full comment"}
+        </button>
+      {/if}
     {/if}
   </div>
-  <ActionButton
-    class="icon-btn"
-    title="Delete draft comment"
-    ariaLabel="Delete draft comment"
-    size="sm"
-    onclick={() => ondelete(comment.id)}
-    disabled={disabled}
-  >
-    <XIcon size={13} />
-  </ActionButton>
+  <div class="draft-actions">
+    {#if editing}
+      <ActionButton
+        class="icon-btn"
+        title="Save draft comment"
+        ariaLabel="Save draft comment"
+        size="sm"
+        onclick={() => void saveEdit()}
+        disabled={saveDisabled}
+      >
+        <CheckIcon size={13} />
+      </ActionButton>
+      <ActionButton
+        class="icon-btn"
+        title="Cancel editing draft comment"
+        ariaLabel="Cancel editing draft comment"
+        size="sm"
+        onclick={cancelEdit}
+        disabled={editDisabled}
+      >
+        <XIcon size={13} />
+      </ActionButton>
+    {:else}
+      <ActionButton
+        class="icon-btn"
+        title="Edit draft comment"
+        ariaLabel="Edit draft comment"
+        size="sm"
+        onclick={beginEdit}
+        disabled={disabled}
+      >
+        <PencilIcon size={13} />
+      </ActionButton>
+      <ActionButton
+        class="icon-btn"
+        title="Delete draft comment"
+        ariaLabel="Delete draft comment"
+        size="sm"
+        onclick={() => ondelete(comment.id)}
+        disabled={disabled}
+      >
+        <XIcon size={13} />
+      </ActionButton>
+    {/if}
+  </div>
 </div>
 
 <style>
   .draft-item {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) 26px;
+    grid-template-columns: minmax(0, 1fr) auto;
     align-items: start;
     gap: 10px;
     min-width: 0;
@@ -134,6 +249,21 @@
     display: block;
     line-clamp: unset;
     -webkit-line-clamp: unset;
+  }
+
+  .draft-editor {
+    box-sizing: border-box;
+    width: 100%;
+    min-height: 78px;
+    resize: vertical;
+    padding: 7px 8px;
+    border: 1px solid var(--border-muted);
+    border-radius: var(--radius-md);
+    background: var(--bg-inset);
+    color: var(--text-primary);
+    font: inherit;
+    font-size: var(--font-size-sm);
+    line-height: 1.42;
   }
 
   .draft-jump {
@@ -172,6 +302,11 @@
 
   .draft-expand:hover {
     text-decoration: underline;
+  }
+
+  .draft-actions {
+    display: flex;
+    gap: 4px;
   }
 
   :global(.icon-btn.action-button) {
