@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { FileDiff, VirtualizedFileDiff } from "@pierre/diffs";
+  import { DEFAULT_TOKENIZE_MAX_LENGTH, FileDiff, VirtualizedFileDiff } from "@pierre/diffs";
   import type {
     DiffLineAnnotation,
     ExpansionDirections,
@@ -874,16 +874,58 @@
     return pierreDiff.render(props);
   }
 
+  // Diagnostic for the scroll-position-deterministic blank-band bug: Pierre's
+  // virtual window math places hunks by estimated line positions, and when its
+  // believed file top/height drift from the real DOM it can compute a render
+  // range that misses the viewport (blank spacer where content belongs).
+  // Logging believed-vs-real geometry on every post-render lets a ?debugDiff=1
+  // session show which quantity is off at the moment a band blanks.
+  function debugVirtualizedRenderState(): void {
+    if (!pierreDiffDebugEnabled()) return;
+    if (!host || !(pierreDiff instanceof VirtualizedFileDiff)) return;
+    const instance = pierreDiff as unknown as {
+      height?: number;
+      renderRange?: { bufferAfter: number; bufferBefore: number; startingLine: number; totalLines: number };
+      top?: number;
+    };
+    const area = host.closest(".diff-area");
+    const hostRect = host.getBoundingClientRect();
+    const areaRect = area?.getBoundingClientRect();
+    const scrollTop = area instanceof HTMLElement ? area.scrollTop : undefined;
+    const realTop = areaRect && scrollTop != null ? hostRect.top - areaRect.top + scrollTop : undefined;
+    const windowSpecs = (
+      virtualizer as unknown as { getWindowSpecs?: () => { bottom: number; top: number } } | undefined
+    )?.getWindowSpecs?.();
+    debugPierreDiff("virtualized post-render", {
+      path: renderFile.path,
+      believedTop: instance.top,
+      realTop,
+      topDrift: instance.top != null && realTop != null ? instance.top - realTop : undefined,
+      believedHeight: instance.height,
+      realHeight: hostRect.height,
+      heightDrift: instance.height != null ? instance.height - hostRect.height : undefined,
+      renderRange: instance.renderRange,
+      windowSpecs,
+      scrollTop,
+      viewportHeight: areaRect?.height,
+      hostInViewport: isHostInScrollViewport(),
+    });
+  }
+
   function finalizeRenderedDom(): boolean {
+    debugVirtualizedRenderState();
     removeStalePlaceholderPres();
     applyLineTargetAttributes();
     applyHunkHeaderLabels();
     applyLineCommentButtons();
     syncLineAnnotationWrappers();
 
-    const ready = renderedDomReady();
-    rendered = ready;
-    if (!ready) return false;
+    // Latch visibility: scroll-driven virtualized re-renders fire onPostRender
+    // too, and the shared worker pool being busy must not hide content that
+    // this render attempt has already shown. Attempt boundaries reset the
+    // latch by assigning `rendered = false` before rendering.
+    if (renderedDomReady()) rendered = true;
+    if (!rendered) return false;
 
     installDemandContextHandler();
     scheduleSelectedRangesApplication();
@@ -896,8 +938,21 @@
 
   function renderedDomReady(): boolean {
     if (!syntaxHighlightWorkerActive) return true;
+    if (diffRendersPlainText()) return true;
     if (host?.shadowRoot?.querySelector("[data-line] span[style]") != null) return true;
     return !syntaxHighlightWorkerHasPendingWork();
+  }
+
+  // Mirrors Pierre's isDiffPlainText/isDiffMassive checks, which @pierre/diffs
+  // does not export as of 1.2.11: these diffs render without styled spans, so
+  // waiting on worker-pool idleness would hide them for as long as any other
+  // file still has highlight tasks queued. Recheck this mirror (and whether
+  // upstream now exports the helpers) when bumping @pierre/diffs.
+  function diffRendersPlainText(): boolean {
+    const fileDiff = fullContextFileDiff ?? pierreFile;
+    if (!fileDiff) return false;
+    if (fileDiff.lang === "text") return true;
+    return Math.max(fileDiff.additionLines.length, fileDiff.deletionLines.length) > DEFAULT_TOKENIZE_MAX_LENGTH;
   }
 
   function syntaxHighlightWorkerHasPendingWork(): boolean {
