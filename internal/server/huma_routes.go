@@ -1624,7 +1624,7 @@ func (s *Server) buildPullDetailResponse(
 	}
 	resp := mergeRequestDetailResponse{
 		Events:           eventResponses,
-		Repo:             s.repoRefWithOperations(*repo),
+		Repo:             s.repoRefWithMergeRequestOperations(ctx, *repo, *mr),
 		RepoOwner:        repo.Owner,
 		RepoName:         repo.Name,
 		PlatformHost:     repo.PlatformHost,
@@ -2817,6 +2817,9 @@ func (s *Server) approvePR(ctx context.Context, input *approvePRInput) (*actionS
 	}
 	if mr == nil {
 		return nil, problemNotFound(CodePullNotFound, "pull request not found", nil)
+	}
+	if s.mergeRequestAuthoredByViewer(ctx, *repo, *mr) {
+		return nil, selfApprovalProblem(*repo)
 	}
 
 	expectedHeadSHA := approvalReviewHeadSHA(mr, input.Body.ExpectedHeadSHA)

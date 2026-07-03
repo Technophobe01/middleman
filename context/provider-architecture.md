@@ -65,6 +65,24 @@ Rules:
 - Capability flags and implemented interfaces must agree.
 - Handlers must check capabilities before performing mutations. A missing
   capability is a feature-level failure, not a whole-provider failure.
+- Keep operation availability split by scope. `repoOperations` handles
+  repo-level gates: provider capability, write credentials, rate limits, and
+  repo-wide viewer permissions. Detail responses may add item-level gates with
+  `repoOperationsForMergeRequest`, where the loaded PR/MR is available. For
+  provider-specific facts, go through provider interfaces. For example, GitHub
+  self-approval uses `platform.MergeRequestViewerResolver`; the GitHub provider
+  resolves the authenticated viewer with the write credential, caches that
+  login only for a bounded window keyed to the credential chain, and compares it
+  to the PR author. Viewer-resolution errors fail open in availability because
+  the provider mutation remains authoritative. Server code must not shell out
+  to provider CLIs or do provider-specific identity matching. Do not put
+  item-level gates in repo settings or list summaries
+  (`internal/server/operation_availability.go::repoOperations`,
+  `internal/server/operation_availability.go::repoOperationsForMergeRequest`).
+- Enforce item-level gates at every mutation entry point and every UI
+  availability signal, not only the detail response. Self-approval both rejects
+  (`selfApprovalProblem`: review-draft publish, direct `/approve`) and hides the
+  action (detail operations, review-draft `supported_actions`).
 - Read sync should continue for supported resources if optional resources such
   as releases, tags, CI, or comments fail or are unsupported.
 - Do not fake GitHub behavior for another provider. Add provider-specific

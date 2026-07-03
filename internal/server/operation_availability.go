@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/danielgtaylor/huma/v2"
 	"go.kenn.io/middleman/internal/db"
+	"go.kenn.io/middleman/internal/platform"
 	"go.kenn.io/middleman/internal/ratelimit"
 	"go.kenn.io/middleman/internal/tokenauth"
 )
@@ -44,6 +46,7 @@ const (
 	availabilityCodeRateLimited            = "rate_limited"
 	availabilityCodeMissingWriteCredential = "missing_write_credential"
 	availabilityCodeWriteCredentialError   = "write_credential_error"
+	availabilityCodeSelfApproval           = "self_approval"
 )
 
 // apiBucket identifies which API quota an operation consumes. GitHub
@@ -117,6 +120,10 @@ type operationDescriptor struct {
 	bucket               apiBucket
 }
 
+type operationAvailabilityContext struct {
+	selfApproval bool
+}
+
 // Mutations are REST-served except ready-for-review, which GitHub
 // only exposes as a GraphQL mutation and therefore consumes the
 // GraphQL budget. The bucket field keeps each operation gated on the
@@ -160,6 +167,13 @@ var (
 // a paused GraphQL tracker does not block REST-backed operations
 // and vice versa.
 func (s *Server) repoOperations(repo db.Repo) RepoOperations {
+	return s.repoOperationsWithContext(repo, operationAvailabilityContext{})
+}
+
+func (s *Server) repoOperationsWithContext(
+	repo db.Repo,
+	opContext operationAvailabilityContext,
+) RepoOperations {
 	caps := s.capabilitiesForRepo(repo)
 	rates := map[apiBucket]rateLimitAvailability{
 		apiBucketREST:    s.mutationRateLimitedReason(repo, apiBucketREST),
@@ -167,8 +181,8 @@ func (s *Server) repoOperations(repo db.Repo) RepoOperations {
 	}
 	writeCred := s.writeCredentialGateForRepo(repo)
 	derive := func(op operationDescriptor) OperationAvailability {
-		return deriveOperationAvailability(
-			op, caps, repo, rates[op.bucket], writeCred,
+		return deriveOperationAvailabilityWithContext(
+			op, caps, repo, rates[op.bucket], writeCred, opContext,
 		)
 	}
 	return RepoOperations{
@@ -195,12 +209,29 @@ func (s *Server) repoOperations(repo db.Repo) RepoOperations {
 	}
 }
 
-func deriveOperationAvailability(
+func (s *Server) repoOperationsForMergeRequest(
+	ctx context.Context,
+	repo db.Repo,
+	mr db.MergeRequest,
+) RepoOperations {
+	ops := s.repoOperationsWithContext(repo, operationAvailabilityContext{})
+	if !ops.SubmitReview.Available {
+		return ops
+	}
+	if !s.mergeRequestAuthoredByViewer(ctx, repo, mr) {
+		return ops
+	}
+	ops.SubmitReview = selfApprovalUnavailable()
+	return ops
+}
+
+func deriveOperationAvailabilityWithContext(
 	op operationDescriptor,
 	caps providerCapabilitiesResponse,
 	repo db.Repo,
 	rate rateLimitAvailability,
 	writeCred writeCredentialGate,
+	opContext operationAvailabilityContext,
 ) OperationAvailability {
 	for _, capability := range op.requiredCapabilities {
 		if !capabilityEnabled(caps, capability) {
@@ -223,6 +254,9 @@ func deriveOperationAvailability(
 			UnavailableReason: "You do not have permission to merge in this repository",
 		}
 	}
+	if op.name == operationSubmitReview && opContext.selfApproval {
+		return selfApprovalUnavailable()
+	}
 	if rate.limited {
 		return OperationAvailability{
 			Code:              availabilityCodeRateLimited,
@@ -231,6 +265,49 @@ func deriveOperationAvailability(
 		}
 	}
 	return OperationAvailability{Available: true}
+}
+
+func selfApprovalUnavailable() OperationAvailability {
+	return OperationAvailability{
+		Code:              availabilityCodeSelfApproval,
+		UnavailableReason: "You cannot approve your own pull request",
+	}
+}
+
+func selfApprovalProblem(repo db.Repo) huma.StatusError {
+	return problemForbidden(
+		"You cannot approve your own pull request",
+		map[string]any{
+			"reason":       availabilityCodeSelfApproval,
+			"provider":     string(repoProviderKind(repo)),
+			"platformHost": repoProviderHost(repo),
+		},
+	)
+}
+
+func (s *Server) mergeRequestAuthoredByViewer(
+	ctx context.Context,
+	repo db.Repo,
+	mr db.MergeRequest,
+) bool {
+	if s == nil || s.syncer == nil || s.syncer.Registry() == nil {
+		return false
+	}
+	resolver, err := s.syncer.Registry().MergeRequestViewerResolver(
+		repoProviderKind(repo), repoProviderHost(repo),
+	)
+	if err != nil {
+		return false
+	}
+	authored, err := resolver.ViewerAuthoredMergeRequest(ctx, platform.MergeRequest{
+		Repo:   platformRepoRefFromDB(repo),
+		Number: mr.Number,
+		Author: mr.Author,
+	})
+	if err != nil {
+		return false
+	}
+	return authored
 }
 
 // rateLimitAvailability is the result of consulting a rate tracker
