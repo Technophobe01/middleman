@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { copyToClipboard, EmptyState } from "@kenn-io/kit-ui";
   import { onMount, onDestroy } from "svelte";
   import {
     getStores,
@@ -163,7 +164,7 @@
           e.preventDefault();
           const output =
             stores.roborevReview?.getOutput() ?? "";
-          void navigator.clipboard.writeText(output);
+          void copyToClipboard(output);
         }
         break;
       case "h":
@@ -187,7 +188,7 @@
         if (!drawerOpen && !daemonDown) {
           e.preventDefault();
           const searchInput = document.querySelector(
-            ".filter-bar .search-input",
+            ".filter-bar .kit-search-input input",
           ) as HTMLElement | null;
           searchInput?.focus();
         }
@@ -232,21 +233,19 @@
 
 <div class="reviews-view">
   {#if !stores.roborevDaemon}
-    <div class="empty-state">
-      Roborev integration is not configured.
-    </div>
+    <EmptyState title="Roborev integration is not configured." />
   {:else if !stores.roborevDaemon.isAvailable() && !stores.roborevDaemon.getWasEverAvailable()}
-    <div class="empty-state">
-      <p>
-        Roborev daemon not reachable at
-        {stores.roborevDaemon.getEndpoint()}
-      </p>
+    <EmptyState
+      title="Roborev daemon not reachable"
+      description={stores.roborevDaemon.getEndpoint()}
+    >
       <button
+        class="retry-btn"
         onclick={() => stores.roborevDaemon?.checkHealth()}
       >
         Retry
       </button>
-    </div>
+    </EmptyState>
   {:else}
     <div class="reviews-header">
       <FilterBar
@@ -295,18 +294,7 @@
     flex-direction: column;
   }
 
-  .empty-state {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: 12px;
-    flex: 1;
-    color: var(--text-muted);
-    font-size: var(--font-size-md);
-  }
-
-  .empty-state button {
+  .retry-btn {
     padding: 6px 16px;
     border-radius: var(--radius-sm);
     border: 1px solid var(--border-default);
@@ -316,7 +304,7 @@
     cursor: pointer;
   }
 
-  .empty-state button:hover {
+  .retry-btn:hover {
     background: var(--bg-surface-hover);
   }
 </style>

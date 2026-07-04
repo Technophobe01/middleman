@@ -24,7 +24,7 @@ async function expectReadableFocusList(page: Page, itemSelector: string): Promis
     const item = document.querySelector(selector);
     const title = item?.querySelector(".title") ?? null;
     const meta = item?.querySelector(".meta-left") ?? null;
-    const search = document.querySelector(".focus-list .search-input");
+    const search = document.querySelector(".focus-list .kit-search-input");
     const stateButton = document.querySelector(".focus-list .state-btn");
     const focusList = document.querySelector(".focus-list");
     const tokenValue = (node: Element | null, name: string): string =>
@@ -46,8 +46,8 @@ async function expectReadableFocusList(page: Page, itemSelector: string): Promis
     };
   }, itemSelector);
 
-  expect(metrics.mobileTypeToken).toBe("1.24rem");
-  expect(metrics.focusHitTarget).toMatch(/rem$/);
+  expect(metrics.mobileTypeToken).toBe("1rem");
+  expect(metrics.focusHitTarget).toMatch(/px$/);
   expect(metrics.documentWidth).toBeLessThanOrEqual(metrics.viewportWidth);
   expect(metrics.searchFontSize).toBeGreaterThanOrEqual(16);
   expect(metrics.stateButtonFontSize).toBeGreaterThanOrEqual(15);
@@ -97,7 +97,7 @@ async function expectReadableDetail(page: Page): Promise<void> {
       titleFontSize: fontSize(".detail-title"),
       metaFontSize: fontSize(".meta-item"),
       bodyFontSize: fontSize(".pull-detail, .issue-detail"),
-      chipFontSize: fontSize(".chip, .state-chip, .status-chip"),
+      chipFontSize: fontSize(".kit-chip, .state-chip, .status-chip"),
       copyNumberFontSize: fontSize(".copy-number-btn"),
       copyNumberRect: rect(".copy-number-btn"),
       overflowingVisible,
@@ -105,9 +105,9 @@ async function expectReadableDetail(page: Page): Promise<void> {
   });
 
   expect(metrics.detailTypeToken).not.toBe("");
-  expect(metrics.detailHitTarget).toMatch(/rem$/);
-  expect(metrics.mobileTypeToken).toBe("1.24rem");
-  expect(metrics.rootFontSize).toBe(13);
+  expect(metrics.detailHitTarget).toMatch(/px$/);
+  expect(metrics.mobileTypeToken).toBe("1rem");
+  expect(metrics.rootFontSize).toBe(16);
   expect(metrics.documentWidth).toBeLessThanOrEqual(metrics.viewportWidth);
   expect(metrics.titleFontSize).toBeGreaterThanOrEqual(19);
   expect(metrics.metaFontSize).toBeGreaterThanOrEqual(15);
@@ -127,11 +127,11 @@ test.describe("phone routes", () => {
     await expect(page.locator(".mobile-tab--active")).toHaveText("Activity");
     await expect(page.locator(".mobile-topbar .mobile-app-icon")).toBeVisible();
     await expect(page.getByRole("button", { name: "Open desktop view" })).toBeVisible();
-    await expect(page.locator(".app-header")).toHaveCount(0);
+    await expect(page.locator(".app-top-bar")).toHaveCount(0);
     await expect(page.locator("footer")).toHaveCount(0);
 
     const metrics = await page.evaluate(() => {
-      const search = document.querySelector(".search-input");
+      const search = document.querySelector(".kit-search-input");
       const rect = search?.getBoundingClientRect();
       return {
         viewportWidth: window.innerWidth,
@@ -177,7 +177,7 @@ test.describe("phone routes", () => {
       const typeSelect = document.querySelector(".mobile-filter-dropdown button[aria-label^='Activity type']");
       const rangeSelect = document.querySelector(".mobile-filter-dropdown button[aria-label^='Time range']");
       const repoSelect = document.querySelector(".mobile-filter-dropdown button[aria-label^='Repository']");
-      const search = document.querySelector(".search-input");
+      const search = document.querySelector(".kit-search-input");
       const cardRect = firstCard?.getBoundingClientRect();
       const buttonRect = firstButton?.getBoundingClientRect();
       const searchRect = search?.getBoundingClientRect();
@@ -250,7 +250,8 @@ test.describe("phone routes", () => {
         cardBackground: styleFor(firstCard)?.backgroundColor ?? "",
         cardBorderColor: styleFor(firstCard)?.borderColor ?? "",
         cardRadius: styleFor(firstCard)?.borderRadius ?? "",
-        searchBackground: styleFor(document.querySelector(".mobile-activity-search"))?.backgroundColor ?? "",
+        searchBackground:
+          styleFor(document.querySelector(".mobile-activity-search .kit-search-input"))?.backgroundColor ?? "",
         themeBgPrimary: getComputedStyle(themeSample).backgroundColor,
         themeBgSurface: getComputedStyle(surfaceSample).backgroundColor,
         themeBgInset: getComputedStyle(insetSample).backgroundColor,
@@ -270,9 +271,9 @@ test.describe("phone routes", () => {
     expect(metrics.documentWidth).toBeLessThanOrEqual(metrics.viewportWidth);
     expect(metrics.searchLeft).toBeGreaterThanOrEqual(0);
     expect(metrics.searchRight).toBeLessThanOrEqual(metrics.viewportWidth);
-    expect(metrics.mobileTypeToken).toBe("1.24rem");
-    expect(metrics.titleTypeToken).toBe("1.54rem");
-    expect(metrics.rootFontSize).toBe(13);
+    expect(metrics.mobileTypeToken).toBe("1rem");
+    expect(metrics.titleTypeToken).toBe("1.25rem");
+    expect(metrics.rootFontSize).toBe(16);
     expect(metrics.cardHeight).toBeGreaterThanOrEqual(110);
     expect(metrics.touchTargetHeight).toBeGreaterThanOrEqual(44);
     expect(metrics.titleFontSize).toBeGreaterThanOrEqual(19);
@@ -454,7 +455,7 @@ test.describe("phone routes", () => {
     await page.goto("/?desktop=1");
 
     await expect(page).toHaveURL(/\/?desktop=1$/);
-    await expect(page.locator(".app-header")).toBeVisible();
+    await expect(page.locator(".app-top-bar")).toBeVisible();
     await expect(page.locator(".mobile-shell")).toHaveCount(0);
   });
 
@@ -481,7 +482,9 @@ test.describe("high-density phone routes", () => {
     userAgent: pixel7.userAgent,
   });
 
-  test("mobile activity sizing stays rem-based and readable on high-density Android displays", async ({ page }) => {
+  test("mobile activity keeps the phone type scale and stays readable on high-density Android displays", async ({
+    page,
+  }) => {
     await page.goto("/m?range=30d&view=threaded");
 
     await expect(page.locator(".mobile-shell")).toBeVisible();
@@ -499,13 +502,15 @@ test.describe("high-density phone routes", () => {
       const tokenValue = (node: Element | null, name: string): string =>
         node ? getComputedStyle(node).getPropertyValue(name).trim() : "";
       const filterControls = [
-        ...document.querySelectorAll(".mobile-activity-filter-grid .select-dropdown-trigger, .mobile-filter-toggle"),
+        ...document.querySelectorAll(
+          ".mobile-activity-filter-grid .kit-select-dropdown__trigger, .mobile-filter-toggle",
+        ),
       ]
         .map((control) => control.getBoundingClientRect())
         .map((rect) => ({ left: rect.left, right: rect.right }));
-      const search = document.querySelector(".search-input")?.getBoundingClientRect();
+      const search = document.querySelector(".kit-search-input")?.getBoundingClientRect();
       const firstOption = document
-        .querySelector(".mobile-filter-dropdown .select-dropdown-option")
+        .querySelector(".mobile-filter-dropdown .kit-select-dropdown__option")
         ?.getBoundingClientRect();
       return {
         dpr: window.devicePixelRatio,
@@ -515,8 +520,8 @@ test.describe("high-density phone routes", () => {
         activityTypeToken: tokenValue(inbox, "--mobile-type-body"),
         densityScale: tokenValue(inbox, "--mobile-device-density-scale"),
         bodyFontSize: fontSize(".mobile-activity-inbox"),
-        filterFontSize: fontSize(".mobile-activity-filter-grid .select-dropdown-trigger"),
-        filterOptionFontSize: fontSize(".mobile-filter-dropdown .select-dropdown-option"),
+        filterFontSize: fontSize(".mobile-activity-filter-grid .kit-select-dropdown__trigger"),
+        filterOptionFontSize: fontSize(".mobile-filter-dropdown .kit-select-dropdown__option"),
         filterOptionHeight: firstOption?.height ?? 0,
         tabFontSize: fontSize(".mobile-tabs a"),
         searchHeight: search?.height ?? 0,
@@ -527,8 +532,8 @@ test.describe("high-density phone routes", () => {
     });
 
     expect(metrics.dpr).toBeGreaterThanOrEqual(2.5);
-    expect(metrics.mobileTypeToken).toBe("1.24rem");
-    expect(metrics.activityTypeToken).toBe("1.24rem");
+    expect(metrics.mobileTypeToken).toBe("1rem");
+    expect(metrics.activityTypeToken).toBe("1rem");
     expect(metrics.densityScale).toBe("");
     expect(metrics.documentWidth).toBeLessThanOrEqual(metrics.viewportWidth);
     expect(metrics.bodyFontSize).toBeGreaterThanOrEqual(16);

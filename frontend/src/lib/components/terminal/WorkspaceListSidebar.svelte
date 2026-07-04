@@ -1,18 +1,18 @@
 <script lang="ts">
+  import { copyToClipboard, SearchInput } from "@kenn-io/kit-ui";
   import { onMount, tick } from "svelte";
   import { navigate } from "../../stores/router.svelte.ts";
   import ChevronDownIcon from "@lucide/svelte/icons/chevron-down";
   import GitBranchIcon from "@lucide/svelte/icons/git-branch";
   import ArrowUpIcon from "@lucide/svelte/icons/arrow-up";
   import ArrowDownIcon from "@lucide/svelte/icons/arrow-down";
-  import SearchIcon from "@lucide/svelte/icons/search";
   import { apiErrorMessage, client } from "../../api/runtime.js";
-  import { showFlash } from "../../stores/flash.svelte.js";
+  import { showFlash } from "@middleman/ui/stores/flash";
   import type { components } from "@middleman/ui/api/schema";
   import {
     DiffStats,
     FilterDropdown,
-    LeftSidebarToggle,
+    SidebarToggle,
   } from "@middleman/ui";
   import {
     createRepoLabelFormatter,
@@ -493,10 +493,8 @@
       : `Open PR #${ws.item_number}`;
   }
 
-  function updateSearch(event: Event): void {
-    searchQuery = event.currentTarget instanceof HTMLInputElement
-      ? event.currentTarget.value
-      : "";
+  function updateSearch(value: string): void {
+    searchQuery = value;
   }
 
   function workspaceMatchesSearch(
@@ -546,9 +544,9 @@
   }
 
   function statusDotClass(ws: Workspace): string {
-    if (ws.status === "ready") return "status-dot ready";
-    if (ws.status === "error") return "status-dot error";
-    return "status-dot pending";
+    if (ws.status === "ready") return "daemon-dot ready";
+    if (ws.status === "error") return "daemon-dot error";
+    return "daemon-dot pending";
   }
 
   function workingTitle(ws: Workspace): string {
@@ -718,10 +716,9 @@
     successMessage: string,
   ): Promise<void> {
     closeContextMenu();
-    try {
-      await navigator.clipboard.writeText(value);
+    if (await copyToClipboard(value)) {
       showFlash(successMessage);
-    } catch {
+    } else {
       showFlash("Could not copy to clipboard.");
     }
   }
@@ -996,29 +993,24 @@
       <!-- No --push here: .workspace-sort's auto margin already
            claims the free space, and a second auto margin would
            split it and strand the sort trigger mid-header. -->
-      <LeftSidebarToggle
+      <SidebarToggle
         state="expanded"
         label="Workspaces sidebar"
         onclick={onCollapseSidebar}
-        class="left-sidebar-toggle--compact"
+        class="kit-sidebar-toggle--compact"
       />
     {/if}
   </div>
-  <label class="workspace-filter">
-    <SearchIcon
-      class="workspace-filter-icon"
-      size="13"
-      strokeWidth="2.25"
-      aria-hidden="true"
-    />
-    <input
-      type="search"
+  <div class="workspace-filter">
+    <SearchInput
       value={searchQuery}
+      size="sm"
+      block
       placeholder="Filter workspaces"
-      aria-label="Filter workspaces"
+      ariaLabel="Filter workspaces"
       oninput={updateSearch}
     />
-  </label>
+  </div>
   {#if showFleetStatus}
     <section class="fleet-status" aria-label="Fleet hosts">
       <div class="fleet-status-heading">
@@ -1262,7 +1254,7 @@
   {@const actionBusy = workspaceAction !== null}
   {@const actionDisabled = actionBusy || workspaceActionsDisabled(menuWorkspace)}
   <div
-    class="workspace-context-menu filter-dropdown"
+    class="workspace-context-menu kit-filter-dropdown__panel"
     bind:this={contextMenuEl}
     style={contextMenuStyle}
     role="menu"
@@ -1279,10 +1271,10 @@
       </div>
     </div>
 
-    <div class="filter-section-title">Sync branch</div>
+    <div class="kit-filter-dropdown__section-title">Sync branch</div>
     {#if canPush(menuWorkspace)}
       <button
-        class="filter-item active"
+        class="kit-filter-dropdown__item active"
         role="menuitem"
         type="button"
         disabled={actionDisabled}
@@ -1290,13 +1282,13 @@
           void syncWorkspaceBranch(menuWorkspace, "push");
         }}
       >
-        <span class="filter-dot filter-dot--success"></span>
-        <span class="filter-label">{workspaceActionMatches(menuWorkspace, "push") ? "Pushing..." : "Push branch"}</span>
+        <span class="kit-filter-dropdown__dot filter-dot--success"></span>
+        <span class="kit-filter-dropdown__label">{workspaceActionMatches(menuWorkspace, "push") ? "Pushing..." : "Push branch"}</span>
         <span class="workspace-context-detail">{syncActionDetail(menuWorkspace)}</span>
       </button>
     {:else if canPull(menuWorkspace)}
       <button
-        class="filter-item active"
+        class="kit-filter-dropdown__item active"
         role="menuitem"
         type="button"
         disabled={actionDisabled}
@@ -1304,13 +1296,13 @@
           void syncWorkspaceBranch(menuWorkspace, "pull");
         }}
       >
-        <span class="filter-dot filter-dot--warning"></span>
-        <span class="filter-label">{workspaceActionMatches(menuWorkspace, "pull") ? "Pulling..." : "Pull remote changes"}</span>
+        <span class="kit-filter-dropdown__dot filter-dot--warning"></span>
+        <span class="kit-filter-dropdown__label">{workspaceActionMatches(menuWorkspace, "pull") ? "Pulling..." : "Pull remote changes"}</span>
         <span class="workspace-context-detail">{syncActionDetail(menuWorkspace)}</span>
       </button>
     {/if}
     <button
-      class="filter-item active"
+      class="kit-filter-dropdown__item active"
       role="menuitem"
       type="button"
       disabled={actionDisabled}
@@ -1318,13 +1310,13 @@
         void refreshWorkspaceStatus(menuWorkspace);
       }}
     >
-      <span class="filter-dot"></span>
-      <span class="filter-label">Refresh git status</span>
+      <span class="kit-filter-dropdown__dot"></span>
+      <span class="kit-filter-dropdown__label">Refresh git status</span>
     </button>
 
-    <div class="filter-divider"></div>
+    <div class="kit-filter-dropdown__divider"></div>
     <button
-      class="filter-item active"
+      class="kit-filter-dropdown__item active"
       role="menuitem"
       type="button"
       disabled={actionBusy}
@@ -1335,12 +1327,12 @@
         );
       }}
     >
-      <span class="filter-dot"></span>
-      <span class="filter-label">Copy branch name</span>
+      <span class="kit-filter-dropdown__dot"></span>
+      <span class="kit-filter-dropdown__label">Copy branch name</span>
     </button>
     {#if localWorkspace}
       <button
-        class="filter-item active"
+        class="kit-filter-dropdown__item active"
         role="menuitem"
         type="button"
         disabled={actionBusy}
@@ -1351,11 +1343,11 @@
           );
         }}
       >
-        <span class="filter-dot"></span>
-        <span class="filter-label">Copy worktree path</span>
+        <span class="kit-filter-dropdown__dot"></span>
+        <span class="kit-filter-dropdown__label">Copy worktree path</span>
       </button>
       <button
-        class="filter-item active"
+        class="kit-filter-dropdown__item active"
         role="menuitem"
         type="button"
         disabled={actionDisabled}
@@ -1363,38 +1355,38 @@
           void revealWorkspacePath(menuWorkspace);
         }}
       >
-        <span class="filter-dot"></span>
-        <span class="filter-label">{workspaceActionMatches(menuWorkspace, "reveal") ? "Opening..." : revealLabel(menuWorkspace)}</span>
+        <span class="kit-filter-dropdown__dot"></span>
+        <span class="kit-filter-dropdown__label">{workspaceActionMatches(menuWorkspace, "reveal") ? "Opening..." : revealLabel(menuWorkspace)}</span>
       </button>
     {/if}
 
     {#if itemURL}
-      <div class="filter-divider"></div>
+      <div class="kit-filter-dropdown__divider"></div>
       <button
-        class="filter-item active"
+        class="kit-filter-dropdown__item active"
         role="menuitem"
         type="button"
         disabled={actionBusy}
         onclick={() => openProviderItem(menuWorkspace)}
       >
-        <span class="filter-dot"></span>
-        <span class="filter-label">{providerLabel(menuWorkspace)}</span>
+        <span class="kit-filter-dropdown__dot"></span>
+        <span class="kit-filter-dropdown__label">{providerLabel(menuWorkspace)}</span>
       </button>
       <button
-        class="filter-item active"
+        class="kit-filter-dropdown__item active"
         role="menuitem"
         type="button"
         disabled={actionBusy}
         onclick={() => copyProviderItemURL(menuWorkspace)}
       >
-        <span class="filter-dot"></span>
-        <span class="filter-label">Copy item URL</span>
+        <span class="kit-filter-dropdown__dot"></span>
+        <span class="kit-filter-dropdown__label">Copy item URL</span>
       </button>
     {/if}
 
-    <div class="filter-divider"></div>
+    <div class="kit-filter-dropdown__divider"></div>
     <button
-      class="filter-item active workspace-context-danger"
+      class="kit-filter-dropdown__item active workspace-context-danger"
       role="menuitem"
       type="button"
       disabled={actionDisabled}
@@ -1402,8 +1394,8 @@
         openDeleteWorkspaceDialog(menuWorkspace);
       }}
     >
-      <span class="filter-dot filter-dot--danger"></span>
-      <span class="filter-label">{workspaceActionMatches(menuWorkspace, "delete") ? "Deleting..." : "Delete workspace..."}</span>
+      <span class="kit-filter-dropdown__dot filter-dot--danger"></span>
+      <span class="kit-filter-dropdown__label">{workspaceActionMatches(menuWorkspace, "delete") ? "Deleting..." : "Delete workspace..."}</span>
     </button>
   </div>
 {/if}
@@ -1469,16 +1461,7 @@
   }
 
   .workspace-filter {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    height: 28px;
     margin: 6px 8px 4px;
-    padding: 0 8px;
-    border: 1px solid var(--border-muted);
-    border-radius: 6px;
-    background: var(--bg-surface);
-    color: var(--text-muted);
     flex-shrink: 0;
   }
 
@@ -1489,7 +1472,7 @@
     flex-shrink: 0;
   }
 
-  .workspace-sort :global(.filter-btn) {
+  .workspace-sort :global(.kit-filter-dropdown__btn) {
     /* Borderless inside the 28px header rail; the dropdown trigger
      * reads as header chrome rather than a standalone button. */
     min-height: 22px;
@@ -1498,34 +1481,8 @@
     background: transparent;
   }
 
-  .workspace-sort :global(.filter-btn:hover:not(:disabled)) {
+  .workspace-sort :global(.kit-filter-dropdown__btn:hover:not(:disabled)) {
     border-color: var(--border-muted);
-  }
-
-  :global(.workspace-filter-icon) {
-    flex-shrink: 0;
-  }
-
-  .workspace-filter input {
-    width: 100%;
-    min-width: 0;
-    padding: 0;
-    border: 0;
-    outline: 0;
-    background: transparent;
-    color: var(--text-primary);
-    font-size: var(--font-size-sm);
-    line-height: 1;
-  }
-
-  .workspace-filter input::placeholder {
-    color: var(--text-muted);
-    opacity: 0.8;
-  }
-
-  .workspace-filter:focus-within {
-    border-color: var(--accent-blue);
-    box-shadow: 0 0 0 1px var(--accent-blue);
   }
 
   .fleet-status {
@@ -1573,13 +1530,13 @@
   .fleet-hosts {
     display: flex;
     flex-wrap: wrap;
-    gap: 5px;
+    gap: var(--space-2);
   }
 
   .fleet-host {
     display: inline-flex;
     align-items: center;
-    gap: 5px;
+    gap: var(--space-2);
     max-width: 100%;
     min-width: 0;
     padding: 2px 6px;
@@ -1789,26 +1746,26 @@
     min-width: 0;
   }
 
-  .status-dot {
+  .daemon-dot {
     width: 6px;
     height: 6px;
     border-radius: 50%;
     flex-shrink: 0;
   }
 
-  .status-dot.ready {
+  .daemon-dot.ready {
     background: var(--accent-green);
   }
 
-  .status-dot.error {
+  .daemon-dot.error {
     background: var(--accent-red);
   }
 
-  .status-dot.pending {
+  .daemon-dot.pending {
     background: var(--accent-amber);
   }
 
-  .status-dot.spinning {
+  .daemon-dot.spinning {
     animation: pulse 1.2s ease-in-out infinite;
   }
 
@@ -1867,7 +1824,7 @@
      * the line so the branch chip always keeps some room. */
     display: inline-flex;
     align-items: center;
-    gap: 3px;
+    gap: var(--space-1);
     flex: 0 1 auto;
     max-width: 50%;
     min-width: 0;
@@ -1892,7 +1849,7 @@
      * push state and diff stats and truncates with ellipsis. */
     display: inline-flex;
     align-items: center;
-    gap: 3px;
+    gap: var(--space-1);
     flex: 1 1 auto;
     min-width: 0;
     overflow: hidden;
@@ -1948,19 +1905,23 @@
       color 80ms ease;
   }
 
+  /* Bubble fills mix each accent toward pure white, and the ink toward
+     --bubble-ink, in both themes. kit-ui-check deliberately permits pure
+     black/white shade constants inside color-mix — white here is a shade
+     anchor, not a palette color. */
   .item-bubble.open {
     --bubble-bg: color-mix(in srgb, var(--accent-green) 70%, #ffffff);
-    --bubble-fg: color-mix(in srgb, var(--accent-green) 25%, #0a0d14);
+    --bubble-fg: color-mix(in srgb, var(--accent-green) 25%, var(--bubble-ink));
   }
 
   .item-bubble.merged {
     --bubble-bg: color-mix(in srgb, var(--accent-purple) 70%, #ffffff);
-    --bubble-fg: color-mix(in srgb, var(--accent-purple) 25%, #0a0d14);
+    --bubble-fg: color-mix(in srgb, var(--accent-purple) 25%, var(--bubble-ink));
   }
 
   .item-bubble.closed {
     --bubble-bg: color-mix(in srgb, var(--accent-red) 70%, #ffffff);
-    --bubble-fg: color-mix(in srgb, var(--accent-red) 25%, #0a0d14);
+    --bubble-fg: color-mix(in srgb, var(--accent-red) 25%, var(--bubble-ink));
   }
 
   .item-bubble.draft {
@@ -1968,19 +1929,19 @@
      * chip, design system) so a draft PR reads as draft here too, rather
      * than as a muted/neutral pill indistinguishable from other states. */
     --bubble-bg: color-mix(in srgb, var(--accent-amber) 70%, #ffffff);
-    --bubble-fg: color-mix(in srgb, var(--accent-amber) 25%, #0a0d14);
+    --bubble-fg: color-mix(in srgb, var(--accent-amber) 25%, var(--bubble-ink));
   }
 
   .item-bubble.kata {
     --bubble-bg: color-mix(in srgb, var(--accent-blue) 70%, #ffffff);
-    --bubble-fg: color-mix(in srgb, var(--accent-blue) 25%, #0a0d14);
+    --bubble-fg: color-mix(in srgb, var(--accent-blue) 25%, var(--bubble-ink));
   }
 
   /* Kata identity labels are short slugs/qualified IDs rather than a
    * fixed-width number, so cap the width and ellipsize to keep the row
    * layout stable. */
   .item-bubble--kata {
-    max-width: 9rem;
+    max-width: 117px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -2035,7 +1996,7 @@
     border: 1px solid var(--border-default);
     border-radius: var(--radius-sm);
     box-shadow: var(--shadow-md);
-    z-index: 1000;
+    z-index: var(--z-popover);
     padding: 4px 0;
   }
 
@@ -2064,7 +2025,7 @@
     font-size: var(--font-size-2xs);
   }
 
-  .filter-section-title {
+  .kit-filter-dropdown__section-title {
     padding: 4px 12px;
     font-size: 0.9em;
     font-weight: 600;
@@ -2073,13 +2034,13 @@
     letter-spacing: 0.04em;
   }
 
-  .filter-divider {
+  .kit-filter-dropdown__divider {
     height: 1px;
     background: var(--border-muted);
     margin: 4px 8px;
   }
 
-  .filter-item {
+  .kit-filter-dropdown__item {
     display: flex;
     align-items: center;
     gap: 8px;
@@ -2094,19 +2055,19 @@
     border: 0;
   }
 
-  .filter-item:hover:not(:disabled) {
+  .kit-filter-dropdown__item:hover:not(:disabled) {
     background: var(--bg-surface-hover);
   }
 
-  .filter-item:not(.active) {
+  .kit-filter-dropdown__item:not(.active) {
     opacity: 0.5;
   }
 
-  .filter-item:disabled {
+  .kit-filter-dropdown__item:disabled {
     cursor: default;
   }
 
-  .filter-dot {
+  .kit-filter-dropdown__dot {
     width: 6px;
     height: 6px;
     border-radius: 50%;
@@ -2126,7 +2087,7 @@
     background: var(--accent-red);
   }
 
-  .filter-label {
+  .kit-filter-dropdown__label {
     flex: 1;
     min-width: 0;
     overflow: hidden;
@@ -2164,7 +2125,7 @@
   /* The sort trigger collapses to its icon before the filter input
    * is squeezed into uselessness. */
   @container workspace-rail (max-width: 240px) {
-    .workspace-sort :global(.filter-trigger-label) {
+    .workspace-sort :global(.kit-filter-dropdown__trigger-label) {
       display: none;
     }
   }

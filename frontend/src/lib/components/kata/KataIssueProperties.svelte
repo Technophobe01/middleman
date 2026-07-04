@@ -4,7 +4,7 @@
   import FlagIcon from "@lucide/svelte/icons/flag";
   import UserIcon from "@lucide/svelte/icons/user-round";
   import XIcon from "@lucide/svelte/icons/x";
-  import { ActionButton, Chip, SelectDropdown } from "@middleman/ui";
+  import { Button, Chip, SelectDropdown } from "@middleman/ui";
   import type { KataTaskDetail } from "../../api/kata/taskTypes.js";
   import DatePicker from "../shared/DatePicker.svelte";
   import TypeaheadTrigger, { type TypeaheadOption } from "../shared/TypeaheadTrigger.svelte";
@@ -284,7 +284,7 @@
             <li class="label-token">
               {#if editingLabels}
                 <Chip
-                  size="sm"
+                  size="xs"
                   tone="muted"
                   uppercase={false}
                   interactive
@@ -299,7 +299,7 @@
                   <XIcon size={11} strokeWidth={2.2} aria-hidden="true" />
                 </Chip>
               {:else}
-                <Chip size="sm" tone="muted" uppercase={false} class="kata-label-chip">
+                <Chip size="xs" tone="muted" uppercase={false} class="kata-label-chip">
                   {label.label}
                 </Chip>
               {/if}
@@ -324,9 +324,9 @@
     />
   {:else}
     <div class="label-actions">
-      <ActionButton size="sm" surface="outline" label="Add label" onclick={() => { addingLabel = true; }} />
+      <Button size="sm" surface="outline" label="Add label" onclick={() => { addingLabel = true; }} />
       {#if issue.labels.length > 0}
-        <ActionButton
+        <Button
           size="sm"
           surface="outline"
           label={editingLabels ? "Done" : "Edit labels"}
@@ -417,19 +417,19 @@
     background: var(--bg-surface-hover);
   }
 
-  .property-pill--select :global(.select-dropdown) {
+  .property-pill--select :global(.kit-select-dropdown) {
     min-width: 104px;
   }
 
-  .property-pill--select :global(.select-dropdown-trigger) {
+  .property-pill--select :global(.kit-select-dropdown__trigger) {
     height: 22px;
     border-color: transparent;
     background: transparent;
     color: var(--text-primary);
   }
 
-  .property-pill--select :global(.select-dropdown-trigger:hover:not(:disabled)),
-  .property-pill--select :global(.select-dropdown-trigger[aria-expanded="true"]) {
+  .property-pill--select :global(.kit-select-dropdown__trigger:hover:not(:disabled)),
+  .property-pill--select :global(.kit-select-dropdown__trigger[aria-expanded="true"]) {
     border-color: var(--border-default);
     background: var(--bg-inset);
   }

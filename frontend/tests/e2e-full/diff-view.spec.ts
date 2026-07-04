@@ -1975,7 +1975,7 @@ test.describe("diff view", () => {
     await waitForDiffLoaded(page);
     await waitForSidebarFilesLoaded(page);
 
-    const mainArea = page.locator(".main-area");
+    const mainArea = page.locator(".kit-sidebar-layout__main");
     const diffArea = page.locator(".diff-area");
     await expect.poll(() => mainArea.evaluate((el) => Math.round(el.scrollTop))).toBe(0);
 
@@ -1992,7 +1992,7 @@ test.describe("diff view", () => {
     await waitForDiffLoaded(page);
     await waitForSidebarFilesLoaded(page);
 
-    const mainArea = page.locator(".main-area");
+    const mainArea = page.locator(".kit-sidebar-layout__main");
     const diffArea = page.locator(".diff-area");
     await page.evaluate(() => {
       document.documentElement.style.overflow = "hidden";
@@ -2144,7 +2144,7 @@ test.describe("diff view", () => {
     const header = firstFile.locator(".file-header");
     const content = firstFile.locator(".file-content");
 
-    await expect(header.locator(".diff-stats")).toHaveCount(1);
+    await expect(header.locator(".kit-diff-stats")).toHaveCount(1);
 
     // Content is initially visible.
     await expect(content).toBeVisible();
@@ -3347,7 +3347,7 @@ test.describe("diff view", () => {
     await expect(treeFileItems(detailFiles)).toHaveCount(4);
 
     // Filter the sidebar to exclude PR 1 by searching for a different PR.
-    await page.locator(".search-input").fill("race");
+    await page.locator(".search-wrap input").fill("race");
     await expect(page.locator(".list-count-chip")).toHaveText(/^1 PRs?$/, {
       timeout: 5_000,
     });

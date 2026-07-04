@@ -1,5 +1,5 @@
 <script lang="ts">
-  import SearchIcon from "@lucide/svelte/icons/search";
+  import { SearchInput } from "@kenn-io/kit-ui";
   import { SelectDropdown } from "@middleman/ui";
 
   import type {
@@ -62,21 +62,19 @@
 
 <section class="kata-search-panel" aria-label="Search and filters">
   <div class="kata-search-toolbar">
-    <label class="search-field">
-      <SearchIcon size={13} strokeWidth={1.9} aria-hidden="true" />
-      <span>Search tasks</span>
-      <input
-        aria-label="Search tasks"
-        type="search"
+    <div class="query-field">
+      <SearchInput
         value={draft.query}
+        size="sm"
+        block
         placeholder="Search tasks..."
-        autocomplete="off"
-        oninput={(event) => emit({ query: inputValue(event) })}
+        ariaLabel="Search tasks"
+        oninput={(query) => emit({ query })}
       />
-    </label>
+    </div>
 
     <div class="filter-control filter-control-project">
-      <span>Project scope</span>
+      <span class="kit-sr-only">Project scope</span>
       <TypeaheadTrigger
         ariaLabel="Project scope"
         options={projectOptions}
@@ -92,7 +90,7 @@
     </div>
 
     <div class="filter-control filter-control-status">
-      <span>Status</span>
+      <span class="kit-sr-only">Status</span>
       <SelectDropdown
         title="Status"
         value={draft.status}
@@ -102,7 +100,7 @@
     </div>
 
     <label class="filter-control filter-control-input">
-      <span>Owner</span>
+      <span class="kit-sr-only">Owner</span>
       <input
         aria-label="Owner"
         value={draft.owner}
@@ -113,7 +111,7 @@
     </label>
 
     <label class="filter-control filter-control-input">
-      <span>Label</span>
+      <span class="kit-sr-only">Label</span>
       <input
         aria-label="Label"
         value={draft.label}
@@ -153,33 +151,15 @@
     min-width: 0;
   }
 
-  .search-field {
+  .query-field {
     flex: 1;
     min-width: 150px;
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    height: 28px;
-    padding: 0 8px;
-    border: 1px solid var(--border-muted);
-    border-radius: var(--radius-sm);
-    background: var(--bg-primary);
-    color: var(--text-muted);
   }
 
   .filter-control {
     display: flex;
     align-items: center;
     min-width: 0;
-  }
-
-  .search-field > span,
-  .filter-control > span {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    overflow: hidden;
-    clip: rect(0 0 0 0);
   }
 
   input {
@@ -200,18 +180,6 @@
     outline-offset: -1px;
   }
 
-  .search-field input {
-    flex: 1;
-    height: 100%;
-    border: 0;
-    background: transparent;
-    padding: 0;
-  }
-
-  .search-field input:focus {
-    outline: 0;
-  }
-
   .filter-control-project :global(.typeahead) {
     width: 168px;
   }
@@ -223,7 +191,7 @@
     background: var(--bg-primary);
   }
 
-  .filter-control-status :global(.select-dropdown) {
+  .filter-control-status :global(.kit-select-dropdown) {
     width: 102px;
   }
 
@@ -273,12 +241,12 @@
     font-style: normal;
   }
 
-  @media (max-width: 820px) {
+  @media (max-width: 900px) {
     .kata-search-toolbar {
       flex-wrap: wrap;
     }
 
-    .search-field {
+    .query-field {
       flex: 1 0 100%;
     }
 

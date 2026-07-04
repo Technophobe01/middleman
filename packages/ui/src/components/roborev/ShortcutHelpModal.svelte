@@ -1,6 +1,8 @@
 <script lang="ts">
   import { untrack } from "svelte";
 
+  import { KbdBadge, Modal } from "@kenn-io/kit-ui";
+
   import { pushModalFrame } from "../../stores/keyboard/modal-stack.svelte.js";
 
   interface Props {
@@ -13,165 +15,89 @@
     if (!open) return;
     return untrack(() => pushModalFrame("roborev-shortcut-help", []));
   });
-
-  function handleKeydown(e: KeyboardEvent): void {
-    if (e.key === "Escape") {
-      e.preventDefault();
-      onclose();
-    }
-  }
 </script>
 
 {#if open}
-  <div
-    class="modal-backdrop"
-    onclick={onclose}
-    onkeydown={handleKeydown}
-    role="dialog"
-    aria-label="Keyboard Shortcuts"
-    tabindex="-1"
-  >
-    <div
-      class="modal-content"
-      onclick={(e) => e.stopPropagation()}
-      role="presentation"
-    >
-      <div class="modal-header">
-        <h3>Keyboard Shortcuts</h3>
-        <button class="close-btn" onclick={onclose}>
-          X
-        </button>
+  <Modal title="Keyboard Shortcuts" {onclose}>
+    <div class="shortcuts-body">
+      <div class="shortcut-group">
+        <h4>Table</h4>
+        <dl>
+          <div class="shortcut-row">
+            <dt><KbdBadge keys={["j"]} /> / <KbdBadge keys={["k"]} /></dt>
+            <dd>Move selection down / up</dd>
+          </div>
+          <div class="shortcut-row">
+            <dt><KbdBadge keys={["Enter"]} /></dt>
+            <dd>Open drawer for selected row</dd>
+          </div>
+          <div class="shortcut-row">
+            <dt><KbdBadge keys={["x"]} /></dt>
+            <dd>Cancel selected job</dd>
+          </div>
+          <div class="shortcut-row">
+            <dt><KbdBadge keys={["r"]} /></dt>
+            <dd>Rerun selected job</dd>
+          </div>
+          <div class="shortcut-row">
+            <dt><KbdBadge keys={["h"]} /></dt>
+            <dd>Toggle hide closed</dd>
+          </div>
+          <div class="shortcut-row">
+            <dt><KbdBadge keys={["/"]} /></dt>
+            <dd>Focus search</dd>
+          </div>
+          <div class="shortcut-row">
+            <dt><KbdBadge keys={["?"]} /></dt>
+            <dd>Toggle this help</dd>
+          </div>
+        </dl>
       </div>
-      <div class="modal-body">
-        <div class="shortcut-group">
-          <h4>Table</h4>
-          <dl>
-            <div class="shortcut-row">
-              <dt><kbd>j</kbd> / <kbd>k</kbd></dt>
-              <dd>Move selection down / up</dd>
-            </div>
-            <div class="shortcut-row">
-              <dt><kbd>Enter</kbd></dt>
-              <dd>Open drawer for selected row</dd>
-            </div>
-            <div class="shortcut-row">
-              <dt><kbd>x</kbd></dt>
-              <dd>Cancel selected job</dd>
-            </div>
-            <div class="shortcut-row">
-              <dt><kbd>r</kbd></dt>
-              <dd>Rerun selected job</dd>
-            </div>
-            <div class="shortcut-row">
-              <dt><kbd>h</kbd></dt>
-              <dd>Toggle hide closed</dd>
-            </div>
-            <div class="shortcut-row">
-              <dt><kbd>/</kbd></dt>
-              <dd>Focus search</dd>
-            </div>
-            <div class="shortcut-row">
-              <dt><kbd>?</kbd></dt>
-              <dd>Toggle this help</dd>
-            </div>
-          </dl>
-        </div>
-        <div class="shortcut-group">
-          <h4>Drawer</h4>
-          <dl>
-            <div class="shortcut-row">
-              <dt><kbd>Esc</kbd></dt>
-              <dd>Close drawer</dd>
-            </div>
-            <div class="shortcut-row">
-              <dt><kbd>a</kbd></dt>
-              <dd>Toggle close / reopen review</dd>
-            </div>
-            <div class="shortcut-row">
-              <dt><kbd>c</kbd></dt>
-              <dd>Focus comment input</dd>
-            </div>
-            <div class="shortcut-row">
-              <dt><kbd>l</kbd></dt>
-              <dd>Switch to Log tab</dd>
-            </div>
-            <div class="shortcut-row">
-              <dt><kbd>p</kbd></dt>
-              <dd>Switch to Prompt tab</dd>
-            </div>
-            <div class="shortcut-row">
-              <dt><kbd>y</kbd></dt>
-              <dd>Copy review output</dd>
-            </div>
-          </dl>
-        </div>
+      <div class="shortcut-group">
+        <h4>Drawer</h4>
+        <dl>
+          <div class="shortcut-row">
+            <dt><KbdBadge keys={["Esc"]} /></dt>
+            <dd>Close drawer</dd>
+          </div>
+          <div class="shortcut-row">
+            <dt><KbdBadge keys={["a"]} /></dt>
+            <dd>Toggle close / reopen review</dd>
+          </div>
+          <div class="shortcut-row">
+            <dt><KbdBadge keys={["c"]} /></dt>
+            <dd>Focus comment input</dd>
+          </div>
+          <div class="shortcut-row">
+            <dt><KbdBadge keys={["l"]} /></dt>
+            <dd>Switch to Log tab</dd>
+          </div>
+          <div class="shortcut-row">
+            <dt><KbdBadge keys={["p"]} /></dt>
+            <dd>Switch to Prompt tab</dd>
+          </div>
+          <div class="shortcut-row">
+            <dt><KbdBadge keys={["y"]} /></dt>
+            <dd>Copy review output</dd>
+          </div>
+        </dl>
       </div>
     </div>
-  </div>
+  </Modal>
 {/if}
 
 <style>
-  .modal-backdrop {
-    position: fixed;
-    inset: 0;
-    z-index: 100;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    background: var(--overlay-bg);
+  /* kit-ui KbdBadge hides itself on coarse pointers, but this modal only
+     opens from a physical keyboard (?), so its badges must stay visible
+     on touch-pointer devices that have one attached. */
+  .shortcuts-body :global(.kit-kbd-badge) {
+    display: inline-flex;
   }
 
-  .modal-content {
-    background: var(--bg-surface);
-    border: 1px solid var(--border-default);
-    border-radius: var(--radius-md);
-    max-width: 480px;
-    width: 90%;
-    max-height: 80vh;
-    overflow-y: auto;
-    box-shadow: var(--shadow-lg);
-  }
-
-  .modal-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 12px 16px;
-    border-bottom: 1px solid var(--border-muted);
-  }
-
-  .modal-header h3 {
-    margin: 0;
-    font-size: var(--font-size-lg);
-    font-weight: 600;
-    color: var(--text-primary);
-  }
-
-  .close-btn {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 24px;
-    height: 24px;
-    border: none;
-    border-radius: var(--radius-sm);
-    background: transparent;
-    color: var(--text-muted);
-    font-size: var(--font-size-sm);
-    font-weight: 600;
-    cursor: pointer;
-  }
-
-  .close-btn:hover {
-    background: var(--bg-surface-hover);
-    color: var(--text-primary);
-  }
-
-  .modal-body {
+  .shortcuts-body {
     display: grid;
     grid-template-columns: 1fr 1fr;
     gap: 16px;
-    padding: 16px;
   }
 
   .shortcut-group h4 {
@@ -207,17 +133,5 @@
     margin: 0;
     font-size: var(--font-size-sm);
     color: var(--text-secondary);
-  }
-
-  kbd {
-    display: inline-block;
-    padding: 1px 5px;
-    font-size: var(--font-size-xs);
-    font-family: var(--font-mono);
-    color: var(--text-primary);
-    background: var(--bg-surface-hover);
-    border: 1px solid var(--border-default);
-    border-radius: 3px;
-    line-height: 1.4;
   }
 </style>

@@ -132,7 +132,7 @@
   .launch-trigger {
     display: inline-flex;
     align-items: center;
-    gap: 5px;
+    gap: var(--space-2);
     height: 22px;
     padding: 0 7px 0 8px;
     border: 1px solid var(--border-default);
@@ -178,9 +178,7 @@
     border: 1px solid var(--border-default);
     border-radius: 4px;
     background: var(--bg-surface);
-    box-shadow:
-      0 1px 2px rgba(0, 0, 0, 0.04),
-      0 4px 16px rgba(0, 0, 0, 0.12);
+    box-shadow: var(--shadow-lg);
   }
 
   .popover-heading {

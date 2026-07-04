@@ -1,7 +1,8 @@
 <script lang="ts">
+  import { EmptyState, SearchInput, Spinner } from "@kenn-io/kit-ui";
   import { tick, untrack } from "svelte";
   import type { ConfigRepo, Settings } from "@middleman/ui/api/types";
-  import { pushModalFrame } from "@middleman/ui/stores/keyboard/modal-stack";
+  import Modal from "../shared/Modal.svelte";
   import {
     bulkAddRepos,
     previewRepos,
@@ -29,7 +30,10 @@
   let error = $state<string | null>(null);
   let requestToken = 0;
   let loadedRepoKey: string | null = null;
-  let searchInput = $state<HTMLInputElement | null>(null);
+  // kit SearchInput's inputEl bindable is exactly-optional, which
+  // exactOptionalPropertyTypes rejects for a `| undefined` binding —
+  // resolve the inner input through the wrapper instead.
+  let searchWrap = $state<HTMLDivElement>();
 
   const filteredRows = $derived.by(() => {
     const query = filterText.trim().toLowerCase();
@@ -65,13 +69,8 @@
     const key = configRepoKey(target);
     if (loadedRepoKey === key) return;
     loadedRepoKey = key;
-    void tick().then(() => searchInput?.focus());
+    void tick().then(() => searchWrap?.querySelector("input")?.focus());
     untrack(() => { void loadMatches(target); });
-  });
-
-  $effect(() => {
-    if (!open) return;
-    return untrack(() => pushModalFrame("repo-promote-modal", []));
   });
 
   function promoteRowKey(row: RepoPreviewRow): string {
@@ -178,62 +177,39 @@
     if (!submitting) onClose();
   }
 
-  function handleKeydown(event: KeyboardEvent): void {
-    if (event.key === "Escape") {
-      closeIfAllowed();
-      return;
-    }
-    if (event.key !== "Tab") return;
-    const container = event.currentTarget;
-    if (!(container instanceof HTMLElement)) return;
-    const modal = container.querySelector("[role='dialog']");
-    if (!(modal instanceof HTMLElement)) return;
-    const focusable = Array.from(
-      modal.querySelectorAll<HTMLElement>(
-        "button:not(:disabled), input:not(:disabled), [tabindex]:not([tabindex='-1'])",
-      ),
-    );
-    const first = focusable[0];
-    const last = focusable[focusable.length - 1];
-    if (!first || !last) return;
-    if (event.shiftKey && document.activeElement === first) {
-      event.preventDefault();
-      last.focus();
-    } else if (!event.shiftKey && document.activeElement === last) {
-      event.preventDefault();
-      first.focus();
-    }
-  }
 </script>
 
-{#if open && repo}
-  <div class="modal-backdrop" role="presentation" onkeydown={handleKeydown}>
-    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="repo-promote-title">
-      <header class="modal-header">
-        <div>
-          <h2 id="repo-promote-title">Promote wildcard repository</h2>
-          <p>{repo.repo_path || `${repo.owner}/${repo.name}`}</p>
-        </div>
-        <button type="button" class="close-btn" aria-label="Close" onclick={closeIfAllowed}>×</button>
-      </header>
+<Modal
+  open={open && repo !== null}
+  title="Promote wildcard repository"
+  width={760}
+  frameId="repo-promote-modal"
+  showClose
+  onClose={closeIfAllowed}
+>
+  <div class="promote-content">
+    <p class="promote-subject">{repo?.repo_path || `${repo?.owner}/${repo?.name}`}</p>
 
-      <label class="search-field">
+      <div class="match-search" bind:this={searchWrap}>
         <span>Search matches</span>
-        <input
-          bind:this={searchInput}
-          value={filterText}
+        <SearchInput
+          bind:value={filterText}
+          block
           placeholder="Filter repositories..."
           disabled={submitting}
-          oninput={(event) => { filterText = event.currentTarget.value; }}
+          ariaLabel="Search matches"
         />
-      </label>
+      </div>
 
       {#if error}
         <div class="error-msg" role="alert">{error}</div>
       {/if}
 
       {#if loading}
-        <div class="empty-state">Loading matches...</div>
+        <div class="loading-placeholder">
+          <Spinner size={14} label="Loading matches" />
+          Loading matches...
+        </div>
       {:else if filteredRows.length > 0}
         <div class="match-list" role="radiogroup" aria-label="Wildcard matches">
           {#each filteredRows as row (promoteRowKey(row))}
@@ -259,7 +235,7 @@
           {/each}
         </div>
       {:else}
-        <div class="empty-state">No matching repositories.</div>
+        <EmptyState title="No matching repositories." />
       {/if}
 
       {#if selectedRow}
@@ -288,69 +264,50 @@
         </label>
       {/if}
 
-      <footer class="modal-footer">
-        <span>{availableCount} available of {rows.length} matches</span>
-        <div class="footer-actions">
-          <button class="secondary-btn" type="button" onclick={closeIfAllowed} disabled={submitting}>Cancel</button>
-          <button
-            class="submit-btn"
-            type="button"
-            onclick={() => void handlePromote()}
-            disabled={submitting || !selectedRow || selectedRow.already_configured || selectedPath.trim() === ""}
-          >
-            {submitting ? "Promoting..." : "Promote repository"}
-          </button>
-        </div>
-      </footer>
-    </div>
   </div>
-{/if}
+  {#snippet footer()}
+    <span class="footer-status">{availableCount} available of {rows.length} matches</span>
+    <div class="footer-actions">
+      <button class="secondary-btn" type="button" onclick={closeIfAllowed} disabled={submitting}>Cancel</button>
+      <button
+        class="submit-btn"
+        type="button"
+        onclick={() => void handlePromote()}
+        disabled={submitting || !selectedRow || selectedRow.already_configured || selectedPath.trim() === ""}
+      >
+        {submitting ? "Promoting..." : "Promote repository"}
+      </button>
+    </div>
+  {/snippet}
+</Modal>
 
 <style>
-  .modal-backdrop {
-    position: fixed;
-    inset: 0;
-    z-index: 40;
+  .loading-placeholder {
     display: flex;
     align-items: center;
     justify-content: center;
-    padding: 24px;
-    background: color-mix(in srgb, black 38%, transparent);
+    gap: var(--space-3);
+    padding: var(--space-8) var(--space-6);
+    color: var(--text-muted);
+    font-size: var(--font-size-md);
   }
-  .modal {
-    width: min(760px, 100%);
-    max-height: min(720px, 92vh);
+
+  .promote-content {
     display: flex;
     flex-direction: column;
-    gap: 14px;
-    padding: 18px;
-    color: var(--text-primary);
-    background: var(--bg-surface);
-    border: 1px solid var(--border-default);
-    border-radius: var(--radius-lg);
-    box-shadow: 0 24px 80px rgb(0 0 0 / 35%);
+    gap: var(--space-5);
   }
-  .modal-header,
-  .modal-footer {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 16px;
-  }
-  h2 {
+  .promote-subject {
     margin: 0;
-    font-size: var(--font-size-lg);
-  }
-  p {
-    margin: 4px 0 0;
     color: var(--text-muted);
     font-size: var(--font-size-sm);
   }
-  .close-btn {
+  .footer-status {
+    margin-right: auto;
     color: var(--text-muted);
-    font-size: var(--font-size-xl);
+    font-size: var(--font-size-sm);
   }
-  .search-field,
+  .match-search,
   .path-field {
     display: flex;
     flex-direction: column;
@@ -358,8 +315,7 @@
     color: var(--text-secondary);
     font-size: var(--font-size-sm);
   }
-  input[type="text"],
-  .search-field input {
+  input[type="text"] {
     min-width: 0;
     padding: 7px 10px;
     color: var(--text-primary);
@@ -381,7 +337,7 @@
   .match-row {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: var(--space-4);
     min-height: 48px;
     padding: 8px 10px;
     border-bottom: 1px solid var(--border-muted);
@@ -426,14 +382,6 @@
     flex-shrink: 0;
     color: var(--text-muted);
     font-size: var(--font-size-xs);
-  }
-  .empty-state {
-    border: 1px dashed var(--border-muted);
-    border-radius: var(--radius-md);
-    padding: 24px;
-    color: var(--text-muted);
-    text-align: center;
-    font-size: var(--font-size-sm);
   }
   .secondary-btn,
   .submit-btn {

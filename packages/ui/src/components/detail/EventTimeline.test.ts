@@ -4,11 +4,12 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vite-p
 import componentSource from "./EventTimeline.svelte?raw";
 import EventTimeline from "./EventTimeline.svelte";
 import { STORES_KEY } from "../../context.js";
-import { copyToClipboard } from "../../utils/clipboard.js";
+import { copyToClipboard } from "@kenn-io/kit-ui";
 import type { DiffResult, PREvent } from "../../api/types.js";
 import type { DiffStore } from "../../stores/diff.svelte.js";
 
-vi.mock("../../utils/clipboard.js", () => ({
+vi.mock("@kenn-io/kit-ui", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@kenn-io/kit-ui")>()),
   copyToClipboard: vi.fn(() => Promise.resolve(true)),
 }));
 
@@ -2077,7 +2078,7 @@ describe("EventTimeline", () => {
     const inlineReplyFloat = findCompiledStyleRule(".event-body--with-inline-reply .thread-reply-inline-float");
     expect(inlineReplyFloat.getPropertyValue("float")).toBe("right");
     expect(inlineReplyFloat.getPropertyValue("clear")).toBe("right");
-    expect(inlineReplyFloat.getPropertyValue("margin-left")).toBe("var(--focus-detail-space-sm, 0.77rem)");
+    expect(inlineReplyFloat.getPropertyValue("margin-left")).toBe("var(--focus-detail-space-sm, 10px)");
 
     const inlineReplyAction = findCompiledStyleRule(".event-body--with-inline-reply .thread-reply-action--inline");
     expect(inlineReplyAction.getPropertyValue("display")).toBe("inline-flex");

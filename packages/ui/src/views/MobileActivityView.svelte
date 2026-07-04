@@ -8,10 +8,10 @@
     type TimeRange,
   } from "../stores/activity.svelte.js";
   import { parseAPITimestamp } from "../utils/time.js";
-  import Chip from "../components/shared/Chip.svelte";
+  import { Chip, SearchInput } from "@kenn-io/kit-ui";
   import ItemKindChip from "../components/shared/ItemKindChip.svelte";
   import ItemStateChip from "../components/shared/ItemStateChip.svelte";
-  import SelectDropdown from "../components/shared/SelectDropdown.svelte";
+  import { SelectDropdown } from "@kenn-io/kit-ui";
   import WorkspaceIndicator from "../components/shared/WorkspaceIndicator.svelte";
   import CheckIcon from "@lucide/svelte/icons/check";
   import {
@@ -232,10 +232,7 @@
     grouping.setHideOrgName(!grouping.getHideOrgName());
   }
 
-  function handleSearchInput(event: Event): void {
-    const value = event.currentTarget instanceof HTMLInputElement
-      ? event.currentTarget.value
-      : "";
+  function handleSearchInput(value: string): void {
     searchInput = value;
     if (debounceTimer) clearTimeout(debounceTimer);
     debounceTimer = setTimeout(() => {
@@ -368,16 +365,15 @@
       <h1>What needs attention?</h1>
     </header>
 
-    <label class="mobile-activity-search">
-      <span aria-hidden="true">⌕</span>
-      <input
-        class="search-input"
-        type="search"
+    <div class="mobile-activity-search">
+      <SearchInput
+        bind:value={searchInput}
+        block
         placeholder="Search issues, PRs, authors"
-        value={searchInput}
+        ariaLabel="Search issues, PRs, authors"
         oninput={handleSearchInput}
       />
-    </label>
+    </div>
 
     <div class="mobile-activity-filter-grid" aria-label="Activity filters">
       <div class="mobile-filter-select">
@@ -470,16 +466,16 @@
               <span class="mobile-activity-card__top">
                 <span class="mobile-activity-card__chips">
                   {#if isDefaultBranchActivity(item)}
-                    <Chip size="md" uppercase={false} class="chip--muted">Branch</Chip>
+                    <Chip size="sm" tone="muted" uppercase={false}>Branch</Chip>
                     <span class="mobile-activity-number">{branchName(item)}</span>
                   {:else}
-                    <ItemKindChip kind={item.item_type === "issue" ? "issue" : "pr"} size="md" />
+                    <ItemKindChip kind={item.item_type === "issue" ? "issue" : "pr"} size="sm" />
                     <span class="mobile-activity-number">#{item.item_number}</span>
                     {#if item.workspace}
                       <WorkspaceIndicator status={item.workspace.status} size={16} />
                     {/if}
                     {#if item.item_state === "merged" || item.item_state === "closed"}
-                      <ItemStateChip state={item.item_state} size="md" />
+                      <ItemStateChip state={item.item_state} size="sm" />
                     {/if}
                   {/if}
                 </span>
@@ -543,22 +539,22 @@
 
 <style>
   .mobile-activity-inbox {
-    --mobile-type-xs: var(--font-size-mobile-xs, 1.08rem);
-    --mobile-type-sm: var(--font-size-mobile-sm, 1.17rem);
-    --mobile-type-body: var(--font-size-mobile-body, 1.24rem);
-    --mobile-type-title: var(--font-size-mobile-title, 1.54rem);
-    --mobile-type-display: var(--font-size-mobile-display, 2.15rem);
-    --mobile-type-metric: var(--font-size-mobile-metric, 1.97rem);
-    --mobile-space-2xs: 0.36rem;
-    --mobile-space-xs: 0.55rem;
-    --mobile-space-sm: 0.75rem;
-    --mobile-space-md: 1rem;
-    --mobile-space-lg: 1.35rem;
+    --mobile-type-xs: var(--font-size-xs);
+    --mobile-type-sm: var(--font-size-sm);
+    --mobile-type-body: var(--font-size-md);
+    --mobile-type-title: var(--font-size-xl);
+    --mobile-type-display: var(--font-size-2xl);
+    --mobile-type-metric: var(--font-size-2xl);
+    --mobile-space-2xs: 4.5px;
+    --mobile-space-xs: 7px;
+    --mobile-space-sm: 10px;
+    --mobile-space-md: 13px;
+    --mobile-space-lg: 17.5px;
     --mobile-radius-sm: var(--radius-md);
     --mobile-radius-md: var(--radius-lg);
-    --mobile-hit-target: 3.5rem;
+    --mobile-hit-target: 45.5px;
     container-type: inline-size;
-    font-size: var(--font-size-mobile-body);
+    font-size: var(--font-size-md);
     flex: 1;
     min-height: 0;
     overflow: hidden;
@@ -572,7 +568,7 @@
       var(--mobile-space-md)
       var(--mobile-space-sm)
       max(var(--mobile-space-lg), env(safe-area-inset-bottom));
-    font-size: var(--font-size-mobile-body);
+    font-size: var(--font-size-md);
   }
 
   .mobile-activity-hero {
@@ -582,7 +578,7 @@
   .mobile-activity-eyebrow {
     margin: 0 0 var(--mobile-space-2xs);
     color: var(--text-secondary);
-    font-size: var(--font-size-mobile-sm);
+    font-size: var(--font-size-sm);
     font-weight: 700;
     letter-spacing: 0.02em;
   }
@@ -590,37 +586,23 @@
   .mobile-activity-hero h1 {
     margin: 0;
     color: var(--text-primary);
-    font-size: var(--font-size-mobile-title);
+    font-size: var(--font-size-xl);
     line-height: 1.16;
     letter-spacing: 0;
   }
 
   .mobile-activity-search {
-    min-height: calc(var(--mobile-hit-target) + var(--mobile-space-xs));
-    display: flex;
-    align-items: center;
-    gap: var(--mobile-space-sm);
-    padding: 0 var(--mobile-space-md);
-    border: thin solid var(--border-default);
-    border-radius: var(--radius-lg);
-    background: var(--bg-inset);
-    color: var(--text-muted);
     margin-bottom: var(--mobile-space-sm);
   }
 
-  .mobile-activity-search .search-input {
-    flex: 1;
-    min-width: 0;
-    width: 100%;
-    border: 0;
-    outline: 0;
-    background: transparent;
-    color: var(--text-primary);
-    font-size: var(--font-size-mobile-body);
-  }
-
-  .mobile-activity-search .search-input::placeholder {
-    color: var(--text-muted);
+  .mobile-activity-search :global(.kit-search-input) {
+    min-height: calc(var(--mobile-hit-target) + var(--mobile-space-xs));
+    border-radius: var(--radius-lg);
+    font-size: var(--font-size-md);
+    /* The phone inbox keeps the inset field look of the original
+       hand-rolled search (mobile-routes e2e pins this against
+       --bg-inset). */
+    background: var(--bg-inset);
   }
 
   .mobile-activity-filter-grid {
@@ -650,7 +632,7 @@
 
   .mobile-filter-select span {
     color: var(--text-muted);
-    font-size: var(--font-size-mobile-xs);
+    font-size: var(--font-size-xs);
     font-weight: 750;
     letter-spacing: 0.01em;
   }
@@ -660,36 +642,36 @@
     min-width: 0;
   }
 
-  .mobile-filter-select :global(.mobile-filter-dropdown .select-dropdown-trigger) {
+  .mobile-filter-select :global(.mobile-filter-dropdown .kit-select-dropdown__trigger) {
     height: auto;
     min-height: calc(var(--mobile-hit-target) - var(--mobile-space-sm));
     padding: 0;
     border: 0;
     background: transparent;
     color: var(--text-primary);
-    font-size: var(--font-size-mobile-sm);
+    font-size: var(--font-size-sm);
     font-weight: 750;
   }
 
-  .mobile-filter-select :global(.mobile-filter-dropdown .select-dropdown-list) {
+  .mobile-filter-select :global(.mobile-filter-dropdown .kit-select-dropdown__list) {
     left: 0;
     right: auto;
-    width: min(20rem, calc(100vw - (var(--mobile-space-sm) * 2)));
+    width: min(260px, calc(100vw - (var(--mobile-space-sm) * 2)));
     max-width: calc(100vw - (var(--mobile-space-sm) * 2));
     padding: var(--mobile-space-2xs);
     border-radius: var(--radius-md);
   }
 
-  .mobile-filter-select :global(.mobile-filter-dropdown .select-dropdown-option) {
+  .mobile-filter-select :global(.mobile-filter-dropdown .kit-select-dropdown__option) {
     min-height: var(--mobile-hit-target);
     padding: var(--mobile-space-xs) var(--mobile-space-sm);
     border-radius: var(--radius-sm);
-    font-size: var(--font-size-mobile-sm);
+    font-size: var(--font-size-sm);
     line-height: 1.2;
   }
 
-  .mobile-filter-select :global(.mobile-filter-dropdown .select-dropdown-check) {
-    width: 1rem;
+  .mobile-filter-select :global(.mobile-filter-dropdown .kit-select-dropdown__check) {
+    width: 13px;
   }
 
   .mobile-filter-toggle {
@@ -700,7 +682,7 @@
     border-radius: var(--radius-md);
     color: var(--text-secondary);
     background: var(--bg-inset);
-    font-size: var(--font-size-mobile-sm);
+    font-size: var(--font-size-sm);
     font-weight: 750;
   }
 
@@ -751,23 +733,23 @@
     min-width: 0;
   }
 
-  .mobile-activity-card__chips :global(.chip--md) {
+  .mobile-activity-card__chips :global(.kit-chip--sm) {
     min-height: calc(var(--mobile-hit-target) * 0.55);
     padding: 0 var(--mobile-space-xs);
-    font-size: var(--font-size-mobile-xs);
+    font-size: var(--font-size-xs);
   }
 
   .mobile-activity-card__top time {
     margin-left: auto;
     flex-shrink: 0;
     color: var(--text-muted);
-    font-size: var(--font-size-mobile-sm);
+    font-size: var(--font-size-sm);
     font-weight: 700;
   }
 
   .mobile-activity-number {
     color: var(--text-muted);
-    font-size: var(--font-size-mobile-sm);
+    font-size: var(--font-size-sm);
     font-weight: 700;
   }
 
@@ -775,7 +757,7 @@
     display: -webkit-box;
     overflow: hidden;
     color: var(--text-primary);
-    font-size: var(--font-size-mobile-title);
+    font-size: var(--font-size-xl);
     font-weight: 800;
     line-height: 1.22;
     letter-spacing: -0.018em;
@@ -790,7 +772,7 @@
     align-items: baseline;
     gap: var(--mobile-space-xs) var(--mobile-space-sm);
     color: var(--text-muted);
-    font-size: var(--font-size-mobile-sm);
+    font-size: var(--font-size-sm);
     line-height: 1.25;
   }
 
@@ -861,8 +843,8 @@
   }
 
   .mobile-activity-event__dot {
-    width: 0.62rem;
-    height: 0.62rem;
+    width: 8px;
+    height: 8px;
     border-radius: 50%;
     background: var(--accent-blue);
   }
@@ -887,7 +869,7 @@
   .mobile-activity-event__body strong {
     display: block;
     color: var(--text-primary);
-    font-size: var(--font-size-mobile-sm);
+    font-size: var(--font-size-sm);
     font-weight: 750;
   }
 
@@ -895,14 +877,14 @@
     display: block;
     overflow: hidden;
     color: var(--text-muted);
-    font-size: var(--font-size-mobile-xs);
+    font-size: var(--font-size-xs);
     text-overflow: ellipsis;
     white-space: nowrap;
   }
 
   .mobile-activity-event time {
     color: var(--text-muted);
-    font-size: var(--font-size-mobile-xs);
+    font-size: var(--font-size-xs);
     font-weight: 750;
   }
 
@@ -914,7 +896,7 @@
     border-radius: var(--radius-lg);
     color: var(--text-muted);
     background: var(--bg-surface);
-    font-size: var(--font-size-mobile-sm);
+    font-size: var(--font-size-sm);
     text-align: center;
   }
 

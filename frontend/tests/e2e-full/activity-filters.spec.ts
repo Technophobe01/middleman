@@ -15,9 +15,9 @@ async function waitForTable(page: Page): Promise<void> {
 }
 
 async function selectActivityFilterItem(page: Page, label: string): Promise<void> {
-  await page.locator(".filter-btn").click();
-  await page.locator(".filter-dropdown").waitFor({ state: "visible" });
-  await page.locator(".filter-item", { hasText: label }).click();
+  await page.locator(".kit-filter-dropdown__btn").click();
+  await page.locator(".kit-filter-dropdown__panel").waitFor({ state: "visible" });
+  await page.locator(".kit-filter-dropdown__item", { hasText: label }).click();
 }
 
 // Verify every badge in the activity table matches the expected text.
@@ -41,21 +41,21 @@ test.describe("activity feed filters", () => {
   });
 
   test("PR filter shows only PR items", async ({ page }) => {
-    await page.locator(".seg-btn", { hasText: "PRs" }).click();
+    await page.getByRole("radio", { name: "PRs" }).click();
     await expectAllBadges(page, "PR");
   });
 
   test("Issues filter shows only issue items", async ({ page }) => {
-    await page.locator(".seg-btn", { hasText: "Issues" }).click();
+    await page.getByRole("radio", { name: "Issues" }).click();
     await expectAllBadges(page, "Issue");
   });
 
   test("All filter shows both PR and issue items", async ({ page }) => {
     // Start on PRs to change state, then switch to All.
-    await page.locator(".seg-btn", { hasText: "PRs" }).click();
+    await page.getByRole("radio", { name: "PRs" }).click();
     await expectAllBadges(page, "PR");
 
-    await page.locator(".seg-btn", { hasText: "All" }).click();
+    await page.getByRole("radio", { name: "All" }).click();
 
     // Wait for both badge types to appear, proving the unfiltered
     // response has rendered.
@@ -123,7 +123,7 @@ test.describe("activity feed filters", () => {
   });
 
   test("search filters by title", async ({ page }) => {
-    const input = page.locator(".search-input");
+    const input = page.locator(".search-wrap input");
     await input.fill("caching layer");
 
     // Wait for the server-side search to actually apply. Notifications now
@@ -144,7 +144,7 @@ test.describe("activity feed filters", () => {
 
   test("combined: PRs + hide closed/merged shows only open PRs", async ({ page }) => {
     // Click PRs filter and wait for filtered DOM.
-    await page.locator(".seg-btn", { hasText: "PRs" }).click();
+    await page.getByRole("radio", { name: "PRs" }).click();
     await expectAllBadges(page, "PR");
 
     // Enable hide closed/merged (client-side filter).

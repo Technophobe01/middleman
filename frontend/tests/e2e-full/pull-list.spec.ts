@@ -18,7 +18,7 @@ async function selectPullState(page: Page, label: string): Promise<void> {
   }
 
   const dropdown = await openCompactFilterMenu(page);
-  await dropdown.locator(".filter-item", { hasText: label }).first().click();
+  await dropdown.locator(".kit-filter-dropdown__item", { hasText: label }).first().click();
   await page.keyboard.press("Escape");
   await expect(dropdown).toBeHidden();
 }
@@ -32,7 +32,7 @@ async function selectPullGrouping(page: Page, label: string): Promise<void> {
 
   const compactLabel = compactPullGroupingLabel(label);
   const dropdown = await openCompactFilterMenu(page);
-  await dropdown.locator(".filter-item", { hasText: compactLabel }).click();
+  await dropdown.locator(".kit-filter-dropdown__item", { hasText: compactLabel }).click();
   await page.keyboard.press("Escape");
   await expect(dropdown).toBeHidden();
 }
@@ -45,9 +45,9 @@ function compactPullGroupingLabel(label: string): string {
 }
 
 async function openCompactFilterMenu(page: Page) {
-  const dropdown = page.locator(".filter-dropdown");
+  const dropdown = page.locator(".kit-filter-dropdown__panel");
   if (!(await dropdown.isVisible())) {
-    await page.locator(".compact-filter-menu .filter-btn").click();
+    await page.locator(".compact-filter-menu .kit-filter-dropdown__btn").click();
     await expect(dropdown).toBeVisible();
   }
   return dropdown;
@@ -90,9 +90,9 @@ async function expectRepoChipToClipSafely(
     (node as HTMLElement).style.width = "180px";
   });
 
-  await expect(repoChip.locator(".chip__label")).toHaveText(expectedRepoPath);
-  await expect(repoChip.locator(".chip__label")).toHaveCSS("overflow", "hidden");
-  await expect(repoChip.locator(".chip__label")).toHaveCSS("text-overflow", "ellipsis");
+  await expect(repoChip.locator(".kit-chip__label")).toHaveText(expectedRepoPath);
+  await expect(repoChip.locator(".kit-chip__label")).toHaveCSS("overflow", "hidden");
+  await expect(repoChip.locator(".kit-chip__label")).toHaveCSS("text-overflow", "ellipsis");
   await expect(repoChip).toHaveAttribute("title", expectedRepoPath);
   await expect(repoChip).toHaveCSS("justify-content", "flex-start");
 
@@ -104,7 +104,7 @@ async function expectRepoChipToClipSafely(
     expect(chipBox.x + chipBox.width).toBeLessThanOrEqual(itemBox.x + itemBox.width + 1);
   }
 
-  const labelOverflow = await repoChip.locator(".chip__label").evaluate((node) => ({
+  const labelOverflow = await repoChip.locator(".kit-chip__label").evaluate((node) => ({
     clientWidth: (node as HTMLElement).clientWidth,
     scrollWidth: (node as HTMLElement).scrollWidth,
   }));
@@ -147,7 +147,7 @@ test.describe("PR list view", () => {
   });
 
   test("search filters PRs by title", async ({ page }) => {
-    const input = page.locator(".search-input");
+    const input = page.locator(".search-wrap input");
     await input.fill("caching");
 
     // Wait for the count badge to reflect filtered results. The
@@ -197,7 +197,7 @@ test.describe("PR list view", () => {
     const finalScroll = await pullDetail.evaluate((el) => el.scrollTop);
     expect(finalScroll).toBeGreaterThan(0);
 
-    const detailArea = page.locator(".main-area");
+    const detailArea = page.locator(".kit-sidebar-layout__main");
     const contentHeader = page.locator(".pull-detail .detail-header");
     const areaBox = await detailArea.boundingBox();
     const detailBox = await pullDetail.boundingBox();

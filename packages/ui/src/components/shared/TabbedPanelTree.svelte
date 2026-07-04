@@ -645,6 +645,7 @@
     border: 0;
     padding: 0;
     background: var(--border-muted);
+    /* kit-ui-check-ignore: recursive split-tree sash (n-ary, orientation-switching), not a two-pane sidebar handle */
     cursor: col-resize;
     flex-shrink: 0;
   }
@@ -768,7 +769,7 @@
     opacity: 0.34;
     transform: translateY(-4px) scale(0.96);
     background: color-mix(in srgb, var(--accent-blue) 10%, var(--bg-surface));
-    box-shadow: 0 8px 22px rgb(0 0 0 / 18%);
+    box-shadow: var(--shadow-lg);
   }
 
   .tabbed-panel-tab.sort-target:not(.dragging) {

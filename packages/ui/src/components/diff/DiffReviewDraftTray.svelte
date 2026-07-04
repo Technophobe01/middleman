@@ -1,10 +1,10 @@
 <script lang="ts">
+  import { Button, IconButton } from "@kenn-io/kit-ui";
   import SendIcon from "@lucide/svelte/icons/send";
   import TrashIcon from "@lucide/svelte/icons/trash-2";
   import { getStores } from "../../context.js";
   import type { DiffReviewDraftComment } from "../../stores/diff-review-draft.svelte.js";
-  import ActionButton from "../shared/ActionButton.svelte";
-  import SelectDropdown from "../shared/SelectDropdown.svelte";
+    import { SelectDropdown } from "@kenn-io/kit-ui";
   import DiffReviewDraftTrayItem from "./DiffReviewDraftTrayItem.svelte";
 
   interface Props {
@@ -61,16 +61,15 @@
   <section class="draft-tray" aria-label="Draft review comments">
     <div class="tray-header">
       <strong>{comments.length} draft {comments.length === 1 ? "comment" : "comments"}</strong>
-      <ActionButton
-        class="icon-btn"
-        title="Discard review draft"
-        ariaLabel="Discard review draft"
+      <IconButton
         size="sm"
+        tone="danger"
+        ariaLabel="Discard review draft"
         onclick={() => void diffReviewDraft.discard()}
         disabled={draftActionDisabled}
       >
         <TrashIcon size={14} />
-      </ActionButton>
+      </IconButton>
     </div>
     <div class="draft-list">
       {#each comments as comment (comment.id)}
@@ -103,7 +102,7 @@
         title="Review action"
         disabled={submitting || supportedActions.length === 0}
       />
-      <ActionButton
+      <Button
         class="publish-btn"
         tone="info"
         surface="solid"
@@ -114,7 +113,7 @@
       >
         <SendIcon size={14} />
         {submitting ? "Publishing..." : "Publish review"}
-      </ActionButton>
+      </Button>
     </div>
   </section>
 {/if}
@@ -127,6 +126,7 @@
     padding: 10px 12px;
     border-top: 1px solid var(--border-default);
     background: var(--bg-surface);
+    /* kit-ui-check-ignore: upward tray shadow; kit shadow tokens only cast downward */
     box-shadow: 0 -8px 20px rgb(0 0 0 / 0.12);
   }
 
@@ -175,20 +175,13 @@
     min-width: 150px;
   }
 
-  :global(.review-action-select .select-dropdown-list) {
-    top: auto;
-    bottom: 100%;
-    margin-top: 0;
-    margin-bottom: 4px;
-  }
-
-  :global(.review-action-select .select-dropdown-trigger),
-  :global(.publish-btn.action-button) {
+  :global(.review-action-select .kit-select-dropdown__trigger),
+  :global(.publish-btn.kit-button) {
     min-height: 28px;
     font-size: var(--font-size-sm);
   }
 
-  :global(.publish-btn.action-button) {
+  :global(.publish-btn.kit-button) {
     border-color: var(--accent-blue);
     background: var(--accent-blue);
     color: var(--bg-surface);
@@ -200,7 +193,7 @@
     font-size: var(--font-size-sm);
   }
 
-  @media (max-width: 680px) {
+  @media (max-width: 760px) {
     .publish-row {
       align-items: stretch;
       flex-wrap: wrap;
@@ -210,7 +203,7 @@
       flex: 1 1 150px;
     }
 
-    :global(.publish-btn.action-button) {
+    :global(.publish-btn.kit-button) {
       flex: 1 1 170px;
     }
   }

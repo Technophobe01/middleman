@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { ActionButton } from "@middleman/ui";
+  import { Button } from "@middleman/ui";
   import { renderMarkdown, renderMarkdownSync } from "@middleman/ui/utils/markdown";
 
   import type {
@@ -187,7 +187,7 @@
         onkeydown={handleRelatedKeydown}
       />
     </label>
-    <ActionButton
+    <Button
       type="submit"
       surface="outline"
       size="sm"
@@ -213,7 +213,7 @@
       {api}
       placeholder="Add a comment..."
     />
-    <ActionButton
+    <Button
       type="submit"
       tone="info"
       surface="solid"
@@ -306,7 +306,7 @@
 
   .link-list {
     display: grid;
-    gap: 3px;
+    gap: var(--space-1);
   }
 
   .link-row {
@@ -361,7 +361,7 @@
     min-width: 0;
     flex: 1;
     display: grid;
-    gap: 3px;
+    gap: var(--space-1);
     color: var(--text-muted);
     font-size: var(--font-size-xs);
     font-weight: 650;

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { IconButton } from "@kenn-io/kit-ui";
   import { onDestroy, onMount, tick } from "svelte";
   import CheckIcon from "@lucide/svelte/icons/check";
   import PencilIcon from "@lucide/svelte/icons/pencil";
@@ -7,7 +8,6 @@
     DiffReviewDraftComment,
     DiffReviewDraftCommentEditState,
   } from "../../stores/diff-review-draft.svelte.js";
-  import ActionButton from "../shared/ActionButton.svelte";
 
   interface Props {
     comment: DiffReviewDraftComment;
@@ -168,47 +168,41 @@
   </div>
   <div class="draft-actions">
     {#if editing}
-      <ActionButton
-        class="icon-btn"
-        title="Save draft comment"
-        ariaLabel="Save draft comment"
+      <IconButton
         size="sm"
+        tone="success"
+        ariaLabel="Save draft comment"
         onclick={() => void saveEdit()}
         disabled={saveDisabled}
       >
         <CheckIcon size={13} />
-      </ActionButton>
-      <ActionButton
-        class="icon-btn"
-        title="Cancel editing draft comment"
-        ariaLabel="Cancel editing draft comment"
+      </IconButton>
+      <IconButton
         size="sm"
+        ariaLabel="Cancel editing draft comment"
         onclick={cancelEdit}
         disabled={editDisabled}
       >
         <XIcon size={13} />
-      </ActionButton>
+      </IconButton>
     {:else}
-      <ActionButton
-        class="icon-btn"
-        title="Edit draft comment"
-        ariaLabel="Edit draft comment"
+      <IconButton
         size="sm"
+        ariaLabel="Edit draft comment"
         onclick={beginEdit}
         disabled={disabled}
       >
         <PencilIcon size={13} />
-      </ActionButton>
-      <ActionButton
-        class="icon-btn"
-        title="Delete draft comment"
-        ariaLabel="Delete draft comment"
+      </IconButton>
+      <IconButton
         size="sm"
+        tone="danger"
+        ariaLabel="Delete draft comment"
         onclick={() => ondelete(comment.id)}
         disabled={disabled}
       >
         <XIcon size={13} />
-      </ActionButton>
+      </IconButton>
     {/if}
   </div>
 </div>
@@ -218,7 +212,7 @@
     display: grid;
     grid-template-columns: minmax(0, 1fr) auto;
     align-items: start;
-    gap: 10px;
+    gap: var(--space-4);
     min-width: 0;
     padding: 8px 8px 8px 10px;
     border: 1px solid var(--border-muted);
@@ -228,7 +222,7 @@
 
   .draft-content {
     display: grid;
-    gap: 3px;
+    gap: var(--space-1);
     min-width: 0;
   }
 
@@ -307,12 +301,5 @@
   .draft-actions {
     display: flex;
     gap: 4px;
-  }
-
-  :global(.icon-btn.action-button) {
-    width: 26px;
-    height: 26px;
-    min-height: 26px;
-    padding: 0;
   }
 </style>

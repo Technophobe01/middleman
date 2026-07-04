@@ -31,7 +31,7 @@ async function waitForPRList(page: Page): Promise<void> {
 async function sidebarWidth(page: Page): Promise<number> {
   return Math.round(
     await page
-      .locator(".sidebar")
+      .locator(".kit-sidebar-layout__sidebar")
       .first()
       .evaluate((node) => node.getBoundingClientRect().width),
   );
@@ -224,7 +224,7 @@ test.describe("embedded config", () => {
       });
 
       await page.goto(`${server.info.base_url}/workspaces/embed/project/${encodeURIComponent(project.id)}?host=hub`);
-      await expect(page.locator("header.app-header")).toHaveCount(0);
+      await expect(page.locator("header.app-top-bar")).toHaveCount(0);
       await expect(page.getByText("Fleet Project")).toBeVisible();
 
       await page

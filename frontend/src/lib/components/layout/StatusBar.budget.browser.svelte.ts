@@ -123,7 +123,7 @@ describe("budget display", () => {
   beforeEach(async () => {
     // The status bar lives in the desktop app shell; size the real Chromium
     // viewport to a desktop width so the standard layout (and the budget area
-    // in status-right) renders deterministically.
+    // in the status bar right section) renders deterministically.
     await page.viewport(1280, 900);
   });
 
@@ -166,6 +166,17 @@ describe("budget display", () => {
     expect(eagerLabel).not.toBeNull();
     expect(eagerValue).not.toBeNull();
     expect(Math.abs(eagerLabel!.getBoundingClientRect().top - eagerValue!.getBoundingClientRect().top)).toBeLessThan(2);
+
+    // The bar runs with overflow="visible" so the popover's absolute
+    // bottom-anchored panel can open fully above the 24px bar rather than
+    // being cut to the section's height.
+    const popoverRect = popover.getBoundingClientRect();
+    const barRect = document.querySelector(".kit-status-bar")!.getBoundingClientRect();
+    expect(popoverRect.height).toBeGreaterThan(100);
+    // Subpixel tolerance: with the real app.css tokens loaded the inline
+    // wrapper's box can sit a fraction of a px off the bar edge; the
+    // invariant is that the panel opens above the bar, not into it.
+    expect(popoverRect.bottom).toBeLessThanOrEqual(barRect.top + 1);
   });
 
   it("marks sync budget spend that exceeds the configured limit", async () => {
@@ -192,23 +203,22 @@ describe("budget display", () => {
     expect(popover.textContent).not.toContain("eager refresh deferred");
   });
 
-  it("popover dismisses on Escape", async () => {
+  it("popover dismisses on Escape and restores focus to the trigger", async () => {
     const bars = await mountStatusBar();
     await openPopover(bars);
 
     pressKey("Escape", {}, document);
     await vi.waitFor(() => expect(document.querySelector(".budget-popover")).toBeNull(), WAIT);
+    expect(document.activeElement).toBe(bars);
   });
 
-  it("popover dismisses on click outside", async () => {
+  it("popover dismisses on press outside", async () => {
     const bars = await mountStatusBar();
     await openPopover(bars);
 
-    // Popover attaches its outside-click listener via setTimeout(0) to
-    // avoid catching the opening click. Let that timer run before
-    // clicking outside.
-    await new Promise((resolve) => setTimeout(resolve, 5));
-
+    // kit's dismissable helper listens for mousedown outside the wrapper;
+    // the opening interaction happened before mount, so no settling delay
+    // is needed.
     await page.elementLocator(document.querySelector<HTMLElement>(".app-main")!).click();
     await vi.waitFor(() => expect(document.querySelector(".budget-popover")).toBeNull(), WAIT);
   });

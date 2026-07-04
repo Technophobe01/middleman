@@ -2,8 +2,8 @@
   import type { PullRequest } from "../../api/types.js";
   import type { Action } from "../../types.js";
   import { getStores, getHostState } from "../../context.js";
-  import { timeAgo } from "../../utils/time.js";
-  import { repoColor } from "../../utils/repo-color.js";
+  import { formatRelativeTime } from "@kenn-io/kit-ui";
+  import { hashColor } from "@kenn-io/kit-ui";
   import { parseCIChecks, bucketCIChecks, safeDiagnosticText } from "../../utils/ci-buckets.js";
   import {
     warnOnUnknownConclusions,
@@ -13,8 +13,8 @@
   import CircleAlertIcon from "@lucide/svelte/icons/circle-alert";
   import CircleCheckBigIcon from "@lucide/svelte/icons/circle-check-big";
   import OctagonXIcon from "@lucide/svelte/icons/octagon-x";
-  import Chip from "../shared/Chip.svelte";
-  import GitHubLabels from "../shared/GitHubLabels.svelte";
+  import { Chip } from "@kenn-io/kit-ui";
+  import LabelRow from "../shared/LabelRow.svelte";
   import WorkspaceIndicator from "../shared/WorkspaceIndicator.svelte";
 
   const { pulls } = getStores();
@@ -73,7 +73,7 @@
   const statusLabel = $derived(kanbanLabels[pr.KanbanStatus] ?? pr.KanbanStatus);
   const statusClass = $derived(`status-chip--${pr.KanbanStatus.replace("_", "-")}`);
   const showStatus = $derived(pr.State !== "closed" && pr.State !== "merged");
-  const ago = $derived(timeAgo(pr.LastActivityAt));
+  const ago = $derived(formatRelativeTime(pr.LastActivityAt));
   const hasWorktree = $derived(
     (pr.worktree_links?.length ?? 0) > 0,
   );
@@ -170,17 +170,15 @@
     <span class="state-dot" style="background: {stateColors[prState]}"></span>
     {pr.Title}
   </p>
-  {#if labels.length > 0}
-    <GitHubLabels {labels} mode="compact" />
-  {/if}
+  <LabelRow {labels} compact />
   {#if showRepo}
     <div class="repo-row">
       <Chip
-        size="sm"
+        size="xs"
         uppercase={false}
         title={repoSlug}
-        class="chip--muted repo-chip"
-        style={`color: ${repoColor(repoSlug)}; background: color-mix(in srgb, ${repoColor(repoSlug)} 15%, transparent);`}
+        tone="muted" class="repo-chip"
+        style={`color: ${hashColor(repoSlug)}; background: color-mix(in srgb, ${hashColor(repoSlug)} 15%, transparent);`}
       >{repoSlug}</Chip>
     </div>
   {/if}
@@ -237,12 +235,12 @@
         >
           <CircleAlertIcon size={10} strokeWidth={2.5} />
         </span>
-        <span class="sr-only">CI unavailable: {safeDiagnosticText(parsed.error)}</span>
+        <span class="kit-sr-only">CI unavailable: {safeDiagnosticText(parsed.error)}</span>
       {:else if bucketed.all.length > 0}
         <span class="ci" aria-hidden="true">
           <CITokenCluster {bucketed} size="compact" pendingStyle="static" />
         </span>
-        <span class="sr-only">{composeAriaLabel(bucketed)}</span>
+        <span class="kit-sr-only">{composeAriaLabel(bucketed)}</span>
       {/if}
       {#if pr.MergeableState === "dirty"}
         <span class="conflict-icon" title="Has merge conflicts">
@@ -275,7 +273,7 @@
         {/if}
       </span>
       {#if showStatus && statusLabel}
-        <Chip size="sm" class={`status-chip ${statusClass}`}>{statusLabel}</Chip>
+        <Chip size="xs" class={`status-chip ${statusClass}`}>{statusLabel}</Chip>
       {/if}
       <span class="time">{ago}</span>
     </span>
@@ -354,7 +352,7 @@
     margin-bottom: 4px;
   }
 
-  :global(.chip.repo-chip) {
+  :global(.kit-chip.repo-chip) {
     flex: 0 1 auto;
     justify-content: flex-start;
     min-width: 0;
@@ -437,26 +435,15 @@
     opacity: 0.85;
   }
 
-  .sr-only {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    padding: 0;
-    overflow: hidden;
-    clip: rect(0, 0, 0, 0);
-    white-space: nowrap;
-    border: 0;
-  }
-
   .pull-item .ci {
     display: inline-flex;
     align-items: center;
     flex-shrink: 0;
-    gap: 5px;
+    gap: var(--space-2);
   }
 
   :global(.mobile-main) .pull-item .ci {
-    gap: 3px;
+    gap: var(--space-1);
   }
 
   .import-btn {
@@ -522,17 +509,17 @@
   }
 
   :global(.mobile-main) .pull-item {
-    min-height: calc(var(--focus-mobile-hit-target, 2.85rem) * 1.65);
-    font-size: var(--font-size-mobile-body);
-    padding: var(--focus-mobile-space-sm, 0.75rem) var(--focus-mobile-space-md, 1rem);
+    min-height: calc(var(--focus-mobile-hit-target, 37px) * 1.65);
+    font-size: var(--font-size-md);
+    padding: var(--focus-mobile-space-sm, 10px) var(--focus-mobile-space-md, 13px);
     border-bottom: thin solid var(--border-muted);
-    border-left-width: 0.25rem;
+    border-left-width: 3px;
   }
 
   :global(.mobile-main) .title {
-    gap: var(--focus-mobile-space-xs, 0.5rem);
-    margin-bottom: var(--focus-mobile-space-xs, 0.5rem);
-    font-size: var(--font-size-mobile-title);
+    gap: var(--focus-mobile-space-xs, 6px);
+    margin-bottom: var(--focus-mobile-space-xs, 6.5px);
+    font-size: var(--font-size-xl);
     line-height: 1.3;
     white-space: normal;
     display: -webkit-box;
@@ -542,36 +529,36 @@
   }
 
   :global(.mobile-main) .state-dot {
-    width: 0.75rem;
-    height: 0.75rem;
+    width: 10px;
+    height: 10px;
   }
 
   :global(.mobile-main) .repo-row {
-    margin-bottom: var(--focus-mobile-space-xs, 0.5rem);
+    margin-bottom: var(--focus-mobile-space-xs, 6.5px);
   }
 
   :global(.mobile-main) .meta-row {
-    gap: var(--focus-mobile-space-sm, 0.75rem);
+    gap: var(--focus-mobile-space-sm, 8px);
   }
 
   :global(.mobile-main) .meta-left,
   :global(.mobile-main) .time,
   :global(.mobile-main) .worktree-name {
-    font-size: var(--font-size-mobile-sm);
+    font-size: var(--font-size-sm);
     line-height: 1.35;
   }
 
   :global(.mobile-main) .meta-right {
-    gap: var(--focus-mobile-space-xs, 0.5rem);
+    gap: var(--focus-mobile-space-xs, 6px);
   }
 
-  :global(.mobile-main) :global(.chip),
+  :global(.mobile-main) :global(.kit-chip),
   :global(.mobile-main) :global(.state-chip),
   :global(.mobile-main) :global(.status-chip) {
-    min-height: calc(var(--focus-mobile-hit-target, 2.85rem) * 0.65);
-    padding: 0.2rem var(--focus-mobile-space-xs, 0.5rem);
-    border-radius: 999rem;
-    font-size: var(--font-size-mobile-xs);
+    min-height: calc(var(--focus-mobile-hit-target, 37px) * 0.65);
+    padding: 2.5px var(--focus-mobile-space-xs, 6.5px);
+    border-radius: 999px;
+    font-size: var(--font-size-xs);
     line-height: 1.25;
   }
 </style>

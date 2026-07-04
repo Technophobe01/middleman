@@ -139,6 +139,7 @@
     const focusable = (): HTMLElement[] =>
       Array.from(
         dialogEl!.querySelectorAll<HTMLElement>(
+          // kit-ui-check-ignore: palette-style actions move focus as their outcome; kit trapFocus restores pre-open focus on teardown, undoing the selected action
           "input, button, [tabindex]:not([tabindex='-1'])",
         ),
       ).filter((e) => !e.hasAttribute("disabled"));
@@ -249,9 +250,10 @@
 <style>
   .cheatsheet-backdrop {
     position: fixed;
+    /* kit-ui-check-ignore: keyboard cheatsheet is a palette-style surface with its own key handling and layout, not a kit Modal dialog */
     inset: 0;
-    background: rgba(0, 0, 0, 0.55);
-    z-index: 100;
+    background: var(--overlay-bg);
+    z-index: 90;
   }
 
   .cheatsheet {
@@ -269,7 +271,7 @@
     border: 1px solid var(--border-default);
     border-radius: 10px;
     box-shadow: var(--shadow-lg);
-    z-index: 101;
+    z-index: 91;
   }
 
   .cheatsheet-filter {

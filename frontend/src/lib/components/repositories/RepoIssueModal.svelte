@@ -1,10 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import {
-    ActionButton,
-    Chip,
-    CommentEditor,
-  } from "@middleman/ui";
+  import { Button, Chip,
+    CommentEditor, } from "@middleman/ui";
   import { pushModalFrame } from "@middleman/ui/stores/keyboard/modal-stack";
   import {
     repoKey,
@@ -87,14 +84,14 @@
         <div class="issue-modal__title-group">
           <h2 id={titleId}>New issue in {key}</h2>
           {#if showPlatformHost}
-            <Chip size="sm" class="chip--muted" uppercase={false}>
+            <Chip size="xs" tone="muted" uppercase={false}>
               {summary.platform_host}
             </Chip>
           {/if}
         </div>
-        <ActionButton size="sm" type="button" onclick={oncancel}>
+        <Button size="sm" type="button" onclick={oncancel}>
           Cancel
-        </ActionButton>
+        </Button>
       </header>
 
       <div class="issue-modal__body">
@@ -133,14 +130,14 @@
       </div>
 
       <footer class="issue-modal__footer">
-        <ActionButton
+        <Button
           type="submit"
           tone="info"
           surface="soft"
           disabled={submitting}
         >
           {submitting ? "Creating..." : "Create issue"}
-        </ActionButton>
+        </Button>
       </footer>
     </form>
   </div>
@@ -149,6 +146,7 @@
 <style>
   .issue-modal__backdrop {
     position: fixed;
+    /* kit-ui-check-ignore: bottom-sheet placement on narrow viewports (media query below) — kit Modal only centers; revisit if kit grows a placement prop */
     inset: 0;
     z-index: 40;
     display: grid;
@@ -238,7 +236,7 @@
     z-index: 60;
   }
 
-  @media (max-width: 560px) {
+  @media (max-width: 640px) {
     .issue-modal__backdrop {
       align-items: end;
       padding: 12px;

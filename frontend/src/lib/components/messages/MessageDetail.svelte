@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { copyToClipboard } from "@kenn-io/kit-ui";
   import { onDestroy } from "svelte";
   import type { MessageDetailData } from "../../api/messages/types";
   import type { MessageLinkInput } from "../../messages/messageLinks";
@@ -81,7 +82,8 @@
   function copyPermalink(): void {
     if (!detail) return;
     const link = permalinkOf(detail.id);
-    void navigator.clipboard.writeText(link).then(() => {
+    void copyToClipboard(link).then((ok) => {
+      if (!ok) return;
       copied = true;
       if (copyTimer !== null) clearTimeout(copyTimer);
       copyTimer = setTimeout(() => {
@@ -228,8 +230,10 @@
 <meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy" content="${csp}">
 <style>
+  /* kit-ui-check-ignore: sandboxed email srcdoc; app theme tokens cannot cascade into the iframe */
   html,body{--font-size-md:0.875em;margin:0;padding:0 16px;font:var(--font-size-md)/1.5 -apple-system,Segoe UI,sans-serif;color:#222;background:#fff;word-wrap:break-word}
   img{max-width:100%;height:auto}
+  /* kit-ui-check-ignore: sandboxed email srcdoc; app theme tokens cannot cascade into the iframe */
   a{color:#0a66c2}
 </style>
 </head><body>${body}</body></html>`;
@@ -403,7 +407,7 @@
         {/if}
       </footer>
       {#if linkedToast}
-        <p class="link-toast" role="status">{linkedToast}</p>
+        <p class="link-status" role="status">{linkedToast}</p>
       {/if}
       {#if saveError}
         <p class="link-error" role="alert">{saveError}</p>
@@ -512,7 +516,7 @@
 
   .header-fields {
     display: grid;
-    gap: 3px 0;
+    gap: var(--space-1) 0;
     margin-bottom: 12px;
   }
 
@@ -556,7 +560,7 @@
   .label-chips {
     display: flex;
     flex-wrap: wrap;
-    gap: 5px;
+    gap: var(--space-2);
   }
 
   .label-chip {
@@ -711,7 +715,7 @@
     cursor: not-allowed;
   }
 
-  .link-toast {
+  .link-status {
     margin: 8px 0 0;
     padding: 6px 10px;
     border-radius: var(--radius-sm, 4px);
@@ -740,7 +744,7 @@
   .pill-list {
     display: flex;
     flex-direction: column;
-    gap: 5px;
+    gap: var(--space-2);
     list-style: none;
     padding: 0;
     margin: 0;
@@ -894,7 +898,7 @@
   .image-banner {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: var(--space-4);
     margin: 0 0 12px;
     padding: 8px 12px;
     border-radius: var(--radius-sm, 4px);

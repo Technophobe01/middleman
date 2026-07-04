@@ -9,7 +9,7 @@
     buildPullRequestRoute,
     type PullRequestRouteRef,
   } from "../../routes.js";
-  import Chip from "../shared/Chip.svelte";
+  import { Chip } from "@kenn-io/kit-ui";
   import type { StoreInstances } from "../../types.js";
 
   const client = getClient();
@@ -272,7 +272,7 @@
 {#if visible && data}
   <div class="stack-status">
     {#if showButton}
-      <Chip
+      <Chip size="sm"
         interactive={true}
         tone="neutral"
         uppercase={false}
@@ -290,12 +290,14 @@
             <span>{downstackBlockerCount}</span>
           </span>
         {/if}
-        <ChevronDownIcon
-          class={["chip-chevron", expanded && "chip-chevron--open"].filter(Boolean).join(" ")}
-          size={12}
-          strokeWidth={2.4}
-          aria-hidden="true"
-        />
+        {#snippet trailing()}
+          <ChevronDownIcon
+            class={["chip-chevron", expanded && "chip-chevron--open"].filter(Boolean).join(" ")}
+            size={12}
+            strokeWidth={2.4}
+            aria-hidden="true"
+          />
+        {/snippet}
       </Chip>
     {/if}
 
@@ -357,12 +359,6 @@
 <style>
   .stack-status {
     display: contents;
-  }
-
-  :global(.stack-status .chip__label) {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
   }
 
   .stack-chip-label {

@@ -1,7 +1,11 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/svelte";
-import { afterEach, describe, expect, it, vi } from "vite-plus/test";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vite-plus/test";
 
 import ConfirmDialog from "./ConfirmDialog.svelte";
+import { installOffsetParentStub, removeOffsetParentStub } from "../../../test/stubOffsetParent.js";
+
+beforeAll(installOffsetParentStub);
+afterAll(removeOffsetParentStub);
 
 afterEach(() => cleanup());
 

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { copyToClipboard } from "@kenn-io/kit-ui";
   import { getStores } from "../../context.js";
   import StatusBadge from "./StatusBadge.svelte";
   import VerdictBadge from "./VerdictBadge.svelte";
@@ -6,6 +7,11 @@
   import ResponseList from "./ResponseList.svelte";
   import LogViewer from "./LogViewer.svelte";
   import PromptViewer from "./PromptViewer.svelte";
+
+  // NOTE: intentionally NOT kit-ui DetailDrawer. This is a resizable bottom
+  // dock (height: 50vh; resize: vertical; accent border-top) that lives
+  // inline in the reviews layout, not a floating dimmed right side-sheet.
+  // The kit-ui-check-ignore markers below record that deliberate choice.
 
   interface Props {
     activeTab?: "review" | "log" | "prompt";
@@ -42,7 +48,7 @@
   async function copyOutput(): Promise<void> {
     const output =
       stores.roborevReview?.getOutput() ?? "";
-    await navigator.clipboard.writeText(output);
+    await copyToClipboard(output);
   }
 
   function handleCloseReview(): void {
@@ -84,9 +90,11 @@
 </script>
 
 {#if isOpen}
+  <!-- kit-ui-check-ignore: resizable inline bottom dock, not a kit side-sheet -->
   <div class="drawer">
+    <!-- kit-ui-check-ignore: resizable inline bottom dock, not a kit side-sheet -->
     <div class="drawer-header">
-      <div class="header-left">
+      <div class="header-start">
         {#if selectedJob}
           <span class="job-id">
             #{selectedJob.id}
@@ -173,6 +181,7 @@
       </button>
     </div>
 
+    <!-- kit-ui-check-ignore: resizable inline bottom dock, not a kit side-sheet -->
     <div class="drawer-body">
       {#if activeTab === "review"}
         <ReviewContent />
@@ -191,6 +200,7 @@
       {/if}
     </div>
 
+    <!-- kit-ui-check-ignore: resizable inline bottom dock, not a kit side-sheet -->
     <div class="drawer-footer">
       <div class="footer-actions">
         {#if hasReview}
@@ -238,6 +248,7 @@
 {/if}
 
 <style>
+  /* kit-ui-check-ignore: resizable inline bottom dock, not a kit side-sheet */
   .drawer {
     display: flex;
     flex-direction: column;
@@ -250,6 +261,7 @@
     overflow: hidden;
   }
 
+  /* kit-ui-check-ignore: resizable inline bottom dock, not a kit side-sheet */
   .drawer-header {
     display: flex;
     align-items: center;
@@ -261,7 +273,7 @@
     min-height: 36px;
   }
 
-  .header-left {
+  .header-start {
     display: flex;
     align-items: center;
     gap: 8px;
@@ -362,6 +374,7 @@
     border-bottom-color: var(--accent-blue);
   }
 
+  /* kit-ui-check-ignore: resizable inline bottom dock, not a kit side-sheet */
   .drawer-body {
     flex: 1;
     overflow-y: auto;
@@ -374,6 +387,7 @@
     border-top: 1px solid var(--border-muted);
   }
 
+  /* kit-ui-check-ignore: resizable inline bottom dock, not a kit side-sheet */
   .drawer-footer {
     display: flex;
     align-items: center;

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { SearchInput } from "@kenn-io/kit-ui";
   import CheckIcon from "@lucide/svelte/icons/check";
   import EraserIcon from "@lucide/svelte/icons/eraser";
   import XIcon from "@lucide/svelte/icons/x";
@@ -43,12 +43,7 @@
   }: Props = $props();
 
   let query = $state("");
-  let filterInput: HTMLInputElement | undefined = $state();
   let failedAvatarKeys = $state<string[]>([]);
-
-  onMount(() => {
-    if (autofocusFilter) filterInput?.focus();
-  });
 
   const selectedNames = $derived(new Set(selected.map((name) => name.toLowerCase())));
   // Selected users always appear in the list even when they are not in
@@ -96,7 +91,7 @@
   }
 </script>
 
-<div class="user-picker" role="dialog" aria-label={title}>
+<div class="user-picker kit-popover-card" role="dialog" aria-label={title}>
   <div class="user-picker__header">
     <div class="user-picker__title">
       <strong>{title}</strong>
@@ -126,17 +121,17 @@
     </div>
   </div>
 
-  <label class="user-picker__filter">
-    <span class="user-picker__sr-only">Filter users</span>
-    <input
-      bind:this={filterInput}
+  <div class="user-picker__filter">
+    <SearchInput
       bind:value={query}
-      oninput={(event) => onquery?.(event.currentTarget.value.trim())}
-      type="search"
+      size="sm"
+      block
+      autofocus={autofocusFilter}
       placeholder="Filter users"
-      aria-label="Filter users"
+      ariaLabel="Filter users"
+      oninput={(value) => onquery?.(value.trim())}
     />
-  </label>
+  </div>
 
   {#if error}
     <div class="user-picker__error" role="alert">{error}</div>
@@ -210,10 +205,6 @@
     display: flex;
     flex-direction: column;
     overflow: hidden;
-    border: 1px solid var(--border-default);
-    border-radius: var(--radius-md);
-    background: var(--bg-surface);
-    box-shadow: var(--shadow-lg);
     color: var(--text-primary);
   }
 
@@ -278,26 +269,6 @@
     display: block;
     padding: 6px;
     border-bottom: 1px solid var(--border-muted);
-    color: var(--text-secondary);
-    font-size: var(--font-size-sm);
-  }
-
-  .user-picker__filter input {
-    width: 100%;
-    border: 1px solid var(--border-default);
-    border-radius: var(--radius-md);
-    background: var(--bg-inset);
-    color: var(--text-primary);
-    padding: 3px 8px;
-    font: inherit;
-    font-size: var(--font-size-sm);
-    min-height: 26px;
-    outline: none;
-  }
-
-  .user-picker__filter input:focus {
-    border-color: var(--accent-blue);
-    box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent-blue) 18%, transparent);
   }
 
   .user-picker__error {
@@ -397,15 +368,4 @@
     font-size: var(--font-size-sm);
   }
 
-  .user-picker__sr-only {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    padding: 0;
-    margin: -1px;
-    overflow: hidden;
-    clip: rect(0, 0, 0, 0);
-    white-space: nowrap;
-    border: 0;
-  }
 </style>

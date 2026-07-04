@@ -4,7 +4,7 @@
   import FolderOpen from "@lucide/svelte/icons/folder-open";
   import RefreshCw from "@lucide/svelte/icons/refresh-cw";
   import { SelectDropdown } from "@middleman/ui";
-  import Modal from "./DocsModal.svelte";
+  import Modal from "../shared/Modal.svelte";
   import type { DocsAPI } from "../../api/docs/api";
   import type { BrowseEntry, DocsAPIError, Folder } from "../../api/docs/types";
   import { getKataDaemonRoster } from "../../stores/active-kata-daemon.svelte";
@@ -219,6 +219,7 @@
         </button>
       </div>
 
+      <!-- kit-ui-check-ignore: directory browser (navigate-into-subfolder rows inside a dialog), not a dropdown -->
       <ul class="picker-list" role="listbox" aria-label="Subfolders">
         {#if browseError}
           <li class="picker-msg error">{browseError}</li>
@@ -357,12 +358,12 @@
     border-color: var(--border-focus);
   }
 
-  .modal-field :global(.select-dropdown) {
+  .modal-field :global(.kit-select-dropdown) {
     width: 100%;
     min-width: 0;
   }
 
-  .modal-field :global(.select-dropdown-trigger) {
+  .modal-field :global(.kit-select-dropdown__trigger) {
     height: 32px;
     font-size: var(--font-size-sm);
     font-weight: 400;

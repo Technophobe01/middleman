@@ -1,6 +1,6 @@
 <script lang="ts">
   import { getStores } from "../../context.js";
-  import { timeAgo } from "../../utils/time.js";
+  import { formatRelativeTime } from "@kenn-io/kit-ui";
   const stores = getStores();
   let commentText = $state("");
   let submitting = $state(false);
@@ -49,7 +49,7 @@
                 class="timestamp"
                 title={resp.created_at}
               >
-                {timeAgo(resp.created_at)}
+                {formatRelativeTime(resp.created_at)}
               </span>
             </div>
             <div class="response-body">
@@ -176,7 +176,7 @@
     border: 1px solid var(--border-default);
     border-radius: var(--radius-sm);
     background: var(--accent-blue);
-    color: #fff;
+    color: var(--text-on-accent);
     font-size: var(--font-size-sm);
     font-weight: 500;
     cursor: pointer;

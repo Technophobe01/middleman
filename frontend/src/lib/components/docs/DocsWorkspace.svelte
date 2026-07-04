@@ -26,7 +26,7 @@
   import DocMarkdownView, { type DocMarkdownState, type HeadingEntry } from "./DocMarkdownView.svelte";
   import DocOutline from "./DocOutline.svelte";
   import FolderTree from "./FolderTree.svelte";
-  import Modal from "./DocsModal.svelte";
+  import Modal from "../shared/Modal.svelte";
   import AddFolderDialog from "./AddFolderDialog.svelte";
   import { buildIssueCompletionSource } from "./issueCompletion";
   import { buildDocsIssueCompletionOptions } from "./docsIssueCompletionOptions";
@@ -980,7 +980,8 @@
         {/if}
       {/if}
       {#if folderMenuOpen}
-        <ul class="folder-menu" role="listbox" aria-label="Folders">
+        <!-- kit-ui-check-ignore: folder switcher renders error/empty message rows kit SelectDropdown lacks (kit-ui#ry18) -->
+        <ul class="folder-menu kit-popover-card" role="listbox" aria-label="Folders">
           {#if foldersError}
             <li class="folder-menu-msg error">{foldersError}</li>
           {:else if folders.length === 0}
@@ -1174,7 +1175,7 @@
                 <MoreHorizontal size={14} strokeWidth={2} />
               </button>
               {#if fileMenuOpen}
-                <ul class="file-menu" role="menu" aria-label="File actions">
+                <ul class="file-menu kit-popover-card" role="menu" aria-label="File actions">
                   <li>
                     <button
                       type="button"
@@ -1250,6 +1251,7 @@
 <Modal
   open={newFileOpen}
   title="New file"
+  width={520}
   onClose={() => (newFileOpen = false)}
 >
   <form
@@ -1286,6 +1288,7 @@
 <Modal
   open={renameOpen}
   title="Rename file"
+  width={520}
   onClose={() => (renameOpen = false)}
 >
   <form
@@ -1321,6 +1324,7 @@
 <Modal
   open={deleteOpen}
   title="Delete file"
+  width={520}
   onClose={() => (deleteOpen = false)}
 >
   <p class="modal-body-text">
@@ -1362,12 +1366,13 @@
 {/if}
 
 {#if publishSuccess}
-  <p class="publish-success" role="status">{publishSuccess}</p>
+  <p class="publish-success kit-popover-card" role="status">{publishSuccess}</p>
 {/if}
 
 <Modal
   open={renameFolderTarget !== null}
   title="Rename folder"
+  width={520}
   onClose={() => (renameFolderTarget = null)}
 >
   <form
@@ -1405,6 +1410,7 @@
 <Modal
   open={removeFolderTarget !== null}
   title="Remove folder"
+  width={520}
   onClose={() => (removeFolderTarget = null)}
 >
   <p class="modal-body-text">
@@ -1541,9 +1547,6 @@
     margin: 0;
     padding: 4px;
     background: var(--bg-elevated);
-    border: 1px solid var(--border-default);
-    border-radius: var(--radius-md);
-    box-shadow: var(--shadow-lg);
     max-height: 320px;
     overflow: auto;
   }
@@ -1711,7 +1714,7 @@
   .inline-rename-error {
     margin: 6px 8px 4px;
     padding: 6px 8px;
-    background: rgba(193, 74, 60, 0.08);
+    background: color-mix(in srgb, var(--accent-red) 8%, transparent);
     border: 1px solid var(--accent-red, #c14a3c);
     border-radius: var(--radius-sm);
     color: var(--accent-red, #c14a3c);
@@ -1857,9 +1860,6 @@
     padding: 4px;
     min-width: 160px;
     background: var(--bg-elevated);
-    border: 1px solid var(--border-default);
-    border-radius: var(--radius-md);
-    box-shadow: var(--shadow-lg);
   }
 
   .file-menu-item {
@@ -1886,7 +1886,7 @@
   .modal-form {
     display: flex;
     flex-direction: column;
-    gap: 10px;
+    gap: var(--space-4);
   }
 
   .modal-field {
@@ -1922,7 +1922,7 @@
     margin: 0;
     padding: 6px 8px;
     border-radius: var(--radius-sm);
-    background: rgba(193, 74, 60, 0.1);
+    background: color-mix(in srgb, var(--accent-red) 10%, transparent);
     color: var(--accent-red, #c14a3c);
     font-size: var(--font-size-sm);
   }
@@ -1956,12 +1956,9 @@
     right: 16px;
     z-index: 50;
     padding: 8px 14px;
-    border-radius: var(--radius-md);
     background: var(--bg-elevated);
-    border: 1px solid var(--border-default);
     color: var(--text-primary);
     font-size: var(--font-size-sm);
-    box-shadow: var(--shadow-lg);
   }
 
   .doc-scroll {
@@ -1996,11 +1993,12 @@
     display: flex;
     flex-direction: column;
     align-items: center;
-    gap: 10px;
+    gap: var(--space-4);
     color: var(--text-muted);
     font-size: var(--font-size-sm);
   }
 
+  /* kit-ui-check-ignore: two-pane docs threshold above the shared ladder (900 is the widest step) */
   @media (max-width: 1100px) {
     .doc-pane {
       grid-template-columns: minmax(0, 1fr);

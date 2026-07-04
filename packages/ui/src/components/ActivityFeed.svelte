@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { EmptyState, SearchInput, SegmentedControl, Spinner } from "@kenn-io/kit-ui";
   import { onMount, onDestroy } from "svelte";
   import type { ActivityItem } from "../api/types.js";
   import {
@@ -9,7 +10,7 @@
   } from "../stores/activity.svelte.js";
   import { getStores, getNavigate, getSidebar } from "../context.js";
   import ActivityThreaded from "./ActivityThreaded.svelte";
-  import FilterDropdown from "./shared/FilterDropdown.svelte";
+  import { FilterDropdown } from "@kenn-io/kit-ui";
   import {
     isDefaultBranchActivity,
     isDefaultBranchCommitActivity,
@@ -28,8 +29,8 @@
     createRepoLabelFormatter,
     type RepoLabelIdentity,
   } from "../utils/repo-label.js";
-  import { repoColor } from "../utils/repo-color.js";
-  import Chip from "./shared/Chip.svelte";
+  import { hashColor } from "@kenn-io/kit-ui";
+  import { Chip, type ChipTone } from "@kenn-io/kit-ui";
   import ItemKindChip from "./shared/ItemKindChip.svelte";
   import ItemStateChip from "./shared/ItemStateChip.svelte";
   import WorkspaceIndicator from "./shared/WorkspaceIndicator.svelte";
@@ -182,8 +183,7 @@
     { value: "90d", label: "90d" },
   ];
 
-  function handleSearchInput(e: Event): void {
-    const val = (e.target as HTMLInputElement).value;
+  function handleSearchInput(val: string): void {
     searchInput = val;
     if (debounceTimer) clearTimeout(debounceTimer);
     debounceTimer = setTimeout(() => {
@@ -464,15 +464,17 @@
     }
   }
 
+  function eventChipTone(type: string): ChipTone {
+    return type === "comment" ? "warning"
+      : type === "review" ? "success"
+      : type === "commit" || type === "default_branch_commit" ? "workspace"
+      : type === "force_push" || type === "default_branch_force_push" ? "danger"
+      : type === "notification" ? "info"
+      : "muted";
+  }
+
   function eventChipClass(type: string): string {
-    const toneClass =
-      type === "comment" ? "chip--amber"
-      : type === "review" ? "chip--green"
-      : type === "commit" || type === "default_branch_commit" ? "chip--teal"
-      : type === "force_push" || type === "default_branch_force_push" ? "chip--red"
-      : type === "notification" ? "chip--blue"
-      : "chip--muted";
-    return `evt-label ${eventClass(type)} ${toneClass}`;
+    return `evt-label ${eventClass(type)}`;
   }
 
   function relativeTime(iso: string): string {
@@ -559,11 +561,17 @@
 >
   <div class="controls-bar">
     <div class="filter-group">
-      <div class="segmented-control">
-        <button class="seg-btn" class:active={activity.getItemFilter() === "all"} onclick={() => handleItemFilterChange("all")}>All</button>
-        <button class="seg-btn" class:active={activity.getItemFilter() === "prs"} onclick={() => handleItemFilterChange("prs")}>PRs</button>
-        <button class="seg-btn" class:active={activity.getItemFilter() === "issues"} onclick={() => handleItemFilterChange("issues")}>Issues</button>
-      </div>
+      <SegmentedControl
+        options={[
+          { value: "all", label: "All" },
+          { value: "prs", label: "PRs" },
+          { value: "issues", label: "Issues" },
+        ]}
+        value={activity.getItemFilter()}
+        onchange={(v) => handleItemFilterChange(v as "all" | "prs" | "issues")}
+        ariaLabel="Item filter"
+        block={compact}
+      />
     </div>
 
     <FilterDropdown
@@ -602,13 +610,16 @@
       </button>
     {/if}
 
-    <input
-      class="search-input"
-      type="text"
-      placeholder="Search..."
-      value={searchInput}
-      oninput={handleSearchInput}
-    />
+    <div class="search-wrap">
+      <SearchInput
+        bind:value={searchInput}
+        size="sm"
+        block
+        placeholder="Search..."
+        ariaLabel="Search activity"
+        oninput={handleSearchInput}
+      />
+    </div>
   </div>
 
   {#if activity.getActivityError()}
@@ -617,13 +628,18 @@
 
   {#if settings.isSettingsLoaded() && !settings.hasConfiguredRepos()}
     <div class="table-container">
-      <div class="empty-state">No repositories configured.<br />
+      <EmptyState title="No repositories configured.">
         {#if !isEmbedded()}<button class="settings-link" onclick={() => navigate("/settings")}>Add one in Settings</button>{/if}
-      </div>
+      </EmptyState>
     </div>
   {:else if activity.getViewMode() === "threaded"}
     {#if displayItems.length === 0 && activity.isActivityLoading()}
-      <div class="table-container"><div class="empty-state">Loading...</div></div>
+      <div class="table-container">
+        <div class="loading-placeholder">
+          <Spinner size={14} label="Loading activity" />
+          Loading...
+        </div>
+      </div>
     {:else}
       <ActivityThreaded
         items={displayItems}
@@ -648,7 +664,7 @@
               >
                 <span class="compact-row-top">
                   {#if isDefaultBranchActivity(row.representative)}
-                    <Chip size="sm" uppercase={false} class="chip--muted branch-chip">Branch</Chip>
+                    <Chip size="xs" tone="muted" uppercase={false} class="branch-chip">Branch</Chip>
                     <span class="branch-name">{branchName(row.representative)}</span>
                   {:else}
                     <ItemKindChip kind={row.representative.item_type} />
@@ -672,9 +688,9 @@
                 <span class="compact-meta">
                   <span>{repoLabel(row.representative)}</span>
                   <Chip
-                    size="sm"
+                    size="xs"
                     uppercase={false}
-                    class="evt-label evt-commit chip--teal"
+                    tone="workspace" class="evt-label evt-commit"
                   >{row.count} commits</Chip>
                   <span>{row.author}</span>
                 </span>
@@ -691,7 +707,7 @@
                 >
                   <span class="compact-row-top">
                     {#if isDefaultBranchActivity(row)}
-                      <Chip size="sm" uppercase={false} class="chip--muted branch-chip">Branch</Chip>
+                      <Chip size="xs" tone="muted" uppercase={false} class="branch-chip">Branch</Chip>
                       <span class="branch-name">{branchName(row)}</span>
                     {:else}
                       <ItemKindChip kind={row.item_type} />
@@ -714,8 +730,9 @@
                       <span class="sha">{branchActivityDetail(row)}</span>
                     {/if}
                     <Chip
-                      size="sm"
+                      size="xs"
                       uppercase={false}
+                      tone={eventChipTone(row.activity_type)}
                       class={eventChipClass(row.activity_type)}
                     >{eventLabel(row)}</Chip>
                     <span>{activityAuthor(row)}</span>
@@ -750,9 +767,9 @@
           {#each flatRows as row (row.id)}
             {@const rep = isCollapsedActivityRow(row) ? row.representative : row}
             {@const repoStyle =
-              `color: ${repoColor(`${rep.repo_owner}/${rep.repo_name}`)}; `
+              `color: ${hashColor(`${rep.repo_owner}/${rep.repo_name}`)}; `
               + `background: color-mix(in srgb, `
-              + `${repoColor(`${rep.repo_owner}/${rep.repo_name}`)} 15%, transparent);`}
+              + `${hashColor(`${rep.repo_owner}/${rep.repo_name}`)} 15%, transparent);`}
             <!-- svelte-ignore a11y_click_events_have_key_events -->
             <!-- svelte-ignore a11y_no_static_element_interactions -->
             <div
@@ -765,19 +782,19 @@
               {#if isCollapsedActivityRow(row)}
                 <span class="cell cell--type">
                   {#if isDefaultBranchActivity(row.representative)}
-                    <Chip size="xs" uppercase={false} class="chip--muted branch-chip">Branch</Chip>
+                    <Chip size="sm" tone="muted" uppercase={false} class="branch-chip">Branch</Chip>
                   {:else}
                     <ItemKindChip kind={row.representative.item_type} />
                   {/if}
                   <Chip
-                    size="xs"
+                    size="sm"
                     uppercase={false}
-                    class="evt-label evt-commit chip--teal"
+                    tone="workspace" class="evt-label evt-commit"
                   >{row.count} commits</Chip>
                 </span>
                 <span class="cell cell--repo col-repo">
                   <Chip
-                    size="xs"
+                    size="sm"
                     uppercase={false}
                     class="repo-chip repo-tag"
                     style={repoStyle}
@@ -820,19 +837,20 @@
               {:else}
                 <span class="cell cell--type">
                   {#if isDefaultBranchActivity(row)}
-                    <Chip size="xs" uppercase={false} class="chip--muted branch-chip">Branch</Chip>
+                    <Chip size="sm" tone="muted" uppercase={false} class="branch-chip">Branch</Chip>
                   {:else}
                     <ItemKindChip kind={row.item_type} />
                   {/if}
                   <Chip
-                    size="xs"
+                    size="sm"
                     uppercase={false}
+                    tone={eventChipTone(row.activity_type)}
                     class={eventChipClass(row.activity_type)}
                   >{eventLabel(row)}</Chip>
                 </span>
                 <span class="cell cell--repo col-repo">
                   <Chip
-                    size="xs"
+                    size="sm"
                     uppercase={false}
                     class="repo-chip repo-tag"
                     style={repoStyle}
@@ -892,7 +910,7 @@
       {/if}
 
       {#if flatRows.length === 0 && !activity.isActivityLoading()}
-        <div class="empty-state">No activity found</div>
+        <EmptyState title="No activity found" />
       {/if}
     </div>
   {/if}
@@ -913,6 +931,16 @@
     overflow: hidden;
   }
 
+  .loading-placeholder {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--space-3);
+    padding: var(--space-8) var(--space-6);
+    color: var(--text-muted);
+    font-size: var(--font-size-md);
+  }
+
   .controls-bar {
     display: flex;
     align-items: center;
@@ -929,39 +957,9 @@
     gap: 8px;
   }
 
-  .segmented-control {
-    display: flex;
-    align-items: center;
-    gap: 1px;
-    background: var(--bg-inset);
-    border-radius: var(--radius-sm);
-    padding: 2px;
-  }
-
-  .seg-btn {
-    padding: 3px 10px;
-    font-size: var(--font-size-xs);
-    font-weight: 500;
-    color: var(--text-muted);
-    border-radius: calc(var(--radius-sm) - 1px);
-    transition: background 0.12s, color 0.12s;
-  }
-
-  .seg-btn.active {
-    background: var(--bg-surface);
-    color: var(--text-primary);
-    box-shadow: var(--shadow-sm);
-  }
-
-  .seg-btn:hover:not(.active) {
-    color: var(--text-secondary);
-  }
-
-  .search-input {
+  .search-wrap {
     margin-left: auto;
     width: 180px;
-    font-size: var(--font-size-sm);
-    padding: 4px 8px;
   }
 
   .collapse-all-btn {
@@ -1001,16 +999,7 @@
     min-width: 0;
   }
 
-  .activity-feed--compact .segmented-control {
-    width: 100%;
-  }
-
-  .activity-feed--compact .seg-btn {
-    flex: 1;
-    padding-inline: 6px;
-  }
-
-  .activity-feed--compact .search-input {
+  .activity-feed--compact .search-wrap {
     order: 1;
     flex: 1 0 100%;
     width: 100%;
@@ -1029,7 +1018,7 @@
     display: none;
   }
 
-  .activity-feed--compact :global(.filter-wrap) {
+  .activity-feed--compact :global(.kit-filter-dropdown) {
     order: 3;
     flex-shrink: 0;
   }
@@ -1075,7 +1064,7 @@
     display: flex;
     flex-direction: column;
     align-items: stretch;
-    gap: 3px;
+    gap: var(--space-1);
     width: 100%;
     min-height: 62px;
     padding: 8px 10px;
@@ -1322,12 +1311,6 @@
     flex-shrink: 0;
   }
 
-  .empty-state {
-    padding: 40px;
-    text-align: center;
-    color: var(--text-muted);
-    font-size: var(--font-size-md);
-  }
 
   .settings-link {
     color: var(--accent-blue);

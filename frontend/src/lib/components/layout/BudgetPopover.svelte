@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { dismissable } from "@kenn-io/kit-ui";
   import type { RateLimitHostStatus } from "@middleman/ui/api/types";
   import { budgetColor, formatCompact, syncBudgetColor } from "./budget-utils";
 
@@ -11,30 +12,17 @@
 
   let popoverEl: HTMLDivElement | undefined = $state();
 
-  function handleClickOutside(e: MouseEvent) {
-    if (popoverEl && !popoverEl.contains(e.target as Node)) {
-      onclose();
-    }
-  }
-
-  function handleKeydown(e: KeyboardEvent) {
-    if (e.key === "Escape") {
-      e.preventDefault();
-      onclose();
-    }
-  }
-
+  // kit StatusBar runs with overflow="visible" so this can be the natural
+  // bottom-anchored absolute panel inside the relative .budget-wrapper (the
+  // sanctioned kit popover recipe). The wrapper counts as "inside" so a
+  // press on the BudgetBars trigger reaches its own toggle instead of
+  // racing a dismiss-then-reopen.
   $effect(() => {
-    // Delay registration to avoid catching the click that opened the popover.
-    const id = setTimeout(() => {
-      document.addEventListener("click", handleClickOutside);
-    }, 0);
-    document.addEventListener("keydown", handleKeydown);
-    return () => {
-      clearTimeout(id);
-      document.removeEventListener("click", handleClickOutside);
-      document.removeEventListener("keydown", handleKeydown);
-    };
+    return dismissable({
+      owners: () => [popoverEl?.parentElement],
+      dismiss: onclose,
+      escapeFocus: () => popoverEl?.parentElement?.querySelector("button"),
+    });
   });
 
   function hostEntries() {
@@ -74,7 +62,7 @@
 </script>
 
 <div
-  class="budget-popover"
+  class="budget-popover kit-popover-card"
   role="dialog"
   aria-label="API Budget"
   bind:this={popoverEl}
@@ -181,17 +169,13 @@
 <style>
   .budget-popover {
     position: absolute;
-    bottom: calc(100% + 4px);
     right: 0;
+    bottom: calc(100% + 4px);
     width: 320px;
     max-height: 400px;
     overflow-y: auto;
-    background: var(--bg-surface);
-    border: 1px solid var(--border-default);
-    border-radius: 8px;
     padding: 12px 16px;
-    box-shadow: 0 -4px 24px rgba(0, 0, 0, 0.2);
-    z-index: 100;
+    z-index: var(--z-popover, 1000);
     font-size: var(--font-size-xs);
   }
   .popover-header {

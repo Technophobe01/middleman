@@ -233,7 +233,7 @@
         </div>
         <span class="crumb-sep">/</span>
         <span class="crumb-id">{issue.issue.short_id}</span>
-        <span class="sr-only">{issue.issue.qualified_id}</span>
+        <span class="kit-sr-only">{issue.issue.qualified_id}</span>
       </div>
       {#if editingTitle}
         <input
@@ -383,7 +383,7 @@
     display: flex;
     align-items: flex-start;
     justify-content: space-between;
-    gap: 14px;
+    gap: var(--space-5);
     margin-bottom: 14px;
   }
 
@@ -444,18 +444,6 @@
 
   .crumb-sep {
     color: var(--text-faint);
-  }
-
-  .sr-only {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    padding: 0;
-    margin: -1px;
-    overflow: hidden;
-    clip: rect(0, 0, 0, 0);
-    white-space: nowrap;
-    border: 0;
   }
 
   .detail-heading h2 {
@@ -566,7 +554,7 @@
     color: var(--text-muted);
     display: inline-flex;
     align-items: center;
-    gap: 5px;
+    gap: var(--space-2);
     padding: 2px 6px;
     font: inherit;
     font-size: var(--font-size-xs);

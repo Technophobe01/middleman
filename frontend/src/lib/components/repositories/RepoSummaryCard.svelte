@@ -1,6 +1,7 @@
 <script lang="ts">
-  import { ActionButton, Chip, operationGate } from "@middleman/ui";
-  import { timeAgo } from "@middleman/ui/utils/time";
+  import { Button, Chip, operationGate } from "@middleman/ui";
+  import type { ChipTone } from "@kenn-io/kit-ui";
+  import { formatRelativeTime } from "@kenn-io/kit-ui";
   import { ExternalLinkIcon, FolderTreeIcon } from "../../icons.js";
   import ProviderIcon from "../provider/ProviderIcon.svelte";
   import RepoMetricGrid from "./RepoMetricGrid.svelte";
@@ -71,10 +72,10 @@
     if (staleRelease) return "Stale";
     return release.prerelease ? "Pre-release" : "Latest";
   });
-  const releaseStatusClass = $derived.by(() => {
-    if (!release) return "chip--muted";
-    if (staleRelease) return "chip--red";
-    return release.prerelease ? "chip--amber" : "chip--green";
+  const releaseStatusTone: ChipTone = $derived.by(() => {
+    if (!release) return "muted";
+    if (staleRelease) return "danger";
+    return release.prerelease ? "warning" : "success";
   });
   let cardElement: HTMLElement | undefined = $state();
   let hoveredTimelinePoint = $state<TimelinePoint | null>(null);
@@ -218,14 +219,14 @@
         </a>
       </div>
       {#if showPlatformHost}
-        <Chip size="sm" class="chip--muted" uppercase={false}>
+        <Chip size="xs" tone="muted" uppercase={false}>
           {summary.platform_host}
         </Chip>
       {/if}
     </div>
 
     <div class="repo-card__actions">
-      <ActionButton
+      <Button
         size="sm"
         tone="neutral"
         surface="outline"
@@ -234,10 +235,10 @@
       >
         <FolderTreeIcon size="14" strokeWidth="2" aria-hidden="true" />
         View repo
-      </ActionButton>
+      </Button>
       {#if summary.repo.capabilities.issue_mutation}
         {@const createIssueGate = operationGate(summary.operations?.create_issue)}
-        <ActionButton
+        <Button
           size="sm"
           tone="neutral"
           surface="outline"
@@ -246,7 +247,7 @@
           onclick={onopencomposer}
         >
           New issue
-        </ActionButton>
+        </Button>
       {/if}
     </div>
   </div>
@@ -264,19 +265,19 @@
     </div>
 
     <div class="repo-card__release-meta">
-      <Chip size="md" class="chip--release" uppercase={false}>
+      <Chip size="sm" class="chip--release" uppercase={false}>
         {releaseLabel}
       </Chip>
       <Chip
-        size="sm"
-        class={releaseStatusClass}
+        size="xs"
+        tone={releaseStatusTone}
         uppercase={false}
       >
         {releaseStatus}
       </Chip>
       {#if releaseDate}
         <span title={localDateTimeLabel(releaseDate)}>
-          {timeAgo(releaseDate)}
+          {formatRelativeTime(releaseDate)}
         </span>
       {/if}
       {#if summary.commits_since_release !== undefined}
@@ -352,7 +353,7 @@
                 title={issue.author}
                 loading="lazy"
               />
-              <span>{timeAgo(issue.last_activity_at)}</span>
+              <span>{formatRelativeTime(issue.last_activity_at)}</span>
             </span>
           </button>
         {/each}
@@ -373,7 +374,7 @@
     </span>
     {#if syncTime}
       <span title={localDateTimeLabel(syncTime)}>
-        Synced {timeAgo(syncTime)}
+        Synced {formatRelativeTime(syncTime)}
       </span>
     {:else}
       <span>Not synced yet</span>
@@ -394,7 +395,7 @@
     display: flex;
     align-items: flex-start;
     justify-content: space-between;
-    gap: 14px;
+    gap: var(--space-5);
     padding: 14px 14px 10px;
   }
 
@@ -575,7 +576,7 @@
     width: max-content;
     min-width: 160px;
     max-width: min(240px, calc(100% - 16px));
-    gap: 3px;
+    gap: var(--space-1);
     padding: 8px 10px;
     border: 1px solid var(--border-default);
     border-radius: var(--radius-md);
@@ -689,7 +690,7 @@
   }
 
   .repo-card__footer {
-    gap: 10px;
+    gap: var(--space-4);
     padding: 9px 14px;
     border-top: 1px solid var(--border-muted);
     color: var(--text-muted);
@@ -721,7 +722,7 @@
     color: var(--accent-blue);
   }
 
-  @media (max-width: 700px) {
+  @media (max-width: 760px) {
     .repo-card__header {
       flex-direction: column;
     }
@@ -734,7 +735,7 @@
     .repo-card__issue-row {
       grid-template-columns: minmax(0, 1fr);
       justify-items: start;
-      gap: 5px;
+      gap: var(--space-2);
     }
 
     .repo-card__issue-main span {

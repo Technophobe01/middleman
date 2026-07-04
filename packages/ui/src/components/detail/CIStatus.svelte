@@ -5,13 +5,14 @@
 <script lang="ts">
   import ChevronDownIcon from "@lucide/svelte/icons/chevron-down";
   import LoaderCircleIcon from "@lucide/svelte/icons/loader-circle";
+  import { Spinner } from "@kenn-io/kit-ui";
   import DotIcon from "@lucide/svelte/icons/dot";
   import XIcon from "@lucide/svelte/icons/x";
   import CheckIcon from "@lucide/svelte/icons/check";
   import MinusIcon from "@lucide/svelte/icons/minus";
   import HelpCircleIcon from "@lucide/svelte/icons/circle-help";
   import type { CICheck } from "../../api/types.js";
-  import Chip from "../shared/Chip.svelte";
+  import { Chip } from "@kenn-io/kit-ui";
   import CITokenCluster, { composeAriaLabel } from "../shared/CITokenCluster.svelte";
   import {
     parseCIChecks,
@@ -185,7 +186,7 @@
       {#if isUnavailable && parseError !== null}
         <span class="ci-unavailable-wrap">
           <span
-            class="chip chip--md chip--muted ci-chip-unavailable"
+            class="ci-chip-unavailable"
             role="button"
             tabindex="0"
             aria-disabled="true"
@@ -195,7 +196,7 @@
             title="CI unavailable: {safeDiagnosticText(parseError)}"
           >CI: unavailable</span>
           <span
-            class="sr-only"
+            class="sr-only kit-sr-only"
             id="ci-unavailable-desc-{instanceId}"
           >CI unavailable: {safeDiagnosticText(parseError)}</span>
           <span
@@ -204,7 +205,7 @@
           >CI unavailable: {safeDiagnosticText(parseError)}</span>
         </span>
       {:else}
-        <Chip
+        <Chip size="sm"
           interactive={true}
           tone="neutral"
           ariaLabel={composeAriaLabel(bucketed)}
@@ -215,12 +216,14 @@
         >
           <span class="ci-label">CI</span>
           <CITokenCluster {bucketed} size="default" />
-          <ChevronDownIcon
-            class={["chip-chevron", expanded && "chip-chevron--open"].filter(Boolean).join(" ")}
-            size={12}
-            strokeWidth={2.4}
-            aria-hidden="true"
-          />
+          {#snippet trailing()}
+            <ChevronDownIcon
+              class={["chip-chevron", expanded && "chip-chevron--open"].filter(Boolean).join(" ")}
+              size={12}
+              strokeWidth={2.4}
+              aria-hidden="true"
+            />
+          {/snippet}
         </Chip>
       {/if}
     {/if}
@@ -230,9 +233,7 @@
         {#if !detailLoaded}
           {#if detailSyncing}
             <div class="loading-placeholder">
-              <span class="sync-spinner" aria-hidden="true">
-                <LoaderCircleIcon size={14} strokeWidth={2} />
-              </span>
+              <Spinner size={14} label="Loading checks" />
               Loading checks...
             </div>
           {:else}
@@ -432,16 +433,14 @@
     white-space: nowrap;
   }
 
-  .sync-spinner {
-    display: inline-flex;
-    animation: spin 0.9s linear infinite;
-  }
-
   .spin {
     display: inline-flex;
     animation: spin 0.9s linear infinite;
   }
 
+  /* Pending-status loader icon tinted by row-icon-amber; kit-ui Spinner
+     has no tone and would drop the semantic color. */
+  /* kit-ui-check-ignore: status-colored loader icon spin */
   @keyframes spin {
     from { transform: rotate(0deg); }
     to { transform: rotate(360deg); }
@@ -479,14 +478,4 @@
     visibility: visible;
   }
 
-  .sr-only {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    padding: 0;
-    overflow: hidden;
-    clip: rect(0, 0, 0, 0);
-    white-space: nowrap;
-    border: 0;
-  }
 </style>
