@@ -59,6 +59,54 @@ func (e ActivityViewMode) Valid() bool {
 	}
 }
 
+// Defines values for IssueWorkflowStatus.
+const (
+	IssueWorkflowStatusAwaitingMerge IssueWorkflowStatus = "awaiting_merge"
+	IssueWorkflowStatusNew           IssueWorkflowStatus = "new"
+	IssueWorkflowStatusReviewing     IssueWorkflowStatus = "reviewing"
+	IssueWorkflowStatusWaiting       IssueWorkflowStatus = "waiting"
+)
+
+// Valid indicates whether the value is a known member of the IssueWorkflowStatus enum.
+func (e IssueWorkflowStatus) Valid() bool {
+	switch e {
+	case IssueWorkflowStatusAwaitingMerge:
+		return true
+	case IssueWorkflowStatusNew:
+		return true
+	case IssueWorkflowStatusReviewing:
+		return true
+	case IssueWorkflowStatusWaiting:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for IssueResponseWorkflowStatus.
+const (
+	IssueResponseWorkflowStatusAwaitingMerge IssueResponseWorkflowStatus = "awaiting_merge"
+	IssueResponseWorkflowStatusNew           IssueResponseWorkflowStatus = "new"
+	IssueResponseWorkflowStatusReviewing     IssueResponseWorkflowStatus = "reviewing"
+	IssueResponseWorkflowStatusWaiting       IssueResponseWorkflowStatus = "waiting"
+)
+
+// Valid indicates whether the value is a known member of the IssueResponseWorkflowStatus enum.
+func (e IssueResponseWorkflowStatus) Valid() bool {
+	switch e {
+	case IssueResponseWorkflowStatusAwaitingMerge:
+		return true
+	case IssueResponseWorkflowStatusNew:
+		return true
+	case IssueResponseWorkflowStatusReviewing:
+		return true
+	case IssueResponseWorkflowStatusWaiting:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for MergeRequestKanbanStatus.
 const (
 	MergeRequestKanbanStatusAwaitingMerge MergeRequestKanbanStatus = "awaiting_merge"
@@ -260,6 +308,30 @@ func (e TerminalRenderer) Valid() bool {
 	}
 }
 
+// Defines values for WorkflowStateMetaResponseStatus.
+const (
+	WorkflowStateMetaResponseStatusAwaitingMerge WorkflowStateMetaResponseStatus = "awaiting_merge"
+	WorkflowStateMetaResponseStatusNew           WorkflowStateMetaResponseStatus = "new"
+	WorkflowStateMetaResponseStatusReviewing     WorkflowStateMetaResponseStatus = "reviewing"
+	WorkflowStateMetaResponseStatusWaiting       WorkflowStateMetaResponseStatus = "waiting"
+)
+
+// Valid indicates whether the value is a known member of the WorkflowStateMetaResponseStatus enum.
+func (e WorkflowStateMetaResponseStatus) Valid() bool {
+	switch e {
+	case WorkflowStateMetaResponseStatusAwaitingMerge:
+		return true
+	case WorkflowStateMetaResponseStatusNew:
+		return true
+	case WorkflowStateMetaResponseStatusReviewing:
+		return true
+	case WorkflowStateMetaResponseStatusWaiting:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for GetPullFilePreviewOnHostParamsSide.
 const (
 	GetPullFilePreviewOnHostParamsSideNew GetPullFilePreviewOnHostParamsSide = "new"
@@ -370,16 +442,16 @@ func (e GetWorkspaceFilePreviewParamsWhitespace) Valid() bool {
 
 // Defines values for GetWorkspaceFilePreviewParamsSide.
 const (
-	New GetWorkspaceFilePreviewParamsSide = "new"
-	Old GetWorkspaceFilePreviewParamsSide = "old"
+	GetWorkspaceFilePreviewParamsSideNew GetWorkspaceFilePreviewParamsSide = "new"
+	GetWorkspaceFilePreviewParamsSideOld GetWorkspaceFilePreviewParamsSide = "old"
 )
 
 // Valid indicates whether the value is a known member of the GetWorkspaceFilePreviewParamsSide enum.
 func (e GetWorkspaceFilePreviewParamsSide) Valid() bool {
 	switch e {
-	case New:
+	case GetWorkspaceFilePreviewParamsSideNew:
 		return true
-	case Old:
+	case GetWorkspaceFilePreviewParamsSideOld:
 		return true
 	default:
 		return false
@@ -1251,40 +1323,45 @@ type InspectProjectWorktreeOutputBody struct {
 
 // Issue defines model for Issue.
 type Issue struct {
-	Author             string     `json:"Author"`
-	Body               string     `json:"Body"`
-	ClosedAt           *time.Time `json:"ClosedAt"`
-	CommentCount       int64      `json:"CommentCount"`
-	CreatedAt          time.Time  `json:"CreatedAt"`
-	DetailFetchedAt    *time.Time `json:"DetailFetchedAt"`
-	ID                 int64      `json:"ID"`
-	LastActivityAt     time.Time  `json:"LastActivityAt"`
-	Number             int64      `json:"Number"`
-	PlatformExternalID string     `json:"PlatformExternalID"`
-	PlatformID         int64      `json:"PlatformID"`
-	RepoID             int64      `json:"RepoID"`
-	Starred            bool       `json:"Starred"`
-	State              string     `json:"State"`
-	Title              string     `json:"Title"`
-	URL                string     `json:"URL"`
-	UpdatedAt          time.Time  `json:"UpdatedAt"`
-	Assignees          *[]string  `json:"assignees,omitempty"`
-	Labels             *[]Label   `json:"labels,omitempty"`
+	Author             string              `json:"Author"`
+	Body               string              `json:"Body"`
+	ClosedAt           *time.Time          `json:"ClosedAt"`
+	CommentCount       int64               `json:"CommentCount"`
+	CreatedAt          time.Time           `json:"CreatedAt"`
+	DetailFetchedAt    *time.Time          `json:"DetailFetchedAt"`
+	ID                 int64               `json:"ID"`
+	LastActivityAt     time.Time           `json:"LastActivityAt"`
+	Number             int64               `json:"Number"`
+	PlatformExternalID string              `json:"PlatformExternalID"`
+	PlatformID         int64               `json:"PlatformID"`
+	RepoID             int64               `json:"RepoID"`
+	Starred            bool                `json:"Starred"`
+	State              string              `json:"State"`
+	Title              string              `json:"Title"`
+	URL                string              `json:"URL"`
+	UpdatedAt          time.Time           `json:"UpdatedAt"`
+	WorkflowStatus     IssueWorkflowStatus `json:"WorkflowStatus"`
+	Assignees          *[]string           `json:"assignees,omitempty"`
+	Labels             *[]Label            `json:"labels,omitempty"`
 }
+
+// IssueWorkflowStatus defines model for Issue.WorkflowStatus.
+type IssueWorkflowStatus string
 
 // IssueDetailResponse defines model for IssueDetailResponse.
 type IssueDetailResponse struct {
 	// Schema A URL to the JSON Schema for this object.
-	Schema          *string         `json:"$schema,omitempty"`
-	DetailFetchedAt *string         `json:"detail_fetched_at,omitempty"`
-	DetailLoaded    bool            `json:"detail_loaded"`
-	Events          *[]IssueEvent   `json:"events"`
-	Issue           Issue           `json:"issue"`
-	PlatformHost    string          `json:"platform_host"`
-	Repo            RepoRefResponse `json:"repo"`
-	RepoName        string          `json:"repo_name"`
-	RepoOwner       string          `json:"repo_owner"`
-	Workspace       *WorkspaceRef   `json:"workspace,omitempty"`
+	Schema          *string                    `json:"$schema,omitempty"`
+	DetailFetchedAt *string                    `json:"detail_fetched_at,omitempty"`
+	DetailLoaded    bool                       `json:"detail_loaded"`
+	Events          *[]IssueEvent              `json:"events"`
+	Issue           Issue                      `json:"issue"`
+	PlatformHost    string                     `json:"platform_host"`
+	Repo            RepoRefResponse            `json:"repo"`
+	RepoName        string                     `json:"repo_name"`
+	RepoOwner       string                     `json:"repo_owner"`
+	Workflow        *WorkflowStateMetaResponse `json:"workflow,omitempty"`
+	Workspace       *WorkspaceRef              `json:"workspace,omitempty"`
 }
 
 // IssueEvent defines model for IssueEvent.
@@ -1309,33 +1386,37 @@ type IssueEvent struct {
 // IssueResponse defines model for IssueResponse.
 type IssueResponse struct {
 	// Schema A URL to the JSON Schema for this object.
-	Schema             *string         `json:"$schema,omitempty"`
-	Author             string          `json:"Author"`
-	Body               string          `json:"Body"`
-	ClosedAt           *time.Time      `json:"ClosedAt"`
-	CommentCount       int64           `json:"CommentCount"`
-	CreatedAt          time.Time       `json:"CreatedAt"`
-	ID                 int64           `json:"ID"`
-	LastActivityAt     time.Time       `json:"LastActivityAt"`
-	Number             int64           `json:"Number"`
-	PlatformExternalID string          `json:"PlatformExternalID"`
-	PlatformID         int64           `json:"PlatformID"`
-	RepoID             int64           `json:"RepoID"`
-	Starred            bool            `json:"Starred"`
-	State              string          `json:"State"`
-	Title              string          `json:"Title"`
-	URL                string          `json:"URL"`
-	UpdatedAt          time.Time       `json:"UpdatedAt"`
-	Assignees          *[]string       `json:"assignees,omitempty"`
-	DetailFetchedAt    *string         `json:"detail_fetched_at,omitempty"`
-	DetailLoaded       bool            `json:"detail_loaded"`
-	Labels             *[]Label        `json:"labels,omitempty"`
-	PlatformHost       string          `json:"platform_host"`
-	Repo               RepoRefResponse `json:"repo"`
-	RepoName           string          `json:"repo_name"`
-	RepoOwner          string          `json:"repo_owner"`
-	Workspace          *WorkspaceRef   `json:"workspace,omitempty"`
+	Schema             *string                     `json:"$schema,omitempty"`
+	Author             string                      `json:"Author"`
+	Body               string                      `json:"Body"`
+	ClosedAt           *time.Time                  `json:"ClosedAt"`
+	CommentCount       int64                       `json:"CommentCount"`
+	CreatedAt          time.Time                   `json:"CreatedAt"`
+	ID                 int64                       `json:"ID"`
+	LastActivityAt     time.Time                   `json:"LastActivityAt"`
+	Number             int64                       `json:"Number"`
+	PlatformExternalID string                      `json:"PlatformExternalID"`
+	PlatformID         int64                       `json:"PlatformID"`
+	RepoID             int64                       `json:"RepoID"`
+	Starred            bool                        `json:"Starred"`
+	State              string                      `json:"State"`
+	Title              string                      `json:"Title"`
+	URL                string                      `json:"URL"`
+	UpdatedAt          time.Time                   `json:"UpdatedAt"`
+	WorkflowStatus     IssueResponseWorkflowStatus `json:"WorkflowStatus"`
+	Assignees          *[]string                   `json:"assignees,omitempty"`
+	DetailFetchedAt    *string                     `json:"detail_fetched_at,omitempty"`
+	DetailLoaded       bool                        `json:"detail_loaded"`
+	Labels             *[]Label                    `json:"labels,omitempty"`
+	PlatformHost       string                      `json:"platform_host"`
+	Repo               RepoRefResponse             `json:"repo"`
+	RepoName           string                      `json:"repo_name"`
+	RepoOwner          string                      `json:"repo_owner"`
+	Workspace          *WorkspaceRef               `json:"workspace,omitempty"`
 }
+
+// IssueResponseWorkflowStatus defines model for IssueResponse.WorkflowStatus.
+type IssueResponseWorkflowStatus string
 
 // ItemAssigneesResponse defines model for ItemAssigneesResponse.
 type ItemAssigneesResponse struct {
@@ -2995,6 +3076,18 @@ type WorkflowApprovalResponse struct {
 	Count    int64 `json:"count"`
 	Required bool  `json:"required"`
 }
+
+// WorkflowStateMetaResponse defines model for WorkflowStateMetaResponse.
+type WorkflowStateMetaResponse struct {
+	Status        WorkflowStateMetaResponseStatus `json:"status"`
+	UpdatedActor  *string                         `json:"updated_actor,omitempty"`
+	UpdatedAt     *time.Time                      `json:"updated_at,omitempty"`
+	UpdatedReason *string                         `json:"updated_reason,omitempty"`
+	UpdatedSource *string                         `json:"updated_source,omitempty"`
+}
+
+// WorkflowStateMetaResponseStatus defines model for WorkflowStateMetaResponse.Status.
+type WorkflowStateMetaResponseStatus string
 
 // WorkspaceKataMetadata defines model for WorkspaceKataMetadata.
 type WorkspaceKataMetadata struct {

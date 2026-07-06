@@ -5110,6 +5110,8 @@ export interface components {
             URL: string;
             /** Format: date-time */
             UpdatedAt: string;
+            /** @enum {string} */
+            WorkflowStatus: "new" | "reviewing" | "waiting" | "awaiting_merge";
             assignees?: string[] | null;
             labels?: components["schemas"]["Label"][] | null;
         };
@@ -5128,6 +5130,7 @@ export interface components {
             repo: components["schemas"]["RepoRefResponse"];
             repo_name: string;
             repo_owner: string;
+            workflow?: components["schemas"]["WorkflowStateMetaResponse"];
             workspace?: components["schemas"]["WorkspaceRef"];
         };
         IssueEvent: {
@@ -5187,6 +5190,8 @@ export interface components {
             URL: string;
             /** Format: date-time */
             UpdatedAt: string;
+            /** @enum {string} */
+            WorkflowStatus: "new" | "reviewing" | "waiting" | "awaiting_merge";
             assignees?: string[] | null;
             detail_fetched_at?: string;
             detail_loaded: boolean;
@@ -7085,6 +7090,15 @@ export interface components {
             /** Format: int64 */
             count: number;
             required: boolean;
+        };
+        WorkflowStateMetaResponse: {
+            /** @enum {string} */
+            status: "new" | "reviewing" | "waiting" | "awaiting_merge";
+            updated_actor?: string;
+            /** Format: date-time */
+            updated_at?: string;
+            updated_reason?: string;
+            updated_source?: string;
         };
         WorkspaceKataMetadata: {
             daemon_id: string;
@@ -16561,9 +16575,12 @@ export const pathsWorkspacesIdFilePreviewGetParametersQueryWhitespaceValues: Rea
 export const pathsWorkspacesIdFilePreviewGetParametersQuerySideValues: ReadonlyArray<FlattenedDeepRequired<paths>["/workspaces/{id}/file-preview"]["get"]["parameters"]["query"]["side"]> = ["old", "new"];
 export const activityTime_rangeValues: ReadonlyArray<FlattenedDeepRequired<components>["schemas"]["Activity"]["time_range"]> = ["24h", "7d", "30d", "90d"];
 export const activityView_modeValues: ReadonlyArray<FlattenedDeepRequired<components>["schemas"]["Activity"]["view_mode"]> = ["flat", "threaded"];
+export const issueWorkflowStatusValues: ReadonlyArray<FlattenedDeepRequired<components>["schemas"]["Issue"]["WorkflowStatus"]> = ["new", "reviewing", "waiting", "awaiting_merge"];
+export const issueResponseWorkflowStatusValues: ReadonlyArray<FlattenedDeepRequired<components>["schemas"]["IssueResponse"]["WorkflowStatus"]> = ["new", "reviewing", "waiting", "awaiting_merge"];
 export const mergeRequestKanbanStatusValues: ReadonlyArray<FlattenedDeepRequired<components>["schemas"]["MergeRequest"]["KanbanStatus"]> = ["new", "reviewing", "waiting", "awaiting_merge"];
 export const mergeRequestStateValues: ReadonlyArray<FlattenedDeepRequired<components>["schemas"]["MergeRequest"]["State"]> = ["open", "closed", "merged"];
 export const mergeRequestResponseKanbanStatusValues: ReadonlyArray<FlattenedDeepRequired<components>["schemas"]["MergeRequestResponse"]["KanbanStatus"]> = ["new", "reviewing", "waiting", "awaiting_merge"];
 export const mergeRequestResponseStateValues: ReadonlyArray<FlattenedDeepRequired<components>["schemas"]["MergeRequestResponse"]["State"]> = ["open", "closed", "merged"];
 export const problemErrorCodeValues: ReadonlyArray<FlattenedDeepRequired<components>["schemas"]["ProblemError"]["code"]> = ["badRequest", "branchConflict", "branchInUse", "branchProtected", "commentNotFound", "conflict", "destinationExists", "forbidden", "hookFailed", "internalError", "issueNotFound", "notFound", "payloadTooLarge", "projectNotFound", "pullNotFound", "rateLimited", "repoNotFound", "serviceUnavailable", "settingsUnavailable", "toolMissing", "toolUnauthenticated", "unauthorized", "unsupportedCapability", "upstreamError", "validationError", "workspaceNotFound", "worktreeDirty"];
 export const terminalRendererValues: ReadonlyArray<FlattenedDeepRequired<components>["schemas"]["Terminal"]["renderer"]> = ["xterm", "ghostty-web"];
+export const workflowStateMetaResponseStatusValues: ReadonlyArray<FlattenedDeepRequired<components>["schemas"]["WorkflowStateMetaResponse"]["status"]> = ["new", "reviewing", "waiting", "awaiting_merge"];
