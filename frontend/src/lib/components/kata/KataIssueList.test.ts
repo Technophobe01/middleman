@@ -104,6 +104,28 @@ describe("KataIssueList", () => {
     expect(within(row).getByText("fixture-user")).toBeTruthy();
   });
 
+  it("opens a graph from a row action without selecting the task", async () => {
+    const onSelect = vi.fn();
+    const onOpenGraph = vi.fn();
+    render(KataIssueList, {
+      props: {
+        currentView,
+        selectedIssueUID: null,
+        loading: false,
+        onSelect,
+        onOpenGraph,
+      },
+    });
+
+    const row = screen.getByRole("button", { name: /Pay rent/ });
+    const frame = row.parentElement;
+    expect(frame).toBeTruthy();
+    await fireEvent.click(within(frame!).getByRole("button", { name: "Open reachable graph" }));
+
+    expect(onOpenGraph).toHaveBeenCalledWith(baseIssues[0]);
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
   it("keeps snapshot loading out of the visual layout", () => {
     render(KataIssueList, {
       props: {
@@ -224,6 +246,7 @@ describe("KataIssueList", () => {
     });
     const api = apiWithDetail(parent, [child]);
     const selected: string[] = [];
+    const onRememberTasks = vi.fn();
 
     render(KataIssueList, {
       props: {
@@ -231,6 +254,7 @@ describe("KataIssueList", () => {
         selectedIssueUID: null,
         loading: false,
         api,
+        onRememberTasks,
         onSelect: (issue: KataTaskSummary) => selected.push(issue.uid),
       },
     });
@@ -246,6 +270,8 @@ describe("KataIssueList", () => {
     expect(childRow).toBeTruthy();
     expect(parentRow.getAttribute("aria-expanded")).toBe("true");
     expect(screen.getByText("2 tasks")).toBeTruthy();
+    const remembered = onRememberTasks.mock.calls[0]?.[0] as readonly KataTaskSummary[] | undefined;
+    expect(remembered?.map((issue) => issue.uid)).toEqual([parent.uid, child.uid]);
 
     parentRow.focus();
     await fireEvent.keyDown(parentRow, { key: "j" });

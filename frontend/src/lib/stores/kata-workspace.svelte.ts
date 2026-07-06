@@ -25,6 +25,7 @@ import type {
   KataTaskViewResponse,
 } from "../api/kata/taskTypes.js";
 import { createULID } from "../api/ulid.js";
+import { recordKataGraphDebugEvent, setKataGraphDebugStore } from "./kata-graph-debug.js";
 
 export interface KataConnectionState {
   status: "offline" | "connecting" | "online" | "error";
@@ -184,6 +185,70 @@ function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function mergeKataPeerList(
+  previous: KataTaskSummary["blocks"],
+  next: KataTaskSummary["blocks"],
+  hasNext: boolean,
+): KataTaskSummary["blocks"] {
+  if (hasNext) return next;
+  return previous && previous.length > 0 ? [...previous] : next;
+}
+
+function hasOwnField<T extends object>(value: T, key: PropertyKey): boolean {
+  return Object.prototype.hasOwnProperty.call(value, key);
+}
+
+function mergeCachedTaskSummary(previous: KataTaskSummary | undefined, next: KataTaskSummary): KataTaskSummary {
+  if (!previous) return next;
+  return {
+    ...next,
+    parent: hasOwnField(next, "parent") ? next.parent : previous.parent,
+    parent_short_id: hasOwnField(next, "parent_short_id") ? next.parent_short_id : previous.parent_short_id,
+    blocks: mergeKataPeerList(previous.blocks, next.blocks, hasOwnField(next, "blocks")),
+    blocked_by: mergeKataPeerList(previous.blocked_by, next.blocked_by, hasOwnField(next, "blocked_by")),
+    related: mergeKataPeerList(previous.related, next.related, hasOwnField(next, "related")),
+    child_counts: hasOwnField(next, "child_counts") ? next.child_counts : previous.child_counts,
+  };
+}
+
+function taskPeerListSignature(peers: KataTaskSummary["blocks"]): string {
+  return JSON.stringify((peers ?? []).map((peer) => [peer.uid ?? "", peer.short_id]));
+}
+
+function taskSummarySignature(task: KataTaskSummary): string {
+  return JSON.stringify([
+    task.id,
+    task.uid,
+    task.project_id,
+    task.project_uid,
+    task.project_name,
+    task.short_id,
+    task.qualified_id,
+    task.title,
+    task.body ?? null,
+    task.status,
+    task.revision,
+    task.created_at,
+    task.updated_at,
+    task.owner ?? null,
+    task.author ?? null,
+    task.priority ?? null,
+    JSON.stringify(task.metadata ?? {}),
+    JSON.stringify(task.labels ?? []),
+    task.recurrence_id ?? null,
+    task.occurrence_key ?? null,
+    task.parent ? [task.parent.uid, task.parent.short_id] : null,
+    task.parent_short_id ?? null,
+    taskPeerListSignature(task.blocks),
+    taskPeerListSignature(task.blocked_by),
+    taskPeerListSignature(task.related),
+    JSON.stringify(task.child_counts ?? null),
+    task.closed_reason ?? null,
+    task.closed_at ?? null,
+    task.deleted_at ?? null,
+  ]);
+}
+
 export function duplicateCandidatesFromError(error: unknown): KataDuplicateCandidateDisplay[] {
   const envelope = isObject(error) && isObject(error.error) ? error.error : error;
   const details =
@@ -224,6 +289,8 @@ export class KataWorkspaceStore {
   searchFilters = $state.raw<KataTaskSearchFilters>(defaultKataTaskSearchFilters());
   duplicateCandidates = $state.raw<KataDuplicateCandidateDisplay[]>([]);
   pendingSelectionUID = $state<string | null>(null);
+  private taskCache = $state.raw<Map<string, KataTaskSummary>>(new Map());
+  cachedTasks = $derived([...this.taskCache.values()]);
 
   private viewRequestID = 0;
   private detailRequestID = 0;
@@ -250,8 +317,10 @@ export class KataWorkspaceStore {
         this.connection = { status: "online" };
         return;
       }
+      this.clearTaskCache();
       this.projects = projects.projects;
       this.areas = deriveKataAreas(projects.projects);
+      this.cacheView(view);
       this.currentView = {
         name: view.view,
         groups: view.groups,
@@ -282,6 +351,7 @@ export class KataWorkspaceStore {
     const requestID = ++this.viewRequestID;
     const view = await this.api.issues({ view: viewName, ...scopedIssueQuery(this.searchFilters) });
     if (requestID !== this.viewRequestID || !shouldApplyLoad(options)) return;
+    this.cacheView(view);
     this.currentView = {
       name: view.view,
       groups: view.groups,
@@ -321,6 +391,7 @@ export class KataWorkspaceStore {
       const results = await this.api.search(this.searchFilters);
       if (requestID !== this.viewRequestID || !shouldApplyLoad(options)) return;
       this.duplicateCandidates = [];
+      this.cacheTasks(results.issues);
       const groups = groupSearchIssues(results.issues);
       this.currentView = {
         name: isProjectBacklogScope(this.searchFilters) ? "all" : this.currentView.name,
@@ -352,6 +423,7 @@ export class KataWorkspaceStore {
       if (requestID !== this.viewRequestID || !shouldApplyLoad(options)) return;
       this.searchFilters = nextFilters;
       this.duplicateCandidates = [];
+      this.cacheView(view);
       this.currentView = {
         name: view.view,
         groups: view.groups,
@@ -374,6 +446,7 @@ export class KataWorkspaceStore {
       }
       this.searchFilters = nextFilters;
       this.duplicateCandidates = [];
+      this.cacheTasks(results.issues);
       const groups = groupSearchIssues(results.issues);
       this.currentView = {
         name: isProjectBacklogScope(nextFilters) ? "all" : this.currentView.name,
@@ -411,6 +484,7 @@ export class KataWorkspaceStore {
     this.duplicateCandidates = [];
     const view = await this.api.issues({ view: "inbox" });
     if (requestID !== this.viewRequestID) return;
+    this.cacheView(view);
     this.currentView = {
       name: "inbox",
       groups: view.groups,
@@ -429,6 +503,7 @@ export class KataWorkspaceStore {
   async selectIssue(uid: string): Promise<boolean> {
     this.pendingSelectionUID = uid;
     const requestID = ++this.detailRequestID;
+    this.observeGraphStore("selection-start", { uid, detailRequestID: requestID });
     try {
       return await this.loadSelectedIssue(uid, undefined, requestID);
     } catch (error) {
@@ -553,11 +628,16 @@ export class KataWorkspaceStore {
     this.duplicateCandidates = [];
   }
 
+  rememberTasks(issues: readonly KataTaskSummary[]): void {
+    this.cacheTasks(issues);
+  }
+
   invalidatePendingLoads(): void {
     this.viewRequestID++;
     this.detailRequestID++;
     this.abortPendingDetail();
     this.pendingSelectionUID = null;
+    this.updateGraphDebugStore();
   }
 
   // Whenever a detail load stops being wanted (newer selection, cleared
@@ -565,6 +645,9 @@ export class KataWorkspaceStore {
   // running ties up the daemon and its late rejection would surface a
   // stale error for a navigation the user already left.
   private abortPendingDetail(): void {
+    if (this.detailAbort) {
+      this.observeGraphStore("detail-load-abort", { selectedIssueUID: this.selectedIssue?.issue.uid ?? null });
+    }
     this.detailAbort?.abort();
     this.detailAbort = null;
   }
@@ -629,6 +712,58 @@ export class KataWorkspaceStore {
     this.areas = deriveKataAreas(projects.projects);
   }
 
+  private clearTaskCache(): void {
+    this.taskCache = new Map();
+  }
+
+  private cacheTasks(issues: readonly KataTaskSummary[]): void {
+    if (issues.length === 0) return;
+    const next = new Map(this.taskCache);
+    let changed = false;
+    for (const issue of issues) {
+      const previous = next.get(issue.uid);
+      const merged = mergeCachedTaskSummary(previous, issue);
+      if (!previous || taskSummarySignature(previous) !== taskSummarySignature(merged)) {
+        next.set(issue.uid, merged);
+        changed = true;
+      }
+    }
+    if (!changed) return;
+    this.taskCache = next;
+    this.updateGraphDebugStore();
+  }
+
+  private cacheView(view: Pick<KataTaskViewResponse, "groups">): void {
+    this.cacheTasks(view.groups.flatMap((group) => group.issues));
+  }
+
+  private cacheDetail(detail: KataTaskDetail): void {
+    this.cacheTasks([detail.issue, ...(detail.children ?? [])]);
+  }
+
+  private isIssueRefreshActive(): boolean {
+    return this.detailAbort !== null || this.pendingSelectionUID !== null;
+  }
+
+  private updateGraphDebugStore(): void {
+    setKataGraphDebugStore({
+      queueKeys: [],
+      graphLoadActive: false,
+      issueRefreshActive: this.isIssueRefreshActive(),
+      pendingSelectionUID: this.pendingSelectionUID,
+      selectedIssueUID: this.selectedIssue?.issue.uid ?? null,
+      cachedTaskCount: this.taskCache.size,
+    });
+  }
+
+  private observeGraphStore(
+    kind: Parameters<typeof recordKataGraphDebugEvent>[0],
+    detail?: Record<string, unknown>,
+  ): void {
+    this.updateGraphDebugStore();
+    recordKataGraphDebugEvent(kind, detail);
+  }
+
   private applyTrivialMetadataEvent(event: KataTaskEvent): void {
     if (event.type !== "issue.metadata_updated") return;
     if (!event.issue_uid) return;
@@ -670,6 +805,7 @@ export class KataWorkspaceStore {
         ),
       })),
     };
+    this.cacheView(this.currentView);
 
     if (this.selectedIssue?.issue.uid !== event.issue_uid) return;
     if (!canApplyToRevision(this.selectedIssue.issue.revision)) return;
@@ -681,6 +817,7 @@ export class KataWorkspaceStore {
         revision: revisionNew ?? this.selectedIssue.issue.revision,
       },
     };
+    this.cacheDetail(this.selectedIssue);
     if (revisionNew !== undefined) {
       this.issueETags.set(event.issue_uid, `"rev-${revisionNew}"`);
     }
@@ -751,6 +888,9 @@ export class KataWorkspaceStore {
     if (typeof result !== "object" || result === null || !("issue" in result)) return;
     const issue = (result as KataTaskMutationResponse).issue;
     const etag = (result as KataTaskMutationResponse).etag;
+    if (issue?.uid) {
+      this.cacheTasks([issue]);
+    }
     if (issue?.uid && etag) {
       this.issueETags.set(issue.uid, etag);
     }
@@ -776,6 +916,7 @@ export class KataWorkspaceStore {
       }
       if (requestID !== this.viewRequestID) return false;
       this.duplicateCandidates = [];
+      this.cacheTasks(results.issues);
       const groups = groupSearchIssues(results.issues);
       nextView = {
         name: isProjectBacklogScope(this.searchFilters) ? "all" : this.currentView.name,
@@ -795,6 +936,7 @@ export class KataWorkspaceStore {
       }
       if (requestID !== this.viewRequestID) return false;
       this.duplicateCandidates = [];
+      this.cacheView(view);
       nextView = {
         name: view.view,
         groups: view.groups,
@@ -837,6 +979,7 @@ export class KataWorkspaceStore {
         this.selectedEvents = [];
         this.selectedRecurrences = [];
         this.pendingSelectionUID = null;
+        this.updateGraphDebugStore();
         return true;
       }
       return false;
@@ -844,6 +987,7 @@ export class KataWorkspaceStore {
 
     const abort = new AbortController();
     this.detailAbort = abort;
+    this.observeGraphStore("detail-load-start", { uid, detailRequestID });
     let detail: KataTaskDetail;
     let events: KataTaskEventsResponse;
     try {
@@ -854,13 +998,23 @@ export class KataWorkspaceStore {
     } catch (error) {
       // Aborted means superseded: a newer selection owns the pane now, so
       // this failure must not surface as a user-facing error.
-      if (abort.signal.aborted) return false;
+      if (abort.signal.aborted) {
+        this.observeGraphStore("detail-load-abort", { uid, detailRequestID });
+        return false;
+      }
       throw error;
     } finally {
       if (this.detailAbort === abort) this.detailAbort = null;
     }
-    if (viewRequestID !== undefined && viewRequestID !== this.viewRequestID) return false;
-    if (detailRequestID !== this.detailRequestID) return false;
+    if (viewRequestID !== undefined && viewRequestID !== this.viewRequestID) {
+      this.observeGraphStore("detail-load-stale", { uid, detailRequestID, viewRequestID });
+      return false;
+    }
+    if (detailRequestID !== this.detailRequestID) {
+      this.observeGraphStore("detail-load-stale", { uid, detailRequestID });
+      return false;
+    }
+    this.cacheDetail(detail);
     this.selectedIssue = detail;
     if (detail.etag) {
       this.issueETags.set(detail.issue.uid, detail.etag);
@@ -870,6 +1024,7 @@ export class KataWorkspaceStore {
     this.selectedEvents = events.events;
     this.selectedRecurrences = [];
     this.pendingSelectionUID = null;
+    this.observeGraphStore("detail-load-complete", { uid, detailRequestID });
     void this.loadSelectedRecurrences(detail.issue.project_id, detailRequestID);
     return true;
   }

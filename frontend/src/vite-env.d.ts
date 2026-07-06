@@ -287,4 +287,46 @@ interface Window {
     },
   ) => void;
   __middleman_update_tooling?: (tooling: ToolingStatus) => void;
+  __middleman_kata_graph_debug?: {
+    snapshot: () => {
+      events: Array<{
+        id: number;
+        at: number;
+        kind: string;
+        detail?: Record<string, unknown> | undefined;
+      }>;
+      latestGraph?:
+        | {
+            sourceUID: string;
+            selectedUID: string | null;
+            hideDone: boolean;
+            contextDepth: string;
+            depthLimit: string;
+            layoutMode: string;
+            layoutDirection: string;
+            layoutReady: boolean;
+            nodeIds: string[];
+            edges: Array<{ id: string; source: string; target: string; kind: string | null; isDepthContext: boolean }>;
+            nodePositions: Array<{ id: string; x: number; y: number }>;
+            disabledNodeIds: string[];
+            missingRefKeys: string[];
+            nodeCount: number;
+            edgeCount: number;
+            layoutEdgeCount: number;
+            layoutBounds: { width: number; height: number; aspectRatio: number };
+          }
+        | undefined;
+      store?:
+        | {
+            queueKeys: string[];
+            graphLoadActive: boolean;
+            issueRefreshActive: boolean;
+            pendingSelectionUID: string | null;
+            selectedIssueUID: string | null;
+            cachedTaskCount: number;
+          }
+        | undefined;
+    };
+    reset: () => void;
+  };
 }

@@ -5,6 +5,7 @@
   import ChevronUpIcon from "@lucide/svelte/icons/chevron-up";
   import ListChevronsDownUpIcon from "@lucide/svelte/icons/list-chevrons-down-up";
   import ListChevronsUpDownIcon from "@lucide/svelte/icons/list-chevrons-up-down";
+  import NetworkIcon from "@lucide/svelte/icons/network";
   import { relativeTime, shortDate } from "../../api/dates.js";
   import type { KataTaskAPI, KataTaskSearchFilters, KataTaskSummary } from "../../api/kata/taskTypes.js";
   import type { KataCurrentView } from "../../stores/kata-workspace.svelte.js";
@@ -27,6 +28,8 @@
     navigationGeneration?: number;
     api?: KataTaskAPI;
     onSelect: (issue: KataTaskSummary) => void;
+    onOpenGraph?: ((issue: KataTaskSummary) => void) | undefined;
+    onRememberTasks?: ((issues: readonly KataTaskSummary[]) => void) | undefined;
   }
 
   let {
@@ -40,6 +43,8 @@
     navigationGeneration = 0,
     api = undefined,
     onSelect,
+    onOpenGraph = undefined,
+    onRememberTasks = undefined,
   }: Props = $props();
 
   const SORT_STORAGE_KEY = "middleman:kata:issue-sort/v1";
@@ -309,6 +314,7 @@
       try {
         const detail = await api.issue(uid);
         if (generation !== childLoadGeneration || !findIssueByUID(uid)) return;
+        onRememberTasks?.([detail.issue, ...(detail.children ?? [])]);
         childrenByUID = { ...childrenByUID, [uid]: detail.children ?? [] };
       } finally {
         if (generation === childLoadGeneration) {
@@ -358,6 +364,12 @@
   function selectNow(issue: KataTaskSummary) {
     cancelPendingKeyboardSelect();
     onSelect(issue);
+  }
+
+  function openGraph(issue: KataTaskSummary, event: MouseEvent | KeyboardEvent) {
+    event.preventDefault();
+    event.stopPropagation();
+    onOpenGraph?.(issue);
   }
 
   function restartKeyboardSelectTimer() {
@@ -672,58 +684,72 @@
   {@const labels = issue.labels?.join(" · ") ?? ""}
   {@const expandable = hasChildren(issue)}
   {@const isExpanded = expanded[issue.uid] === true}
-  <button
-    class="row issue-row"
-    class:row--child={depth > 0}
-    class:selected={isSelected(issue)}
-    aria-current={isSelected(issue) ? "true" : undefined}
-    aria-expanded={expandable ? isExpanded : undefined}
-    data-uid={issue.uid}
-    style:--task-depth={String(depth)}
-    onclick={() => selectNow(issue)}
-  >
-    <span class="cell cell-id"><span class="id-badge">{displayId(issue)}</span></span>
-    <span class="cell cell-title">
-      {#if expandable}
-        <!-- A span (not a button) inside the row's outer <button> — nesting
-             real interactives is invalid HTML. Clicks still toggle expand
-             via the onclick handler; keyboard equivalents are ArrowRight
-             and ArrowLeft handled at the table level. -->
-        <span
-          class="chevron"
-          class:open={isExpanded}
-          aria-hidden="true"
-          onclick={(event) => toggleExpand(issue, event)}
-        >
-          <ChevronRightIcon size={12} strokeWidth={2} />
-        </span>
-      {:else}
-        <span class="chevron chevron--placeholder" aria-hidden="true"></span>
-      {/if}
-      <span class="title-text">{issue.title}</span>
-    </span>
-    <span class="cell cell-updated" title={issue.updated_at}>
-      {relativeTime(issue.updated_at)}
-    </span>
-    <span class="cell cell-priority">
-      {#if priority}
-        <span class={`pri-pill priority-${issue.priority}`}>{priority}</span>
-      {/if}
-    </span>
-    <span class="cell cell-due" title={issue.metadata.deadline_on ?? ""}>
-      {#if issue.metadata.deadline_on}{shortDate(issue.metadata.deadline_on)}{/if}
-    </span>
-    <span class="cell cell-owner">{issue.owner ?? ""}</span>
-    <span class="cell cell-tags" title={labels}>
-      {#if labels}{labels}{/if}
-    </span>
-    <span class="kit-sr-only">
-      <span>project: {issue.project_name}</span>
-      {#if issue.metadata.deadline_on}<span> · Due {shortDate(issue.metadata.deadline_on)}</span>{/if}
-      {#if issue.owner}<span> · owner: {issue.owner}</span>{/if}
-      {#if issue.priority !== undefined}<span> · priority: {issue.priority}</span>{/if}
-    </span>
-  </button>
+  {@const titleId = `kata-issue-title-${issue.uid}`}
+  <div class="row-frame" style:--task-depth={String(depth)}>
+    <button
+      class="row issue-row"
+      class:row--child={depth > 0}
+      class:selected={isSelected(issue)}
+      aria-current={isSelected(issue) ? "true" : undefined}
+      aria-expanded={expandable ? isExpanded : undefined}
+      data-uid={issue.uid}
+      onclick={() => selectNow(issue)}
+    >
+      <span class="cell cell-id"><span class="id-badge">{displayId(issue)}</span></span>
+      <span class="cell cell-title">
+        {#if expandable}
+          <!-- A span (not a button) inside the row's outer <button> — nesting
+               real interactives is invalid HTML. Clicks still toggle expand
+               via the onclick handler; keyboard equivalents are ArrowRight
+               and ArrowLeft handled at the table level. -->
+          <span
+            class="chevron"
+            class:open={isExpanded}
+            aria-hidden="true"
+            onclick={(event) => toggleExpand(issue, event)}
+          >
+            <ChevronRightIcon size={12} strokeWidth={2} />
+          </span>
+        {:else}
+          <span class="chevron chevron--placeholder" aria-hidden="true"></span>
+        {/if}
+        <span class="title-text" id={titleId}>{issue.title}</span>
+      </span>
+      <span class="cell cell-updated" title={issue.updated_at}>
+        {relativeTime(issue.updated_at)}
+      </span>
+      <span class="cell cell-priority">
+        {#if priority}
+          <span class={`pri-pill priority-${issue.priority}`}>{priority}</span>
+        {/if}
+      </span>
+      <span class="cell cell-due" title={issue.metadata.deadline_on ?? ""}>
+        {#if issue.metadata.deadline_on}{shortDate(issue.metadata.deadline_on)}{/if}
+      </span>
+      <span class="cell cell-owner">{issue.owner ?? ""}</span>
+      <span class="cell cell-tags" title={labels}>
+        {#if labels}{labels}{/if}
+      </span>
+      <span class="kit-sr-only">
+        <span>project: {issue.project_name}</span>
+        {#if issue.metadata.deadline_on}<span> · Due {shortDate(issue.metadata.deadline_on)}</span>{/if}
+        {#if issue.owner}<span> · owner: {issue.owner}</span>{/if}
+        {#if issue.priority !== undefined}<span> · priority: {issue.priority}</span>{/if}
+      </span>
+    </button>
+    {#if onOpenGraph}
+      <button
+        type="button"
+        class="graph-action"
+        aria-label="Open reachable graph"
+        aria-describedby={titleId}
+        title="Open reachable graph"
+        onclick={(event) => openGraph(issue, event)}
+      >
+        <NetworkIcon size={13} strokeWidth={1.9} aria-hidden="true" />
+      </button>
+    {/if}
+  </div>
 
   {#if isExpanded}
     {#if loadingChildren[issue.uid]}
@@ -995,6 +1021,11 @@
     transition: background 0.08s;
   }
 
+  .row-frame {
+    position: relative;
+    min-width: var(--table-min-width);
+  }
+
   .row:hover {
     background: var(--bg-surface-hover);
   }
@@ -1100,6 +1131,40 @@
 
   .chevron--placeholder {
     pointer-events: none;
+  }
+
+  .graph-action {
+    position: absolute;
+    top: 50%;
+    right: 8px;
+    transform: translateY(-50%);
+    width: 22px;
+    height: 22px;
+    border-radius: var(--radius-sm);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: var(--text-muted);
+    opacity: 0;
+    pointer-events: none;
+    cursor: pointer;
+  }
+
+  .row-frame:hover .graph-action,
+  .row-frame:focus-within .graph-action,
+  .graph-action:focus-visible {
+    opacity: 1;
+    pointer-events: auto;
+  }
+
+  .graph-action:hover,
+  .graph-action:focus-visible {
+    background: var(--bg-inset);
+    color: var(--accent-blue);
+    outline: none;
   }
 
   .cell-priority {
