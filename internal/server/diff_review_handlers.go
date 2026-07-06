@@ -13,6 +13,7 @@ import (
 
 	"github.com/danielgtaylor/huma/v2"
 	"go.kenn.io/middleman/internal/db"
+	ghclient "go.kenn.io/middleman/internal/github"
 	"go.kenn.io/middleman/internal/platform"
 )
 
@@ -156,6 +157,328 @@ func (s *Server) discardDiffReviewDraft(
 		return nil, huma.Error500InternalServerError("discard review draft failed")
 	}
 	return &statusOnlyOutput{Status: http.StatusOK}, nil
+}
+
+func (s *Server) applyReviewSuggestions(
+	ctx context.Context,
+	input *applyReviewSuggestionInput,
+) (*applyReviewSuggestionOutput, error) {
+	repo, err := s.requireRepoRouteCapability(
+		ctx,
+		input.Provider, input.PlatformHost, input.Owner, input.Name,
+		capabilityReviewSuggestionApplication,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.requireSyncerCapability(*repo, capabilityReviewSuggestionApplication); err != nil {
+		return nil, err
+	}
+	if err := s.requireReviewSuggestionCapabilities(*repo); err != nil {
+		return nil, err
+	}
+	mr, err := s.db.GetMergeRequestByRepoIDAndNumber(ctx, repo.ID, input.Number)
+	if err != nil {
+		return nil, huma.Error500InternalServerError("get pull request failed")
+	}
+	if mr == nil {
+		return nil, huma.Error404NotFound("pull request not found")
+	}
+	if mr.State != db.MergeRequestStateOpen {
+		return nil, problemConflict(
+			CodeConflict,
+			"pull request is not open",
+			map[string]any{"reason": "not_open"},
+		)
+	}
+	if repoProviderKind(*repo) == platform.KindGitHub && ghclient.ParseHeadRepoFullName(mr.HeadRepoCloneURL) == "" {
+		return nil, problemConflict(
+			CodeConflict,
+			"pull request head repository is unknown",
+			map[string]any{"reason": "head_repo_unknown"},
+		)
+	}
+	if len(input.Body.Suggestions) == 0 {
+		return nil, problemValidation("body.suggestions", "at least one suggestion is required")
+	}
+	caps := s.capabilitiesForRepo(*repo)
+	expectedHeadSHA := strings.TrimSpace(input.Body.ExpectedHeadSHA)
+	if expectedHeadSHA == "" && caps.MutationHeadBinding {
+		return nil, problemValidation(
+			"body.expected_head_sha",
+			"required for this provider: echo the platform_head_sha you rendered",
+		)
+	}
+	if err := s.verifyClientReviewedHead(repo, input.Number, expectedHeadSHA, mr.PlatformHeadSHA); err != nil {
+		return nil, err
+	}
+
+	applier, err := s.syncer.ReviewSuggestionApplier(
+		repoProviderKind(*repo), repoProviderHost(*repo),
+	)
+	if err != nil {
+		return nil, huma.Error404NotFound(err.Error())
+	}
+	suggestions := make([]platform.ReviewSuggestion, 0, len(input.Body.Suggestions))
+	seenThreadIDs := make(map[int64]struct{}, len(input.Body.Suggestions))
+	for i, request := range input.Body.Suggestions {
+		field := "body.suggestions[" + strconv.Itoa(i) + "].thread_id"
+		threadID, err := parseReviewLocalID(request.ThreadID, "review thread")
+		if err != nil {
+			return nil, problemValidation(field, "review thread id must be a positive integer")
+		}
+		if _, ok := seenThreadIDs[threadID]; ok {
+			return nil, problemValidation(field, "duplicate review thread id")
+		}
+		seenThreadIDs[threadID] = struct{}{}
+		thread, err := s.db.GetMRReviewThread(ctx, mr.ID, threadID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil, huma.Error404NotFound("review thread not found")
+			}
+			return nil, huma.Error500InternalServerError("get review thread failed")
+		}
+		if thread == nil {
+			return nil, huma.Error404NotFound("review thread not found")
+		}
+		if err := validateReviewSuggestionThread(*thread, expectedHeadSHA); err != nil {
+			return nil, err
+		}
+		replacement, err := verifyReviewSuggestionReplacement(thread.Body, request.Replacement)
+		if err != nil {
+			return nil, problemValidation(
+				"body.suggestions["+strconv.Itoa(i)+"].replacement",
+				err.Error(),
+			)
+		}
+		suggestions = append(suggestions, platform.ReviewSuggestion{
+			ProviderThreadID:  thread.ProviderThreadID,
+			ProviderCommentID: thread.ProviderCommentID,
+			Range:             platformReviewLineRange(thread.Range),
+			Replacement:       replacement,
+		})
+	}
+	if rate := s.mutationOperationRateLimit(*repo, descApplyReviewSuggestion); rate.limited {
+		return nil, problemOperationRateLimited(*repo, rate)
+	}
+
+	result, err := applier.ApplyReviewSuggestions(
+		ctx,
+		platformRepoRefFromDB(*repo),
+		input.Number,
+		platform.ApplyReviewSuggestionsInput{
+			HeadBranch:       mr.HeadBranch,
+			HeadRepoCloneURL: mr.HeadRepoCloneURL,
+			ExpectedHeadSHA:  expectedHeadSHA,
+			Message:          strings.TrimSpace(input.Body.Message),
+			Suggestions:      suggestions,
+		},
+	)
+	if err != nil {
+		if errors.Is(err, platform.ErrStaleState) {
+			s.syncAfterReviewSuggestionApply(*repo, input.Number)
+		}
+		return nil, providerCallProblemWithDetail(
+			err,
+			string(repoProviderKind(*repo)),
+			repoProviderHost(*repo),
+			"apply review suggestions on provider failed",
+		)
+	}
+	s.syncAfterReviewSuggestionApply(*repo, input.Number)
+	response := applyReviewSuggestionResponse{Status: "applied"}
+	if result != nil {
+		response.CommitSHA = result.CommitSHA
+		response.CommitURL = result.CommitURL
+	}
+	return &applyReviewSuggestionOutput{Body: response}, nil
+}
+
+func validateReviewSuggestionThread(thread db.MRReviewThread, expectedHeadSHA string) error {
+	lineRange := thread.Range
+	if strings.TrimSpace(lineRange.Path) == "" {
+		return huma.Error400BadRequest("review thread path is missing")
+	}
+	if strings.ToLower(strings.TrimSpace(lineRange.Side)) != "right" {
+		return huma.Error400BadRequest("suggestions on removed lines cannot be applied")
+	}
+	if lineRange.Line <= 0 {
+		return huma.Error400BadRequest("review thread line is missing")
+	}
+	if lineRange.StartLine != nil && *lineRange.StartLine <= 0 {
+		return huma.Error400BadRequest("review thread start line is invalid")
+	}
+	if lineRange.StartLine != nil && *lineRange.StartLine > lineRange.Line {
+		return huma.Error400BadRequest("review thread start line must be before line")
+	}
+	if strings.TrimSpace(lineRange.DiffHeadSHA) == "" {
+		return problemConflict(
+			CodeConflict,
+			"review suggestion is missing a reviewed head commit",
+			map[string]any{"reason": "head_unknown"},
+		)
+	}
+	if expectedHeadSHA != "" && lineRange.DiffHeadSHA != expectedHeadSHA {
+		return problemConflict(
+			CodeConflict,
+			"target changed since it was reviewed; refresh and retry",
+			map[string]any{"reason": "stale_state"},
+		)
+	}
+	return nil
+}
+
+func (s *Server) requireReviewSuggestionCapabilities(repo db.Repo) error {
+	caps := s.capabilitiesForRepo(repo)
+	for _, capability := range []string{
+		capabilityMutationHeadBinding,
+		capabilityReadReviewThreads,
+	} {
+		if !capabilityEnabled(caps, capability) {
+			return problemUnsupportedCapability(repo, capability)
+		}
+	}
+	return nil
+}
+
+func verifyReviewSuggestionReplacement(body, replacement string) (string, error) {
+	for _, stored := range markdownSuggestionReplacements(body) {
+		if replacement == stored {
+			return stored, nil
+		}
+	}
+	return "", errors.New("must match a stored review suggestion")
+}
+
+type markdownFence struct {
+	marker byte
+	length int
+	info   string
+}
+
+func markdownSuggestionReplacements(body string) []string {
+	if body == "" {
+		return nil
+	}
+	lines := strings.Split(strings.ReplaceAll(body, "\r\n", "\n"), "\n")
+	replacements := make([]string, 0)
+	for lineIndex := 0; lineIndex < len(lines); {
+		fence, ok := openingMarkdownFence(lines[lineIndex])
+		if !ok {
+			lineIndex++
+			continue
+		}
+		closeIndex := closingMarkdownFenceIndex(lines, lineIndex, fence)
+		if closeIndex == -1 {
+			break
+		}
+		if !markdownFenceInfoIsSuggestion(fence.info) {
+			lineIndex = closeIndex + 1
+			continue
+		}
+		replacements = append(replacements, strings.Join(lines[lineIndex+1:closeIndex], "\n"))
+		lineIndex = closeIndex + 1
+	}
+	return replacements
+}
+
+func closingMarkdownFenceIndex(lines []string, openIndex int, fence markdownFence) int {
+	for i := openIndex + 1; i < len(lines); i++ {
+		if closesMarkdownFence(lines[i], fence) {
+			return i
+		}
+	}
+	return -1
+}
+
+func markdownFenceContent(line string) (string, bool) {
+	line = strings.TrimSuffix(line, "\r")
+	indent := 0
+	for indent < len(line) && indent < 3 && line[indent] == ' ' {
+		indent++
+	}
+	if indent < len(line) && line[indent] == ' ' {
+		return "", false
+	}
+	return line[indent:], true
+}
+
+func openingMarkdownFence(line string) (markdownFence, bool) {
+	line, ok := markdownFenceContent(line)
+	if !ok {
+		return markdownFence{}, false
+	}
+	if len(line) < 3 {
+		return markdownFence{}, false
+	}
+	marker := line[0]
+	if marker != '`' && marker != '~' {
+		return markdownFence{}, false
+	}
+	length := 0
+	for length < len(line) && line[length] == marker {
+		length++
+	}
+	if length < 3 {
+		return markdownFence{}, false
+	}
+	return markdownFence{
+		marker: marker,
+		length: length,
+		info:   strings.TrimSpace(line[length:]),
+	}, true
+}
+
+func markdownFenceInfoIsSuggestion(info string) bool {
+	lower := strings.ToLower(info)
+	if !strings.HasPrefix(lower, "suggestion") {
+		return false
+	}
+	if len(lower) == len("suggestion") {
+		return true
+	}
+	next := rune(lower[len("suggestion")])
+	return next == ':' || next == ' ' || next == '\t'
+}
+
+func closesMarkdownFence(line string, fence markdownFence) bool {
+	line, ok := markdownFenceContent(line)
+	if !ok {
+		return false
+	}
+	count := 0
+	for count < len(line) && line[count] == fence.marker {
+		count++
+	}
+	if count < fence.length {
+		return false
+	}
+	return strings.TrimSpace(line[count:]) == ""
+}
+
+func (s *Server) syncAfterReviewSuggestionApply(repo db.Repo, number int) {
+	kind := repoProviderKind(repo)
+	host := repoProviderHost(repo)
+	key := "pr:" + string(kind) + ":" + host + ":" + repo.RepoPath +
+		"#" + strconv.Itoa(number)
+	s.enqueueDetailSyncOrRerun(
+		key,
+		[]any{
+			"type", "pr",
+			"provider", string(kind),
+			"platform_host", host,
+			"repo_path", repo.RepoPath,
+			"owner", repo.Owner,
+			"name", repo.Name,
+			"number", number,
+			"source", "review_suggestion_apply",
+		},
+		func(ctx context.Context) error {
+			return s.syncer.SyncMROnProvider(
+				ctx, kind, host, repo.Owner, repo.Name, number,
+			)
+		},
+	)
 }
 
 func (s *Server) publishDiffReviewDraft(

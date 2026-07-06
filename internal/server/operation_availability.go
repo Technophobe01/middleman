@@ -17,26 +17,27 @@ import (
 // of RepoOperations and are part of the wire contract; renaming one
 // is a breaking change for clients pinned to an older schema.
 const (
-	operationMergePR             = "merge_pr"
-	operationClosePR             = "close_pr"
-	operationReopenPR            = "reopen_pr"
-	operationMarkReadyForReview  = "mark_ready_for_review"
-	operationMarkDraft           = "mark_draft"
-	operationSubmitReview        = "submit_review"
-	operationReviewDraft         = "review_draft"
-	operationAddComment          = "add_comment"
-	operationEditComment         = "edit_comment"
-	operationAddLabel            = "add_label"
-	operationRemoveLabel         = "remove_label"
-	operationSetAssignees        = "set_assignees"
-	operationSetReviewers        = "set_reviewers"
-	operationCreateIssue         = "create_issue"
-	operationCloseIssue          = "close_issue"
-	operationReopenIssue         = "reopen_issue"
-	operationApproveWorkflow     = "approve_workflow"
-	operationUpdateContent       = "update_content"
-	operationReplyReviewThread   = "reply_review_thread"
-	operationResolveReviewThread = "resolve_review_thread"
+	operationMergePR               = "merge_pr"
+	operationClosePR               = "close_pr"
+	operationReopenPR              = "reopen_pr"
+	operationMarkReadyForReview    = "mark_ready_for_review"
+	operationMarkDraft             = "mark_draft"
+	operationSubmitReview          = "submit_review"
+	operationReviewDraft           = "review_draft"
+	operationAddComment            = "add_comment"
+	operationEditComment           = "edit_comment"
+	operationAddLabel              = "add_label"
+	operationRemoveLabel           = "remove_label"
+	operationSetAssignees          = "set_assignees"
+	operationSetReviewers          = "set_reviewers"
+	operationCreateIssue           = "create_issue"
+	operationCloseIssue            = "close_issue"
+	operationReopenIssue           = "reopen_issue"
+	operationApproveWorkflow       = "approve_workflow"
+	operationUpdateContent         = "update_content"
+	operationReplyReviewThread     = "reply_review_thread"
+	operationResolveReviewThread   = "resolve_review_thread"
+	operationApplyReviewSuggestion = string(platform.OperationApplyReviewSuggestion)
 )
 
 // Availability codes returned to clients. Empty code means available.
@@ -87,30 +88,31 @@ type OperationAvailability struct {
 // frontend helper packages/ui/.../operation-gates.ts implements this
 // side of the contract.
 type RepoOperations struct {
-	MergePR             OperationAvailability `json:"merge_pr"`
-	ClosePR             OperationAvailability `json:"close_pr"`
-	ReopenPR            OperationAvailability `json:"reopen_pr"`
-	MarkReadyForReview  OperationAvailability `json:"mark_ready_for_review"`
-	MarkDraft           OperationAvailability `json:"mark_draft"`
-	SubmitReview        OperationAvailability `json:"submit_review"`
-	ReviewDraft         OperationAvailability `json:"review_draft"`
-	AddComment          OperationAvailability `json:"add_comment"`
-	EditComment         OperationAvailability `json:"edit_comment"`
-	AddLabel            OperationAvailability `json:"add_label"`
-	RemoveLabel         OperationAvailability `json:"remove_label"`
-	SetAssignees        OperationAvailability `json:"set_assignees"`
-	SetReviewers        OperationAvailability `json:"set_reviewers"`
-	CreateIssue         OperationAvailability `json:"create_issue"`
-	CloseIssue          OperationAvailability `json:"close_issue"`
-	ReopenIssue         OperationAvailability `json:"reopen_issue"`
-	ApproveWorkflow     OperationAvailability `json:"approve_workflow"`
-	UpdateContent       OperationAvailability `json:"update_content"`
-	ReplyReviewThread   OperationAvailability `json:"reply_review_thread"`
-	ResolveReviewThread OperationAvailability `json:"resolve_review_thread"`
+	MergePR               OperationAvailability `json:"merge_pr"`
+	ClosePR               OperationAvailability `json:"close_pr"`
+	ReopenPR              OperationAvailability `json:"reopen_pr"`
+	MarkReadyForReview    OperationAvailability `json:"mark_ready_for_review"`
+	MarkDraft             OperationAvailability `json:"mark_draft"`
+	SubmitReview          OperationAvailability `json:"submit_review"`
+	ReviewDraft           OperationAvailability `json:"review_draft"`
+	AddComment            OperationAvailability `json:"add_comment"`
+	EditComment           OperationAvailability `json:"edit_comment"`
+	AddLabel              OperationAvailability `json:"add_label"`
+	RemoveLabel           OperationAvailability `json:"remove_label"`
+	SetAssignees          OperationAvailability `json:"set_assignees"`
+	SetReviewers          OperationAvailability `json:"set_reviewers"`
+	CreateIssue           OperationAvailability `json:"create_issue"`
+	CloseIssue            OperationAvailability `json:"close_issue"`
+	ReopenIssue           OperationAvailability `json:"reopen_issue"`
+	ApproveWorkflow       OperationAvailability `json:"approve_workflow"`
+	UpdateContent         OperationAvailability `json:"update_content"`
+	ReplyReviewThread     OperationAvailability `json:"reply_review_thread"`
+	ResolveReviewThread   OperationAvailability `json:"resolve_review_thread"`
+	ApplyReviewSuggestion OperationAvailability `json:"apply_review_suggestion"`
 }
 
 // operationDescriptor lists the capabilities an operation needs and
-// the API bucket it consumes. requiredCapabilities is checked in
+// the API bucket or buckets it consumes. requiredCapabilities is checked in
 // declaration order so the first missing capability becomes
 // RequiredCapability, giving deterministic behavior when multiple
 // are absent.
@@ -118,6 +120,7 @@ type operationDescriptor struct {
 	name                 string
 	requiredCapabilities []string
 	bucket               apiBucket
+	extraBuckets         []apiBucket
 }
 
 type operationAvailabilityContext struct {
@@ -155,9 +158,18 @@ var (
 	// budget of the routes that serve them; review-thread reply and
 	// resolution are REST on every provider that supports them (GitHub
 	// replies via REST comments, GitLab discussions via REST).
-	descUpdateContent       = operationDescriptor{name: operationUpdateContent, requiredCapabilities: []string{capabilityStateMutation}, bucket: apiBucketREST}
-	descReplyReviewThread   = operationDescriptor{name: operationReplyReviewThread, requiredCapabilities: []string{capabilityThreadReply}, bucket: apiBucketREST}
-	descResolveReviewThread = operationDescriptor{name: operationResolveReviewThread, requiredCapabilities: []string{capabilityReviewThreadResolution}, bucket: apiBucketREST}
+	descUpdateContent         = operationDescriptor{name: operationUpdateContent, requiredCapabilities: []string{capabilityStateMutation}, bucket: apiBucketREST}
+	descReplyReviewThread     = operationDescriptor{name: operationReplyReviewThread, requiredCapabilities: []string{capabilityThreadReply}, bucket: apiBucketREST}
+	descResolveReviewThread   = operationDescriptor{name: operationResolveReviewThread, requiredCapabilities: []string{capabilityReviewThreadResolution}, bucket: apiBucketREST}
+	descApplyReviewSuggestion = operationDescriptor{
+		name: operationApplyReviewSuggestion,
+		requiredCapabilities: []string{
+			capabilityReviewSuggestionApplication,
+			capabilityMutationHeadBinding,
+			capabilityReadReviewThreads,
+		},
+		bucket: apiBucketREST,
+	}
 )
 
 // repoOperations derives the availability of every operation for a
@@ -175,38 +187,42 @@ func (s *Server) repoOperationsWithContext(
 	opContext operationAvailabilityContext,
 ) RepoOperations {
 	caps := s.capabilitiesForRepo(repo)
-	rates := map[apiBucket]rateLimitAvailability{
-		apiBucketREST:    s.mutationRateLimitedReason(repo, apiBucketREST),
-		apiBucketGraphQL: s.mutationRateLimitedReason(repo, apiBucketGraphQL),
-	}
 	writeCred := s.writeCredentialGateForRepo(repo)
 	derive := func(op operationDescriptor) OperationAvailability {
 		return deriveOperationAvailabilityWithContext(
-			op, caps, repo, rates[op.bucket], writeCred, opContext,
+			op, caps, repo, s.mutationOperationRateLimit(repo, op), writeCred, opContext,
 		)
 	}
 	return RepoOperations{
-		MergePR:             derive(descMergePR),
-		ClosePR:             derive(descClosePR),
-		ReopenPR:            derive(descReopenPR),
-		MarkReadyForReview:  derive(descMarkReadyForReview),
-		MarkDraft:           derive(descMarkDraft),
-		SubmitReview:        derive(descSubmitReview),
-		ReviewDraft:         derive(descReviewDraft),
-		AddComment:          derive(descAddComment),
-		EditComment:         derive(descEditComment),
-		AddLabel:            derive(descAddLabel),
-		RemoveLabel:         derive(descRemoveLabel),
-		SetAssignees:        derive(descSetAssignees),
-		SetReviewers:        derive(descSetReviewers),
-		CreateIssue:         derive(descCreateIssue),
-		CloseIssue:          derive(descCloseIssue),
-		ReopenIssue:         derive(descReopenIssue),
-		ApproveWorkflow:     derive(descApproveWorkflow),
-		UpdateContent:       derive(descUpdateContent),
-		ReplyReviewThread:   derive(descReplyReviewThread),
-		ResolveReviewThread: derive(descResolveReviewThread),
+		MergePR:               derive(descMergePR),
+		ClosePR:               derive(descClosePR),
+		ReopenPR:              derive(descReopenPR),
+		MarkReadyForReview:    derive(descMarkReadyForReview),
+		MarkDraft:             derive(descMarkDraft),
+		SubmitReview:          derive(descSubmitReview),
+		ReviewDraft:           derive(descReviewDraft),
+		AddComment:            derive(descAddComment),
+		EditComment:           derive(descEditComment),
+		AddLabel:              derive(descAddLabel),
+		RemoveLabel:           derive(descRemoveLabel),
+		SetAssignees:          derive(descSetAssignees),
+		SetReviewers:          derive(descSetReviewers),
+		CreateIssue:           derive(descCreateIssue),
+		CloseIssue:            derive(descCloseIssue),
+		ReopenIssue:           derive(descReopenIssue),
+		ApproveWorkflow:       derive(descApproveWorkflow),
+		UpdateContent:         derive(descUpdateContent),
+		ReplyReviewThread:     derive(descReplyReviewThread),
+		ResolveReviewThread:   derive(descResolveReviewThread),
+		ApplyReviewSuggestion: derive(descApplyReviewSuggestion),
 	}
+}
+
+func (s *Server) mutationOperationRateLimit(repo db.Repo, op operationDescriptor) rateLimitAvailability {
+	return s.operationRateLimit(repo, op, map[apiBucket]rateLimitAvailability{
+		apiBucketREST:    s.mutationRateLimitedReason(repo, apiBucketREST),
+		apiBucketGraphQL: s.mutationRateLimitedReason(repo, apiBucketGraphQL),
+	})
 }
 
 func (s *Server) repoOperationsForMergeRequest(
@@ -308,6 +324,79 @@ func (s *Server) mergeRequestAuthoredByViewer(
 		return false
 	}
 	return authored
+}
+
+func (s *Server) operationRateLimit(
+	repo db.Repo,
+	op operationDescriptor,
+	rates map[apiBucket]rateLimitAvailability,
+) rateLimitAvailability {
+	buckets, ok := s.operationRateLimitBuckets(repo, op)
+	if !ok {
+		return invalidOperationRateLimitBucketReport(op)
+	}
+	return operationRateLimitForBuckets(buckets, rates)
+}
+
+func (s *Server) operationRateLimitBuckets(repo db.Repo, op operationDescriptor) ([]apiBucket, bool) {
+	if s != nil && s.syncer != nil && s.syncer.Registry() != nil {
+		provider, err := s.syncer.Registry().Provider(repoProviderKind(repo), repoProviderHost(repo))
+		if err == nil {
+			if reporter, ok := provider.(platform.OperationRateLimitReporter); ok {
+				if buckets, ok := reporter.OperationRateLimitBuckets(platform.OperationName(op.name)); ok {
+					if converted, ok := apiBucketsFromPlatform(buckets); ok {
+						return converted, true
+					}
+					return nil, false
+				}
+			}
+		}
+	}
+	return op.rateLimitBuckets(), true
+}
+
+func apiBucketsFromPlatform(buckets []platform.RateLimitBucket) ([]apiBucket, bool) {
+	if len(buckets) == 0 {
+		return nil, false
+	}
+	result := make([]apiBucket, 0, len(buckets))
+	for _, bucket := range buckets {
+		switch bucket {
+		case platform.RateLimitBucketREST:
+			result = append(result, apiBucketREST)
+		case platform.RateLimitBucketGraphQL:
+			result = append(result, apiBucketGraphQL)
+		default:
+			return nil, false
+		}
+	}
+	return result, true
+}
+
+func invalidOperationRateLimitBucketReport(op operationDescriptor) rateLimitAvailability {
+	return rateLimitAvailability{
+		limited: true,
+		reason:  fmt.Sprintf("Provider reported invalid rate-limit buckets for %s", op.name),
+	}
+}
+
+func (op operationDescriptor) rateLimitBuckets() []apiBucket {
+	buckets := make([]apiBucket, 0, 1+len(op.extraBuckets))
+	buckets = append(buckets, op.bucket)
+	buckets = append(buckets, op.extraBuckets...)
+	return buckets
+}
+
+func operationRateLimitForBuckets(
+	buckets []apiBucket,
+	rates map[apiBucket]rateLimitAvailability,
+) rateLimitAvailability {
+	for _, bucket := range buckets {
+		if rate := rates[bucket]; rate.limited {
+			return rate
+		}
+	}
+	return rateLimitAvailability{}
 }
 
 // rateLimitAvailability is the result of consulting a rate tracker

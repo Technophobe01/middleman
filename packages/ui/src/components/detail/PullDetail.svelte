@@ -20,6 +20,7 @@
   import { renderMarkdown, renderMarkdownSync } from "../../utils/markdown.js";
   import { buildPullRequestFilesRoute } from "../../routes.js";
   import { moveTaskListItem, toggleTaskListItem } from "../../utils/task-list.js";
+  import type { ApplySuggestionRequest } from "../../utils/markdown-suggestions.js";
   import { firstUnavailableGate, operationGate } from "./operation-gates.js";
   import { CopyButton, formatRelativeTime } from "@kenn-io/kit-ui";
   import { copyToClipboard } from "@kenn-io/kit-ui";
@@ -118,6 +119,7 @@
     thread_resolve: false,
     review_draft_mutation: false,
     review_thread_resolution: false,
+    review_suggestion_application: false,
     read_review_threads: false,
     native_multiline_ranges: false,
     mutation_head_binding: false,
@@ -273,6 +275,12 @@
     if (stalePR) return false;
     if (event.PlatformID === null) return false;
     return detailStore.editComment(owner, name, number, event.PlatformID, body);
+  }
+
+  async function applyTimelineSuggestion(input: ApplySuggestionRequest): Promise<boolean> {
+    if (stalePR || headActionsBlocked || applySuggestionGate.unavailable) return false;
+    if (currentPR()?.State !== "open") return false;
+    return detailStore.applyReviewSuggestions(owner, name, number, input);
   }
 
   function updateTimelineFilter(next: PRTimelineFilterState): void {
@@ -747,6 +755,7 @@
   const contentGate = $derived(operationGate(repoOperations?.update_content));
   const replyThreadGate = $derived(operationGate(repoOperations?.reply_review_thread));
   const resolveThreadGate = $derived(operationGate(repoOperations?.resolve_review_thread));
+  const applySuggestionGate = $derived(operationGate(repoOperations?.apply_review_suggestion));
 
   const kanbanOptions: { value: KanbanStatus; label: string }[] = [
     { value: "new", label: "New" },
@@ -2331,6 +2340,7 @@
             repoName={name}
             {repoPath}
             {number}
+            currentHeadSHA={latestPlatformHeadSha}
             canResolveReviewThreads={capabilities.review_thread_resolution && !resolveThreadGate.unavailable}
             canReplyToThreads={capabilities.thread_reply && !stalePR && !replyThreadGate.unavailable}
             filtered={hasActiveTimelineFilters}
@@ -2339,6 +2349,13 @@
             onEditComment={capabilities.comment_mutation && !stalePR && !editCommentGate.unavailable
               ? editTimelineComment
               : undefined}
+            onApplySuggestion={capabilities.review_suggestion_application
+              && !stalePR
+              && pr.State === "open"
+              && !headActionsBlocked
+              && !applySuggestionGate.unavailable
+                ? applyTimelineSuggestion
+                : undefined}
             {jumpToReviewThread}
           />
         {:else if detailStore.isDetailSyncing()}

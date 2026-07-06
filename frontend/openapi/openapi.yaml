@@ -243,6 +243,82 @@ components:
         - attachment_size
         - attachment_count
       type: object
+    ApplyReviewSuggestionHostInputBody:
+      additionalProperties: false
+      properties:
+        $schema:
+          description: A URL to the JSON Schema for this object.
+          examples:
+            - /api/v1/schemas/ApplyReviewSuggestionHostInputBody.json
+          format: uri
+          readOnly: true
+          type: string
+        expected_head_sha:
+          type: string
+        message:
+          type: string
+        suggestions:
+          items:
+            $ref: "#/components/schemas/ApplyReviewSuggestionRequestItem"
+          type:
+            - array
+            - "null"
+      required:
+        - suggestions
+      type: object
+    ApplyReviewSuggestionInputBody:
+      additionalProperties: false
+      properties:
+        $schema:
+          description: A URL to the JSON Schema for this object.
+          examples:
+            - /api/v1/schemas/ApplyReviewSuggestionInputBody.json
+          format: uri
+          readOnly: true
+          type: string
+        expected_head_sha:
+          type: string
+        message:
+          type: string
+        suggestions:
+          items:
+            $ref: "#/components/schemas/ApplyReviewSuggestionRequestItem"
+          type:
+            - array
+            - "null"
+      required:
+        - suggestions
+      type: object
+    ApplyReviewSuggestionRequestItem:
+      additionalProperties: false
+      properties:
+        replacement:
+          type: string
+        thread_id:
+          type: string
+      required:
+        - thread_id
+        - replacement
+      type: object
+    ApplyReviewSuggestionResponse:
+      additionalProperties: false
+      properties:
+        $schema:
+          description: A URL to the JSON Schema for this object.
+          examples:
+            - /api/v1/schemas/ApplyReviewSuggestionResponse.json
+          format: uri
+          readOnly: true
+          type: string
+        commit_sha:
+          type: string
+        commit_url:
+          type: string
+        status:
+          type: string
+      required:
+        - status
+      type: object
     ApprovePRHostInputBody:
       additionalProperties: false
       properties:
@@ -864,6 +940,9 @@ components:
             - /api/v1/schemas/DiffResponse.json
           format: uri
           readOnly: true
+          type: string
+        diff_head_sha:
+          description: Synced PR diff snapshot head this diff was computed from. Always set for pull request diffs (the endpoint fails when no snapshot head is synced); empty for commit and workspace diffs. Compare with the pull detail's platform_head_sha to detect stale cached diff context; unrelated to 'stale', which reports clone-refresh staleness.
           type: string
         files:
           items:
@@ -4245,6 +4324,8 @@ components:
           type: boolean
         review_mutation:
           type: boolean
+        review_suggestion_application:
+          type: boolean
         review_thread_resolution:
           type: boolean
         reviewer_mutation:
@@ -4286,6 +4367,7 @@ components:
         - thread_resolve
         - review_draft_mutation
         - review_thread_resolution
+        - review_suggestion_application
         - read_review_threads
         - native_multiline_ranges
         - mutation_head_binding
@@ -5204,6 +5286,8 @@ components:
           $ref: "#/components/schemas/OperationAvailability"
         add_label:
           $ref: "#/components/schemas/OperationAvailability"
+        apply_review_suggestion:
+          $ref: "#/components/schemas/OperationAvailability"
         approve_workflow:
           $ref: "#/components/schemas/OperationAvailability"
         close_issue:
@@ -5261,6 +5345,7 @@ components:
         - update_content
         - reply_review_thread
         - resolve_review_thread
+        - apply_review_suggestion
       type: object
     RepoPreviewRequest:
       additionalProperties: false
@@ -10961,6 +11046,58 @@ paths:
       summary: Review pull request diff
       tags:
         - Pull Requests
+  /host/{platform_host}/pulls/{provider}/{owner}/{name}/{number}/review-suggestions/apply:
+    post:
+      operationId: apply-pr-review-suggestions-on-host
+      parameters:
+        - in: path
+          name: provider
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: platform_host
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: owner
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: name
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: number
+          required: true
+          schema:
+            format: int64
+            type: integer
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ApplyReviewSuggestionHostInputBody"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApplyReviewSuggestionResponse"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemError"
+          description: Error
+      summary: Apply pull request review suggestions
+      tags:
+        - Pull Requests
   /host/{platform_host}/pulls/{provider}/{owner}/{name}/{number}/review-threads/{thread_id}/resolve:
     post:
       operationId: resolve-pr-review-thread-on-host
@@ -15276,6 +15413,53 @@ paths:
                 $ref: "#/components/schemas/ProblemError"
           description: Error
       summary: Review pull request diff
+      tags:
+        - Pull Requests
+  /pulls/{provider}/{owner}/{name}/{number}/review-suggestions/apply:
+    post:
+      operationId: apply-pr-review-suggestions
+      parameters:
+        - in: path
+          name: provider
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: owner
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: name
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: number
+          required: true
+          schema:
+            format: int64
+            type: integer
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ApplyReviewSuggestionInputBody"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApplyReviewSuggestionResponse"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemError"
+          description: Error
+      summary: Apply pull request review suggestions
       tags:
         - Pull Requests
   /pulls/{provider}/{owner}/{name}/{number}/review-threads/{thread_id}/resolve:

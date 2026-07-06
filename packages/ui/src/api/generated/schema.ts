@@ -1497,6 +1497,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/host/{platform_host}/pulls/{provider}/{owner}/{name}/{number}/review-suggestions/apply": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Apply pull request review suggestions */
+        post: operations["apply-pr-review-suggestions-on-host"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/host/{platform_host}/pulls/{provider}/{owner}/{name}/{number}/review-threads/{thread_id}/resolve": {
         parameters: {
             query?: never;
@@ -3090,6 +3107,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/pulls/{provider}/{owner}/{name}/{number}/review-suggestions/apply": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Apply pull request review suggestions */
+        post: operations["apply-pr-review-suggestions"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/pulls/{provider}/{owner}/{name}/{number}/review-threads/{thread_id}/resolve": {
         parameters: {
             query?: never;
@@ -4233,6 +4267,43 @@ export interface components {
             /** Format: int64 */
             total_size: number;
         };
+        ApplyReviewSuggestionHostInputBody: {
+            /**
+             * Format: uri
+             * @description A URL to the JSON Schema for this object.
+             * @example /api/v1/schemas/ApplyReviewSuggestionHostInputBody.json
+             */
+            readonly $schema?: string;
+            expected_head_sha?: string;
+            message?: string;
+            suggestions: components["schemas"]["ApplyReviewSuggestionRequestItem"][] | null;
+        };
+        ApplyReviewSuggestionInputBody: {
+            /**
+             * Format: uri
+             * @description A URL to the JSON Schema for this object.
+             * @example /api/v1/schemas/ApplyReviewSuggestionInputBody.json
+             */
+            readonly $schema?: string;
+            expected_head_sha?: string;
+            message?: string;
+            suggestions: components["schemas"]["ApplyReviewSuggestionRequestItem"][] | null;
+        };
+        ApplyReviewSuggestionRequestItem: {
+            replacement: string;
+            thread_id: string;
+        };
+        ApplyReviewSuggestionResponse: {
+            /**
+             * Format: uri
+             * @description A URL to the JSON Schema for this object.
+             * @example /api/v1/schemas/ApplyReviewSuggestionResponse.json
+             */
+            readonly $schema?: string;
+            commit_sha?: string;
+            commit_url?: string;
+            status: string;
+        };
         ApprovePRHostInputBody: {
             /**
              * Format: uri
@@ -4534,6 +4605,8 @@ export interface components {
              * @example /api/v1/schemas/DiffResponse.json
              */
             readonly $schema?: string;
+            /** @description Synced PR diff snapshot head this diff was computed from. Always set for pull request diffs (the endpoint fails when no snapshot head is synced); empty for commit and workspace diffs. Compare with the pull detail's platform_head_sha to detect stale cached diff context; unrelated to 'stale', which reports clone-refresh staleness. */
+            diff_head_sha?: string;
             files: components["schemas"]["DiffFile"][] | null;
             stale: boolean;
             /** Format: int64 */
@@ -6041,6 +6114,7 @@ export interface components {
             ready_for_review: boolean;
             review_draft_mutation: boolean;
             review_mutation: boolean;
+            review_suggestion_application: boolean;
             review_thread_resolution: boolean;
             reviewer_mutation: boolean;
             state_mutation: boolean;
@@ -6484,6 +6558,7 @@ export interface components {
         RepoOperations: {
             add_comment: components["schemas"]["OperationAvailability"];
             add_label: components["schemas"]["OperationAvailability"];
+            apply_review_suggestion: components["schemas"]["OperationAvailability"];
             approve_workflow: components["schemas"]["OperationAvailability"];
             close_issue: components["schemas"]["OperationAvailability"];
             close_pr: components["schemas"]["OperationAvailability"];
@@ -10626,6 +10701,45 @@ export interface operations {
             };
         };
     };
+    "apply-pr-review-suggestions-on-host": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                provider: string;
+                platform_host: string;
+                owner: string;
+                name: string;
+                number: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ApplyReviewSuggestionHostInputBody"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApplyReviewSuggestionResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemError"];
+                };
+            };
+        };
+    };
     "resolve-pr-review-thread-on-host": {
         parameters: {
             query?: never;
@@ -14225,6 +14339,44 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ActionStatusBody"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemError"];
+                };
+            };
+        };
+    };
+    "apply-pr-review-suggestions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                provider: string;
+                owner: string;
+                name: string;
+                number: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ApplyReviewSuggestionInputBody"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApplyReviewSuggestionResponse"];
                 };
             };
             /** @description Error */

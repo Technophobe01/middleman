@@ -3,6 +3,7 @@ package github
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -19,6 +20,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"go.kenn.io/middleman/internal/platform"
 	"go.kenn.io/middleman/internal/tokenauth"
 )
 
@@ -78,6 +80,797 @@ func TestClientInterfaceIncludesListPullRequestTimelineEvents(t *testing.T) {
 func TestClientInterfaceIncludesListPullRequestReviewThreads(t *testing.T) {
 	_, ok := reflect.TypeFor[Client]().MethodByName("ListPullRequestReviewThreads")
 	require.True(t, ok)
+}
+
+func TestApplyReviewSuggestionEdits(t *testing.T) {
+	assert := assert.New(t)
+	content := "package main\nfunc main() {\n\tfmt.Println(\"old\")\n}\n"
+
+	got, err := applyReviewSuggestionEdits(content, []platform.ReviewSuggestion{
+		{
+			Range: platform.DiffReviewLineRange{
+				Path: "main.go",
+				Side: "right",
+				Line: 3,
+			},
+			Replacement: "\tfmt.Println(\"new\")\n\tfmt.Println(\"done\")",
+		},
+	})
+
+	require.NoError(t, err)
+	assert.Equal("package main\nfunc main() {\n\tfmt.Println(\"new\")\n\tfmt.Println(\"done\")\n}\n", got)
+}
+
+func TestApplyReviewSuggestionEditsRejectsOverlap(t *testing.T) {
+	startLine := 1
+	_, err := applyReviewSuggestionEdits("a\nb\nc\n", []platform.ReviewSuggestion{
+		{
+			Range:       platform.DiffReviewLineRange{Path: "main.go", Side: "right", StartLine: &startLine, Line: 2},
+			Replacement: "x",
+		},
+		{
+			Range:       platform.DiffReviewLineRange{Path: "main.go", Side: "right", Line: 2},
+			Replacement: "y",
+		},
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "overlapping")
+}
+
+func TestApplyReviewSuggestionEditsPreservesTrailingBlankReplacementLine(t *testing.T) {
+	got, err := applyReviewSuggestionEdits("one\ntwo\n", []platform.ReviewSuggestion{
+		{
+			Range:       platform.DiffReviewLineRange{Path: "main.go", Side: "right", Line: 2},
+			Replacement: "TWO\n",
+		},
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, "one\nTWO\n\n", got)
+}
+
+func TestApplyReviewSuggestionEditsDeletesOnlyLineWithoutLeavingNewline(t *testing.T) {
+	got, err := applyReviewSuggestionEdits("only\n", []platform.ReviewSuggestion{
+		{
+			Range:       platform.DiffReviewLineRange{Path: "main.go", Side: "right", Line: 1},
+			Replacement: "",
+		},
+	})
+
+	require.NoError(t, err)
+	assert.Empty(t, got)
+}
+
+func TestApplyReviewSuggestionsRejectsWhitespacePaddedPath(t *testing.T) {
+	content := base64.StdEncoding.EncodeToString([]byte("one\ntwo\n"))
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/repos/fork/widget/contents/src/main.go", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"type":"file","encoding":"base64","content":"` + content + `","path":"src/main.go","sha":"file-sha"}`))
+	})
+	mux.HandleFunc("/graphql", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":{"createCommitOnBranch":{"commit":{"oid":"commit-sha","url":"https://github.com/fork/widget/commit/commit-sha"}}}}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	ghClient, err := gh.NewClient(srv.Client()).WithEnterpriseURLs(
+		srv.URL+"/api/v3/",
+		srv.URL+"/api/uploads/",
+	)
+	require.NoError(t, err)
+	client := &liveClient{
+		gh:              ghClient,
+		ghWrite:         ghClient,
+		httpWriteClient: srv.Client(),
+		graphQLEndpoint: srv.URL + "/graphql",
+	}
+
+	_, err = client.ApplyReviewSuggestions(t.Context(), "acme", "widget", 7, platform.ApplyReviewSuggestionsInput{
+		HeadBranch:       "feature/suggestion",
+		HeadRepoCloneURL: "https://github.com/fork/widget.git",
+		ExpectedHeadSHA:  "head-sha",
+		Suggestions: []platform.ReviewSuggestion{{
+			Range:       platform.DiffReviewLineRange{Path: "src/main.go ", Side: "right", Line: 2},
+			Replacement: "TWO",
+		}},
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "leading or trailing whitespace")
+}
+
+func TestApplyReviewSuggestionsCreatesBoundCommit(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	content := base64.StdEncoding.EncodeToString([]byte("one\ntwo\nthree\n"))
+	var graphqlPayload graphQLRequest
+	var graphqlDecodeErr error
+	var pullCalls int
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/repos/acme/widget/pulls/7", func(w http.ResponseWriter, _ *http.Request) {
+		pullCalls++
+		writeReviewSuggestionPullResponse(w, "open", "fork/widget")
+	})
+	mux.HandleFunc("/api/v3/repos/fork/widget", func(w http.ResponseWriter, _ *http.Request) {
+		writeReviewSuggestionRepositoryResponse(w, "fork/widget")
+	})
+	mux.HandleFunc("/api/v3/repos/fork/widget/contents/src/main.go", func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(http.MethodGet, r.Method)
+		assert.Equal("head-sha", r.URL.Query().Get("ref"))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"type":"file","encoding":"base64","content":"` + content + `","path":"src/main.go","sha":"file-sha"}`))
+	})
+	mux.HandleFunc("/graphql", func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(http.MethodPost, r.Method)
+		graphqlDecodeErr = json.NewDecoder(r.Body).Decode(&graphqlPayload)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":{"createCommitOnBranch":{"commit":{"oid":"commit-sha","url":"https://github.com/fork/widget/commit/commit-sha"}}}}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	ghClient, err := gh.NewClient(srv.Client()).WithEnterpriseURLs(
+		srv.URL+"/api/v3/",
+		srv.URL+"/api/uploads/",
+	)
+	require.NoError(err)
+	client := &liveClient{
+		gh:              ghClient,
+		ghWrite:         ghClient,
+		httpWriteClient: srv.Client(),
+		graphQLEndpoint: srv.URL + "/graphql",
+	}
+
+	result, err := client.ApplyReviewSuggestions(t.Context(), "acme", "widget", 7, platform.ApplyReviewSuggestionsInput{
+		HeadBranch:       "feature/suggestion",
+		HeadRepoCloneURL: "https://github.com/fork/widget.git",
+		ExpectedHeadSHA:  "head-sha",
+		Message:          "Apply suggested fix",
+		Suggestions: []platform.ReviewSuggestion{{
+			Range:       platform.DiffReviewLineRange{Path: "src/main.go", Side: "right", Line: 2},
+			Replacement: "TWO",
+		}},
+	})
+
+	require.NoError(err)
+	require.NoError(graphqlDecodeErr)
+	assert.Equal("commit-sha", result.CommitSHA)
+	variables := graphqlPayload.Variables["input"].(map[string]any)
+	branch := variables["branch"].(map[string]any)
+	assert.Equal("fork/widget", branch["repositoryNameWithOwner"])
+	assert.Equal("feature/suggestion", branch["branchName"])
+	assert.Equal("head-sha", variables["expectedHeadOid"])
+	assert.Equal("Apply suggested fix", variables["message"].(map[string]any)["headline"])
+	additions := variables["fileChanges"].(map[string]any)["additions"].([]any)
+	require.Len(additions, 1)
+	addition := additions[0].(map[string]any)
+	assert.Equal("src/main.go", addition["path"])
+	decoded, err := base64.StdEncoding.DecodeString(addition["contents"].(string))
+	require.NoError(err)
+	assert.Equal("one\nTWO\nthree\n", string(decoded))
+	assert.Equal(2, pullCalls)
+}
+
+func TestApplyReviewSuggestionsProbesHeadRepoWithWriteCredential(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	content := base64.StdEncoding.EncodeToString([]byte("one\ntwo\nthree\n"))
+	var pullCalls int
+	var readRepoCalls int
+	var writeRepoCalls int
+	var contentCalls int
+	var graphQLCalls int
+
+	readMux := http.NewServeMux()
+	readMux.HandleFunc("/api/v3/repos/acme/widget/pulls/7", func(w http.ResponseWriter, _ *http.Request) {
+		pullCalls++
+		writeReviewSuggestionPullResponse(w, "open", "fork/widget")
+	})
+	readMux.HandleFunc("/api/v3/repos/fork/widget", func(w http.ResponseWriter, _ *http.Request) {
+		readRepoCalls++
+		http.Error(w, "read credential cannot see fork", http.StatusNotFound)
+	})
+	readSrv := httptest.NewServer(readMux)
+	defer readSrv.Close()
+
+	writeMux := http.NewServeMux()
+	writeMux.HandleFunc("/api/v3/repos/fork/widget", func(w http.ResponseWriter, _ *http.Request) {
+		writeRepoCalls++
+		writeReviewSuggestionRepositoryResponse(w, "fork/widget")
+	})
+	writeMux.HandleFunc("/api/v3/repos/fork/widget/contents/src/main.go", func(w http.ResponseWriter, _ *http.Request) {
+		contentCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"type":"file","encoding":"base64","content":"` + content + `","path":"src/main.go","sha":"file-sha"}`))
+	})
+	writeMux.HandleFunc("/graphql", func(w http.ResponseWriter, _ *http.Request) {
+		graphQLCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":{"createCommitOnBranch":{"commit":{"oid":"commit-sha","url":"https://github.com/fork/widget/commit/commit-sha"}}}}`))
+	})
+	writeSrv := httptest.NewServer(writeMux)
+	defer writeSrv.Close()
+
+	readGH, err := gh.NewClient(readSrv.Client()).WithEnterpriseURLs(
+		readSrv.URL+"/api/v3/",
+		readSrv.URL+"/api/uploads/",
+	)
+	require.NoError(err)
+	writeGH, err := gh.NewClient(writeSrv.Client()).WithEnterpriseURLs(
+		writeSrv.URL+"/api/v3/",
+		writeSrv.URL+"/api/uploads/",
+	)
+	require.NoError(err)
+	client := &liveClient{
+		gh:              readGH,
+		ghWrite:         writeGH,
+		httpWriteClient: writeSrv.Client(),
+		graphQLEndpoint: writeSrv.URL + "/graphql",
+	}
+
+	result, err := client.ApplyReviewSuggestions(t.Context(), "acme", "widget", 7, platform.ApplyReviewSuggestionsInput{
+		HeadBranch:       "feature/suggestion",
+		HeadRepoCloneURL: "https://github.com/fork/widget.git",
+		ExpectedHeadSHA:  "head-sha",
+		Suggestions: []platform.ReviewSuggestion{{
+			Range:       platform.DiffReviewLineRange{Path: "src/main.go", Side: "right", Line: 2},
+			Replacement: "TWO",
+		}},
+	})
+
+	require.NoError(err)
+	assert.Equal("commit-sha", result.CommitSHA)
+	assert.Equal(2, pullCalls)
+	assert.Zero(readRepoCalls)
+	assert.Equal(2, writeRepoCalls)
+	assert.Equal(1, contentCalls)
+	assert.Equal(1, graphQLCalls)
+}
+
+func TestApplyReviewSuggestionsFailsClosedWhenPullNotOpenUpstream(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	var contentCalls int
+	var graphqlCalls int
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/repos/acme/widget/pulls/7", func(w http.ResponseWriter, _ *http.Request) {
+		writeReviewSuggestionPullResponse(w, "closed", "")
+	})
+	mux.HandleFunc("/api/v3/repos/fork/widget/contents/src/main.go", func(w http.ResponseWriter, _ *http.Request) {
+		contentCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"type":"file","encoding":"base64","content":"","path":"src/main.go","sha":"file-sha"}`))
+	})
+	mux.HandleFunc("/graphql", func(w http.ResponseWriter, _ *http.Request) {
+		graphqlCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":{"createCommitOnBranch":{"commit":{"oid":"commit-sha","url":"https://github.com/fork/widget/commit/commit-sha"}}}}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	ghClient, err := gh.NewClient(srv.Client()).WithEnterpriseURLs(
+		srv.URL+"/api/v3/",
+		srv.URL+"/api/uploads/",
+	)
+	require.NoError(err)
+	client := &liveClient{
+		gh:              ghClient,
+		ghWrite:         ghClient,
+		httpWriteClient: srv.Client(),
+		graphQLEndpoint: srv.URL + "/graphql",
+	}
+
+	_, err = client.ApplyReviewSuggestions(t.Context(), "acme", "widget", 7, platform.ApplyReviewSuggestionsInput{
+		HeadBranch:       "feature/suggestion",
+		HeadRepoCloneURL: "https://github.com/fork/widget.git",
+		ExpectedHeadSHA:  "head-sha",
+		Suggestions: []platform.ReviewSuggestion{{
+			Range:       platform.DiffReviewLineRange{Path: "src/main.go", Side: "right", Line: 2},
+			Replacement: "TWO",
+		}},
+	})
+
+	require.Error(err)
+	var platformErr *platform.Error
+	require.ErrorAs(err, &platformErr)
+	assert.Equal(platform.ErrCodeConflict, platformErr.Code)
+	assert.Equal("not_open", platformErr.Details["reason"])
+	assert.Zero(contentCalls)
+	assert.Zero(graphqlCalls)
+}
+
+func TestApplyReviewSuggestionsFailsClosedWhenPullClosesBeforeMutation(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	content := base64.StdEncoding.EncodeToString([]byte("one\ntwo\nthree\n"))
+	var pullCalls int
+	var contentCalls int
+	var graphQLCalls int
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/repos/acme/widget/pulls/7", func(w http.ResponseWriter, _ *http.Request) {
+		pullCalls++
+		if pullCalls == 1 {
+			writeReviewSuggestionPullResponse(w, "open", "fork/widget")
+			return
+		}
+		writeReviewSuggestionPullResponse(w, "closed", "")
+	})
+	mux.HandleFunc("/api/v3/repos/fork/widget", func(w http.ResponseWriter, _ *http.Request) {
+		writeReviewSuggestionRepositoryResponse(w, "fork/widget")
+	})
+	mux.HandleFunc("/api/v3/repos/fork/widget/contents/src/main.go", func(w http.ResponseWriter, _ *http.Request) {
+		contentCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"type":"file","encoding":"base64","content":"` + content + `","path":"src/main.go","sha":"file-sha"}`))
+	})
+	mux.HandleFunc("/graphql", func(w http.ResponseWriter, _ *http.Request) {
+		graphQLCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":{"createCommitOnBranch":{"commit":{"oid":"commit-sha","url":"https://github.com/fork/widget/commit/commit-sha"}}}}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	ghClient, err := gh.NewClient(srv.Client()).WithEnterpriseURLs(
+		srv.URL+"/api/v3/",
+		srv.URL+"/api/uploads/",
+	)
+	require.NoError(err)
+	client := &liveClient{
+		gh:              ghClient,
+		ghWrite:         ghClient,
+		httpWriteClient: srv.Client(),
+		graphQLEndpoint: srv.URL + "/graphql",
+	}
+
+	_, err = client.ApplyReviewSuggestions(t.Context(), "acme", "widget", 7, platform.ApplyReviewSuggestionsInput{
+		HeadBranch:       "feature/suggestion",
+		HeadRepoCloneURL: "https://github.com/fork/widget.git",
+		ExpectedHeadSHA:  "head-sha",
+		Suggestions: []platform.ReviewSuggestion{{
+			Range:       platform.DiffReviewLineRange{Path: "src/main.go", Side: "right", Line: 2},
+			Replacement: "TWO",
+		}},
+	})
+
+	require.Error(err)
+	var platformErr *platform.Error
+	require.ErrorAs(err, &platformErr)
+	assert.Equal(platform.ErrCodeConflict, platformErr.Code)
+	assert.Equal("not_open", platformErr.Details["reason"])
+	assert.Equal(2, pullCalls)
+	assert.Equal(1, contentCalls)
+	assert.Zero(graphQLCalls)
+}
+
+func TestApplyReviewSuggestionsFailsStaleBeforeContentWhenPullHeadAlreadyChanged(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+
+	tests := []struct {
+		name    string
+		headRef string
+		headSHA string
+		message string
+	}{
+		{
+			name:    "retargeted branch",
+			headRef: "feature/other",
+			headSHA: "head-sha",
+			message: "branch changed",
+		},
+		{
+			name:    "moved head",
+			headRef: "feature/suggestion",
+			headSHA: "new-head-sha",
+			message: "head changed",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var repoCalls int
+			var contentCalls int
+			var graphQLCalls int
+
+			mux := http.NewServeMux()
+			mux.HandleFunc("/api/v3/repos/acme/widget/pulls/7", func(w http.ResponseWriter, _ *http.Request) {
+				writeReviewSuggestionPullResponseWithHead(w, "open", "fork/widget", tt.headRef, tt.headSHA)
+			})
+			mux.HandleFunc("/api/v3/repos/fork/widget", func(w http.ResponseWriter, _ *http.Request) {
+				repoCalls++
+				http.Error(w, "head repo should not be probed", http.StatusInternalServerError)
+			})
+			mux.HandleFunc("/api/v3/repos/fork/widget/contents/src/main.go", func(w http.ResponseWriter, _ *http.Request) {
+				contentCalls++
+				http.Error(w, "content should not be read", http.StatusInternalServerError)
+			})
+			mux.HandleFunc("/graphql", func(w http.ResponseWriter, _ *http.Request) {
+				graphQLCalls++
+				http.Error(w, "mutation should not run", http.StatusInternalServerError)
+			})
+			srv := httptest.NewServer(mux)
+			defer srv.Close()
+
+			ghClient, err := gh.NewClient(srv.Client()).WithEnterpriseURLs(
+				srv.URL+"/api/v3/",
+				srv.URL+"/api/uploads/",
+			)
+			require.NoError(err)
+			client := &liveClient{
+				gh:              ghClient,
+				ghWrite:         ghClient,
+				httpWriteClient: srv.Client(),
+				graphQLEndpoint: srv.URL + "/graphql",
+			}
+
+			_, err = client.ApplyReviewSuggestions(t.Context(), "acme", "widget", 7, platform.ApplyReviewSuggestionsInput{
+				HeadBranch:       "feature/suggestion",
+				HeadRepoCloneURL: "https://github.com/fork/widget.git",
+				ExpectedHeadSHA:  "head-sha",
+				Suggestions: []platform.ReviewSuggestion{{
+					Range:       platform.DiffReviewLineRange{Path: "src/main.go", Side: "right", Line: 2},
+					Replacement: "TWO",
+				}},
+			})
+
+			require.Error(err)
+			require.ErrorIs(err, platform.ErrStaleState)
+			var platformErr *platform.Error
+			require.ErrorAs(err, &platformErr)
+			assert.Equal(platform.ErrCodeStaleState, platformErr.Code)
+			assert.Contains(err.Error(), tt.message)
+			assert.Zero(repoCalls)
+			assert.Zero(contentCalls)
+			assert.Zero(graphQLCalls)
+		})
+	}
+}
+
+func TestApplyReviewSuggestionsFailsStaleWhenPullHeadChangesBeforeMutation(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	content := base64.StdEncoding.EncodeToString([]byte("one\ntwo\nthree\n"))
+
+	tests := []struct {
+		name      string
+		secondRef string
+		secondSHA string
+		message   string
+	}{
+		{
+			name:      "retargeted branch",
+			secondRef: "feature/other",
+			secondSHA: "head-sha",
+			message:   "branch changed",
+		},
+		{
+			name:      "moved head",
+			secondRef: "feature/suggestion",
+			secondSHA: "new-head-sha",
+			message:   "head changed",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var pullCalls int
+			var contentCalls int
+			var graphQLCalls int
+
+			mux := http.NewServeMux()
+			mux.HandleFunc("/api/v3/repos/acme/widget/pulls/7", func(w http.ResponseWriter, _ *http.Request) {
+				pullCalls++
+				if pullCalls == 1 {
+					writeReviewSuggestionPullResponse(w, "open", "fork/widget")
+					return
+				}
+				writeReviewSuggestionPullResponseWithHead(w, "open", "fork/widget", tt.secondRef, tt.secondSHA)
+			})
+			mux.HandleFunc("/api/v3/repos/fork/widget", func(w http.ResponseWriter, _ *http.Request) {
+				writeReviewSuggestionRepositoryResponse(w, "fork/widget")
+			})
+			mux.HandleFunc("/api/v3/repos/fork/widget/contents/src/main.go", func(w http.ResponseWriter, _ *http.Request) {
+				contentCalls++
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"type":"file","encoding":"base64","content":"` + content + `","path":"src/main.go","sha":"file-sha"}`))
+			})
+			mux.HandleFunc("/graphql", func(w http.ResponseWriter, _ *http.Request) {
+				graphQLCalls++
+				http.Error(w, "mutation should not run", http.StatusInternalServerError)
+			})
+			srv := httptest.NewServer(mux)
+			defer srv.Close()
+
+			ghClient, err := gh.NewClient(srv.Client()).WithEnterpriseURLs(
+				srv.URL+"/api/v3/",
+				srv.URL+"/api/uploads/",
+			)
+			require.NoError(err)
+			client := &liveClient{
+				gh:              ghClient,
+				ghWrite:         ghClient,
+				httpWriteClient: srv.Client(),
+				graphQLEndpoint: srv.URL + "/graphql",
+			}
+
+			_, err = client.ApplyReviewSuggestions(t.Context(), "acme", "widget", 7, platform.ApplyReviewSuggestionsInput{
+				HeadBranch:       "feature/suggestion",
+				HeadRepoCloneURL: "https://github.com/fork/widget.git",
+				ExpectedHeadSHA:  "head-sha",
+				Suggestions: []platform.ReviewSuggestion{{
+					Range:       platform.DiffReviewLineRange{Path: "src/main.go", Side: "right", Line: 2},
+					Replacement: "TWO",
+				}},
+			})
+
+			require.Error(err)
+			require.ErrorIs(err, platform.ErrStaleState)
+			var platformErr *platform.Error
+			require.ErrorAs(err, &platformErr)
+			assert.Equal(platform.ErrCodeStaleState, platformErr.Code)
+			assert.Contains(err.Error(), tt.message)
+			assert.Equal(2, pullCalls)
+			assert.Equal(1, contentCalls)
+			assert.Zero(graphQLCalls)
+		})
+	}
+}
+
+func TestApplyReviewSuggestionsFailsClosedWhenLiveHeadRepoMissing(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	var contentCalls int
+	var graphQLCalls int
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/repos/acme/widget/pulls/7", func(w http.ResponseWriter, _ *http.Request) {
+		writeReviewSuggestionPullResponse(w, "open", "")
+	})
+	mux.HandleFunc("/api/v3/repos/fork/widget/contents/src/main.go", func(w http.ResponseWriter, _ *http.Request) {
+		contentCalls++
+		http.Error(w, "content should not be read", http.StatusInternalServerError)
+	})
+	mux.HandleFunc("/graphql", func(w http.ResponseWriter, _ *http.Request) {
+		graphQLCalls++
+		http.Error(w, "mutation should not run", http.StatusInternalServerError)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	ghClient, err := gh.NewClient(srv.Client()).WithEnterpriseURLs(
+		srv.URL+"/api/v3/",
+		srv.URL+"/api/uploads/",
+	)
+	require.NoError(err)
+	client := &liveClient{
+		gh:              ghClient,
+		ghWrite:         ghClient,
+		httpWriteClient: srv.Client(),
+		graphQLEndpoint: srv.URL + "/graphql",
+	}
+
+	_, err = client.ApplyReviewSuggestions(t.Context(), "acme", "widget", 7, platform.ApplyReviewSuggestionsInput{
+		HeadBranch:       "feature/suggestion",
+		HeadRepoCloneURL: "https://github.com/fork/widget.git",
+		ExpectedHeadSHA:  "head-sha",
+		Suggestions: []platform.ReviewSuggestion{{
+			Range:       platform.DiffReviewLineRange{Path: "src/main.go", Side: "right", Line: 2},
+			Replacement: "TWO",
+		}},
+	})
+
+	require.Error(err)
+	var platformErr *platform.Error
+	require.ErrorAs(err, &platformErr)
+	assert.Equal(platform.ErrCodeConflict, platformErr.Code)
+	assert.Equal("head_repo_unknown", platformErr.Details["reason"])
+	assert.Zero(contentCalls)
+	assert.Zero(graphQLCalls)
+}
+
+func TestApplyReviewSuggestionsFailsClosedWhenLiveHeadRepoInaccessible(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	var repoCalls int
+	var contentCalls int
+	var graphQLCalls int
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/repos/acme/widget/pulls/7", func(w http.ResponseWriter, _ *http.Request) {
+		writeReviewSuggestionPullResponse(w, "open", "fork/widget")
+	})
+	mux.HandleFunc("/api/v3/repos/fork/widget", func(w http.ResponseWriter, _ *http.Request) {
+		repoCalls++
+		http.Error(w, "not found", http.StatusNotFound)
+	})
+	mux.HandleFunc("/api/v3/repos/fork/widget/contents/src/main.go", func(w http.ResponseWriter, _ *http.Request) {
+		contentCalls++
+		http.Error(w, "content should not be read", http.StatusInternalServerError)
+	})
+	mux.HandleFunc("/graphql", func(w http.ResponseWriter, _ *http.Request) {
+		graphQLCalls++
+		http.Error(w, "mutation should not run", http.StatusInternalServerError)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	ghClient, err := gh.NewClient(srv.Client()).WithEnterpriseURLs(
+		srv.URL+"/api/v3/",
+		srv.URL+"/api/uploads/",
+	)
+	require.NoError(err)
+	client := &liveClient{
+		gh:              ghClient,
+		ghWrite:         ghClient,
+		httpWriteClient: srv.Client(),
+		graphQLEndpoint: srv.URL + "/graphql",
+	}
+
+	_, err = client.ApplyReviewSuggestions(t.Context(), "acme", "widget", 7, platform.ApplyReviewSuggestionsInput{
+		HeadBranch:       "feature/suggestion",
+		HeadRepoCloneURL: "https://github.com/fork/widget.git",
+		ExpectedHeadSHA:  "head-sha",
+		Suggestions: []platform.ReviewSuggestion{{
+			Range:       platform.DiffReviewLineRange{Path: "src/main.go", Side: "right", Line: 2},
+			Replacement: "TWO",
+		}},
+	})
+
+	require.Error(err)
+	var platformErr *platform.Error
+	require.ErrorAs(err, &platformErr)
+	assert.Equal(platform.ErrCodeConflict, platformErr.Code)
+	assert.Equal("head_repo_unknown", platformErr.Details["reason"])
+	assert.Equal(1, repoCalls)
+	assert.Zero(contentCalls)
+	assert.Zero(graphQLCalls)
+}
+
+func writeReviewSuggestionPullResponse(w http.ResponseWriter, state string, headFullName string) {
+	writeReviewSuggestionPullResponseWithHead(w, state, headFullName, "feature/suggestion", "head-sha")
+}
+
+func writeReviewSuggestionPullResponseWithHead(
+	w http.ResponseWriter,
+	state string,
+	headFullName string,
+	headRef string,
+	headSHA string,
+) {
+	w.Header().Set("Content-Type", "application/json")
+	head := fmt.Sprintf(`{"repo":null,"ref":%q,"sha":%q}`, headRef, headSHA)
+	if headFullName != "" {
+		headOwner, headRepo, _ := strings.Cut(headFullName, "/")
+		head = fmt.Sprintf(
+			`{"repo":{"full_name":%q,"clone_url":%q,"owner":{"login":%q},"name":%q},"ref":%q,"sha":%q}`,
+			headFullName,
+			"https://github.com/"+headFullName+".git",
+			headOwner,
+			headRepo,
+			headRef,
+			headSHA,
+		)
+	}
+	_, _ = fmt.Fprintf(w, `{"number":7,"state":%q,"head":%s}`, state, head)
+}
+
+func writeReviewSuggestionRepositoryResponse(w http.ResponseWriter, fullName string) {
+	w.Header().Set("Content-Type", "application/json")
+	owner, name, _ := strings.Cut(fullName, "/")
+	_, _ = fmt.Fprintf(
+		w,
+		`{"name":%q,"full_name":%q,"owner":{"login":%q}}`,
+		name,
+		fullName,
+		owner,
+	)
+}
+
+func TestGitHubCreateCommitGraphQLErrorMapsStableReasons(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+
+	tests := []struct {
+		name       string
+		errors     []graphQLError
+		wantCode   platform.PlatformErrorCode
+		wantReason string
+	}{
+		{
+			name:     "expected head moved",
+			errors:   []graphQLError{{Message: "expectedHeadOid does not match"}},
+			wantCode: platform.ErrCodeStaleState,
+		},
+		{
+			name:       "head repo resolution race",
+			errors:     []graphQLError{{Type: "NOT_FOUND", Message: "Could not resolve to a Repository"}},
+			wantCode:   platform.ErrCodeConflict,
+			wantReason: "head_repo_unknown",
+		},
+		{
+			name:       "head branch resolution race",
+			errors:     []graphQLError{{Message: "Could not resolve to a Ref"}},
+			wantCode:   platform.ErrCodeConflict,
+			wantReason: "head_repo_unknown",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := githubCreateCommitGraphQLError("acme", "widget", 7, tt.errors)
+
+			require.Error(err)
+			var platformErr *platform.Error
+			require.ErrorAs(err, &platformErr)
+			assert.Equal(tt.wantCode, platformErr.Code)
+			if tt.wantReason != "" {
+				assert.Equal(tt.wantReason, platformErr.Details["reason"])
+			}
+		})
+	}
+}
+
+func TestGitHubSuggestionHeadRepoRequiresCloneURL(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+
+	tests := []struct {
+		name     string
+		cloneURL string
+		wantFull string
+		wantErr  bool
+	}{
+		{
+			name:     "same repo clone URL",
+			cloneURL: "https://github.com/acme/widget.git",
+			wantFull: "acme/widget",
+		},
+		{
+			name:     "fork clone URL",
+			cloneURL: "https://github.com/fork/widget.git",
+			wantFull: "fork/widget",
+		},
+		{
+			name:    "missing clone URL",
+			wantErr: true,
+		},
+		{
+			name:     "unparseable clone URL",
+			cloneURL: "not-a-url",
+			wantErr:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			headOwner, headRepo, fullName, err := githubSuggestionHeadRepo(
+				"acme",
+				"widget",
+				platform.ApplyReviewSuggestionsInput{HeadRepoCloneURL: tt.cloneURL},
+			)
+
+			if tt.wantErr {
+				require.Error(err)
+				var platformErr *platform.Error
+				require.ErrorAs(err, &platformErr)
+				assert.Equal(platform.ErrCodeInvalidArgument, platformErr.Code)
+				assert.Contains(err.Error(), "head repository is required")
+				return
+			}
+			require.NoError(err)
+			assert.Equal(tt.wantFull, fullName)
+			wantOwner, wantRepo, ok := strings.Cut(tt.wantFull, "/")
+			require.True(ok)
+			assert.Equal(wantOwner, headOwner)
+			assert.Equal(wantRepo, headRepo)
+		})
+	}
 }
 
 func TestListReleasesTracksRate(t *testing.T) {

@@ -13,8 +13,12 @@
   import type { DetailActivityViewMode } from "../../stores/detail-activity-view.svelte.js";
   import type { StoreInstances } from "../../types.js";
   import { renderMarkdown, renderMarkdownSync } from "../../utils/markdown.js";
-  import { formatRelativeTime } from "@kenn-io/kit-ui";
-  import { copyToClipboard } from "@kenn-io/kit-ui";
+  import { copyToClipboard, formatRelativeTime } from "@kenn-io/kit-ui";
+  import {
+    parseMarkdownSuggestions,
+    type ApplySuggestionRequest,
+    type MarkdownSuggestionBlock,
+  } from "../../utils/markdown-suggestions.js";
   import { getStores } from "../../context.js";
   import {
     buildItemReferenceLink,
@@ -22,6 +26,7 @@
   } from "../../utils/item-reference.js";
   import CommentEditor from "./CommentEditor.svelte";
   import DiffReviewThreadSnippet from "../diff/DiffReviewThreadSnippet.svelte";
+  import ReviewSuggestionBlock from "./ReviewSuggestionBlock.svelte";
   import {
     reviewThreadContext,
     reviewThreadLineLabel,
@@ -37,12 +42,14 @@
     repoName?: string;
     repoPath?: string | undefined;
     number?: number | undefined;
+    currentHeadSHA?: string | undefined;
     canResolveReviewThreads?: boolean;
     canReplyToThreads?: boolean;
     filtered?: boolean;
     showCommitDetails?: boolean;
     activityViewMode?: DetailActivityViewMode;
     onEditComment?: ((event: PREvent | IssueEvent, body: string) => Promise<boolean>) | undefined;
+    onApplySuggestion?: ((input: ApplySuggestionRequest) => Promise<boolean>) | undefined;
     jumpToReviewThread?: ((thread: ReviewThread) => void) | undefined;
   }
 
@@ -55,12 +62,14 @@
     repoName,
     repoPath,
     number = undefined,
+    currentHeadSHA = "",
     canResolveReviewThreads = false,
     canReplyToThreads = false,
     filtered = false,
     showCommitDetails = true,
     activityViewMode = "normal",
     onEditComment,
+    onApplySuggestion,
     jumpToReviewThread,
   }: Props = $props();
   const stores = getStores() as StoreInstances | undefined;
@@ -68,6 +77,18 @@
   const diffStore = stores?.diff;
   const diffReviewDraft = stores?.diffReviewDraft;
   const diff = $derived(diffStore?.getDiff() ?? null);
+  // The cached diff can predate the current PR head (the store skips
+  // reloads for the same route). A preview built from that diff would
+  // show stale surrounding code for a suggestion applied to the newer
+  // head, so treat a known head mismatch as missing context.
+  const diffContextStale = $derived(
+    currentHeadSHA !== "" &&
+      diff !== null &&
+      (diff.diff_head_sha ?? "") !== "" &&
+      diff.diff_head_sha !== currentHeadSHA,
+  );
+  const suggestionDiff = $derived(diffContextStale ? null : diff);
+  let diffReloadedForHead = "";
 
   $effect(() => {
     if (!provider || !repoOwner || !repoName || !repoPath || number == null) return;
@@ -92,7 +113,12 @@
       current.repoPath === repoPath &&
       current.number === number
     ) {
-      return;
+      // Same route, but the loaded diff may predate the current head.
+      // Reload once per observed head; if the server still serves the
+      // older snapshot, the preview stays marked outdated instead of
+      // looping.
+      if (!diffContextStale || diffReloadedForHead === currentHeadSHA) return;
+      diffReloadedForHead = currentHeadSHA;
     }
     untrack(() => {
       void diffStore.loadDiff(repoOwner, repoName, number, {
@@ -149,6 +175,12 @@
 
   type TimelineReviewThread = {
     thread: ReviewThread;
+  };
+
+  type BatchedSuggestion = {
+    key: string;
+    reviewedHeadSHA: string;
+    request: ApplySuggestionRequest["suggestions"][number];
   };
 
   function threadID(event: PREvent | IssueEvent): string | null {
@@ -866,6 +898,22 @@
   let replyDraft = $state("");
   let savingReplyThreadID = $state<string | null>(null);
   let replyError = $state<string | null>(null);
+  let applyingSuggestionKey = $state<string | null>(null);
+  let suggestionError = $state<Record<string, string>>({});
+  let batchedSuggestions = $state<BatchedSuggestion[]>([]);
+  const batchedSuggestionKeys = $derived(batchedSuggestions.map((item) => item.key));
+  // Suggestions batched before the PR head moved (or while it is unknown)
+  // must not reach batch submit; the server would reject the whole batch.
+  // A stale cached diff context also withholds the batch, matching the
+  // per-row apply gating.
+  const eligibleBatchedSuggestions = $derived(
+    diffContextStale
+      ? []
+      : batchedSuggestions.filter(
+          (item) => currentHeadSHA !== "" && item.reviewedHeadSHA === currentHeadSHA,
+        ),
+  );
+  let savingSuggestionBatch = $state(false);
 
   function canEditComment(event: PREvent | IssueEvent): boolean {
     return (
@@ -1026,6 +1074,110 @@
         copyTimeout = null;
       }, 1500);
     });
+  }
+
+  function suggestionKey(event: PREvent | IssueEvent, block: MarkdownSuggestionBlock): string {
+    return `${event.ID}:${block.key}`;
+  }
+
+  function eventSuggestionBlocks(event: PREvent | IssueEvent): MarkdownSuggestionBlock[] {
+    if (!shouldRenderMarkdown(event.EventType)) return [];
+    return parseMarkdownSuggestions(event.Body);
+  }
+
+  function hasSuggestionBlocks(blocks: MarkdownSuggestionBlock[]): boolean {
+    return blocks.some((block) => block.type === "suggestion");
+  }
+
+  async function renderedMarkdownTextHtml(text: string): Promise<string> {
+    return renderMarkdown(
+      text,
+      provider && repoOwner && repoName && repoPath
+        ? { provider, platformHost, owner: repoOwner, name: repoName, repoPath }
+        : undefined,
+    );
+  }
+
+  function renderedMarkdownTextHtmlSync(text: string): string {
+    return renderMarkdownSync(
+      text,
+      provider && repoOwner && repoName && repoPath
+        ? { provider, platformHost, owner: repoOwner, name: repoName, repoPath }
+        : undefined,
+    );
+  }
+
+  function suggestionRequest(
+    thread: ReviewThread,
+    replacement: string,
+  ): ApplySuggestionRequest["suggestions"][number] {
+    return {
+      threadID: thread.id,
+      replacement,
+    };
+  }
+
+  async function commitSuggestion(
+    event: PREvent | IssueEvent,
+    block: Extract<MarkdownSuggestionBlock, { type: "suggestion" }>,
+    thread: ReviewThread,
+  ): Promise<void> {
+    if (onApplySuggestion === undefined) return;
+    const key = suggestionKey(event, block);
+    applyingSuggestionKey = key;
+    suggestionError = { ...suggestionError, [key]: "" };
+    try {
+      const ok = await onApplySuggestion({
+        suggestions: [suggestionRequest(thread, block.replacement)],
+      });
+      if (!ok) {
+        suggestionError = {
+          ...suggestionError,
+          [key]: detailStore?.getDetailError() ?? "Could not apply suggestion",
+        };
+      } else {
+        batchedSuggestions = batchedSuggestions.filter((item) => item.key !== key);
+      }
+    } finally {
+      applyingSuggestionKey = null;
+    }
+  }
+
+  function toggleSuggestionBatch(
+    event: PREvent | IssueEvent,
+    block: Extract<MarkdownSuggestionBlock, { type: "suggestion" }>,
+    thread: ReviewThread,
+  ): void {
+    const key = suggestionKey(event, block);
+    batchedSuggestions = batchedSuggestionKeys.includes(key)
+      ? batchedSuggestions.filter((item) => item.key !== key)
+      : [
+          ...batchedSuggestions,
+          {
+            key,
+            reviewedHeadSHA: thread.diff_head_sha ?? "",
+            request: suggestionRequest(thread, block.replacement),
+          },
+        ];
+  }
+
+  async function commitSuggestionBatch(): Promise<void> {
+    const eligible = eligibleBatchedSuggestions;
+    if (onApplySuggestion === undefined || eligible.length === 0) return;
+    const submittedKeys = eligible.map((item) => item.key);
+    savingSuggestionBatch = true;
+    suggestionError = {};
+    try {
+      const ok = await onApplySuggestion({ suggestions: eligible.map((item) => item.request) });
+      if (ok) {
+        batchedSuggestions = batchedSuggestions.filter((item) => !submittedKeys.includes(item.key));
+      } else {
+        const message = detailStore?.getDetailError() ?? "Could not apply suggestion batch";
+        suggestionError = Object.fromEntries(submittedKeys.map((key) => [key, message]));
+      }
+    } finally {
+      savingSuggestionBatch = false;
+    }
   }
 
   function directLinkCopyID(event: PREvent | IssueEvent): string {
@@ -1274,11 +1426,68 @@
             </div>
           {/if}
           {#if shouldRenderMarkdown(event.EventType)}
-            {#await renderedBodyHtml(event, inlineReplyEntry)}
-              {@html renderedBodyHtmlSync(event, inlineReplyEntry)}
-            {:then html}
-              {@html html}
-            {/await}
+            {@const blocks = eventSuggestionBlocks(event)}
+            {#if hasSuggestionBlocks(blocks)}
+              <div class="event-body-segments">
+                {#each blocks as block (block.key)}
+                  {#if block.type === "markdown"}
+                    {#if block.text.trim().length > 0}
+                      <div class="event-body-segment">
+                        {#await renderedMarkdownTextHtml(block.text)}
+                          {@html renderedMarkdownTextHtmlSync(block.text)}
+                        {:then html}
+                          {@html html}
+                        {/await}
+                      </div>
+                    {/if}
+                  {:else if reviewThread}
+                    {@const blockKey = suggestionKey(event, block)}
+                    <ReviewSuggestionBlock
+                      thread={reviewThread.thread}
+                      context={suggestionDiff ? reviewThreadContext(suggestionDiff, reviewThread.thread) : reviewThreadContext(null, reviewThread.thread)}
+                      replacement={block.replacement}
+                      {currentHeadSHA}
+                      applying={applyingSuggestionKey === blockKey}
+                      batched={batchedSuggestionKeys.includes(blockKey)}
+                      error={suggestionError[blockKey] || null}
+                      onCommit={onApplySuggestion !== undefined
+                        ? () => void commitSuggestion(event, block, reviewThread.thread)
+                        : undefined}
+                      onToggleBatch={onApplySuggestion !== undefined
+                        ? () => toggleSuggestionBatch(event, block, reviewThread.thread)
+                        : undefined}
+                    />
+                  {:else}
+                    {@const fallback = "```suggestion\n" + block.replacement + "\n```"}
+                    <div class="event-body-segment">
+                      {#await renderedMarkdownTextHtml(fallback)}
+                        {@html renderedMarkdownTextHtmlSync(fallback)}
+                      {:then html}
+                        {@html html}
+                      {/await}
+                    </div>
+                  {/if}
+                {/each}
+                {#if inlineReplyEntry}
+                  <button
+                    class="thread-toggle thread-reply-action thread-reply-action--inline"
+                    type="button"
+                    onclick={() => startReply(inlineReplyEntry)}
+                    aria-expanded={isReplyingToEntry(inlineReplyEntry)}
+                    disabled={savingReplyThreadID !== null}
+                  >
+                    <MessageSquareReplyIcon size={14} />
+                    Reply
+                  </button>
+                {/if}
+              </div>
+            {:else}
+              {#await renderedBodyHtml(event, inlineReplyEntry)}
+                {@html renderedBodyHtmlSync(event, inlineReplyEntry)}
+              {:then html}
+                {@html html}
+              {/await}
+            {/if}
           {:else}
             {event.Body}
           {/if}
@@ -1398,6 +1607,20 @@
 {#if events.length === 0}
   <p class="empty">{filtered ? "No activity matches the current filters" : "No activity yet"}</p>
 {:else}
+  {#if onApplySuggestion !== undefined && eligibleBatchedSuggestions.length > 0}
+    <div class="suggestion-batch-bar">
+      <span>{eligibleBatchedSuggestions.length} {eligibleBatchedSuggestions.length === 1 ? "suggestion" : "suggestions"} in batch</span>
+      <button
+        class="thread-toggle thread-reply-action"
+        type="button"
+        onclick={() => void commitSuggestionBatch()}
+        disabled={savingSuggestionBatch}
+      >
+        <CheckIcon size={14} />
+        {savingSuggestionBatch ? "Committing..." : "Commit batch"}
+      </button>
+    </div>
+  {/if}
   <ol class="timeline">
     {#each renderedTimelineEntries as entry (entry.key)}
       {@const event = entry.event}
@@ -1683,6 +1906,20 @@
     padding: 16px 0;
   }
 
+  .suggestion-batch-bar {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: var(--focus-detail-space-sm, 0.62rem);
+    margin: 0.31rem 0 0.31rem 2.47rem;
+    padding: 0.46rem 0.62rem;
+    border: 1px solid var(--border-muted);
+    border-radius: var(--radius-md);
+    background: var(--bg-surface);
+    color: var(--text-secondary);
+    font-size: var(--font-size-sm);
+  }
+
   .timeline {
     list-style: none;
     display: flex;
@@ -1762,6 +1999,14 @@
 
   .event-card--compact-row {
     overflow: hidden;
+  }
+
+  .event-body-segments {
+    display: flow-root;
+  }
+
+  .event-body-segment:empty {
+    display: none;
   }
 
   .compact-event-line {

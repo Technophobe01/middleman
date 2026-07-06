@@ -71,7 +71,7 @@ Minimum read scope should cover repository metadata, merge requests or pull
 requests, issues, comments, commits, tags, releases, and CI/status data. Write
 scopes are only required for mutation capabilities: comments, issue creation,
 issue or PR content/state changes, merge, review approval, workflow approval,
-or ready-for-review.
+review suggestion application, or ready-for-review.
 
 ## Sync Capabilities
 
@@ -86,6 +86,45 @@ registry helpers return typed errors for missing providers or capabilities.
   changing state, merging, requesting review, or approving workflows.
   Server handlers translate these typed platform errors into the stable problem
   envelope described in [`context/error-handling.md`](./error-handling.md).
+- Review suggestion application is a provider capability
+  (`review_suggestion_application` + `mutation_head_binding` +
+  `read_review_threads`, via
+  `internal/platform/client.go::ReviewSuggestionApplier`): an all-or-nothing
+  batch apply against the expected head. Partial success is invalid.
+- The server rebuilds each suggestion from persisted review-thread metadata and
+  only accepts replacement text matching a stored suggestion fence (opaque
+  non-suggestion fences skipped, fences may be indented up to three spaces,
+  CRLF normalized to LF, no other rewriting; UI preview mirrors this). Never
+  trust clients for ids, ranges, paths, or patch content
+  (`internal/server/diff_review_handlers.go::applyReviewSuggestions`).
+- Providers report every upstream bucket the apply consumes through
+  `OperationRateLimitReporter`; an empty or unknown report fails closed as
+  `rate_limited`, and mutation handlers re-check buckets immediately before the
+  provider call because UI availability goes stale.
+- Suggestion apply mutates the source branch, is open-PR-only, and fails closed
+  with stable reasons: non-open rows and upstream closed/merged races →
+  `not_open`; missing, unparseable, or inaccessible head repo identity →
+  `head_repo_unknown` (never fall back to the base repo as a write target;
+  GitHub is currently the only provider needing an explicit source repo
+  target); live branch or SHA movement → `stale_state`. The live re-check
+  before mutation is best-effort — no provider offers commit-only-if-open — so
+  expected-head binding is the final integrity check
+  (`internal/server/diff_review_handlers.go::applyReviewSuggestions`, `internal/github/client.go::ensureReviewSuggestionPullMutable`).
+- Post-apply refresh goes through the detail-sync broadcaster and must rerun
+  after any in-flight sync for the same PR — that sync may predate the commit
+  (`internal/server/detail_sync.go::enqueueDetailSyncOrRerun`).
+- The UI only exposes apply actions when the thread head matches a known
+  current PR head; stale or unknown heads disable actions, and stale batched
+  suggestions must not reach batch submit while staying removable. A suggestion
+  preview built from a cached diff whose `diff_head_sha` no longer matches the
+  current head is treated as missing context (single apply and batch submit
+  disabled) until reloaded. PR diff responses always carry `diff_head_sha` —
+  the endpoint fails instead of serving a PR diff without a synced snapshot
+  head — so clients only need to handle the mismatch case
+  (`packages/ui/src/components/detail/ReviewSuggestionBlock.svelte`, `packages/ui/src/components/detail/EventTimeline.svelte`).
+- Remaining edge cases (duplicate thread ids, overlapping ranges, missing
+  reviewed heads, renamed/deleted/binary files, unsupported encodings,
+  whitespace-padded paths) fail the entire batch with stable reasons.
 - Forgejo and Gitea currently expose only SDK-proven mutations: comments,
   issue creation, issue and PR content/state edits, merge, and review approval.
   Workflow approval and ready-for-review must remain hidden or return typed

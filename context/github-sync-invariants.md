@@ -111,6 +111,22 @@ Some PR-derived state is only valid for one head commit.
   state between items.
 - When a refresh cannot prove the state belongs to the current head SHA, clear
   the stale derived state instead of preserving it.
+- `MRReviewThread.Range.DiffHeadSHA` preserves the comment commit even for
+  current threads and is distinct from `MergeRequest.DiffHeadSHA` (the synced
+  diff snapshot); suggestion apply uses the stored thread head to reject stale
+  suggestions (`internal/github/sync.go::githubReviewLineRange`).
+- Suggestion apply commits to the PR head repo/branch bound by
+  `createCommitOnBranch.expectedHeadOid`, never the base repo. Reject
+  whitespace-padded paths (do not trim), preserve terminal blank replacement
+  lines, and do not re-add a trailing newline when a suggestion deletes every
+  line. Mutation-time `NOT_FOUND`/could-not-resolve failures are head repo or
+  branch races and map to conflict `head_repo_unknown`, not `not_found`
+  (`internal/github/client.go::ApplyReviewSuggestions`).
+- Apply-suggestion consumes REST content reads plus the GraphQL
+  `createCommitOnBranch` mutation; the provider reports both buckets via
+  `OperationRateLimitBuckets(platform.OperationApplyReviewSuggestion)` so a
+  paused GraphQL budget disables the operation without making GraphQL
+  provider-neutral.
 
 ## Fallback Data Rules
 

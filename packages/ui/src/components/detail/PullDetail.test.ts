@@ -1,8 +1,10 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/svelte";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
-import type { PullDetail } from "../../api/types.js";
+import type { DiffResult, PullDetail } from "../../api/types.js";
 import { ACTIONS_KEY, API_CLIENT_KEY, NAVIGATE_KEY, STORES_KEY, UI_CONFIG_KEY } from "../../context.js";
 import { createDetailActivityViewStore } from "../../stores/detail-activity-view.svelte.js";
+import { createDetailStore } from "../../stores/detail.svelte.js";
+import type { MiddlemanClient } from "../../types.js";
 
 const markdownMockState = vi.hoisted(() => ({
   pending: false,
@@ -192,6 +194,7 @@ function renderPullDetail(
     updatePRContent: vi.fn(),
     refreshPendingCI: vi.fn(async () => undefined),
     editComment: vi.fn(),
+    applyReviewSuggestions: vi.fn(async () => true),
   };
 
   const rendered = render(PullDetailComponent, {
@@ -221,6 +224,117 @@ function renderPullDetail(
     ]),
   });
   return { ...rendered, detailStore };
+}
+
+function addReviewSuggestionToDetail(detail: PullDetail): void {
+  detail.repo.capabilities.review_suggestion_application = true;
+  detail.repo.operations = {
+    apply_review_suggestion: {
+      available: true,
+    },
+  } as unknown as PullDetail["repo"]["operations"];
+  detail.events = [
+    {
+      ID: 501,
+      MergeRequestID: detail.merge_request.ID,
+      PlatformID: 501,
+      PlatformExternalID: "review-comment-501",
+      EventType: "review_comment",
+      Author: "reviewer",
+      Summary: "",
+      Body: ["This can return directly.", "", "```suggestion", "return client.publishThreads();", "```"].join("\n"),
+      MetadataJSON: "",
+      CreatedAt: "2026-05-01T12:01:00Z",
+      DedupeKey: "review-comment-501",
+      ThreadID: null,
+      Resolvable: true,
+      Resolved: false,
+      diff_thread: {
+        id: "501",
+        provider_comment_id: "review-comment-501",
+        path: "src/review.ts",
+        side: "right",
+        start_side: "right",
+        start_line: 10,
+        line: 11,
+        new_line: 11,
+        line_type: "context",
+        diff_head_sha: "head",
+        commit_sha: "head",
+        body: "This can return directly.",
+        author_login: "reviewer",
+        resolved: false,
+        can_resolve: true,
+        created_at: "2026-05-01T12:01:00Z",
+        updated_at: "2026-05-01T12:01:00Z",
+      },
+    },
+  ];
+}
+
+function makeReviewSuggestionDiffStore() {
+  const diff: DiffResult = {
+    stale: false,
+    whitespace_only_count: 0,
+    files: [
+      {
+        path: "src/review.ts",
+        old_path: "src/review.ts",
+        status: "modified",
+        is_binary: false,
+        is_whitespace_only: false,
+        additions: 2,
+        deletions: 0,
+        hunks: [
+          {
+            old_start: 9,
+            old_count: 1,
+            new_start: 9,
+            new_count: 3,
+            lines: [
+              {
+                type: "context",
+                old_num: 9,
+                new_num: 9,
+                content: "const client = setup();",
+              },
+              {
+                type: "add",
+                new_num: 10,
+                content: "client.enableReviews();",
+              },
+              {
+                type: "add",
+                new_num: 11,
+                content: "client.publishThreads();",
+              },
+              {
+                type: "context",
+                old_num: 10,
+                new_num: 12,
+                content: "return client;",
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  };
+  return {
+    getDiff: () => diff,
+    isDiffLoading: () => false,
+    getCurrentPR: () => ({
+      provider: "github",
+      platformHost: "github.com",
+      owner: "acme",
+      name: "widget",
+      repoPath: "acme/widget",
+      number: 1,
+    }),
+    getTabWidth: () => 4,
+    loadDiff: vi.fn(),
+    requestScrollToLine: vi.fn(),
+  };
 }
 
 function getActionMenuLabelsButton(): HTMLButtonElement {
@@ -806,6 +920,115 @@ describe("PullDetail approvals", () => {
     });
     expect(button.disabled).toBe(true);
     expect(button.title).toBe("No user credential for writes on github.com");
+  });
+
+  it("hides review suggestion apply actions when the pull request is not open", async () => {
+    const detail = pullDetail();
+    addReviewSuggestionToDetail(detail);
+    detail.merge_request.State = "closed";
+
+    renderPullDetail(detail);
+
+    expect(screen.getByText("This can return directly.")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Commit suggestion" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Add suggestion to batch" })).toBeNull();
+  });
+
+  it("disables review suggestion controls after failed apply recovery cannot refresh detail", async () => {
+    const detail = pullDetail();
+    addReviewSuggestionToDetail(detail);
+    const repoSettings = {
+      AllowSquashMerge: false,
+      AllowMergeCommit: false,
+      AllowRebaseMerge: false,
+      ViewerCanMerge: true,
+      operations: detail.repo.operations,
+    };
+    const apiClient = {
+      GET: vi.fn(async (path: string) => {
+        if (path.includes("/repos/")) {
+          return { data: repoSettings };
+        }
+        return { data: detail };
+      }),
+      POST: vi.fn(async (path: string) => {
+        if (path.endsWith("/review-suggestions/apply")) {
+          return {
+            error: {
+              code: "conflict",
+              type: "about:blank",
+              detail: "target changed since it was reviewed; refresh and retry",
+              details: { reason: "stale_state" },
+            },
+          };
+        }
+        if (path.endsWith("/sync")) {
+          return { error: undefined };
+        }
+        return { data: {} };
+      }),
+    };
+    const detailStore = createDetailStore({
+      client: apiClient as unknown as MiddlemanClient,
+    });
+    await detailStore.loadDetail("acme", "widget", 1, {
+      provider: "github",
+      platformHost: "github.com",
+      repoPath: "acme/widget",
+      sync: false,
+    });
+
+    render(PullDetailComponent, {
+      props: {
+        owner: "acme",
+        name: "widget",
+        number: 1,
+        provider: "github",
+        platformHost: "github.com",
+        repoPath: "acme/widget",
+        hideWorkspaceAction: true,
+        // Background sync would re-fetch the original fixture and race
+        // the fail-closed state this test asserts.
+        autoSync: false,
+      },
+      context: new Map<symbol, unknown>([
+        [API_CLIENT_KEY, apiClient],
+        [
+          STORES_KEY,
+          {
+            detail: detailStore,
+            pulls: { loadPulls: vi.fn() },
+            activity: { loadActivity: vi.fn() },
+            diff: makeReviewSuggestionDiffStore(),
+            diffReviewDraft: {
+              setRouteContext: vi.fn(),
+              isSubmitting: () => false,
+            },
+            detailActivityView: createDetailActivityViewStore(),
+          },
+        ],
+        [ACTIONS_KEY, { pull: [] }],
+        [UI_CONFIG_KEY, { hideStar: true }],
+        [NAVIGATE_KEY, vi.fn()],
+      ]),
+    });
+
+    const commitButton = await vi.waitFor(() => {
+      const found = screen.getByRole("button", { name: "Commit suggestion" }) as HTMLButtonElement;
+      expect(found.disabled).toBe(false);
+      return found;
+    });
+    await fireEvent.click(commitButton);
+
+    await vi.waitFor(() => {
+      const nextCommit = screen.getByRole("button", { name: "Commit suggestion" }) as HTMLButtonElement;
+      expect(nextCommit.disabled).toBe(true);
+      expect(nextCommit.title).toBe("The current pull request head is not known yet");
+      expect((screen.getByRole("button", { name: "Add suggestion to batch" }) as HTMLButtonElement).disabled).toBe(
+        true,
+      );
+    });
+    expect(detailStore.getDetail()?.platform_head_sha).toBe("");
   });
 
   it("disables approve with reason when submit_review is unavailable", async () => {
