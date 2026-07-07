@@ -7,6 +7,11 @@
   import ResponseList from "./ResponseList.svelte";
   import LogViewer from "./LogViewer.svelte";
   import PromptViewer from "./PromptViewer.svelte";
+  import {
+    isPanelParent,
+    isTerminalStatus,
+    panelReviewHeader,
+  } from "../../utils/roborev-panel.js";
 
   // NOTE: intentionally NOT kit-ui DetailDrawer. This is a resizable bottom
   // dock (height: 50vh; resize: vertical; accent border-top) that lives
@@ -25,7 +30,7 @@
   // Fall back to the review store's fetched job for
   // off-page deep links where the job isn't in the table.
   const selectedJob = $derived(
-    stores.roborevJobs?.getJobs().find(
+    stores.roborevJobs?.getVisibleJobs().find(
       (j) =>
         j.id ===
         stores.roborevJobs?.getSelectedJobId(),
@@ -87,6 +92,43 @@
   const reviewIsClosed = $derived(
     stores.roborevReview?.isClosed() ?? false,
   );
+  let interestedPanelRun: string | undefined;
+
+  const selectedPanelRun = $derived(
+    selectedJob && isPanelParent(selectedJob)
+      ? selectedJob.panel_run_uuid
+      : undefined,
+  );
+
+  const panelError = $derived(
+    selectedPanelRun
+      ? stores.roborevJobs?.getPanelMemberError(selectedPanelRun)
+      : undefined,
+  );
+
+  const panelLoading = $derived(
+    selectedPanelRun
+      ? (stores.roborevJobs?.isLoadingMembers(selectedPanelRun) ?? false)
+      : false,
+  );
+
+  const panelMembers = $derived.by(() => {
+    const runUuid = selectedJob?.panel_run_uuid;
+    if (!runUuid) return undefined;
+    return stores.roborevJobs?.getPanelMembers(runUuid);
+  });
+
+  const panelHeader = $derived(
+    selectedJob
+      ? panelReviewHeader(selectedJob, panelMembers)
+      : null,
+  );
+
+  $effect(() => {
+    if (interestedPanelRun === selectedPanelRun) return;
+    interestedPanelRun = selectedPanelRun;
+    stores.roborevJobs?.setPanelMemberInterest(selectedPanelRun);
+  });
 </script>
 
 {#if isOpen}
@@ -131,6 +173,16 @@
               {selectedJob.review_type}
             </span>
           {/if}
+          {#if selectedJob.source === "auto_design"}
+            <span class="review-type">
+              auto-design
+            </span>
+          {/if}
+          {#if selectedJob.panel_member_name}
+            <span class="review-type">
+              {selectedJob.panel_member_name}
+            </span>
+          {/if}
           <StatusBadge status={selectedJob.status} />
         {/if}
       </div>
@@ -156,6 +208,37 @@
         </svg>
       </button>
     </div>
+
+    {#if panelHeader}
+      <div class="panel-line">
+        {panelHeader}
+        {#if panelError}
+          <span class="panel-error">
+            Could not refresh reviewers.
+          </span>
+          {#if selectedPanelRun}
+            <button
+              type="button"
+              class="panel-retry"
+              onclick={() =>
+                stores.roborevJobs?.refreshPanelMembers(
+                  selectedPanelRun,
+                )}
+            >
+              Retry
+            </button>
+          {/if}
+        {:else if panelLoading}
+          <span class="panel-progress">
+            Refreshing reviewers...
+          </span>
+        {:else if selectedJob && !isTerminalStatus(selectedJob.status)}
+          <span class="panel-progress">
+            Panel still synthesizing...
+          </span>
+        {/if}
+      </div>
+    {/if}
 
     <div class="tab-bar">
       <button
@@ -184,6 +267,11 @@
     <!-- kit-ui-check-ignore: resizable inline bottom dock, not a kit side-sheet -->
     <div class="drawer-body">
       {#if activeTab === "review"}
+        {#if selectedJob?.status === "skipped" && selectedJob.skip_reason}
+          <div class="skip-reason">
+            Skipped: {selectedJob.skip_reason}
+          </div>
+        {/if}
         <ReviewContent />
         <div class="responses-section">
           <ResponseList />
@@ -324,6 +412,39 @@
     border: 1px solid var(--border-muted);
     border-radius: var(--radius-sm);
     white-space: nowrap;
+  }
+
+  .panel-line {
+    padding: 4px 16px;
+    font-size: var(--font-size-xs);
+    color: var(--text-secondary);
+    border-bottom: 1px solid var(--border-muted);
+    display: flex;
+    gap: 12px;
+  }
+
+  .panel-progress {
+    color: var(--accent-amber);
+  }
+
+  .panel-error {
+    color: var(--accent-red);
+  }
+
+  .panel-retry {
+    border: 0;
+    padding: 0;
+    background: transparent;
+    color: var(--text-primary);
+    font: inherit;
+    text-decoration: underline;
+    cursor: pointer;
+  }
+
+  .skip-reason {
+    padding: 8px 12px;
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
   }
 
   .close-btn {

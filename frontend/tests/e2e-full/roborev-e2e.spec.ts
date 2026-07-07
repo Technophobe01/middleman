@@ -22,6 +22,12 @@ function parseElapsed(text: string): number {
   );
 }
 
+function jobRowById(page: Page, id: number) {
+  return page.locator(".job-row").filter({
+    has: page.locator(".col-id .mono", { hasText: new RegExp(`^${id}$`) }),
+  });
+}
+
 test.describe.serial("Roborev", () => {
   // Refuse to run if the e2e server is not proxying to the
   // script-managed seeded daemon. This catches the failure mode
@@ -52,15 +58,260 @@ test.describe.serial("Roborev", () => {
       await waitForReviewsReady(page);
       await waitForJobRows(page, 10);
 
-      // Job 74 is the highest ID (first row in desc order):
-      // agent=claude, status=done (zero-duration fixture).
-      const firstRow = page.locator(".job-row").first();
-      await expect(firstRow).toBeVisible();
-      await expect(firstRow.locator(".col-id")).toContainText("74");
-      await expect(firstRow.locator(".col-agent")).toContainText("claude");
-      await expect(firstRow.locator(".status-badge")).toContainText("done");
+      // Job 74 is a stable zero-duration fixture:
+      // agent=claude, status=done, cost=$0.42.
+      const row = jobRowById(page, 74);
+      await expect(row).toBeVisible();
+      await expect(row.locator(".col-agent")).toContainText("claude");
+      await expect(row.locator(".status-badge")).toContainText("done");
       await expect(page.locator("th").filter({ hasText: "Cost" })).toBeVisible();
-      await expect(firstRow.locator(".col-cost")).toHaveText("~$0.42");
+      await expect(row.locator(".col-cost")).toHaveText("~$0.42");
+    });
+
+    test("panel parent expands to real member rows through the daemon proxy", async ({ page }) => {
+      await waitForReviewsReady(page);
+      await waitForJobRows(page, 10);
+
+      const parent = jobRowById(page, 79);
+      await expect(parent).toBeVisible();
+      await expect(parent.locator(".panel-status")).toContainText("1 ok · 1 failed");
+      await expect(parent.locator(".col-cost")).toHaveText("~$0.35");
+
+      const panelRunResponse = page.waitForResponse((response) => {
+        const url = new URL(response.url());
+        return (
+          response.ok() &&
+          url.pathname.endsWith("/api/roborev/api/jobs") &&
+          url.searchParams.get("panel_run") === "panel-e2e-1" &&
+          url.searchParams.get("omit_prompt") === "true"
+        );
+      });
+      await page.keyboard.press("j");
+      await expect(parent).toHaveClass(/highlighted/);
+      await page.keyboard.press("ArrowRight");
+      await panelRunResponse;
+
+      const members = page.locator(".job-row.member");
+      await expect(members).toHaveCount(2);
+      await expect(members.nth(0).locator(".member-name")).toHaveText("default");
+      await expect(members.nth(0).locator(".col-id")).toContainText("77");
+      await expect(members.nth(1).locator(".member-name")).toHaveText("security");
+      await expect(members.nth(1).locator(".col-id")).toContainText("78");
+
+      await page.keyboard.press("Enter");
+      await expect(page).toHaveURL(/\/reviews\/79$/);
+      await expect(page.locator(".panel-line")).toContainText("2 reviewers:");
+      await expect(page.locator(".panel-line")).toContainText("default");
+      await page.keyboard.press("Escape");
+      await expect(page).toHaveURL(/\/reviews$/);
+
+      await page.keyboard.press("ArrowLeft");
+      await expect(members).toHaveCount(0);
+      await page.keyboard.press("ArrowRight");
+      await expect(members).toHaveCount(2);
+
+      let releaseRefresh: (() => void) | undefined;
+      let delayedRefresh = false;
+      let resolveRefreshStarted!: () => void;
+      const refreshStarted = new Promise<void>((resolve) => {
+        resolveRefreshStarted = resolve;
+      });
+      let resolveRefreshContinued!: () => void;
+      const refreshContinued = new Promise<void>((resolve) => {
+        resolveRefreshContinued = resolve;
+      });
+      let failNextRefresh = false;
+      let allowRetryRefresh = false;
+      let failedRefresh = false;
+      let retryRefresh = false;
+      let resolveFailureServed!: () => void;
+      const failureServed = new Promise<void>((resolve) => {
+        resolveFailureServed = resolve;
+      });
+      let resolveRetryContinued!: () => void;
+      const retryContinued = new Promise<void>((resolve) => {
+        resolveRetryContinued = resolve;
+      });
+      await page.route("**/api/roborev/api/jobs?**", async (route) => {
+        const url = new URL(route.request().url());
+        if (url.searchParams.get("panel_run") !== "panel-e2e-1") {
+          await route.continue();
+          return;
+        }
+
+        let heldRefresh = false;
+        if (!delayedRefresh) {
+          delayedRefresh = true;
+          heldRefresh = true;
+          resolveRefreshStarted();
+          await new Promise<void>((release) => {
+            releaseRefresh = release;
+          });
+        }
+        if (heldRefresh) {
+          await route.continue();
+          resolveRefreshContinued();
+          return;
+        }
+        if (failNextRefresh && !failedRefresh) {
+          failedRefresh = true;
+          await route.fulfill({
+            status: 502,
+            contentType: "application/json",
+            body: JSON.stringify({ error: "seeded panel refresh failure" }),
+          });
+          resolveFailureServed();
+          return;
+        }
+        if (failedRefresh && !allowRetryRefresh) {
+          await route.fulfill({
+            status: 502,
+            contentType: "application/json",
+            body: JSON.stringify({ error: "seeded panel refresh failure" }),
+          });
+          return;
+        }
+        await route.continue();
+        if (!retryRefresh) {
+          retryRefresh = true;
+          resolveRetryContinued();
+        }
+      });
+
+      await page.keyboard.press("Enter");
+      await refreshStarted;
+      await expect(members).toHaveCount(2);
+      await expect(page.locator(".members-status-row")).toContainText("Refreshing reviewers");
+      releaseRefresh?.();
+      await refreshContinued;
+      await expect(page.locator(".members-status-row", { hasText: "Refreshing reviewers" })).toHaveCount(0);
+      await expect(page).toHaveURL(/\/reviews\/79$/);
+      await page.keyboard.press("Escape");
+      await expect(page).toHaveURL(/\/reviews$/);
+      failNextRefresh = true;
+      await parent.click();
+      await failureServed;
+      await expect(page).toHaveURL(/\/reviews\/79$/);
+      await expect(page.locator(".drawer")).toBeVisible();
+      await expect(page.locator(".panel-error")).toContainText("Could not refresh reviewers.");
+      await expect(page.locator(".members-status-row.error")).toContainText("Could not refresh reviewers.");
+      allowRetryRefresh = true;
+      const retryResponse = page.waitForResponse((response) => {
+        const url = new URL(response.url());
+        return (
+          response.ok() &&
+          url.pathname.endsWith("/api/roborev/api/jobs") &&
+          url.searchParams.get("panel_run") === "panel-e2e-1" &&
+          url.searchParams.get("omit_prompt") === "true"
+        );
+      });
+      await page.locator(".panel-retry").click();
+      await retryContinued;
+      await retryResponse;
+      await expect(page.locator(".panel-error")).toHaveCount(0);
+      await expect(page.locator(".members-status-row.error")).toHaveCount(0);
+      await page.keyboard.press("Escape");
+      await expect(page).toHaveURL(/\/reviews$/);
+      await page.keyboard.press("j");
+      await expect(members.nth(0)).toHaveClass(/highlighted/);
+      await page.keyboard.press("ArrowLeft");
+      await expect(members).toHaveCount(0);
+      await expect(parent).toHaveClass(/highlighted/);
+      await page.keyboard.press("ArrowRight");
+      await expect(members).toHaveCount(2);
+      await page.keyboard.press("j");
+      await expect(members.nth(0)).toHaveClass(/highlighted/);
+      await page.keyboard.press("Enter");
+      await expect(page).toHaveURL(/\/reviews\/77$/);
+      await expect(page.locator(".drawer")).toBeVisible();
+      await expect(page.locator(".header-start .review-type", { hasText: "default" })).toBeVisible();
+    });
+
+    test("route-selected panel drawer drains queued member refresh while table stays collapsed", async ({ page }) => {
+      let panelMemberRequests = 0;
+      let releaseFirstMemberFetch: (() => void) | undefined;
+      let resolveFirstMemberFetchStarted!: () => void;
+      const firstMemberFetchStarted = new Promise<void>((resolve) => {
+        resolveFirstMemberFetchStarted = resolve;
+      });
+      let resolveLatestMemberFetchServed!: () => void;
+      const latestMemberFetchServed = new Promise<void>((resolve) => {
+        resolveLatestMemberFetchServed = resolve;
+      });
+
+      await page.route("**/api/roborev/api/jobs?**", async (route) => {
+        const url = new URL(route.request().url());
+        if (url.searchParams.get("panel_run") !== "panel-e2e-1") {
+          await route.continue();
+          return;
+        }
+
+        panelMemberRequests++;
+        if (panelMemberRequests === 1) {
+          resolveFirstMemberFetchStarted();
+          await new Promise<void>((resolve) => {
+            releaseFirstMemberFetch = resolve;
+          });
+          await route.continue();
+          return;
+        }
+
+        const response = await route.fetch();
+        const body = (await response.json()) as {
+          jobs?: Array<Record<string, unknown>> | null;
+          [key: string]: unknown;
+        };
+        const jobs = (body.jobs ?? []).map((job) => {
+          if (job["id"] === 77) {
+            return { ...job, panel_member_name: "fresh-default", verdict: "pass" };
+          }
+          if (job["id"] === 78) {
+            return { ...job, panel_member_name: "fresh-security", verdict: "pass" };
+          }
+          return job;
+        });
+        await route.fulfill({
+          response,
+          body: JSON.stringify({ ...body, jobs }),
+        });
+        resolveLatestMemberFetchServed();
+      });
+
+      await page.goto("/reviews/79");
+      await expect(page).toHaveURL(/\/reviews\/79$/);
+      await expect(page.locator(".job-table")).toBeVisible({
+        timeout: 15_000,
+      });
+      const parent = jobRowById(page, 79);
+      await expect(parent).toBeVisible();
+      await expect(parent).toHaveAttribute("aria-expanded", "false");
+      await expect(page.locator(".job-row.member")).toHaveCount(0);
+      await expect(page.locator(".drawer")).toBeVisible();
+      await firstMemberFetchStarted;
+      await expect(page.locator(".panel-line")).toContainText("Refreshing reviewers");
+
+      const listingReload = page.waitForResponse((response) => {
+        const url = new URL(response.url());
+        return (
+          response.ok() &&
+          url.pathname.endsWith("/api/roborev/api/jobs") &&
+          url.searchParams.get("panel_run") === null &&
+          url.searchParams.get("status") === "done"
+        );
+      });
+      await selectStatusFilter(page, "Done");
+      await listingReload;
+      await expect(page.locator(".status-badge.status-done").first()).toBeVisible({
+        timeout: 5_000,
+      });
+      await expect(page.locator(".status-badge:not(.status-done)")).toHaveCount(0);
+
+      releaseFirstMemberFetch?.();
+      await latestMemberFetchServed;
+      await expect(page.locator(".panel-line")).toContainText("fresh-default pass");
+      await expect(page.locator(".panel-line")).toContainText("fresh-security pass");
+      await expect(parent).toHaveAttribute("aria-expanded", "false");
+      await expect(page.locator(".job-row.member")).toHaveCount(0);
     });
 
     test("status badges show correct classes for each status", async ({ page }) => {
@@ -180,7 +431,7 @@ test.describe.serial("Roborev", () => {
       }
 
       const totalCount = await page.locator(".job-row").count();
-      // Seed has 74 jobs total
+      // Seed has 77 parent-visible rows; panel members are hidden until expanded.
       expect(totalCount).toBeGreaterThanOrEqual(70);
     });
 
@@ -311,8 +562,7 @@ test.describe.serial("Roborev", () => {
 
       const beforeCount = await page.locator(".job-row").count();
 
-      // Check the hide-closed checkbox
-      await page.locator(".hide-closed input[type=checkbox]").check();
+      await page.getByLabel("Hide closed").check();
 
       // Auto-retry until the row count drops to or below the
       // unfiltered baseline. The seed has closed jobs that should
@@ -323,6 +573,32 @@ test.describe.serial("Roborev", () => {
         const afterCount = await page.locator(".job-row").count();
         expect(afterCount).toBeLessThanOrEqual(beforeCount);
       }).toPass({ timeout: 5_000 });
+    });
+
+    test("show auto-design reveals skipped router byproducts", async ({ page }) => {
+      await waitForReviewsReady(page);
+      await waitForJobRows(page, 10);
+
+      const autoDesignSkipRef = page.locator(".git-ref[title='auto-design-skip']");
+      const autoDesignClassifyRef = page.locator(".git-ref[title='auto-design-classify']");
+      await expect(autoDesignSkipRef).toHaveCount(0);
+      await expect(autoDesignClassifyRef).toHaveCount(0);
+
+      await page.getByLabel("Show auto-design").check();
+
+      await expect(autoDesignSkipRef).toBeVisible({ timeout: 5_000 });
+      const autoDesignSkipRow = page.locator(".job-row", { has: autoDesignSkipRef });
+      await expect(autoDesignSkipRow.locator(".status-badge")).toHaveText("skipped");
+      await expect(autoDesignSkipRow.locator(".col-type")).toHaveText("review");
+      await autoDesignSkipRow.click();
+      await expect(page.locator(".header-start .review-type", { hasText: "auto-design" })).toBeVisible();
+      await expect(page.locator(".skip-reason")).toHaveText("Skipped: trivial diff");
+      await page.keyboard.press("Escape");
+
+      await expect(autoDesignClassifyRef).toBeVisible({ timeout: 5_000 });
+      const autoDesignClassifyRow = page.locator(".job-row", { has: autoDesignClassifyRef });
+      await expect(autoDesignClassifyRow.locator(".status-badge")).toHaveText("failed");
+      await expect(autoDesignClassifyRow.locator(".col-type")).toHaveText("classify");
     });
 
     test("reset each filter to default restores full list", async ({ page }) => {

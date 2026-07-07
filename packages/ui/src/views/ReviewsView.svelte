@@ -15,6 +15,7 @@
     from "../components/roborev/ReviewDrawer.svelte";
   import ShortcutHelpModal
     from "../components/roborev/ShortcutHelpModal.svelte";
+  import { isPanelParent } from "../utils/roborev-panel.js";
 
   interface Props {
     jobId?: number;
@@ -90,6 +91,46 @@
         e.preventDefault();
         stores.roborevJobs?.highlightPrevJob();
         break;
+      case "ArrowRight":
+      case "ArrowLeft": {
+        const jobsStore = stores.roborevJobs;
+        if (!jobsStore) break;
+        const highlightedId =
+          jobsStore.getHighlightedJobId();
+        const highlighted = jobsStore
+          .getVisibleJobs()
+          .find(
+            (candidate) =>
+              candidate.id === highlightedId,
+          );
+        const panelParent =
+          highlighted && isPanelParent(highlighted)
+            ? highlighted
+            : jobsStore
+                .getJobs()
+                .find(
+                  (candidate) =>
+                    isPanelParent(candidate) &&
+                    candidate.panel_run_uuid ===
+                      highlighted?.panel_run_uuid,
+                );
+        if (
+          panelParent &&
+          panelParent.panel_run_uuid
+        ) {
+          const open = jobsStore.isPanelExpanded(
+            panelParent.panel_run_uuid,
+          );
+          if (
+            (e.key === "ArrowRight" && !open) ||
+            (e.key === "ArrowLeft" && open)
+          ) {
+            e.preventDefault();
+            jobsStore.togglePanel(panelParent);
+          }
+        }
+        break;
+      }
       case "Enter": {
         const highlighted =
           stores.roborevJobs?.getHighlightedJobId();
