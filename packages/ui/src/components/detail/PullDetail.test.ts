@@ -79,6 +79,7 @@ function pullDetail(): PullDetail {
   return {
     detail_loaded: true,
     detail_fetched_at: "2026-05-01T12:05:00Z",
+    deferred_merge_pending: false,
     diff_head_sha: "head",
     merge_base_sha: "base",
     platform_base_sha: "base",
@@ -1102,6 +1103,45 @@ describe("PullDetail approvals", () => {
 
     expect(screen.getByRole("dialog", { name: "Merge Pull Request" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Merge after CI is complete" })).toBeTruthy();
+  });
+
+  it("shows the queued merge state and still allows an immediate merge while a deferred merge waits", async () => {
+    const detail = pullDetail();
+    detail.repo.capabilities.merge_mutation = true;
+    detail.deferred_merge_pending = true;
+    detail.merge_request.CIStatus = "pending";
+    detail.merge_request.CIChecksJSON = JSON.stringify([
+      {
+        name: "build",
+        status: "in_progress",
+        conclusion: "",
+        url: "https://example.com/build",
+        app: "GitHub Actions",
+      },
+    ]);
+
+    renderPullDetail(detail, {
+      AllowSquashMerge: true,
+      AllowMergeCommit: false,
+      AllowRebaseMerge: false,
+      ViewerCanMerge: true,
+    });
+
+    const queued = await vi.waitFor(() => {
+      const found = screen.queryByRole("button", { name: "Merge queued" });
+      expect(found).not.toBeNull();
+      return found as HTMLButtonElement;
+    });
+    expect(queued.disabled).toBe(false);
+    expect(queued.title).toContain("Click to merge immediately");
+
+    // Clicking the queued action reopens the merge modal so the user can
+    // force an immediate merge — but it must not offer queueing a second
+    // deferred merge, which the server would reject.
+    await fireEvent.click(queued);
+    expect(screen.getByRole("dialog", { name: "Merge Pull Request" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Merge after CI is complete" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Squash and merge" })).toBeTruthy();
   });
 
   it("opens the merge modal in normal mode when aggregate CI has already failed", async () => {

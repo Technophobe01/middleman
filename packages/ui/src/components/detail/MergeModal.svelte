@@ -31,8 +31,16 @@
     requireHeadPin?: boolean;
     /** When true, the primary action waits for currently pending CI before merging. */
     deferUntilChecksPass?: boolean;
+    /**
+     * True while a background merge is already queued for this PR. The
+     * deferred action is withheld (the server would 409 on a second
+     * queue) and the modal offers an immediate merge instead.
+     */
+    alreadyQueued?: boolean;
     onclose: () => void;
     onmerged: () => void;
+    /** Called when a deferred merge was accepted and now waits on CI. */
+    onqueued: () => void;
     onheadconflict?: ((reason: "stale_state" | "head_unknown", context?: string) => void) | undefined;
   }
 
@@ -42,8 +50,12 @@
     allowSquash, allowMerge, allowRebase,
     expectedHeadSha, requireHeadPin = false,
     deferUntilChecksPass = false,
-    onclose, onmerged, onheadconflict,
+    alreadyQueued = false,
+    onclose, onmerged, onqueued, onheadconflict,
   }: Props = $props();
+
+  // Offer to queue a deferred merge only when none is queued yet.
+  const offerDeferredMerge = $derived(deferUntilChecksPass && !alreadyQueued);
 
   // Captured once when the modal opens: a background detail refresh
   // must not silently rebind the pin to a head the user has not seen
@@ -147,7 +159,7 @@
         if (handleMergeError(error)) return;
       }
       if (deferred) {
-        onclose();
+        onqueued();
         return;
       }
       onmerged();
@@ -159,7 +171,7 @@
   }
 
   function handleMerge(): void {
-    if (deferUntilChecksPass) {
+    if (offerDeferredMerge) {
       void submitMerge(true);
       return;
     }
@@ -179,8 +191,8 @@
 
   function primaryButtonLabel(): string {
     if (activeMergeSubmission === "deferred") return "Merge scheduled...";
-    if (activeMergeSubmission === "immediate" && !deferUntilChecksPass) return "Merging...";
-    return deferUntilChecksPass ? "Merge after CI is complete" : methodLabel();
+    if (activeMergeSubmission === "immediate" && !offerDeferredMerge) return "Merging...";
+    return offerDeferredMerge ? "Merge after CI is complete" : methodLabel();
   }
 
   function mergeAnywayButtonLabel(): string {
@@ -244,7 +256,13 @@
       {#if error}
         <p class="merge-error">{error}</p>
       {/if}
-      {#if deferUntilChecksPass}
+      {#if alreadyQueued}
+        <div class="ci-defer-note">
+          A merge is already queued; it runs only if the CI checks that were
+          pending when it was queued pass. Merging here merges immediately
+          instead.
+        </div>
+      {:else if deferUntilChecksPass}
         <div class="ci-defer-note">
           CI is still running. This will merge only if the checks that are pending now pass.
         </div>
@@ -277,7 +295,7 @@
     >
       {primaryButtonLabel()}
     </Button>
-    {#if deferUntilChecksPass}
+    {#if offerDeferredMerge}
       <Button
         class="btn btn--merge-anyway"
         onclick={handleMergeAnyway}
