@@ -6,12 +6,7 @@
   import PlusIcon from "@lucide/svelte/icons/plus";
 
   import { fetchKataDaemons, type KataDaemonInfo } from "../../api/kata/daemons.js";
-  import {
-    createKataWorkspaceForTask,
-    kataWorkspaceIdentityFromIssue,
-    resolveKataWorkspaceTarget,
-    type KataWorkspaceTarget,
-  } from "../../api/kata/workspaces.js";
+  import { createKataWorkspaceForTask, kataWorkspaceIdentityFromIssue } from "../../api/kata/workspaces.js";
   import type {
     KataCreateRecurrenceInput,
     KataPatchRecurrenceInput,
@@ -104,10 +99,7 @@
   let listResetGeneration = $state(0);
   let checklistRevealed = $state(false);
   let recurrenceDialogs = $state<KataRecurrenceDialogController | null>(null);
-  let workspaceTarget = $state.raw<KataWorkspaceTarget | null>(null);
   let workspaceActionBusy = $state(false);
-  let workspaceTargetKey: string | null = null;
-  let workspaceTargetRequestID = 0;
   let listMode = $state<ListMode>("tasks");
   let graphSourceIssue = $state.raw<KataTaskSummary | null>(null);
   const store = createKataWorkspaceStore({ api: untrack(() => api) });
@@ -161,35 +153,11 @@
     },
   });
 
-  $effect(() => {
-    const selected = store.selectedIssue?.issue;
-    const daemonID = activeKataDaemonId ?? null;
-    const requestID = ++workspaceTargetRequestID;
-    if (!selected || !daemonID) {
-      workspaceTargetKey = null;
-      workspaceTarget = null;
-      return;
-    }
-
-    const identity = kataWorkspaceIdentityFromIssue(selected, daemonID, projectNameForIssue(selected));
-    const targetKey = `${identity.daemon_id}:${identity.project_uid}:${identity.project_name ?? ""}:${identity.issue_uid}`;
-    requestError = null;
-    if (targetKey !== workspaceTargetKey) {
-      workspaceTargetKey = targetKey;
-      workspaceTarget = null;
-    }
-    void resolveKataWorkspaceTarget(identity)
-      .then((target) => {
-        if (requestID !== workspaceTargetRequestID) return;
-        workspaceTarget = target.available ? target : null;
-        requestError = null;
-      })
-      .catch((err) => {
-        if (requestID !== workspaceTargetRequestID) return;
-        requestError = kataRequestErrorMessage(err);
-        workspaceTarget = null;
-      });
-  });
+  // The workspace target arrives with the combined task-detail payload, so
+  // the workspace action renders atomically with the detail pane.
+  const workspaceTarget = $derived(
+    store.selectedIssue?.workspace_target?.available ? store.selectedIssue.workspace_target : null,
+  );
 
   const systemViews = [
     { name: "inbox", label: "Inbox" },
@@ -417,13 +385,13 @@
     return `${route.view ?? ""}\u0000${route.scope ?? ""}\u0000${route.issue ?? ""}`;
   }
 
-  function routeChangeMatchesPendingSelection(route: KataRouteSnapshot): boolean {
+  function routeChangeMatchesAwaitedSelection(route: KataRouteSnapshot): boolean {
     return (
       route.view === syncedRouteViewName &&
       route.scope === syncedRouteScopeUID &&
       route.issue !== null &&
       route.issue === awaitingSelectedIssueRouteUID &&
-      route.issue === store.pendingSelectionUID
+      (route.issue === store.pendingSelectionUID || route.issue === store.selectedIssue?.issue.uid)
     );
   }
 
@@ -433,7 +401,7 @@
     const signature = routeSignature(snapshot);
     if (signature === observedRouteSignature) return;
     observedRouteSignature = signature;
-    if (routeChangeMatchesPendingSelection(snapshot)) return;
+    if (routeChangeMatchesAwaitedSelection(snapshot)) return;
     beginNavigation();
     store.invalidatePendingLoads();
   });

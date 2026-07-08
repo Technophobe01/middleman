@@ -25,7 +25,13 @@ import type {
   KataTaskViewResponse,
 } from "../api/kata/taskTypes.js";
 import { createULID } from "../api/ulid.js";
+import { clearInteraction, markInteractionStart, measureInteraction } from "../instrumentation/interactionTiming.js";
 import { recordKataGraphDebugEvent, setKataGraphDebugStore } from "./kata-graph-debug.js";
+
+// User Timing interaction name for selecting a task: measures
+// "kata:select-issue:detail-visible" (click to detail pane rendered) and
+// "kata:select-issue:events-loaded" (click to events section populated).
+export const KATA_SELECT_ISSUE_INTERACTION = "kata:select-issue";
 
 export interface KataConnectionState {
   status: "offline" | "connecting" | "online" | "error";
@@ -988,45 +994,131 @@ export class KataWorkspaceStore {
     const abort = new AbortController();
     this.detailAbort = abort;
     this.observeGraphStore("detail-load-start", { uid, detailRequestID });
+    const timingToken = String(detailRequestID);
+    markInteractionStart(KATA_SELECT_ISSUE_INTERACTION, timingToken);
+    // The events read may walk the daemon's whole event log (the daemon has
+    // no issue_uid filter), which takes seconds against remote daemons. Start
+    // it alongside the detail read so the pane never waits on the walk.
+    const eventsPromise = this.api.events({ issue_uid: uid, limit: 100 }, { signal: abort.signal });
+    eventsPromise.catch(() => {});
     let detail: KataTaskDetail;
-    let events: KataTaskEventsResponse;
     try {
-      [detail, events] = await Promise.all([
-        this.api.issue(uid, { signal: abort.signal }),
-        this.api.events({ issue_uid: uid, limit: 100 }, { signal: abort.signal }),
-      ]);
+      detail = await this.api.issue(uid, { signal: abort.signal });
     } catch (error) {
+      if (this.detailAbort === abort) this.detailAbort = null;
+      clearInteraction(KATA_SELECT_ISSUE_INTERACTION, timingToken);
       // Aborted means superseded: a newer selection owns the pane now, so
       // this failure must not surface as a user-facing error.
       if (abort.signal.aborted) {
         this.observeGraphStore("detail-load-abort", { uid, detailRequestID });
         return false;
       }
+      abort.abort();
       throw error;
-    } finally {
-      if (this.detailAbort === abort) this.detailAbort = null;
     }
+
+    const applyDetail = () => {
+      this.cacheDetail(detail);
+      this.selectedIssue = detail;
+      if (detail.etag) {
+        this.issueETags.set(detail.issue.uid, detail.etag);
+      } else {
+        this.issueETags.set(detail.issue.uid, `"rev-${detail.issue.revision}"`);
+      }
+      this.selectedEvents = [];
+      this.selectedRecurrences = [];
+      this.pendingSelectionUID = null;
+      this.observeGraphStore("detail-load-complete", { uid, detailRequestID });
+      measureInteraction(KATA_SELECT_ISSUE_INTERACTION, "detail-visible", timingToken, { uid });
+      void this.loadSelectedRecurrences(detail.issue.project_id, detailRequestID);
+    };
+
     if (viewRequestID !== undefined && viewRequestID !== this.viewRequestID) {
       this.observeGraphStore("detail-load-stale", { uid, detailRequestID, viewRequestID });
+      clearInteraction(KATA_SELECT_ISSUE_INTERACTION, timingToken);
       return false;
     }
     if (detailRequestID !== this.detailRequestID) {
       this.observeGraphStore("detail-load-stale", { uid, detailRequestID });
+      clearInteraction(KATA_SELECT_ISSUE_INTERACTION, timingToken);
       return false;
     }
-    this.cacheDetail(detail);
-    this.selectedIssue = detail;
-    if (detail.etag) {
-      this.issueETags.set(detail.issue.uid, detail.etag);
-    } else {
-      this.issueETags.set(detail.issue.uid, `"rev-${detail.issue.revision}"`);
+    // Direct selections render the pane and resolve as soon as the detail
+    // lands: callers sync the route from this promise, so it must not wait
+    // on (or fail with) the event-log walk, which finishes in a guarded
+    // background continuation. View loads keep the original atomic apply:
+    // their callers update route bookkeeping only after this promise
+    // settles, and an intermediate reactive flush would let the workspace
+    // route-sync effect stomp the fresh selection with the stale route
+    // issue.
+    if (viewRequestID === undefined) {
+      applyDetail();
+      void this.finishSelectedEvents(eventsPromise, abort, uid, detailRequestID, timingToken);
+      return true;
+    }
+
+    let events: KataTaskEventsResponse;
+    try {
+      events = await eventsPromise;
+    } catch (error) {
+      clearInteraction(KATA_SELECT_ISSUE_INTERACTION, timingToken);
+      if (abort.signal.aborted) return false;
+      throw error;
+    } finally {
+      if (this.detailAbort === abort) this.detailAbort = null;
+    }
+    if (viewRequestID !== this.viewRequestID) {
+      this.observeGraphStore("detail-load-stale", { uid, detailRequestID, viewRequestID });
+      clearInteraction(KATA_SELECT_ISSUE_INTERACTION, timingToken);
+      return false;
+    }
+    if (detailRequestID !== this.detailRequestID) {
+      clearInteraction(KATA_SELECT_ISSUE_INTERACTION, timingToken);
+      return false;
+    }
+    applyDetail();
+    this.selectedEvents = events.events;
+    measureInteraction(KATA_SELECT_ISSUE_INTERACTION, "events-loaded", timingToken, {
+      uid,
+      count: events.events.length,
+    });
+    clearInteraction(KATA_SELECT_ISSUE_INTERACTION, timingToken);
+    return true;
+  }
+
+  // Completes a direct selection's best-effort event-log read after the
+  // detail has already been applied and the selection promise resolved. A
+  // failed or superseded read leaves the rendered detail in place with an
+  // empty event log instead of failing the selection.
+  private async finishSelectedEvents(
+    eventsPromise: Promise<KataTaskEventsResponse>,
+    abort: AbortController,
+    uid: string,
+    detailRequestID: number,
+    timingToken: string,
+  ): Promise<void> {
+    let events: KataTaskEventsResponse;
+    try {
+      events = await eventsPromise;
+    } catch {
+      clearInteraction(KATA_SELECT_ISSUE_INTERACTION, timingToken);
+      if (!abort.signal.aborted) {
+        this.observeGraphStore("events-load-error", { uid, detailRequestID });
+      }
+      return;
+    } finally {
+      if (this.detailAbort === abort) this.detailAbort = null;
+    }
+    if (detailRequestID !== this.detailRequestID) {
+      clearInteraction(KATA_SELECT_ISSUE_INTERACTION, timingToken);
+      return;
     }
     this.selectedEvents = events.events;
-    this.selectedRecurrences = [];
-    this.pendingSelectionUID = null;
-    this.observeGraphStore("detail-load-complete", { uid, detailRequestID });
-    void this.loadSelectedRecurrences(detail.issue.project_id, detailRequestID);
-    return true;
+    measureInteraction(KATA_SELECT_ISSUE_INTERACTION, "events-loaded", timingToken, {
+      uid,
+      count: events.events.length,
+    });
+    clearInteraction(KATA_SELECT_ISSUE_INTERACTION, timingToken);
   }
 
   private async loadSelectedRecurrences(projectID: number, detailRequestID: number): Promise<void> {
