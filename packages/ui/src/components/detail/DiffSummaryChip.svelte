@@ -4,7 +4,7 @@
     summarizeDiffFiles,
     type DiffLineSummary,
   } from "./diff-summary.js";
-  import DiffStats from "../shared/DiffStats.svelte";
+  import { DiffStats, Tooltip } from "@kenn-io/kit-ui";
 
   interface Props {
     additions: number;
@@ -20,12 +20,15 @@
     loadFiles,
   }: Props = $props();
 
-  const popoverId = $derived(
-    `diff-summary-popover-${
-      (summaryKey || "current").replace(/[^a-zA-Z0-9_-]/g, "-")
-    }`,
-  );
-  let open = $state(false);
+  /* kit Tooltip sets aria-describedby on its non-focusable wrapper span, not
+     on the real trigger. Reference the tooltip content from the button
+     directly: while closed the id resolves to nothing (ignored by AT), while
+     open it resolves to the summary. */
+  const summaryContentId = $props.id();
+
+  /* Whether the pointer/focus is on the trigger — drives lazy loading and
+     the refetch-on-rekey behavior while the tooltip is held open. */
+  let active = false;
   let loading = $state(false);
   let error = $state<string | null>(null);
   let summary = $state<DiffLineSummary | null>(null);
@@ -82,18 +85,18 @@
         summary = null;
         error = null;
         loadedSummaryKey = null;
-        if (open) void ensureSummary();
+        if (active) void ensureSummary();
       }
     }
   }
 
-  function showPopover(): void {
-    open = true;
+  function handleEnter(): void {
+    active = true;
     void ensureSummary();
   }
 
-  function hidePopover(): void {
-    open = false;
+  function handleLeave(): void {
+    active = false;
   }
 
   $effect.pre(() => {
@@ -106,34 +109,17 @@
     summary = null;
     error = null;
     loadedSummaryKey = null;
-    if (open) void ensureSummary();
+    if (active) void ensureSummary();
   });
 </script>
 
-<span class="diff-summary">
-  <button
-    type="button"
-    class="chip chip--muted diff-summary-trigger"
-    aria-describedby={open ? popoverId : undefined}
-    onmouseenter={showPopover}
-    onmouseleave={hidePopover}
-    onmouseover={showPopover}
-    onmouseout={hidePopover}
-    onfocus={showPopover}
-    onblur={hidePopover}
-  >
-    <DiffStats {additions} {deletions} />
-  </button>
-
-  {#if open}
-    <div
-      id={popoverId}
-      class="diff-summary-popover"
-      role="status"
-    >
-      {#if loading}
-        <div class="diff-summary-state">Loading...</div>
-      {:else if error}
+<Tooltip class="diff-summary-popover" align="start" openDelayMs={0}>
+  {#snippet content()}
+    <!-- The summary loads after the tooltip is already described to
+         assistive tech; a live region announces the async transition
+         from Loading to the totals (or an error). -->
+    <div id={summaryContentId} aria-live="polite">
+      {#if error}
         <div class="diff-summary-state diff-summary-state--error">
           {error}
         </div>
@@ -149,17 +135,25 @@
             </div>
           {/each}
         </div>
+      {:else}
+        <div class="diff-summary-state">Loading...</div>
       {/if}
     </div>
-  {/if}
-</span>
+  {/snippet}
+  <button
+    type="button"
+    class="diff-summary-trigger"
+    aria-describedby={summaryContentId}
+    onmouseenter={handleEnter}
+    onmouseleave={handleLeave}
+    onfocusin={handleEnter}
+    onfocusout={handleLeave}
+  >
+    <DiffStats {additions} {deletions} />
+  </button>
+</Tooltip>
 
 <style>
-  .diff-summary {
-    position: relative;
-    display: inline-flex;
-  }
-
   .diff-summary-trigger {
     box-sizing: border-box;
     display: inline-flex;
@@ -185,35 +179,6 @@
     outline-offset: 2px;
   }
 
-  .diff-summary-popover {
-    position: absolute;
-    z-index: 30;
-    top: calc(100% + 8px);
-    left: 0;
-    width: max-content;
-    min-width: 190px;
-    max-width: min(260px, calc(100vw - 32px));
-    padding: 10px;
-    border: 1px solid var(--border-default);
-    border-radius: var(--radius-md, 8px);
-    background: var(--bg-surface);
-    color: var(--text-primary);
-    box-shadow: 0 12px 30px rgba(0, 0, 0, 0.18);
-  }
-
-  .diff-summary-popover::before {
-    content: "";
-    position: absolute;
-    top: -5px;
-    left: 18px;
-    width: 8px;
-    height: 8px;
-    transform: rotate(45deg);
-    border-left: 1px solid var(--border-default);
-    border-top: 1px solid var(--border-default);
-    background: var(--bg-surface);
-  }
-
   .diff-summary-row {
     display: grid;
     grid-template-columns: minmax(0, 1fr) auto;
@@ -225,7 +190,7 @@
   .diff-summary-rows {
     display: flex;
     flex-direction: column;
-    gap: 5px;
+    gap: var(--space-2);
   }
 
   .diff-summary-row {

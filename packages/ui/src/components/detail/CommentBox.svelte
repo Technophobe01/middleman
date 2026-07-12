@@ -161,7 +161,7 @@
   .comment-box {
     display: flex;
     flex-direction: column;
-    gap: var(--focus-detail-space-sm, 0.62rem);
+    gap: var(--focus-detail-space-sm, 8px);
   }
 
   .error-msg {
@@ -174,20 +174,20 @@
   }
 
   .comment-editor-shell :global(.comment-editor-input) {
-    min-height: 8.62rem;
+    min-height: 112px;
     max-height: 75dvh;
-    padding-bottom: calc(var(--focus-detail-hit-target, 3.05rem) + var(--focus-detail-space-sm, 0.57rem));
+    padding-bottom: calc(var(--focus-detail-hit-target, 39.5px) + var(--focus-detail-space-sm, 7.5px));
   }
 
   .submit-btn {
     position: absolute;
-    right: var(--focus-detail-space-sm, 0.62rem);
-    bottom: var(--focus-detail-space-sm, 0.62rem);
+    right: var(--focus-detail-space-sm, 8px);
+    bottom: var(--focus-detail-space-sm, 8px);
     font-size: var(--font-size-root);
     font-weight: 500;
-    padding: var(--focus-detail-space-xs, 0.46rem) var(--focus-detail-space-md, 1.08rem);
+    padding: var(--focus-detail-space-xs, 6px) var(--focus-detail-space-md, 14px);
     background: var(--accent-blue);
-    color: #fff;
+    color: var(--text-on-accent);
     border-radius: var(--radius-sm);
     cursor: pointer;
     z-index: 1;

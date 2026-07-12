@@ -1,6 +1,6 @@
 import type { RoborevClient } from "../../api/roborev/client.js";
 import type { components, operations } from "../../api/roborev/generated/schema.js";
-import { parseCostUsd } from "../../utils/roborev-cost.js";
+import { isPanelParent, panelCostUsd, panelElapsedStart } from "../../utils/roborev-panel.js";
 
 type ReviewJob = components["schemas"]["ReviewJob"];
 type JobStats = components["schemas"]["JobStats"];
@@ -34,10 +34,23 @@ export function createJobsStore(opts: JobsStoreOptions) {
   let filterSearch = $state<string | undefined>(undefined);
   let filterHideClosed = $state(false);
   let filterJobType = $state<string | undefined>(undefined);
+  let filterShowAutoDesign = $state(false);
 
   // Sorting (client-side)
   let sortColumn = $state<SortColumn>("id");
   let sortDirection = $state<SortDirection>("desc");
+
+  // Panel expansion, keyed by panel_run_uuid. Member lists are cached per
+  // run and refreshed alongside the listing so SSE-driven reloads keep
+  // expanded panels live.
+  let expandedPanels = $state<Record<string, boolean>>({});
+  let panelMembers = $state<Record<string, ReviewJob[]>>({});
+  let panelMemberErrors = $state<Record<string, string>>({});
+  let loadingMembers = $state<Record<string, boolean>>({});
+  let panelRequestedVersions: Record<string, number> = {};
+  let activePanelFetchVersions: Record<string, number> = {};
+  let pendingPanelRefreshes: Record<string, boolean> = {};
+  let interestedPanelRun: string | undefined = undefined;
 
   // SSE
   let sseConnected = $state(false);
@@ -48,20 +61,42 @@ export function createJobsStore(opts: JobsStoreOptions) {
 
   function buildQuery(): ListJobsQuery {
     const q: ListJobsQuery = { limit: 50 };
-    if (filterRepo) q.repo = filterRepo;
+    if (filterRepo) q.repo = [filterRepo];
     if (filterBranch) q.branch = filterBranch;
     if (filterStatus) q.status = filterStatus;
     if (filterSearch) q.git_ref = filterSearch;
     if (filterHideClosed) q.closed = "false";
     if (filterJobType) q.job_type = filterJobType;
+    if (!filterShowAutoDesign) q.hide_classify_jobs = "true";
     return q;
   }
 
   function getElapsedSeconds(job: ReviewJob): number {
-    if (!job.started_at) return -1;
-    const start = new Date(job.started_at).getTime();
+    const startedAt = panelElapsedStart(job, getPanelMembersForJob(job));
+    if (!startedAt) return -1;
+    const start = new Date(startedAt).getTime();
     const end = job.finished_at ? new Date(job.finished_at).getTime() : Date.now();
     return Math.max(0, Math.floor((end - start) / 1000));
+  }
+
+  function getPanelMembersForJob(job: ReviewJob): ReviewJob[] | undefined {
+    const runUuid = job.panel_run_uuid;
+    return runUuid ? panelMembers[runUuid] : undefined;
+  }
+
+  function getPanelParentForMemberId(memberId: number): ReviewJob | undefined {
+    for (const job of jobs) {
+      const runUuid = job.panel_run_uuid;
+      if (!runUuid || !isPanelParent(job)) continue;
+      if (panelMembers[runUuid]?.some((member) => member.id === memberId)) {
+        return job;
+      }
+    }
+    return undefined;
+  }
+
+  function wantsPanelMembers(runUuid: string): boolean {
+    return expandedPanels[runUuid] === true || interestedPanelRun === runUuid;
   }
 
   function getSortValue(job: ReviewJob, col: SortColumn): string | number {
@@ -77,7 +112,7 @@ export function createJobsStore(opts: JobsStoreOptions) {
       case "elapsed":
         return getElapsedSeconds(job);
       case "cost":
-        return parseCostUsd(job.token_usage) ?? -1;
+        return panelCostUsd(job, getPanelMembersForJob(job)) ?? -1;
       case "job_type":
         return job.job_type;
       case "enqueued_at":
@@ -111,16 +146,20 @@ export function createJobsStore(opts: JobsStoreOptions) {
       jobs = sortJobs(data?.jobs ?? []);
       hasMore = data?.has_more ?? false;
       stats = data?.stats ?? { done: 0, closed: 0, open: 0 };
+      const expandedRuns: Record<string, true> = {};
+      for (const job of jobs) {
+        const runUuid = job.panel_run_uuid;
+        if (runUuid && wantsPanelMembers(runUuid)) {
+          expandedRuns[runUuid] = true;
+        }
+      }
+      if (interestedPanelRun) expandedRuns[interestedPanelRun] = true;
+      for (const runUuid of Object.keys(expandedRuns)) void fetchPanelMembers(runUuid);
       // Clear highlight if the row is no longer visible.
       // Do NOT clear selectedJobId — the selected job may
       // be on a later page (deep link, older job). The
       // drawer fetches its review independently.
-      if (highlightedJobId !== undefined) {
-        const ids = new Set(jobs.map((j) => j.id));
-        if (!ids.has(highlightedJobId)) {
-          highlightedJobId = undefined;
-        }
-      }
+      adjustHiddenHighlight();
     } catch (err) {
       if (version !== requestVersion) return;
       storeError = err instanceof Error ? err.message : String(err);
@@ -178,6 +217,9 @@ export function createJobsStore(opts: JobsStoreOptions) {
       case "jobType":
         filterJobType = value as string | undefined;
         break;
+      case "showAutoDesign":
+        filterShowAutoDesign = value as boolean;
+        break;
     }
     void loadJobs();
   }
@@ -214,6 +256,117 @@ export function createJobsStore(opts: JobsStoreOptions) {
       return;
     }
     void loadJobs();
+  }
+
+  async function fetchPanelMembers(runUuid: string): Promise<void> {
+    const version = (panelRequestedVersions[runUuid] ?? 0) + 1;
+    panelRequestedVersions = { ...panelRequestedVersions, [runUuid]: version };
+    if (loadingMembers[runUuid] === true) {
+      pendingPanelRefreshes = { ...pendingPanelRefreshes, [runUuid]: true };
+      return;
+    }
+
+    await runPanelMembersFetch(runUuid, version);
+  }
+
+  async function runPanelMembersFetch(runUuid: string, version: number): Promise<void> {
+    activePanelFetchVersions = { ...activePanelFetchVersions, [runUuid]: version };
+    loadingMembers = { ...loadingMembers, [runUuid]: true };
+    const { [runUuid]: _startedError, ...startedErrors } = panelMemberErrors;
+    panelMemberErrors = startedErrors;
+    try {
+      const { data, error } = await client.GET("/api/jobs", {
+        params: { query: { panel_run: runUuid, limit: 0, omit_prompt: "true" } },
+      });
+      if (error) throw new Error("Failed to load panel members");
+      if (panelRequestedVersions[runUuid] !== version) return;
+      const members = (data?.jobs ?? [])
+        .filter((job) => job.panel_role === "member")
+        .sort((a, b) => (a.panel_member_index ?? 0) - (b.panel_member_index ?? 0));
+      panelMembers = { ...panelMembers, [runUuid]: members };
+      const { [runUuid]: _memberError, ...memberErrors } = panelMemberErrors;
+      panelMemberErrors = memberErrors;
+      adjustHiddenHighlight(runUuid);
+      if (sortColumn === "cost" || sortColumn === "elapsed") {
+        jobs = sortJobs(jobs);
+      }
+    } catch (err) {
+      if (panelRequestedVersions[runUuid] === version) {
+        const message = err instanceof Error ? err.message : String(err);
+        panelMemberErrors = { ...panelMemberErrors, [runUuid]: message };
+        opts.onError?.(message);
+      }
+    } finally {
+      if (activePanelFetchVersions[runUuid] === version) {
+        const { [runUuid]: _active, ...activeRest } = activePanelFetchVersions;
+        activePanelFetchVersions = activeRest;
+        loadingMembers = { ...loadingMembers, [runUuid]: false };
+        if (pendingPanelRefreshes[runUuid] === true) {
+          const { [runUuid]: _pending, ...rest } = pendingPanelRefreshes;
+          pendingPanelRefreshes = rest;
+          const queuedVersion = panelRequestedVersions[runUuid];
+          if (queuedVersion !== undefined && queuedVersion > version && wantsPanelMembers(runUuid)) {
+            void runPanelMembersFetch(runUuid, queuedVersion);
+          }
+        }
+      }
+    }
+  }
+
+  function togglePanel(job: ReviewJob): void {
+    if (!isPanelParent(job)) return;
+    const runUuid = job.panel_run_uuid;
+    if (!runUuid) return;
+    const open = expandedPanels[runUuid] === true;
+    if (open && highlightedJobId !== undefined) {
+      const highlightedMember = panelMembers[runUuid]?.some((member) => member.id === highlightedJobId) ?? false;
+      if (highlightedMember) highlightedJobId = job.id;
+    }
+    expandedPanels = { ...expandedPanels, [runUuid]: !open };
+    if (!open && panelMembers[runUuid] === undefined && loadingMembers[runUuid] !== true) {
+      void fetchPanelMembers(runUuid);
+    }
+  }
+
+  function ensurePanelMembers(runUuid: string): void {
+    if (panelMembers[runUuid] === undefined && loadingMembers[runUuid] !== true) {
+      void fetchPanelMembers(runUuid);
+    }
+  }
+
+  function setPanelMemberInterest(runUuid: string | undefined): void {
+    interestedPanelRun = runUuid;
+    if (runUuid !== undefined) void fetchPanelMembers(runUuid);
+  }
+
+  function refreshPanelMembers(runUuid: string): void {
+    void fetchPanelMembers(runUuid);
+  }
+
+  function adjustHiddenHighlight(runUuid?: string): void {
+    if (highlightedJobId === undefined) return;
+    if (getVisibleJobs().some((job) => job.id === highlightedJobId)) return;
+    const parent =
+      runUuid !== undefined
+        ? jobs.find((job) => isPanelParent(job) && job.panel_run_uuid === runUuid)
+        : getPanelParentForMemberId(highlightedJobId);
+    highlightedJobId = parent?.id;
+  }
+
+  function isPanelExpanded(runUuid: string): boolean {
+    return expandedPanels[runUuid] === true;
+  }
+
+  function getPanelMembers(runUuid: string): ReviewJob[] | undefined {
+    return panelMembers[runUuid];
+  }
+
+  function getPanelMemberError(runUuid: string): string | undefined {
+    return panelMemberErrors[runUuid];
+  }
+
+  function isLoadingMembers(runUuid: string): boolean {
+    return loadingMembers[runUuid] === true;
   }
 
   // Selection — setSelectedJobId sets state only (no
@@ -269,27 +422,41 @@ export function createJobsStore(opts: JobsStoreOptions) {
 
   // Selection helpers for keyboard nav
   function selectNextJob(): void {
-    if (jobs.length === 0) return;
+    const visibleJobs = getVisibleJobs();
+    if (visibleJobs.length === 0) return;
     if (selectedJobId === undefined) {
-      selectJob(jobs[0]!.id);
+      selectJob(visibleJobs[0]!.id);
       return;
     }
-    const idx = jobs.findIndex((j) => j.id === selectedJobId);
-    if (idx < jobs.length - 1) {
-      selectJob(jobs[idx + 1]!.id);
+    const idx = visibleJobs.findIndex((j) => j.id === selectedJobId);
+    if (idx < visibleJobs.length - 1) {
+      selectJob(visibleJobs[idx + 1]!.id);
     }
   }
 
   function selectPrevJob(): void {
-    if (jobs.length === 0) return;
+    const visibleJobs = getVisibleJobs();
+    if (visibleJobs.length === 0) return;
     if (selectedJobId === undefined) {
-      selectJob(jobs[jobs.length - 1]!.id);
+      selectJob(visibleJobs[visibleJobs.length - 1]!.id);
       return;
     }
-    const idx = jobs.findIndex((j) => j.id === selectedJobId);
+    const idx = visibleJobs.findIndex((j) => j.id === selectedJobId);
     if (idx > 0) {
-      selectJob(jobs[idx - 1]!.id);
+      selectJob(visibleJobs[idx - 1]!.id);
     }
+  }
+
+  function getVisibleJobs(): ReviewJob[] {
+    const visible: ReviewJob[] = [];
+    for (const job of jobs) {
+      visible.push(job);
+      const runUuid = job.panel_run_uuid;
+      if (runUuid && expandedPanels[runUuid] === true && panelMembers[runUuid] !== undefined) {
+        visible.push(...(panelMembers[runUuid] ?? []));
+      }
+    }
+    return visible;
   }
 
   // Highlight navigation (j/k without opening drawer)
@@ -298,26 +465,28 @@ export function createJobsStore(opts: JobsStoreOptions) {
   }
 
   function highlightNextJob(): void {
-    if (jobs.length === 0) return;
+    const visibleJobs = getVisibleJobs();
+    if (visibleJobs.length === 0) return;
     if (highlightedJobId === undefined) {
-      highlightedJobId = jobs[0]!.id;
+      highlightedJobId = visibleJobs[0]!.id;
       return;
     }
-    const idx = jobs.findIndex((j) => j.id === highlightedJobId);
-    if (idx < jobs.length - 1) {
-      highlightedJobId = jobs[idx + 1]!.id;
+    const idx = visibleJobs.findIndex((j) => j.id === highlightedJobId);
+    if (idx < visibleJobs.length - 1) {
+      highlightedJobId = visibleJobs[idx + 1]!.id;
     }
   }
 
   function highlightPrevJob(): void {
-    if (jobs.length === 0) return;
+    const visibleJobs = getVisibleJobs();
+    if (visibleJobs.length === 0) return;
     if (highlightedJobId === undefined) {
-      highlightedJobId = jobs[jobs.length - 1]!.id;
+      highlightedJobId = visibleJobs[visibleJobs.length - 1]!.id;
       return;
     }
-    const idx = jobs.findIndex((j) => j.id === highlightedJobId);
+    const idx = visibleJobs.findIndex((j) => j.id === highlightedJobId);
     if (idx > 0) {
-      highlightedJobId = jobs[idx - 1]!.id;
+      highlightedJobId = visibleJobs[idx - 1]!.id;
     }
   }
 
@@ -361,6 +530,9 @@ export function createJobsStore(opts: JobsStoreOptions) {
   function getFilterJobType(): string | undefined {
     return filterJobType;
   }
+  function getFilterShowAutoDesign(): boolean {
+    return filterShowAutoDesign;
+  }
   function getSortColumn(): SortColumn {
     return sortColumn;
   }
@@ -373,6 +545,7 @@ export function createJobsStore(opts: JobsStoreOptions) {
 
   return {
     getJobs,
+    getVisibleJobs,
     isLoading,
     getHasMore,
     getStats,
@@ -385,9 +558,18 @@ export function createJobsStore(opts: JobsStoreOptions) {
     getFilterSearch,
     getFilterHideClosed,
     getFilterJobType,
+    getFilterShowAutoDesign,
     getSortColumn,
     getSortDirection,
     isSSEConnected,
+    togglePanel,
+    ensurePanelMembers,
+    setPanelMemberInterest,
+    refreshPanelMembers,
+    isPanelExpanded,
+    getPanelMembers,
+    getPanelMemberError,
+    isLoadingMembers,
     loadJobs,
     loadMore,
     setFilter,

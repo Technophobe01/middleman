@@ -59,6 +59,54 @@ func (e ActivityViewMode) Valid() bool {
 	}
 }
 
+// Defines values for IssueWorkflowStatus.
+const (
+	IssueWorkflowStatusAwaitingMerge IssueWorkflowStatus = "awaiting_merge"
+	IssueWorkflowStatusNew           IssueWorkflowStatus = "new"
+	IssueWorkflowStatusReviewing     IssueWorkflowStatus = "reviewing"
+	IssueWorkflowStatusWaiting       IssueWorkflowStatus = "waiting"
+)
+
+// Valid indicates whether the value is a known member of the IssueWorkflowStatus enum.
+func (e IssueWorkflowStatus) Valid() bool {
+	switch e {
+	case IssueWorkflowStatusAwaitingMerge:
+		return true
+	case IssueWorkflowStatusNew:
+		return true
+	case IssueWorkflowStatusReviewing:
+		return true
+	case IssueWorkflowStatusWaiting:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for IssueResponseWorkflowStatus.
+const (
+	IssueResponseWorkflowStatusAwaitingMerge IssueResponseWorkflowStatus = "awaiting_merge"
+	IssueResponseWorkflowStatusNew           IssueResponseWorkflowStatus = "new"
+	IssueResponseWorkflowStatusReviewing     IssueResponseWorkflowStatus = "reviewing"
+	IssueResponseWorkflowStatusWaiting       IssueResponseWorkflowStatus = "waiting"
+)
+
+// Valid indicates whether the value is a known member of the IssueResponseWorkflowStatus enum.
+func (e IssueResponseWorkflowStatus) Valid() bool {
+	switch e {
+	case IssueResponseWorkflowStatusAwaitingMerge:
+		return true
+	case IssueResponseWorkflowStatusNew:
+		return true
+	case IssueResponseWorkflowStatusReviewing:
+		return true
+	case IssueResponseWorkflowStatusWaiting:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for MergeRequestKanbanStatus.
 const (
 	MergeRequestKanbanStatusAwaitingMerge MergeRequestKanbanStatus = "awaiting_merge"
@@ -260,6 +308,30 @@ func (e TerminalRenderer) Valid() bool {
 	}
 }
 
+// Defines values for WorkflowStateMetaResponseStatus.
+const (
+	WorkflowStateMetaResponseStatusAwaitingMerge WorkflowStateMetaResponseStatus = "awaiting_merge"
+	WorkflowStateMetaResponseStatusNew           WorkflowStateMetaResponseStatus = "new"
+	WorkflowStateMetaResponseStatusReviewing     WorkflowStateMetaResponseStatus = "reviewing"
+	WorkflowStateMetaResponseStatusWaiting       WorkflowStateMetaResponseStatus = "waiting"
+)
+
+// Valid indicates whether the value is a known member of the WorkflowStateMetaResponseStatus enum.
+func (e WorkflowStateMetaResponseStatus) Valid() bool {
+	switch e {
+	case WorkflowStateMetaResponseStatusAwaitingMerge:
+		return true
+	case WorkflowStateMetaResponseStatusNew:
+		return true
+	case WorkflowStateMetaResponseStatusReviewing:
+		return true
+	case WorkflowStateMetaResponseStatusWaiting:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for GetPullFilePreviewOnHostParamsSide.
 const (
 	GetPullFilePreviewOnHostParamsSideNew GetPullFilePreviewOnHostParamsSide = "new"
@@ -370,16 +442,16 @@ func (e GetWorkspaceFilePreviewParamsWhitespace) Valid() bool {
 
 // Defines values for GetWorkspaceFilePreviewParamsSide.
 const (
-	New GetWorkspaceFilePreviewParamsSide = "new"
-	Old GetWorkspaceFilePreviewParamsSide = "old"
+	GetWorkspaceFilePreviewParamsSideNew GetWorkspaceFilePreviewParamsSide = "new"
+	GetWorkspaceFilePreviewParamsSideOld GetWorkspaceFilePreviewParamsSide = "old"
 )
 
 // Valid indicates whether the value is a known member of the GetWorkspaceFilePreviewParamsSide enum.
 func (e GetWorkspaceFilePreviewParamsSide) Valid() bool {
 	switch e {
-	case New:
+	case GetWorkspaceFilePreviewParamsSideNew:
 		return true
-	case Old:
+	case GetWorkspaceFilePreviewParamsSideOld:
 		return true
 	default:
 		return false
@@ -488,6 +560,39 @@ type AggregateRow struct {
 	TotalSize       int64  `json:"total_size"`
 }
 
+// ApplyReviewSuggestionHostInputBody defines model for ApplyReviewSuggestionHostInputBody.
+type ApplyReviewSuggestionHostInputBody struct {
+	// Schema A URL to the JSON Schema for this object.
+	Schema          *string                             `json:"$schema,omitempty"`
+	ExpectedHeadSha *string                             `json:"expected_head_sha,omitempty"`
+	Message         *string                             `json:"message,omitempty"`
+	Suggestions     *[]ApplyReviewSuggestionRequestItem `json:"suggestions"`
+}
+
+// ApplyReviewSuggestionInputBody defines model for ApplyReviewSuggestionInputBody.
+type ApplyReviewSuggestionInputBody struct {
+	// Schema A URL to the JSON Schema for this object.
+	Schema          *string                             `json:"$schema,omitempty"`
+	ExpectedHeadSha *string                             `json:"expected_head_sha,omitempty"`
+	Message         *string                             `json:"message,omitempty"`
+	Suggestions     *[]ApplyReviewSuggestionRequestItem `json:"suggestions"`
+}
+
+// ApplyReviewSuggestionRequestItem defines model for ApplyReviewSuggestionRequestItem.
+type ApplyReviewSuggestionRequestItem struct {
+	Replacement string `json:"replacement"`
+	ThreadId    string `json:"thread_id"`
+}
+
+// ApplyReviewSuggestionResponse defines model for ApplyReviewSuggestionResponse.
+type ApplyReviewSuggestionResponse struct {
+	// Schema A URL to the JSON Schema for this object.
+	Schema    *string `json:"$schema,omitempty"`
+	CommitSha *string `json:"commit_sha,omitempty"`
+	CommitUrl *string `json:"commit_url,omitempty"`
+	Status    string  `json:"status"`
+}
+
 // ApprovePRHostInputBody defines model for ApprovePRHostInputBody.
 type ApprovePRHostInputBody struct {
 	// Schema A URL to the JSON Schema for this object.
@@ -532,6 +637,16 @@ type BulkAddReposRequest struct {
 	// Schema A URL to the JSON Schema for this object.
 	Schema *string              `json:"$schema,omitempty"`
 	Repos  []BulkAddRepoRequest `json:"repos"`
+}
+
+// CICheck defines model for CICheck.
+type CICheck struct {
+	App             string `json:"app"`
+	Conclusion      string `json:"conclusion"`
+	DurationSeconds *int64 `json:"duration_seconds,omitempty"`
+	Name            string `json:"name"`
+	Status          string `json:"status"`
+	Url             string `json:"url"`
 }
 
 // Capabilities defines model for Capabilities.
@@ -758,7 +873,10 @@ type DiffFile struct {
 // DiffResponse defines model for DiffResponse.
 type DiffResponse struct {
 	// Schema A URL to the JSON Schema for this object.
-	Schema              *string     `json:"$schema,omitempty"`
+	Schema *string `json:"$schema,omitempty"`
+
+	// DiffHeadSha Synced PR diff snapshot head this diff was computed from. Always set for pull request diffs (the endpoint fails when no snapshot head is synced); empty for commit and workspace diffs. Compare with the pull detail's platform_head_sha to detect stale cached diff context; unrelated to 'stale', which reports clone-refresh staleness.
+	DiffHeadSha         *string     `json:"diff_head_sha,omitempty"`
 	Files               *[]DiffFile `json:"files"`
 	Stale               bool        `json:"stale"`
 	WhitespaceOnlyCount int64       `json:"whitespace_only_count"`
@@ -1241,40 +1359,45 @@ type InspectProjectWorktreeOutputBody struct {
 
 // Issue defines model for Issue.
 type Issue struct {
-	Author             string     `json:"Author"`
-	Body               string     `json:"Body"`
-	ClosedAt           *time.Time `json:"ClosedAt"`
-	CommentCount       int64      `json:"CommentCount"`
-	CreatedAt          time.Time  `json:"CreatedAt"`
-	DetailFetchedAt    *time.Time `json:"DetailFetchedAt"`
-	ID                 int64      `json:"ID"`
-	LastActivityAt     time.Time  `json:"LastActivityAt"`
-	Number             int64      `json:"Number"`
-	PlatformExternalID string     `json:"PlatformExternalID"`
-	PlatformID         int64      `json:"PlatformID"`
-	RepoID             int64      `json:"RepoID"`
-	Starred            bool       `json:"Starred"`
-	State              string     `json:"State"`
-	Title              string     `json:"Title"`
-	URL                string     `json:"URL"`
-	UpdatedAt          time.Time  `json:"UpdatedAt"`
-	Assignees          *[]string  `json:"assignees,omitempty"`
-	Labels             *[]Label   `json:"labels,omitempty"`
+	Author             string              `json:"Author"`
+	Body               string              `json:"Body"`
+	ClosedAt           *time.Time          `json:"ClosedAt"`
+	CommentCount       int64               `json:"CommentCount"`
+	CreatedAt          time.Time           `json:"CreatedAt"`
+	DetailFetchedAt    *time.Time          `json:"DetailFetchedAt"`
+	ID                 int64               `json:"ID"`
+	LastActivityAt     time.Time           `json:"LastActivityAt"`
+	Number             int64               `json:"Number"`
+	PlatformExternalID string              `json:"PlatformExternalID"`
+	PlatformID         int64               `json:"PlatformID"`
+	RepoID             int64               `json:"RepoID"`
+	Starred            bool                `json:"Starred"`
+	State              string              `json:"State"`
+	Title              string              `json:"Title"`
+	URL                string              `json:"URL"`
+	UpdatedAt          time.Time           `json:"UpdatedAt"`
+	WorkflowStatus     IssueWorkflowStatus `json:"WorkflowStatus"`
+	Assignees          *[]string           `json:"assignees,omitempty"`
+	Labels             *[]Label            `json:"labels,omitempty"`
 }
+
+// IssueWorkflowStatus defines model for Issue.WorkflowStatus.
+type IssueWorkflowStatus string
 
 // IssueDetailResponse defines model for IssueDetailResponse.
 type IssueDetailResponse struct {
 	// Schema A URL to the JSON Schema for this object.
-	Schema          *string         `json:"$schema,omitempty"`
-	DetailFetchedAt *string         `json:"detail_fetched_at,omitempty"`
-	DetailLoaded    bool            `json:"detail_loaded"`
-	Events          *[]IssueEvent   `json:"events"`
-	Issue           Issue           `json:"issue"`
-	PlatformHost    string          `json:"platform_host"`
-	Repo            RepoRefResponse `json:"repo"`
-	RepoName        string          `json:"repo_name"`
-	RepoOwner       string          `json:"repo_owner"`
-	Workspace       *WorkspaceRef   `json:"workspace,omitempty"`
+	Schema          *string                    `json:"$schema,omitempty"`
+	DetailFetchedAt *string                    `json:"detail_fetched_at,omitempty"`
+	DetailLoaded    bool                       `json:"detail_loaded"`
+	Events          *[]IssueEvent              `json:"events"`
+	Issue           Issue                      `json:"issue"`
+	PlatformHost    string                     `json:"platform_host"`
+	Repo            RepoRefResponse            `json:"repo"`
+	RepoName        string                     `json:"repo_name"`
+	RepoOwner       string                     `json:"repo_owner"`
+	Workflow        *WorkflowStateMetaResponse `json:"workflow,omitempty"`
+	Workspace       *WorkspaceRef              `json:"workspace,omitempty"`
 }
 
 // IssueEvent defines model for IssueEvent.
@@ -1299,33 +1422,37 @@ type IssueEvent struct {
 // IssueResponse defines model for IssueResponse.
 type IssueResponse struct {
 	// Schema A URL to the JSON Schema for this object.
-	Schema             *string         `json:"$schema,omitempty"`
-	Author             string          `json:"Author"`
-	Body               string          `json:"Body"`
-	ClosedAt           *time.Time      `json:"ClosedAt"`
-	CommentCount       int64           `json:"CommentCount"`
-	CreatedAt          time.Time       `json:"CreatedAt"`
-	ID                 int64           `json:"ID"`
-	LastActivityAt     time.Time       `json:"LastActivityAt"`
-	Number             int64           `json:"Number"`
-	PlatformExternalID string          `json:"PlatformExternalID"`
-	PlatformID         int64           `json:"PlatformID"`
-	RepoID             int64           `json:"RepoID"`
-	Starred            bool            `json:"Starred"`
-	State              string          `json:"State"`
-	Title              string          `json:"Title"`
-	URL                string          `json:"URL"`
-	UpdatedAt          time.Time       `json:"UpdatedAt"`
-	Assignees          *[]string       `json:"assignees,omitempty"`
-	DetailFetchedAt    *string         `json:"detail_fetched_at,omitempty"`
-	DetailLoaded       bool            `json:"detail_loaded"`
-	Labels             *[]Label        `json:"labels,omitempty"`
-	PlatformHost       string          `json:"platform_host"`
-	Repo               RepoRefResponse `json:"repo"`
-	RepoName           string          `json:"repo_name"`
-	RepoOwner          string          `json:"repo_owner"`
-	Workspace          *WorkspaceRef   `json:"workspace,omitempty"`
+	Schema             *string                     `json:"$schema,omitempty"`
+	Author             string                      `json:"Author"`
+	Body               string                      `json:"Body"`
+	ClosedAt           *time.Time                  `json:"ClosedAt"`
+	CommentCount       int64                       `json:"CommentCount"`
+	CreatedAt          time.Time                   `json:"CreatedAt"`
+	ID                 int64                       `json:"ID"`
+	LastActivityAt     time.Time                   `json:"LastActivityAt"`
+	Number             int64                       `json:"Number"`
+	PlatformExternalID string                      `json:"PlatformExternalID"`
+	PlatformID         int64                       `json:"PlatformID"`
+	RepoID             int64                       `json:"RepoID"`
+	Starred            bool                        `json:"Starred"`
+	State              string                      `json:"State"`
+	Title              string                      `json:"Title"`
+	URL                string                      `json:"URL"`
+	UpdatedAt          time.Time                   `json:"UpdatedAt"`
+	WorkflowStatus     IssueResponseWorkflowStatus `json:"WorkflowStatus"`
+	Assignees          *[]string                   `json:"assignees,omitempty"`
+	DetailFetchedAt    *string                     `json:"detail_fetched_at,omitempty"`
+	DetailLoaded       bool                        `json:"detail_loaded"`
+	Labels             *[]Label                    `json:"labels,omitempty"`
+	PlatformHost       string                      `json:"platform_host"`
+	Repo               RepoRefResponse             `json:"repo"`
+	RepoName           string                      `json:"repo_name"`
+	RepoOwner          string                      `json:"repo_owner"`
+	Workspace          *WorkspaceRef               `json:"workspace,omitempty"`
 }
+
+// IssueResponseWorkflowStatus defines model for IssueResponse.WorkflowStatus.
+type IssueResponseWorkflowStatus string
 
 // ItemAssigneesResponse defines model for ItemAssigneesResponse.
 type ItemAssigneesResponse struct {
@@ -1375,10 +1502,21 @@ type KataProjectRepoMapping struct {
 	RepoPath     string  `json:"repo_path"`
 }
 
+// KataTaskDetailResponse defines model for KataTaskDetailResponse.
+type KataTaskDetailResponse struct {
+	// Schema A URL to the JSON Schema for this object.
+	Schema *string `json:"$schema,omitempty"`
+
+	// Detail Verbatim Kata daemon issue detail payload
+	Detail interface{} `json:"detail"`
+
+	// Etag Daemon issue detail ETag, when the daemon provided one
+	Etag            *string                     `json:"etag,omitempty"`
+	WorkspaceTarget KataWorkspaceTargetResponse `json:"workspace_target"`
+}
+
 // KataWorkspaceTargetResponse defines model for KataWorkspaceTargetResponse.
 type KataWorkspaceTargetResponse struct {
-	// Schema A URL to the JSON Schema for this object.
-	Schema            *string          `json:"$schema,omitempty"`
 	Available         bool             `json:"available"`
 	ExistingWorkspace *WorkspaceRef    `json:"existing_workspace,omitempty"`
 	ItemKey           *string          `json:"item_key,omitempty"`
@@ -1582,25 +1720,27 @@ type MergeRequestState string
 // MergeRequestDetailResponse defines model for MergeRequestDetailResponse.
 type MergeRequestDetailResponse struct {
 	// Schema A URL to the JSON Schema for this object.
-	Schema           *string                      `json:"$schema,omitempty"`
-	DetailFetchedAt  *string                      `json:"detail_fetched_at,omitempty"`
-	DetailLoaded     bool                         `json:"detail_loaded"`
-	DiffHeadSha      string                       `json:"diff_head_sha"`
-	Events           *[]MergeRequestEventResponse `json:"events"`
-	MergeBaseSha     string                       `json:"merge_base_sha"`
-	MergeRequest     MergeRequest                 `json:"merge_request"`
-	PlatformBaseSha  string                       `json:"platform_base_sha"`
-	PlatformHeadSha  string                       `json:"platform_head_sha"`
-	PlatformHost     string                       `json:"platform_host"`
-	Repo             RepoRefResponse              `json:"repo"`
-	RepoName         string                       `json:"repo_name"`
-	RepoOwner        string                       `json:"repo_owner"`
-	ReviewedHeadSha  string                       `json:"reviewed_head_sha"`
-	Stack            *StackContextResponse        `json:"stack,omitempty"`
-	Warnings         *[]string                    `json:"warnings,omitempty"`
-	WorkflowApproval WorkflowApprovalResponse     `json:"workflow_approval"`
-	Workspace        *WorkspaceRef                `json:"workspace,omitempty"`
-	WorktreeLinks    *[]WorktreeLinkResponse      `json:"worktree_links"`
+	Schema               *string                      `json:"$schema,omitempty"`
+	Checks               *[]CICheck                   `json:"checks,omitempty"`
+	DeferredMergePending bool                         `json:"deferred_merge_pending"`
+	DetailFetchedAt      *string                      `json:"detail_fetched_at,omitempty"`
+	DetailLoaded         bool                         `json:"detail_loaded"`
+	DiffHeadSha          string                       `json:"diff_head_sha"`
+	Events               *[]MergeRequestEventResponse `json:"events"`
+	MergeBaseSha         string                       `json:"merge_base_sha"`
+	MergeRequest         MergeRequest                 `json:"merge_request"`
+	PlatformBaseSha      string                       `json:"platform_base_sha"`
+	PlatformHeadSha      string                       `json:"platform_head_sha"`
+	PlatformHost         string                       `json:"platform_host"`
+	Repo                 RepoRefResponse              `json:"repo"`
+	RepoName             string                       `json:"repo_name"`
+	RepoOwner            string                       `json:"repo_owner"`
+	ReviewedHeadSha      string                       `json:"reviewed_head_sha"`
+	Stack                *StackContextResponse        `json:"stack,omitempty"`
+	Warnings             *[]string                    `json:"warnings,omitempty"`
+	WorkflowApproval     WorkflowApprovalResponse     `json:"workflow_approval"`
+	Workspace            *WorkspaceRef                `json:"workspace,omitempty"`
+	WorktreeLinks        *[]WorktreeLinkResponse      `json:"worktree_links"`
 }
 
 // MergeRequestEventResponse defines model for MergeRequestEventResponse.
@@ -2032,32 +2172,33 @@ type ProjectWorktreeRuntimeSession struct {
 
 // ProviderCapabilitiesResponse defines model for ProviderCapabilitiesResponse.
 type ProviderCapabilitiesResponse struct {
-	AssigneeMutation       bool      `json:"assignee_mutation"`
-	CommentMutation        bool      `json:"comment_mutation"`
-	DraftMutation          bool      `json:"draft_mutation"`
-	IssueMutation          bool      `json:"issue_mutation"`
-	LabelMutation          bool      `json:"label_mutation"`
-	MergeMutation          bool      `json:"merge_mutation"`
-	MutationHeadBinding    bool      `json:"mutation_head_binding"`
-	NativeMultilineRanges  bool      `json:"native_multiline_ranges"`
-	ReadCi                 bool      `json:"read_ci"`
-	ReadComments           bool      `json:"read_comments"`
-	ReadIssues             bool      `json:"read_issues"`
-	ReadLabels             bool      `json:"read_labels"`
-	ReadMergeRequests      bool      `json:"read_merge_requests"`
-	ReadReleases           bool      `json:"read_releases"`
-	ReadRepositories       bool      `json:"read_repositories"`
-	ReadReviewThreads      bool      `json:"read_review_threads"`
-	ReadyForReview         bool      `json:"ready_for_review"`
-	ReviewDraftMutation    bool      `json:"review_draft_mutation"`
-	ReviewMutation         bool      `json:"review_mutation"`
-	ReviewThreadResolution bool      `json:"review_thread_resolution"`
-	ReviewerMutation       bool      `json:"reviewer_mutation"`
-	StateMutation          bool      `json:"state_mutation"`
-	SupportedReviewActions *[]string `json:"supported_review_actions"`
-	ThreadReply            bool      `json:"thread_reply"`
-	ThreadResolve          bool      `json:"thread_resolve"`
-	WorkflowApproval       bool      `json:"workflow_approval"`
+	AssigneeMutation            bool      `json:"assignee_mutation"`
+	CommentMutation             bool      `json:"comment_mutation"`
+	DraftMutation               bool      `json:"draft_mutation"`
+	IssueMutation               bool      `json:"issue_mutation"`
+	LabelMutation               bool      `json:"label_mutation"`
+	MergeMutation               bool      `json:"merge_mutation"`
+	MutationHeadBinding         bool      `json:"mutation_head_binding"`
+	NativeMultilineRanges       bool      `json:"native_multiline_ranges"`
+	ReadCi                      bool      `json:"read_ci"`
+	ReadComments                bool      `json:"read_comments"`
+	ReadIssues                  bool      `json:"read_issues"`
+	ReadLabels                  bool      `json:"read_labels"`
+	ReadMergeRequests           bool      `json:"read_merge_requests"`
+	ReadReleases                bool      `json:"read_releases"`
+	ReadRepositories            bool      `json:"read_repositories"`
+	ReadReviewThreads           bool      `json:"read_review_threads"`
+	ReadyForReview              bool      `json:"ready_for_review"`
+	ReviewDraftMutation         bool      `json:"review_draft_mutation"`
+	ReviewMutation              bool      `json:"review_mutation"`
+	ReviewSuggestionApplication bool      `json:"review_suggestion_application"`
+	ReviewThreadResolution      bool      `json:"review_thread_resolution"`
+	ReviewerMutation            bool      `json:"reviewer_mutation"`
+	StateMutation               bool      `json:"state_mutation"`
+	SupportedReviewActions      *[]string `json:"supported_review_actions"`
+	ThreadReply                 bool      `json:"thread_reply"`
+	ThreadResolve               bool      `json:"thread_resolve"`
+	WorkflowApproval            bool      `json:"workflow_approval"`
 }
 
 // PublishChange defines model for PublishChange.
@@ -2224,6 +2365,11 @@ type RawWorktree struct {
 	LinkedPRNumber     *int64         `json:"linkedPRNumber,omitempty"`
 	Name               string         `json:"name"`
 	Path               string         `json:"path"`
+	PrAdditions        *int64         `json:"prAdditions,omitempty"`
+	PrCommentCount     *int64         `json:"prCommentCount,omitempty"`
+	PrDeletions        *int64         `json:"prDeletions,omitempty"`
+	PrMergeable        *string        `json:"prMergeable,omitempty"`
+	PrReviewDecision   *string        `json:"prReviewDecision,omitempty"`
 	PrState            *string        `json:"prState,omitempty"`
 	PrTitle            *string        `json:"prTitle,omitempty"`
 	PrURL              *string        `json:"prURL,omitempty"`
@@ -2441,26 +2587,27 @@ type RepoLabelsResponse struct {
 
 // RepoOperations defines model for RepoOperations.
 type RepoOperations struct {
-	AddComment          OperationAvailability `json:"add_comment"`
-	AddLabel            OperationAvailability `json:"add_label"`
-	ApproveWorkflow     OperationAvailability `json:"approve_workflow"`
-	CloseIssue          OperationAvailability `json:"close_issue"`
-	ClosePr             OperationAvailability `json:"close_pr"`
-	CreateIssue         OperationAvailability `json:"create_issue"`
-	EditComment         OperationAvailability `json:"edit_comment"`
-	MarkDraft           OperationAvailability `json:"mark_draft"`
-	MarkReadyForReview  OperationAvailability `json:"mark_ready_for_review"`
-	MergePr             OperationAvailability `json:"merge_pr"`
-	RemoveLabel         OperationAvailability `json:"remove_label"`
-	ReopenIssue         OperationAvailability `json:"reopen_issue"`
-	ReopenPr            OperationAvailability `json:"reopen_pr"`
-	ReplyReviewThread   OperationAvailability `json:"reply_review_thread"`
-	ResolveReviewThread OperationAvailability `json:"resolve_review_thread"`
-	ReviewDraft         OperationAvailability `json:"review_draft"`
-	SetAssignees        OperationAvailability `json:"set_assignees"`
-	SetReviewers        OperationAvailability `json:"set_reviewers"`
-	SubmitReview        OperationAvailability `json:"submit_review"`
-	UpdateContent       OperationAvailability `json:"update_content"`
+	AddComment            OperationAvailability `json:"add_comment"`
+	AddLabel              OperationAvailability `json:"add_label"`
+	ApplyReviewSuggestion OperationAvailability `json:"apply_review_suggestion"`
+	ApproveWorkflow       OperationAvailability `json:"approve_workflow"`
+	CloseIssue            OperationAvailability `json:"close_issue"`
+	ClosePr               OperationAvailability `json:"close_pr"`
+	CreateIssue           OperationAvailability `json:"create_issue"`
+	EditComment           OperationAvailability `json:"edit_comment"`
+	MarkDraft             OperationAvailability `json:"mark_draft"`
+	MarkReadyForReview    OperationAvailability `json:"mark_ready_for_review"`
+	MergePr               OperationAvailability `json:"merge_pr"`
+	RemoveLabel           OperationAvailability `json:"remove_label"`
+	ReopenIssue           OperationAvailability `json:"reopen_issue"`
+	ReopenPr              OperationAvailability `json:"reopen_pr"`
+	ReplyReviewThread     OperationAvailability `json:"reply_review_thread"`
+	ResolveReviewThread   OperationAvailability `json:"resolve_review_thread"`
+	ReviewDraft           OperationAvailability `json:"review_draft"`
+	SetAssignees          OperationAvailability `json:"set_assignees"`
+	SetReviewers          OperationAvailability `json:"set_reviewers"`
+	SubmitReview          OperationAvailability `json:"submit_review"`
+	UpdateContent         OperationAvailability `json:"update_content"`
 }
 
 // RepoPreviewRequest defines model for RepoPreviewRequest.
@@ -2980,6 +3127,18 @@ type WorkflowApprovalResponse struct {
 	Required bool  `json:"required"`
 }
 
+// WorkflowStateMetaResponse defines model for WorkflowStateMetaResponse.
+type WorkflowStateMetaResponse struct {
+	Status        WorkflowStateMetaResponseStatus `json:"status"`
+	UpdatedActor  *string                         `json:"updated_actor,omitempty"`
+	UpdatedAt     *time.Time                      `json:"updated_at,omitempty"`
+	UpdatedReason *string                         `json:"updated_reason,omitempty"`
+	UpdatedSource *string                         `json:"updated_source,omitempty"`
+}
+
+// WorkflowStateMetaResponseStatus defines model for WorkflowStateMetaResponse.Status.
+type WorkflowStateMetaResponseStatus string
+
 // WorkspaceKataMetadata defines model for WorkspaceKataMetadata.
 type WorkspaceKataMetadata struct {
 	DaemonId    string  `json:"daemon_id"`
@@ -3099,6 +3258,11 @@ type WorktreeSummary struct {
 	LinkedPRNumber     *int64         `json:"linkedPRNumber,omitempty"`
 	Name               string         `json:"name"`
 	Path               string         `json:"path"`
+	PrAdditions        *int64         `json:"prAdditions,omitempty"`
+	PrCommentCount     *int64         `json:"prCommentCount,omitempty"`
+	PrDeletions        *int64         `json:"prDeletions,omitempty"`
+	PrMergeable        *string        `json:"prMergeable,omitempty"`
+	PrReviewDecision   *string        `json:"prReviewDecision,omitempty"`
 	PrState            *string        `json:"prState,omitempty"`
 	PrTitle            *string        `json:"prTitle,omitempty"`
 	PrURL              *string        `json:"prURL,omitempty"`
@@ -3418,6 +3582,12 @@ type ListIssuesParams struct {
 	Assignee *string `form:"assignee,omitempty" json:"assignee,omitempty"`
 	Limit    *int64  `form:"limit,omitempty" json:"limit,omitempty"`
 	Offset   *int64  `form:"offset,omitempty" json:"offset,omitempty"`
+}
+
+// GetKataTaskDetailParams defines parameters for GetKataTaskDetail.
+type GetKataTaskDetailParams struct {
+	// XMiddlemanKataDaemon Kata daemon id; the effective default daemon when empty
+	XMiddlemanKataDaemon *string `json:"X-Middleman-Kata-Daemon,omitempty"`
 }
 
 // ReplaceMessagesSavedSearchesParams defines parameters for ReplaceMessagesSavedSearches.
@@ -3827,6 +3997,9 @@ type EditPrReviewDraftCommentOnHostJSONRequestBody = EditDiffReviewDraftCommentH
 // PublishPrReviewDraftOnHostJSONRequestBody defines body for PublishPrReviewDraftOnHost for application/json ContentType.
 type PublishPrReviewDraftOnHostJSONRequestBody = PublishDiffReviewDraftHostInputBody
 
+// ApplyPrReviewSuggestionsOnHostJSONRequestBody defines body for ApplyPrReviewSuggestionsOnHost for application/json ContentType.
+type ApplyPrReviewSuggestionsOnHostJSONRequestBody = ApplyReviewSuggestionHostInputBody
+
 // SetPrReviewersOnHostJSONRequestBody defines body for SetPrReviewersOnHost for application/json ContentType.
 type SetPrReviewersOnHostJSONRequestBody = SetReviewersRequest
 
@@ -3859,9 +4032,6 @@ type SetIssueLabelsJSONRequestBody = SetLabelsRequest
 
 // CreateIssueWorkspaceJSONRequestBody defines body for CreateIssueWorkspace for application/json ContentType.
 type CreateIssueWorkspaceJSONRequestBody = CreateIssueWorkspaceInputBody
-
-// ResolveKataWorkspaceTargetJSONRequestBody defines body for ResolveKataWorkspaceTarget for application/json ContentType.
-type ResolveKataWorkspaceTargetJSONRequestBody = KataWorkspaceTaskRequest
 
 // CreateKataWorkspaceJSONRequestBody defines body for CreateKataWorkspace for application/json ContentType.
 type CreateKataWorkspaceJSONRequestBody = KataWorkspaceTaskRequest
@@ -3949,6 +4119,9 @@ type EditPrReviewDraftCommentJSONRequestBody = EditDiffReviewDraftCommentInputBo
 
 // PublishPrReviewDraftJSONRequestBody defines body for PublishPrReviewDraft for application/json ContentType.
 type PublishPrReviewDraftJSONRequestBody = PublishDiffReviewDraftInputBody
+
+// ApplyPrReviewSuggestionsJSONRequestBody defines body for ApplyPrReviewSuggestions for application/json ContentType.
+type ApplyPrReviewSuggestionsJSONRequestBody = ApplyReviewSuggestionInputBody
 
 // SetPrReviewersJSONRequestBody defines body for SetPrReviewers for application/json ContentType.
 type SetPrReviewersJSONRequestBody = SetReviewersRequest
@@ -4464,6 +4637,11 @@ type ClientInterface interface {
 
 	PublishPrReviewDraftOnHost(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, body PublishPrReviewDraftOnHostJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
+	// ApplyPrReviewSuggestionsOnHostWithBody request with any body
+	ApplyPrReviewSuggestionsOnHostWithBody(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	ApplyPrReviewSuggestionsOnHost(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, body ApplyPrReviewSuggestionsOnHostJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
 	// ResolvePrReviewThreadOnHost request
 	ResolvePrReviewThreadOnHost(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, threadId string, reqEditors ...RequestEditorFn) (*http.Response, error)
 
@@ -4591,10 +4769,8 @@ type ClientInterface interface {
 	// ListKataDaemons request
 	ListKataDaemons(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error)
 
-	// ResolveKataWorkspaceTargetWithBody request with any body
-	ResolveKataWorkspaceTargetWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
-
-	ResolveKataWorkspaceTarget(ctx context.Context, body ResolveKataWorkspaceTargetJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+	// GetKataTaskDetail request
+	GetKataTaskDetail(ctx context.Context, issueUid string, params *GetKataTaskDetailParams, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// CreateKataWorkspaceWithBody request with any body
 	CreateKataWorkspaceWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
@@ -4851,6 +5027,11 @@ type ClientInterface interface {
 	PublishPrReviewDraftWithBody(ctx context.Context, provider string, owner string, name string, number int64, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	PublishPrReviewDraft(ctx context.Context, provider string, owner string, name string, number int64, body PublishPrReviewDraftJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// ApplyPrReviewSuggestionsWithBody request with any body
+	ApplyPrReviewSuggestionsWithBody(ctx context.Context, provider string, owner string, name string, number int64, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	ApplyPrReviewSuggestions(ctx context.Context, provider string, owner string, name string, number int64, body ApplyPrReviewSuggestionsJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// ResolvePrReviewThread request
 	ResolvePrReviewThread(ctx context.Context, provider string, owner string, name string, number int64, threadId string, reqEditors ...RequestEditorFn) (*http.Response, error)
@@ -6815,6 +6996,30 @@ func (c *Client) PublishPrReviewDraftOnHost(ctx context.Context, platformHost st
 	return c.Client.Do(req)
 }
 
+func (c *Client) ApplyPrReviewSuggestionsOnHostWithBody(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewApplyPrReviewSuggestionsOnHostRequestWithBody(c.Server, platformHost, provider, owner, name, number, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+func (c *Client) ApplyPrReviewSuggestionsOnHost(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, body ApplyPrReviewSuggestionsOnHostJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewApplyPrReviewSuggestionsOnHostRequest(c.Server, platformHost, provider, owner, name, number, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
 func (c *Client) ResolvePrReviewThreadOnHost(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, threadId string, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewResolvePrReviewThreadOnHostRequest(c.Server, platformHost, provider, owner, name, number, threadId)
 	if err != nil {
@@ -7367,20 +7572,8 @@ func (c *Client) ListKataDaemons(ctx context.Context, reqEditors ...RequestEdito
 	return c.Client.Do(req)
 }
 
-func (c *Client) ResolveKataWorkspaceTargetWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewResolveKataWorkspaceTargetRequestWithBody(c.Server, contentType, body)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
-		return nil, err
-	}
-	return c.Client.Do(req)
-}
-
-func (c *Client) ResolveKataWorkspaceTarget(ctx context.Context, body ResolveKataWorkspaceTargetJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewResolveKataWorkspaceTargetRequest(c.Server, body)
+func (c *Client) GetKataTaskDetail(ctx context.Context, issueUid string, params *GetKataTaskDetailParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewGetKataTaskDetailRequest(c.Server, issueUid, params)
 	if err != nil {
 		return nil, err
 	}
@@ -8521,6 +8714,30 @@ func (c *Client) PublishPrReviewDraftWithBody(ctx context.Context, provider stri
 
 func (c *Client) PublishPrReviewDraft(ctx context.Context, provider string, owner string, name string, number int64, body PublishPrReviewDraftJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewPublishPrReviewDraftRequest(c.Server, provider, owner, name, number, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+func (c *Client) ApplyPrReviewSuggestionsWithBody(ctx context.Context, provider string, owner string, name string, number int64, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewApplyPrReviewSuggestionsRequestWithBody(c.Server, provider, owner, name, number, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+func (c *Client) ApplyPrReviewSuggestions(ctx context.Context, provider string, owner string, name string, number int64, body ApplyPrReviewSuggestionsJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewApplyPrReviewSuggestionsRequest(c.Server, provider, owner, name, number, body)
 	if err != nil {
 		return nil, err
 	}
@@ -15809,6 +16026,81 @@ func NewPublishPrReviewDraftOnHostRequestWithBody(server string, platformHost st
 	return req, nil
 }
 
+// NewApplyPrReviewSuggestionsOnHostRequest calls the generic ApplyPrReviewSuggestionsOnHost builder with application/json body
+func NewApplyPrReviewSuggestionsOnHostRequest(server string, platformHost string, provider string, owner string, name string, number int64, body ApplyPrReviewSuggestionsOnHostJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewApplyPrReviewSuggestionsOnHostRequestWithBody(server, platformHost, provider, owner, name, number, "application/json", bodyReader)
+}
+
+// NewApplyPrReviewSuggestionsOnHostRequestWithBody generates requests for ApplyPrReviewSuggestionsOnHost with any type of body
+func NewApplyPrReviewSuggestionsOnHostRequestWithBody(server string, platformHost string, provider string, owner string, name string, number int64, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "platform_host", platformHost, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam1 string
+
+	pathParam1, err = runtime.StyleParamWithOptions("simple", false, "provider", provider, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam2 string
+
+	pathParam2, err = runtime.StyleParamWithOptions("simple", false, "owner", owner, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam3 string
+
+	pathParam3, err = runtime.StyleParamWithOptions("simple", false, "name", name, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam4 string
+
+	pathParam4, err = runtime.StyleParamWithOptions("simple", false, "number", number, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "integer", Format: "int64"})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/host/%s/pulls/%s/%s/%s/%s/review-suggestions/apply", pathParam0, pathParam1, pathParam2, pathParam3, pathParam4)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
 // NewResolvePrReviewThreadOnHostRequest generates requests for ResolvePrReviewThreadOnHost
 func NewResolvePrReviewThreadOnHostRequest(server string, platformHost string, provider string, owner string, name string, number int64, threadId string) (*http.Request, error) {
 	var err error
@@ -18579,27 +18871,23 @@ func NewListKataDaemonsRequest(server string) (*http.Request, error) {
 	return req, nil
 }
 
-// NewResolveKataWorkspaceTargetRequest calls the generic ResolveKataWorkspaceTarget builder with application/json body
-func NewResolveKataWorkspaceTargetRequest(server string, body ResolveKataWorkspaceTargetJSONRequestBody) (*http.Request, error) {
-	var bodyReader io.Reader
-	buf, err := json.Marshal(body)
+// NewGetKataTaskDetailRequest generates requests for GetKataTaskDetail
+func NewGetKataTaskDetailRequest(server string, issueUid string, params *GetKataTaskDetailParams) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "issue_uid", issueUid, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
 	if err != nil {
 		return nil, err
 	}
-	bodyReader = bytes.NewReader(buf)
-	return NewResolveKataWorkspaceTargetRequestWithBody(server, "application/json", bodyReader)
-}
-
-// NewResolveKataWorkspaceTargetRequestWithBody generates requests for ResolveKataWorkspaceTarget with any type of body
-func NewResolveKataWorkspaceTargetRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
-	var err error
 
 	serverURL, err := url.Parse(server)
 	if err != nil {
 		return nil, err
 	}
 
-	operationPath := fmt.Sprintf("/kata/workspace-target")
+	operationPath := fmt.Sprintf("/kata/tasks/%s", pathParam0)
 	if operationPath[0] == '/' {
 		operationPath = "." + operationPath
 	}
@@ -18609,12 +18897,25 @@ func NewResolveKataWorkspaceTargetRequestWithBody(server string, contentType str
 		return nil, err
 	}
 
-	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
 	if err != nil {
 		return nil, err
 	}
 
-	req.Header.Add("Content-Type", contentType)
+	if params != nil {
+
+		if params.XMiddlemanKataDaemon != nil {
+			var headerParam0 string
+
+			headerParam0, err = runtime.StyleParamWithOptions("simple", false, "X-Middleman-Kata-Daemon", *params.XMiddlemanKataDaemon, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationHeader, Type: "string", Format: ""})
+			if err != nil {
+				return nil, err
+			}
+
+			req.Header.Set("X-Middleman-Kata-Daemon", headerParam0)
+		}
+
+	}
 
 	return req, nil
 }
@@ -22411,6 +22712,74 @@ func NewPublishPrReviewDraftRequestWithBody(server string, provider string, owne
 	}
 
 	operationPath := fmt.Sprintf("/pulls/%s/%s/%s/%s/review-draft/publish", pathParam0, pathParam1, pathParam2, pathParam3)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
+// NewApplyPrReviewSuggestionsRequest calls the generic ApplyPrReviewSuggestions builder with application/json body
+func NewApplyPrReviewSuggestionsRequest(server string, provider string, owner string, name string, number int64, body ApplyPrReviewSuggestionsJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewApplyPrReviewSuggestionsRequestWithBody(server, provider, owner, name, number, "application/json", bodyReader)
+}
+
+// NewApplyPrReviewSuggestionsRequestWithBody generates requests for ApplyPrReviewSuggestions with any type of body
+func NewApplyPrReviewSuggestionsRequestWithBody(server string, provider string, owner string, name string, number int64, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "provider", provider, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam1 string
+
+	pathParam1, err = runtime.StyleParamWithOptions("simple", false, "owner", owner, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam2 string
+
+	pathParam2, err = runtime.StyleParamWithOptions("simple", false, "name", name, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam3 string
+
+	pathParam3, err = runtime.StyleParamWithOptions("simple", false, "number", number, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "integer", Format: "int64"})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/pulls/%s/%s/%s/%s/review-suggestions/apply", pathParam0, pathParam1, pathParam2, pathParam3)
 	if operationPath[0] == '/' {
 		operationPath = "." + operationPath
 	}
@@ -26618,6 +26987,11 @@ type ClientWithResponsesInterface interface {
 
 	PublishPrReviewDraftOnHostWithResponse(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, body PublishPrReviewDraftOnHostJSONRequestBody, reqEditors ...RequestEditorFn) (*PublishPrReviewDraftOnHostResponse, error)
 
+	// ApplyPrReviewSuggestionsOnHostWithBodyWithResponse request with any body
+	ApplyPrReviewSuggestionsOnHostWithBodyWithResponse(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*ApplyPrReviewSuggestionsOnHostResponse, error)
+
+	ApplyPrReviewSuggestionsOnHostWithResponse(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, body ApplyPrReviewSuggestionsOnHostJSONRequestBody, reqEditors ...RequestEditorFn) (*ApplyPrReviewSuggestionsOnHostResponse, error)
+
 	// ResolvePrReviewThreadOnHostWithResponse request
 	ResolvePrReviewThreadOnHostWithResponse(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, threadId string, reqEditors ...RequestEditorFn) (*ResolvePrReviewThreadOnHostResponse, error)
 
@@ -26745,10 +27119,8 @@ type ClientWithResponsesInterface interface {
 	// ListKataDaemonsWithResponse request
 	ListKataDaemonsWithResponse(ctx context.Context, reqEditors ...RequestEditorFn) (*ListKataDaemonsResponse, error)
 
-	// ResolveKataWorkspaceTargetWithBodyWithResponse request with any body
-	ResolveKataWorkspaceTargetWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*ResolveKataWorkspaceTargetResponse, error)
-
-	ResolveKataWorkspaceTargetWithResponse(ctx context.Context, body ResolveKataWorkspaceTargetJSONRequestBody, reqEditors ...RequestEditorFn) (*ResolveKataWorkspaceTargetResponse, error)
+	// GetKataTaskDetailWithResponse request
+	GetKataTaskDetailWithResponse(ctx context.Context, issueUid string, params *GetKataTaskDetailParams, reqEditors ...RequestEditorFn) (*GetKataTaskDetailResponse, error)
 
 	// CreateKataWorkspaceWithBodyWithResponse request with any body
 	CreateKataWorkspaceWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*CreateKataWorkspaceResponse, error)
@@ -27005,6 +27377,11 @@ type ClientWithResponsesInterface interface {
 	PublishPrReviewDraftWithBodyWithResponse(ctx context.Context, provider string, owner string, name string, number int64, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PublishPrReviewDraftResponse, error)
 
 	PublishPrReviewDraftWithResponse(ctx context.Context, provider string, owner string, name string, number int64, body PublishPrReviewDraftJSONRequestBody, reqEditors ...RequestEditorFn) (*PublishPrReviewDraftResponse, error)
+
+	// ApplyPrReviewSuggestionsWithBodyWithResponse request with any body
+	ApplyPrReviewSuggestionsWithBodyWithResponse(ctx context.Context, provider string, owner string, name string, number int64, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*ApplyPrReviewSuggestionsResponse, error)
+
+	ApplyPrReviewSuggestionsWithResponse(ctx context.Context, provider string, owner string, name string, number int64, body ApplyPrReviewSuggestionsJSONRequestBody, reqEditors ...RequestEditorFn) (*ApplyPrReviewSuggestionsResponse, error)
 
 	// ResolvePrReviewThreadWithResponse request
 	ResolvePrReviewThreadWithResponse(ctx context.Context, provider string, owner string, name string, number int64, threadId string, reqEditors ...RequestEditorFn) (*ResolvePrReviewThreadResponse, error)
@@ -29546,6 +29923,29 @@ func (r PublishPrReviewDraftOnHostResponse) StatusCode() int {
 	return 0
 }
 
+type ApplyPrReviewSuggestionsOnHostResponse struct {
+	Body                          []byte
+	HTTPResponse                  *http.Response
+	JSON200                       *ApplyReviewSuggestionResponse
+	ApplicationproblemJSONDefault *ProblemError
+}
+
+// Status returns HTTPResponse.Status
+func (r ApplyPrReviewSuggestionsOnHostResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r ApplyPrReviewSuggestionsOnHostResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
 type ResolvePrReviewThreadOnHostResponse struct {
 	Body                          []byte
 	HTTPResponse                  *http.Response
@@ -30344,15 +30744,15 @@ func (r ListKataDaemonsResponse) StatusCode() int {
 	return 0
 }
 
-type ResolveKataWorkspaceTargetResponse struct {
+type GetKataTaskDetailResponse struct {
 	Body                          []byte
 	HTTPResponse                  *http.Response
-	JSON200                       *KataWorkspaceTargetResponse
+	JSON200                       *KataTaskDetailResponse
 	ApplicationproblemJSONDefault *ProblemError
 }
 
 // Status returns HTTPResponse.Status
-func (r ResolveKataWorkspaceTargetResponse) Status() string {
+func (r GetKataTaskDetailResponse) Status() string {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.Status
 	}
@@ -30360,7 +30760,7 @@ func (r ResolveKataWorkspaceTargetResponse) Status() string {
 }
 
 // StatusCode returns HTTPResponse.StatusCode
-func (r ResolveKataWorkspaceTargetResponse) StatusCode() int {
+func (r GetKataTaskDetailResponse) StatusCode() int {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.StatusCode
 	}
@@ -31869,6 +32269,29 @@ func (r PublishPrReviewDraftResponse) Status() string {
 
 // StatusCode returns HTTPResponse.StatusCode
 func (r PublishPrReviewDraftResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+type ApplyPrReviewSuggestionsResponse struct {
+	Body                          []byte
+	HTTPResponse                  *http.Response
+	JSON200                       *ApplyReviewSuggestionResponse
+	ApplicationproblemJSONDefault *ProblemError
+}
+
+// Status returns HTTPResponse.Status
+func (r ApplyPrReviewSuggestionsResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r ApplyPrReviewSuggestionsResponse) StatusCode() int {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.StatusCode
 	}
@@ -34707,6 +35130,23 @@ func (c *ClientWithResponses) PublishPrReviewDraftOnHostWithResponse(ctx context
 	return ParsePublishPrReviewDraftOnHostResponse(rsp)
 }
 
+// ApplyPrReviewSuggestionsOnHostWithBodyWithResponse request with arbitrary body returning *ApplyPrReviewSuggestionsOnHostResponse
+func (c *ClientWithResponses) ApplyPrReviewSuggestionsOnHostWithBodyWithResponse(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*ApplyPrReviewSuggestionsOnHostResponse, error) {
+	rsp, err := c.ApplyPrReviewSuggestionsOnHostWithBody(ctx, platformHost, provider, owner, name, number, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseApplyPrReviewSuggestionsOnHostResponse(rsp)
+}
+
+func (c *ClientWithResponses) ApplyPrReviewSuggestionsOnHostWithResponse(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, body ApplyPrReviewSuggestionsOnHostJSONRequestBody, reqEditors ...RequestEditorFn) (*ApplyPrReviewSuggestionsOnHostResponse, error) {
+	rsp, err := c.ApplyPrReviewSuggestionsOnHost(ctx, platformHost, provider, owner, name, number, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseApplyPrReviewSuggestionsOnHostResponse(rsp)
+}
+
 // ResolvePrReviewThreadOnHostWithResponse request returning *ResolvePrReviewThreadOnHostResponse
 func (c *ClientWithResponses) ResolvePrReviewThreadOnHostWithResponse(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, threadId string, reqEditors ...RequestEditorFn) (*ResolvePrReviewThreadOnHostResponse, error) {
 	rsp, err := c.ResolvePrReviewThreadOnHost(ctx, platformHost, provider, owner, name, number, threadId, reqEditors...)
@@ -35110,21 +35550,13 @@ func (c *ClientWithResponses) ListKataDaemonsWithResponse(ctx context.Context, r
 	return ParseListKataDaemonsResponse(rsp)
 }
 
-// ResolveKataWorkspaceTargetWithBodyWithResponse request with arbitrary body returning *ResolveKataWorkspaceTargetResponse
-func (c *ClientWithResponses) ResolveKataWorkspaceTargetWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*ResolveKataWorkspaceTargetResponse, error) {
-	rsp, err := c.ResolveKataWorkspaceTargetWithBody(ctx, contentType, body, reqEditors...)
+// GetKataTaskDetailWithResponse request returning *GetKataTaskDetailResponse
+func (c *ClientWithResponses) GetKataTaskDetailWithResponse(ctx context.Context, issueUid string, params *GetKataTaskDetailParams, reqEditors ...RequestEditorFn) (*GetKataTaskDetailResponse, error) {
+	rsp, err := c.GetKataTaskDetail(ctx, issueUid, params, reqEditors...)
 	if err != nil {
 		return nil, err
 	}
-	return ParseResolveKataWorkspaceTargetResponse(rsp)
-}
-
-func (c *ClientWithResponses) ResolveKataWorkspaceTargetWithResponse(ctx context.Context, body ResolveKataWorkspaceTargetJSONRequestBody, reqEditors ...RequestEditorFn) (*ResolveKataWorkspaceTargetResponse, error) {
-	rsp, err := c.ResolveKataWorkspaceTarget(ctx, body, reqEditors...)
-	if err != nil {
-		return nil, err
-	}
-	return ParseResolveKataWorkspaceTargetResponse(rsp)
+	return ParseGetKataTaskDetailResponse(rsp)
 }
 
 // CreateKataWorkspaceWithBodyWithResponse request with arbitrary body returning *CreateKataWorkspaceResponse
@@ -35951,6 +36383,23 @@ func (c *ClientWithResponses) PublishPrReviewDraftWithResponse(ctx context.Conte
 		return nil, err
 	}
 	return ParsePublishPrReviewDraftResponse(rsp)
+}
+
+// ApplyPrReviewSuggestionsWithBodyWithResponse request with arbitrary body returning *ApplyPrReviewSuggestionsResponse
+func (c *ClientWithResponses) ApplyPrReviewSuggestionsWithBodyWithResponse(ctx context.Context, provider string, owner string, name string, number int64, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*ApplyPrReviewSuggestionsResponse, error) {
+	rsp, err := c.ApplyPrReviewSuggestionsWithBody(ctx, provider, owner, name, number, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseApplyPrReviewSuggestionsResponse(rsp)
+}
+
+func (c *ClientWithResponses) ApplyPrReviewSuggestionsWithResponse(ctx context.Context, provider string, owner string, name string, number int64, body ApplyPrReviewSuggestionsJSONRequestBody, reqEditors ...RequestEditorFn) (*ApplyPrReviewSuggestionsResponse, error) {
+	rsp, err := c.ApplyPrReviewSuggestions(ctx, provider, owner, name, number, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseApplyPrReviewSuggestionsResponse(rsp)
 }
 
 // ResolvePrReviewThreadWithResponse request returning *ResolvePrReviewThreadResponse
@@ -39978,6 +40427,39 @@ func ParsePublishPrReviewDraftOnHostResponse(rsp *http.Response) (*PublishPrRevi
 	return response, nil
 }
 
+// ParseApplyPrReviewSuggestionsOnHostResponse parses an HTTP response from a ApplyPrReviewSuggestionsOnHostWithResponse call
+func ParseApplyPrReviewSuggestionsOnHostResponse(rsp *http.Response) (*ApplyPrReviewSuggestionsOnHostResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &ApplyPrReviewSuggestionsOnHostResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest ApplyReviewSuggestionResponse
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && true:
+		var dest ProblemError
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSONDefault = &dest
+
+	}
+
+	return response, nil
+}
+
 // ParseResolvePrReviewThreadOnHostResponse parses an HTTP response from a ResolvePrReviewThreadOnHostWithResponse call
 func ParseResolvePrReviewThreadOnHostResponse(rsp *http.Response) (*ResolvePrReviewThreadOnHostResponse, error) {
 	bodyBytes, err := io.ReadAll(rsp.Body)
@@ -41084,22 +41566,22 @@ func ParseListKataDaemonsResponse(rsp *http.Response) (*ListKataDaemonsResponse,
 	return response, nil
 }
 
-// ParseResolveKataWorkspaceTargetResponse parses an HTTP response from a ResolveKataWorkspaceTargetWithResponse call
-func ParseResolveKataWorkspaceTargetResponse(rsp *http.Response) (*ResolveKataWorkspaceTargetResponse, error) {
+// ParseGetKataTaskDetailResponse parses an HTTP response from a GetKataTaskDetailWithResponse call
+func ParseGetKataTaskDetailResponse(rsp *http.Response) (*GetKataTaskDetailResponse, error) {
 	bodyBytes, err := io.ReadAll(rsp.Body)
 	defer func() { _ = rsp.Body.Close() }()
 	if err != nil {
 		return nil, err
 	}
 
-	response := &ResolveKataWorkspaceTargetResponse{
+	response := &GetKataTaskDetailResponse{
 		Body:         bodyBytes,
 		HTTPResponse: rsp,
 	}
 
 	switch {
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
-		var dest KataWorkspaceTargetResponse
+		var dest KataTaskDetailResponse
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
 			return nil, err
 		}
@@ -43208,6 +43690,39 @@ func ParsePublishPrReviewDraftResponse(rsp *http.Response) (*PublishPrReviewDraf
 	switch {
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
 		var dest ActionStatusBody
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && true:
+		var dest ProblemError
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSONDefault = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseApplyPrReviewSuggestionsResponse parses an HTTP response from a ApplyPrReviewSuggestionsWithResponse call
+func ParseApplyPrReviewSuggestionsResponse(rsp *http.Response) (*ApplyPrReviewSuggestionsResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &ApplyPrReviewSuggestionsResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest ApplyReviewSuggestionResponse
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
 			return nil, err
 		}

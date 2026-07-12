@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { SearchInput } from "@kenn-io/kit-ui";
   import CheckIcon from "@lucide/svelte/icons/check";
   import EraserIcon from "@lucide/svelte/icons/eraser";
   import XIcon from "@lucide/svelte/icons/x";
@@ -37,11 +37,6 @@
   }: Props = $props();
 
   let query = $state("");
-  let filterInput: HTMLInputElement | undefined = $state();
-
-  onMount(() => {
-    if (autofocusFilter) filterInput?.focus();
-  });
 
   const selectedNames = $derived(new Set(selectedLabels.map((label) => label.name)));
   const filteredLabels = $derived.by(() => {
@@ -68,7 +63,7 @@
   }
 </script>
 
-<div class="label-picker" role="dialog" aria-label="Edit labels">
+<div class="label-picker kit-popover-card" role="dialog" aria-label="Edit labels">
   <div class="label-picker__header">
     <div class="label-picker__title">
       <strong>Edit labels</strong>
@@ -98,16 +93,15 @@
     </div>
   </div>
 
-  <label class="label-picker__filter">
-    <span class="label-picker__sr-only">Filter labels</span>
-    <input
-      bind:this={filterInput}
+  <div class="label-picker__filter">
+    <SearchInput
       bind:value={query}
-      type="search"
+      block
+      autofocus={autofocusFilter}
       placeholder="Filter labels"
-      aria-label="Filter labels"
+      ariaLabel="Filter labels"
     />
-  </label>
+  </div>
 
   {#if error}
     <div class="label-picker__error" role="alert">{error}</div>
@@ -154,10 +148,6 @@
     display: flex;
     flex-direction: column;
     overflow: hidden;
-    border: 1px solid var(--border-default);
-    border-radius: var(--radius-md);
-    background: var(--bg-surface);
-    box-shadow: var(--shadow-lg);
     color: var(--text-primary);
   }
 
@@ -222,25 +212,6 @@
     display: block;
     padding: 8px;
     border-bottom: 1px solid var(--border-muted);
-    color: var(--text-secondary);
-    font-size: var(--font-size-sm);
-  }
-
-  .label-picker__filter input {
-    width: 100%;
-    border: 1px solid var(--border-default);
-    border-radius: var(--radius-md);
-    background: var(--bg-inset);
-    color: var(--text-primary);
-    padding: 6px 9px;
-    font: inherit;
-    min-height: 32px;
-    outline: none;
-  }
-
-  .label-picker__filter input:focus {
-    border-color: var(--accent-blue);
-    box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent-blue) 18%, transparent);
   }
 
   .label-picker__error {
@@ -262,7 +233,7 @@
     display: grid;
     grid-template-columns: 12px minmax(0, 1fr) 48px;
     align-items: center;
-    gap: 9px;
+    gap: var(--space-4);
     border: 0;
     background: transparent;
     color: inherit;
@@ -341,15 +312,4 @@
     font-size: var(--font-size-sm);
   }
 
-  .label-picker__sr-only {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    padding: 0;
-    margin: -1px;
-    overflow: hidden;
-    clip: rect(0, 0, 0, 0);
-    white-space: nowrap;
-    border: 0;
-  }
 </style>

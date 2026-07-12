@@ -1,22 +1,19 @@
 <script lang="ts">
   import { onMount, untrack } from "svelte";
+  import { IconButton } from "@kenn-io/kit-ui";
   import LayoutPanelLeftIcon from "@lucide/svelte/icons/layout-panel-left";
   import LayoutPanelTopIcon from "@lucide/svelte/icons/layout-panel-top";
   import PlusIcon from "@lucide/svelte/icons/plus";
 
   import { fetchKataDaemons, type KataDaemonInfo } from "../../api/kata/daemons.js";
-  import {
-    createKataWorkspaceForTask,
-    kataWorkspaceIdentityFromIssue,
-    resolveKataWorkspaceTarget,
-    type KataWorkspaceTarget,
-  } from "../../api/kata/workspaces.js";
+  import { createKataWorkspaceForTask, kataWorkspaceIdentityFromIssue } from "../../api/kata/workspaces.js";
   import type {
     KataCreateRecurrenceInput,
     KataPatchRecurrenceInput,
     KataProjectSummary,
     KataRecurrence,
     KataTaskAPI,
+    KataTaskDetail,
     KataTaskEditPatch,
     KataTaskSearchFilters,
     KataTaskSummary,
@@ -39,9 +36,11 @@
   import { navigate } from "../../stores/router.svelte.js";
   import { createKataWorkspaceStore } from "../../stores/kata-workspace.svelte.js";
   import KataDaemonSwitcher from "./KataDaemonSwitcher.svelte";
+  import KataReachableGraph from "./KataReachableGraph.svelte";
   import KataRecurrenceDialogs from "./KataRecurrenceDialogs.svelte";
   import KataSearchPanel from "./KataSearchPanel.svelte";
   import { createKataEventStreamController } from "./kataEventStreamController.js";
+  import type { KataGraphLayoutDirection } from "./kataReachableGraph.js";
 
   interface Props {
     api?: KataTaskAPI | undefined;
@@ -70,6 +69,11 @@
 
   type SplitOrientation = "vertical" | "horizontal";
   type FailureSurface = "request" | "daemon" | "none";
+  type ListMode = "tasks" | "reachableGraph";
+
+  function graphLayoutDirectionForSplit(orientation: SplitOrientation): KataGraphLayoutDirection {
+    return orientation === "horizontal" ? "LR" : "TB";
+  }
 
   let {
     api = undefined,
@@ -95,15 +99,15 @@
   let listResetGeneration = $state(0);
   let checklistRevealed = $state(false);
   let recurrenceDialogs = $state<KataRecurrenceDialogController | null>(null);
-  let workspaceTarget = $state.raw<KataWorkspaceTarget | null>(null);
-  let workspaceTargetLoading = $state(false);
   let workspaceActionBusy = $state(false);
-  let workspaceTargetRequestID = 0;
+  let listMode = $state<ListMode>("tasks");
+  let graphSourceIssue = $state.raw<KataTaskSummary | null>(null);
   const store = createKataWorkspaceStore({ api: untrack(() => api) });
   const actor = "middleman";
   let syncedRouteIssueUID = $state<string | null>(null);
   let syncedRouteViewName: KataTaskViewName | null = null;
   let syncedRouteScopeUID: string | null = null;
+  let awaitingSelectedIssueRouteUID = $state<string | null>(null);
   let navigationGeneration = 0;
   // Reactive shadow of navigationGeneration so the issue list can drop
   // a pending keyboard selection the moment any navigation starts —
@@ -119,6 +123,7 @@
   let splitOrientation = $state<SplitOrientation>("vertical");
   let splitSizes = $state<Record<SplitOrientation, number>>({ ...defaultSplitSizes });
   const activeSplitSize = $derived(splitSizes[splitOrientation]);
+  const graphLayoutDirection = $derived(graphLayoutDirectionForSplit(splitOrientation));
   const activeKataDaemonId = $derived(
     getActiveKataDaemon() ??
       getDefaultKataDaemon() ??
@@ -148,33 +153,11 @@
     },
   });
 
-  $effect(() => {
-    const selected = store.selectedIssue?.issue;
-    const daemonID = activeKataDaemonId ?? null;
-    const requestID = ++workspaceTargetRequestID;
-    workspaceTarget = null;
-    workspaceTargetLoading = false;
-    requestError = null;
-    if (!selected || !daemonID) return;
-
-    workspaceTargetLoading = true;
-    const identity = kataWorkspaceIdentityFromIssue(selected, daemonID, projectNameForIssue(selected));
-    void resolveKataWorkspaceTarget(identity)
-      .then((target) => {
-        if (requestID !== workspaceTargetRequestID) return;
-        workspaceTarget = target.available ? target : null;
-      })
-      .catch((err) => {
-        if (requestID !== workspaceTargetRequestID) return;
-        requestError = kataRequestErrorMessage(err);
-        workspaceTarget = null;
-      })
-      .finally(() => {
-        if (requestID === workspaceTargetRequestID) {
-          workspaceTargetLoading = false;
-        }
-      });
-  });
+  // The workspace target arrives with the combined task-detail payload, so
+  // the workspace action renders atomically with the detail pane.
+  const workspaceTarget = $derived(
+    store.selectedIssue?.workspace_target?.available ? store.selectedIssue.workspace_target : null,
+  );
 
   const systemViews = [
     { name: "inbox", label: "Inbox" },
@@ -323,6 +306,7 @@
     issueUID: string | null,
   ): Promise<void> {
     const generation = beginNavigation();
+    closeReachableGraph();
     store.invalidatePendingLoads();
     resetDetailDrafts();
     store.resetSearchFilters();
@@ -361,19 +345,31 @@
   $effect(() => {
     const uid = selectedIssueUID ?? null;
     if (loading) return;
+    if (awaitingSelectedIssueRouteUID) {
+      if (uid === awaitingSelectedIssueRouteUID) {
+        awaitingSelectedIssueRouteUID = null;
+      } else if (uid !== syncedRouteIssueUID) {
+        awaitingSelectedIssueRouteUID = null;
+      } else {
+        return;
+      }
+    }
     if ((routeViewName ?? null) !== syncedRouteViewName || (routeScopeUID ?? null) !== syncedRouteScopeUID) return;
     if (!uid) {
       if (syncedRouteIssueUID === null) return;
+      clearTaskErrors();
       resetDetailDrafts();
       store.clearSelection();
       syncedRouteIssueUID = null;
       return;
     }
     if (uid === syncedRouteIssueUID) return;
-    if (store.selectedIssue?.issue.uid === uid) {
+    if (store.pendingSelectionUID === uid) return;
+    if (store.selectedIssue?.issue.uid === uid && store.pendingSelectionUID !== uid) {
       syncedRouteIssueUID = uid;
       return;
     }
+    syncedRouteIssueUID = uid;
     void selectIssue(uid, false);
   });
 
@@ -389,12 +385,23 @@
     return `${route.view ?? ""}\u0000${route.scope ?? ""}\u0000${route.issue ?? ""}`;
   }
 
+  function routeChangeMatchesAwaitedSelection(route: KataRouteSnapshot): boolean {
+    return (
+      route.view === syncedRouteViewName &&
+      route.scope === syncedRouteScopeUID &&
+      route.issue !== null &&
+      route.issue === awaitingSelectedIssueRouteUID &&
+      (route.issue === store.pendingSelectionUID || route.issue === store.selectedIssue?.issue.uid)
+    );
+  }
+
   $effect.pre(() => {
     if (loading) return;
     const snapshot = currentRouteSnapshot();
     const signature = routeSignature(snapshot);
     if (signature === observedRouteSignature) return;
     observedRouteSignature = signature;
+    if (routeChangeMatchesAwaitedSelection(snapshot)) return;
     beginNavigation();
     store.invalidatePendingLoads();
   });
@@ -525,6 +532,7 @@
   async function updateSearchFilters(filters: Partial<KataTaskSearchFilters>): Promise<void> {
     const generation = beginNavigation();
     const nextStatus = filters.status ?? store.searchFilters.status;
+    closeReachableGraph();
     resetDetailDrafts();
     // Same rationale as openRoutedProjectScope: a pending detail load is
     // abandoned by the filter reload, so drop it before awaiting.
@@ -549,6 +557,7 @@
 
   async function openRoutedSystemView(viewName: KataTaskViewName): Promise<void> {
     const generation = beginNavigation();
+    closeReachableGraph();
     resetDetailDrafts();
     store.resetSearchFilters();
     // Clear (and thereby abort) the abandoned selection before awaiting
@@ -570,6 +579,7 @@
 
   async function openRoutedProjectScope(projectUID: string): Promise<void> {
     const generation = beginNavigation();
+    closeReachableGraph();
     resetDetailDrafts();
     // Scope changes keep a completed selection but abandon an in-flight
     // one (the scoped reload re-selects from selectedIssue, which a
@@ -602,6 +612,7 @@
 
   async function submitQuickCapture(title: string): Promise<void> {
     await runViewTaskOrThrow(async () => {
+      closeReachableGraph();
       resetDetailDrafts();
       await store.captureIssue(actor, { title });
     });
@@ -617,6 +628,7 @@
     const previousFilters = store.searchFilters;
     const previousIssueUID = store.selectedIssue?.issue.uid ?? null;
     switchingDaemon = true;
+    closeReachableGraph();
     resetDetailDrafts();
     resetIssueExpansion();
     // The switch abandons any in-flight detail load (only a completed
@@ -673,13 +685,64 @@
 
   async function selectIssue(uid: string, notify = true): Promise<void> {
     const generation = beginNavigation();
+    if (notify) {
+      awaitingSelectedIssueRouteUID = uid;
+    }
     resetDetailDrafts();
     const ok = await runViewTask(() => store.selectIssue(uid));
-    if (!ok || !isCurrentNavigation(generation)) return;
-    if (!notify || selectedIssueUID === uid) {
+    if (!ok || !isCurrentNavigation(generation)) {
+      if (awaitingSelectedIssueRouteUID === uid) {
+        awaitingSelectedIssueRouteUID = null;
+      }
+      if (
+        !notify &&
+        selectedIssueUID === uid &&
+        syncedRouteIssueUID === uid &&
+        lastTaskError !== null
+      ) {
+        store.clearSelection();
+        syncedRouteIssueUID = uid;
+      }
+      return;
+    }
+    // syncedRouteIssueUID asserts that the route prop and the store selection
+    // agree, so it may only be recorded when the prop actually carries this
+    // UID. Recording it for a non-routed selection (no onSelectedIssueChange,
+    // prop stays null) makes the route-sync effect read the null prop as a
+    // route-driven deselect and immediately clear the selection.
+    if (selectedIssueUID === uid) {
       syncedRouteIssueUID = uid;
     }
     if (notify) onSelectedIssueChange?.(uid);
+  }
+
+  function selectReachableGraphIssue(uid: string): void {
+    if (!onSelectedIssueChange) {
+      void selectIssue(uid, false);
+      return;
+    }
+    if (selectedIssueUID === uid) {
+      void selectIssue(uid, false);
+      return;
+    }
+    awaitingSelectedIssueRouteUID = uid;
+    onSelectedIssueChange(uid);
+    void selectIssue(uid, false);
+  }
+
+  function openReachableGraph(issue: KataTaskSummary): void {
+    store.rememberTasks([issue]);
+    graphSourceIssue = issue;
+    listMode = "reachableGraph";
+  }
+
+  function rememberGraphTasks(tasks: readonly KataTaskSummary[]): void {
+    store.rememberTasks(tasks);
+  }
+
+  function closeReachableGraph(): void {
+    listMode = "tasks";
+    graphSourceIssue = null;
   }
 
   async function moveSelectedIssue(toProjectUID: string | null): Promise<void> {
@@ -748,7 +811,7 @@
   function selectedWorkspaceAction():
     | { label: string; busy?: boolean; disabled?: boolean; onClick: () => void | Promise<void> }
     | undefined {
-    if (workspaceTargetLoading || !workspaceTarget?.available) return undefined;
+    if (!workspaceTarget?.available) return undefined;
     if (workspaceTarget.existing_workspace) {
       const id = workspaceTarget.existing_workspace.id;
       return {
@@ -850,10 +913,8 @@
       {/if}
     </div>
     <div class="kata-header-actions">
-      <button
-        type="button"
-        class="icon-button"
-        aria-label={splitOrientation === "vertical" ? "Switch to side-by-side layout" : "Switch to stacked layout"}
+      <IconButton
+        ariaLabel={splitOrientation === "vertical" ? "Switch to side-by-side layout" : "Switch to stacked layout"}
         title={splitOrientation === "vertical"
           ? "Side-by-side (list left, detail right)"
           : "Stacked (list top, detail bottom)"}
@@ -864,7 +925,7 @@
         {:else}
           <LayoutPanelTopIcon size={15} strokeWidth={1.8} aria-hidden="true" />
         {/if}
-      </button>
+      </IconButton>
       <button type="button" class="accent-button header-action" onclick={() => { captureOpen = true; }}>
         <PlusIcon size={13} strokeWidth={1.9} aria-hidden="true" />
         <span>New task</span>
@@ -909,28 +970,46 @@
 
 {#snippet listPane()}
   <div class="list-column kata-list">
-    <KataSearchPanel
-      filters={store.searchFilters}
-      projects={store.projects}
-      duplicateCandidates={store.duplicateCandidates}
-      onChange={updateSearchFilters}
-    />
-    {#key `${activeKataDaemonId ?? ""}:${listResetGeneration}`}
-      <KataIssueList
-        currentView={store.currentView}
-        scopeLabel={listTitle()}
-        scopedProjectName={selectedProjectName()}
-        selectedIssueUID={store.pendingSelectionUID ?? store.selectedIssue?.issue.uid ?? null}
-        loading={viewLoading}
-        statusFilter={listStatusFilter}
-        resetGeneration={listResetGeneration}
-        navigationGeneration={navigationEpoch}
+    {#if listMode === "reachableGraph" && graphSourceIssue}
+      <KataReachableGraph
         api={store.api}
-        onSelect={(issue) => {
-          void selectIssue(issue.uid);
+        sourceIssue={graphSourceIssue}
+        selectedUID={store.pendingSelectionUID ?? store.selectedIssue?.issue.uid ?? null}
+        layoutDirection={graphLayoutDirection}
+        onBack={closeReachableGraph}
+        onSelectIssue={(uid) => {
+          selectReachableGraphIssue(uid);
         }}
+        onGraphTasksLoaded={rememberGraphTasks}
       />
-    {/key}
+    {:else}
+      <KataSearchPanel
+        filters={store.searchFilters}
+        projects={store.projects}
+        duplicateCandidates={store.duplicateCandidates}
+        onChange={updateSearchFilters}
+      />
+      {#key `${activeKataDaemonId ?? ""}:${listResetGeneration}`}
+        <KataIssueList
+          currentView={store.currentView}
+          scopeLabel={listTitle()}
+          scopedProjectName={selectedProjectName()}
+          selectedIssueUID={store.pendingSelectionUID ?? store.selectedIssue?.issue.uid ?? null}
+          loading={viewLoading}
+          statusFilter={listStatusFilter}
+          resetGeneration={listResetGeneration}
+          navigationGeneration={navigationEpoch}
+          api={store.api}
+          onSelect={(issue) => {
+            void selectIssue(issue.uid);
+          }}
+          onOpenGraph={openReachableGraph}
+          onRememberTasks={(issues) => {
+            store.rememberTasks(issues);
+          }}
+        />
+      {/key}
+    {/if}
   </div>
 {/snippet}
 
@@ -978,6 +1057,7 @@
       onSelectIssue={(uid) => {
         void selectIssue(uid);
       }}
+      onOpenGraph={openReachableGraph}
       workspaceAction={selectedWorkspaceAction()}
     />
   {:else}
@@ -1025,7 +1105,7 @@
     min-width: 0;
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: var(--space-4);
     flex: 1 1 auto;
   }
 
@@ -1050,7 +1130,7 @@
   .kata-header-actions {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: var(--space-4);
     flex: 0 0 auto;
   }
 
@@ -1068,29 +1148,8 @@
   .header-action {
     display: inline-flex;
     align-items: center;
-    gap: 5px;
+    gap: var(--space-2);
     white-space: nowrap;
-  }
-
-  .icon-button {
-    width: 28px;
-    height: 28px;
-    border: 1px solid var(--border-default);
-    border-radius: var(--radius-sm);
-    background: var(--bg-surface);
-    color: var(--text-secondary);
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    padding: 0;
-    cursor: pointer;
-  }
-
-  .icon-button:hover,
-  .icon-button:focus-visible {
-    background: var(--bg-surface-hover);
-    color: var(--text-primary);
-    outline: none;
   }
 
   .kata-layout {

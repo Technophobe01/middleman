@@ -2,12 +2,19 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 import { KataTaskAPIError } from "../../api/kata/taskClient.js";
-import type { KataTaskDetail, KataTaskSearchFilters, KataTaskSearchResponse } from "../../api/kata/taskTypes.js";
+import type {
+  KataTaskDetail,
+  KataTaskLink,
+  KataTaskSearchFilters,
+  KataTaskSearchResponse,
+} from "../../api/kata/taskTypes.js";
+import type { KataWorkspaceTarget } from "../../api/kata/workspaces.js";
 import {
   getActiveKataDaemon,
   getDefaultKataDaemon,
   getKataDaemonRoster,
 } from "../../stores/active-kata-daemon.svelte.js";
+import { defaultProviderCapabilities } from "../../components/repositories/repoSummary.js";
 import KataWorkspace from "./KataWorkspace.svelte";
 import {
   createDaemonWorkspaceAPI,
@@ -22,10 +29,9 @@ import {
   resetKataWorkspaceTestState,
 } from "./KataWorkspaceTestSupport.js";
 
-const { mockCreateKataWorkspaceForTask, mockNavigate, mockResolveKataWorkspaceTarget } = vi.hoisted(() => ({
+const { mockCreateKataWorkspaceForTask, mockNavigate } = vi.hoisted(() => ({
   mockCreateKataWorkspaceForTask: vi.fn(),
   mockNavigate: vi.fn(),
-  mockResolveKataWorkspaceTarget: vi.fn(),
 }));
 
 vi.mock("../../api/kata/workspaces.js", async (importOriginal) => {
@@ -33,7 +39,6 @@ vi.mock("../../api/kata/workspaces.js", async (importOriginal) => {
   return {
     ...actual,
     createKataWorkspaceForTask: mockCreateKataWorkspaceForTask,
-    resolveKataWorkspaceTarget: mockResolveKataWorkspaceTarget,
   };
 });
 
@@ -41,13 +46,30 @@ vi.mock("../../stores/router.svelte.js", () => ({
   navigate: mockNavigate,
 }));
 
+vi.mock("./KataReachableGraph.svelte", async () => ({
+  default: (await import("./KataReachableGraphTestStub.svelte")).default,
+}));
+
+function graphNodeWithText(text: string): HTMLElement {
+  const node = screen
+    .getAllByText(text)
+    .find((element) => element.closest(".svelte-flow__node"))
+    ?.closest(".svelte-flow__node");
+  expect(node).toBeTruthy();
+  return node as HTMLElement;
+}
+
+function graphNodeButtonWithText(text: string): HTMLButtonElement {
+  const button = graphNodeWithText(text).querySelector<HTMLButtonElement>("button.graph-task-node");
+  expect(button).toBeTruthy();
+  return button!;
+}
+
 describe("KataWorkspace", () => {
   beforeEach(() => {
     resetKataWorkspaceTestState();
     mockCreateKataWorkspaceForTask.mockReset();
     mockNavigate.mockReset();
-    mockResolveKataWorkspaceTarget.mockReset();
-    mockResolveKataWorkspaceTarget.mockResolvedValue({ available: false });
   });
 
   afterEach(() => {
@@ -93,6 +115,537 @@ describe("KataWorkspace", () => {
 
     await waitFor(() => {
       expect(screen.getByRole("heading", { name: "Inbox" })).toBeTruthy();
+    });
+  });
+
+  it("opens a reachable graph from the task list and keeps task selection active", async () => {
+    const root = {
+      ...issue("issue-root", "Root graph task", "project-kata"),
+      priority: 0,
+      blocks: [{ uid: "issue-blocked", short_id: "blocked" }],
+    };
+    const blocked = {
+      ...issue("issue-blocked", "Blocked follow-up", "project-kata"),
+      priority: 2,
+    };
+    const { api } = createWorkspaceAPI([root, blocked]);
+
+    render(KataWorkspace, { props: { api } });
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /Root graph task/ })).toBeTruthy();
+    });
+    const rootRow = screen.getByRole("button", { name: /Root graph task/ });
+    const rootFrame = rootRow.parentElement;
+    expect(rootFrame).toBeTruthy();
+    await fireEvent.click(within(rootFrame!).getByRole("button", { name: "Open reachable graph" }));
+
+    expect(screen.getByRole("region", { name: "Reachable task graph" })).toBeTruthy();
+    expect(screen.queryByLabelText("Search tasks")).toBeNull();
+    expect(screen.getAllByText("Root graph task").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Blocked follow-up").length).toBeGreaterThan(0);
+    expect(screen.getByText("P0")).toBeTruthy();
+
+    await fireEvent.click(graphNodeWithText("Blocked follow-up"));
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: "Blocked follow-up" })).toBeTruthy();
+    });
+    expect(api.issue).toHaveBeenCalledWith(
+      "issue-blocked",
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
+
+    await fireEvent.click(screen.getByRole("button", { name: "Back to task list" }));
+    expect(screen.getByLabelText("Search tasks")).toBeTruthy();
+    expect(screen.queryByRole("region", { name: "Reachable task graph" })).toBeNull();
+  });
+
+  it("keeps a graph node selection when no route callback is provided", async () => {
+    const root = {
+      ...issue("issue-root", "Root graph task", "project-kata"),
+      blocks: [{ uid: "issue-blocked", short_id: "blocked" }],
+    };
+    const blocked = issue("issue-blocked", "Blocked follow-up", "project-kata");
+    const { api } = createWorkspaceAPI([root, blocked]);
+
+    render(KataWorkspace, { props: { api } });
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /Root graph task/ })).toBeTruthy();
+    });
+    const rootRow = screen.getByRole("button", { name: /Root graph task/ });
+    await fireEvent.click(within(rootRow.parentElement!).getByRole("button", { name: "Open reachable graph" }));
+    await fireEvent.click(graphNodeWithText("Blocked follow-up"));
+
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: "Blocked follow-up" })).toBeTruthy();
+    });
+    // Without a route callback the selectedIssueUID prop never updates. The
+    // route-sync effect must not read that null prop as a route-driven
+    // deselect and clear the selection right after it was made.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(screen.getByRole("heading", { name: "Blocked follow-up" })).toBeTruthy();
+  });
+
+  it("opens a reachable graph from the task detail toolbar", async () => {
+    const root = {
+      ...issue("issue-root", "Root graph task", "project-kata"),
+      related: [{ uid: "issue-related", short_id: "related" }],
+    };
+    const related = issue("issue-related", "Related graph task", "project-kata");
+    const { api } = createWorkspaceAPI([root, related]);
+
+    render(KataWorkspace, { props: { api, selectedIssueUID: root.uid } });
+
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: "Root graph task" })).toBeTruthy();
+    });
+    await fireEvent.click(
+      within(screen.getByRole("region", { name: "Task detail" })).getByRole("button", {
+        name: "Open reachable graph",
+      }),
+    );
+
+    expect(screen.getByRole("region", { name: "Reachable task graph" })).toBeTruthy();
+    expect(screen.getAllByText("Related graph task").length).toBeGreaterThan(0);
+  });
+
+  it("updates the reachable graph direction with the task detail layout", async () => {
+    const root = {
+      ...issue("issue-root", "Root graph task", "project-kata"),
+      blocks: [{ uid: "issue-blocked", short_id: "blocked" }],
+    };
+    const blocked = issue("issue-blocked", "Blocked graph task", "project-kata");
+    const { api } = createWorkspaceAPI([root, blocked]);
+
+    render(KataWorkspace, { props: { api, selectedIssueUID: root.uid } });
+
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: "Root graph task" })).toBeTruthy();
+    });
+    await fireEvent.click(
+      within(screen.getByRole("region", { name: "Task detail" })).getByRole("button", {
+        name: "Open reachable graph",
+      }),
+    );
+
+    const graph = screen.getByRole("region", { name: "Reachable task graph" });
+    expect(graph.getAttribute("data-layout-direction")).toBe("TB");
+
+    await fireEvent.click(screen.getByRole("button", { name: "Switch to side-by-side layout" }));
+    expect(graph.getAttribute("data-layout-direction")).toBe("LR");
+
+    await fireEvent.click(screen.getByRole("button", { name: "Switch to stacked layout" }));
+    expect(graph.getAttribute("data-layout-direction")).toBe("TB");
+  });
+
+  it("keeps source detail links in the graph after selecting a linked node", async () => {
+    const root = issue("issue-root", "Root graph task", "project-kata");
+    const related = issue("issue-related", "Detail-only graph task", "project-kata");
+    const { api } = createWorkspaceAPI([root, related]);
+    const sourceLink: KataTaskLink = {
+      id: 1,
+      project_id: root.project_id,
+      from: { uid: root.uid, short_id: root.short_id },
+      to: { uid: related.uid, short_id: related.short_id },
+      type: "related",
+      author: "fixture-user",
+      created_at: fetchedAt,
+    };
+    vi.mocked(api.issue).mockImplementation(async (uid: string) => {
+      if (uid === root.uid) {
+        const rootDetail = detail(root.uid, [root, related]);
+        return { ...rootDetail, links: [sourceLink] };
+      }
+      return detail(uid, [root, related]);
+    });
+
+    render(KataWorkspace, { props: { api, selectedIssueUID: root.uid } });
+
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: "Root graph task" })).toBeTruthy();
+    });
+    await fireEvent.click(
+      within(screen.getByRole("region", { name: "Task detail" })).getByRole("button", {
+        name: "Open reachable graph",
+      }),
+    );
+
+    expect(screen.getAllByText("Detail-only graph task").length).toBeGreaterThan(0);
+    await fireEvent.click(graphNodeWithText("Detail-only graph task"));
+
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: "Detail-only graph task" })).toBeTruthy();
+    });
+    const graph = screen.getByRole("region", { name: "Reachable task graph" });
+    expect(within(graph).getAllByText("Detail-only graph task").length).toBeGreaterThan(0);
+  });
+
+  it("uses the native graph endpoint when opening a graph from an unselected list row", async () => {
+    const selected = issue("issue-selected", "Initially selected task", "project-kata");
+    const root = issue("issue-root", "Root graph task", "project-kata");
+    const related = issue("issue-related", "Detail-only graph task", "project-kata");
+    const { api } = createWorkspaceAPI([selected, root, related]);
+    vi.mocked(api.issue).mockImplementation(async (uid: string) => detail(uid, [selected, root, related]));
+
+    render(KataWorkspace, { props: { api, selectedIssueUID: selected.uid } });
+
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: "Initially selected task" })).toBeTruthy();
+    });
+    const rootRow = screen.getByRole("button", { name: /Root graph task/ });
+    const rootFrame = rootRow.parentElement;
+    expect(rootFrame).toBeTruthy();
+    await fireEvent.click(within(rootFrame!).getByRole("button", { name: "Open reachable graph" }));
+
+    expect(screen.getByRole("region", { name: "Reachable task graph" })).toBeTruthy();
+    await waitFor(() => {
+      expect(
+        within(screen.getByRole("region", { name: "Reachable task graph" })).getAllByText("Detail-only graph task")
+          .length,
+      ).toBeGreaterThan(0);
+    });
+    expect(api.reachableGraph).toHaveBeenCalledWith(
+      root.project_id,
+      root.uid,
+      { depth: "full", hide_done: false },
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
+    expect(vi.mocked(api.issue).mock.calls.some(([uid]) => uid === root.uid)).toBe(false);
+
+    await fireEvent.click(graphNodeWithText("Detail-only graph task"));
+
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: "Detail-only graph task" })).toBeTruthy();
+    });
+    expect(
+      within(screen.getByRole("region", { name: "Reachable task graph" })).getAllByText("Detail-only graph task")
+        .length,
+    ).toBeGreaterThan(0);
+  });
+
+  it("renders native graph nodes that are not cached locally", async () => {
+    const root = {
+      ...issue("issue-root", "Root graph task", "project-kata"),
+      blocks: [{ uid: "issue-linked", short_id: "linked" }],
+    };
+    const linked = {
+      ...issue("issue-linked", "Fetched linked task", "project-kata"),
+      priority: 1,
+    };
+    const { api } = createWorkspaceAPI([root]);
+    vi.mocked(api.issue).mockImplementation(async (uid: string) => detail(uid, [root, linked]));
+    vi.mocked(api.reachableGraph).mockImplementation(async (_projectID, _ref, query = {}) => ({
+      source_uid: root.uid,
+      depth: query.depth ?? "full",
+      hide_done: query.hide_done === true,
+      nodes: [root, linked],
+      edges: [{ from_uid: root.uid, to_uid: linked.uid, kind: "blocks", layout: true }],
+      unresolved_refs: [],
+      fetched_at: fetchedAt,
+    }));
+
+    render(KataWorkspace, { props: { api, selectedIssueUID: root.uid } });
+
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: "Root graph task" })).toBeTruthy();
+    });
+    await fireEvent.click(
+      within(screen.getByRole("region", { name: "Task detail" })).getByRole("button", {
+        name: "Open reachable graph",
+      }),
+    );
+
+    await waitFor(() => {
+      expect(graphNodeButtonWithText("Fetched linked task").disabled).toBe(false);
+    });
+    expect(vi.mocked(api.issue).mock.calls.some(([uid]) => uid === linked.uid)).toBe(false);
+
+    await waitFor(() => {
+      expect(graphNodeButtonWithText("Fetched linked task").disabled).toBe(false);
+    });
+    await fireEvent.click(graphNodeWithText("Fetched linked task"));
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: "Fetched linked task" })).toBeTruthy();
+    });
+  });
+
+  it("selects a graph node immediately and tolerates the route prop catching up later", async () => {
+    const root = {
+      ...issue("issue-root", "Root graph task", "project-kata"),
+      blocks: [{ uid: "issue-blocked", short_id: "blocked" }],
+    };
+    const blocked = issue("issue-blocked", "Blocked follow-up", "project-kata");
+    const { api } = createWorkspaceAPI([root, blocked]);
+    const onSelectedIssueChange = vi.fn();
+
+    const { rerender } = render(KataWorkspace, {
+      props: {
+        api,
+        selectedIssueUID: root.uid,
+        onSelectedIssueChange,
+      },
+    });
+
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: "Root graph task" })).toBeTruthy();
+    });
+    await fireEvent.click(
+      within(screen.getByRole("region", { name: "Task detail" })).getByRole("button", {
+        name: "Open reachable graph",
+      }),
+    );
+
+    await fireEvent.click(graphNodeWithText("Blocked follow-up"));
+    expect(onSelectedIssueChange).toHaveBeenCalledWith("issue-blocked");
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: "Blocked follow-up" })).toBeTruthy();
+    });
+
+    await rerender({ api, selectedIssueUID: blocked.uid, onSelectedIssueChange });
+
+    expect(screen.getByRole("heading", { name: "Blocked follow-up" })).toBeTruthy();
+  });
+
+  it("routes and starts loading graph node selections before the task detail resolves", async () => {
+    const root = {
+      ...issue("issue-root", "Root graph task", "project-kata"),
+      blocks: [{ uid: "issue-blocked", short_id: "blocked" }],
+    };
+    const blocked = issue("issue-blocked", "Blocked follow-up", "project-kata");
+    const { api } = createWorkspaceAPI([root, blocked]);
+    const blockedDetail = deferred<KataTaskDetail>();
+    vi.mocked(api.issue).mockImplementation(async (uid: string) => {
+      if (uid === blocked.uid) return blockedDetail.promise;
+      return detail(uid, [root, blocked]);
+    });
+    const onSelectedIssueChange = vi.fn();
+
+    const { rerender } = render(KataWorkspace, {
+      props: {
+        api,
+        selectedIssueUID: root.uid,
+        onSelectedIssueChange,
+      },
+    });
+
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: "Root graph task" })).toBeTruthy();
+    });
+    await fireEvent.click(
+      within(screen.getByRole("region", { name: "Task detail" })).getByRole("button", {
+        name: "Open reachable graph",
+      }),
+    );
+
+    await fireEvent.click(graphNodeWithText("Blocked follow-up"));
+
+    expect(onSelectedIssueChange).toHaveBeenCalledWith(blocked.uid);
+    expect(screen.getByText("Loading task")).toBeTruthy();
+
+    await rerender({ api, selectedIssueUID: blocked.uid, onSelectedIssueChange });
+
+    expect(screen.getByText("Loading task")).toBeTruthy();
+    expect(api.issue).toHaveBeenCalledTimes(2);
+    expect(api.issue).toHaveBeenLastCalledWith(
+      blocked.uid,
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
+
+    blockedDetail.resolve(detail(blocked.uid, [root, blocked]));
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: "Blocked follow-up" })).toBeTruthy();
+    });
+  });
+
+  it("clears stale detail when a routed graph node selection fails", async () => {
+    const root = {
+      ...issue("issue-root", "Root graph task", "project-kata"),
+      blocks: [{ uid: "issue-blocked", short_id: "blocked" }],
+    };
+    const blocked = issue("issue-blocked", "Blocked follow-up", "project-kata");
+    const { api } = createWorkspaceAPI([root, blocked]);
+    vi.mocked(api.issue).mockImplementation(async (uid: string) => {
+      if (uid === blocked.uid) {
+        throw new KataTaskAPIError({
+          status: 500,
+          code: "internal",
+          message: "detail failed",
+          headers: new Headers(),
+        });
+      }
+      return detail(uid, [root, blocked]);
+    });
+    const onSelectedIssueChange = vi.fn();
+
+    const { rerender } = render(KataWorkspace, {
+      props: {
+        api,
+        selectedIssueUID: root.uid,
+        onSelectedIssueChange,
+      },
+    });
+
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: "Root graph task" })).toBeTruthy();
+    });
+    await fireEvent.click(
+      within(screen.getByRole("region", { name: "Task detail" })).getByRole("button", {
+        name: "Open reachable graph",
+      }),
+    );
+
+    await fireEvent.click(graphNodeWithText("Blocked follow-up"));
+    await rerender({ api, selectedIssueUID: blocked.uid, onSelectedIssueChange });
+
+    await waitFor(() => {
+      expect(screen.getByText("detail failed").getAttribute("role")).toBe("alert");
+      expect(screen.getByText("Select a task")).toBeTruthy();
+    });
+    expect(screen.queryByRole("heading", { name: "Root graph task" })).toBeNull();
+    expect(screen.queryByRole("heading", { name: "Blocked follow-up" })).toBeNull();
+  });
+
+  it("clears stale graph selection errors when the route deselects the task", async () => {
+    const root = {
+      ...issue("issue-root", "Root graph task", "project-kata"),
+      blocks: [{ uid: "issue-blocked", short_id: "blocked" }],
+    };
+    const blocked = issue("issue-blocked", "Blocked follow-up", "project-kata");
+    const { api } = createWorkspaceAPI([root, blocked]);
+    vi.mocked(api.issue).mockImplementation(async (uid: string) => {
+      if (uid === blocked.uid) {
+        throw new KataTaskAPIError({
+          status: 500,
+          code: "internal",
+          message: "detail failed",
+          headers: new Headers(),
+        });
+      }
+      return detail(uid, [root, blocked]);
+    });
+    const onSelectedIssueChange = vi.fn();
+
+    const { rerender } = render(KataWorkspace, {
+      props: {
+        api,
+        selectedIssueUID: root.uid,
+        onSelectedIssueChange,
+      },
+    });
+
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: "Root graph task" })).toBeTruthy();
+    });
+    await fireEvent.click(
+      within(screen.getByRole("region", { name: "Task detail" })).getByRole("button", {
+        name: "Open reachable graph",
+      }),
+    );
+
+    await fireEvent.click(graphNodeWithText("Blocked follow-up"));
+    await rerender({ api, selectedIssueUID: blocked.uid, onSelectedIssueChange });
+
+    await waitFor(() => {
+      expect(screen.getByText("detail failed").getAttribute("role")).toBe("alert");
+    });
+
+    await rerender({ api, selectedIssueUID: null, onSelectedIssueChange });
+
+    await waitFor(() => {
+      expect(screen.queryByText("detail failed")).toBeNull();
+      expect(screen.getByText("Select a task")).toBeTruthy();
+    });
+  });
+
+  it("lets route back cancel a pending graph node selection", async () => {
+    const root = {
+      ...issue("issue-root", "Root graph task", "project-kata"),
+      blocks: [{ uid: "issue-blocked", short_id: "blocked" }],
+    };
+    const blocked = issue("issue-blocked", "Blocked follow-up", "project-kata");
+    const { api } = createWorkspaceAPI([root, blocked]);
+    const blockedDetail = deferred<KataTaskDetail>();
+    vi.mocked(api.issue).mockImplementation(async (uid: string) => {
+      if (uid === blocked.uid) return blockedDetail.promise;
+      return detail(uid, [root, blocked]);
+    });
+    const onSelectedIssueChange = vi.fn();
+
+    const { rerender } = render(KataWorkspace, {
+      props: {
+        api,
+        selectedIssueUID: root.uid,
+        onSelectedIssueChange,
+      },
+    });
+
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: "Root graph task" })).toBeTruthy();
+    });
+    await fireEvent.click(
+      within(screen.getByRole("region", { name: "Task detail" })).getByRole("button", {
+        name: "Open reachable graph",
+      }),
+    );
+    await fireEvent.click(graphNodeWithText("Blocked follow-up"));
+    await rerender({ api, selectedIssueUID: blocked.uid, onSelectedIssueChange });
+
+    await waitFor(() => {
+      expect(screen.getByText("Loading task")).toBeTruthy();
+    });
+
+    await rerender({ api, selectedIssueUID: root.uid, onSelectedIssueChange });
+
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: "Root graph task" })).toBeTruthy();
+    });
+    expect(screen.queryByText("Loading task")).toBeNull();
+
+    blockedDetail.resolve(detail(blocked.uid, [root, blocked]));
+    await Promise.resolve();
+
+    expect(screen.getByRole("heading", { name: "Root graph task" })).toBeTruthy();
+    expect(screen.queryByRole("heading", { name: "Blocked follow-up" })).toBeNull();
+    expect(screen.getByRole("region", { name: "Reachable task graph" })).toBeTruthy();
+  });
+
+  it("closes the reachable graph when the routed view or scope changes", async () => {
+    const root = {
+      ...issue("issue-root", "Root graph task", "project-kata"),
+      blocks: [{ uid: "issue-blocked", short_id: "blocked" }],
+    };
+    const blocked = issue("issue-blocked", "Blocked follow-up", "project-kata");
+    const { api } = createWorkspaceAPI([root, blocked]);
+    const { rerender } = render(KataWorkspace, {
+      props: {
+        api,
+        routeViewName: null,
+        routeScopeUID: null,
+        selectedIssueUID: root.uid,
+      },
+    });
+
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: "Root graph task" })).toBeTruthy();
+    });
+    await fireEvent.click(
+      within(screen.getByRole("region", { name: "Task detail" })).getByRole("button", {
+        name: "Open reachable graph",
+      }),
+    );
+    expect(screen.getByRole("region", { name: "Reachable task graph" })).toBeTruthy();
+
+    await rerender({
+      api,
+      routeViewName: "inbox",
+      routeScopeUID: null,
+      selectedIssueUID: null,
+    });
+
+    await waitFor(() => {
+      expect(screen.queryByRole("region", { name: "Reachable task graph" })).toBeNull();
+      expect(screen.getByLabelText("Search tasks")).toBeTruthy();
     });
   });
 
@@ -417,7 +970,7 @@ describe("KataWorkspace", () => {
         ],
       }),
     );
-    mockResolveKataWorkspaceTarget.mockResolvedValue({
+    const target: KataWorkspaceTarget = {
       available: true,
       repo: {
         provider: "github",
@@ -425,10 +978,11 @@ describe("KataWorkspace", () => {
         owner: "acme",
         name: "middleman",
         repo_path: "acme/middleman",
+        capabilities: defaultProviderCapabilities,
       },
       item_type: "kata_task",
       item_key: "issue-pay-rent",
-    });
+    };
     mockCreateKataWorkspaceForTask.mockResolvedValue({
       id: "workspace-kata",
       item_type: "kata_task",
@@ -437,6 +991,10 @@ describe("KataWorkspace", () => {
       status: "creating",
     });
     const { api } = createWorkspaceAPI();
+    vi.mocked(api.issue).mockImplementation(async (uid: string) => ({
+      ...detail(uid, initialIssues),
+      workspace_target: target,
+    }));
 
     render(KataWorkspace, { props: { api, selectedIssueUID: "issue-pay-rent" } });
 
@@ -444,14 +1002,6 @@ describe("KataWorkspace", () => {
       expect(screen.getByRole("heading", { name: "Pay rent" })).toBeTruthy();
       expect(screen.getByRole("button", { name: "Create workspace" })).toBeTruthy();
     });
-    expect(mockResolveKataWorkspaceTarget).toHaveBeenCalledWith(
-      expect.objectContaining({
-        daemon_id: "home",
-        project_uid: "project-finances",
-        project_name: "Finances",
-        issue_uid: "issue-pay-rent",
-      }),
-    );
     await fireEvent.click(screen.getByRole("button", { name: "Create workspace" }));
 
     await waitFor(() => {
@@ -464,6 +1014,110 @@ describe("KataWorkspace", () => {
         }),
       );
       expect(mockNavigate).toHaveBeenCalledWith("/terminal/workspace-kata");
+    });
+  });
+
+  it("keeps the create workspace action visible while refreshing the same selected task", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () =>
+      Response.json({
+        daemons: [
+          {
+            id: "home",
+            url: "http://127.0.0.1:7777",
+            default: true,
+            auth: "none",
+            health: "connected",
+          },
+        ],
+      }),
+    );
+    const target: KataWorkspaceTarget = {
+      available: true,
+      repo: {
+        provider: "github",
+        platform_host: "github.com",
+        owner: "acme",
+        name: "middleman",
+        repo_path: "acme/middleman",
+        capabilities: defaultProviderCapabilities,
+      },
+      item_type: "kata_task",
+      item_key: "issue-pay-rent",
+    };
+    const { api, addLabel } = createWorkspaceAPI();
+    vi.mocked(api.issue).mockImplementation(async (uid: string) => ({
+      ...detail(uid, initialIssues),
+      workspace_target: target,
+    }));
+
+    render(KataWorkspace, { props: { api, selectedIssueUID: "issue-pay-rent" } });
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Create workspace" })).toBeTruthy();
+    });
+
+    await fireEvent.click(screen.getByRole("button", { name: "Add label" }));
+    await fireEvent.input(screen.getByLabelText("New label"), { target: { value: "blocked" } });
+    await fireEvent.keyDown(screen.getByLabelText("New label"), { key: "Enter" });
+
+    await waitFor(() => {
+      expect(addLabel).toHaveBeenCalledWith(expect.objectContaining({ ref: "issue-pay-rent" }), "middleman", "blocked");
+    });
+    expect(screen.getByRole("button", { name: "Create workspace" })).toBeTruthy();
+  });
+
+  it("renders the workspace action together with the detail payload", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () =>
+      Response.json({
+        daemons: [
+          {
+            id: "home",
+            url: "http://127.0.0.1:7777",
+            default: true,
+            auth: "none",
+            health: "connected",
+          },
+        ],
+      }),
+    );
+    const { api } = createWorkspaceAPI();
+    const slowDetail = deferred<ReturnType<typeof detail>>();
+    let holdEmailSusanDetail = false;
+    vi.mocked(api.issue).mockImplementation(async (uid: string) => {
+      if (holdEmailSusanDetail && uid === "issue-email-susan") return slowDetail.promise;
+      return detail(uid, initialIssues);
+    });
+
+    render(KataWorkspace, { props: { api, selectedIssueUID: "issue-pay-rent" } });
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: "Pay rent" })).toBeTruthy();
+    });
+
+    holdEmailSusanDetail = true;
+    await fireEvent.click(screen.getByRole("button", { name: /Email Susan re: Q3/ }));
+    expect(screen.queryByRole("heading", { name: "Email Susan re: Q3" })).toBeNull();
+
+    // The combined payload carries the target: pane and action land in the
+    // same flush, with no separate resolution that could pop in later.
+    slowDetail.resolve({
+      ...detail("issue-email-susan", initialIssues),
+      workspace_target: {
+        available: true,
+        repo: {
+          provider: "github",
+          platform_host: "github.com",
+          owner: "acme",
+          name: "middleman",
+          repo_path: "acme/middleman",
+          capabilities: defaultProviderCapabilities,
+        },
+        item_type: "kata_task",
+        item_key: "issue-email-susan",
+      },
+    });
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: "Email Susan re: Q3" })).toBeTruthy();
+      expect(screen.getByRole("button", { name: "Create workspace" })).toBeTruthy();
     });
   });
 
@@ -481,16 +1135,19 @@ describe("KataWorkspace", () => {
         ],
       }),
     );
-    mockResolveKataWorkspaceTarget.mockResolvedValue({
-      available: true,
-      existing_workspace: {
-        id: "workspace-existing",
-        status: "ready",
-      },
-      item_type: "kata_task",
-      item_key: "issue-pay-rent",
-    });
     const { api } = createWorkspaceAPI();
+    vi.mocked(api.issue).mockImplementation(async (uid: string) => ({
+      ...detail(uid, initialIssues),
+      workspace_target: {
+        available: true,
+        existing_workspace: {
+          id: "workspace-existing",
+          status: "ready",
+        },
+        item_type: "kata_task",
+        item_key: "issue-pay-rent",
+      },
+    }));
 
     render(KataWorkspace, { props: { api, selectedIssueUID: "issue-pay-rent" } });
 

@@ -119,19 +119,19 @@ export {
 export { default as KanbanBoardView } from "./views/KanbanBoardView.svelte";
 export { default as ReviewsView } from "./views/ReviewsView.svelte";
 export { default as FocusListView } from "./views/FocusListView.svelte";
-export { default as ActionButton } from "./components/shared/ActionButton.svelte";
+export { Button } from "@kenn-io/kit-ui";
 export { default as CommentEditor } from "./components/detail/CommentEditor.svelte";
-export { default as Chip } from "./components/shared/Chip.svelte";
+export { Chip } from "@kenn-io/kit-ui";
 export { default as ItemKindChip } from "./components/shared/ItemKindChip.svelte";
 export { default as ItemStateChip } from "./components/shared/ItemStateChip.svelte";
-export { default as CollapsibleResizableSidebar } from "./components/shared/CollapsibleResizableSidebar.svelte";
-export { default as LeftSidebarToggle } from "./components/shared/LeftSidebarToggle.svelte";
-export { default as DiffStats } from "./components/shared/DiffStats.svelte";
-export { default as FilterDropdown } from "./components/shared/FilterDropdown.svelte";
-export { default as SelectDropdown } from "./components/shared/SelectDropdown.svelte";
-export type { SelectDropdownOption } from "./components/shared/select-dropdown.js";
-export { default as SplitResizeHandle } from "./components/shared/SplitResizeHandle.svelte";
-export type { SplitResizeEvent } from "./components/shared/split-resize.js";
+export { CollapsibleSidebar, SidebarToggle } from "@kenn-io/kit-ui";
+export { DiffStats } from "@kenn-io/kit-ui";
+export { FilterDropdown } from "@kenn-io/kit-ui";
+export type { FilterDropdownItem, FilterDropdownSection } from "@kenn-io/kit-ui";
+export { SelectDropdown } from "@kenn-io/kit-ui";
+export type { SelectDropdownOption } from "@kenn-io/kit-ui";
+export { SplitResizeHandle } from "@kenn-io/kit-ui";
+export type { SplitResizeEvent } from "@kenn-io/kit-ui";
 export { default as TabbedPanelTree } from "./components/shared/TabbedPanelTree.svelte";
 export {
   clearActiveTabbedPanelDrag,

@@ -4,6 +4,7 @@ import { KataTaskAPIError } from "../api/kata/taskClient.js";
 import type {
   KataCreateRecurrenceInput,
   KataInstanceResponse,
+  KataReachableGraphResponse,
   KataTaskCreateDraft,
   KataProjectSummary,
   KataRecurrence,
@@ -21,6 +22,7 @@ import type {
   KataTaskViewResponse,
 } from "../api/kata/taskTypes.js";
 import { buildKataTaskView } from "../api/kata/taskViewBuilder.js";
+import { getKataGraphDebugSnapshot, resetKataGraphDebug } from "./kata-graph-debug.js";
 import { createKataWorkspaceStore, deriveKataAreas, duplicateCandidatesFromError } from "./kata-workspace.svelte.js";
 
 function deferred<T>() {
@@ -206,6 +208,7 @@ type FakeKataTaskAPI = KataTaskAPI & {
     issues: ReturnType<typeof vi.fn>;
     search: ReturnType<typeof vi.fn>;
     issue: ReturnType<typeof vi.fn>;
+    reachableGraph: ReturnType<typeof vi.fn>;
     events: ReturnType<typeof vi.fn>;
     addComment: ReturnType<typeof vi.fn>;
     addLabel: ReturnType<typeof vi.fn>;
@@ -317,6 +320,17 @@ function createFakeKataTaskAPI(): FakeKataTaskAPI {
     return { filters, issues: rows, fetched_at: fetchedAt };
   });
   const issueMock = vi.fn(async (uid: string) => detailFor(uid));
+  const reachableGraph = vi.fn(
+    async (_projectID: number, ref: string): Promise<KataReachableGraphResponse> => ({
+      source_uid: ref,
+      depth: "full",
+      hide_done: false,
+      nodes: issues,
+      edges: [],
+      unresolved_refs: [],
+      fetched_at: fetchedAt,
+    }),
+  );
   const eventsMock = vi.fn(async (query: KataTaskEventsQuery = {}): Promise<KataTaskEventsResponse> => {
     const rows = events
       .filter((event) => event.event_id > (query.after_id ?? 0))
@@ -408,6 +422,7 @@ function createFakeKataTaskAPI(): FakeKataTaskAPI {
     issues: issuesMock,
     search,
     issue: issueMock,
+    reachableGraph,
     events: eventsMock,
     addComment,
     addLabel,
@@ -435,6 +450,7 @@ function createFakeKataTaskAPI(): FakeKataTaskAPI {
       issues: issuesMock,
       search,
       issue: issueMock,
+      reachableGraph,
       events: eventsMock,
       addComment,
       addLabel,
@@ -526,6 +542,184 @@ describe("kata workspace store", () => {
     await store.bootstrap();
 
     expect(store.selectedIssue?.issue.uid).toBe(parent.uid);
+  });
+
+  test("caches tasks from bootstrap views and selected detail children", async () => {
+    const parent = {
+      ...issues[0]!,
+      uid: "issue-parent",
+      short_id: "parent",
+      qualified_id: "Finances#parent",
+      title: "Parent task",
+      child_counts: { open: 1, total: 1 },
+    };
+    const child = {
+      ...issues[1]!,
+      uid: "issue-child",
+      short_id: "child",
+      qualified_id: "Finances#child",
+      project_id: parent.project_id,
+      project_uid: parent.project_uid,
+      project_name: parent.project_name,
+      title: "Child task",
+      parent_short_id: parent.short_id,
+    };
+    const api = createFakeKataTaskAPI();
+    api.mocks.issues.mockResolvedValueOnce({
+      view: "today",
+      groups: [{ id: "today", title: "Today", issues: [parent] }],
+      fetched_at: fetchedAt,
+    });
+    api.mocks.issue.mockResolvedValueOnce({
+      ...detailFor(parent.uid),
+      issue: { ...parent, body: "Parent body" },
+      children: [child],
+    });
+    const store = createKataWorkspaceStore({ api });
+
+    await store.bootstrap("today", parent.uid);
+
+    expect(store.cachedTasks.map((item) => item.uid).sort()).toEqual(["issue-child", "issue-parent"]);
+  });
+
+  test("keeps cached task array stable across equivalent view refreshes", async () => {
+    const visible = {
+      ...issues[0]!,
+      uid: "issue-stable-cache",
+      short_id: "stable-cache",
+      qualified_id: "Finances#stable-cache",
+      title: "Stable cached task",
+      blocks: [{ uid: "issue-peer", short_id: "peer" }],
+    };
+    const changed = { ...visible, title: "Changed cached task", revision: visible.revision + 1 };
+    const viewFor = (item: KataTaskSummary): KataTaskViewResponse => ({
+      view: "today",
+      groups: [
+        { id: "today", title: "Today", issues: [{ ...item, blocks: item.blocks ? [...item.blocks] : undefined }] },
+      ],
+      fetched_at: fetchedAt,
+    });
+    const api = createFakeKataTaskAPI();
+    api.mocks.issues
+      .mockResolvedValueOnce(viewFor(visible))
+      .mockResolvedValueOnce(viewFor(visible))
+      .mockResolvedValueOnce(viewFor(changed));
+    const store = createKataWorkspaceStore({ api });
+
+    await store.bootstrap("today", null, { selectFirst: false });
+    const initialCachedTasks = store.cachedTasks;
+
+    await store.openView("today", { selectFirst: false });
+
+    expect(store.cachedTasks).toBe(initialCachedTasks);
+
+    await store.openView("today", { selectFirst: false });
+
+    expect(store.cachedTasks).not.toBe(initialCachedTasks);
+    expect(store.cachedTasks.find((item) => item.uid === visible.uid)?.title).toBe("Changed cached task");
+  });
+
+  test("keeps cached parent uid refs across sparse view refreshes", async () => {
+    const parent = {
+      ...issues[0]!,
+      uid: "issue-cache-parent",
+      short_id: "cache-parent",
+      qualified_id: "Finances#cache-parent",
+      title: "Cache parent",
+    };
+    const child = {
+      ...issues[1]!,
+      uid: "issue-cache-child",
+      short_id: "cache-child",
+      qualified_id: "Finances#cache-child",
+      title: "Cache child",
+      parent: { uid: parent.uid, short_id: parent.short_id },
+      parent_short_id: parent.short_id,
+    };
+    const sparseChild = { ...child } as Record<string, unknown>;
+    delete sparseChild.parent;
+    delete sparseChild.parent_short_id;
+    const viewFor = (item: KataTaskSummary): KataTaskViewResponse => ({
+      view: "today",
+      groups: [{ id: "today", title: "Today", issues: [item] }],
+      fetched_at: fetchedAt,
+    });
+    const api = createFakeKataTaskAPI();
+    api.mocks.issues
+      .mockResolvedValueOnce(viewFor(child))
+      .mockResolvedValueOnce(viewFor(sparseChild as unknown as KataTaskSummary));
+    const store = createKataWorkspaceStore({ api });
+
+    await store.bootstrap("today", null, { selectFirst: false });
+    await store.openView("today", { selectFirst: false });
+
+    expect(store.cachedTasks.find((item) => item.uid === child.uid)).toMatchObject({
+      parent: { uid: parent.uid, short_id: parent.short_id },
+      parent_short_id: parent.short_id,
+    });
+  });
+
+  test("clears cached task summaries when bootstrap applies a new daemon view", async () => {
+    const first = {
+      ...issues[0]!,
+      uid: "issue-first-daemon",
+      short_id: "first-daemon",
+      qualified_id: "Finances#first-daemon",
+      title: "First daemon task",
+    };
+    const second = {
+      ...issues[1]!,
+      uid: "issue-second-daemon",
+      short_id: "second-daemon",
+      qualified_id: "Health#second-daemon",
+      title: "Second daemon task",
+    };
+    const api = createFakeKataTaskAPI();
+    api.mocks.issues
+      .mockResolvedValueOnce({
+        view: "today",
+        groups: [{ id: "today", title: "Today", issues: [first] }],
+        fetched_at: fetchedAt,
+      })
+      .mockResolvedValueOnce({
+        view: "today",
+        groups: [{ id: "today", title: "Today", issues: [second] }],
+        fetched_at: fetchedAt,
+      });
+    api.mocks.issue
+      .mockResolvedValueOnce({ ...detailFor(first.uid), issue: { ...first, body: "First body" } })
+      .mockResolvedValueOnce({ ...detailFor(second.uid), issue: { ...second, body: "Second body" } });
+    const store = createKataWorkspaceStore({ api });
+
+    await store.bootstrap();
+    expect(store.cachedTasks.map((item) => item.uid)).toContain(first.uid);
+
+    await store.bootstrap();
+
+    expect(store.cachedTasks.map((item) => item.uid)).toEqual([second.uid]);
+  });
+
+  test("updates cached task summaries after a mutation refresh", async () => {
+    const api = createFakeKataTaskAPI();
+    const store = createKataWorkspaceStore({ api });
+    await store.bootstrap();
+    const selected = store.selectedIssue?.issue;
+    if (!selected) throw new Error("expected selected issue");
+    const updated = { ...selected, priority: 0, revision: selected.revision + 1 };
+    api.mocks.setPriority.mockResolvedValueOnce({ changed: true, issue: updated, etag: '"rev-2"' });
+    api.mocks.issues.mockResolvedValueOnce({
+      view: store.currentView.name,
+      groups: [{ id: "today", title: "Today", issues: [updated] }],
+      fetched_at: fetchedAt,
+    });
+    api.mocks.issue.mockResolvedValueOnce({
+      ...detailFor(updated.uid),
+      issue: { ...updated, body: "Updated body" },
+    });
+
+    await store.setPriority(selected.uid, "middleman", 0);
+
+    expect(store.cachedTasks.find((item) => item.uid === selected.uid)?.priority).toBe(0);
   });
 
   test("does not let an already stale guarded view load cancel the active view", async () => {
@@ -739,7 +933,9 @@ describe("kata workspace store", () => {
     expect(api.mocks.issues).not.toHaveBeenCalled();
     expect(store.currentView.name).toBe("today");
     expect(store.selectedIssue?.issue.title).toBe("Call dentist");
-    expect(store.selectedEvents.map((event) => event.issue_uid)).toEqual(["issue-call-dentist"]);
+    await vi.waitFor(() => {
+      expect(store.selectedEvents.map((event) => event.issue_uid)).toEqual(["issue-call-dentist"]);
+    });
   });
 
   test("loading an issue loads the full recurrence list for that issue project", async () => {
@@ -779,6 +975,102 @@ describe("kata workspace store", () => {
     });
   });
 
+  test("selecting an issue records detail-visible and events-loaded timing measures", async () => {
+    performance.clearMarks();
+    performance.clearMeasures();
+    const api = createFakeKataTaskAPI();
+    const store = createKataWorkspaceStore({ api });
+
+    await store.selectIssue("issue-pay-rent");
+
+    await vi.waitFor(() => {
+      expect(performance.getEntriesByName("kata:select-issue:detail-visible", "measure")).toHaveLength(1);
+      expect(performance.getEntriesByName("kata:select-issue:events-loaded", "measure")).toHaveLength(1);
+    });
+  });
+
+  test("a superseded selection does not record timing measures", async () => {
+    performance.clearMarks();
+    performance.clearMeasures();
+    const { api, signals } = apiWithHangingIssueDetail();
+    const store = createKataWorkspaceStore({ api });
+
+    const first = store.selectIssue("issue-pay-rent");
+    const second = store.selectIssue("issue-call-dentist");
+    await expect(second).resolves.toBe(true);
+    await expect(first).resolves.toBe(false);
+
+    expect(signals[0]?.aborted).toBe(true);
+    expect(performance.getEntriesByName("kata:select-issue:detail-visible", "measure")).toHaveLength(1);
+    expect(performance.getEntriesByName("kata:select-issue:events-loaded", "measure")).toHaveLength(1);
+  });
+
+  test("slow events loading does not delay showing the selected issue detail", async () => {
+    const api = createFakeKataTaskAPI();
+    const slowEvents = deferred<KataTaskEventsResponse>();
+    api.mocks.events.mockReturnValue(slowEvents.promise);
+    const store = createKataWorkspaceStore({ api });
+
+    // The selection itself resolves while the events read is still in
+    // flight: callers sync the route from this promise, so a slow event-log
+    // walk must not hold it.
+    await expect(store.selectIssue("issue-pay-rent")).resolves.toBe(true);
+    expect(store.selectedIssue?.issue.uid).toBe("issue-pay-rent");
+    expect(store.pendingSelectionUID).toBeNull();
+    expect(store.selectedEvents).toEqual([]);
+
+    slowEvents.resolve({ reset_required: false, events: [events[0]!], next_after_id: 1 });
+    await vi.waitFor(() => {
+      expect(store.selectedEvents.map((event) => event.issue_uid)).toEqual(["issue-pay-rent"]);
+    });
+  });
+
+  test("a failed events read does not fail an already-rendered selection", async () => {
+    const api = createFakeKataTaskAPI();
+    api.mocks.events.mockRejectedValue(new Error("event log walk failed"));
+    const store = createKataWorkspaceStore({ api });
+
+    await expect(store.selectIssue("issue-pay-rent")).resolves.toBe(true);
+
+    expect(store.selectedIssue?.issue.uid).toBe("issue-pay-rent");
+    expect(store.pendingSelectionUID).toBeNull();
+    // Flush the background events continuation before proving it left the
+    // rendered detail in place with an empty event log.
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(store.selectedIssue?.issue.uid).toBe("issue-pay-rent");
+    expect(store.selectedEvents).toEqual([]);
+  });
+
+  test("a selection superseded while its events read is in flight keeps the newer selection", async () => {
+    const api = createFakeKataTaskAPI();
+    const slowEvents = deferred<KataTaskEventsResponse>();
+    let holdPayRentEvents = false;
+    api.mocks.events.mockImplementation((query: KataTaskEventsQuery = {}) => {
+      if (holdPayRentEvents && query.issue_uid === "issue-pay-rent") return slowEvents.promise;
+      const rows = events.filter((event) => (query.issue_uid ? event.issue_uid === query.issue_uid : true));
+      return Promise.resolve({ reset_required: false, events: rows, next_after_id: rows.at(-1)?.event_id ?? 0 });
+    });
+    const store = createKataWorkspaceStore({ api });
+
+    holdPayRentEvents = true;
+    // The first selection resolves once its detail is applied, even though
+    // its events read is still held open.
+    await expect(store.selectIssue("issue-pay-rent")).resolves.toBe(true);
+    expect(store.selectedIssue?.issue.uid).toBe("issue-pay-rent");
+    holdPayRentEvents = false;
+    await expect(store.selectIssue("issue-call-dentist")).resolves.toBe(true);
+
+    // The stale events finally landing must not leak into the newer
+    // selection's event log.
+    slowEvents.resolve({ reset_required: false, events: [events[0]!], next_after_id: 1 });
+    expect(store.selectedIssue?.issue.uid).toBe("issue-call-dentist");
+    await vi.waitFor(() => {
+      expect(store.selectedEvents.map((event) => event.issue_uid)).toEqual(["issue-call-dentist"]);
+    });
+    expect(store.selectedIssue?.issue.uid).toBe("issue-call-dentist");
+  });
+
   test("failed recurrence loading does not block issue selection", async () => {
     const loaded = [recurrence({ id: 1, template_title: "Loaded recurrence" })];
     const api = createFakeKataTaskAPI();
@@ -794,7 +1086,9 @@ describe("kata workspace store", () => {
     await expect(store.selectIssue("issue-call-dentist")).resolves.toBe(true);
 
     expect(store.selectedIssue?.issue.uid).toBe("issue-call-dentist");
-    expect(store.selectedEvents.map((event) => event.issue_uid)).toEqual(["issue-call-dentist"]);
+    await vi.waitFor(() => {
+      expect(store.selectedEvents.map((event) => event.issue_uid)).toEqual(["issue-call-dentist"]);
+    });
     expect(store.selectedRecurrences).toEqual([]);
     expect(store.pendingSelectionUID).toBeNull();
   });
@@ -823,6 +1117,35 @@ describe("kata workspace store", () => {
     await expect(pending).resolves.toBe(false);
     expect(signals[0]?.aborted).toBe(true);
     expect(store.pendingSelectionUID).toBeNull();
+  });
+
+  test("explicit empty relationship fields clear stale cached graph links", () => {
+    const store = createKataWorkspaceStore({ api: createFakeKataTaskAPI() });
+    const stale = {
+      ...issue("issue-stale-graph", "Stale graph task", "project-kata"),
+      blocks: [{ uid: "issue-old-blocked", short_id: "old-blocked" }],
+      blocked_by: [{ uid: "issue-old-blocker", short_id: "old-blocker" }],
+      related: [{ uid: "issue-old-related", short_id: "old-related" }],
+      child_counts: { open: 1, total: 1 },
+    };
+
+    store.rememberTasks([stale]);
+    store.rememberTasks([
+      {
+        ...stale,
+        blocks: [],
+        blocked_by: [],
+        related: [],
+        child_counts: { open: 0, total: 0 },
+      },
+    ]);
+
+    expect(store.cachedTasks.find((task) => task.uid === stale.uid)).toMatchObject({
+      blocks: [],
+      blocked_by: [],
+      related: [],
+      child_counts: { open: 0, total: 0 },
+    });
   });
 
   test("clearing the selection aborts the in-flight detail load", async () => {
@@ -898,6 +1221,34 @@ describe("kata workspace store", () => {
       "issue-parent",
     ]);
     expect(store.selectedIssue?.issue.uid).toBe("issue-parent");
+  });
+
+  test("search-backed views select a child whose parent is absent from the results", async () => {
+    const child = {
+      ...issue("issue-child", "Child task", "project-kata"),
+      short_id: "child",
+      qualified_id: "Kata#child",
+      parent_short_id: "parent",
+    };
+    const api = createFakeKataTaskAPI();
+    api.mocks.search.mockResolvedValueOnce({
+      filters: { scope: { kind: "all" }, status: "open", owner: "", label: "", query: "child" },
+      issues: [child],
+      fetched_at: fetchedAt,
+    });
+    api.mocks.issue.mockImplementation(async (uid: string) => ({
+      ...detailFor(uid),
+      issue: { ...child, body: `${uid} body` },
+    }));
+    const store = createKataWorkspaceStore({ api });
+    await store.bootstrap();
+
+    await store.updateSearchFilters({ query: "child" });
+
+    // The parent is not in the result set, so the child cannot fold into a
+    // missing ancestor: it stays a top-level row and is selected like one.
+    expect(store.currentView.groups.flatMap((group) => group.issues).map((item) => item.uid)).toEqual(["issue-child"]);
+    expect(store.selectedIssue?.issue.uid).toBe("issue-child");
   });
 
   test("system view navigation keeps the selected project scope", async () => {
@@ -1227,7 +1578,9 @@ describe("kata workspace store", () => {
       "Payment is scheduled.",
     );
     expect(store.selectedIssue?.issue.uid).toBe("issue-call-dentist");
-    expect(store.selectedEvents.map((event) => event.issue_uid)).toEqual(["issue-call-dentist"]);
+    await vi.waitFor(() => {
+      expect(store.selectedEvents.map((event) => event.issue_uid)).toEqual(["issue-call-dentist"]);
+    });
   });
 
   test("delayed mutation detail load does not overwrite a newer manual selection", async () => {
@@ -1258,7 +1611,9 @@ describe("kata workspace store", () => {
     await mutation;
 
     expect(store.selectedIssue?.issue.uid).toBe("issue-call-dentist");
-    expect(store.selectedEvents.map((event) => event.issue_uid)).toEqual(["issue-call-dentist"]);
+    await vi.waitFor(() => {
+      expect(store.selectedEvents.map((event) => event.issue_uid)).toEqual(["issue-call-dentist"]);
+    });
   });
 
   test("a selection made while a remote-event view refresh is in flight is not discarded", async () => {

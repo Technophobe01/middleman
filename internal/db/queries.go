@@ -913,7 +913,7 @@ func (d *DB) PurgeOtherHosts(ctx context.Context, keepHost string) error {
 		queries := []string{
 			`DELETE FROM middleman_starred_items WHERE repo_id IN (SELECT id FROM middleman_repos WHERE platform_host != ?)`,
 			`DELETE FROM middleman_mr_worktree_links WHERE merge_request_id IN (SELECT id FROM middleman_merge_requests WHERE repo_id IN (SELECT id FROM middleman_repos WHERE platform_host != ?))`,
-			`DELETE FROM middleman_kanban_state WHERE merge_request_id IN (SELECT id FROM middleman_merge_requests WHERE repo_id IN (SELECT id FROM middleman_repos WHERE platform_host != ?))`,
+			`DELETE FROM middleman_item_workflow_state WHERE repo_id IN (SELECT id FROM middleman_repos WHERE platform_host != ?)`,
 			`DELETE FROM middleman_mr_events WHERE merge_request_id IN (SELECT id FROM middleman_merge_requests WHERE repo_id IN (SELECT id FROM middleman_repos WHERE platform_host != ?))`,
 			`DELETE FROM middleman_merge_requests WHERE repo_id IN (SELECT id FROM middleman_repos WHERE platform_host != ?)`,
 			`DELETE FROM middleman_issue_events WHERE issue_id IN (SELECT id FROM middleman_issues WHERE repo_id IN (SELECT id FROM middleman_repos WHERE platform_host != ?))`,
@@ -2313,7 +2313,8 @@ func (d *DB) GetMergeRequest(
 		       (s.number IS NOT NULL) AS starred
 		FROM middleman_merge_requests p
 		JOIN middleman_repos r ON r.id = p.repo_id
-		LEFT JOIN middleman_kanban_state k ON k.merge_request_id = p.id
+		LEFT JOIN middleman_item_workflow_state k
+		    ON k.repo_id = p.repo_id AND k.item_type = 'pr' AND k.item_number = p.number
 		LEFT JOIN middleman_starred_items s
 		    ON s.item_type = 'pr' AND s.repo_id = p.repo_id AND s.number = p.number
 		WHERE r.platform = ? AND r.platform_host = ?
@@ -2373,7 +2374,8 @@ func (d *DB) GetMergeRequestByRepoIDAndNumber(ctx context.Context, repoID int64,
 		       COALESCE(k.status, '') AS kanban_status,
 		       (s.number IS NOT NULL) AS starred
 		FROM middleman_merge_requests p
-		LEFT JOIN middleman_kanban_state k ON k.merge_request_id = p.id
+		LEFT JOIN middleman_item_workflow_state k
+		    ON k.repo_id = p.repo_id AND k.item_type = 'pr' AND k.item_number = p.number
 		LEFT JOIN middleman_starred_items s
 		    ON s.item_type = 'pr' AND s.repo_id = p.repo_id AND s.number = p.number
 		WHERE p.repo_id = ? AND p.number = ?`,
@@ -2496,7 +2498,8 @@ func (d *DB) ListMergeRequests(ctx context.Context, opts ListMergeRequestsOpts) 
 		       (s.number IS NOT NULL) AS starred
 		FROM middleman_merge_requests p
 		JOIN middleman_repos r ON r.id = p.repo_id
-		LEFT JOIN middleman_kanban_state k ON k.merge_request_id = p.id
+		LEFT JOIN middleman_item_workflow_state k
+		    ON k.repo_id = p.repo_id AND k.item_type = 'pr' AND k.item_number = p.number
 		LEFT JOIN middleman_starred_items s
 		    ON s.item_type = 'pr' AND s.repo_id = p.repo_id AND s.number = p.number
 		%s
@@ -2726,40 +2729,54 @@ func (d *DB) UpdateThreadResolved(ctx context.Context, mrID int64, threadID stri
 
 // --- Kanban ---
 
-// EnsureKanbanState creates a kanban row with status "new" if one does not exist.
-func (d *DB) EnsureKanbanState(ctx context.Context, mrID int64) error {
-	_, err := d.rw.ExecContext(ctx,
-		`INSERT INTO middleman_kanban_state (merge_request_id, status) VALUES (?, 'new')
-		 ON CONFLICT(merge_request_id) DO NOTHING`,
+func (d *DB) mergeRequestWorkflowRef(ctx context.Context, mrID int64) (int64, int, error) {
+	var repoID int64
+	var number int
+	err := d.ro.QueryRowContext(ctx,
+		`SELECT repo_id, number FROM middleman_merge_requests WHERE id = ?`,
 		mrID,
-	)
+	).Scan(&repoID, &number)
+	if err != nil {
+		return 0, 0, fmt.Errorf("lookup merge request workflow ref: %w", err)
+	}
+	return repoID, number, nil
+}
+
+// EnsureKanbanState creates a PR workflow row with status "new" if one does not exist.
+func (d *DB) EnsureKanbanState(ctx context.Context, mrID int64) error {
+	repoID, number, err := d.mergeRequestWorkflowRef(ctx, mrID)
 	if err != nil {
 		return fmt.Errorf("ensure kanban state: %w", err)
 	}
-	return nil
+	return d.EnsureItemWorkflowState(ctx, repoID, ItemTypePR, number)
 }
 
-// SetKanbanState sets the kanban status for a merge request (upsert).
+// SetKanbanState sets the PR workflow status for a merge request (upsert).
 func (d *DB) SetKanbanState(ctx context.Context, mrID int64, status string) error {
-	_, err := d.rw.ExecContext(ctx, `
-		INSERT INTO middleman_kanban_state (merge_request_id, status, updated_at)
-		VALUES (?, ?, datetime('now'))
-		ON CONFLICT(merge_request_id) DO UPDATE SET
-		    status     = excluded.status,
-		    updated_at = excluded.updated_at`,
-		mrID, status,
-	)
+	repoID, number, err := d.mergeRequestWorkflowRef(ctx, mrID)
 	if err != nil {
 		return fmt.Errorf("set kanban state: %w", err)
 	}
-	return nil
+	_, err = d.SetItemWorkflowState(ctx, SetItemWorkflowStateParams{
+		RepoID:     repoID,
+		ItemType:   ItemTypePR,
+		ItemNumber: number,
+		Status:     status,
+		Source:     "ui",
+	})
+	return err
 }
 
-// GetKanbanState returns the kanban state for a merge request, or nil if not found.
+// GetKanbanState returns the PR workflow state for a merge request, or nil if not found.
 func (d *DB) GetKanbanState(ctx context.Context, mrID int64) (*KanbanState, error) {
 	var k KanbanState
 	err := d.ro.QueryRowContext(ctx,
-		`SELECT merge_request_id, status, updated_at FROM middleman_kanban_state WHERE merge_request_id = ?`, mrID,
+		`SELECT p.id, w.status, w.updated_at
+		   FROM middleman_merge_requests p
+		   JOIN middleman_item_workflow_state w
+		     ON w.repo_id = p.repo_id AND w.item_type = 'pr' AND w.item_number = p.number
+		  WHERE p.id = ?`,
+		mrID,
 	).Scan(&k.MergeRequestID, &k.Status, &k.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -3238,11 +3255,14 @@ func (d *DB) GetIssue(
 		       i.author, i.state, i.body, i.comment_count, i.labels_json, i.assignees_json,
 		       i.detail_fetched_at,
 		       i.created_at, i.updated_at, i.last_activity_at, i.closed_at,
-		       (s.number IS NOT NULL) AS starred
+		       (s.number IS NOT NULL) AS starred,
+		       COALESCE(w.status, '') AS workflow_status
 		FROM middleman_issues i
 		JOIN middleman_repos r ON r.id = i.repo_id
 		LEFT JOIN middleman_starred_items s
 		    ON s.item_type = 'issue' AND s.repo_id = i.repo_id AND s.number = i.number
+		LEFT JOIN middleman_item_workflow_state w
+		    ON w.repo_id = i.repo_id AND w.item_type = 'issue' AND w.item_number = i.number
 		WHERE r.platform = ? AND r.platform_host = ?
 		  AND r.owner_key = ? AND r.name_key = ?
 		  AND i.number = ?`,
@@ -3253,7 +3273,7 @@ func (d *DB) GetIssue(
 		&issue.Body, &issue.CommentCount, &issue.LabelsJSON, &issue.AssigneesJSON,
 		&issue.DetailFetchedAt,
 		&issue.CreatedAt, &issue.UpdatedAt, &issue.LastActivityAt,
-		&issue.ClosedAt, &issue.Starred,
+		&issue.ClosedAt, &issue.Starred, &issue.WorkflowStatus,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -3283,10 +3303,13 @@ func (d *DB) GetIssueByRepoIDAndNumber(ctx context.Context, repoID int64, number
 		       i.author, i.state, i.body, i.comment_count, i.labels_json, i.assignees_json,
 		       i.detail_fetched_at,
 		       i.created_at, i.updated_at, i.last_activity_at, i.closed_at,
-		       (s.number IS NOT NULL) AS starred
+		       (s.number IS NOT NULL) AS starred,
+		       COALESCE(w.status, '') AS workflow_status
 		FROM middleman_issues i
 		LEFT JOIN middleman_starred_items s
 		    ON s.item_type = 'issue' AND s.repo_id = i.repo_id AND s.number = i.number
+		LEFT JOIN middleman_item_workflow_state w
+		    ON w.repo_id = i.repo_id AND w.item_type = 'issue' AND w.item_number = i.number
 		WHERE i.repo_id = ? AND i.number = ?`,
 		repoID, number,
 	).Scan(
@@ -3295,7 +3318,7 @@ func (d *DB) GetIssueByRepoIDAndNumber(ctx context.Context, repoID int64, number
 		&issue.Body, &issue.CommentCount, &issue.LabelsJSON, &issue.AssigneesJSON,
 		&issue.DetailFetchedAt,
 		&issue.CreatedAt, &issue.UpdatedAt, &issue.LastActivityAt,
-		&issue.ClosedAt, &issue.Starred,
+		&issue.ClosedAt, &issue.Starred, &issue.WorkflowStatus,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -3386,11 +3409,14 @@ func (d *DB) ListIssues(
 		       i.author, i.state, i.body, i.comment_count, i.labels_json, i.assignees_json,
 		       i.detail_fetched_at,
 		       i.created_at, i.updated_at, i.last_activity_at, i.closed_at,
-		       (s.number IS NOT NULL) AS starred
+		       (s.number IS NOT NULL) AS starred,
+		       COALESCE(w.status, '') AS workflow_status
 		FROM middleman_issues i
 		JOIN middleman_repos r ON r.id = i.repo_id
 		LEFT JOIN middleman_starred_items s
 		    ON s.item_type = 'issue' AND s.repo_id = i.repo_id AND s.number = i.number
+		LEFT JOIN middleman_item_workflow_state w
+		    ON w.repo_id = i.repo_id AND w.item_type = 'issue' AND w.item_number = i.number
 		%s
 		ORDER BY i.last_activity_at DESC, i.id DESC`, where)
 	query = appendLimitOffset(query, &args, opts.Limit, opts.Offset)
@@ -3411,7 +3437,7 @@ func (d *DB) ListIssues(
 			&issue.Body, &issue.CommentCount, &issue.LabelsJSON, &issue.AssigneesJSON,
 			&issue.DetailFetchedAt,
 			&issue.CreatedAt, &issue.UpdatedAt, &issue.LastActivityAt,
-			&issue.ClosedAt, &issue.Starred,
+			&issue.ClosedAt, &issue.Starred, &issue.WorkflowStatus,
 		); err != nil {
 			return nil, fmt.Errorf("scan issue: %w", err)
 		}
@@ -5030,8 +5056,13 @@ const workspaceSummaryColumns = `
 	    WHEN w.item_type = 'issue' THEN i.state
 	    ELSE m.state
 	END,
+	CASE
+	    WHEN w.item_type = 'issue' THEN i.url
+	    ELSE m.url
+	END,
 	m.is_draft, m.ci_status,
 	m.review_decision, m.additions, m.deletions,
+	m.comment_count, m.mergeable_state, m.head_branch,
 	CASE
 	    WHEN w.item_type = 'issue' THEN i.last_activity_at
 	    ELSE m.last_activity_at
@@ -5067,14 +5098,19 @@ func scanWorkspaceSummary(
 		&s.GitHeadRef, &s.MRHeadRepo, &s.WorkspaceBranch,
 		&s.WorktreePath, &s.TmuxSession, &s.TerminalBackend, &s.Status,
 		&s.ErrorMessage, &s.CreatedAt, &kataMetadataJSON,
-		&s.MRTitle, &s.MRState, &s.MRIsDraft, &s.MRCIStatus,
+		&s.SourceTitle, &s.SourceState, &s.SourceURL,
+		&s.MRIsDraft, &s.MRCIStatus,
 		&s.MRReviewDecision, &s.MRAdditions, &s.MRDeletions,
+		&s.MRCommentCount, &s.MRMergeableState,
+		&s.MRHeadBranch,
 		&itemLastActivityAt,
 	)
 	if err != nil {
 		return nil, err
 	}
 	s.CreatedAt = s.CreatedAt.UTC()
+	s.MRTitle = s.SourceTitle
+	s.MRState = s.SourceState
 	if s.ItemKey == "" && s.ItemType != WorkspaceItemTypeKataTask {
 		s.ItemKey = strconv.Itoa(s.ItemNumber)
 	}

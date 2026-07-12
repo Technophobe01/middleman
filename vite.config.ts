@@ -9,7 +9,16 @@ export default defineConfig({
   run: {
     tasks: {
       "frontend-check": {
-        command: [`${rootVP} run frontend-fmt`, `${rootVP} run frontend-lint`, `${rootVP} run svelte-check`],
+        command: [
+          `${rootVP} run frontend-fmt`,
+          `${rootVP} run frontend-lint`,
+          `${rootVP} run kit-ui-check`,
+          `${rootVP} run svelte-check`,
+        ],
+        cache: false,
+      },
+      "kit-ui-check": {
+        command: `(cd frontend && node node_modules/@kenn-io/kit-ui/bin/kit-ui-check.mjs src ../packages/ui/src)`,
         cache: false,
       },
       "frontend-fmt": {
@@ -21,7 +30,10 @@ export default defineConfig({
         cache: false,
       },
       "frontend-package-check": {
-        command: [`${rootVP} fmt --check frontend --no-error-on-unmatched-pattern --threads=1`, `${rootVP} run frontend-package-typecheck`],
+        command: [
+          `${rootVP} fmt --check frontend --no-error-on-unmatched-pattern --threads=1`,
+          `${rootVP} run frontend-package-typecheck`,
+        ],
         cache: false,
       },
       "frontend-package-typecheck": {
@@ -53,7 +65,10 @@ export default defineConfig({
         ],
       },
       "ui-package-check": {
-        command: [`${rootVP} fmt --check packages/ui --no-error-on-unmatched-pattern --threads=1`, `${rootVP} run ui-package-typecheck`],
+        command: [
+          `${rootVP} fmt --check packages/ui --no-error-on-unmatched-pattern --threads=1`,
+          `${rootVP} run ui-package-typecheck`,
+        ],
         cache: false,
       },
       "ui-package-typecheck": {

@@ -145,14 +145,18 @@ function renderDetail(props: Partial<KataIssueDetailProps> = {}) {
 describe("KataIssueDetail", () => {
   afterEach(() => {
     cleanup();
+    vi.useRealTimers();
   });
 
   it("renders the selected issue shell and composed sections", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-06-01T13:00:00Z"));
     renderDetail();
 
     const detail = screen.getByRole("region", { name: "Task detail" });
     expect(within(detail).getByRole("heading", { name: "Ship the thing" })).toBeTruthy();
     expect(within(detail).getByText("INBOX-1")).toBeTruthy();
+    expect(within(detail).getByText("1h ago")).toBeTruthy();
     expect(within(detail).getByText("Initial body")).toBeTruthy();
     expect(within(detail).getByRole("region", { name: "Checklist" })).toBeTruthy();
     expect(within(detail).getByRole("heading", { name: "Recurring" })).toBeTruthy();
@@ -188,6 +192,15 @@ describe("KataIssueDetail", () => {
     await fireEvent.keyDown(screen.getByRole("combobox", { name: "Move issue project" }), { key: "Enter" });
 
     expect(onMoveIssue).toHaveBeenCalledWith("project-2");
+  });
+
+  it("opens the reachable graph for the selected task", async () => {
+    const onOpenGraph = vi.fn();
+    renderDetail({ onOpenGraph });
+
+    await fireEvent.click(screen.getByRole("button", { name: "Open reachable graph" }));
+
+    expect(onOpenGraph).toHaveBeenCalledWith(expect.objectContaining({ uid: "issue-1" }));
   });
 
   it("falls back to project UID when the issue omits project name", () => {

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { EmptyState } from "@kenn-io/kit-ui";
   import type { ActivityItem } from "../api/types.js";
   import { getStores } from "../context.js";
   import {
@@ -21,13 +22,13 @@
     createRepoLabelFormatter,
     type RepoLabelIdentity,
   } from "../utils/repo-label.js";
-  import Chip from "./shared/Chip.svelte";
+  import { Chip } from "@kenn-io/kit-ui";
   import ItemKindChip from "./shared/ItemKindChip.svelte";
   import ItemStateChip from "./shared/ItemStateChip.svelte";
   import WorkspaceIndicator from "./shared/WorkspaceIndicator.svelte";
 
   const { grouping, activity } = getStores();
-  import { repoColor } from "../utils/repo-color.js";
+  import { hashColor } from "@kenn-io/kit-ui";
   import ArrowUpRightIcon from "@lucide/svelte/icons/arrow-up-right";
   import CheckIcon from "@lucide/svelte/icons/check";
   import ChevronDownIcon from "@lucide/svelte/icons/chevron-down";
@@ -621,10 +622,10 @@
             {#if !grouping.getGroupByRepo()}
               <span class="cell cell--repo">
                 <Chip
-                  size="xs"
+                  size="sm"
                   uppercase={false}
                   class="repo-chip repo-tag"
-                  style="color: {repoColor(`${entry.repoOwner}/${entry.repoName}`)}; background: color-mix(in srgb, {repoColor(`${entry.repoOwner}/${entry.repoName}`)} 15%, transparent);"
+                  style="color: {hashColor(`${entry.repoOwner}/${entry.repoName}`)}; background: color-mix(in srgb, {hashColor(`${entry.repoOwner}/${entry.repoName}`)} 15%, transparent);"
                 >
                   <span class="repo-chip__label">{repoLabel(entryRepoIdentity(entry))}</span>
                 </Chip>
@@ -686,10 +687,10 @@
           {#if !grouping.getGroupByRepo()}
             <span class="cell cell--repo">
               <Chip
-                size="xs"
+                size="sm"
                 uppercase={false}
                 class="repo-chip repo-tag"
-                style="color: {repoColor(`${itemGroup.repoOwner}/${itemGroup.repoName}`)}; background: color-mix(in srgb, {repoColor(`${itemGroup.repoOwner}/${itemGroup.repoName}`)} 15%, transparent);"
+                style="color: {hashColor(`${itemGroup.repoOwner}/${itemGroup.repoName}`)}; background: color-mix(in srgb, {hashColor(`${itemGroup.repoOwner}/${itemGroup.repoName}`)} 15%, transparent);"
               >
                 <span class="repo-chip__label">{repoLabel(entryRepoIdentity(entry))}</span>
               </Chip>
@@ -763,7 +764,7 @@
   {/each}
 
   {#if grouped.length === 0}
-    <div class="empty-state">No activity found</div>
+    <EmptyState title="No activity found" />
   {/if}
 </div>
 
@@ -794,6 +795,12 @@
       24px;
     column-gap: 6px;
     align-content: start;
+  }
+
+  /* The empty state is a direct grid child; without a spanning rule it
+     would sit in the first (caret) column instead of the full width. */
+  .threaded-view > :global(.kit-empty-state) {
+    grid-column: 1 / -1;
   }
 
   .threaded-view--grouped {
@@ -1084,13 +1091,6 @@
     color: var(--accent-blue);
   }
 
-  .empty-state {
-    grid-column: 1 / -1;
-    padding: 40px;
-    text-align: center;
-    color: var(--text-muted);
-    font-size: var(--font-size-md);
-  }
 
   .cell--repo :global(.repo-chip) {
     min-width: 0;

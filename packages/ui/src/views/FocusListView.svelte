@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { SearchInput } from "@kenn-io/kit-ui";
   import { getStores, getNavigate, getActions } from "../context.js";
   import { groupByWorkflow } from "../stores/workflow.svelte.js";
   import PullItem from "../components/sidebar/PullItem.svelte";
@@ -79,8 +80,7 @@
     };
   });
 
-  function onSearchInput(e: Event): void {
-    const value = (e.target as HTMLInputElement).value;
+  function onSearchInput(value: string): void {
     searchInput = value;
 
     if (debounceHandle !== null) clearTimeout(debounceHandle);
@@ -216,32 +216,13 @@
     {/if}
   </div>
   <div class="search-bar">
-    <div class="search-input-wrap">
-      <svg
-        class="search-icon"
-        viewBox="0 0 16 16"
-        fill="none"
-        xmlns="http://www.w3.org/2000/svg"
-      >
-        <circle
-          cx="6.5"
-          cy="6.5"
-          r="4.5"
-          stroke="currentColor"
-          stroke-width="1.5"
-        />
-        <path
-          d="M10 10L14 14"
-          stroke="currentColor"
-          stroke-width="1.5"
-          stroke-linecap="round"
-        />
-      </svg>
-      <input
-        class="search-input"
-        type="search"
+    <div class="search-wrap">
+      <SearchInput
+        bind:value={searchInput}
+        size="sm"
+        block
         placeholder="Search {itemLabel}..."
-        value={searchInput}
+        ariaLabel="Search {itemLabel}"
         oninput={onSearchInput}
       />
     </div>
@@ -408,7 +389,7 @@
   .group-btn--active {
     background: var(--bg-surface);
     color: var(--text-primary);
-    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.1);
+    box-shadow: var(--shadow-sm);
   }
 
   .workflow-group {
@@ -439,35 +420,9 @@
     background: var(--bg-surface);
   }
 
-  .search-input-wrap {
-    position: relative;
+  .search-wrap {
     flex: 1;
     min-width: 0;
-  }
-
-  .search-icon {
-    position: absolute;
-    left: 8px;
-    top: 50%;
-    transform: translateY(-50%);
-    width: 13px;
-    height: 13px;
-    color: var(--text-muted);
-    pointer-events: none;
-  }
-
-  .search-input {
-    width: 100%;
-    font-size: var(--font-size-sm);
-    padding: 5px 8px 5px 28px;
-    background: var(--bg-inset);
-    border: 1px solid var(--border-muted);
-    border-radius: var(--radius-sm);
-  }
-
-  .search-input:focus {
-    border-color: var(--accent-blue);
-    outline: none;
   }
 
   .state-toggle {
@@ -492,7 +447,7 @@
   .state-btn--active {
     background: var(--bg-surface);
     color: var(--text-primary);
-    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.1);
+    box-shadow: var(--shadow-sm);
   }
 
   .state-note {
@@ -545,13 +500,13 @@
   }
 
   :global(.mobile-main) .focus-list {
-    --focus-mobile-space-2xs: 0.36rem;
-    --focus-mobile-space-xs: 0.5rem;
-    --focus-mobile-space-sm: 0.75rem;
-    --focus-mobile-space-md: 1rem;
-    --focus-mobile-hit-target: 3.4rem;
-    --focus-mobile-radius-sm: 0.65rem;
-    --focus-mobile-radius-md: 0.9rem;
+    --focus-mobile-space-2xs: 4.5px;
+    --focus-mobile-space-xs: 6.5px;
+    --focus-mobile-space-sm: 10px;
+    --focus-mobile-space-md: 13px;
+    --focus-mobile-hit-target: 44px;
+    --focus-mobile-radius-sm: 8.5px;
+    --focus-mobile-radius-md: 12px;
     background: var(--bg-primary);
   }
 
@@ -562,7 +517,7 @@
   }
 
   :global(.mobile-main) .header-label {
-    font-size: var(--font-size-mobile-body);
+    font-size: var(--font-size-md);
     line-height: 1.35;
   }
 
@@ -571,9 +526,9 @@
     display: inline-flex;
     align-items: center;
     border: thin solid var(--border-muted);
-    border-radius: 999rem;
+    border-radius: 999px;
     padding: var(--focus-mobile-space-2xs) var(--focus-mobile-space-sm);
-    font-size: var(--font-size-mobile-xs);
+    font-size: var(--font-size-xs);
     line-height: 1.25;
   }
 
@@ -601,7 +556,7 @@
     min-height: var(--focus-mobile-hit-target);
     border-radius: var(--focus-mobile-radius-sm);
     padding: var(--focus-mobile-space-xs) var(--focus-mobile-space-sm);
-    font-size: var(--font-size-mobile-sm);
+    font-size: var(--font-size-sm);
     line-height: 1.3;
     font-weight: 600;
   }
@@ -612,35 +567,22 @@
     border-bottom: thin solid var(--border-default);
   }
 
-  :global(.mobile-main) .search-icon {
-    left: var(--focus-mobile-space-sm);
-    width: 1.25rem;
-    height: 1.25rem;
-  }
-
-  :global(.mobile-main) .search-input {
+  :global(.mobile-main) .search-wrap :global(.kit-search-input) {
     min-height: var(--focus-mobile-hit-target);
-    border: thin solid var(--border-muted);
     border-radius: var(--focus-mobile-radius-sm);
-    padding:
-      var(--focus-mobile-space-xs)
-      var(--focus-mobile-space-sm)
-      var(--focus-mobile-space-xs)
-      calc(var(--focus-mobile-space-md) + 1.5rem);
-    font-size: var(--font-size-mobile-body);
-    line-height: 1.35;
+    font-size: var(--font-size-md);
   }
 
   :global(.mobile-main) .group-header {
     padding: var(--focus-mobile-space-sm) var(--focus-mobile-space-md);
-    font-size: var(--font-size-mobile-xs);
+    font-size: var(--font-size-xs);
     line-height: 1.25;
   }
 
   :global(.mobile-main) .state-note,
   :global(.mobile-main) .state-message {
     padding: var(--focus-mobile-space-sm) var(--focus-mobile-space-md);
-    font-size: var(--font-size-mobile-sm);
+    font-size: var(--font-size-sm);
     line-height: 1.35;
   }
 </style>

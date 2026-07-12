@@ -1,6 +1,6 @@
 <script lang="ts">
   import { getSidebar } from "../context.js";
-  import CollapsibleResizableSidebar from "../components/shared/CollapsibleResizableSidebar.svelte";
+  import { CollapsibleSidebar } from "@kenn-io/kit-ui";
   import IssueList
     from "../components/sidebar/IssueList.svelte";
   import IssueDetail
@@ -15,6 +15,8 @@
     isSidebarCollapsed?: boolean;
     hideSidebar?: boolean;
     sidebarWidth?: number;
+    /** Float the expanded sidebar over the list (narrow-container hosts). */
+    sidebarOverlay?: boolean;
     autoSyncDetail?: IssueDetailSyncMode;
     hideStaleDetailWhileLoading?: boolean;
     onSidebarResize?: (width: number) => void;
@@ -25,17 +27,19 @@
     isSidebarCollapsed = false,
     hideSidebar = false,
     sidebarWidth = 340,
+    sidebarOverlay = false,
     autoSyncDetail = "background",
     hideStaleDetailWhileLoading = false,
     onSidebarResize,
   }: Props = $props();
 </script>
 
-<CollapsibleResizableSidebar
+<CollapsibleSidebar
   isCollapsed={isSidebarCollapsed}
   {hideSidebar}
   {sidebarWidth}
   {onSidebarResize}
+  overlay={sidebarOverlay}
   showCollapsedStrip={isSidebarToggleEnabled()}
   onExpand={toggleSidebar}
   mainEmpty={selectedIssue === null}
@@ -61,7 +65,7 @@
       <p class="placeholder-hint">j/k to navigate</p>
     </div>
   {/if}
-</CollapsibleResizableSidebar>
+</CollapsibleSidebar>
 
 <style>
   .placeholder-content {

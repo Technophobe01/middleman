@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { SearchInput } from "@kenn-io/kit-ui";
   import { tick, untrack } from "svelte";
   import { SvelteMap } from "svelte/reactivity";
   import {
@@ -654,10 +655,10 @@
     <div class="repo-browser__actions">
       <div class="repo-browser__ref-picker typeahead" bind:this={refPickerRootEl}>
         {#if refPickerOpen}
-          <input
+          <!-- kit-ui-check-ignore: ref picker needs a Branches/Tags tab switcher inside the menu and async loading rows; kit Typeahead has no menu-header snippet (kit-ui#ry18) -->
+          <input role="combobox"
             bind:this={refPickerInputEl}
             class="typeahead-input"
-            role="combobox"
             aria-label="Search repository refs"
             aria-expanded="true"
             aria-controls={refPickerListID}
@@ -690,10 +691,10 @@
                 onclick={() => setRefPickerType("tag")}
               >Tags {tagRefs.length}</button>
             </div>
-            <ul
+            <!-- kit-ui-check-ignore: same ref-picker gap set as the combobox above (kit-ui#ry18) -->
+            <ul role="listbox"
               id={refPickerListID}
               class="repo-browser__ref-list"
-              role="listbox"
               tabindex="-1"
               aria-label="Repository ref options"
             >
@@ -712,7 +713,7 @@
                   }}
                   onmouseenter={() => (refPickerHighlightIndex = index)}
                 >
-                  <span class="option-label">{ref.type}: {ref.name || ref.sha.slice(0, 12)}</span>
+                  <span class="option-label">{ref.name || ref.sha.slice(0, 12)}</span>
                   {#if ref.sha}
                     <span class="option-meta">{ref.sha.slice(0, 8)}</span>
                   {/if}
@@ -759,11 +760,12 @@
       style:width={`${Math.round(filesWidth)}px`}
     >
       <div class="repo-browser__filter">
-        <input
-          type="search"
-          placeholder="Filter files"
-          aria-label="Filter files"
+        <SearchInput
           bind:value={pathFilter}
+          size="sm"
+          block
+          placeholder="Filter files"
+          ariaLabel="Filter files"
         />
       </div>
       <div class="repo-browser__categories" aria-label="File category filters">
@@ -957,16 +959,6 @@
     flex: 0 0 auto;
   }
 
-  .repo-browser__filter input {
-    height: 30px;
-    border: thin solid var(--border-default);
-    border-radius: var(--radius-sm);
-    color: var(--text-primary);
-    background: var(--bg-inset);
-    font: inherit;
-    font-size: var(--font-size-sm);
-  }
-
   .repo-browser__icon-button {
     width: 30px;
     height: 30px;
@@ -1061,7 +1053,7 @@
     z-index: 1;
     display: grid;
     grid-template-columns: 1fr 1fr;
-    gap: 3px;
+    gap: var(--space-1);
     padding: 3px 3px 5px;
     background: var(--bg-surface);
   }
@@ -1096,7 +1088,7 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    gap: 10px;
+    gap: var(--space-4);
     min-height: 28px;
     padding: 5px 8px;
     border-radius: 3px;
@@ -1173,11 +1165,6 @@
     padding: 10px 10px 6px;
   }
 
-  .repo-browser__filter input {
-    width: 100%;
-    padding: 0 9px;
-  }
-
   .repo-browser__categories {
     display: flex;
     flex-wrap: wrap;
@@ -1188,7 +1175,7 @@
   .repo-browser__categories button {
     display: inline-flex;
     align-items: center;
-    gap: 5px;
+    gap: var(--space-2);
     min-height: 24px;
     padding: 0 7px;
     border: thin solid var(--border-default);
@@ -1251,7 +1238,7 @@
 
   .repo-browser__filemeta {
     flex: 0 0 auto;
-    gap: 10px;
+    gap: var(--space-4);
   }
 
   .repo-browser__segmented {
@@ -1345,7 +1332,7 @@
   .repo-browser__history-list button {
     width: 100%;
     display: grid;
-    gap: 3px;
+    gap: var(--space-1);
     padding: 9px 12px;
     border: 0;
     border-bottom: thin solid var(--border-muted);
@@ -1406,6 +1393,7 @@
     font-size: var(--font-size-xs);
   }
 
+  /* kit-ui-check-ignore: three-pane threshold above the shared ladder (900 is the widest step) */
   @media (max-width: 980px) {
     :global(.repo-browser__history-resize),
     .repo-browser__history {
@@ -1414,7 +1402,7 @@
 
   }
 
-  @media (max-width: 720px) {
+  @media (max-width: 760px) {
     :global(.repo-browser__files-resize),
     .repo-browser__sidebar {
       display: none;

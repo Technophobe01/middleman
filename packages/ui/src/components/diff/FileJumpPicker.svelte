@@ -4,7 +4,7 @@
   import { tick } from "svelte";
   import type { DiffFile } from "../../api/types.js";
   import { getStores } from "../../context.js";
-  import { floatingPopoverStyle } from "../shared/floatingPosition.js";
+  import { floatingPopoverStyle } from "@kenn-io/kit-ui";
 
   interface Props {
     disabled?: boolean;
@@ -177,6 +177,7 @@
           onkeydown={handleKeydown}
         />
       </div>
+      <!-- kit-ui-check-ignore: command-palette-style jump list with rich rows and active-file state, not a form dropdown -->
       <div class="file-jump-list" role="listbox" aria-label="Changed files">
         {#each filteredFiles as file, index (file.path)}
           {@const dir = directory(file.path)}
@@ -208,8 +209,13 @@
 
 <style>
   .file-jump {
+    /* Local stacking only: the host and its fixed menu render inside the
+       diff toolbar's own stacking context, so this z competes only with
+       toolbar siblings — the menu's global order comes from the toolbar's
+       plane. That was equally true of the old 1200/2000 literals; they
+       never escaped the toolbar's context either. */
     position: relative;
-    z-index: 1200;
+    z-index: 10;
     flex-shrink: 0;
   }
 
@@ -238,7 +244,7 @@
 
   .file-jump-menu {
     position: fixed;
-    z-index: 2000;
+    z-index: var(--z-popover);
     max-height: min(520px, 70vh);
     overflow: hidden;
     border: 1px solid var(--border-default);

@@ -18,9 +18,32 @@ state.
 - `POST /repos/{owner}/{name}/issues/{number}/workspace`: create or reuse an
   issue-backed workspace; these start from the repo's current `origin/HEAD`,
   not from a PR head branch.
-- `POST /kata/workspace-target`: resolve whether a Kata task has a clear
-  repository target. The UI should hide the workspace action when this returns
-  `available:false`.
+- `GET /kata/tasks/{issue_uid}`: middleman's combined Kata task read. It
+  fetches the daemon's issue detail server-side and returns it together with
+  the resolved workspace target, so the detail pane and its workspace action
+  render from one response. There is no separate workspace-target endpoint;
+  do not reintroduce one. The UI hides the workspace action when the embedded
+  target has `available:false`. The issue read is the critical path and the
+  `/projects` read is best-effort enrichment that must never fail the detail
+  response. The exact latency contract: when the issue payload carries
+  `project_name`, the handler never waits on `/projects` (it takes the
+  result only if already available); when the payload has no name, it may
+  wait only up to the short `/projects`-specific budget
+  (`internal/server/kata_task_detail.go::kataDaemonProjectsReadTimeout`)
+  before falling back to the (empty) payload name. Server-side daemon reads
+  never follow redirects, matching the passthrough proxy and health probe: a
+  redirected issue read surfaces as a `502 upstream_error`, and a redirected
+  `/projects` read is just a failed best-effort read that falls back to the
+  payload name. All outcomes, including problem responses, depend on the
+  daemon selection and must declare `Vary: X-Middleman-Kata-Daemon`. The
+  frontend mirrors the critical-path rule for direct user selections only: a
+  direct selection resolves (and syncs the route) as soon as the detail
+  applies, with the event-log read finishing in a guarded background
+  continuation whose failure silently leaves the event list empty rather
+  than failing the selection. View/bootstrap loads intentionally stay
+  atomic; do not move them to the background-events behavior, or the
+  route-sync effect can stomp a fresh selection
+  (`frontend/src/lib/stores/kata-workspace.svelte.ts::loadSelectedIssue`).
 - `POST /kata/workspaces`: create or reuse a Kata-task-backed workspace. Kata
   tasks are not provider issues, so this path never resolves or syncs a
   provider issue row.
@@ -68,15 +91,21 @@ longer configured, so settings repo deletion must remove mappings for the
 deleted repo in the same save/rollback path
 (`internal/config/config.go::validateKataProjectRepoMappings`,
 `internal/server/settings_handlers.go::deleteConfiguredRepo`). Automatic
-resolution only uses watched exact repos with `worktree_base_path` whose clone
+resolution first uses watched exact repos with `worktree_base_path` whose clone
 contains a matching `.kata.toml`. Matching first compares both explicit
 identifiers, `project.uid` and `project.identity`, to the Kata project UID. If
 either identifier matches exactly, that clone is a candidate; if more than one
-clone matches, the result is ambiguous. Name fallback is only allowed when the
-watched clone metadata set has no usable `project.uid` or `project.identity`
-values at all, and then exactly one case-insensitive `project.name` match is
-required. Ambiguous, mismatched, or missing matches mean the Create/Open
-workspace button must not render.
+clone matches, the result is ambiguous. Name fallback through `.kata.toml` is
+only allowed per clone when that clone has no usable `project.uid` or
+`project.identity`, and then exactly one case-insensitive `project.name` match
+is required. If no `.kata.toml` mapping matches, the
+resolver may fall back to a case-insensitive exact match between the Kata
+project name and exactly one synced tracked repo matched by current repo
+configuration, whether that configuration entry is exact or globbed, but only
+for repos without readable `.kata.toml` project metadata. Ambiguous, mismatched,
+or missing matches mean the Create/Open
+workspace button must not render
+(`internal/server/kata_workspace.go::resolveKataWorkspaceRepo`).
 
 Persisted workspace `worktree_path` values should be absolute. Workspace setup
 runs `git worktree add` from the managed clone or configured base checkout, so
@@ -86,6 +115,25 @@ API reads interpret them relative to the middleman server process.
 All workspace API timestamps are emitted as UTC RFC3339 strings. Keep timestamp
 normalization in the DB/server boundary; the Svelte UI can present local time
 where needed.
+
+## Agent Launch Context
+
+Agent launch writes rendered workspace context to the target's local
+instruction file (`AGENTS.local.md` for Codex, `CLAUDE.local.md` for Claude).
+It does not write during setup or create a generated worktree directory.
+
+The first-line marker owns refreshes: middleman updates only marked files.
+Unmarked files, symlinks, and root `AGENTS.md`/`CLAUDE.md` stay untouched. The
+content carries source identity (kind, repo, item number, URL) and PR push
+target facts agents cannot read from the worktree. Source-system prose (titles,
+Kata project names) is XML-escaped inside `<untrusted-source-text>` fences —
+the prompt-injection boundary. External identifiers are only normalized to one
+line, which preserves Markdown structure and is not a trust boundary; new
+free-prose fields must go through the fence.
+
+Before writing, middleman ignores the generated path through the worktree's
+private exclude file, not tracked `.gitignore`. If the path would remain
+visible to Git, the write fails.
 
 ## Diff Scopes
 

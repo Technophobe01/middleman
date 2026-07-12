@@ -418,10 +418,10 @@ test.describe("detail action buttons", () => {
     await expect(merge).toBeVisible();
     await expect(close).toBeVisible();
 
-    // All action buttons use the shared action-button base class
+    // All action buttons use the shared kit-button base class
     for (const btn of [approve, merge, close]) {
       const classes = await btn.getAttribute("class");
-      expect(classes).toContain("action-button");
+      expect(classes).toContain("kit-button");
     }
   });
 
@@ -435,7 +435,7 @@ test.describe("detail action buttons", () => {
       await expect(page.locator(".pull-detail")).toBeVisible();
 
       await page.locator(".btn--merge").first().click();
-      const modal = page.locator(".modal", { hasText: "Merge Pull Request" });
+      const modal = page.getByRole("dialog", { name: "Merge Pull Request" });
       await expect(modal).toBeVisible();
 
       const deferResponse = page.waitForResponse((response) => {
@@ -450,6 +450,33 @@ test.describe("detail action buttons", () => {
 
       await expect(modal).toHaveCount(0);
       await expect(page.locator(".pull-detail")).toBeVisible();
+
+      // While the background merge waits on CI, the merge action reads as
+      // queued. It stays clickable so the user can force an immediate
+      // merge, but a second deferred queue is not offered (it would 409).
+      const queued = page.getByRole("button", { name: "Merge queued" });
+      await expect(queued).toBeVisible();
+      await expect(queued).toBeEnabled();
+      await queued.click();
+      const reopened = page.getByRole("dialog", { name: "Merge Pull Request" });
+      await expect(reopened).toBeVisible();
+      await expect(reopened.getByRole("button", { name: "Merge after CI is complete" })).toHaveCount(0);
+
+      // Completing the immediate merge from the queued state must go
+      // through the real /merge endpoint, supersede the queued worker,
+      // and land the merged state in the UI.
+      const mergeResponse = page.waitForResponse((response) => {
+        const url = new URL(response.url());
+        return response.request().method() === "POST" && url.pathname === "/api/v1/pulls/github/acme/widgets/1/merge";
+      });
+      await reopened.getByRole("button", { name: "Squash and merge" }).click();
+      expect((await mergeResponse).status()).toBe(200);
+      await expect(reopened).toHaveCount(0);
+
+      // The merged PR has no merge action at all — queued or otherwise —
+      // and the detail header reflects the merged state.
+      await expect(page.locator(".btn--merge")).toHaveCount(0);
+      await expect(page.locator(".pull-detail").getByText("Merged", { exact: true }).first()).toBeVisible();
     } finally {
       await isolatedServer?.stop();
     }
@@ -474,7 +501,7 @@ test.describe("detail action buttons", () => {
       await expect(page.locator(".pull-detail")).toBeVisible();
 
       await page.locator(".btn--merge").first().click();
-      const modal = page.locator(".modal", { hasText: "Merge Pull Request" });
+      const modal = page.getByRole("dialog", { name: "Merge Pull Request" });
       await expect(modal).toBeVisible();
       await expect(modal.getByRole("button", { name: "Merge after CI is complete" })).toBeVisible();
 
@@ -505,7 +532,7 @@ test.describe("detail action buttons", () => {
       await expect(page.locator(".pull-detail")).toBeVisible();
 
       await page.locator(".btn--merge").first().click();
-      const modal = page.locator(".modal", { hasText: "Merge Pull Request" });
+      const modal = page.getByRole("dialog", { name: "Merge Pull Request" });
       await expect(modal).toBeVisible();
 
       const deferResponse = page.waitForResponse((response) => {
@@ -555,7 +582,7 @@ test.describe("detail action buttons", () => {
       await expect(merge).toHaveAttribute("title", "You do not have permission to merge in this repository");
       // Clicking a disabled merge button must not open the merge modal.
       await merge.click({ force: true });
-      await expect(page.locator(".modal-title", { hasText: "Merge Pull Request" })).toHaveCount(0);
+      await expect(page.getByRole("dialog", { name: "Merge Pull Request" })).toHaveCount(0);
     } finally {
       await isolatedServer?.stop();
     }
@@ -575,7 +602,7 @@ test.describe("detail action buttons", () => {
       const merge = page.locator(".btn--merge").first();
       await expect(merge).toBeDisabled();
       await merge.click({ force: true });
-      await expect(page.locator(".modal-title", { hasText: "Merge Pull Request" })).toHaveCount(0);
+      await expect(page.getByRole("dialog", { name: "Merge Pull Request" })).toHaveCount(0);
     } finally {
       await isolatedServer?.stop();
     }

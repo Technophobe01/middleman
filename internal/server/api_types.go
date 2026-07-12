@@ -16,32 +16,33 @@ type worktreeLinkResponse struct {
 }
 
 type providerCapabilitiesResponse struct {
-	ReadRepositories       bool     `json:"read_repositories"`
-	ReadMergeRequests      bool     `json:"read_merge_requests"`
-	ReadIssues             bool     `json:"read_issues"`
-	ReadComments           bool     `json:"read_comments"`
-	ReadReleases           bool     `json:"read_releases"`
-	ReadCI                 bool     `json:"read_ci"`
-	ReadLabels             bool     `json:"read_labels"`
-	CommentMutation        bool     `json:"comment_mutation"`
-	StateMutation          bool     `json:"state_mutation"`
-	MergeMutation          bool     `json:"merge_mutation"`
-	ReviewMutation         bool     `json:"review_mutation"`
-	WorkflowApproval       bool     `json:"workflow_approval"`
-	ReadyForReview         bool     `json:"ready_for_review"`
-	DraftMutation          bool     `json:"draft_mutation"`
-	IssueMutation          bool     `json:"issue_mutation"`
-	LabelMutation          bool     `json:"label_mutation"`
-	AssigneeMutation       bool     `json:"assignee_mutation"`
-	ReviewerMutation       bool     `json:"reviewer_mutation"`
-	ThreadReply            bool     `json:"thread_reply"`
-	ThreadResolve          bool     `json:"thread_resolve"`
-	ReviewDraftMutation    bool     `json:"review_draft_mutation"`
-	ReviewThreadResolution bool     `json:"review_thread_resolution"`
-	ReadReviewThreads      bool     `json:"read_review_threads"`
-	NativeMultilineRanges  bool     `json:"native_multiline_ranges"`
-	MutationHeadBinding    bool     `json:"mutation_head_binding"`
-	SupportedReviewActions []string `json:"supported_review_actions"`
+	ReadRepositories            bool     `json:"read_repositories"`
+	ReadMergeRequests           bool     `json:"read_merge_requests"`
+	ReadIssues                  bool     `json:"read_issues"`
+	ReadComments                bool     `json:"read_comments"`
+	ReadReleases                bool     `json:"read_releases"`
+	ReadCI                      bool     `json:"read_ci"`
+	ReadLabels                  bool     `json:"read_labels"`
+	CommentMutation             bool     `json:"comment_mutation"`
+	StateMutation               bool     `json:"state_mutation"`
+	MergeMutation               bool     `json:"merge_mutation"`
+	ReviewMutation              bool     `json:"review_mutation"`
+	WorkflowApproval            bool     `json:"workflow_approval"`
+	ReadyForReview              bool     `json:"ready_for_review"`
+	DraftMutation               bool     `json:"draft_mutation"`
+	IssueMutation               bool     `json:"issue_mutation"`
+	LabelMutation               bool     `json:"label_mutation"`
+	AssigneeMutation            bool     `json:"assignee_mutation"`
+	ReviewerMutation            bool     `json:"reviewer_mutation"`
+	ThreadReply                 bool     `json:"thread_reply"`
+	ThreadResolve               bool     `json:"thread_resolve"`
+	ReviewDraftMutation         bool     `json:"review_draft_mutation"`
+	ReviewThreadResolution      bool     `json:"review_thread_resolution"`
+	ReviewSuggestionApplication bool     `json:"review_suggestion_application"`
+	ReadReviewThreads           bool     `json:"read_review_threads"`
+	NativeMultilineRanges       bool     `json:"native_multiline_ranges"`
+	MutationHeadBinding         bool     `json:"mutation_head_binding"`
+	SupportedReviewActions      []string `json:"supported_review_actions"`
 }
 
 type repoResponse struct {
@@ -122,9 +123,17 @@ type mergeRequestDetailResponse struct {
 	WorkflowApproval workflowApprovalResponse    `json:"workflow_approval"`
 	Warnings         []string                    `json:"warnings,omitempty"`
 	DetailLoaded     bool                        `json:"detail_loaded"`
-	DetailFetchedAt  string                      `json:"detail_fetched_at,omitempty"`
-	Workspace        *workspaceRef               `json:"workspace,omitempty"`
-	Stack            *stackContextResponse       `json:"stack,omitempty"`
+	// DeferredMergePending reports whether a background "merge after CI"
+	// worker is currently waiting on this pull request in this server
+	// process, so the UI can show the queued state instead of a merge
+	// action.
+	DeferredMergePending bool                  `json:"deferred_merge_pending"`
+	DetailFetchedAt      string                `json:"detail_fetched_at,omitempty"`
+	Workspace            *workspaceRef         `json:"workspace,omitempty"`
+	Stack                *stackContextResponse `json:"stack,omitempty"`
+	// Checks is the merge request's CI checks decoded from its cached
+	// ci_checks_json. Omitted when the merge request has no cached checks.
+	Checks []db.CICheck `json:"checks,omitempty"`
 }
 
 var validKanbanStates = map[string]bool{
@@ -132,6 +141,14 @@ var validKanbanStates = map[string]bool{
 	"reviewing":      true,
 	"waiting":        true,
 	"awaiting_merge": true,
+}
+
+type workflowStateMetaResponse struct {
+	Status        db.KanbanStatus `json:"status" enum:"new,reviewing,waiting,awaiting_merge"`
+	UpdatedAt     string          `json:"updated_at,omitempty" format:"date-time"`
+	UpdatedSource string          `json:"updated_source,omitempty"`
+	UpdatedActor  string          `json:"updated_actor,omitempty"`
+	UpdatedReason string          `json:"updated_reason,omitempty"`
 }
 
 type issueResponse struct {
@@ -146,15 +163,16 @@ type issueResponse struct {
 }
 
 type issueDetailResponse struct {
-	Issue           *db.Issue       `json:"issue"`
-	Events          []db.IssueEvent `json:"events"`
-	Repo            repoRefResponse `json:"repo"`
-	PlatformHost    string          `json:"platform_host"`
-	RepoOwner       string          `json:"repo_owner"`
-	RepoName        string          `json:"repo_name"`
-	DetailLoaded    bool            `json:"detail_loaded"`
-	DetailFetchedAt string          `json:"detail_fetched_at,omitempty"`
-	Workspace       *workspaceRef   `json:"workspace,omitempty"`
+	Issue           *db.Issue                  `json:"issue"`
+	Events          []db.IssueEvent            `json:"events"`
+	Repo            repoRefResponse            `json:"repo"`
+	PlatformHost    string                     `json:"platform_host"`
+	RepoOwner       string                     `json:"repo_owner"`
+	RepoName        string                     `json:"repo_name"`
+	DetailLoaded    bool                       `json:"detail_loaded"`
+	DetailFetchedAt string                     `json:"detail_fetched_at,omitempty"`
+	Workspace       *workspaceRef              `json:"workspace,omitempty"`
+	Workflow        *workflowStateMetaResponse `json:"workflow,omitempty"`
 }
 
 type repoSummaryAuthorResponse struct {
@@ -329,6 +347,10 @@ type diffResponse struct {
 	Stale               bool                `json:"stale"`
 	WhitespaceOnlyCount int                 `json:"whitespace_only_count"`
 	Files               []gitclone.DiffFile `json:"files"`
+	// DiffHeadSHA is the synced PR diff snapshot head this diff was
+	// computed from; clients compare it against platform_head_sha to
+	// detect stale cached diff context. Empty for non-PR diffs.
+	DiffHeadSHA string `json:"diff_head_sha,omitempty" doc:"Synced PR diff snapshot head this diff was computed from. Always set for pull request diffs (the endpoint fails when no snapshot head is synced); empty for commit and workspace diffs. Compare with the pull detail's platform_head_sha to detect stale cached diff context; unrelated to 'stale', which reports clone-refresh staleness."`
 }
 
 type filesResponse struct {

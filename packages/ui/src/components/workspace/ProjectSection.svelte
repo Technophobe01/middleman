@@ -172,7 +172,7 @@
 {#if showMenu}
   <!-- svelte-ignore a11y_no_static_element_interactions -->
   <div
-    class="context-menu"
+    class="context-menu kit-popover-card"
     style="left: {menuX}px; top: {menuY}px"
     oncontextmenu={(e) => e.preventDefault()}
   >
@@ -304,13 +304,9 @@
 
   .context-menu {
     position: fixed;
-    z-index: 1000;
+    z-index: var(--z-popover);
     min-width: 180px;
-    background: var(--bg-surface);
-    border: 1px solid var(--border-default);
-    border-radius: var(--radius-md);
     padding: 4px 0;
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
   }
 
   .menu-item {

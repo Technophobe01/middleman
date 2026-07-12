@@ -15,7 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	gh "github.com/google/go-github/v84/github"
+	gh "github.com/google/go-github/v88/github"
 	"go.kenn.io/middleman/internal/config"
 	"go.kenn.io/middleman/internal/db"
 	"go.kenn.io/middleman/internal/gitclone"
@@ -705,9 +705,23 @@ func NewSyncerWithRegistry(
 }
 
 type gitHubClientProvider struct {
-	host   string
-	client Client
+	host           string
+	client         Client
+	viewerMu       sync.Mutex
+	viewerLogin    string
+	viewerCacheAt  time.Time
+	viewerCacheKey string
 }
+
+type authenticatedViewerLoginClient interface {
+	AuthenticatedViewerLogin(ctx context.Context) (string, error)
+}
+
+type authenticatedViewerCacheKeyClient interface {
+	AuthenticatedViewerCacheKey() string
+}
+
+const authenticatedViewerLoginTTL = time.Minute
 
 type githubLabelClient interface {
 	ListRepoLabels(ctx context.Context, owner, repo string) ([]*gh.Label, error)
@@ -732,7 +746,7 @@ func registryFromGitHubClients(clients map[string]Client) *platform.Registry {
 		if client == nil {
 			continue
 		}
-		provider := gitHubClientProvider{
+		provider := &gitHubClientProvider{
 			host:   canonicalRepoHost(host),
 			client: client,
 		}
@@ -754,44 +768,45 @@ func NewProviderRegistry(
 	return registry, nil
 }
 
-func (p gitHubClientProvider) Platform() platform.Kind {
+func (p *gitHubClientProvider) Platform() platform.Kind {
 	return platform.KindGitHub
 }
 
-func (p gitHubClientProvider) Host() string {
+func (p *gitHubClientProvider) Host() string {
 	return p.host
 }
 
-func (p gitHubClientProvider) Capabilities() platform.Capabilities {
+func (p *gitHubClientProvider) Capabilities() platform.Capabilities {
 	_, labels := p.client.(githubLabelClient)
 	_, assignees := p.client.(githubAssigneeClient)
 	_, reviewers := p.client.(githubReviewerClient)
 	return platform.Capabilities{
-		ReadRepositories:      true,
-		ReadMergeRequests:     true,
-		ReadIssues:            true,
-		ReadComments:          true,
-		ReadReleases:          true,
-		ReadCI:                true,
-		ReadLabels:            labels,
-		ReadNotifications:     true,
-		CommentMutation:       true,
-		StateMutation:         true,
-		MergeMutation:         true,
-		ReviewMutation:        true,
-		MutationHeadBinding:   true,
-		WorkflowApproval:      true,
-		ReadyForReview:        true,
-		DraftMutation:         true,
-		IssueMutation:         true,
-		LabelMutation:         labels,
-		AssigneeMutation:      assignees,
-		ReviewerMutation:      reviewers,
-		NotificationMutation:  true,
-		ThreadReply:           true,
-		ReviewDraftMutation:   true,
-		ReadReviewThreads:     true,
-		NativeMultilineRanges: true,
+		ReadRepositories:            true,
+		ReadMergeRequests:           true,
+		ReadIssues:                  true,
+		ReadComments:                true,
+		ReadReleases:                true,
+		ReadCI:                      true,
+		ReadLabels:                  labels,
+		ReadNotifications:           true,
+		CommentMutation:             true,
+		StateMutation:               true,
+		MergeMutation:               true,
+		ReviewMutation:              true,
+		MutationHeadBinding:         true,
+		WorkflowApproval:            true,
+		ReadyForReview:              true,
+		DraftMutation:               true,
+		IssueMutation:               true,
+		LabelMutation:               labels,
+		AssigneeMutation:            assignees,
+		ReviewerMutation:            reviewers,
+		NotificationMutation:        true,
+		ThreadReply:                 true,
+		ReviewDraftMutation:         true,
+		ReviewSuggestionApplication: true,
+		ReadReviewThreads:           true,
+		NativeMultilineRanges:       true,
 		SupportedReviewActions: []platform.ReviewAction{
 			platform.ReviewActionComment,
 			platform.ReviewActionApprove,
@@ -800,25 +815,89 @@ func (p gitHubClientProvider) Capabilities() platform.Capabilities {
 	}
 }
 
-func (p gitHubClientProvider) GitHubClient() Client {
+func (p *gitHubClientProvider) OperationRateLimitBuckets(
+	operation platform.OperationName,
+) ([]platform.RateLimitBucket, bool) {
+	if operation != platform.OperationApplyReviewSuggestion {
+		return nil, false
+	}
+	return []platform.RateLimitBucket{
+		platform.RateLimitBucketREST,
+		platform.RateLimitBucketGraphQL,
+	}, true
+}
+
+func (p *gitHubClientProvider) GitHubClient() Client {
 	return p.client
 }
 
-func (p gitHubClientProvider) ListNotifications(
+func (p *gitHubClientProvider) ViewerAuthoredMergeRequest(
+	ctx context.Context,
+	mr platform.MergeRequest,
+) (bool, error) {
+	author := strings.TrimSpace(mr.Author)
+	if author == "" {
+		return false, nil
+	}
+	viewer, err := p.authenticatedViewerLogin(ctx)
+	if err != nil {
+		return false, err
+	}
+	return strings.EqualFold(viewer, author), nil
+}
+
+func (p *gitHubClientProvider) authenticatedViewerLogin(ctx context.Context) (string, error) {
+	cacheKey := p.authenticatedViewerCacheKey()
+	now := time.Now()
+	p.viewerMu.Lock()
+	defer p.viewerMu.Unlock()
+	if p.viewerLogin != "" &&
+		p.viewerCacheKey == cacheKey &&
+		now.Sub(p.viewerCacheAt) < authenticatedViewerLoginTTL {
+		return p.viewerLogin, nil
+	}
+
+	client, ok := p.client.(authenticatedViewerLoginClient)
+	if !ok {
+		return "", fmt.Errorf("github client does not resolve authenticated viewer")
+	}
+	login, err := client.AuthenticatedViewerLogin(ctx)
+	if err != nil {
+		return "", err
+	}
+	login = strings.TrimSpace(login)
+	if login == "" {
+		return "", fmt.Errorf("authenticated viewer login is empty")
+	}
+	p.viewerLogin = login
+	p.viewerCacheAt = now
+	p.viewerCacheKey = cacheKey
+	return login, nil
+}
+
+func (p *gitHubClientProvider) authenticatedViewerCacheKey() string {
+	client, ok := p.client.(authenticatedViewerCacheKeyClient)
+	if !ok {
+		return ""
+	}
+	return client.AuthenticatedViewerCacheKey()
+}
+
+func (p *gitHubClientProvider) ListNotifications(
 	ctx context.Context,
 	opts platform.NotificationListOptions,
 ) ([]platform.NotificationThread, bool, error) {
 	return p.client.ListNotifications(ctx, opts)
 }
 
-func (p gitHubClientProvider) MarkNotificationThreadRead(
+func (p *gitHubClientProvider) MarkNotificationThreadRead(
 	ctx context.Context,
 	threadID string,
 ) error {
 	return p.client.MarkNotificationThreadRead(ctx, threadID)
 }
 
-func (p gitHubClientProvider) GetRepository(
+func (p *gitHubClientProvider) GetRepository(
 	ctx context.Context,
 	ref platform.RepoRef,
 ) (platform.Repository, error) {
@@ -871,7 +950,7 @@ func gitHubViewerCanMerge(repo *gh.Repository) *bool {
 	return &canMerge
 }
 
-func (p gitHubClientProvider) ListRepositories(
+func (p *gitHubClientProvider) ListRepositories(
 	ctx context.Context,
 	owner string,
 	_ platform.RepositoryListOptions,
@@ -913,7 +992,7 @@ func (p gitHubClientProvider) ListRepositories(
 	return out, nil
 }
 
-func (p gitHubClientProvider) ListOpenMergeRequests(
+func (p *gitHubClientProvider) ListOpenMergeRequests(
 	ctx context.Context,
 	ref platform.RepoRef,
 ) ([]platform.MergeRequest, error) {
@@ -932,7 +1011,7 @@ func (p gitHubClientProvider) ListOpenMergeRequests(
 	return out, nil
 }
 
-func (p gitHubClientProvider) GetMergeRequest(
+func (p *gitHubClientProvider) GetMergeRequest(
 	ctx context.Context,
 	ref platform.RepoRef,
 	number int,
@@ -941,7 +1020,7 @@ func (p gitHubClientProvider) GetMergeRequest(
 	return mr, err
 }
 
-func (p gitHubClientProvider) GetGitHubPullRequest(
+func (p *gitHubClientProvider) GetGitHubPullRequest(
 	ctx context.Context,
 	ref platform.RepoRef,
 	number int,
@@ -957,7 +1036,7 @@ func (p gitHubClientProvider) GetGitHubPullRequest(
 	return pr, mr, nil
 }
 
-func (p gitHubClientProvider) ListMergeRequestEvents(
+func (p *gitHubClientProvider) ListMergeRequestEvents(
 	ctx context.Context,
 	ref platform.RepoRef,
 	number int,
@@ -1027,7 +1106,7 @@ func (p gitHubClientProvider) ListMergeRequestEvents(
 	return out, nil
 }
 
-func (p gitHubClientProvider) ListOpenIssues(
+func (p *gitHubClientProvider) ListOpenIssues(
 	ctx context.Context,
 	ref platform.RepoRef,
 ) ([]platform.Issue, error) {
@@ -1046,14 +1125,14 @@ func (p gitHubClientProvider) ListOpenIssues(
 	return out, nil
 }
 
-func (p gitHubClientProvider) ListOpenGitHubIssues(
+func (p *gitHubClientProvider) ListOpenGitHubIssues(
 	ctx context.Context,
 	ref platform.RepoRef,
 ) ([]*gh.Issue, error) {
 	return p.client.ListOpenIssues(ctx, ref.Owner, ref.Name)
 }
 
-func (p gitHubClientProvider) ListLabels(
+func (p *gitHubClientProvider) ListLabels(
 	ctx context.Context,
 	ref platform.RepoRef,
 ) (platform.LabelCatalog, error) {
@@ -1068,7 +1147,7 @@ func (p gitHubClientProvider) ListLabels(
 	return platform.LabelCatalog{Labels: platformgithub.NormalizeLabels(ref, labels)}, nil
 }
 
-func (p gitHubClientProvider) GetIssue(
+func (p *gitHubClientProvider) GetIssue(
 	ctx context.Context,
 	ref platform.RepoRef,
 	number int,
@@ -1080,7 +1159,7 @@ func (p gitHubClientProvider) GetIssue(
 	return platformgithub.NormalizeIssue(ref, issue)
 }
 
-func (p gitHubClientProvider) GetGitHubIssue(
+func (p *gitHubClientProvider) GetGitHubIssue(
 	ctx context.Context,
 	ref platform.RepoRef,
 	number int,
@@ -1088,7 +1167,7 @@ func (p gitHubClientProvider) GetGitHubIssue(
 	return p.client.GetIssue(ctx, ref.Owner, ref.Name, number)
 }
 
-func (p gitHubClientProvider) ListIssueEvents(
+func (p *gitHubClientProvider) ListIssueEvents(
 	ctx context.Context,
 	ref platform.RepoRef,
 	number int,
@@ -1137,7 +1216,7 @@ func (p gitHubClientProvider) ListIssueEvents(
 	return out, nil
 }
 
-func (p gitHubClientProvider) CreateMergeRequestComment(
+func (p *gitHubClientProvider) CreateMergeRequestComment(
 	ctx context.Context,
 	ref platform.RepoRef,
 	number int,
@@ -1153,7 +1232,7 @@ func (p gitHubClientProvider) CreateMergeRequestComment(
 	return platformgithub.NormalizeCommentEvent(ref, number, comment), nil
 }
 
-func (p gitHubClientProvider) EditMergeRequestComment(
+func (p *gitHubClientProvider) EditMergeRequestComment(
 	ctx context.Context,
 	ref platform.RepoRef,
 	number int,
@@ -1170,7 +1249,7 @@ func (p gitHubClientProvider) EditMergeRequestComment(
 	return platformgithub.NormalizeCommentEvent(ref, number, comment), nil
 }
 
-func (p gitHubClientProvider) ReplyToThread(
+func (p *gitHubClientProvider) ReplyToThread(
 	ctx context.Context,
 	ref platform.RepoRef,
 	number int,
@@ -1193,7 +1272,7 @@ func (p gitHubClientProvider) ReplyToThread(
 	return platformgithub.NormalizeReviewCommentEvent(ref, number, comment), nil
 }
 
-func (p gitHubClientProvider) CreateIssueComment(
+func (p *gitHubClientProvider) CreateIssueComment(
 	ctx context.Context,
 	ref platform.RepoRef,
 	number int,
@@ -1209,7 +1288,7 @@ func (p gitHubClientProvider) CreateIssueComment(
 	return platformgithub.NormalizeIssueCommentEvent(ref, number, comment), nil
 }
 
-func (p gitHubClientProvider) EditIssueComment(
+func (p *gitHubClientProvider) EditIssueComment(
 	ctx context.Context,
 	ref platform.RepoRef,
 	number int,
@@ -1226,7 +1305,7 @@ func (p gitHubClientProvider) EditIssueComment(
 	return platformgithub.NormalizeIssueCommentEvent(ref, number, comment), nil
 }
 
-func (p gitHubClientProvider) SetMergeRequestState(
+func (p *gitHubClientProvider) SetMergeRequestState(
 	ctx context.Context,
 	ref platform.RepoRef,
 	number int,
@@ -1244,7 +1323,7 @@ func (p gitHubClientProvider) SetMergeRequestState(
 	return platformgithub.NormalizePullRequest(ref, ghPR)
 }
 
-func (p gitHubClientProvider) SetIssueState(
+func (p *gitHubClientProvider) SetIssueState(
 	ctx context.Context,
 	ref platform.RepoRef,
 	number int,
@@ -1263,7 +1342,7 @@ func (p gitHubClientProvider) SetIssueState(
 // MergeMergeRequest passes expectedHeadSHA as the GitHub merge sha
 // parameter: GitHub rejects the merge when the PR head moved past the
 // reviewed commit, and that rejection is classified as stale_state.
-func (p gitHubClientProvider) MergeMergeRequest(
+func (p *gitHubClientProvider) MergeMergeRequest(
 	ctx context.Context,
 	ref platform.RepoRef,
 	number int,
@@ -1312,7 +1391,7 @@ func isGitHubHeadModified(err error) bool {
 	return strings.Contains(strings.ToLower(ghErr.Message), "head branch was modified")
 }
 
-func (p gitHubClientProvider) ApproveWorkflow(
+func (p *gitHubClientProvider) ApproveWorkflow(
 	ctx context.Context,
 	ref platform.RepoRef,
 	runID string,
@@ -1324,7 +1403,7 @@ func (p gitHubClientProvider) ApproveWorkflow(
 	return p.client.ApproveWorkflowRun(ctx, ref.Owner, ref.Name, parsed)
 }
 
-func (p gitHubClientProvider) MarkReadyForReview(
+func (p *gitHubClientProvider) MarkReadyForReview(
 	ctx context.Context,
 	ref platform.RepoRef,
 	number int,
@@ -1339,7 +1418,7 @@ func (p gitHubClientProvider) MarkReadyForReview(
 	return platformgithub.NormalizePullRequest(ref, pr)
 }
 
-func (p gitHubClientProvider) ConvertMergeRequestToDraft(
+func (p *gitHubClientProvider) ConvertMergeRequestToDraft(
 	ctx context.Context,
 	ref platform.RepoRef,
 	number int,
@@ -1354,7 +1433,7 @@ func (p gitHubClientProvider) ConvertMergeRequestToDraft(
 	return nil
 }
 
-func (p gitHubClientProvider) CreateIssue(
+func (p *gitHubClientProvider) CreateIssue(
 	ctx context.Context,
 	ref platform.RepoRef,
 	title string,
@@ -1370,7 +1449,7 @@ func (p gitHubClientProvider) CreateIssue(
 	return platformgithub.NormalizeIssue(ref, issue)
 }
 
-func (p gitHubClientProvider) SetMergeRequestLabels(
+func (p *gitHubClientProvider) SetMergeRequestLabels(
 	ctx context.Context,
 	ref platform.RepoRef,
 	number int,
@@ -1379,7 +1458,7 @@ func (p gitHubClientProvider) SetMergeRequestLabels(
 	return p.setIssueLikeLabels(ctx, ref, number, names)
 }
 
-func (p gitHubClientProvider) SetIssueLabels(
+func (p *gitHubClientProvider) SetIssueLabels(
 	ctx context.Context,
 	ref platform.RepoRef,
 	number int,
@@ -1388,7 +1467,7 @@ func (p gitHubClientProvider) SetIssueLabels(
 	return p.setIssueLikeLabels(ctx, ref, number, names)
 }
 
-func (p gitHubClientProvider) setIssueLikeLabels(
+func (p *gitHubClientProvider) setIssueLikeLabels(
 	ctx context.Context,
 	ref platform.RepoRef,
 	number int,
@@ -1405,7 +1484,7 @@ func (p gitHubClientProvider) setIssueLikeLabels(
 	return platformgithub.NormalizeLabels(ref, labels), nil
 }
 
-func (p gitHubClientProvider) SetMergeRequestAssignees(
+func (p *gitHubClientProvider) SetMergeRequestAssignees(
 	ctx context.Context,
 	ref platform.RepoRef,
 	number int,
@@ -1414,7 +1493,7 @@ func (p gitHubClientProvider) SetMergeRequestAssignees(
 	return p.setIssueLikeAssignees(ctx, ref, number, usernames)
 }
 
-func (p gitHubClientProvider) SetIssueAssignees(
+func (p *gitHubClientProvider) SetIssueAssignees(
 	ctx context.Context,
 	ref platform.RepoRef,
 	number int,
@@ -1423,7 +1502,7 @@ func (p gitHubClientProvider) SetIssueAssignees(
 	return p.setIssueLikeAssignees(ctx, ref, number, usernames)
 }
 
-func (p gitHubClientProvider) setIssueLikeAssignees(
+func (p *gitHubClientProvider) setIssueLikeAssignees(
 	ctx context.Context,
 	ref platform.RepoRef,
 	number int,
@@ -1449,7 +1528,7 @@ func (p gitHubClientProvider) setIssueLikeAssignees(
 	return assignees, nil
 }
 
-func (p gitHubClientProvider) RequestMergeRequestReviewers(
+func (p *gitHubClientProvider) RequestMergeRequestReviewers(
 	ctx context.Context,
 	ref platform.RepoRef,
 	number int,
@@ -1481,7 +1560,7 @@ func (p gitHubClientProvider) RequestMergeRequestReviewers(
 	return githubRequestedReviewerLogins(pr), nil
 }
 
-func (p gitHubClientProvider) RemoveMergeRequestReviewers(
+func (p *gitHubClientProvider) RemoveMergeRequestReviewers(
 	ctx context.Context,
 	ref platform.RepoRef,
 	number int,
@@ -1516,7 +1595,7 @@ func githubRequestedReviewerLogins(pr *gh.PullRequest) []string {
 	return logins
 }
 
-func (p gitHubClientProvider) ApproveMergeRequest(
+func (p *gitHubClientProvider) ApproveMergeRequest(
 	ctx context.Context,
 	ref platform.RepoRef,
 	number int,
@@ -1542,7 +1621,7 @@ func (p gitHubClientProvider) ApproveMergeRequest(
 	return platformgithub.NormalizeReviewEvent(ref, number, review), nil
 }
 
-func (p gitHubClientProvider) ListMergeRequestReviewThreads(
+func (p *gitHubClientProvider) ListMergeRequestReviewThreads(
 	ctx context.Context,
 	ref platform.RepoRef,
 	number int,
@@ -1615,10 +1694,6 @@ func githubReviewLineRange(
 		newLine = &line
 	}
 	commitSHA := firstNonEmpty(comment.CommitID, comment.OriginalCommitID)
-	diffHeadSHA := ""
-	if thread.IsOutdated {
-		diffHeadSHA = commitSHA
-	}
 	return platform.DiffReviewLineRange{
 		Path:        firstNonEmpty(thread.Path, comment.Path),
 		Side:        side,
@@ -1628,7 +1703,7 @@ func githubReviewLineRange(
 		OldLine:     oldLine,
 		NewLine:     newLine,
 		LineType:    lineType,
-		DiffHeadSHA: diffHeadSHA,
+		DiffHeadSHA: commitSHA,
 		CommitSHA:   commitSHA,
 	}
 }
@@ -1665,7 +1740,7 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-func (p gitHubClientProvider) PublishDiffReviewDraft(
+func (p *gitHubClientProvider) PublishDiffReviewDraft(
 	ctx context.Context,
 	ref platform.RepoRef,
 	number int,
@@ -1701,6 +1776,15 @@ func (p gitHubClientProvider) PublishDiffReviewDraft(
 		ProviderReviewID: strconv.FormatInt(review.GetID(), 10),
 		SubmittedAt:      submittedAt.Time,
 	}, nil
+}
+
+func (p *gitHubClientProvider) ApplyReviewSuggestions(
+	ctx context.Context,
+	ref platform.RepoRef,
+	number int,
+	input platform.ApplyReviewSuggestionsInput,
+) (*platform.AppliedReviewSuggestions, error) {
+	return p.client.ApplyReviewSuggestions(ctx, ref.Owner, ref.Name, number, input)
 }
 
 func githubReviewEvent(action platform.ReviewAction) (string, error) {
@@ -1748,7 +1832,7 @@ func githubDraftReviewComment(comment platform.LocalDiffReviewDraftComment) *gh.
 	return next
 }
 
-func (p gitHubClientProvider) EditMergeRequestContent(
+func (p *gitHubClientProvider) EditMergeRequestContent(
 	ctx context.Context,
 	ref platform.RepoRef,
 	number int,
@@ -1767,7 +1851,7 @@ func (p gitHubClientProvider) EditMergeRequestContent(
 	return platformgithub.NormalizePullRequest(ref, pr)
 }
 
-func (p gitHubClientProvider) EditIssueContent(
+func (p *gitHubClientProvider) EditIssueContent(
 	ctx context.Context,
 	ref platform.RepoRef,
 	number int,
@@ -2229,6 +2313,13 @@ func (s *Syncer) DiffReviewDraftMutator(
 	host string,
 ) (platform.DiffReviewDraftMutator, error) {
 	return s.clients.DiffReviewDraftMutator(kind, canonicalRepoHost(host))
+}
+
+func (s *Syncer) ReviewSuggestionApplier(
+	kind platform.Kind,
+	host string,
+) (platform.ReviewSuggestionApplier, error) {
+	return s.clients.ReviewSuggestionApplier(kind, canonicalRepoHost(host))
 }
 
 func (s *Syncer) DiffReviewThreadResolver(
@@ -4485,6 +4576,9 @@ func (s *Syncer) indexUpsertMergeRequest(
 	if err := s.replaceMergeRequestLabels(ctx, repoID, mrID, normalized.Labels); err != nil {
 		return fmt.Errorf("persist labels for MR #%d: %w", mr.Number, err)
 	}
+	if _, err := s.persistMergedActorEvent(ctx, mrID, mr.MergedBy, normalized.MergedAt); err != nil {
+		return fmt.Errorf("persist merged lifecycle event for MR #%d: %w", mr.Number, err)
+	}
 
 	if err := s.db.EnsureKanbanState(ctx, mrID); err != nil {
 		return fmt.Errorf(
@@ -4591,6 +4685,9 @@ func (s *Syncer) indexUpsertMR(
 	}
 	if err := s.replaceMergeRequestLabels(ctx, repoID, mrID, normalized.Labels); err != nil {
 		return fmt.Errorf("persist labels for MR #%d: %w", ghPR.GetNumber(), err)
+	}
+	if _, err := s.persistMergedTransitionEvent(ctx, mrID, ghPR, normalized.MergedAt); err != nil {
+		return fmt.Errorf("persist merged lifecycle event for MR #%d: %w", ghPR.GetNumber(), err)
 	}
 
 	if err := s.db.EnsureKanbanState(ctx, mrID); err != nil {
@@ -5208,6 +5305,10 @@ func (s *Syncer) syncOpenMRFromBulk(
 			events = append(events, *event)
 		}
 	}
+	events, err = s.filterDuplicateMergedLifecycleEvents(ctx, mrID, events)
+	if err != nil {
+		return fmt.Errorf("dedupe merged lifecycle events for MR #%d: %w", number, err)
+	}
 	if bulk.CommentsComplete {
 		if err := s.replacePRCommentEvents(ctx, mrID, bulk.Comments); err != nil {
 			return fmt.Errorf(
@@ -5219,6 +5320,9 @@ func (s *Syncer) syncOpenMRFromBulk(
 		return fmt.Errorf(
 			"upsert events for MR #%d: %w", number, err,
 		)
+	}
+	if _, err := s.persistMergedTransitionEvent(ctx, mrID, bulk.PR, normalized.MergedAt); err != nil {
+		return fmt.Errorf("persist merged lifecycle event for MR #%d: %w", number, err)
 	}
 
 	// CI status — only write if complete (don't write
@@ -5249,7 +5353,7 @@ func (s *Syncer) syncOpenMRFromBulk(
 	// a full REST fetch. Derived fields from truncated data would
 	// overwrite correct values with partial counts.
 	if bulk.CommentsComplete {
-		lastActivity := computeLastActivity(bulk.PR, bulk.Comments, nil, nil)
+		lastActivity := computeLastActivity(bulk.PR, bulk.Comments, nil, nil, nil)
 		// When reviews/commits are truncated this cycle, any stored
 		// review/commit/force-push event with a newer timestamp must
 		// still win so the dashboard ordering doesn't regress.
@@ -5284,7 +5388,7 @@ func (s *Syncer) syncOpenMRFromBulk(
 	if allComplete {
 		reviewDecision := DeriveReviewDecision(bulk.Reviews)
 		lastActivity := computeLastActivity(
-			bulk.PR, bulk.Comments, bulk.Reviews, bulk.Commits,
+			bulk.PR, bulk.Comments, bulk.Reviews, bulk.Commits, bulk.TimelineEvents,
 		)
 		if err := s.db.UpdateMRDerivedFields(
 			ctx, repoID, number, db.MRDerivedFields{
@@ -5509,6 +5613,9 @@ func (s *Syncer) fetchMRDetail(
 		return calls, err
 	}
 	calls += 4
+	if _, err := s.persistMergedTransitionEvent(ctx, mrID, fullPR, normalized.MergedAt); err != nil {
+		return calls, fmt.Errorf("persist merged lifecycle event for MR #%d: %w", number, err)
+	}
 
 	ciHeadSHA := ""
 	if fullPR.GetHead() != nil {
@@ -5700,6 +5807,9 @@ func (s *Syncer) fetchProviderMRDetail(
 	if err != nil {
 		return calls, err
 	}
+	if _, err := s.persistMergedActorEvent(ctx, mrID, mr.MergedBy, normalized.MergedAt); err != nil {
+		return calls, fmt.Errorf("persist merged lifecycle event for MR #%d: %w", number, err)
+	}
 
 	if err := s.updateMRDetailFetchedByRepoID(ctx, repoID, number, pending); err != nil {
 		return calls, fmt.Errorf("mark detail fetched for MR #%d: %w", number, err)
@@ -5756,6 +5866,10 @@ func (s *Syncer) syncProviderMRDetailExtras(
 		}
 		if err := s.db.DeleteMissingMRCommentEvents(ctx, mrID, commentDedupeKeys); err != nil {
 			return calls, false, fmt.Errorf("delete missing comment events for MR #%d: %w", number, err)
+		}
+		dbEvents, err = s.filterDuplicateMergedLifecycleEvents(ctx, mrID, dbEvents)
+		if err != nil {
+			return calls, false, fmt.Errorf("dedupe merged lifecycle events for MR #%d: %w", number, err)
 		}
 		if err := s.db.UpsertMREvents(ctx, dbEvents); err != nil {
 			return calls, false, fmt.Errorf("upsert events for MR #%d: %w", number, err)
@@ -6143,6 +6257,7 @@ func (s *Syncer) refreshTimeline(
 		return fmt.Errorf("list commits for MR #%d: %w", number, err)
 	}
 
+	timelineEventsFetched := true
 	timelineEvents, err := client.ListPullRequestTimelineEvents(ctx, repo.Owner, repo.Name, number)
 	if err != nil {
 		slog.Warn("timeline event fetch failed during timeline refresh",
@@ -6150,6 +6265,7 @@ func (s *Syncer) refreshTimeline(
 			"number", number,
 			"err", err,
 		)
+		timelineEventsFetched = false
 		timelineEvents = nil
 	}
 
@@ -6176,6 +6292,10 @@ func (s *Syncer) refreshTimeline(
 		}
 		events = append(events, *event)
 	}
+	events, err = s.filterDuplicateMergedLifecycleEvents(ctx, mrID, events)
+	if err != nil {
+		return fmt.Errorf("dedupe merged lifecycle events for MR #%d: %w", number, err)
+	}
 
 	if err := s.replacePRCommentEvents(ctx, mrID, comments); err != nil {
 		return fmt.Errorf("replace comment events for MR #%d: %w", number, err)
@@ -6188,7 +6308,16 @@ func (s *Syncer) refreshTimeline(
 	}
 
 	reviewDecision := DeriveReviewDecision(reviews)
-	lastActivityAt := computeLastActivity(ghPR, comments, reviews, commits)
+	lastActivityAt := computeLastActivity(ghPR, comments, reviews, commits, timelineEvents)
+	if !timelineEventsFetched {
+		nonCommentLatest, err := s.db.GetMRLatestNonCommentEventTime(ctx, mrID)
+		if err != nil {
+			return fmt.Errorf("load stored non-comment activity for MR #%d: %w", number, err)
+		}
+		if nonCommentLatest.After(lastActivityAt) {
+			lastActivityAt = nonCommentLatest
+		}
+	}
 
 	return s.db.UpdateMRDerivedFields(ctx, repoID, number, db.MRDerivedFields{
 		ReviewDecision: reviewDecision,
@@ -6443,6 +6572,7 @@ func computeLastActivity(
 	comments []*gh.IssueComment,
 	reviews []*gh.PullRequestReview,
 	commits []*gh.RepositoryCommit,
+	timelineEvents []PullRequestTimelineEvent,
 ) time.Time {
 	latest := time.Time{}
 	if ghPR.UpdatedAt != nil {
@@ -6464,6 +6594,11 @@ func computeLastActivity(
 			c.GetCommit().Author.Date != nil &&
 			c.GetCommit().Author.Date.After(latest) {
 			latest = c.GetCommit().Author.Date.Time
+		}
+	}
+	for _, event := range timelineEvents {
+		if event.CreatedAt.After(latest) {
+			latest = event.CreatedAt
 		}
 	}
 	return latest
@@ -7724,6 +7859,7 @@ func (s *Syncer) syncMRForRepo(
 	}
 
 	var ghPR *gh.PullRequest
+	var platformMR platform.MergeRequest
 	var normalized *db.MergeRequest
 	var newETag string
 	if rawReader, ok := mrReader.(interface {
@@ -7747,14 +7883,12 @@ func (s *Syncer) syncMRForRepo(
 				normalized, err = NormalizePR(repoID, ghPR)
 			}
 		} else {
-			var platformMR platform.MergeRequest
 			ghPR, platformMR, err = rawReader.GetGitHubPullRequest(ctx, platformRepoRef(repo), number)
 			if err == nil {
 				normalized = platform.DBMergeRequest(repoID, platformMR)
 			}
 		}
 	} else {
-		var platformMR platform.MergeRequest
 		platformMR, err = mrReader.GetMergeRequest(ctx, platformRepoRef(repo), number)
 		if err == nil {
 			normalized = platform.DBMergeRequest(repoID, platformMR)
@@ -7838,6 +7972,9 @@ func (s *Syncer) syncMRForRepo(
 		if err := s.refreshTimeline(ctx, repo, repoID, mrID, ghPR); err != nil {
 			return fmt.Errorf("refresh timeline for MR #%d: %w", number, err)
 		}
+		if _, err := s.persistMergedTransitionEvent(ctx, mrID, ghPR, normalized.MergedAt); err != nil {
+			return fmt.Errorf("persist merged lifecycle event for MR #%d: %w", number, err)
+		}
 
 		syncMRHeadSHA := ""
 		if ghPR.GetHead() != nil {
@@ -7877,6 +8014,9 @@ func (s *Syncer) syncMRForRepo(
 		)
 		if err != nil {
 			return err
+		}
+		if _, err := s.persistMergedActorEvent(ctx, mrID, platformMR.MergedBy, normalized.MergedAt); err != nil {
+			return fmt.Errorf("persist merged lifecycle event for MR #%d: %w", number, err)
 		}
 		if err := s.updateMRDetailFetchedByRepoID(ctx, repoID, number, pending); err != nil {
 			return fmt.Errorf("mark detail fetched for MR #%d: %w", number, err)
@@ -8313,6 +8453,9 @@ func (s *Syncer) fetchAndUpdateClosed(ctx context.Context, repo RepoRef, repoID 
 		return fmt.Errorf("get closed MR #%d for labels: %w", number, err)
 	}
 	if mr != nil {
+		if _, err := s.persistMergedTransitionEvent(ctx, mr.ID, ghPR, mergedAt); err != nil {
+			return fmt.Errorf("persist merged lifecycle event for MR #%d: %w", number, err)
+		}
 		normalized, err := NormalizePR(repoID, ghPR)
 		if err != nil {
 			return fmt.Errorf("normalize closed PR #%d: %w", number, err)
@@ -8364,6 +8507,99 @@ func (s *Syncer) fetchAndUpdateClosed(ctx context.Context, repo RepoRef, repoID 
 	return s.markClosedLinkedNotificationsDone(ctx)
 }
 
+func (s *Syncer) filterDuplicateMergedLifecycleEvents(
+	ctx context.Context,
+	mrID int64,
+	events []db.MREvent,
+) ([]db.MREvent, error) {
+	if !slices.ContainsFunc(events, isAuthoredMergedLifecycleEvent) {
+		return events, nil
+	}
+	existing, err := s.db.ListMREvents(ctx, mrID)
+	if err != nil {
+		return nil, err
+	}
+	out := events[:0]
+	for _, event := range events {
+		if isAuthoredMergedLifecycleEvent(event) &&
+			authoredMergedLifecycleEventExists(existing) {
+			continue
+		}
+		out = append(out, event)
+	}
+	return out, nil
+}
+
+func (s *Syncer) authoredMergedLifecycleEventExists(
+	ctx context.Context,
+	mrID int64,
+) (bool, error) {
+	events, err := s.db.ListMREvents(ctx, mrID)
+	if err != nil {
+		return false, err
+	}
+	return authoredMergedLifecycleEventExists(events), nil
+}
+
+func authoredMergedLifecycleEventExists(events []db.MREvent) bool {
+	return slices.ContainsFunc(events, isAuthoredMergedLifecycleEvent)
+}
+
+func isAuthoredMergedLifecycleEvent(event db.MREvent) bool {
+	return event.EventType == "merged" &&
+		strings.TrimSpace(event.Author) != ""
+}
+
+func (s *Syncer) persistMergedTransitionEvent(
+	ctx context.Context,
+	mrID int64,
+	ghPR *gh.PullRequest,
+	mergedAt *time.Time,
+) (bool, error) {
+	if ghPR == nil || mergedAt == nil {
+		return false, nil
+	}
+	mergedBy := ghPR.GetMergedBy()
+	if mergedBy == nil {
+		return false, nil
+	}
+	return s.persistMergedActorEvent(ctx, mrID, mergedBy.GetLogin(), mergedAt)
+}
+
+func (s *Syncer) persistMergedActorEvent(
+	ctx context.Context,
+	mrID int64,
+	actor string,
+	mergedAt *time.Time,
+) (bool, error) {
+	if mergedAt == nil {
+		return false, nil
+	}
+	actor = strings.TrimSpace(actor)
+	if actor == "" {
+		return false, nil
+	}
+	exists, err := s.authoredMergedLifecycleEventExists(ctx, mrID)
+	if err != nil {
+		return false, err
+	}
+	if exists {
+		return false, nil
+	}
+	event := NormalizeTimelineEvent(mrID, PullRequestTimelineEvent{
+		EventType: "merged",
+		Actor:     actor,
+		CreatedAt: *mergedAt,
+	})
+	if event == nil {
+		return false, nil
+	}
+	if err := s.db.UpsertMREvents(ctx, []db.MREvent{*event}); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (s *Syncer) fetchAndUpdateClosedMergeRequest(
 	ctx context.Context,
 	reader platform.MergeRequestReader,
@@ -8389,6 +8625,9 @@ func (s *Syncer) fetchAndUpdateClosedMergeRequest(
 	}
 	if err := s.replaceMergeRequestLabels(ctx, repoID, mrID, normalized.Labels); err != nil {
 		return fmt.Errorf("persist labels for closed MR #%d: %w", number, err)
+	}
+	if _, err := s.persistMergedActorEvent(ctx, mrID, mr.MergedBy, normalized.MergedAt); err != nil {
+		return fmt.Errorf("persist merged lifecycle event for closed MR #%d: %w", number, err)
 	}
 	return nil
 }

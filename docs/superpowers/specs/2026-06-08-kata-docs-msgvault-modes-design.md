@@ -310,9 +310,30 @@ Header/navigation changes:
 Kata frontend adaptation:
 
 - Keep the existing task workspace behavior and daemon switcher semantics.
+- Treat task lists as trees: a row stays out of the top-level projection only
+  when its parent is present in the same result set (so it can fold under that
+  ancestor once expanded). A child whose parent is absent — e.g. a search or
+  filter that matches the child but not the parent — must still render and be
+  selectable as its own top-level row instead of being dropped; otherwise the
+  header counts it while the list shows "No tasks". Recursive row rendering must
+  support nested subtasks beyond one level
+  (`frontend/src/lib/components/kata/KataIssueList.svelte::topLevelIssues`,
+  `frontend/src/lib/components/kata/KataIssueList.svelte::row`,
+  `frontend/src/lib/stores/kata-workspace.svelte.ts::selectableViewIssues`).
+- Task-list header controls should expand every visible task tree recursively
+  through the task-detail API, and collapse should hide cached descendants
+  without reintroducing them as top-level flat rows.
 - Replace direct daemon URL/localStorage bootstrap with calls to middleman's
   Kata daemon roster and proxy.
 - Use a middleman-owned selector header for proxied daemon requests.
+- The reachable-task graph is an alternate task-list pane, not detail content:
+  launch it from a row or task detail action, load the REACHABLE graph from
+  Kata's native daemon graph endpoint, and route graph node clicks through
+  the existing task selection/detail path
+  (`frontend/src/lib/features/kata/KataWorkspace.svelte`,
+  `frontend/src/lib/features/kata/KataReachableGraph.svelte`,
+  `frontend/src/lib/features/kata/kataReachableGraph.ts`; detailed design:
+  `docs/superpowers/specs/2026-06-29-kata-reachable-graph-design.md`).
 - Keep isolated-daemon e2e harness safeguards.
 
 Docs frontend adaptation:

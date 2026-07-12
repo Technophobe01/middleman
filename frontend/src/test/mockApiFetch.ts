@@ -29,6 +29,7 @@ const defaultProviderCapabilities = {
   issue_mutation: true,
   review_draft_mutation: false,
   review_thread_resolution: false,
+  review_suggestion_application: false,
   read_review_threads: false,
   native_multiline_ranges: false,
   mutation_head_binding: false,
@@ -42,6 +43,7 @@ const defaultOperationAvailability = { available: true };
 const defaultRepoOperations = {
   add_comment: defaultOperationAvailability,
   add_label: defaultOperationAvailability,
+  apply_review_suggestion: defaultOperationAvailability,
   approve_workflow: defaultOperationAvailability,
   close_issue: defaultOperationAvailability,
   close_pr: defaultOperationAvailability,
@@ -402,6 +404,7 @@ function pullDetailResponse(pr: (typeof pulls)[number]) {
     reviewed_head_sha: pr.platform_head_sha ?? "",
     detail_loaded: true,
     detail_fetched_at: "2026-03-30T14:00:00Z",
+    deferred_merge_pending: false,
     worktree_links: pr.worktree_links,
   };
 }

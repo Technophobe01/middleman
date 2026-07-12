@@ -1,5 +1,7 @@
 <script lang="ts">
+  import { EmptyState } from "@kenn-io/kit-ui";
   import { getStores } from "../../context.js";
+  import { isPanelParent } from "../../utils/roborev-panel.js";
   import JobRow from "./JobRow.svelte";
 
   const stores = getStores();
@@ -84,12 +86,66 @@
     <tbody>
       {#if jobsStore}
         {#each jobsStore.getJobs() as job (job.id)}
+          {@const runUuid = job.panel_run_uuid ?? undefined}
+          {@const expandable = isPanelParent(job) && runUuid !== undefined}
+          {@const expanded =
+            expandable &&
+            runUuid !== undefined &&
+            jobsStore.isPanelExpanded(runUuid)}
+          {@const members =
+            runUuid !== undefined
+              ? jobsStore.getPanelMembers(runUuid)
+              : undefined}
+          {@const memberError =
+            runUuid !== undefined
+              ? jobsStore.getPanelMemberError(runUuid)
+              : undefined}
           <JobRow
             {job}
+            {members}
+            {expandable}
+            {expanded}
             selected={jobsStore.getSelectedJobId() === job.id}
             highlighted={jobsStore.getHighlightedJobId() === job.id}
             onclick={() => jobsStore.selectJob(job.id)}
+            ontoggle={() => jobsStore.togglePanel(job)}
           />
+          {#if expanded && runUuid !== undefined}
+            {#if jobsStore.isLoadingMembers(runUuid) && members === undefined}
+              <tr class="members-status-row">
+                <td colspan={columns.length}>Loading reviewers…</td>
+              </tr>
+            {:else}
+              {#each members ?? [] as panelMember, i (panelMember.id)}
+                <JobRow
+                  job={panelMember}
+                  member
+                  selected={jobsStore.getSelectedJobId() === panelMember.id}
+                  highlighted={jobsStore.getHighlightedJobId() === panelMember.id}
+                  onclick={() => jobsStore.selectJob(panelMember.id)}
+                />
+              {/each}
+              {#if jobsStore.isLoadingMembers(runUuid)}
+                <tr class="members-status-row">
+                  <td colspan={columns.length}>Refreshing reviewers…</td>
+                </tr>
+              {/if}
+              {#if memberError}
+                <tr class="members-status-row error">
+                  <td colspan={columns.length}>
+                    Could not refresh reviewers.
+                    <button
+                      type="button"
+                      class="members-retry"
+                      onclick={() => jobsStore.refreshPanelMembers(runUuid)}
+                    >
+                      Retry
+                    </button>
+                  </td>
+                </tr>
+              {/if}
+            {/if}
+          {/if}
         {/each}
       {/if}
     </tbody>
@@ -106,7 +162,7 @@
   {/if}
 
   {#if jobsStore && !jobsStore.isLoading() && jobsStore.getJobs().length === 0}
-    <div class="empty-state">No jobs found</div>
+    <EmptyState title="No jobs found" />
   {/if}
 
   {#if jobsStore?.getHasMore()}
@@ -182,11 +238,26 @@
     color: var(--accent-red);
   }
 
-  .empty-state {
-    padding: 32px;
-    text-align: center;
-    font-size: var(--font-size-md);
+  .members-status-row td {
+    padding: 6px 10px 6px 34px;
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
+    background: var(--bg-inset);
+  }
+
+  .members-status-row.error td {
+    color: var(--accent-red);
+  }
+
+  .members-retry {
+    margin-left: 8px;
+    border: 0;
+    padding: 0;
+    background: transparent;
+    color: var(--text-primary);
+    font: inherit;
+    text-decoration: underline;
+    cursor: pointer;
   }
 
   .load-more {

@@ -1,10 +1,11 @@
 import { getActiveKataDaemon } from "../../stores/active-kata-daemon.svelte.js";
-import { KATA_DAEMON_HEADER, kataProxyPath, withKataDaemon } from "./daemons.js";
+import { KATA_DAEMON_HEADER, kataProxyPath, kataTaskDetailPath, withKataDaemon } from "./daemons.js";
 import {
   normalizeKataEvents,
   normalizeKataInstance,
   normalizeKataProject,
   normalizeKataProjectList,
+  normalizeKataReachableGraph,
   normalizeKataRecurrenceResponse,
   normalizeKataRecurrences,
   normalizeKataTaskDetail,
@@ -16,6 +17,8 @@ import type {
   KataProjectMetadataPatch,
   KataProjectMutationResponse,
   KataProjectSummary,
+  KataReachableGraphQuery,
+  KataReachableGraphResponse,
   KataTaskAPI,
   KataTaskCloseOptions,
   KataTaskDetail,
@@ -30,6 +33,7 @@ import type {
   KataTaskSearchFilters,
   KataTaskSearchResponse,
   KataTaskSummary,
+  KataWorkspaceTarget,
 } from "./taskTypes.js";
 import { buildKataTaskView } from "./taskViewBuilder.js";
 import { localDateString } from "../dates.js";
@@ -52,6 +56,9 @@ interface KataRequestInit {
   body?: unknown;
   headers?: Record<string, string> | undefined;
   signal?: AbortSignal | undefined;
+  // The path is already app-rooted (a middleman API route) instead of a
+  // daemon path to send through the passthrough proxy.
+  appRoute?: boolean | undefined;
 }
 
 interface ErrorEnvelope {
@@ -61,6 +68,11 @@ interface ErrorEnvelope {
 }
 
 const KATA_TASK_API_PREFIX = "/api" + "/v1";
+
+// Page size for issue-scoped event-log walks. Both TCP and unix-socket
+// daemons accept limit=1000 on /events; larger pages keep the walk to a
+// handful of round trips even on multi-thousand-event logs.
+const KATA_EVENTS_SCAN_PAGE_LIMIT = 1000;
 const responseHeaders = new WeakMap<KataTaskAPI, Headers>();
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -270,7 +282,7 @@ export function createKataTaskAPI(options: CreateKataTaskAPIOptions = {}): KataT
       requestInit.body = JSON.stringify(init.body);
     }
 
-    const response = await fetchImpl(kataProxyPath(path), requestInit);
+    const response = await fetchImpl(init.appRoute ? path : kataProxyPath(path), requestInit);
     responseHeaders.set(api, response.headers);
 
     const text = await response.text();
@@ -350,11 +362,22 @@ export function createKataTaskAPI(options: CreateKataTaskAPIOptions = {}): KataT
     pinned = false,
     signal?: AbortSignal,
   ): Promise<KataTaskDetail> {
-    const result = await request<unknown>(taskPath(`/issues/${encodeURIComponent(uid)}`), {
-      headers: pinned ? pinnedDaemonHeaders(daemonId) : daemonHeaders(daemonId),
-      signal,
-    });
-    return { ...normalizeKataTaskDetail(result.body), etag: result.headers.get("etag") ?? undefined };
+    // Middleman's combined read: the daemon detail plus the resolved
+    // workspace target in one round trip, so the detail pane and its
+    // workspace action render together.
+    const result = await request<{ detail?: unknown; etag?: string; workspace_target?: KataWorkspaceTarget }>(
+      kataTaskDetailPath(uid),
+      {
+        headers: pinned ? pinnedDaemonHeaders(daemonId) : daemonHeaders(daemonId),
+        signal,
+        appRoute: true,
+      },
+    );
+    const body = isObject(result.body) ? result.body : {};
+    const detail = normalizeKataTaskDetail(body.detail);
+    const etag = typeof body.etag === "string" && body.etag !== "" ? body.etag : undefined;
+    const target = isObject(body.workspace_target) ? (body.workspace_target as KataWorkspaceTarget) : undefined;
+    return { ...detail, etag, workspace_target: target };
   }
 
   async function postRecurrence(path: string, input: KataCreateRecurrenceInput) {
@@ -550,12 +573,31 @@ export function createKataTaskAPI(options: CreateKataTaskAPIOptions = {}): KataT
       return fetchIssue(uid, opts?.daemonId, opts?.pinned, opts?.signal);
     },
 
+    async reachableGraph(
+      projectID: number,
+      ref: string,
+      query: KataReachableGraphQuery = {},
+      opts,
+    ): Promise<KataReachableGraphResponse> {
+      const params = new URLSearchParams();
+      params.set("depth", query.depth ?? "full");
+      if (query.hide_done) params.set("hide_done", "true");
+      const result = await request<unknown>(
+        taskPath(`/projects/${projectID}/issues/${encodeURIComponent(ref)}/graph?${params.toString()}`),
+        {
+          headers: daemonHeaders(opts?.daemonId),
+          signal: opts?.signal,
+        },
+      );
+      return normalizeKataReachableGraph(result.body);
+    },
+
     async events(query = {}, opts) {
-      async function fetchPage(afterID?: number): Promise<KataTaskEventsResponse> {
+      async function fetchPage(afterID: number | undefined, pageLimit: number): Promise<KataTaskEventsResponse> {
         const params = new URLSearchParams();
         if (query.project_id !== undefined) params.set("project_id", String(query.project_id));
         if (afterID !== undefined) params.set("after_id", String(afterID));
-        if (query.limit !== undefined) params.set("limit", String(query.limit));
+        params.set("limit", String(pageLimit));
         const suffix = params.toString() ? `?${params.toString()}` : "";
         const result = await request<unknown>(taskPath(`/events${suffix}`), { signal: opts?.signal });
         return normalizeKataEvents(result.body);
@@ -565,9 +607,14 @@ export function createKataTaskAPI(options: CreateKataTaskAPIOptions = {}): KataT
         let afterID = query.after_id;
         let lastResponse: KataTaskEventsResponse | undefined;
         const events: KataTaskEventsResponse["events"] = [];
+        // The daemon has no server-side issue_uid filter, so this walks the
+        // log and filters client-side. Page far beyond the requested limit:
+        // paging at query.limit means one round trip per few matches, which
+        // takes seconds against remote daemons.
+        const pageLimit = Math.max(query.limit, KATA_EVENTS_SCAN_PAGE_LIMIT);
 
         for (;;) {
-          const response = await fetchPage(afterID);
+          const response = await fetchPage(afterID, pageLimit);
           const filtered = response.events.filter((event) => eventMatchesQuery(event, query));
           events.push(...filtered);
           lastResponse = response;

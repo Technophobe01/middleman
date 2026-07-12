@@ -56,11 +56,14 @@ The resolver uses this precedence:
    repositories with a non-empty `worktree_base_path`.
 4. Automatic mapping by unambiguous `.kata.toml` project name, considering only
    clones whose `.kata.toml` declares no `uid`/`identity`.
-5. No target when neither source yields exactly one repository.
+5. Automatic mapping by unambiguous synced tracked repository name, whether the
+   tracked repo was configured exactly or discovered through a configured glob,
+   when the matching repo has no readable `.kata.toml` project metadata.
+6. No target when neither source yields exactly one repository.
 
-Manual mappings are a fallback and override only the project they name. Automatic
-discovery remains the default path because it follows the user's existing watched
-repo clone setup.
+Manual mappings are explicit overrides for the project they name. Automatic
+discovery runs only when no matching manual mapping exists and remains the
+default path because it follows the user's existing watched repo clone setup.
 
 ## Alternatives Considered
 
@@ -102,8 +105,9 @@ it accepts only a regular file (rejecting symlinks, devices, and other
 non-regular entries) and reads through a small explicit size cap before
 decoding. This stops a malicious clone from pointing the file at an endless or
 oversized target (for example a symlink to `/dev/zero`) and stalling or
-exhausting the process during a worktree scan. A symlinked, oversized, or
-otherwise non-regular `.kata.toml` contributes no mapping.
+exhausting the process during a worktree scan. A symlinked, oversized,
+malformed, or otherwise non-regular `.kata.toml` contributes no mapping and is
+treated as absent for tracked-name fallback.
 
 The `.kata.toml` parser accepts a small, explicit shape:
 
@@ -132,13 +136,20 @@ valid name-only project still resolves even when an unrelated watched clone
 carries identity metadata, and a clone with stable identity is never silently
 matched by a colliding name.
 
+Tracked-name fallback uses the synced repository catalog filtered through
+current repo configuration. Readable `.kata.toml` project metadata suppresses
+that fallback for the same repo; stale synced rows remain candidates until sync
+or config removes them, and workspace creation still owns clone/fetch failure.
+
 Automatic `.kata.toml` mappings are global by project UID, identity, or name
 because the file does not carry daemon identity. If two repositories claim the
 same Kata project identity, or two identifier-less repositories claim the same
 project name, the resolver treats the mapping as ambiguous and returns no
-workspace target. The UI should not show a disabled button for this state
-because the user asked for the button to be absent when there is no clear
-mapping.
+workspace target. `.kata.toml` ambiguity is terminal: tracked-name fallback runs
+only when `.kata.toml` produces zero candidates. The UI should not show a
+disabled button or reason text for this state because the user asked for the
+button to be absent when there is no clear mapping; diagnostics need a new API
+field.
 
 ## Manual Settings
 
@@ -353,10 +364,15 @@ Backend coverage:
 - Automatic mapping succeeds from a configured exact repo with
   `worktree_base_path` and `.kata.toml` project UID, identity, or unambiguous
   project name.
-- Glob repos and repos without local clone paths do not participate in automatic
-  mapping.
+- Glob repos and repos without local clone paths do not participate in
+  `.kata.toml` scanning.
 - Duplicate `.kata.toml` project UID, identity, or name claims are ambiguous and
   return `available: false`.
+- A project name matching exactly one synced tracked repository name resolves
+  when that repository has no readable `.kata.toml` project metadata.
+- A project name matching exactly one synced glob-matched repository name also
+  resolves through the same tracked-repo rule; multiple tracked repository
+  matches are ambiguous and return `available: false`.
 - Manual mapping resolves to a watched repository and overrides an automatic
   mapping for the same daemon/project.
 - Missing Kata issue UID and removed watched repo mappings return

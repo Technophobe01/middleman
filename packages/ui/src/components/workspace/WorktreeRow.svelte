@@ -3,10 +3,10 @@
     WorkspaceActivity,
     WorkspaceWorktree,
   } from "../../api/types.js";
-  import Chip, {
+  import { Chip,
     type ChipTone,
-  } from "../shared/Chip.svelte";
-  import DiffStats from "../shared/DiffStats.svelte";
+  } from "@kenn-io/kit-ui";
+  import { DiffStats } from "@kenn-io/kit-ui";
 
   interface Props {
     worktree: WorkspaceWorktree;
@@ -152,10 +152,10 @@
     <span class="name-row">
       <span class="name">{title}</span>
       {#if worktree.isPrimary}
-        <Chip size="xs" tone="info">ROOT</Chip>
+        <Chip size="sm" tone="info">ROOT</Chip>
       {/if}
       {#if worktree.sessionBackend === "localTmux"}
-        <Chip size="xs" tone="warning">tmux</Chip>
+        <Chip size="sm" tone="warning">tmux</Chip>
       {/if}
       {#if worktree.isStale}
         <span class="stale-icon" title="Stale worktree">⚠</span>
@@ -178,7 +178,7 @@
       <span class="meta-row">
         {#if worktree.linkedPR}
           <Chip
-            size="xs"
+            size="sm"
             tone={linkedPRTone(worktree.linkedPR.state)}
             uppercase={false}
             class={`workspace-pr-chip chip--state-${worktree.linkedPR.state}`}
@@ -243,7 +243,7 @@
 {#if showMenu}
   <!-- svelte-ignore a11y_no_static_element_interactions -->
   <div
-    class="context-menu"
+    class="context-menu kit-popover-card"
     style="left: {menuX}px; top: {menuY}px"
     oncontextmenu={(e) => e.preventDefault()}
   >
@@ -346,8 +346,8 @@
     min-width: 0;
   }
 
-  .name-row :global(.chip),
-  .meta-row :global(.chip) {
+  .name-row :global(.kit-chip),
+  .meta-row :global(.kit-chip) {
     flex-shrink: 0;
   }
 
@@ -416,13 +416,9 @@
 
   .context-menu {
     position: fixed;
-    z-index: 1000;
+    z-index: var(--z-popover);
     min-width: 180px;
-    background: var(--bg-surface);
-    border: 1px solid var(--border-default);
-    border-radius: var(--radius-md);
     padding: 4px 0;
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
   }
 
   .menu-item {

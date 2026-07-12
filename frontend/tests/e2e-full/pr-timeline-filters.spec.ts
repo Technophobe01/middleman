@@ -59,7 +59,7 @@ async function openActivityViewMenu(
   surface: ".pull-detail" | ".issue-detail" = ".pull-detail",
 ): Promise<Locator> {
   await page.locator(surface).getByRole("button", { name: "View", exact: true }).click();
-  const menu = page.locator(".filter-dropdown");
+  const menu = page.locator(".kit-filter-dropdown__panel");
   await expect(menu).toBeVisible();
   return menu;
 }
@@ -173,14 +173,17 @@ test.describe("PR timeline filters", () => {
       .toBe("compact");
 
     await openPRTimelinePath(page, "/pulls/github/acme/tools/2");
-    await expect(page.locator(".pull-detail .event-card--compact-row").first()).toBeVisible();
+    const mergedRows = page.locator(".pull-detail .event-card--compact-row", { hasText: "MERGED" });
+    await expect(mergedRows).toHaveCount(1);
+    await expect(mergedRows.first()).toContainText("by alice");
+    await expect(mergedRows.first()).not.toContainText("merged this");
 
     await openIssueTimeline(page);
     await expect(page.locator(".issue-detail").getByRole("button", { name: "View", exact: true })).toContainText(
       "Compact",
     );
     await openActivityViewMenu(page, ".issue-detail");
-    await expect(page.locator(".filter-dropdown").getByRole("button", { name: "Messages" })).toHaveCount(0);
+    await expect(page.locator(".kit-filter-dropdown__panel").getByRole("button", { name: "Messages" })).toHaveCount(0);
   });
 
   test("keeps normal reply composer open when refreshed detail regroups a review thread", async ({ page }) => {

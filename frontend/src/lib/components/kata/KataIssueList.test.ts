@@ -104,6 +104,28 @@ describe("KataIssueList", () => {
     expect(within(row).getByText("fixture-user")).toBeTruthy();
   });
 
+  it("opens a graph from a row action without selecting the task", async () => {
+    const onSelect = vi.fn();
+    const onOpenGraph = vi.fn();
+    render(KataIssueList, {
+      props: {
+        currentView,
+        selectedIssueUID: null,
+        loading: false,
+        onSelect,
+        onOpenGraph,
+      },
+    });
+
+    const row = screen.getByRole("button", { name: /Pay rent/ });
+    const frame = row.parentElement;
+    expect(frame).toBeTruthy();
+    await fireEvent.click(within(frame!).getByRole("button", { name: "Open reachable graph" }));
+
+    expect(onOpenGraph).toHaveBeenCalledWith(baseIssues[0]);
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
   it("keeps snapshot loading out of the visual layout", () => {
     render(KataIssueList, {
       props: {
@@ -115,7 +137,7 @@ describe("KataIssueList", () => {
     });
 
     const loading = screen.getByText("Loading snapshot");
-    expect(loading.classList.contains("sr-only")).toBe(true);
+    expect(loading.classList.contains("kit-sr-only")).toBe(true);
     expect(screen.queryByText("Updating")).toBeNull();
   });
 
@@ -224,6 +246,7 @@ describe("KataIssueList", () => {
     });
     const api = apiWithDetail(parent, [child]);
     const selected: string[] = [];
+    const onRememberTasks = vi.fn();
 
     render(KataIssueList, {
       props: {
@@ -231,12 +254,14 @@ describe("KataIssueList", () => {
         selectedIssueUID: null,
         loading: false,
         api,
+        onRememberTasks,
         onSelect: (issue: KataTaskSummary) => selected.push(issue.uid),
       },
     });
 
     expect(screen.getByText("Parent task")).toBeTruthy();
     expect(screen.queryByText("Child task")).toBeNull();
+    expect(screen.getByText("2 tasks")).toBeTruthy();
 
     const parentRow = screen.getByRole("button", { name: /Parent task/ });
     await fireEvent.keyDown(parentRow, { key: "ArrowRight" });
@@ -244,6 +269,9 @@ describe("KataIssueList", () => {
     const childRow = await screen.findByRole("button", { name: /Child task/ });
     expect(childRow).toBeTruthy();
     expect(parentRow.getAttribute("aria-expanded")).toBe("true");
+    expect(screen.getByText("2 tasks")).toBeTruthy();
+    const remembered = onRememberTasks.mock.calls[0]?.[0] as readonly KataTaskSummary[] | undefined;
+    expect(remembered?.map((issue) => issue.uid)).toEqual([parent.uid, child.uid]);
 
     parentRow.focus();
     await fireEvent.keyDown(parentRow, { key: "j" });
@@ -258,6 +286,193 @@ describe("KataIssueList", () => {
       expect(parentRow.getAttribute("aria-expanded")).toBe("false");
     });
     expect(screen.queryByRole("button", { name: /Child task/ })).toBeNull();
+  });
+
+  it("does not show an expanded child again as a flat row", async () => {
+    const parent = task({
+      uid: "issue-parent",
+      short_id: "parent",
+      qualified_id: "Finances#parent",
+      title: "Parent task",
+      child_counts: { open: 1, total: 1 },
+    });
+    const child = task({
+      uid: "issue-child",
+      short_id: "child",
+      qualified_id: "Finances#child",
+      title: "Child task",
+      parent_short_id: parent.short_id,
+    });
+    const api = apiWithDetail(parent, [child]);
+
+    render(KataIssueList, {
+      props: {
+        currentView: viewWithIssues([parent, child]),
+        selectedIssueUID: null,
+        loading: false,
+        api,
+        onSelect: () => {},
+      },
+    });
+
+    expect(screen.queryByRole("button", { name: /Child task/ })).toBeNull();
+
+    const parentRow = screen.getByRole("button", { name: /Parent task/ });
+    await fireEvent.keyDown(parentRow, { key: "ArrowRight" });
+
+    await waitFor(() => {
+      expect(screen.getAllByRole("button", { name: /Child task/ })).toHaveLength(1);
+    });
+    expect(screen.getByRole("button", { name: /Child task/ }).classList.contains("row--child")).toBe(true);
+  });
+
+  it("renders a matched child as a top-level row when its parent is absent", async () => {
+    // A search or filter can surface a child whose parent is not in the
+    // result set. The child has a parent_short_id, but with no visible
+    // ancestor to fold into it must still render as its own row instead of
+    // being dropped — otherwise the header counts it while the list shows
+    // "No tasks".
+    const child = task({
+      uid: "issue-child",
+      short_id: "child",
+      qualified_id: "Finances#child",
+      title: "Child task",
+      parent_short_id: "parent",
+    });
+
+    render(KataIssueList, {
+      props: {
+        currentView: viewWithIssues([child]),
+        selectedIssueUID: null,
+        loading: false,
+        onSelect: () => {},
+      },
+    });
+
+    expect(screen.getByRole("button", { name: /Child task/ })).toBeTruthy();
+    expect(screen.queryByText("No tasks")).toBeNull();
+    expect(screen.getByText("1 task")).toBeTruthy();
+  });
+
+  it("expands nested child rows beyond one level", async () => {
+    const parent = task({
+      uid: "issue-parent",
+      short_id: "parent",
+      qualified_id: "Finances#parent",
+      title: "Parent task",
+      child_counts: { open: 1, total: 1 },
+    });
+    const child = task({
+      uid: "issue-child",
+      short_id: "child",
+      qualified_id: "Finances#child",
+      title: "Child task",
+      child_counts: { open: 1, total: 1 },
+      parent_short_id: parent.short_id,
+    });
+    const grandchild = task({
+      uid: "issue-grandchild",
+      short_id: "grandchild",
+      qualified_id: "Finances#grandchild",
+      title: "Grandchild task",
+      parent_short_id: child.short_id,
+    });
+    const api = {
+      issue: vi.fn(async (uid: string) => {
+        if (uid === parent.uid) return apiDetail(parent, [child]);
+        return apiDetail(child, [grandchild]);
+      }),
+    } as unknown as KataTaskAPI;
+
+    render(KataIssueList, {
+      props: {
+        currentView: viewWithIssues([parent]),
+        selectedIssueUID: null,
+        loading: false,
+        api,
+        onSelect: () => {},
+      },
+    });
+
+    const parentRow = screen.getByRole("button", { name: /Parent task/ });
+    await fireEvent.keyDown(parentRow, { key: "ArrowRight" });
+
+    const childRow = await screen.findByRole("button", { name: /Child task/ });
+    expect(childRow.getAttribute("aria-expanded")).toBe("false");
+
+    await fireEvent.keyDown(childRow, { key: "ArrowRight" });
+
+    const grandchildRow = await screen.findByRole("button", { name: /Grandchild task/ });
+    expect(grandchildRow.classList.contains("row--child")).toBe(true);
+    expect(api.issue).toHaveBeenCalledWith(parent.uid);
+    expect(api.issue).toHaveBeenCalledWith(child.uid);
+  });
+
+  it("expands and collapses every visible task tree from the header controls", async () => {
+    const parent = task({
+      uid: "issue-parent",
+      short_id: "parent",
+      qualified_id: "Finances#parent",
+      title: "Parent task",
+      child_counts: { open: 1, total: 1 },
+    });
+    const child = task({
+      uid: "issue-child",
+      short_id: "child",
+      qualified_id: "Finances#child",
+      title: "Child task",
+      child_counts: { open: 1, total: 1 },
+      parent_short_id: parent.short_id,
+    });
+    const grandchild = task({
+      uid: "issue-grandchild",
+      short_id: "grandchild",
+      qualified_id: "Finances#grandchild",
+      title: "Grandchild task",
+      parent_short_id: child.short_id,
+    });
+    const api = {
+      issue: vi.fn(async (uid: string) => {
+        if (uid === parent.uid) return apiDetail(parent, [child]);
+        return apiDetail(child, [grandchild]);
+      }),
+    } as unknown as KataTaskAPI;
+
+    render(KataIssueList, {
+      props: {
+        currentView: viewWithIssues([parent]),
+        selectedIssueUID: null,
+        loading: false,
+        api,
+        onSelect: () => {},
+      },
+    });
+
+    const expandAll = screen.getByRole("button", { name: "Expand all" });
+    const collapseAll = screen.getByRole("button", { name: "Collapse all" });
+    expect(collapseAll.hasAttribute("disabled")).toBe(true);
+
+    await fireEvent.click(expandAll);
+
+    const parentRow = screen.getByRole("button", { name: /Parent task/ });
+    const childRow = await screen.findByRole("button", { name: /Child task/ });
+    const grandchildRow = await screen.findByRole("button", { name: /Grandchild task/ });
+    expect(parentRow.getAttribute("aria-expanded")).toBe("true");
+    expect(childRow.getAttribute("aria-expanded")).toBe("true");
+    expect(grandchildRow.classList.contains("row--child")).toBe(true);
+    expect(api.issue).toHaveBeenCalledWith(parent.uid);
+    expect(api.issue).toHaveBeenCalledWith(child.uid);
+    expect(expandAll.hasAttribute("disabled")).toBe(true);
+    expect(collapseAll.hasAttribute("disabled")).toBe(false);
+
+    await fireEvent.click(collapseAll);
+
+    await waitFor(() => {
+      expect(parentRow.getAttribute("aria-expanded")).toBe("false");
+    });
+    expect(screen.queryByRole("button", { name: /Child task/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: /Grandchild task/ })).toBeNull();
+    expect(collapseAll.hasAttribute("disabled")).toBe(true);
   });
 
   it("j and k move focus and selection through rows", async () => {

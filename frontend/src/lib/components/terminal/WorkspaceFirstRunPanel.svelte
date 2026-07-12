@@ -14,6 +14,7 @@
     loadSnapshotHosts,
     type HostSummary,
   } from "../../api/fleet-snapshot.ts";
+  import { SelectDropdown } from "@middleman/ui";
   import {
     emitWorkspaceCommand,
     getWorkspaceData,
@@ -148,10 +149,20 @@
       repo.name_with_owner.toLowerCase().includes(query),
     );
   });
+  // Resolve against the filtered list with the same fallback SelectDropdown
+  // uses to render (selected value, else first option). This keeps the cloned
+  // repo identical to the one shown: if a filter hides the current selection,
+  // both the dropdown and submit fall back to the first visible repo instead of
+  // cloning a stale, no-longer-visible selection.
   const chosenGithubRepo = $derived(
-    githubRepos.find(
-      (repo) => repo.name_with_owner === selectedGithubRepo,
-    ),
+    filteredRepos.find((repo) => repo.name_with_owner === selectedGithubRepo) ??
+      filteredRepos[0],
+  );
+  const githubRepoOptions = $derived(
+    filteredRepos.map((repo) => ({
+      value: repo.name_with_owner,
+      label: repo.name_with_owner,
+    })),
   );
 
   function isDisabled(definition: ActionDefinition): boolean {
@@ -472,16 +483,13 @@
             </label>
             <label class="first-run-field">
               <span>GitHub repository</span>
-              <select
-                bind:value={selectedGithubRepo}
+              <SelectDropdown
+                title="GitHub repository"
+                value={selectedGithubRepo}
+                options={githubRepoOptions}
+                onchange={(value) => { selectedGithubRepo = value; }}
                 disabled={inFlight}
-              >
-                {#each filteredRepos as repo (repo.name_with_owner)}
-                  <option value={repo.name_with_owner}>
-                    {repo.name_with_owner}
-                  </option>
-                {/each}
-              </select>
+              />
             </label>
             <label class="first-run-field">
               <span>Destination path</span>
@@ -512,7 +520,7 @@
               </button>
               <button
                 type="submit"
-                disabled={inFlight || !selectedGithubRepo}
+                disabled={inFlight || !chosenGithubRepo}
               >
                 {inFlight ? "Cloning..." : "Clone repository"}
               </button>
@@ -633,7 +641,7 @@
     padding: 14px;
     display: flex;
     flex-direction: column;
-    gap: 14px;
+    gap: var(--space-5);
   }
 
   .first-run-form__header,
@@ -666,8 +674,7 @@
     font-weight: 600;
   }
 
-  .first-run-field input,
-  .first-run-field select {
+  .first-run-field input {
     box-sizing: border-box;
     width: 100%;
     border: 1px solid var(--border-default);
@@ -679,9 +686,19 @@
     padding: 8px 10px;
   }
 
-  .first-run-field input:disabled,
-  .first-run-field select:disabled {
+  .first-run-field input:disabled {
     opacity: 0.6;
+  }
+
+  .first-run-field :global(.kit-select-dropdown) {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .first-run-field :global(.kit-select-dropdown__trigger) {
+    height: 36px;
+    font-size: var(--font-size-sm);
+    font-weight: 400;
   }
 
   .first-run-form__buttons {

@@ -119,6 +119,17 @@ func (s *Server) repoRefWithOperations(repo db.Repo) repoRefResponse {
 	return resp
 }
 
+func (s *Server) repoRefWithMergeRequestOperations(
+	ctx context.Context,
+	repo db.Repo,
+	mr db.MergeRequest,
+) repoRefResponse {
+	resp := s.repoRefFromRepo(repo)
+	ops := s.repoOperationsForMergeRequest(ctx, repo, mr)
+	resp.Operations = &ops
+	return resp
+}
+
 func (s *Server) repoResponse(repo db.Repo) repoResponse {
 	return repoResponse{
 		ID:                       repo.ID,
@@ -173,53 +184,55 @@ func providerCapabilitiesFromPlatform(caps platform.Capabilities) providerCapabi
 		reviewActions = append(reviewActions, string(action))
 	}
 	return providerCapabilitiesResponse{
-		ReadRepositories:       caps.ReadRepositories,
-		ReadMergeRequests:      caps.ReadMergeRequests,
-		ReadIssues:             caps.ReadIssues,
-		ReadComments:           caps.ReadComments,
-		ReadReleases:           caps.ReadReleases,
-		ReadCI:                 caps.ReadCI,
-		ReadLabels:             caps.ReadLabels,
-		CommentMutation:        caps.CommentMutation,
-		StateMutation:          caps.StateMutation,
-		MergeMutation:          caps.MergeMutation,
-		ReviewMutation:         caps.ReviewMutation,
-		WorkflowApproval:       caps.WorkflowApproval,
-		ReadyForReview:         caps.ReadyForReview,
-		DraftMutation:          caps.DraftMutation,
-		IssueMutation:          caps.IssueMutation,
-		LabelMutation:          caps.LabelMutation,
-		AssigneeMutation:       caps.AssigneeMutation,
-		ReviewerMutation:       caps.ReviewerMutation,
-		ThreadReply:            caps.ThreadReply,
-		ThreadResolve:          caps.ThreadResolve,
-		ReviewDraftMutation:    caps.ReviewDraftMutation,
-		ReviewThreadResolution: caps.ReviewThreadResolution,
-		ReadReviewThreads:      caps.ReadReviewThreads,
-		NativeMultilineRanges:  caps.NativeMultilineRanges,
-		MutationHeadBinding:    caps.MutationHeadBinding,
-		SupportedReviewActions: reviewActions,
+		ReadRepositories:            caps.ReadRepositories,
+		ReadMergeRequests:           caps.ReadMergeRequests,
+		ReadIssues:                  caps.ReadIssues,
+		ReadComments:                caps.ReadComments,
+		ReadReleases:                caps.ReadReleases,
+		ReadCI:                      caps.ReadCI,
+		ReadLabels:                  caps.ReadLabels,
+		CommentMutation:             caps.CommentMutation,
+		StateMutation:               caps.StateMutation,
+		MergeMutation:               caps.MergeMutation,
+		ReviewMutation:              caps.ReviewMutation,
+		WorkflowApproval:            caps.WorkflowApproval,
+		ReadyForReview:              caps.ReadyForReview,
+		DraftMutation:               caps.DraftMutation,
+		IssueMutation:               caps.IssueMutation,
+		LabelMutation:               caps.LabelMutation,
+		AssigneeMutation:            caps.AssigneeMutation,
+		ReviewerMutation:            caps.ReviewerMutation,
+		ThreadReply:                 caps.ThreadReply,
+		ThreadResolve:               caps.ThreadResolve,
+		ReviewDraftMutation:         caps.ReviewDraftMutation,
+		ReviewThreadResolution:      caps.ReviewThreadResolution,
+		ReviewSuggestionApplication: caps.ReviewSuggestionApplication,
+		ReadReviewThreads:           caps.ReadReviewThreads,
+		NativeMultilineRanges:       caps.NativeMultilineRanges,
+		MutationHeadBinding:         caps.MutationHeadBinding,
+		SupportedReviewActions:      reviewActions,
 	}
 }
 
 func defaultGitHubProviderCapabilities() providerCapabilitiesResponse {
 	return providerCapabilitiesFromPlatform(platform.Capabilities{
-		ReadRepositories:  true,
-		ReadMergeRequests: true,
-		ReadIssues:        true,
-		ReadComments:      true,
-		ReadReleases:      true,
-		ReadCI:            true,
-		ReadLabels:        false,
-		CommentMutation:   true,
-		StateMutation:     true,
-		MergeMutation:     true,
-		ReviewMutation:    true,
-		WorkflowApproval:  true,
-		ReadyForReview:    true,
-		DraftMutation:     true,
-		IssueMutation:     true,
-		LabelMutation:     false,
+		ReadRepositories:            true,
+		ReadMergeRequests:           true,
+		ReadIssues:                  true,
+		ReadComments:                true,
+		ReadReleases:                true,
+		ReadCI:                      true,
+		ReadLabels:                  false,
+		CommentMutation:             true,
+		StateMutation:               true,
+		MergeMutation:               true,
+		ReviewMutation:              true,
+		WorkflowApproval:            true,
+		ReadyForReview:              true,
+		DraftMutation:               true,
+		IssueMutation:               true,
+		LabelMutation:               false,
+		ReviewSuggestionApplication: true,
 	})
 }
 

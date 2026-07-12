@@ -35,12 +35,6 @@
     "./utils/markdown": {
       "default": "./src/utils/markdown.ts"
     },
-    "./utils/clipboard": {
-      "default": "./src/utils/clipboard.ts"
-    },
-    "./utils/repo-color": {
-      "default": "./src/utils/repo-color.ts"
-    },
     "./utils/repo-label": {
       "default": "./src/utils/repo-label.ts"
     },
@@ -129,9 +123,10 @@
     "typecheck": "cd ../.. && node node_modules/vite-plus/bin/vp run ui-package-typecheck"
   },
   "dependencies": {
-    "@lucide/svelte": "1.21.0",
-    "@pierre/diffs": "1.2.11",
-    "@pierre/trees": "1.0.0-beta.4",
+    "@kenn-io/kit-ui": "github:kenn-io/kit-ui#59f8167e673e0040d29a47f73ffd7b545d57304f",
+    "@lucide/svelte": "1.23.0",
+    "@pierre/diffs": "1.2.12",
+    "@pierre/trees": "1.0.0-beta.5",
     "@tiptap/core": "3.27.1",
     "@tiptap/extension-document": "3.27.1",
     "@tiptap/extension-hard-break": "3.27.1",
@@ -141,19 +136,19 @@
     "@tiptap/pm": "3.27.1",
     "@tiptap/suggestion": "3.27.1",
     "dompurify": "3.4.11",
-    "marked": "17.0.6",
+    "marked": "18.0.5",
     "openapi-fetch": "^0.17.0",
     "prosemirror-state": "^1.4.4",
-    "shiki": "3.23.0",
+    "shiki": "4.3.0",
     "svelte-tiptap": "3.0.1"
   },
   "devDependencies": {
-    "@testing-library/svelte": "5.4.0",
+    "@testing-library/svelte": "5.4.2",
     "@tsconfig/svelte": "^5.0.0",
-    "@types/node": "^24.9.2",
+    "@types/node": "^26.0.0",
     "openapi-fetch": "^0.17.0",
     "svelte": "^5.55.7",
-    "vite-plus": "0.2.1"
+    "vite-plus": "0.2.2"
   },
   "peerDependencies": {
     "svelte": "^5.55.7"

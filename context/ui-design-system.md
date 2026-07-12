@@ -18,8 +18,13 @@ Use this document as the intent-level guide for frontend UI work in `middleman`.
 
 ## Sources of truth
 
-- Tokens: `frontend/src/app.css`
-- Shared primitives: `packages/ui/src/components/shared/` and
+- Tokens: `@kenn-io/kit-ui/theme.css` and `@kenn-io/kit-ui/mermaid.css`
+  (the `--mermaid-*`/`--viewer-scrim` tokens and diagram viewer chrome;
+  both imported at the top of `frontend/src/app.css`) plus the
+  middleman-specific tokens `app.css` defines on top (chrome, budget,
+  kanban, review, verdict, diff, viewer glass controls)
+- Shared primitives: `@kenn-io/kit-ui` first; app-specific compositions live
+  in `packages/ui/src/components/shared/` and
   `frontend/src/lib/components/shared/`
 - Diff/file-tree adapters: `packages/ui/src/components/diff/PierreFileDiff.svelte`
   and `packages/ui/src/components/diff/PierreFileTree.svelte`
@@ -28,6 +33,84 @@ Use this document as the intent-level guide for frontend UI work in `middleman`.
 - Interaction contracts: `context/ui-interaction-contracts.md`
 - Mobile UX principles: `context/mobile-ux.md`
 - This guidance: `context/ui-design-system.md`
+
+## kit-ui contract
+
+middleman consumes `@kenn-io/kit-ui` as source, pinned to one commit SHA in
+both `frontend/package.json` and `packages/ui/package.json` (bump both
+together; never a `file:` path — bun's store keys by name@version and goes
+stale). Its runtime deps are peers and its rune-module source cannot be
+prebundled: keep it in vite `optimizeDeps.exclude` with transitive deps as
+`"@kenn-io/kit-ui > <dep>"` includes. See kit-ui's `docs/migration.md` and
+`docs/theming.md`. Invariants middleman relies on:
+
+- Theme tokens come from kit `theme.css`; theming is `dark` /
+  `high-contrast` classes on `<html>`. `@middleman/ui` additionally
+  consumes app tokens from `frontend/src/app.css` and has no standalone
+  theme — style-asserting harnesses must load `app.css` like
+  `browserAppHarness.ts`.
+- Type scale: rem tokens self-adjust on coarse pointers; `kit-type-touch`
+  on `<html>` forces the touch scale. Never pin `html { font-size }`.
+- Breakpoints are written in px (shared steps 640/760/900) — media-query
+  `rem` resolves against the browser's 16px, not the app root.
+- Spacing: `--space-1…8` = 2/4/6/8/12/16/24/32px. New or edited `gap`
+  declarations use ladder tokens (both axes of shorthands); off-ladder px
+  snaps to the nearest step, biased compact. On-ladder raw px in untouched
+  code migrates opportunistically, not as churn.
+- kit BEM classes are the sanctioned surface for parent `:global` styles
+  and test selectors; a SHA bump that renames a class updates selectors in
+  the same change.
+- Chip: icons go in `children` (kit centers them), dropdown chevrons in
+  `trailing`; no downstream `.kit-chip__label` overrides — repo chips
+  depend on its ellipsis.
+- Theme resolution: kit's theme store owns dark/light/system resolution
+  and persistence (`middleman-theme` key); `theme.svelte.ts` adapts it. A
+  host-forced mode applies classes directly and never persists via
+  `setThemeMode`; an explicit user toggle persists even under a forced
+  mode. Relative timestamps use kit `formatRelativeTime`;
+  `parseAPITimestamp`/`localDate*Label` stay app-side.
+- Dialogs: every dialog pushes a keyboard modal-stack frame. Background
+  Escape surfaces cannot detect dialogs via `defaultPrevented` (kit's
+  window listener registers late); they stand down when
+  `getStackDepth() > 0`. kit `Modal`'s `closable` gates only the header X.
+- Escape in overlay-hosted search: a non-empty kit `SearchInput` claims
+  Escape to clear itself (stops propagation); an empty field lets it
+  bubble so the hosting popover closes — every `SearchInput`-hosting
+  popover must handle that bubbled Escape (`UserListEditor.test.ts` pins
+  the flow).
+- Palette, Cheatsheet, and the image lightbox keep hand-rolled focus
+  traps and own their focus restore (the state stores' close functions;
+  the lightbox's `restoreFocusTo`): close restores focus synchronously
+  before the picked action runs, so an action's own focus move wins. kit
+  `trapFocus` restores at unmount teardown, which would undo it.
+- jsdom lacks `offsetParent` / `scrollIntoView` / `ResizeObserver`:
+  `test/setup.ts` stubs the latter two, focus-trap tests install
+  `stubOffsetParent.ts`, and synthetic Tab only exercises kit's trap at
+  wrap boundaries.
+- `CollapsibleSidebar`: middleman relies on the `kit-sidebar-layout*` BEM
+  classes, `data-collapsed`, `SplitResizeEvent`, and `SidebarToggle`
+  modifiers; the narrow floating overlay is kit-owned via the `overlay`
+  prop — no app-side copies of its CSS.
+- `StatusBar`: relies on `kit-status-bar*` classes and
+  `--status-bar-height`; `overflow="visible"` lets BudgetPopover use kit's
+  popover recipe; the app owns keeping bar text short.
+- `TopBar`: renders the app header as `.app-top-bar`; tabs collapse by
+  measurement. The header must clip its x-axis (`overflow-x: clip` — kit's
+  hidden probe row otherwise inflates scrollWidth) and side regions must
+  stay content-sized (a flex-stretched region poisons the frozen
+  `expandUsed` footprint and blocks re-expansion). Select tabs via
+  `.kit-top-bar__tabs .kit-top-bar__tab`, never the bare class.
+  Provider-mode repo selector visibility must not move the tab row; non-provider
+  modes reserve its footprint unless embed config hides it
+  (`frontend/src/lib/components/layout/AppHeader.svelte::reserveProviderRepoSelectorSlot`).
+- Flash: one shared store (`@middleman/ui/stores/flash`); kit
+  `FlashBanner` mounts once per shell; stacking (not latest-wins) is
+  intended. Tests assert `.kit-flash-stack`.
+
+`kit-ui-check` gates at zero findings in both `make frontend-check` and the
+Vite+ `frontend-check` task behind CI's `vp run -w check`. Suppress only
+with a per-line `kit-ui-check-ignore` (same line or the line above) that
+states a reason.
 
 ## Shared primitives
 
@@ -62,6 +145,15 @@ In this repo, the standard term is **chip**, not pill.
 
 When a screen needs semantic chip color, extend `Chip` with a named tone class such as `chip--blue`, `chip--green`, or `chip--red` instead of redefining local badge geometry. Screens may keep legacy class names for test selectors during migration, but sizing, casing, and spacing should come from `Chip`.
 
+### Tree Cells
+
+Tree-like rows inside dense tables should preserve the table's scan line.
+Keep IDs and primary row numbers in their normal column, and put disclosure
+chevrons plus child indentation inside the content cell that owns the
+hierarchy, such as a repo/ref or file-name cell. Do not use terminal/TUI
+connector glyphs, branch-line borders, or extra ornamental strokes to draw the
+tree. Indentation and a standard chevron are the affordance.
+
 ### ActionButton
 
 Use `ActionButton` for repeated action styling.
@@ -79,9 +171,9 @@ If a new repeated button treatment is needed, extend `ActionButton` rather than 
 - `ConfirmDialog`
 - `DialogButton`
 
-### LeftSidebarToggle
+### SidebarToggle
 
-Use `LeftSidebarToggle` for collapse and expand controls on left-side navigation rails.
+Use kit-ui's `SidebarToggle` (re-exported from `@middleman/ui`) for collapse and expand controls on left-side navigation rails.
 
 Intent:
 
@@ -89,11 +181,11 @@ Intent:
 - consistent expanded/collapsed direction across PR, issue, activity, and workspace sidebars
 - avoid one-off SVG buttons or local `.sidebar-toggle` styling in each rail
 
-Use it inside left sidebar headers and collapsed strips. Pass a specific label such as `Workspaces sidebar` when the generic `sidebar` label would be ambiguous.
+Use it inside left sidebar headers and collapsed strips. Pass a specific label such as `Workspaces sidebar` when the generic `sidebar` label would be ambiguous. The resizable sidebar layout itself is kit-ui's `CollapsibleSidebar`; the container-width-driven floating overlay is requested through its `overlay` prop (hosts pass the container store's `isNarrow()` — kit's `overlayOnNarrow` media query is viewport-based, which is not the same signal).
 
 ### SplitResizeHandle
 
-Use `SplitResizeHandle` for draggable pane dividers in split views.
+Use kit-ui's `SplitResizeHandle` (re-exported from `@middleman/ui`) for draggable pane dividers in split views.
 
 Intent:
 
@@ -146,7 +238,7 @@ Intent:
 - avoid mixing browser-native select styling with custom app dropdowns
 - keep selection affordances consistent across detail headers, filters, and compact command surfaces
 
-Do not add new native `<select>` controls for visible app UI unless there is a platform-specific accessibility need that cannot be met by `SelectDropdown`.
+Do not add native `<select>` controls for visible app UI; use `SelectDropdown` instead. This is enforced by `frontend/src/no-native-select.test.ts`, which scans the component source trees and fails when a native `<select>` element is reintroduced. There is no allowlist or per-component exemption: if `SelectDropdown` cannot express a case, extend the primitive rather than reaching for a native `<select>`.
 
 ### Overlays
 
@@ -224,6 +316,8 @@ Use assertions only at real boundaries: DOM event targets, `JSON.parse`, third-p
 For repeated async or event patterns, prefer a small typed helper over repeated structural checks. Never check promise shape with `typeof result.then === "function"`, `then?: unknown`, or similar maybe-thenable probes. If the value may be async, make the contract `void | Promise<void>` and use the promise methods through that type; if the value is a browser API promise such as `document.fonts.ready`, use the typed API directly. Do not duplicate browser API feature checks across components if a shared helper can express the actual browser boundary.
 
 Shared markdown rendering has an async highlighted path and plain synchronous fallbacks. Use `renderMarkdown` for normal rendered descriptions and comments so fenced code blocks can be highlighted by Shiki with the declared fence language. Keep `renderMarkdownSync` and `renderMarkdownBlocks` independent of highlighter state; they intentionally render plain code fences for pending UI and rich-preview slicing. Shiki work is bounded per render; once the fence, language, or code-size budget is exceeded, additional fences render as escaped plain code. Shiki inline styles are trusted only when generated by the renderer during the current sanitization pass. Raw markdown HTML, even if it uses Shiki class names, must not retain style attributes.
+
+The markdown pipelines deliberately stay app-side rather than moving to kit-ui `createMarkdownRenderer`: interactive task lists and docs link/image rewriting need marked renderer overrides, docs external-image blocking needs an element-level DOMPurify hook, and the drag handle needs the non-data `draggable` attribute — all beyond kit's extensions/codeFence/data-\* hook surface. This applies to the two renderers (`packages/ui/src/utils/markdown.ts` and the docs renderer) plus the markdown DOM-diff surface (`markdown-diff.ts`), which diffs already-rendered HTML and owns no render or escaping invariants of its own. The fence primitives that do fit (`escapeHtml`, `codeFenceLanguage`, `codeHighlightPlan` and its budgets, `shikiStyleIsAllowed`) are imported from `@kenn-io/kit-ui/utils/markdown` in both renderers so highlight budgets and escaping stay in parity by construction; do not reintroduce local copies. Mermaid is fully kit-owned: both renderers route fences through `mermaidCodeFence`, and `frontend/src/main.ts` wires kit's `initMarkdownMermaidRendering` (from `@kenn-io/kit-ui/utils/markdown-mermaid`, viewer classes `kit-mermaid-*`) into the app modal stack via `onLightboxOpen`; the diff image panel is kit's `ImagePreview`. New deps reached through the excluded kit-ui source barrel (mermaid, new lucide icons) must be added to `optimizeDeps.include` in `frontend/vite.config.ts`, or the cold optimizer re-bundles mid-run and breaks the browser test tier. `escapeHtml`'s double-quote escaping is a load-bearing contract for double-quoted attribute interpolation in both renderers, pinned by the docs suite's attribute-escaping tests. The invariants the boundary protects — task index stability, style stripping, external-image blocking, mermaid bypass, highlight budgets — are covered by `packages/ui/src/utils/markdown.test.ts`, `frontend/src/lib/utils/markdownTaskListStyle.test.ts`, and the docs markdown suite.
 
 Responsive layout work should separate presentation mode from sizing mode.
 

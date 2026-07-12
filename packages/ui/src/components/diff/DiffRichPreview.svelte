@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { ImagePreview } from "@kenn-io/kit-ui";
   import type { DiffFile, FilePreview } from "../../api/types.js";
   import { getStores } from "../../context.js";
   import type { DiffViewMode } from "../../stores/diff.svelte.js";
@@ -629,9 +630,7 @@
           {/await}
         </div>
       {:else if kind === "image"}
-        <div class="diff-image-preview">
-          <img src={dataURL} alt={file.path} />
-        </div>
+        <ImagePreview src={dataURL} alt={file.path} />
       {:else if kind === "pdf"}
         <object
           class="diff-object-preview"
@@ -805,8 +804,8 @@
 
   .markdown-rich-diff--unified :global(.markdown-diff__block) {
     display: block;
-    margin: 0.55rem 0;
-    padding: 0.45rem 0.6rem;
+    margin: 7px 0;
+    padding: 6px 8px;
     border: 1px solid transparent;
     text-decoration: none;
   }
@@ -841,7 +840,7 @@
   }
 
   .markdown-rich-diff__anchored-block--spaced {
-    margin-bottom: 1rem;
+    margin-bottom: 13px;
   }
 
   .markdown-rich-diff__anchored-block--spaced:last-child {
@@ -866,30 +865,6 @@
     .markdown-rich-diff__split-row {
       grid-template-columns: minmax(0, 1fr);
     }
-  }
-
-  .diff-image-preview {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    min-height: 240px;
-    padding: 24px;
-    background:
-      linear-gradient(45deg, var(--bg-inset) 25%, transparent 25%),
-      linear-gradient(-45deg, var(--bg-inset) 25%, transparent 25%),
-      linear-gradient(45deg, transparent 75%, var(--bg-inset) 75%),
-      linear-gradient(-45deg, transparent 75%, var(--bg-inset) 75%);
-    background-color: var(--bg-surface);
-    background-position: 0 0, 0 10px, 10px -10px, -10px 0;
-    background-size: 20px 20px;
-  }
-
-  .diff-image-preview img {
-    max-width: min(100%, 960px);
-    max-height: 70vh;
-    object-fit: contain;
-    border: 1px solid var(--border-muted);
-    background: var(--bg-surface);
   }
 
   .diff-object-preview {

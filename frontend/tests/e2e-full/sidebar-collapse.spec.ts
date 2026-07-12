@@ -58,7 +58,7 @@ async function expectResizedSidebar(
   await page.goto(path);
   await waitForList(page);
 
-  const sidebar = page.locator(".sidebar").first();
+  const sidebar = page.locator(".kit-sidebar-layout__sidebar").first();
   const handle = sidebarResizeHandle(page);
 
   expect(await sidebarWidth(sidebar)).toBe(340);
@@ -70,7 +70,7 @@ async function expectResizedSidebar(
   await page.reload();
   await waitForList(page);
 
-  await expect.poll(async () => sidebarWidth(page.locator(".sidebar").first())).toBe(420);
+  await expect.poll(async () => sidebarWidth(page.locator(".kit-sidebar-layout__sidebar").first())).toBe(420);
 }
 
 async function expectCompactFiltersAtMinimumWidth(
@@ -81,14 +81,14 @@ async function expectCompactFiltersAtMinimumWidth(
   await page.goto(path);
   await waitForList(page);
 
-  const sidebar = page.locator(".sidebar").first();
+  const sidebar = page.locator(".kit-sidebar-layout__sidebar").first();
   const handle = sidebarResizeHandle(page);
 
   await dragResizeHandle(page, handle, -220);
   await expect.poll(async () => sidebarWidth(sidebar)).toBe(200);
 
   const filterBar = sidebar.locator(".filter-bar").first();
-  const compactFilters = filterBar.locator(".compact-filter-menu .filter-btn");
+  const compactFilters = filterBar.locator(".compact-filter-menu .kit-filter-dropdown__btn");
   await expect(compactFilters).toBeVisible();
   await expect(filterBar.locator(".state-toggle")).toBeHidden();
   await expect(filterBar.locator(".group-toggle")).toBeHidden();
@@ -110,9 +110,9 @@ async function expectCompactFiltersInNarrowViewport(
   await page.goto(desktopPath);
   await waitForList(page);
 
-  const sidebar = page.locator(".sidebar").first();
+  const sidebar = page.locator(".kit-sidebar-layout__sidebar").first();
   const filterBar = sidebar.locator(".filter-bar").first();
-  await expect(filterBar.locator(".compact-filter-menu .filter-btn")).toBeVisible();
+  await expect(filterBar.locator(".compact-filter-menu .kit-filter-dropdown__btn")).toBeVisible();
   await expect(filterBar.locator(".state-toggle")).toBeHidden();
   await expect(filterBar.locator(".group-toggle")).toBeHidden();
 }
@@ -130,26 +130,26 @@ async function setPersistedSidebarWidth(
   }, width);
   await page.reload();
   await waitForList(page);
-  return page.locator(".sidebar").first().locator(".filter-bar").first();
+  return page.locator(".kit-sidebar-layout__sidebar").first().locator(".filter-bar").first();
 }
 
 async function expectCompactFilterBar(filterBar: Locator): Promise<void> {
-  await expect(filterBar.locator(".compact-filter-menu .filter-btn")).toBeVisible();
-  await expect(filterBar.locator(".local-filter-menu .filter-btn")).toBeHidden();
+  await expect(filterBar.locator(".compact-filter-menu .kit-filter-dropdown__btn")).toBeVisible();
+  await expect(filterBar.locator(".local-filter-menu .kit-filter-dropdown__btn")).toBeHidden();
   await expect(filterBar.locator(".state-toggle")).toBeHidden();
   await expect(filterBar.locator(".group-toggle")).toBeHidden();
   await expectFastAnimation(filterBar.locator(".compact-filter-menu"));
 }
 
 async function openCompactFilters(filterBar: Locator): Promise<Locator> {
-  await filterBar.locator(".compact-filter-menu .filter-btn").click();
-  const dropdown = filterBar.page().locator(".filter-dropdown");
+  await filterBar.locator(".compact-filter-menu .kit-filter-dropdown__btn").click();
+  const dropdown = filterBar.page().locator(".kit-filter-dropdown__panel");
   await expect(dropdown).toBeVisible();
   return dropdown;
 }
 
 async function expectExpandedFilterBar(filterBar: Locator): Promise<void> {
-  await expect(filterBar.locator(".compact-filter-menu .filter-btn")).toBeHidden();
+  await expect(filterBar.locator(".compact-filter-menu .kit-filter-dropdown__btn")).toBeHidden();
   await expect(filterBar.locator(".state-toggle")).toBeVisible();
   await expect(filterBar.locator(".group-toggle")).toBeVisible();
   await expectFastAnimation(filterBar.locator(".state-toggle"));
@@ -165,10 +165,10 @@ async function expectPullLocalFilterIconOnly(filterBar: Locator): Promise<void> 
   await expect(filterBar.locator(".state-toggle")).toBeVisible();
   await expect(filterBar.locator(".group-toggle")).toBeVisible();
   await expect(filterBar.locator(".compact-filter-menu")).toBeHidden();
-  await expect(localFilter.locator(".filter-trigger-label")).toHaveCSS("display", "none");
+  await expect(localFilter.locator(".kit-filter-dropdown__trigger-label")).toHaveCSS("display", "none");
 
   const triggerWidth = await localFilter
-    .locator(".filter-btn")
+    .locator(".kit-filter-dropdown__btn")
     .evaluate((node) => Math.round(node.getBoundingClientRect().width));
   expect(triggerWidth).toBe(34);
 
@@ -182,8 +182,8 @@ async function expectPullLocalFilterIconOnly(filterBar: Locator): Promise<void> 
 async function expectPullLocalFilterLabeled(filterBar: Locator): Promise<void> {
   await expectExpandedFilterBar(filterBar);
   const localFilter = filterBar.locator(".local-filter-menu");
-  await expect(localFilter.locator(".filter-trigger-label")).toHaveText("PR filters");
-  await expect(localFilter.locator(".filter-trigger-label")).not.toHaveCSS("display", "none");
+  await expect(localFilter.locator(".kit-filter-dropdown__trigger-label")).toHaveText("PR filters");
+  await expect(localFilter.locator(".kit-filter-dropdown__trigger-label")).not.toHaveCSS("display", "none");
 }
 
 async function expectFastAnimation(locator: Locator): Promise<void> {
@@ -204,45 +204,45 @@ test.describe("collapsible sidebar", () => {
     await page.goto("/pulls");
     await waitForPRList(page);
 
-    const sidebar = page.locator(".sidebar");
+    const sidebar = page.locator(".kit-sidebar-layout__sidebar");
     await expect(sidebar).toBeVisible();
-    await expect(sidebar).not.toHaveClass(/sidebar--collapsed/);
+    await expect(sidebar).not.toHaveClass(/kit-sidebar-layout__sidebar--collapsed/);
 
     await collapseToggle(sidebar).click();
-    await expect(sidebar).toHaveClass(/sidebar--collapsed/);
+    await expect(sidebar).toHaveClass(/kit-sidebar-layout__sidebar--collapsed/);
 
     const expandBtn = expandToggle(sidebar);
     await expect(expandBtn).toBeVisible();
 
     await expandBtn.click();
-    await expect(sidebar).not.toHaveClass(/sidebar--collapsed/);
+    await expect(sidebar).not.toHaveClass(/kit-sidebar-layout__sidebar--collapsed/);
   });
 
   test("collapse and expand via strip on issues", async ({ page }) => {
     await page.goto("/issues");
     await waitForIssueList(page);
 
-    const sidebar = page.locator(".sidebar");
+    const sidebar = page.locator(".kit-sidebar-layout__sidebar");
     await expect(sidebar).toBeVisible();
-    await expect(sidebar).not.toHaveClass(/sidebar--collapsed/);
+    await expect(sidebar).not.toHaveClass(/kit-sidebar-layout__sidebar--collapsed/);
 
     await collapseToggle(sidebar).click();
-    await expect(sidebar).toHaveClass(/sidebar--collapsed/);
+    await expect(sidebar).toHaveClass(/kit-sidebar-layout__sidebar--collapsed/);
 
     const expandBtn = expandToggle(sidebar);
     await expect(expandBtn).toBeVisible();
 
     await expandBtn.click();
-    await expect(sidebar).not.toHaveClass(/sidebar--collapsed/);
+    await expect(sidebar).not.toHaveClass(/kit-sidebar-layout__sidebar--collapsed/);
   });
 
   test("header expand on non-list route after collapsing", async ({ page }) => {
     await page.goto("/pulls");
     await waitForPRList(page);
 
-    const sidebar = page.locator(".sidebar");
+    const sidebar = page.locator(".kit-sidebar-layout__sidebar");
     await collapseToggle(sidebar).click();
-    await expect(sidebar).toHaveClass(/sidebar--collapsed/);
+    await expect(sidebar).toHaveClass(/kit-sidebar-layout__sidebar--collapsed/);
 
     // Navigate to board view (no sidebar strip).
     await page.goto("/pulls/board");
@@ -260,25 +260,25 @@ test.describe("collapsible sidebar", () => {
     // Navigate back to list view and verify sidebar is expanded.
     await page.goto("/pulls");
     await waitForPRList(page);
-    const restoredSidebar = page.locator(".sidebar");
-    await expect(restoredSidebar).not.toHaveClass(/sidebar--collapsed/);
+    const restoredSidebar = page.locator(".kit-sidebar-layout__sidebar");
+    await expect(restoredSidebar).not.toHaveClass(/kit-sidebar-layout__sidebar--collapsed/);
   });
 
   test("keyboard shortcut toggles sidebar", async ({ page }) => {
     await page.goto("/pulls");
     await waitForPRList(page);
 
-    const sidebar = page.locator(".sidebar");
-    await expect(sidebar).not.toHaveClass(/sidebar--collapsed/);
+    const sidebar = page.locator(".kit-sidebar-layout__sidebar");
+    await expect(sidebar).not.toHaveClass(/kit-sidebar-layout__sidebar--collapsed/);
 
     // Press Cmd+[ (macOS) or Ctrl+[ to collapse.
     const modifier = process.platform === "darwin" ? "Meta" : "Control";
     await page.keyboard.press(`${modifier}+[`);
-    await expect(sidebar).toHaveClass(/sidebar--collapsed/);
+    await expect(sidebar).toHaveClass(/kit-sidebar-layout__sidebar--collapsed/);
 
     // Press again to expand.
     await page.keyboard.press(`${modifier}+[`);
-    await expect(sidebar).not.toHaveClass(/sidebar--collapsed/);
+    await expect(sidebar).not.toHaveClass(/kit-sidebar-layout__sidebar--collapsed/);
   });
 
   test("sidebar can be resized on pulls and keeps the new width after reload", async ({ page }) => {
@@ -325,13 +325,13 @@ test.describe("collapsible sidebar", () => {
     await expectCompactFilterBar(filterBar);
 
     const dropdown = await openCompactFilters(filterBar);
-    await expect(dropdown.locator(".filter-section-title", { hasText: "PR" })).toBeVisible();
-    await expect(dropdown.locator(".filter-section-title", { hasText: "Kanban" })).toBeVisible();
-    await dropdown.locator(".filter-item", { hasText: "Closed" }).click();
+    await expect(dropdown.locator(".kit-filter-dropdown__section-title", { hasText: "PR" })).toBeVisible();
+    await expect(dropdown.locator(".kit-filter-dropdown__section-title", { hasText: "Kanban" })).toBeVisible();
+    await dropdown.locator(".kit-filter-dropdown__item", { hasText: "Closed" }).click();
     await expect(filterBar.page().locator(".state-note")).toBeVisible();
     await expect(dropdown).toBeVisible();
 
-    await dropdown.locator(".filter-item", { hasText: "Flat list" }).click();
+    await dropdown.locator(".kit-filter-dropdown__item", { hasText: "Flat list" }).click();
     await expect(dropdown).toBeVisible();
     await expect(page.locator(".repo-header")).toHaveCount(0, {
       timeout: 5_000,
@@ -407,11 +407,11 @@ test.describe("collapsible sidebar", () => {
     await expectCompactFilterBar(filterBar);
 
     const dropdown = await openCompactFilters(filterBar);
-    await dropdown.locator(".filter-item", { hasText: "Closed" }).click();
+    await dropdown.locator(".kit-filter-dropdown__item", { hasText: "Closed" }).click();
     await expect(filterBar.page().locator(".state-note")).toBeVisible();
     await expect(dropdown).toBeVisible();
 
-    await dropdown.locator(".filter-item", { hasText: "All" }).last().click();
+    await dropdown.locator(".kit-filter-dropdown__item", { hasText: "All" }).last().click();
     await expect(dropdown).toBeVisible();
     await expect(page.locator(".repo-header")).toHaveCount(0, {
       timeout: 5_000,

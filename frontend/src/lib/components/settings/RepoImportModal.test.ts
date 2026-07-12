@@ -1,8 +1,12 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/svelte";
-import { afterEach, describe, expect, it, vi } from "vite-plus/test";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vite-plus/test";
 import type { MockedFunction } from "vite-plus/test";
 import RepoImportModal from "./RepoImportModal.svelte";
 import { bulkAddRepos, previewRepos } from "../../api/settings.js";
+import { installOffsetParentStub, removeOffsetParentStub } from "../../../test/stubOffsetParent.js";
+
+beforeAll(installOffsetParentStub);
+afterAll(removeOffsetParentStub);
 
 vi.mock("../../api/settings.js", () => ({
   previewRepos: vi.fn(),
@@ -281,11 +285,11 @@ describe("RepoImportModal", () => {
       props: { open: true, onClose: vi.fn(), onImported: vi.fn() },
     });
 
-    const provider = screen.getByLabelText("Provider");
     const host = screen.getByLabelText("Host") as HTMLInputElement;
     const pattern = screen.getByLabelText("Repository pattern");
 
-    await fireEvent.change(provider, { target: { value: "forgejo" } });
+    await fireEvent.click(screen.getByRole("combobox", { name: /Provider/ }));
+    await fireEvent.click(screen.getByRole("option", { name: "Forgejo" }));
     expect(host.value).toBe("codeberg.org");
     await fireEvent.input(pattern, {
       target: { value: "team/subgroup/project-*" },
@@ -294,7 +298,8 @@ describe("RepoImportModal", () => {
     expect((await screen.findByRole("alert")).textContent).toContain("Format: owner/pattern");
     expect(preview).not.toHaveBeenCalled();
 
-    await fireEvent.change(provider, { target: { value: "gitea" } });
+    await fireEvent.click(screen.getByRole("combobox", { name: /Provider/ }));
+    await fireEvent.click(screen.getByRole("option", { name: "Gitea" }));
     expect(host.value).toBe("gitea.com");
     await fireEvent.input(pattern, {
       target: { value: "team/service-*" },

@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/middleman/internal/db"
 	ghclient "go.kenn.io/middleman/internal/github"
+	"go.kenn.io/middleman/internal/platform"
 	"go.kenn.io/middleman/internal/ratelimit"
 	"go.kenn.io/middleman/internal/testutil/dbtest"
 	"go.kenn.io/middleman/internal/tokenauth"
@@ -20,27 +21,34 @@ import (
 
 func TestDeriveOperationAvailability(t *testing.T) {
 	allCaps := providerCapabilitiesResponse{
-		ReadRepositories:    true,
-		ReadMergeRequests:   true,
-		ReadIssues:          true,
-		ReadComments:        true,
-		ReadReleases:        true,
-		ReadCI:              true,
-		ReadLabels:          true,
-		CommentMutation:     true,
-		StateMutation:       true,
-		MergeMutation:       true,
-		ReviewMutation:      true,
-		ReviewDraftMutation: true,
-		WorkflowApproval:    true,
-		ReadyForReview:      true,
-		DraftMutation:       true,
-		IssueMutation:       true,
-		LabelMutation:       true,
+		ReadRepositories:            true,
+		ReadMergeRequests:           true,
+		ReadIssues:                  true,
+		ReadComments:                true,
+		ReadReleases:                true,
+		ReadCI:                      true,
+		ReadLabels:                  true,
+		CommentMutation:             true,
+		StateMutation:               true,
+		MergeMutation:               true,
+		ReviewMutation:              true,
+		ReviewDraftMutation:         true,
+		WorkflowApproval:            true,
+		ReadyForReview:              true,
+		DraftMutation:               true,
+		IssueMutation:               true,
+		LabelMutation:               true,
+		ReviewSuggestionApplication: true,
+		MutationHeadBinding:         true,
+		ReadReviewThreads:           true,
 	}
 	mergePR := operationDescriptor{
 		name:                 operationMergePR,
 		requiredCapabilities: []string{capabilityMergeMutation},
+	}
+	submitReview := operationDescriptor{
+		name:                 operationSubmitReview,
+		requiredCapabilities: []string{capabilityReviewMutation},
 	}
 	addLabel := operationDescriptor{
 		name:                 operationAddLabel,
@@ -62,6 +70,7 @@ func TestDeriveOperationAvailability(t *testing.T) {
 		repo      db.Repo
 		rate      rateLimitAvailability
 		writeCred writeCredentialGate
+		opContext operationAvailabilityContext
 		expected  OperationAvailability
 	}{
 		{
@@ -120,6 +129,17 @@ func TestDeriveOperationAvailability(t *testing.T) {
 			expected: OperationAvailability{Available: true},
 		},
 		{
+			name:      "viewer cannot approve own pull request",
+			op:        submitReview,
+			caps:      allCaps,
+			repo:      repoCanMerge,
+			opContext: operationAvailabilityContext{selfApproval: true},
+			expected: OperationAvailability{
+				Code:              availabilityCodeSelfApproval,
+				UnavailableReason: "You cannot approve your own pull request",
+			},
+		},
+		{
 			name: "review draft operation uses draft capability without requiring submitted reviews",
 			op:   descReviewDraft,
 			caps: func() providerCapabilitiesResponse {
@@ -130,6 +150,29 @@ func TestDeriveOperationAvailability(t *testing.T) {
 			}(),
 			repo:     repoCanMerge,
 			expected: OperationAvailability{Available: true},
+		},
+		{
+			name:     "review suggestion operation requires stored thread and head binding prerequisites",
+			op:       descApplyReviewSuggestion,
+			caps:     allCaps,
+			repo:     repoCanMerge,
+			expected: OperationAvailability{Available: true},
+		},
+		{
+			name: "first missing review suggestion prerequisite wins",
+			op:   descApplyReviewSuggestion,
+			caps: func() providerCapabilitiesResponse {
+				c := allCaps
+				c.MutationHeadBinding = false
+				c.ReadReviewThreads = false
+				return c
+			}(),
+			repo: repoCanMerge,
+			expected: OperationAvailability{
+				Code:               availabilityCodeUnsupportedCapability,
+				UnavailableReason:  "Provider does not support mutation_head_binding",
+				RequiredCapability: capabilityMutationHeadBinding,
+			},
 		},
 		{
 			name: "rate-limited host blocks even when capability and permission exist",
@@ -192,10 +235,39 @@ func TestDeriveOperationAvailability(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := deriveOperationAvailability(tc.op, tc.caps, tc.repo, tc.rate, tc.writeCred)
+			got := deriveOperationAvailabilityWithContext(
+				tc.op, tc.caps, tc.repo, tc.rate, tc.writeCred, tc.opContext,
+			)
 			require.Equal(t, tc.expected, got)
 		})
 	}
+}
+
+func TestOperationRateLimitChecksAllBuckets(t *testing.T) {
+	resetAt := time.Date(2026, 5, 19, 14, 35, 0, 0, time.UTC)
+	restRate := rateLimitAvailability{
+		limited: true,
+		reason:  "github.com REST rate-limited",
+		retryAt: resetAt.UTC().Format(time.RFC3339),
+	}
+	graphQLRate := rateLimitAvailability{
+		limited: true,
+		reason:  "github.com GraphQL rate-limited",
+		retryAt: resetAt.Add(time.Minute).UTC().Format(time.RFC3339),
+	}
+	multiBucketOp := operationDescriptor{
+		bucket:       apiBucketREST,
+		extraBuckets: []apiBucket{apiBucketGraphQL},
+	}
+
+	assert.Equal(t, restRate, operationRateLimitForBuckets(multiBucketOp.rateLimitBuckets(), map[apiBucket]rateLimitAvailability{
+		apiBucketREST:    restRate,
+		apiBucketGraphQL: graphQLRate,
+	}))
+	assert.Equal(t, graphQLRate, operationRateLimitForBuckets(multiBucketOp.rateLimitBuckets(), map[apiBucket]rateLimitAvailability{
+		apiBucketGraphQL: graphQLRate,
+	}))
+	assert.Equal(t, []apiBucket{apiBucketREST}, descApplyReviewSuggestion.rateLimitBuckets())
 }
 
 func TestFormatRateLimit(t *testing.T) {
@@ -247,6 +319,7 @@ func TestRepoOperationsWireShape(t *testing.T) {
 		"update_content",
 		"reply_review_thread",
 		"resolve_review_thread",
+		"apply_review_suggestion",
 	}, tags)
 }
 
@@ -369,6 +442,185 @@ func TestAPIRepoResponseIncludesOperationsGraphQLPauseDoesNotBlockREST(t *testin
 	merge := resp.Operations.MergePR
 	assert.True(merge.Available, "merge_pr is REST-backed; GraphQL pause must not block it")
 	assert.Empty(merge.Code)
+}
+
+func TestAPIRepoResponseApplySuggestionRateBucketsFollowProvider(t *testing.T) {
+	resetAt := time.Now().UTC().Add(30 * time.Minute)
+
+	t.Run("github reports rest and graphql apply suggestion buckets", func(t *testing.T) {
+		require := require.New(t)
+		assert := assert.New(t)
+		database := dbtest.Open(t)
+		gqlRT := ghclient.NewRateTracker(database, "github.com", "graphql")
+		key := ratelimit.RateBucketKey("github", "github.com")
+		syncer := ghclient.NewSyncer(
+			map[string]ghclient.Client{"github.com": &mockGH{}},
+			database, nil,
+			[]ghclient.RepoRef{{Owner: "acme", Name: "widget", PlatformHost: "github.com"}},
+			time.Minute,
+			map[string]*ghclient.RateTracker{
+				key: ghclient.NewRateTracker(database, "github.com", "rest"),
+			},
+			nil,
+		)
+		syncer.SetFetchers(map[string]*ghclient.GraphQLFetcher{
+			"github.com": ghclient.NewGraphQLFetcherWithClient(nil, gqlRT),
+		})
+		t.Cleanup(syncer.Stop)
+		srv := New(database, syncer, nil, "/", nil, ServerOptions{})
+		t.Cleanup(func() { gracefulShutdown(t, srv) })
+
+		_, err := database.UpsertRepo(
+			t.Context(), db.GitHubRepoIdentity("github.com", "acme", "widget"),
+		)
+		require.NoError(err)
+		gqlRT.UpdateFromRate(ratelimit.Rate{Limit: 5000, Remaining: 0, Reset: resetAt})
+
+		rr := doJSON(t, srv, http.MethodGet, "/api/v1/repo/github/acme/widget", nil)
+		require.Equal(http.StatusOK, rr.Code)
+		var resp repoResponse
+		require.NoError(json.NewDecoder(rr.Body).Decode(&resp))
+
+		suggestion := resp.Operations.ApplyReviewSuggestion
+		assert.False(suggestion.Available)
+		assert.Equal(availabilityCodeRateLimited, suggestion.Code)
+	})
+
+	t.Run("provider without bucket hook keeps descriptor default", func(t *testing.T) {
+		require := require.New(t)
+		assert := assert.New(t)
+		database := dbtest.Open(t)
+		gqlRT := ghclient.NewPlatformRateTracker(database, "gitlab", "gitlab.example.com", "graphql")
+		provider := &apiTestGitLabProvider{
+			ref: platform.RepoRef{
+				Platform: platform.KindGitLab,
+				Host:     "gitlab.example.com",
+				Owner:    "group",
+				Name:     "project",
+				RepoPath: "group/project",
+			},
+			capabilities: &platform.Capabilities{
+				ReadRepositories:            true,
+				ReadMergeRequests:           true,
+				ReviewSuggestionApplication: true,
+				MutationHeadBinding:         true,
+				ReadReviewThreads:           true,
+			},
+		}
+		registry, err := platform.NewRegistry(provider)
+		require.NoError(err)
+		syncer := ghclient.NewSyncerWithRegistry(
+			registry, database, nil,
+			[]ghclient.RepoRef{{
+				Platform:     platform.KindGitLab,
+				PlatformHost: "gitlab.example.com",
+				Owner:        "group",
+				Name:         "project",
+				RepoPath:     "group/project",
+			}},
+			time.Minute,
+			nil,
+			nil,
+		)
+		syncer.SetFetchers(map[string]*ghclient.GraphQLFetcher{
+			"gitlab.example.com": ghclient.NewGraphQLFetcherWithClient(nil, gqlRT),
+		})
+		t.Cleanup(syncer.Stop)
+		srv := New(database, syncer, nil, "/", nil, ServerOptions{})
+		t.Cleanup(func() { gracefulShutdown(t, srv) })
+
+		_, err = database.UpsertRepo(t.Context(), db.RepoIdentity{
+			Platform:     "gitlab",
+			PlatformHost: "gitlab.example.com",
+			RepoPath:     "group/project",
+		})
+		require.NoError(err)
+		gqlRT.UpdateFromRate(ratelimit.Rate{Limit: 5000, Remaining: 0, Reset: resetAt})
+
+		rr := doJSON(
+			t, srv, http.MethodGet,
+			"/api/v1/host/gitlab.example.com/repo/gitlab/group/project", nil,
+		)
+		require.Equal(http.StatusOK, rr.Code)
+		var resp repoResponse
+		require.NoError(json.NewDecoder(rr.Body).Decode(&resp))
+
+		suggestion := resp.Operations.ApplyReviewSuggestion
+		assert.True(suggestion.Available)
+		assert.Empty(suggestion.Code)
+	})
+
+	assertInvalidProviderBuckets := func(t *testing.T, buckets []platform.RateLimitBucket) {
+		t.Helper()
+		require := require.New(t)
+		assert := assert.New(t)
+		database := dbtest.Open(t)
+		provider := &apiTestGitLabProvider{
+			ref: platform.RepoRef{
+				Platform: platform.KindGitLab,
+				Host:     "gitlab.example.com",
+				Owner:    "group",
+				Name:     "project",
+				RepoPath: "group/project",
+			},
+			capabilities: &platform.Capabilities{
+				ReadRepositories:            true,
+				ReadMergeRequests:           true,
+				ReviewSuggestionApplication: true,
+				MutationHeadBinding:         true,
+				ReadReviewThreads:           true,
+			},
+			rateLimitBuckets: map[platform.OperationName][]platform.RateLimitBucket{
+				platform.OperationApplyReviewSuggestion: buckets,
+			},
+		}
+		registry, err := platform.NewRegistry(provider)
+		require.NoError(err)
+		syncer := ghclient.NewSyncerWithRegistry(
+			registry, database, nil,
+			[]ghclient.RepoRef{{
+				Platform:     platform.KindGitLab,
+				PlatformHost: "gitlab.example.com",
+				Owner:        "group",
+				Name:         "project",
+				RepoPath:     "group/project",
+			}},
+			time.Minute,
+			nil,
+			nil,
+		)
+		t.Cleanup(syncer.Stop)
+		srv := New(database, syncer, nil, "/", nil, ServerOptions{})
+		t.Cleanup(func() { gracefulShutdown(t, srv) })
+
+		_, err = database.UpsertRepo(t.Context(), db.RepoIdentity{
+			Platform:     "gitlab",
+			PlatformHost: "gitlab.example.com",
+			RepoPath:     "group/project",
+		})
+		require.NoError(err)
+
+		rr := doJSON(
+			t, srv, http.MethodGet,
+			"/api/v1/host/gitlab.example.com/repo/gitlab/group/project", nil,
+		)
+		require.Equal(http.StatusOK, rr.Code)
+		var resp repoResponse
+		require.NoError(json.NewDecoder(rr.Body).Decode(&resp))
+
+		suggestion := resp.Operations.ApplyReviewSuggestion
+		assert.False(suggestion.Available)
+		assert.Equal(availabilityCodeRateLimited, suggestion.Code)
+		assert.Contains(suggestion.UnavailableReason, "invalid rate-limit buckets")
+	}
+
+	t.Run("empty provider bucket report fails closed", func(t *testing.T) {
+		assertInvalidProviderBuckets(t, []platform.RateLimitBucket{})
+	})
+
+	t.Run("unknown provider bucket report fails closed", func(t *testing.T) {
+		assertInvalidProviderBuckets(t, []platform.RateLimitBucket{platform.RateLimitBucket("restt")})
+	})
 }
 
 func TestAPIRepoResponseOperationsGateOnWriteTrackerWhenSplit(t *testing.T) {
@@ -540,10 +792,16 @@ func splitTestDescriptor(writeCandidate tokenauth.Candidate) tokenauth.Descripto
 func newSplitTestServer(
 	t *testing.T, writeCandidate tokenauth.Candidate,
 ) (*Server, *tokenauth.SourceSet) {
+	return newSplitTestServerWithMock(t, writeCandidate, &mockGH{})
+}
+
+func newSplitTestServerWithMock(
+	t *testing.T, writeCandidate tokenauth.Candidate, mock *mockGH,
+) (*Server, *tokenauth.SourceSet) {
 	t.Helper()
 	database := dbtest.Open(t)
 	syncer := ghclient.NewSyncer(
-		map[string]ghclient.Client{"github.com": &mockGH{}},
+		map[string]ghclient.Client{"github.com": mock},
 		database, nil,
 		[]ghclient.RepoRef{{Owner: "acme", Name: "widget", PlatformHost: "github.com"}},
 		time.Minute, nil, nil,
@@ -591,4 +849,57 @@ func TestAPIRepoResponseIncludesOperationsViewerCannotMerge(t *testing.T) {
 	// Other operations remain available because viewer_can_merge only
 	// gates merge_pr.
 	assert.True(resp.Operations.ClosePR.Available)
+}
+
+func TestAPIPullDetailOperationsDisableSelfApproval(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+
+	mock := &mockGH{
+		authenticatedViewerLoginFn: func(context.Context) (string, error) {
+			return "marius", nil
+		},
+	}
+	srv, database := setupTestServerWithMock(t, mock)
+	seedPR(t, database, "acme", "widget", 1, withSeedPRAuthor("marius"))
+
+	rr := doJSON(t, srv, http.MethodGet, "/api/v1/pulls/github/acme/widget/1", nil)
+	require.Equal(http.StatusOK, rr.Code)
+
+	var resp mergeRequestDetailResponse
+	require.NoError(json.NewDecoder(rr.Body).Decode(&resp))
+	require.NotNil(resp.Repo.Operations)
+
+	submitReview := resp.Repo.Operations.SubmitReview
+	assert.False(submitReview.Available)
+	assert.Equal(availabilityCodeSelfApproval, submitReview.Code)
+	assert.Equal("You cannot approve your own pull request", submitReview.UnavailableReason)
+	assert.True(resp.Repo.Operations.MergePR.Available)
+
+	rr = doJSON(t, srv, http.MethodGet, "/api/v1/pulls/github/acme/widget/1", nil)
+	require.Equal(http.StatusOK, rr.Code)
+	assert.Equal(1, mock.authenticatedViewerCalls,
+		"provider should cache the authenticated viewer login")
+}
+
+func TestAPIPullDetailOperationsSkipViewerLookupWhenSubmitReviewUnavailable(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+
+	t.Setenv("SPLIT_WRITE_CRED_PAT", "")
+	mock := &mockGH{}
+	srv, _ := newSplitTestServerWithMock(t, tokenauth.Candidate{
+		Kind: tokenauth.SourceKindEnv, EnvName: "SPLIT_WRITE_CRED_PAT",
+	}, mock)
+	seedPR(t, srv.db, "acme", "widget", 1, withSeedPRAuthor("marius"))
+
+	rr := doJSON(t, srv, http.MethodGet, "/api/v1/pulls/github/acme/widget/1", nil)
+	require.Equal(http.StatusOK, rr.Code, rr.Body.String())
+
+	var resp mergeRequestDetailResponse
+	require.NoError(json.NewDecoder(rr.Body).Decode(&resp))
+	require.NotNil(resp.Repo.Operations)
+	assert.Equal(availabilityCodeMissingWriteCredential, resp.Repo.Operations.SubmitReview.Code)
+	assert.Zero(mock.authenticatedViewerCalls,
+		"viewer lookup must not run when the write credential already blocks review submission")
 }

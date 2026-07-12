@@ -37,7 +37,7 @@ DEV_CLONE_PORT ?= 8092
 DEV_CLONE_FRONTEND_PORT ?= 5175
 
 .PHONY: ensure-embed-dir ensure-tmp-dir check-air air-install build build-release install \
-        rust-pty-manager rust-test vite-plus-install frontend-deps check-vite-plus-bin frontend githubapp-frontend frontend-dev frontend-dev-bun frontend-check api-generate roborev-api-generate \
+        rust-pty-manager rust-test vite-plus-install frontend-deps check-vite-plus-bin frontend githubapp-frontend frontend-dev frontend-dev-bun frontend-check frontend-check-no-deps api-generate roborev-api-generate \
         dev dev-ephemeral dev-ephemeral-stop test test-short test-integration test-e2e test-e2e-roborev test-fleet-container test-fleet-drive-container test-gitlab-container gitlab-fixture-bake vet lint nilaway testify-helper-check \
         frontend-api-client-check font-size-token-check huma-route-check playwright-version-check script-tests guardrail-check race-times tidy svelte-skills svelte-skills-sync clean install-hooks help \
         dev-clone-db frontend-dev-clone-db
@@ -153,11 +153,17 @@ frontend-dev-bun: frontend-deps
 
 # Run TypeScript/Svelte lint and type checks
 frontend-check: frontend-deps
+	$(MAKE) frontend-check-no-deps
+
+# Same checks without the bun install prerequisite. The pre-commit hook uses
+# this target because the priority-4 frontend-deps hook already installed
+# deps; running bun install again here would mutate node_modules while other
+# priority-10 Node hooks read it.
+frontend-check-no-deps: check-vite-plus-bin
 	$(VITE_PLUS_BIN) fmt --check frontend packages/ui packages/github-app-ui --no-error-on-unmatched-pattern --threads=1
 	$(VITE_PLUS_BIN) lint frontend packages/ui packages/github-app-ui '!frontend/dist/**' '!packages/github-app-ui/dist/**' '!frontend/test-results/**' '!packages/github-app-ui/test-results/**' '!packages/ui/src/api/generated/**' '!packages/ui/src/api/roborev/generated/**' --no-error-on-unmatched-pattern --threads=1
-	cd frontend && ../node_modules/.bin/svelte-check --tsconfig ./tsconfig.json --fail-on-warnings
-	cd packages/ui && ../../node_modules/.bin/svelte-check --tsconfig ./tsconfig.json --fail-on-warnings
-	cd packages/github-app-ui && ../../node_modules/.bin/svelte-check --tsconfig ./tsconfig.json --fail-on-warnings
+	cd frontend && node node_modules/@kenn-io/kit-ui/bin/kit-ui-check.mjs src ../packages/ui/src
+	$(VITE_PLUS_BIN) run svelte-check
 
 # Prevent production frontend code from bypassing generated API clients
 frontend-api-client-check: check-vite-plus-bin
@@ -191,9 +197,9 @@ guardrail-check: check-vite-plus-bin
 
 # Regenerate the checked-in OpenAPI document and generated clients
 api-generate: frontend-deps
-	set -e; tmp="$$(mktemp)"; trap 'rm -f "$$tmp"' EXIT; GOCACHE="$${GOCACHE:-/tmp/middleman-gocache}" go run ./cmd/middleman-openapi -out "$$tmp" -format yaml; if [ -f frontend/openapi/openapi.yaml ] && cmp -s "$$tmp" frontend/openapi/openapi.yaml; then rm "$$tmp"; else mv "$$tmp" frontend/openapi/openapi.yaml; fi; trap - EXIT
+	set -e; tmp="$$(mktemp)"; trap 'rm -f "$$tmp"' EXIT; go run ./cmd/middleman-openapi -out "$$tmp" -format yaml; if [ -f frontend/openapi/openapi.yaml ] && cmp -s "$$tmp" frontend/openapi/openapi.yaml; then rm "$$tmp"; else mv "$$tmp" frontend/openapi/openapi.yaml; fi; trap - EXIT
 	mkdir -p internal/apiclient/spec
-	set -e; tmp="$$(mktemp)"; trap 'rm -f "$$tmp"' EXIT; GOCACHE="$${GOCACHE:-/tmp/middleman-gocache}" go run ./cmd/middleman-openapi -out "$$tmp" -version 3.0 -format json; if [ -f internal/apiclient/spec/openapi.json ] && cmp -s "$$tmp" internal/apiclient/spec/openapi.json; then rm "$$tmp"; else mv "$$tmp" internal/apiclient/spec/openapi.json; fi; trap - EXIT
+	set -e; tmp="$$(mktemp)"; trap 'rm -f "$$tmp"' EXIT; go run ./cmd/middleman-openapi -out "$$tmp" -version 3.0 -format json; if [ -f internal/apiclient/spec/openapi.json ] && cmp -s "$$tmp" internal/apiclient/spec/openapi.json; then rm "$$tmp"; else mv "$$tmp" internal/apiclient/spec/openapi.json; fi; trap - EXIT
 	set -e; tmp="$$(mktemp)"; trap 'rm -f "$$tmp"' EXIT; node frontend/node_modules/openapi-typescript/bin/cli.js frontend/openapi/openapi.yaml --enum-values -o "$$tmp"; if [ -f packages/ui/src/api/generated/schema.ts ] && cmp -s "$$tmp" packages/ui/src/api/generated/schema.ts; then rm "$$tmp"; else mv "$$tmp" packages/ui/src/api/generated/schema.ts; fi; trap - EXIT
 	set -e; tmp="$$(mktemp)"; trap 'rm -f "$$tmp"' EXIT; printf '%s\n' \
 		'/**' \
@@ -208,7 +214,7 @@ api-generate: frontend-deps
 		'  return createClient<paths>({ baseUrl, ...options });' \
 		'}' \
 		> "$$tmp"; if [ -f packages/ui/src/api/generated/client.ts ] && cmp -s "$$tmp" packages/ui/src/api/generated/client.ts; then rm "$$tmp"; else mv "$$tmp" packages/ui/src/api/generated/client.ts; fi; trap - EXIT
-	set -e; tmp="$$(mktemp)"; trap 'rm -f "$$tmp"' EXIT; (cd internal/apiclient/generated && GOCACHE="$${GOCACHE:-/tmp/middleman-gocache}" go tool oapi-codegen --config config.yaml -o "$$tmp" ../spec/openapi.json); if [ -f internal/apiclient/generated/client.gen.go ] && cmp -s "$$tmp" internal/apiclient/generated/client.gen.go; then rm "$$tmp"; else mv "$$tmp" internal/apiclient/generated/client.gen.go; fi; trap - EXIT
+	set -e; tmp="$$(mktemp)"; trap 'rm -f "$$tmp"' EXIT; (cd internal/apiclient/generated && go tool oapi-codegen --config config.yaml -o "$$tmp" ../spec/openapi.json); if [ -f internal/apiclient/generated/client.gen.go ] && cmp -s "$$tmp" internal/apiclient/generated/client.gen.go; then rm "$$tmp"; else mv "$$tmp" internal/apiclient/generated/client.gen.go; fi; trap - EXIT
 
 # Regenerate roborev TypeScript client types from checked-in OpenAPI spec
 roborev-api-generate: frontend-deps
@@ -263,6 +269,13 @@ test: ensure-embed-dir ensure-tmp-dir
 # Run fast tests only
 test-short: ensure-embed-dir ensure-tmp-dir
 	$(GOTESTSUM)=tmp/test-short-output.json -- $(GO_TEST_P_FLAG) ./... -short -shuffle=on
+
+# Pre-commit lane for test-short. Deliberately no -shuffle=on: shuffle is not a
+# cacheable go-test flag, so it forces a full re-run of every package on every
+# commit. Unshuffled runs let unchanged packages hit the Go test result cache;
+# CI and make test/test-short keep shuffled ordering to catch test coupling.
+test-short-precommit: ensure-embed-dir ensure-tmp-dir
+	$(GOTESTSUM)=tmp/test-short-precommit-output.json -- $(GO_TEST_P_FLAG) ./... -short
 
 # Run integration tests that execute real git commands (excluded from test-short)
 test-integration: ensure-embed-dir ensure-tmp-dir
@@ -325,8 +338,7 @@ lint: ensure-embed-dir
 		echo "mise not found. Install with: brew install mise" >&2; \
 		exit 1; \
 	fi
-	GOCACHE="$${GOCACHE:-/tmp/middleman-gocache}" mise exec -- golangci-lint run --fix
-	GOFLAGS="$${GOFLAGS:+$$GOFLAGS }-buildvcs=false" go run ./cmd/testify-helper-check ./...
+	mise exec -- golangci-lint run --fix
 
 # Run NilAway against first-party Go packages
 nilaway: ensure-embed-dir

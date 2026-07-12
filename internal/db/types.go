@@ -3,6 +3,7 @@ package db
 import (
 	"cmp"
 	"encoding/base64"
+	"fmt"
 	"strings"
 	"time"
 )
@@ -350,6 +351,71 @@ type KanbanState struct {
 	UpdatedAt      time.Time
 }
 
+type ItemWorkflowState struct {
+	RepoID        int64
+	ItemType      string
+	ItemNumber    int
+	Status        string
+	UpdatedAt     time.Time
+	UpdatedSource string
+	UpdatedActor  string
+	UpdatedReason string
+}
+
+// WorkflowStateConflictError reports an expected-status mismatch on a
+// conditional workflow-state write. Current is the effective status at
+// write time; a missing row reads as "new".
+type WorkflowStateConflictError struct {
+	Expected string
+	Current  string
+}
+
+func (e *WorkflowStateConflictError) Error() string {
+	return fmt.Sprintf("workflow state is %q, expected %q", e.Current, e.Expected)
+}
+
+type SetItemWorkflowStateParams struct {
+	RepoID         int64
+	ItemType       string
+	ItemNumber     int
+	Status         string
+	ExpectedStatus string
+	Source         string
+	Actor          string
+	Reason         string
+}
+
+type ListWorkflowStatesOpts struct {
+	RepoFilters   []RepoFilter
+	ItemTypes     []string
+	States        []string
+	IncludeClosed bool
+	Limit         int
+	Cursor        string
+}
+
+type WorkflowStateListRow struct {
+	Platform       string
+	PlatformHost   string
+	Owner          string
+	Name           string
+	RepoPath       string
+	ItemType       string
+	Number         int
+	Title          string
+	State          string
+	URL            string
+	Author         string
+	IsDraft        bool
+	LastActivityAt time.Time
+	Status         string
+	HasRow         bool
+	UpdatedAt      *time.Time
+	UpdatedSource  string
+	UpdatedActor   string
+	UpdatedReason  string
+}
+
 type ListMergeRequestsOpts struct {
 	RepoID       int64
 	PlatformHost string
@@ -393,8 +459,9 @@ type Issue struct {
 	ClosedAt           *time.Time
 	DetailFetchedAt    *time.Time
 	Starred            bool
-	Labels             []Label  `json:"labels,omitempty"`
-	Assignees          []string `json:"assignees,omitempty"` // Parsed assignees
+	WorkflowStatus     KanbanStatus `enum:"new,reviewing,waiting,awaiting_merge"`
+	Labels             []Label      `json:"labels,omitempty"`
+	Assignees          []string     `json:"assignees,omitempty"` // Parsed assignees
 }
 
 type IssueEvent struct {
@@ -679,16 +746,25 @@ type Workspace struct {
 	KataMetadata    *WorkspaceKataMetadata
 }
 
-// WorkspaceSummary extends Workspace with joined MR metadata.
+// WorkspaceSummary extends Workspace with joined source-item metadata.
 type WorkspaceSummary struct {
 	Workspace
-	MRTitle            *string
-	MRState            *string
-	MRIsDraft          *bool
-	MRCIStatus         *string
-	MRReviewDecision   *string
-	MRAdditions        *int
-	MRDeletions        *int
+	SourceTitle      *string
+	SourceState      *string
+	SourceURL        *string
+	MRTitle          *string
+	MRState          *string
+	MRIsDraft        *bool
+	MRCIStatus       *string
+	MRReviewDecision *string
+	MRAdditions      *int
+	MRDeletions      *int
+	MRCommentCount   *int
+	MRMergeableState *string
+	// MRHeadBranch is the currently synced PR head branch, which can move
+	// after workspace creation (branch rename); prefer it over the
+	// creation-time GitHeadRef snapshot for push-target context.
+	MRHeadBranch       *string
 	ItemLastActivityAt *time.Time
 }
 

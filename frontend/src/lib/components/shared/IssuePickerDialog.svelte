@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { IssueSummary, KataAPI, IssueFilters, SearchScope } from "../../messages/types";
+  import { SearchInput } from "@kenn-io/kit-ui";
   import Modal from "./Modal.svelte";
 
   interface Props {
@@ -116,15 +117,15 @@
 
 <Modal {open} title="Link to task" {onClose}>
   <div class="picker">
-    <label class="picker-field">
+    <div class="picker-field">
       <span>Search tasks</span>
-      <input
-        type="search"
+      <SearchInput
         bind:value={query}
+        block
         placeholder="Title or qualified ID..."
-        autocomplete="off"
+        ariaLabel="Search tasks"
       />
-    </label>
+    </div>
     {#if loading}
       <div class="picker-state">Searching...</div>
     {:else if visible.length === 0}
@@ -132,6 +133,7 @@
         {query.trim() === "" ? "Type to search open tasks." : "No matches."}
       </div>
     {:else}
+      <!-- kit-ui-check-ignore: async search-results list inside a dialog, not a dropdown -->
       <ul class="picker-results" role="listbox" aria-label="Matching tasks">
         {#each visible as r (r.uid)}
           <li role="option" aria-selected={selected?.uid === r.uid}>
@@ -171,7 +173,7 @@
   .picker {
     display: flex;
     flex-direction: column;
-    gap: 10px;
+    gap: var(--space-4);
     min-width: min(360px, calc(100vw - 68px));
   }
 
@@ -189,20 +191,6 @@
     letter-spacing: 0.05em;
   }
 
-  .picker-field input {
-    width: 100%;
-    padding: 6px 8px;
-    border: 1px solid var(--border-default);
-    border-radius: var(--radius-sm);
-    background: var(--bg-surface);
-    color: var(--text-primary);
-    font-size: var(--font-size-sm);
-  }
-
-  .picker-field input:focus {
-    outline: 2px solid var(--accent-blue);
-    outline-offset: -1px;
-  }
 
   .picker-state {
     padding: 8px 10px;
@@ -285,7 +273,7 @@
   .picker-action.primary {
     background: var(--accent-blue);
     border-color: var(--accent-blue);
-    color: #ffffff;
+    color: var(--text-on-accent);
   }
 
   .picker-action.primary:hover:not(:disabled) {

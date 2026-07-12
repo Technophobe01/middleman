@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { EmptyState, Spinner } from "@kenn-io/kit-ui";
   import { onDestroy, type Snippet } from "svelte";
   import { getStores } from "../../context.js";
   import {
@@ -325,7 +326,7 @@
         </div>
       {/key}
     {:else}
-      <div class="empty-state">No linked PR</div>
+      <EmptyState title="No linked PR" />
     {/if}
   {:else if activeTab === "issue"}
     {#if hasIssue}
@@ -342,31 +343,26 @@
         </div>
       {/key}
     {:else}
-      <div class="empty-state">No linked issue</div>
+      <EmptyState title="No linked issue" />
     {/if}
   {:else if activeTab === "kata_task"}
     {#if hasKataTask && kataTaskPanel}
       {@render kataTaskPanel()}
     {:else}
-      <div class="empty-state">No linked Kata task</div>
+      <EmptyState title="No linked Kata task" />
     {/if}
   {:else if activeTab === "reviews"}
     {#if !hasRepo}
-      <div class="empty-state">
-        No reviews for this worktree
-      </div>
+      <EmptyState title="No reviews for this worktree" />
     {:else if repoResolutionError}
-      <div class="empty-state">
-        {repoResolutionError}
-      </div>
+      <EmptyState title={repoResolutionError} />
     {:else if resolvedRootPath === null && !negativeMatch}
-      <div class="empty-state">
+      <div class="loading-placeholder">
+        <Spinner size={14} label="Resolving repo" />
         Resolving repo...
       </div>
     {:else if negativeMatch}
-      <div class="empty-state">
-        No reviews for this worktree
-      </div>
+      <EmptyState title="No reviews for this worktree" />
     {:else}
       <SidebarStoreScope stores={sidebarStores}>
         <div class="sidebar-reviews" inert={disabled}>
@@ -387,6 +383,16 @@
 </div>
 
 <style>
+  .loading-placeholder {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--space-3);
+    padding: var(--space-8) var(--space-6);
+    color: var(--text-muted);
+    font-size: var(--font-size-md);
+  }
+
   .right-sidebar-content {
     display: flex;
     flex-direction: column;
@@ -398,17 +404,6 @@
   .pr-scroll {
     flex: 1;
     overflow-y: auto;
-  }
-
-  .empty-state {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    flex: 1;
-    color: var(--text-muted);
-    font-size: var(--font-size-sm);
-    padding: 24px;
-    text-align: center;
   }
 
   .sidebar-reviews {

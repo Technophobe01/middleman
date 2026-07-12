@@ -1,6 +1,6 @@
 <script lang="ts">
   import { getStores } from "../../context.js";
-  import FilterDropdown from "../shared/FilterDropdown.svelte";
+  import { FilterDropdown, SearchInput } from "@kenn-io/kit-ui";
   import RepoTreePicker from "./RepoTreePicker.svelte";
 
   interface Props {
@@ -63,10 +63,8 @@
     },
   ]);
 
-  function onSearchInput(
-    e: Event & { currentTarget: HTMLInputElement },
-  ): void {
-    searchValue = e.currentTarget.value;
+  function onSearchInput(value: string): void {
+    searchValue = value;
     clearTimeout(searchTimeout);
     searchTimeout = setTimeout(() => {
       jobsStore?.setFilter(
@@ -81,6 +79,15 @@
   ): void {
     jobsStore?.setFilter(
       "hideClosed",
+      e.currentTarget.checked,
+    );
+  }
+
+  function onShowAutoDesignChange(
+    e: Event & { currentTarget: HTMLInputElement },
+  ): void {
+    jobsStore?.setFilter(
+      "showAutoDesign",
       e.currentTarget.checked,
     );
   }
@@ -102,14 +109,17 @@
     {...statusDetail ? { detail: statusDetail } : {}}
   />
 
-  <input
-    class="search-input"
-    type="text"
-    placeholder="Search by ref..."
-    value={searchValue}
-    oninput={onSearchInput}
-    {disabled}
-  />
+  <div class="search-wrap">
+    <SearchInput
+      bind:value={searchValue}
+      size="sm"
+      block
+      placeholder="Search by ref..."
+      ariaLabel="Search by ref"
+      oninput={onSearchInput}
+      {disabled}
+    />
+  </div>
 
   <label class="hide-closed">
     <input
@@ -119,6 +129,16 @@
       {disabled}
     />
     Hide closed
+  </label>
+
+  <label class="hide-closed">
+    <input
+      type="checkbox"
+      checked={jobsStore?.getFilterShowAutoDesign() ?? false}
+      onchange={onShowAutoDesignChange}
+      {disabled}
+    />
+    Show auto-design
   </label>
 
   <button
@@ -142,25 +162,10 @@
     flex-wrap: wrap;
   }
 
-  .search-input {
-    padding: 4px 8px;
-    border: 1px solid var(--border-default);
-    border-radius: var(--radius-sm);
-    background: var(--bg-surface);
-    color: var(--text-primary);
-    font-size: var(--font-size-sm);
-    outline: none;
+  .search-wrap {
     min-width: 140px;
     flex: 1;
     max-width: 220px;
-  }
-
-  .search-input::placeholder {
-    color: var(--text-muted);
-  }
-
-  .search-input:focus {
-    border-color: var(--accent-blue);
   }
 
   .hide-closed {

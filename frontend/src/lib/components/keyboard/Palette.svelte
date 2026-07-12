@@ -4,7 +4,7 @@
   import { pushModalFrame } from "@middleman/ui/stores/keyboard/modal-stack";
   import type { ModalFrameAction } from "@middleman/ui/stores/keyboard/keyspec";
   import { getStores, ItemStateChip } from "@middleman/ui";
-  import { timeAgo } from "@middleman/ui/utils/time";
+  import { formatRelativeTime } from "@kenn-io/kit-ui";
   import type { Issue, PullRequest } from "@middleman/ui/api/types";
   import {
     buildIssueRoute,
@@ -440,6 +440,7 @@
     const focusable = (): HTMLElement[] =>
       Array.from(
         dialogEl!.querySelectorAll<HTMLElement>(
+          // kit-ui-check-ignore: palette-style actions move focus as their outcome; kit trapFocus restores pre-open focus on teardown, undoing the selected action
           "input, button, [tabindex]:not([tabindex='-1'])",
         ),
       ).filter((e) => !e.hasAttribute("disabled"));
@@ -665,7 +666,7 @@
             {pr.repo_owner}/{pr.repo_name} #{pr.Number}
           </div>
           {#if pr.UpdatedAt}
-            <div class="preview-meta">Updated {timeAgo(pr.UpdatedAt)}</div>
+            <div class="preview-meta">Updated {formatRelativeTime(pr.UpdatedAt)}</div>
           {/if}
           {#if pr.Body}
             <div class="preview-body">{bodyExcerpt(pr.Body)}</div>
@@ -683,7 +684,7 @@
             {issue.repo_owner}/{issue.repo_name} #{issue.Number}
           </div>
           {#if issue.UpdatedAt}
-            <div class="preview-meta">Updated {timeAgo(issue.UpdatedAt)}</div>
+            <div class="preview-meta">Updated {formatRelativeTime(issue.UpdatedAt)}</div>
           {/if}
           {#if issue.Body}
             <div class="preview-body">{bodyExcerpt(issue.Body)}</div>
@@ -719,7 +720,7 @@
             {ref.provider}{ref.platformHost ? ` · ${ref.platformHost}` : ""}
           </div>
           <div class="preview-meta">
-            Last used {timeAgo(highlighted.lastSelectedAt)}
+            Last used {formatRelativeTime(highlighted.lastSelectedAt)}
           </div>
           {#if loaded?.Body}
             <div class="preview-body">{bodyExcerpt(loaded.Body)}</div>
@@ -734,7 +735,7 @@
             {ref.provider}{ref.platformHost ? ` · ${ref.platformHost}` : ""}
           </div>
           <div class="preview-meta">
-            Last used {timeAgo(highlighted.lastSelectedAt)}
+            Last used {formatRelativeTime(highlighted.lastSelectedAt)}
           </div>
           {#if loaded?.Body}
             <div class="preview-body">{bodyExcerpt(loaded.Body)}</div>
@@ -753,9 +754,10 @@
 <style>
   .palette-backdrop {
     position: fixed;
+    /* kit-ui-check-ignore: command palette owns its overlay, query focus, and result keyboard model; a kit CommandPalette adoption is a separate migration */
     inset: 0;
-    background: rgba(0, 0, 0, 0.55);
-    z-index: 100;
+    background: var(--overlay-bg);
+    z-index: 90;
   }
 
   .palette {
@@ -773,7 +775,7 @@
     border: 1px solid var(--border-default);
     border-radius: 10px;
     box-shadow: var(--shadow-lg);
-    z-index: 101;
+    z-index: 91;
   }
 
   .palette-input {
@@ -814,7 +816,7 @@
     width: 100%;
     display: flex;
     align-items: baseline;
-    gap: 10px;
+    gap: var(--space-4);
     padding: 6px 16px;
     background: transparent;
     border: none;

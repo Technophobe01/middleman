@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	gitlab "gitlab.com/gitlab-org/api/client-go"
+	gitlab "gitlab.com/gitlab-org/api/client-go/v2"
 )
 
 // gitlabStatusError builds a *gitlab.ErrorResponse whose embedded request URL
@@ -17,7 +17,8 @@ import (
 // as the gitlab.ErrNotFound sentinel instead.
 func gitlabStatusError(host string, status int) *gitlab.ErrorResponse {
 	return &gitlab.ErrorResponse{
-		Message: "boom",
+		StatusCode: status,
+		Message:    "boom",
 		Response: &http.Response{
 			StatusCode: status,
 			Request: &http.Request{

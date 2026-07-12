@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	gh "github.com/google/go-github/v84/github"
+	gh "github.com/google/go-github/v88/github"
 	"github.com/shurcooL/githubv4"
 	"go.kenn.io/middleman/internal/tokenauth"
 )
@@ -47,6 +47,7 @@ type gqlPR struct {
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
 	MergedAt       *time.Time
+	MergedBy       *struct{ Login string }
 	ClosedAt       *time.Time
 	Additions      int
 	Deletions      int
@@ -390,6 +391,9 @@ func adaptPR(gql *gqlPR) *gh.PullRequest {
 		t := gh.Timestamp{Time: *gql.MergedAt}
 		pr.MergedAt = &t
 		pr.Merged = new(true)
+	}
+	if gql.MergedBy != nil {
+		pr.MergedBy = &gh.User{Login: new(gql.MergedBy.Login)}
 	}
 	if gql.ClosedAt != nil {
 		t := gh.Timestamp{Time: *gql.ClosedAt}

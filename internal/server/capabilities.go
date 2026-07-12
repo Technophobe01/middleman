@@ -8,23 +8,25 @@ import (
 )
 
 const (
-	capabilityCommentMutation        = "comment_mutation"
-	capabilityStateMutation          = "state_mutation"
-	capabilityMergeMutation          = "merge_mutation"
-	capabilityReviewMutation         = "review_mutation"
-	capabilityWorkflowApproval       = "workflow_approval"
-	capabilityReadyForReview         = "ready_for_review"
-	capabilityDraftMutation          = "draft_mutation"
-	capabilityIssueMutation          = "issue_mutation"
-	capabilityReadLabels             = "read_labels"
-	capabilityLabelMutation          = "label_mutation"
-	capabilityAssigneeMutation       = "assignee_mutation"
-	capabilityReviewerMutation       = "reviewer_mutation"
-	capabilityThreadReply            = "thread_reply"
-	capabilityThreadResolve          = "thread_resolve"
-	capabilityReviewDraftMutation    = "review_draft_mutation"
-	capabilityReviewThreadResolution = "review_thread_resolution"
-	capabilityReadReviewThreads      = "read_review_threads"
+	capabilityCommentMutation             = "comment_mutation"
+	capabilityStateMutation               = "state_mutation"
+	capabilityMergeMutation               = "merge_mutation"
+	capabilityReviewMutation              = "review_mutation"
+	capabilityWorkflowApproval            = "workflow_approval"
+	capabilityReadyForReview              = "ready_for_review"
+	capabilityDraftMutation               = "draft_mutation"
+	capabilityIssueMutation               = "issue_mutation"
+	capabilityReadLabels                  = "read_labels"
+	capabilityLabelMutation               = "label_mutation"
+	capabilityAssigneeMutation            = "assignee_mutation"
+	capabilityReviewerMutation            = "reviewer_mutation"
+	capabilityThreadReply                 = "thread_reply"
+	capabilityThreadResolve               = "thread_resolve"
+	capabilityReviewDraftMutation         = "review_draft_mutation"
+	capabilityReviewThreadResolution      = "review_thread_resolution"
+	capabilityReviewSuggestionApplication = "review_suggestion_application"
+	capabilityReadReviewThreads           = "read_review_threads"
+	capabilityMutationHeadBinding         = "mutation_head_binding"
 )
 
 func capabilityEnabled(
@@ -64,8 +66,12 @@ func capabilityEnabled(
 		return caps.ReviewDraftMutation
 	case capabilityReviewThreadResolution:
 		return caps.ReviewThreadResolution
+	case capabilityReviewSuggestionApplication:
+		return caps.ReviewSuggestionApplication
 	case capabilityReadReviewThreads:
 		return caps.ReadReviewThreads
+	case capabilityMutationHeadBinding:
+		return caps.MutationHeadBinding
 	default:
 		return false
 	}

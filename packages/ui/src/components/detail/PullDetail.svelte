@@ -20,9 +20,10 @@
   import { renderMarkdown, renderMarkdownSync } from "../../utils/markdown.js";
   import { buildPullRequestFilesRoute } from "../../routes.js";
   import { moveTaskListItem, toggleTaskListItem } from "../../utils/task-list.js";
+  import type { ApplySuggestionRequest } from "../../utils/markdown-suggestions.js";
   import { firstUnavailableGate, operationGate } from "./operation-gates.js";
-  import { timeAgo } from "../../utils/time.js";
-  import { copyToClipboard } from "../../utils/clipboard.js";
+  import { CopyButton, formatRelativeTime } from "@kenn-io/kit-ui";
+  import { copyToClipboard } from "@kenn-io/kit-ui";
   import EventTimeline from "./EventTimeline.svelte";
   import DetailActivityViewMenu from "./DetailActivityViewMenu.svelte";
   import CommentBox from "./CommentBox.svelte";
@@ -35,9 +36,9 @@
     runOpenMerge,
     type PRDetailActionInput,
   } from "./keyboard-actions.js";
-  import ActionButton from "../shared/ActionButton.svelte";
-  import SelectDropdown from "../shared/SelectDropdown.svelte";
+    import { SelectDropdown } from "@kenn-io/kit-ui";
   import ChevronDownIcon from "@lucide/svelte/icons/chevron-down";
+  import ClockIcon from "@lucide/svelte/icons/clock";
   import GitMergeIcon from "@lucide/svelte/icons/git-merge";
   import MonitorUpIcon from "@lucide/svelte/icons/monitor-up";
   import PackagePlusIcon from "@lucide/svelte/icons/package-plus";
@@ -46,8 +47,9 @@
   import UserCheckIcon from "@lucide/svelte/icons/user-check";
   import UsersIcon from "@lucide/svelte/icons/users";
   import XIcon from "@lucide/svelte/icons/x";
-  import Chip from "../shared/Chip.svelte";
-  import GitHubLabels from "../shared/GitHubLabels.svelte";
+  import { Button, Chip } from "@kenn-io/kit-ui";
+  import { Spinner } from "@kenn-io/kit-ui";
+  import LabelRow from "../shared/LabelRow.svelte";
   import LabelPicker from "./LabelPicker.svelte";
   import UserListEditor from "./UserListEditor.svelte";
   import { loadLabelCatalogWithRefresh } from "./labelCatalogRefresh.js";
@@ -57,7 +59,7 @@
     type OpenLabelPickerDetail,
   } from "./labelPickerCommand.js";
   import { nextCatalogLabelNames } from "./labelSelection.js";
-  import { floatingPopoverStyle } from "../shared/floatingPosition.js";
+  import { floatingPopoverStyle } from "@kenn-io/kit-ui";
   import DiffFilesLayout from "../diff/DiffFilesLayout.svelte";
   import { reviewThreadsFromEvents } from "../diff/review-thread-context.js";
   import {
@@ -118,6 +120,7 @@
     thread_resolve: false,
     review_draft_mutation: false,
     review_thread_resolution: false,
+    review_suggestion_application: false,
     read_review_threads: false,
     native_multiline_ranges: false,
     mutation_head_binding: false,
@@ -273,6 +276,12 @@
     if (stalePR) return false;
     if (event.PlatformID === null) return false;
     return detailStore.editComment(owner, name, number, event.PlatformID, body);
+  }
+
+  async function applyTimelineSuggestion(input: ApplySuggestionRequest): Promise<boolean> {
+    if (stalePR || headActionsBlocked || applySuggestionGate.unavailable) return false;
+    if (currentPR()?.State !== "open") return false;
+    return detailStore.applyReviewSuggestions(owner, name, number, input);
   }
 
   function updateTimelineFilter(next: PRTimelineFilterState): void {
@@ -456,20 +465,6 @@
     clearDragState();
   });
 
-  let copied = $state(false);
-  let copyTimeout: ReturnType<typeof setTimeout> | null = null;
-
-  function copyBody(text: string): void {
-    void copyToClipboard(text).then((ok) => {
-      if (!ok) return;
-      copied = true;
-      if (copyTimeout !== null) clearTimeout(copyTimeout);
-      copyTimeout = setTimeout(() => {
-        copied = false;
-        copyTimeout = null;
-      }, 1500);
-    });
-  }
 
   let copiedBranch = $state<string | null>(null);
   let branchCopyTimeout: ReturnType<typeof setTimeout> | null
@@ -696,6 +691,12 @@
     (detailStore.getDetail()?.repo?.capabilities?.mutation_head_binding ?? false)
       && detailHeadSha === "",
   );
+  // A background "merge after CI" worker is waiting on this PR. The merge
+  // action is replaced by a queued indicator until the worker reports
+  // completion (deferred_merge_completed refreshes the detail).
+  const deferredMergePending = $derived(
+    detailStore.getDetail()?.deferred_merge_pending ?? false,
+  );
 
   function handleHeadConflict(
     reason: "stale_state" | "head_unknown",
@@ -761,6 +762,7 @@
   const contentGate = $derived(operationGate(repoOperations?.update_content));
   const replyThreadGate = $derived(operationGate(repoOperations?.reply_review_thread));
   const resolveThreadGate = $derived(operationGate(repoOperations?.resolve_review_thread));
+  const applySuggestionGate = $derived(operationGate(repoOperations?.apply_review_suggestion));
 
   const kanbanOptions: { value: KanbanStatus; label: string }[] = [
     { value: "new", label: "New" },
@@ -1399,6 +1401,40 @@
       (data?.files ?? []) as DiffFile[],
     );
   }
+  // Body-copy feedback is parent-controlled: the kit CopyButton's internal
+  // copied state is not observable from CSS, and the reveal-on-hover wrap
+  // must keep the button visible for the whole copied window even after
+  // the pointer leaves.
+  let bodyCopied = $state(false);
+  let bodyCopiedTimeout: ReturnType<typeof setTimeout> | null = null;
+  let bodyCopySeq = 0;
+
+  function copyBody(text: string): void {
+    const seq = bodyCopySeq;
+    void copyToClipboard(text).then((ok) => {
+      // A copy started on a previous item must not surface feedback on
+      // the one now displayed; the reset effect bumps the token.
+      if (!ok || seq !== bodyCopySeq) return;
+      bodyCopied = true;
+      if (bodyCopiedTimeout !== null) clearTimeout(bodyCopiedTimeout);
+      bodyCopiedTimeout = setTimeout(() => {
+        bodyCopied = false;
+        bodyCopiedTimeout = null;
+      }, 1500);
+    });
+  }
+
+  $effect(() => {
+    // The component is reused across item navigation; the copied feedback
+    // (and its pending reset timer) belongs to the item it was copied from.
+    void [provider, platformHost, owner, name, number];
+    bodyCopySeq++;
+    if (bodyCopiedTimeout !== null) {
+      clearTimeout(bodyCopiedTimeout);
+      bodyCopiedTimeout = null;
+    }
+    bodyCopied = false;
+  });
 </script>
 
 <svelte:window onkeydown={onActionMenuKeydown} />
@@ -1476,7 +1512,7 @@
             class:pull-detail-content--has-compact-actions={pr.State !== "merged" && !stalePR}
           >
             {#snippet labelActionButton(iconSize = 16)}
-              <ActionButton
+              <Button
                 class="btn--labels"
                 label="Labels"
                 shortLabel="Labels"
@@ -1488,7 +1524,7 @@
                 onclick={openLabelPicker}
               >
                 <TagsIcon size={iconSize} aria-hidden="true" />
-              </ActionButton>
+              </Button>
             {/snippet}
 
       {#if detailStore.isStaleRefreshing()}
@@ -1582,7 +1618,7 @@
         <span class="meta-sep">·</span>
         <span class="meta-item">{pr.Author}</span>
         <span class="meta-sep">·</span>
-        <span class="meta-item">{timeAgo(pr.CreatedAt)}</span>
+        <span class="meta-item">{formatRelativeTime(pr.CreatedAt)}</span>
         {#if pr.HeadBranch}
           <span class="meta-sep meta-sep--branch">·</span>
           <span class="meta-branch">
@@ -1607,9 +1643,7 @@
         {#if detailStore.isDetailSyncing()}
           <span class="meta-sep meta-sep--sync">·</span>
           <span class="sync-indicator" title="Syncing from GitHub">
-            <svg class="sync-spinner" width="12" height="12" viewBox="0 0 16 16" fill="none">
-              <circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="2" stroke-dasharray="28" stroke-dashoffset="8" stroke-linecap="round"/>
-            </svg>
+            <Spinner size={12} label="Syncing" />
             Syncing
           </span>
         {/if}
@@ -1621,25 +1655,26 @@
           {@const markDraftGate = operationGate(repoOperations?.mark_draft)}
           {@const canOpenStateMenu = pr.State === "open" && !pr.IsDraft && capabilities.draft_mutation}
           <span class="state-menu-wrap" bind:this={stateMenuWrapEl}>
-            <Chip
-              class={visiblePRState(pr) === "merged"
-                ? "chip--purple"
+            {#snippet stateChevron()}
+              <ChevronDownIcon size="12" strokeWidth="2.2" aria-hidden="true" />
+            {/snippet}
+            <Chip size="sm"
+              tone={visiblePRState(pr) === "merged"
+                ? "merged"
                 : visiblePRState(pr) === "closed"
-                  ? "chip--red"
+                  ? "danger"
                   : visiblePRState(pr) === "draft"
-                    ? "chip--amber"
-                    : "chip--green"}
+                    ? "warning"
+                    : "success"}
               interactive={canOpenStateMenu}
               disabled={stateSubmitting || stalePR || markDraftGate.unavailable}
               expanded={canOpenStateMenu ? stateMenuOpen : undefined}
               title={markDraftGate.unavailable ? markDraftGate.reason : undefined}
               ariaLabel={canOpenStateMenu ? `State: ${stateLabel}` : undefined}
               onclick={canOpenStateMenu ? toggleStateMenu : undefined}
+              trailing={canOpenStateMenu ? stateChevron : undefined}
             >
               {stateLabel}
-              {#if canOpenStateMenu}
-                <ChevronDownIcon size="12" strokeWidth="2.2" aria-hidden="true" />
-              {/if}
             </Chip>
             {#if canOpenStateMenu && stateMenuOpen}
               <div class="state-menu" role="menu" aria-label="Pull request state">
@@ -1658,7 +1693,7 @@
           </span>
         {/if}
         {#if pr.IsLocked && lockedSupported}
-          <Chip class="chip--amber" title="This pull request is locked">Locked</Chip>
+          <Chip size="sm" tone="warning" title="This pull request is locked">Locked</Chip>
         {/if}
         <CIStatus
           status={pr.CIStatus}
@@ -1704,11 +1739,9 @@
           />
         {/if}
         {#if hasWorktreeLinks}
-          <Chip class="chip--teal">Worktree</Chip>
+          <Chip size="sm" tone="workspace">Worktree</Chip>
         {/if}
-        {#if labels.length > 0}
-          <GitHubLabels {labels} mode="full" />
-        {/if}
+        <LabelRow {labels} />
         {#if capabilities.read_labels && capabilities.label_mutation}
           <div class="label-editor-anchor label-editor-anchor--inline">
             {@render labelActionButton()}
@@ -1747,7 +1780,21 @@
           {#if labelPickerLaunchedFromActionMenu}
             <div class="label-editor-backdrop" aria-hidden="true"></div>
           {/if}
-          <div class="label-editor-popover" style={labelPickerStyle} bind:this={labelPickerPopover}>
+          <!-- Escape precedence: a non-empty filter claims Escape to clear itself
+               (kit SearchInput stops propagation); only an empty-field Escape
+               bubbles here and dismisses the picker. -->
+          <div
+            class="label-editor-popover"
+            style={labelPickerStyle}
+            bind:this={labelPickerPopover}
+            role="presentation"
+            onkeydown={(event) => {
+              if (event.key === "Escape") {
+                event.stopPropagation();
+                closeLabelPicker();
+              }
+            }}
+          >
             <LabelPicker
               catalogLabels={labelCatalog}
               selectedLabels={labels}
@@ -1894,9 +1941,11 @@
                 ? "The reviewed head commit has not been synced yet; merging is disabled until the next sync records it"
                 : mergeOpUnavailable
                   ? mergeOp?.unavailable_reason ?? ""
-                  : ""}
-            <ActionButton
-              class="btn--merge"
+                  : deferredMergePending
+                    ? "A background merge is queued to run if its pending CI checks pass. Click to merge immediately; close the pull request to cancel."
+                    : ""}
+            <Button
+              class={deferredMergePending ? "btn--merge btn--merge-queued" : "btn--merge"}
               disabled={stalePR || mergeDisabledByConflicts || mergeOpUnavailable || headActionsBlocked || headPinMissing}
               title={mergeTitle}
               onclick={() => {
@@ -1904,22 +1953,26 @@
                 runOpenMerge(buildOpenMergeInput(pr, capabilities));
               }}
               tone="success"
-              surface="solid"
+              surface={deferredMergePending ? "soft" : "solid"}
               size="sm"
-              label={mergeActionLabel(mergeSettings)}
-              shortLabel={mergeActionShortLabel(mergeSettings)}
+              label={deferredMergePending ? "Merge queued" : mergeActionLabel(mergeSettings)}
+              shortLabel={deferredMergePending ? "Queued" : mergeActionShortLabel(mergeSettings)}
             >
-              <GitMergeIcon size="14" strokeWidth="2.2" aria-hidden="true" />
+              {#if deferredMergePending}
+                <ClockIcon size="14" strokeWidth="2.2" aria-hidden="true" />
+              {:else}
+                <GitMergeIcon size="14" strokeWidth="2.2" aria-hidden="true" />
+              {/if}
               {#snippet trailing()}
-                {#if mergeActionHasMenu(mergeSettings)}
+                {#if !deferredMergePending && mergeActionHasMenu(mergeSettings)}
                   <ChevronDownIcon size="13" strokeWidth="2.2" aria-hidden="true" />
                 {/if}
               {/snippet}
-            </ActionButton>
+            </Button>
           {/if}
           {#if capabilities.state_mutation}
             {@const closeGate = operationGate(repoOperations?.close_pr)}
-            <ActionButton
+            <Button
               class="btn--close"
               disabled={stateSubmitting || stalePR || closeGate.unavailable}
               title={closeGate.unavailable ? closeGate.reason : undefined}
@@ -1935,12 +1988,12 @@
               shortLabel={stateSubmitting ? "Closing..." : "Close"}
             >
               <XIcon size="14" strokeWidth="2.2" aria-hidden="true" />
-            </ActionButton>
+            </Button>
           {/if}
         {:else if pr.State === "closed"}
           {#if capabilities.state_mutation}
             {@const reopenGate = operationGate(repoOperations?.reopen_pr)}
-            <ActionButton
+            <Button
               class="btn--reopen"
               disabled={stateSubmitting || stalePR || reopenGate.unavailable}
               title={reopenGate.unavailable ? reopenGate.reason : undefined}
@@ -1956,14 +2009,14 @@
               shortLabel={stateSubmitting ? "Reopening..." : "Reopen"}
             >
               <RefreshCwIcon size="14" strokeWidth="2.2" aria-hidden="true" />
-            </ActionButton>
+            </Button>
           {/if}
         {/if}
       {/snippet}
 
       {#snippet workspaceActionButton()}
         {#if workspace}
-          <ActionButton
+          <Button
             class="btn--workspace"
             disabled={stalePR}
             onclick={() => {
@@ -1978,9 +2031,9 @@
             shortLabel="Workspace"
           >
             <MonitorUpIcon size="14" strokeWidth="2.2" aria-hidden="true" />
-          </ActionButton>
+          </Button>
         {:else}
-          <ActionButton
+          <Button
             class="btn--workspace"
             disabled={wsCreating || stalePR}
             onclick={() => void createWorkspace()}
@@ -1995,13 +2048,13 @@
             shortLabel={wsCreating ? "Creating..." : "Create Workspace"}
           >
             <PackagePlusIcon size="14" strokeWidth="2.2" aria-hidden="true" />
-          </ActionButton>
+          </Button>
         {/if}
       {/snippet}
 
       <!-- Approve / Merge / Close / Reopen actions -->
       {#if !workspace}
-        <span id={createWorkspaceDescriptionId} class="sr-only">
+        <span id={createWorkspaceDescriptionId} class="kit-sr-only">
           {stalePR ? "Refresh details before creating a workspace." : createWorkspaceTitle}
         </span>
       {/if}
@@ -2078,7 +2131,7 @@
 
       {#if !hasWorktreeLinks && importAction}
         <div class="actions-row">
-          <ActionButton
+          <Button
             class="btn--embedding-action"
             onclick={() => {
               if (stalePR) return;
@@ -2092,13 +2145,13 @@
             size="sm"
           >
             {importAction.label}
-          </ActionButton>
+          </Button>
         </div>
       {/if}
       {#if hasWorktreeLinks && navigateAction}
         <div class="actions-row">
           {#each worktreeLinks as link (link.worktree_key)}
-            <ActionButton
+            <Button
               class="btn--embedding-action"
               onclick={() => {
                 if (stalePR) return;
@@ -2116,14 +2169,14 @@
               size="sm"
             >
               {navigateAction.label}: {link.worktree_key}
-            </ActionButton>
+            </Button>
           {/each}
         </div>
       {/if}
       {#if otherActions.length > 0}
         <div class="actions-row">
           {#each otherActions as action (action.id)}
-            <ActionButton
+            <Button
               class="btn--embedding-action"
               onclick={() => {
                 if (stalePR) return;
@@ -2137,7 +2190,7 @@
               size="sm"
             >
               {action.label}
-            </ActionButton>
+            </Button>
           {/each}
         </div>
       {/if}
@@ -2162,8 +2215,19 @@
           expectedHeadSha={detailHeadSha}
           requireHeadPin={capabilities.mutation_head_binding}
           deferUntilChecksPass={shouldDeferMergeForCI(p.CIStatus, p.CIChecksJSON)}
+          alreadyQueued={deferredMergePending}
           onheadconflict={handleHeadConflict}
           onclose={() => { showMergeModal = false; }}
+          onqueued={() => {
+            showMergeModal = false;
+            // Pick up deferred_merge_pending so the merge action renders
+            // as queued until the background worker completes.
+            void detailStore.refreshDetailOnly(owner, name, number, {
+              provider,
+              platformHost,
+              repoPath,
+            });
+          }}
           onmerged={() => {
             showMergeModal = false;
             headConflict = null;
@@ -2224,23 +2288,16 @@
           </div>
         {:else if pr.Body}
           <div class="inset-box-wrap">
-            <button
-              class="copy-icon-btn"
-              class:copied
+            <CopyButton
+              class={bodyCopied ? "body-copy body-copy--copied" : "body-copy"}
+              copied={bodyCopied}
               onclick={() => copyBody(pr.Body)}
-              title={copied ? "Copied!" : "Copy to clipboard"}
-            >
-              {#if copied}
-                <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
-                  <path d="M13.78 4.22a.75.75 0 010 1.06l-7.25 7.25a.75.75 0 01-1.06 0L2.22 9.28a.75.75 0 011.06-1.06L6 10.94l6.72-6.72a.75.75 0 011.06 0z"/>
-                </svg>
-              {:else}
-                <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
-                  <path d="M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 010 1.5h-1.5a.25.25 0 00-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 00.25-.25v-1.5a.75.75 0 011.5 0v1.5A1.75 1.75 0 019.25 16h-7.5A1.75 1.75 0 010 14.25v-7.5z"/>
-                  <path d="M5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0114.25 11h-7.5A1.75 1.75 0 015 9.25v-7.5zm1.75-.25a.25.25 0 00-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 00.25-.25v-7.5a.25.25 0 00-.25-.25h-7.5z"/>
-                </svg>
-              {/if}
-            </button>
+              revealOnHover
+              ariaLabel="Copy to clipboard"
+              copiedAriaLabel="Copied!"
+              title="Copy to clipboard"
+              copiedTitle="Copied!"
+            />
             <!-- svelte-ignore a11y_click_events_have_key_events -->
             <!-- svelte-ignore a11y_no_static_element_interactions -->
             <div
@@ -2307,6 +2364,7 @@
             repoName={name}
             {repoPath}
             {number}
+            currentHeadSHA={latestPlatformHeadSha}
             canResolveReviewThreads={capabilities.review_thread_resolution && !resolveThreadGate.unavailable}
             canReplyToThreads={capabilities.thread_reply && !stalePR && !replyThreadGate.unavailable}
             filtered={hasActiveTimelineFilters}
@@ -2315,13 +2373,18 @@
             onEditComment={capabilities.comment_mutation && !stalePR && !editCommentGate.unavailable
               ? editTimelineComment
               : undefined}
+            onApplySuggestion={capabilities.review_suggestion_application
+              && !stalePR
+              && pr.State === "open"
+              && !headActionsBlocked
+              && !applySuggestionGate.unavailable
+                ? applyTimelineSuggestion
+                : undefined}
             {jumpToReviewThread}
           />
         {:else if detailStore.isDetailSyncing()}
           <div class="loading-placeholder">
-            <svg class="sync-spinner" width="14" height="14" viewBox="0 0 16 16" fill="none">
-              <circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="2" stroke-dasharray="28" stroke-dashoffset="8" stroke-linecap="round"/>
-            </svg>
+            <Spinner size={14} label="Syncing" />
             Loading discussion...
           </div>
         {:else}
@@ -2381,6 +2444,21 @@
     width: 100%;
   }
 
+  /* Wrap long lines inside fenced code blocks at all widths. The detail
+     panel clips horizontal overflow (overflow-x: hidden above), so an
+     unwrapped <pre> line in a PR body or comment gets cut off; this view
+     also renders in the desktop-width yet equally narrow workspace
+     sidebar. Scope to <pre> only -- white-space/overflow-wrap/word-break
+     all inherit to the inner <code> -- so inline code keeps the
+     table-cell reset in app.css that lets wide tables scroll instead of
+     squeezing columns. */
+  .pull-detail :global(.markdown-body pre) {
+    max-width: 100%;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+
   .pull-detail-content {
     container: pull-detail / inline-size;
     display: flex;
@@ -2402,22 +2480,23 @@
 
   .label-editor-backdrop {
     position: fixed;
+    /* kit-ui-check-ignore: dimmed click-catcher behind the label-editor popover, not a dialog surface */
     inset: 0;
     z-index: 55;
-    background: rgba(128, 128, 128, 0.3);
+    background: var(--overlay-bg);
   }
 
   .detail-header {
     position: relative;
     display: flex;
     align-items: flex-start;
-    gap: 10px;
+    gap: var(--space-4);
   }
 
   .title-line {
     display: flex;
     align-items: flex-start;
-    gap: 10px;
+    gap: var(--space-4);
     flex: 1;
     min-width: 0;
   }
@@ -2476,7 +2555,7 @@
 
   .title-edit-save {
     background: var(--accent-blue);
-    color: #fff;
+    color: var(--text-on-accent);
     border: none;
   }
 
@@ -2559,18 +2638,10 @@
     color: var(--accent-blue);
   }
 
-  .sync-spinner {
-    animation: spin 1s linear infinite;
-  }
-
-  @keyframes spin {
-    to { transform: rotate(360deg); }
-  }
-
   .meta-branch {
     display: inline-flex;
     align-items: center;
-    gap: 3px;
+    gap: var(--space-1);
     font-size: var(--font-size-sm);
   }
 
@@ -2614,7 +2685,7 @@
     font-size: var(--font-size-2xs);
     font-weight: 600;
     letter-spacing: 0.02em;
-    color: #fff;
+    color: var(--text-on-accent);
     background: var(--accent-green);
     padding: 2px 8px;
     border-radius: 4px;
@@ -2661,7 +2732,7 @@
     border: 1px solid var(--border-default);
     border-radius: var(--radius-md, 8px);
     background: var(--bg-surface);
-    box-shadow: 0 12px 30px rgba(0, 0, 0, 0.18);
+    box-shadow: var(--shadow-lg);
   }
 
   .state-menu-item {
@@ -2714,19 +2785,19 @@
     display: none;
   }
 
-  :global(.kanban-select--new .select-dropdown-trigger) {
+  :global(.kanban-select--new .kit-select-dropdown__trigger) {
     color: var(--kanban-new);
   }
 
-  :global(.kanban-select--reviewing .select-dropdown-trigger) {
+  :global(.kanban-select--reviewing .kit-select-dropdown__trigger) {
     color: var(--accent-amber);
   }
 
-  :global(.kanban-select--waiting .select-dropdown-trigger) {
+  :global(.kanban-select--waiting .kit-select-dropdown__trigger) {
     color: var(--accent-purple);
   }
 
-  :global(.kanban-select--awaiting-merge .select-dropdown-trigger) {
+  :global(.kanban-select--awaiting-merge .kit-select-dropdown__trigger) {
     color: var(--accent-green);
   }
 
@@ -2766,7 +2837,7 @@
     min-width: 0;
   }
 
-  .actions-row :global(.action-button) {
+  .actions-row :global(.kit-button) {
     max-width: 100%;
   }
 
@@ -2775,8 +2846,8 @@
     min-width: 0;
   }
 
-  .actions-row :global(.action-button__label),
-  .actions-row :global(.action-button__short-label) {
+  .actions-row :global(.kit-button__label),
+  .actions-row :global(.kit-button__short-label) {
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -2828,10 +2899,10 @@
     border: 1px solid var(--border-default);
     border-radius: var(--radius-md, 8px);
     background: var(--bg-surface);
-    box-shadow: 0 12px 30px rgba(0, 0, 0, 0.18);
+    box-shadow: var(--shadow-lg);
   }
 
-  .actions-menu-popover :global(.action-button) {
+  .actions-menu-popover :global(.kit-button) {
     width: 100%;
     justify-content: flex-start;
   }
@@ -2869,7 +2940,7 @@
     flex-wrap: wrap;
   }
 
-  .actions-menu-popover :global(.action-button__short-label) {
+  .actions-menu-popover :global(.kit-button__short-label) {
     display: none;
   }
 
@@ -2884,13 +2955,13 @@
   }
 
   @container pull-detail (max-width: 520px) {
-    .actions-row--primary :global(.action-button__label),
-    .actions-row--workspace :global(.action-button__label) {
+    .actions-row--primary :global(.kit-button__label),
+    .actions-row--workspace :global(.kit-button__label) {
       display: none;
     }
 
-    .actions-row--primary :global(.action-button__short-label),
-    .actions-row--workspace :global(.action-button__short-label) {
+    .actions-row--primary :global(.kit-button__short-label),
+    .actions-row--workspace :global(.kit-button__short-label) {
       display: inline;
     }
   }
@@ -2923,18 +2994,6 @@
   .action-error--workspace-compact {
     display: block;
     margin-top: 6px;
-  }
-
-  .sr-only {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    padding: 0;
-    margin: -1px;
-    overflow: hidden;
-    clip: rect(0, 0, 0, 0);
-    white-space: nowrap;
-    border: 0;
   }
 
   .section {
@@ -2976,46 +3035,19 @@
     position: relative;
   }
 
-  .copy-icon-btn {
+  /* Kit CopyButton owns size, hover, active, copied icon, and the
+     touch always-visible rule; the wrap positions it and reveals it on
+     hover (kit's --reveal only self-reveals on focus-visible). */
+  .inset-box-wrap :global(.kit-copy-btn.body-copy) {
     position: absolute;
     top: 6px;
     right: 6px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 26px;
-    height: 26px;
-    border-radius: var(--radius-sm);
-    color: var(--text-muted);
-    opacity: 0;
-    transition: opacity 0.15s, background 0.15s, color 0.15s;
     z-index: 1;
   }
 
-  .inset-box-wrap:hover .copy-icon-btn,
-  .copy-icon-btn:focus-visible {
+  .inset-box-wrap:hover :global(.kit-copy-btn.body-copy),
+  .inset-box-wrap :global(.kit-copy-btn.body-copy--copied) {
     opacity: 1;
-  }
-
-  .copy-icon-btn:hover {
-    background: var(--bg-surface-hover);
-    color: var(--text-secondary);
-  }
-
-  .copy-icon-btn:active {
-    transform: scale(0.92);
-  }
-
-  .copy-icon-btn.copied {
-    opacity: 1;
-    color: var(--accent-green);
-    background: color-mix(in srgb, var(--accent-green) 12%, transparent);
-  }
-
-  @media (hover: none) {
-    .copy-icon-btn {
-      opacity: 1;
-    }
   }
 
   .inset-box {
@@ -3201,16 +3233,16 @@
 
   @media (max-width: 640px) {
     .pull-detail {
-      --detail-mobile-type-xs: var(--mobile-type-xs, var(--font-size-mobile-xs));
-      --detail-mobile-type-sm: var(--mobile-type-sm, var(--font-size-mobile-sm));
-      --detail-mobile-type-body: var(--mobile-type-body, 1rem);
-      --detail-mobile-type-title: var(--mobile-type-title, var(--font-size-mobile-title));
-      --detail-mobile-space-xs: 0.5rem;
-      --detail-mobile-space-sm: 0.75rem;
-      --detail-mobile-space-md: 1rem;
-      --detail-mobile-hit-target: 2.85rem;
+      --detail-mobile-type-xs: var(--mobile-type-xs, var(--font-size-xs));
+      --detail-mobile-type-sm: var(--mobile-type-sm, var(--font-size-sm));
+      --detail-mobile-type-body: var(--mobile-type-body, 13px);
+      --detail-mobile-type-title: var(--mobile-type-title, var(--font-size-xl));
+      --detail-mobile-space-xs: 6.5px;
+      --detail-mobile-space-sm: 10px;
+      --detail-mobile-space-md: 13px;
+      --detail-mobile-hit-target: 37px;
       padding: var(--detail-mobile-space-md);
-      font-size: var(--font-size-mobile-body);
+      font-size: var(--font-size-md);
       line-height: 1.5;
     }
 
@@ -3225,7 +3257,7 @@
     }
 
     .detail-title {
-      font-size: var(--font-size-mobile-title);
+      font-size: var(--font-size-xl);
       line-height: 1.25;
     }
 
@@ -3233,13 +3265,13 @@
     .edit-body-btn,
     .star-btn,
     .gh-link,
-    .copy-icon-btn {
+    .inset-box-wrap :global(.kit-copy-btn.body-copy) {
       min-width: var(--detail-mobile-hit-target);
       min-height: var(--detail-mobile-hit-target);
       justify-content: center;
       padding: var(--detail-mobile-space-xs);
       margin-top: 0;
-      font-size: var(--font-size-mobile-sm);
+      font-size: var(--font-size-sm);
     }
 
     .pull-detail-content .meta-row :global(.copy-number-btn) {
@@ -3247,10 +3279,14 @@
       min-height: 0;
       padding: 0;
       border-radius: 3px;
-      font-size: var(--font-size-mobile-sm);
+      font-size: var(--font-size-sm);
       line-height: 1.35;
     }
 
+    /* Phone-only touch bump: between 480px and the 640px mobile block the
+       copy-number button stays text-compact (the mid-narrow focus grid
+       depends on that); only true phone widths get the 44px hit target. */
+    /* kit-ui-check-ignore: intentional sub-tier inside the shared 640px block, not a layout breakpoint */
     @media (max-width: 480px) {
       .pull-detail-content .meta-row :global(.copy-number-btn) {
         min-width: max(44px, var(--detail-mobile-hit-target));
@@ -3280,7 +3316,7 @@
     .refresh-banner,
     .loading-placeholder,
     .detail-tab {
-      font-size: var(--font-size-mobile-sm);
+      font-size: var(--font-size-sm);
       line-height: 1.35;
     }
 
@@ -3297,13 +3333,13 @@
     .add-description-btn,
     .detail-load-error,
     :global(.markdown-body) {
-      font-size: var(--font-size-mobile-body);
+      font-size: var(--font-size-md);
       line-height: 1.55;
     }
 
     .inset-box {
       padding: var(--detail-mobile-space-sm) var(--detail-mobile-space-md);
-      border-radius: 0.75rem;
+      border-radius: 10px;
     }
 
     :global(.markdown-body pre),
@@ -3318,17 +3354,17 @@
       font-size: 0.9em;
     }
 
-    .pull-detail :global(.chip),
+    .pull-detail :global(.kit-chip),
     .pull-detail :global(.state-chip),
     .pull-detail :global(.status-chip) {
       min-height: calc(var(--detail-mobile-hit-target) * 0.65);
-      padding: 0.2rem var(--detail-mobile-space-xs);
-      border-radius: 999rem;
-      font-size: var(--font-size-mobile-xs);
+      padding: 2.5px var(--detail-mobile-space-xs);
+      border-radius: 999px;
+      font-size: var(--font-size-xs);
       line-height: 1.25;
     }
 
-    .actions-row :global(.action-button),
+    .actions-row :global(.kit-button),
     .actions-menu-trigger,
     .detail-tab,
     .title-edit-save,
@@ -3337,7 +3373,7 @@
       min-height: var(--detail-mobile-hit-target);
     }
 
-    .copy-icon-btn {
+    .inset-box-wrap :global(.kit-copy-btn.body-copy) {
       position: static;
       opacity: 1;
     }

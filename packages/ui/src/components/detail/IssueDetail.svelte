@@ -11,14 +11,14 @@
   import { renderMarkdown, renderMarkdownSync } from "../../utils/markdown.js";
   import { moveTaskListItem, toggleTaskListItem } from "../../utils/task-list.js";
   import { firstUnavailableGate, operationGate } from "./operation-gates.js";
-  import { timeAgo } from "../../utils/time.js";
-  import { copyToClipboard } from "../../utils/clipboard.js";
+  import { CopyButton, formatRelativeTime } from "@kenn-io/kit-ui";
+  import { copyToClipboard } from "@kenn-io/kit-ui";
   import EventTimeline from "./EventTimeline.svelte";
   import DetailActivityViewMenu from "./DetailActivityViewMenu.svelte";
   import IssueCommentBox from "./IssueCommentBox.svelte";
-  import ActionButton from "../shared/ActionButton.svelte";
-  import Chip from "../shared/Chip.svelte";
-  import GitHubLabels from "../shared/GitHubLabels.svelte";
+    import { Button, Chip, Modal } from "@kenn-io/kit-ui";
+  import { Spinner } from "@kenn-io/kit-ui";
+  import LabelRow from "../shared/LabelRow.svelte";
   import LabelPicker from "./LabelPicker.svelte";
   import UserListEditor from "./UserListEditor.svelte";
   import { loadLabelCatalogWithRefresh } from "./labelCatalogRefresh.js";
@@ -28,7 +28,7 @@
     type OpenLabelPickerDetail,
   } from "./labelPickerCommand.js";
   import { nextCatalogLabelNames } from "./labelSelection.js";
-  import { floatingPopoverStyle } from "../shared/floatingPosition.js";
+  import { floatingPopoverStyle } from "@kenn-io/kit-ui";
   import CopyItemNumber from "./CopyItemNumber.svelte";
   import MonitorUpIcon from "@lucide/svelte/icons/monitor-up";
   import PackagePlusIcon from "@lucide/svelte/icons/package-plus";
@@ -68,6 +68,7 @@
     thread_resolve: false,
     review_draft_mutation: false,
     review_thread_resolution: false,
+    review_suggestion_application: false,
     read_review_threads: false,
     native_multiline_ranges: false,
     mutation_head_binding: false,
@@ -202,8 +203,6 @@
     pendingLabel = null;
   });
 
-  let copied = $state(false);
-  let copyTimeout: ReturnType<typeof setTimeout> | null = null;
   let labelPickerOpen = $state(false);
   let labelCatalog = $state<Label[]>([]);
   let labelCatalogSyncing = $state(false);
@@ -368,18 +367,6 @@
     if (!labelPickerPopover?.contains(target) && !labelPickerAnchor?.contains(target)) {
       closeLabelPicker();
     }
-  }
-
-  function copyBody(text: string): void {
-    void copyToClipboard(text).then((ok) => {
-      if (!ok) return;
-      copied = true;
-      if (copyTimeout !== null) clearTimeout(copyTimeout);
-      copyTimeout = setTimeout(() => {
-        copied = false;
-        copyTimeout = null;
-      }, 1500);
-    });
   }
 
   function handleStarClick(): void {
@@ -852,6 +839,40 @@
     flushBodySave();
     clearDragState();
   });
+  // Body-copy feedback is parent-controlled: the kit CopyButton's internal
+  // copied state is not observable from CSS, and the reveal-on-hover wrap
+  // must keep the button visible for the whole copied window even after
+  // the pointer leaves.
+  let bodyCopied = $state(false);
+  let bodyCopiedTimeout: ReturnType<typeof setTimeout> | null = null;
+  let bodyCopySeq = 0;
+
+  function copyBody(text: string): void {
+    const seq = bodyCopySeq;
+    void copyToClipboard(text).then((ok) => {
+      // A copy started on a previous item must not surface feedback on
+      // the one now displayed; the reset effect bumps the token.
+      if (!ok || seq !== bodyCopySeq) return;
+      bodyCopied = true;
+      if (bodyCopiedTimeout !== null) clearTimeout(bodyCopiedTimeout);
+      bodyCopiedTimeout = setTimeout(() => {
+        bodyCopied = false;
+        bodyCopiedTimeout = null;
+      }, 1500);
+    });
+  }
+
+  $effect(() => {
+    // The component is reused across item navigation; the copied feedback
+    // (and its pending reset timer) belongs to the item it was copied from.
+    void [provider, platformHost, owner, name, number];
+    bodyCopySeq++;
+    if (bodyCopiedTimeout !== null) {
+      clearTimeout(bodyCopiedTimeout);
+      bodyCopiedTimeout = null;
+    }
+    bodyCopied = false;
+  });
 </script>
 
 <svelte:document onmousedown={onDocumentMousedown} />
@@ -934,19 +955,17 @@
           </UserListEditor>
         {/if}
         <span class="meta-sep">·</span>
-        <span class="meta-item">{timeAgo(issue.CreatedAt)}</span>
+        <span class="meta-item">{formatRelativeTime(issue.CreatedAt)}</span>
         <span class="meta-sep">·</span>
-        <Chip size="sm" class={`issue-state-chip chip--${issue.State}`}>
+        <Chip size="xs" tone={issue.State === "open" ? "success" : "merged"} class="issue-state-chip">
           {issue.State === "open" ? "Open" : "Closed"}
         </Chip>
         {#if labels.length > 0 || (capabilities.read_labels && capabilities.label_mutation)}
           <span class="meta-sep">·</span>
-          {#if labels.length > 0}
-            <GitHubLabels {labels} mode="full" />
-          {/if}
+          <LabelRow {labels} />
           {#if capabilities.read_labels && capabilities.label_mutation}
             <div class="label-editor-anchor" bind:this={labelPickerAnchor}>
-              <ActionButton
+              <Button
                 class="btn--labels"
                 label="Labels"
                 shortLabel="Labels"
@@ -958,9 +977,23 @@
                 onclick={openLabelPicker}
               >
                 <TagsIcon size="16" aria-hidden="true" />
-              </ActionButton>
+              </Button>
               {#if labelPickerOpen}
-                <div class="label-editor-popover" style={labelPickerStyle} bind:this={labelPickerPopover}>
+                <!-- Escape precedence: a non-empty filter claims Escape to clear itself
+                     (kit SearchInput stops propagation); only an empty-field Escape
+                     bubbles here and dismisses the picker. -->
+                <div
+                  class="label-editor-popover"
+                  style={labelPickerStyle}
+                  bind:this={labelPickerPopover}
+                  role="presentation"
+                  onkeydown={(event) => {
+                    if (event.key === "Escape") {
+                      event.stopPropagation();
+                      closeLabelPicker();
+                    }
+                  }}
+                >
                   <LabelPicker
                     catalogLabels={labelCatalog}
                     selectedLabels={labels}
@@ -982,9 +1015,7 @@
         {#if issues.isIssueDetailSyncing()}
           <span class="meta-sep">·</span>
           <span class="sync-indicator" title="Syncing from GitHub">
-            <svg class="sync-spinner" width="12" height="12" viewBox="0 0 16 16" fill="none">
-              <circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="2" stroke-dasharray="28" stroke-dashoffset="8" stroke-linecap="round"/>
-            </svg>
+            <Spinner size={12} label="Syncing" />
             Syncing
           </span>
         {/if}
@@ -998,23 +1029,16 @@
             <span class="section-title-inline">Description</span>
           </div>
           <div class="inset-box-wrap">
-            <button
-              class="copy-icon-btn"
-              class:copied
+            <CopyButton
+              class={bodyCopied ? "body-copy body-copy--copied" : "body-copy"}
+              copied={bodyCopied}
               onclick={() => copyBody(issue.Body)}
-              title={copied ? "Copied!" : "Copy to clipboard"}
-            >
-              {#if copied}
-                <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
-                  <path d="M13.78 4.22a.75.75 0 010 1.06l-7.25 7.25a.75.75 0 01-1.06 0L2.22 9.28a.75.75 0 011.06-1.06L6 10.94l6.72-6.72a.75.75 0 011.06 0z"/>
-                </svg>
-              {:else}
-                <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
-                  <path d="M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 010 1.5h-1.5a.25.25 0 00-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 00.25-.25v-1.5a.75.75 0 011.5 0v1.5A1.75 1.75 0 019.25 16h-7.5A1.75 1.75 0 010 14.25v-7.5z"/>
-                  <path d="M5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0114.25 11h-7.5A1.75 1.75 0 015 9.25v-7.5zm1.75-.25a.25.25 0 00-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 00.25-.25v-7.5a.25.25 0 00-.25-.25h-7.5z"/>
-                </svg>
-              {/if}
-            </button>
+              revealOnHover
+              ariaLabel="Copy to clipboard"
+              copiedAriaLabel="Copied!"
+              title="Copy to clipboard"
+              copiedTitle="Copied!"
+            />
             <!-- svelte-ignore a11y_click_events_have_key_events -->
             <!-- svelte-ignore a11y_no_static_element_interactions -->
             <div
@@ -1040,7 +1064,7 @@
       <!-- Actions -->
       <div class="actions-row">
         {#if workspace}
-          <ActionButton
+          <Button
             class="btn--workspace"
             disabled={staleIssue}
             onclick={() => {
@@ -1054,9 +1078,9 @@
             shortLabel="Workspace"
           >
             <MonitorUpIcon size="14" strokeWidth="2.2" aria-hidden="true" />
-          </ActionButton>
+          </Button>
         {:else}
-          <ActionButton
+          <Button
             class="btn--workspace"
             disabled={workspaceCreating || staleIssue}
             onclick={() => void createWorkspace()}
@@ -1071,10 +1095,10 @@
             shortLabel={workspaceCreating ? "Creating..." : "Create Workspace"}
           >
             <PackagePlusIcon size="14" strokeWidth="2.2" aria-hidden="true" />
-          </ActionButton>
+          </Button>
         {/if}
         {#if !workspace}
-          <span id={createWorkspaceDescriptionId} class="sr-only">
+          <span id={createWorkspaceDescriptionId} class="kit-sr-only">
             {staleIssue
               ? "Refresh details before creating a workspace."
               : createWorkspaceTitle}
@@ -1082,7 +1106,7 @@
         {/if}
         {#if issue.State === "open" && capabilities.state_mutation}
           {@const closeGate = operationGate(repoOperations?.close_issue)}
-          <ActionButton
+          <Button
             class="btn--close"
             disabled={stateSubmitting || staleIssue || closeGate.unavailable}
             title={closeGate.unavailable ? closeGate.reason : undefined}
@@ -1097,10 +1121,10 @@
             shortLabel={stateSubmitting ? "Closing..." : "Close"}
           >
             <XIcon size="14" strokeWidth="2.2" aria-hidden="true" />
-          </ActionButton>
+          </Button>
         {:else if capabilities.state_mutation}
           {@const reopenGate = operationGate(repoOperations?.reopen_issue)}
-          <ActionButton
+          <Button
             class="btn--reopen"
             disabled={stateSubmitting || staleIssue || reopenGate.unavailable}
             title={reopenGate.unavailable ? reopenGate.reason : undefined}
@@ -1115,13 +1139,13 @@
             shortLabel={stateSubmitting ? "Reopening..." : "Reopen"}
           >
             <RefreshCwIcon size="14" strokeWidth="2.2" aria-hidden="true" />
-          </ActionButton>
+          </Button>
         {/if}
         {#if workspaceError}
           <span class="action-error">{workspaceError}</span>
         {/if}
         {#each actions.issue ?? [] as action (action.id)}
-          <ActionButton
+          <Button
             class="btn--embedding-action"
             onclick={() => {
               if (staleIssue) return;
@@ -1135,7 +1159,7 @@
             size="sm"
           >
             {action.label}
-          </ActionButton>
+          </Button>
         {/each}
         {#if stateError}
           <span class="action-error">{stateError}</span>
@@ -1180,9 +1204,7 @@
           />
         {:else if issues.isIssueDetailSyncing()}
           <div class="loading-placeholder">
-            <svg class="sync-spinner" width="14" height="14" viewBox="0 0 16 16" fill="none">
-              <circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="2" stroke-dasharray="28" stroke-dashoffset="8" stroke-linecap="round"/>
-            </svg>
+            <Spinner size={14} label="Syncing" />
             Loading comments...
           </div>
         {:else}
@@ -1194,52 +1216,13 @@
 
     {#if branchConflict}
       {@const conflict = branchConflict}
-      <!-- svelte-ignore a11y_no_static_element_interactions -->
-      <div
-        class="modal-overlay"
-        onclick={closeBranchConflictDialog}
-        onkeydown={(event) => {
-          if (event.key === "Escape") {
-            event.preventDefault();
-            closeBranchConflictDialog();
-          }
-        }}
+      <Modal
+        title="Branch Name Conflict"
+        width="min(560px, 92vw)"
+        maxWidth="min(560px, 92vw)"
+        onclose={closeBranchConflictDialog}
       >
-        <!-- svelte-ignore a11y_click_events_have_key_events -->
-        <!-- svelte-ignore a11y_no_static_element_interactions -->
-        <div
-          class="modal"
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="issue-workspace-branch-conflict-title"
-          tabindex="-1"
-          onclick={(event) => event.stopPropagation()}
-        >
-          <div class="modal-header">
-            <h3
-              id="issue-workspace-branch-conflict-title"
-              class="modal-title"
-            >
-              Branch Name Conflict
-            </h3>
-            <button
-              class="modal-close"
-              onclick={closeBranchConflictDialog}
-              title="Cancel (Esc)"
-              disabled={workspaceCreating}
-            >
-              <svg
-                width="16"
-                height="16"
-                viewBox="0 0 16 16"
-                fill="currentColor"
-              >
-                <path d="M3.72 3.72a.75.75 0 011.06 0L8 6.94l3.22-3.22a.75.75 0 111.06 1.06L9.06 8l3.22 3.22a.75.75 0 11-1.06 1.06L8 9.06l-3.22 3.22a.75.75 0 01-1.06-1.06L6.94 8 3.72 4.78a.75.75 0 010-1.06z"/>
-              </svg>
-            </button>
-          </div>
-
-          <div class="modal-body">
+          <div class="conflict-body">
             <p class="modal-copy">
               The branch <code>{conflict.existingBranch}</code> already exists locally.
             </p>
@@ -1253,7 +1236,7 @@
                   Reopen the workspace on the branch that is already present in the local clone.
                 </div>
               </div>
-              <ActionButton
+              <Button
                 class="btn btn--primary"
                 onclick={() => void createWorkspace({
                   gitHeadRef: conflict.existingBranch,
@@ -1266,7 +1249,7 @@
                 size="sm"
               >
                 {workspaceCreating ? "Creating..." : "Use Existing Branch"}
-              </ActionButton>
+              </Button>
             </div>
 
             <div class="field">
@@ -1297,31 +1280,30 @@
             {/if}
           </div>
 
-          <div class="modal-footer">
-            <ActionButton
-              class="btn btn--secondary"
-              onclick={closeBranchConflictDialog}
-              disabled={workspaceCreating}
-              tone="neutral"
-              surface="outline"
-            >
-              Cancel
-            </ActionButton>
-            <ActionButton
-              class="btn btn--primary btn--green"
-              onclick={() => void createWorkspace({
-                gitHeadRef: conflict.branchInput,
-                fromConflictDialog: true,
-              })}
-              disabled={workspaceCreating}
-              tone="success"
-              surface="solid"
-            >
-              {workspaceCreating ? "Creating..." : "Create New Branch"}
-            </ActionButton>
-          </div>
-        </div>
-      </div>
+        {#snippet footer()}
+          <Button
+            class="btn btn--secondary"
+            onclick={closeBranchConflictDialog}
+            disabled={workspaceCreating}
+            tone="neutral"
+            surface="outline"
+          >
+            Cancel
+          </Button>
+          <Button
+            class="btn btn--primary btn--green"
+            onclick={() => void createWorkspace({
+              gitHeadRef: conflict.branchInput,
+              fromConflictDialog: true,
+            })}
+            disabled={workspaceCreating}
+            tone="success"
+            surface="solid"
+          >
+            {workspaceCreating ? "Creating..." : "Create New Branch"}
+          </Button>
+        {/snippet}
+      </Modal>
     {/if}
   {/if}
 {/if}
@@ -1343,18 +1325,6 @@
     color: var(--accent-red);
   }
 
-  .sr-only {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    padding: 0;
-    margin: -1px;
-    overflow: hidden;
-    clip: rect(0, 0, 0, 0);
-    white-space: nowrap;
-    border: 0;
-  }
-
   .issue-detail {
     padding: 20px 24px;
     display: flex;
@@ -1365,6 +1335,17 @@
     overflow-y: auto;
     overflow-x: hidden;
     width: 100%;
+  }
+
+  /* Wrap long lines inside fenced code blocks at all widths (see
+     PullDetail): scope to <pre> only so the wrap inherits to the inner
+     <code> without touching inline code, which must keep the table-cell
+     reset in app.css. */
+  .issue-detail :global(.markdown-body pre) {
+    max-width: 100%;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    word-break: break-word;
   }
 
   .issue-detail-content {
@@ -1389,7 +1370,7 @@
   .detail-header {
     display: flex;
     align-items: flex-start;
-    gap: 10px;
+    gap: var(--space-4);
   }
 
   .detail-title {
@@ -1477,14 +1458,6 @@
     color: var(--accent-blue);
   }
 
-  .sync-spinner {
-    animation: spin 1s linear infinite;
-  }
-
-  @keyframes spin {
-    to { transform: rotate(360deg); }
-  }
-
   .section {
     display: flex;
     flex-direction: column;
@@ -1524,46 +1497,19 @@
     position: relative;
   }
 
-  .copy-icon-btn {
+  /* Kit CopyButton owns size, hover, active, copied icon, and the
+     touch always-visible rule; the wrap positions it and reveals it on
+     hover (kit's --reveal only self-reveals on focus-visible). */
+  .inset-box-wrap :global(.kit-copy-btn.body-copy) {
     position: absolute;
     top: 6px;
     right: 6px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 26px;
-    height: 26px;
-    border-radius: var(--radius-sm);
-    color: var(--text-muted);
-    opacity: 0;
-    transition: opacity 0.15s, background 0.15s, color 0.15s;
     z-index: 1;
   }
 
-  .inset-box-wrap:hover .copy-icon-btn,
-  .copy-icon-btn:focus-visible {
+  .inset-box-wrap:hover :global(.kit-copy-btn.body-copy),
+  .inset-box-wrap :global(.kit-copy-btn.body-copy--copied) {
     opacity: 1;
-  }
-
-  .copy-icon-btn:hover {
-    background: var(--bg-surface-hover);
-    color: var(--text-secondary);
-  }
-
-  .copy-icon-btn:active {
-    transform: scale(0.92);
-  }
-
-  .copy-icon-btn.copied {
-    opacity: 1;
-    color: var(--accent-green);
-    background: color-mix(in srgb, var(--accent-green) 12%, transparent);
-  }
-
-  @media (hover: none) {
-    .copy-icon-btn {
-      opacity: 1;
-    }
   }
 
   .inset-box {
@@ -1634,73 +1580,9 @@
     color: var(--text-muted);
   }
 
-  .modal-overlay {
-    position: fixed;
-    inset: 0;
-    background: var(--overlay-bg);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    z-index: 50;
-    animation: fade-in 0.12s ease-out;
-  }
-
-  @keyframes fade-in {
-    from { opacity: 0; }
-    to { opacity: 1; }
-  }
-
-  .modal {
-    width: min(560px, 92vw);
-    background: var(--bg-surface);
-    border: 1px solid var(--border-muted);
-    border-radius: 12px;
-    box-shadow: var(--shadow-lg);
-    overflow: hidden;
-  }
-
-  .modal-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 14px 16px;
-    border-bottom: 1px solid var(--border-muted);
-  }
-
-  .modal-title {
-    margin: 0;
-    font-size: var(--font-size-lg);
-    font-weight: 600;
-    color: var(--text-primary);
-  }
-
-  .modal-close {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 28px;
-    height: 28px;
-    border: 1px solid transparent;
-    border-radius: 8px;
-    background: transparent;
-    color: var(--text-secondary);
-    cursor: pointer;
-  }
-
-  .modal-close:hover:not(:disabled) {
-    background: var(--bg-inset);
-    color: var(--text-primary);
-  }
-
-  .modal-close:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-  }
-
-  .modal-body {
-    padding: 16px;
+  .conflict-body {
     display: grid;
-    gap: 14px;
+    gap: var(--space-5);
   }
 
   .modal-copy {
@@ -1767,26 +1649,18 @@
     color: var(--accent-red, #d73a49);
   }
 
-  .modal-footer {
-    display: flex;
-    justify-content: flex-end;
-    gap: 8px;
-    padding: 14px 16px;
-    border-top: 1px solid var(--border-muted);
-  }
-
   @media (max-width: 640px) {
     .issue-detail {
-      --detail-mobile-type-xs: var(--mobile-type-xs, var(--font-size-mobile-xs));
-      --detail-mobile-type-sm: var(--mobile-type-sm, var(--font-size-mobile-sm));
-      --detail-mobile-type-body: var(--mobile-type-body, 1rem);
-      --detail-mobile-type-title: var(--mobile-type-title, var(--font-size-mobile-title));
-      --detail-mobile-space-xs: 0.5rem;
-      --detail-mobile-space-sm: 0.75rem;
-      --detail-mobile-space-md: 1rem;
-      --detail-mobile-hit-target: 2.85rem;
+      --detail-mobile-type-xs: var(--mobile-type-xs, var(--font-size-xs));
+      --detail-mobile-type-sm: var(--mobile-type-sm, var(--font-size-sm));
+      --detail-mobile-type-body: var(--mobile-type-body, 13px);
+      --detail-mobile-type-title: var(--mobile-type-title, var(--font-size-xl));
+      --detail-mobile-space-xs: 6.5px;
+      --detail-mobile-space-sm: 10px;
+      --detail-mobile-space-md: 13px;
+      --detail-mobile-hit-target: 37px;
       padding: var(--detail-mobile-space-md);
-      font-size: var(--font-size-mobile-body);
+      font-size: var(--font-size-md);
       line-height: 1.5;
     }
 
@@ -1800,13 +1674,13 @@
     }
 
     .detail-title {
-      font-size: var(--font-size-mobile-title);
+      font-size: var(--font-size-xl);
       line-height: 1.25;
     }
 
     .star-btn,
     .gh-link,
-    .copy-icon-btn,
+    .inset-box-wrap :global(.kit-copy-btn.body-copy),
     .meta-row :global(.copy-number-btn) {
       min-width: var(--detail-mobile-hit-target);
       min-height: var(--detail-mobile-hit-target);
@@ -1827,7 +1701,7 @@
     .action-error,
     .refresh-banner,
     .loading-placeholder {
-      font-size: var(--font-size-mobile-sm);
+      font-size: var(--font-size-sm);
       line-height: 1.35;
     }
 
@@ -1841,13 +1715,13 @@
     .merge-error,
     .detail-load-error,
     :global(.markdown-body) {
-      font-size: var(--font-size-mobile-body);
+      font-size: var(--font-size-md);
       line-height: 1.55;
     }
 
     .inset-box {
       padding: var(--detail-mobile-space-sm) var(--detail-mobile-space-md);
-      border-radius: 0.75rem;
+      border-radius: 10px;
     }
 
     :global(.markdown-body pre),
@@ -1862,13 +1736,13 @@
       font-size: 0.9em;
     }
 
-    .issue-detail :global(.chip),
+    .issue-detail :global(.kit-chip),
     .issue-detail :global(.state-chip),
     .issue-detail :global(.status-chip) {
       min-height: calc(var(--detail-mobile-hit-target) * 0.65);
-      padding: 0.2rem var(--detail-mobile-space-xs);
-      border-radius: 999rem;
-      font-size: var(--font-size-mobile-xs);
+      padding: 2.5px var(--detail-mobile-space-xs);
+      border-radius: 999px;
+      font-size: var(--font-size-xs);
       line-height: 1.25;
     }
 
@@ -1876,14 +1750,13 @@
       gap: var(--detail-mobile-space-sm);
     }
 
-    .actions-row :global(.action-button),
-    .modal-close,
+    .actions-row :global(.kit-button),
     .field-input {
       min-height: var(--detail-mobile-hit-target);
-      font-size: var(--font-size-mobile-sm);
+      font-size: var(--font-size-sm);
     }
 
-    .copy-icon-btn {
+    .inset-box-wrap :global(.kit-copy-btn.body-copy) {
       position: static;
       opacity: 1;
     }

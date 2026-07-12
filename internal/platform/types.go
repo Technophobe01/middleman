@@ -94,6 +94,7 @@ type MergeRequest struct {
 	UpdatedAt          time.Time
 	LastActivityAt     time.Time
 	MergedAt           *time.Time
+	MergedBy           string
 	ClosedAt           *time.Time
 	Labels             []Label
 	// Assignees and RequestedReviewers carry usernames. nil means the
@@ -320,6 +321,26 @@ type MergeRequestReviewThread struct {
 	MetadataJSON      string
 }
 
+type ReviewSuggestion struct {
+	ProviderThreadID  string
+	ProviderCommentID string
+	Range             DiffReviewLineRange
+	Replacement       string
+}
+
+type ApplyReviewSuggestionsInput struct {
+	HeadBranch       string
+	HeadRepoCloneURL string
+	ExpectedHeadSHA  string
+	Message          string
+	Suggestions      []ReviewSuggestion
+}
+
+type AppliedReviewSuggestions struct {
+	CommitSHA string
+	CommitURL string
+}
+
 type Capabilities struct {
 	ReadRepositories  bool
 	ReadMergeRequests bool
@@ -337,23 +358,24 @@ type Capabilities struct {
 	// provider that could change state but not content (or vice
 	// versa) must split this capability rather than half-implement
 	// it.
-	StateMutation          bool
-	MergeMutation          bool
-	ReviewMutation         bool
-	WorkflowApproval       bool
-	ReadyForReview         bool
-	DraftMutation          bool
-	IssueMutation          bool
-	LabelMutation          bool
-	AssigneeMutation       bool
-	ReviewerMutation       bool
-	NotificationMutation   bool
-	ThreadReply            bool
-	ThreadResolve          bool
-	ReviewDraftMutation    bool
-	ReviewThreadResolution bool
-	ReadReviewThreads      bool
-	NativeMultilineRanges  bool
+	StateMutation               bool
+	MergeMutation               bool
+	ReviewMutation              bool
+	WorkflowApproval            bool
+	ReadyForReview              bool
+	DraftMutation               bool
+	IssueMutation               bool
+	LabelMutation               bool
+	AssigneeMutation            bool
+	ReviewerMutation            bool
+	NotificationMutation        bool
+	ThreadReply                 bool
+	ThreadResolve               bool
+	ReviewDraftMutation         bool
+	ReviewThreadResolution      bool
+	ReviewSuggestionApplication bool
+	ReadReviewThreads           bool
+	NativeMultilineRanges       bool
 	// MutationHeadBinding is true when mutations can be hard-bound to an
 	// expected head SHA and the provider rejects the mutation when the MR
 	// head moved past it. Merge uses the reviewed diff head as that pin;

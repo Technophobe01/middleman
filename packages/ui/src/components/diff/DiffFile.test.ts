@@ -280,6 +280,8 @@ function renderDiffFile(
     getError: () => null,
     createComment: options.createComment ?? (() => Promise.resolve(true)),
     deleteComment: () => Promise.resolve(true),
+    editComment: () => Promise.resolve(true),
+    setCommentEditState: vi.fn(),
   };
   const owner = options.owner ?? uniqueOwner();
   const result = render(DiffFile, {
@@ -388,7 +390,7 @@ describe("DiffFile", () => {
     try {
       renderDiffFile(makeFile());
 
-      expect(screen.getByRole("status").textContent).toContain("Loading diff");
+      expect(screen.getByRole("status", { name: "Loading diff" })).toBeTruthy();
       expect(document.querySelector(".pierre-diff--pending")).toBeTruthy();
     } finally {
       (globalThis as GlobalWithIO).IntersectionObserver = visibleObserver;

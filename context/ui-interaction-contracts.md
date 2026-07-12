@@ -25,6 +25,13 @@ Interactive surfaces must agree on which item is selected.
   `{ owner, name, number }`-style shapes.
 - When a view changes from item A to item B, reset transient action state that
   could otherwise submit or render against the wrong item.
+- When a background refresh replaces the selected item's backing object but
+  the stable item identity is unchanged, preserve already-resolved action
+  affordances instead of treating the refresh as item A -> B. Key invalidation
+  on stable route/domain identity, not object reference; the Kata workspace
+  action target is the reference case
+  (`frontend/src/lib/features/kata/KataWorkspace.svelte:158`,
+  `frontend/src/lib/features/kata/KataWorkspace.test.ts:473`).
 
 Responsive layout changes must not change route identity.
 
@@ -99,6 +106,10 @@ shortcuts while it is open.
   their `when` predicate no longer matches the active modal state.
 - Outside-click, focus-leave, and Escape close paths should converge on the same
   cleanup so stale frames, listeners, and highlighted rows are not left behind.
+- Custom focus traps must cycle controls in rendered DOM order. If the trap
+  builds the focusable list from a mixed selector list (`button, input, select,
+  ...`), normalize the result by document position before wrapping Tab /
+  Shift+Tab so selector-engine grouping cannot change keyboard order.
 
 ## Palette Persistence
 
@@ -187,6 +198,31 @@ context.
 - This contract should also guide future diff-comment UI: inline diff threads
   can anchor to a file/line position, but their compact timeline summaries
   should still use root-comment context plus newest-first replies.
+
+## Inline Review Drafts
+
+Inline diff review draft comments are local staged review state until publish.
+Editing a saved draft comment should change only the body and preserve the
+original diff range, so the PATCH path must rebuild the range from the stored
+comment rather than from whichever line is currently selected
+(`packages/ui/src/stores/diff-review-draft.svelte.ts::editComment`).
+
+An open saved-draft comment editor is also pending local state, even before its
+body differs from the saved text. Review-level publish and discard must stay
+unavailable until every draft comment editor is saved or canceled; otherwise the
+provider mutation can submit the old saved body while the UI still shows an
+unsaved edit. Track that state in the draft-review store and have both tray and
+inline editors clear it on save, cancel, and unmount
+(`packages/ui/src/stores/diff-review-draft.svelte.ts::hasPendingCommentEdits`,
+`packages/ui/src/components/diff/DiffReviewDraftTray.svelte::publish`,
+`packages/ui/src/components/diff/DiffReviewDraftInlineComment.svelte::reportEditState`).
+
+Draft authoring and the sticky publish tray are gated by the repo operation
+`review_draft`, not `submit_review`. `submit_review` gates submitted review
+actions in the detail header, while Files-tab draft authoring must disappear
+when `review_draft` is unavailable and show that operation's reason instead
+(`packages/ui/src/components/diff/DiffFilesLayout.svelte:44`,
+`frontend/tests/e2e/inline-review.spec.ts:655`).
 
 ## Optional Metadata Controls
 

@@ -1,6 +1,7 @@
 <script lang="ts">
-  import { ActionButton } from "@middleman/ui";
+  import { Button } from "@middleman/ui";
   import { renderMarkdown, renderMarkdownSync } from "@middleman/ui/utils/markdown";
+  import { localDateTimeLabel, timeAgo } from "@middleman/ui/utils/time";
 
   import type {
     KataTaskAPI,
@@ -187,7 +188,7 @@
         onkeydown={handleRelatedKeydown}
       />
     </label>
-    <ActionButton
+    <Button
       type="submit"
       surface="outline"
       size="sm"
@@ -213,7 +214,7 @@
       {api}
       placeholder="Add a comment..."
     />
-    <ActionButton
+    <Button
       type="submit"
       tone="info"
       surface="solid"
@@ -229,7 +230,12 @@
     <div class="comment-list">
       {#each sortedComments as comment (comment.id)}
         <article class="comment">
-          <div class="comment-meta">{comment.author}</div>
+          <div class="comment-meta">
+            <span>{comment.author}</span>
+            <time datetime={comment.created_at} title={localDateTimeLabel(comment.created_at)}>
+              {timeAgo(comment.created_at)}
+            </time>
+          </div>
           <div class="comment-body markdown-body">
             {#await renderMarkdown(comment.body)}
               {@html renderMarkdownSync(comment.body)}
@@ -306,7 +312,7 @@
 
   .link-list {
     display: grid;
-    gap: 3px;
+    gap: var(--space-1);
   }
 
   .link-row {
@@ -361,7 +367,7 @@
     min-width: 0;
     flex: 1;
     display: grid;
-    gap: 3px;
+    gap: var(--space-1);
     color: var(--text-muted);
     font-size: var(--font-size-xs);
     font-weight: 650;
@@ -407,9 +413,18 @@
   }
 
   .comment-meta {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
     color: var(--text-muted);
     font-size: var(--font-size-xs);
     margin-bottom: 4px;
+  }
+
+  .comment-meta time {
+    flex: 0 0 auto;
+    white-space: nowrap;
   }
 
   .comment-body :global(p) {

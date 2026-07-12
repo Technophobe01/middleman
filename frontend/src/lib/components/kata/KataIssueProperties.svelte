@@ -3,7 +3,8 @@
   import ClockIcon from "@lucide/svelte/icons/clock-3";
   import FlagIcon from "@lucide/svelte/icons/flag";
   import UserIcon from "@lucide/svelte/icons/user-round";
-  import { ActionButton, Chip } from "@middleman/ui";
+  import XIcon from "@lucide/svelte/icons/x";
+  import { Button, Chip, SelectDropdown } from "@middleman/ui";
   import type { KataTaskDetail } from "../../api/kata/taskTypes.js";
   import DatePicker from "../shared/DatePicker.svelte";
   import TypeaheadTrigger, { type TypeaheadOption } from "../shared/TypeaheadTrigger.svelte";
@@ -45,6 +46,7 @@
   let scheduledDraft = $state("");
   let dueDraft = $state("");
   let addingLabel = $state(false);
+  let editingLabels = $state(false);
   let labelDraft = $state("");
   let trackedUID = $state<string | null>(null);
 
@@ -55,6 +57,7 @@
     scheduledDraft = "";
     dueDraft = "";
     addingLabel = false;
+    editingLabels = false;
     labelDraft = "";
   });
 
@@ -154,6 +157,14 @@
     }
   }
 
+  function toggleLabelEditing(): void {
+    editingLabels = !editingLabels;
+    if (!editingLabels) {
+      labelDraft = "";
+      addingLabel = false;
+    }
+  }
+
   function handleLabelKeydown(event: KeyboardEvent): void {
     if (event.key === "Enter") {
       event.preventDefault();
@@ -236,23 +247,20 @@
   </div>
 
   {#if activeProperty === "priority"}
-    <label class="property-pill property-pill--editing">
+    <div class="property-pill property-pill--editing property-pill--select" role="group" aria-label="Edit priority">
       <FlagIcon size={13} strokeWidth={1.8} />
       <span>Priority</span>
-      <select
-        aria-label="Priority"
+      <SelectDropdown
+        title="Priority"
         value={issue.issue.priority === undefined || issue.issue.priority === null
           ? ""
           : String(issue.issue.priority)}
-        onchange={(event) => {
-          void updatePriority(event.currentTarget.value);
+        options={priorityOptions}
+        onchange={(value) => {
+          void updatePriority(value);
         }}
-      >
-        {#each priorityOptions as option (option.value)}
-          <option value={option.value}>{option.label}</option>
-        {/each}
-      </select>
-    </label>
+      />
+    </div>
   {:else}
     <button type="button" class="property-pill" aria-label="Edit priority" onclick={() => openProperty("priority")}>
       <FlagIcon size={13} strokeWidth={1.8} />
@@ -271,23 +279,33 @@
     <div>
       <dt>Labels</dt>
       <dd>
-        <div class="label-row">
+        <ul class="label-list" aria-label="Labels">
           {#each issue.labels as label (label.label)}
-            <Chip
-              size="sm"
-              tone="muted"
-              interactive
-              uppercase={false}
-              ariaLabel={`Remove ${label.label}`}
-              title={`Remove ${label.label}`}
-              onclick={() => {
-                void onRemoveLabel(uid(), label.label);
-              }}
-            >
-              {label.label} x
-            </Chip>
+            <li class="label-token">
+              {#if editingLabels}
+                <Chip
+                  size="xs"
+                  tone="muted"
+                  uppercase={false}
+                  interactive
+                  class="kata-label-chip"
+                  ariaLabel={`Remove label ${label.label}`}
+                  title={`Remove label ${label.label}`}
+                  onclick={() => {
+                    void onRemoveLabel(uid(), label.label);
+                  }}
+                >
+                  {label.label}
+                  <XIcon size={11} strokeWidth={2.2} aria-hidden="true" />
+                </Chip>
+              {:else}
+                <Chip size="xs" tone="muted" uppercase={false} class="kata-label-chip">
+                  {label.label}
+                </Chip>
+              {/if}
+            </li>
           {/each}
-        </div>
+        </ul>
       </dd>
     </div>
   {/if}
@@ -305,7 +323,18 @@
       }}
     />
   {:else}
-    <ActionButton size="sm" surface="outline" label="Add label" onclick={() => { addingLabel = true; }} />
+    <div class="label-actions">
+      <Button size="sm" surface="outline" label="Add label" onclick={() => { addingLabel = true; }} />
+      {#if issue.labels.length > 0}
+        <Button
+          size="sm"
+          surface="outline"
+          label={editingLabels ? "Done" : "Edit labels"}
+          ariaLabel={editingLabels ? "Done editing labels" : undefined}
+          onclick={toggleLabelEditing}
+        />
+      {/if}
+    </div>
   {/if}
 </section>
 
@@ -388,15 +417,21 @@
     background: var(--bg-surface-hover);
   }
 
-  .property-pill select {
-    min-height: 22px;
-    min-width: 0;
-    border: 0;
-    border-radius: 4px;
+  .property-pill--select :global(.kit-select-dropdown) {
+    min-width: 104px;
+  }
+
+  .property-pill--select :global(.kit-select-dropdown__trigger) {
+    height: 22px;
+    border-color: transparent;
     background: transparent;
     color: var(--text-primary);
-    font: inherit;
-    font-size: var(--font-size-sm);
+  }
+
+  .property-pill--select :global(.kit-select-dropdown__trigger:hover:not(:disabled)),
+  .property-pill--select :global(.kit-select-dropdown__trigger[aria-expanded="true"]) {
+    border-color: var(--border-default);
+    background: var(--bg-inset);
   }
 
   .detail-properties {
@@ -424,14 +459,36 @@
     font-size: var(--font-size-sm);
   }
 
-  .label-row {
+  .label-list {
     display: flex;
     flex-wrap: wrap;
     gap: 6px;
+    align-items: center;
+    min-width: 0;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .label-token {
+    display: inline-flex;
+    align-items: center;
+    max-width: 100%;
+    min-width: 0;
+  }
+
+  .label-token :global(.kata-label-chip) {
+    max-width: min(220px, 100%);
   }
 
   .label-editor {
     margin: 0 0 22px;
+  }
+
+  .label-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
   }
 
   .label-input {

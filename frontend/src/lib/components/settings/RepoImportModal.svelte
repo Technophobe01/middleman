@@ -1,7 +1,7 @@
 <script lang="ts">
-  import { tick, untrack } from "svelte";
+  import { SelectDropdown, type SelectDropdownOption } from "@middleman/ui";
   import type { Settings } from "@middleman/ui/api/types";
-  import { pushModalFrame } from "@middleman/ui/stores/keyboard/modal-stack";
+  import Modal from "../shared/Modal.svelte";
   import { bulkAddRepos, previewRepos, type RepoPreviewRow } from "../../api/settings.js";
   import RepoPreviewTable from "./RepoPreviewTable.svelte";
   import { defaultRepoImportProvider, repoImportProvider, repoImportProviders } from "./repoImportProviders.js";
@@ -25,6 +25,11 @@
 
   let { open, onClose, onImported }: Props = $props();
 
+  const providerOptions: SelectDropdownOption[] = repoImportProviders.map((option) => ({
+    value: option.id,
+    label: option.label,
+  }));
+
   let patternInput = $state("");
   let provider = $state("github");
   let hostInput = $state("github.com");
@@ -40,7 +45,6 @@
   let submitting = $state(false);
   let error = $state<string | null>(null);
   let requestToken = 0;
-  let inputEl = $state<HTMLInputElement | null>(null);
 
   const sortedRows = $derived(sortRows(rows, sort));
   const visibilityFilters = $derived({ hideForks, hidePrivate });
@@ -51,16 +55,7 @@
   const providerMeta = $derived(repoImportProvider(provider));
 
   $effect(() => {
-    if (open) {
-      void tick().then(() => inputEl?.focus());
-    } else {
-      resetAll();
-    }
-  });
-
-  $effect(() => {
-    if (!open) return;
-    return untrack(() => pushModalFrame("repo-import-modal", []));
+    if (!open) resetAll();
   });
 
   function resetPreviewState(): void {
@@ -178,58 +173,27 @@
   function closeIfAllowed(): void {
     if (!submitting) onClose();
   }
-
-  function handleKeydown(event: KeyboardEvent): void {
-    if (event.key === "Escape") {
-      closeIfAllowed();
-      return;
-    }
-    if (event.key !== "Tab") return;
-    const container = event.currentTarget;
-    if (!(container instanceof HTMLElement)) return;
-    const modal = container.querySelector("[role='dialog']");
-    if (!(modal instanceof HTMLElement)) return;
-    const focusable = Array.from(
-      modal.querySelectorAll<HTMLElement>(
-        "button:not(:disabled), input:not(:disabled), select:not(:disabled), [tabindex]:not([tabindex='-1'])",
-      ),
-    );
-    if (focusable.length === 0) return;
-    const first = focusable[0];
-    const last = focusable[focusable.length - 1];
-    if (!first || !last) return;
-    if (event.shiftKey && document.activeElement === first) {
-      event.preventDefault();
-      last.focus();
-    } else if (!event.shiftKey && document.activeElement === last) {
-      event.preventDefault();
-      first.focus();
-    }
-  }
 </script>
 
-{#if open}
-  <div class="modal-backdrop" role="presentation" onkeydown={handleKeydown}>
-    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="repo-import-title">
-      <header class="modal-header">
-        <div>
-          <h2 id="repo-import-title">Add repositories</h2>
-          <p>Preview repositories before adding them.</p>
-        </div>
-        <button type="button" class="close-btn" aria-label="Close" onclick={closeIfAllowed}>×</button>
-      </header>
-
-      <div class="preview-form">
+<Modal
+  {open}
+  title="Add repositories"
+  width={1040}
+  frameId="repo-import-modal"
+  showClose
+  onClose={closeIfAllowed}
+>
+  <div class="import-content">
+    <div class="preview-form">
         <label class="provider-field">
           <span>Provider</span>
-          <select
+          <SelectDropdown
+            class="provider-select"
+            title="Provider"
             value={provider}
-            onchange={(event) => handleProviderChange(event.currentTarget.value)}
-          >
-            {#each repoImportProviders as option (option.id)}
-              <option value={option.id}>{option.label}</option>
-            {/each}
-          </select>
+            options={providerOptions}
+            onchange={handleProviderChange}
+          />
         </label>
         <label class="host-field">
           <span>Host</span>
@@ -242,7 +206,7 @@
         <label>
           <span>Repository pattern</span>
           <input
-            bind:this={inputEl}
+            data-autofocus
             value={patternInput}
             placeholder={providerMeta.ownerPatternPlaceholder}
             oninput={(event) => handlePatternInput(event.currentTarget.value)}
@@ -280,31 +244,28 @@
         <div class="empty-preview">Preview repositories before adding them.</div>
       {/if}
 
-      <footer class="modal-footer">
-        <span>Selected {selectedCount} of {selectableVisibleCount}</span>
-        <div class="footer-actions">
-          <button class="secondary-btn" type="button" onclick={closeIfAllowed} disabled={submitting}>Cancel</button>
-          <button class="submit-btn" type="button" onclick={() => void handleSubmit()} disabled={submitting || selectedCount === 0}>
-            {submitting ? "Adding…" : "Add selected repositories"}
-          </button>
-        </div>
-      </footer>
-    </div>
   </div>
-{/if}
+  {#snippet footer()}
+    <span class="footer-status">Selected {selectedCount} of {selectableVisibleCount}</span>
+    <div class="footer-actions">
+      <button class="secondary-btn" type="button" onclick={closeIfAllowed} disabled={submitting}>Cancel</button>
+      <button class="submit-btn" type="button" onclick={() => void handleSubmit()} disabled={submitting || selectedCount === 0}>
+        {submitting ? "Adding…" : "Add selected repositories"}
+      </button>
+    </div>
+  {/snippet}
+</Modal>
 
 <style>
-  .modal-backdrop { position: fixed; inset: 0; z-index: 40; display: flex; align-items: center; justify-content: center; padding: 24px; background: color-mix(in srgb, black 38%, transparent); }
-  .modal { width: min(1040px, 100%); max-height: min(760px, 92vh); display: flex; flex-direction: column; gap: 14px; background: var(--bg-surface); color: var(--text-primary); border: 1px solid var(--border-default); border-radius: var(--radius-lg); box-shadow: 0 24px 80px rgb(0 0 0 / 35%); padding: 18px; }
-  .modal-header, .modal-footer { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
-  h2 { margin: 0; font-size: var(--font-size-lg); }
-  p { margin: 4px 0 0; color: var(--text-muted); font-size: var(--font-size-sm); }
-  .close-btn { color: var(--text-muted); font-size: var(--font-size-xl); }
-  .preview-form { display: flex; gap: 10px; align-items: end; }
+  .import-content { display: flex; flex-direction: column; gap: var(--space-5); }
+  .footer-status { margin-right: auto; color: var(--text-muted); font-size: var(--font-size-sm); }
+  .preview-form { display: flex; gap: var(--space-4); align-items: end; }
   label { flex: 1; display: flex; flex-direction: column; gap: 6px; font-size: var(--font-size-sm); color: var(--text-secondary); }
   .provider-field { flex: 0 0 120px; }
   .host-field { flex: 0 0 190px; }
-  input, select { font-size: var(--font-size-md); padding: 7px 10px; color: var(--text-primary); background: var(--bg-inset); border: 1px solid var(--border-muted); border-radius: var(--radius-sm); }
+  input { font-size: var(--font-size-md); padding: 7px 10px; color: var(--text-primary); background: var(--bg-inset); border: 1px solid var(--border-muted); border-radius: var(--radius-sm); }
+  .provider-field :global(.provider-select) { width: 100%; min-width: 0; }
+  .provider-field :global(.kit-select-dropdown__trigger) { height: 34px; font-size: var(--font-size-md); font-weight: 400; }
   .preview-btn, .submit-btn { padding: 7px 14px; font-size: var(--font-size-md); font-weight: 600; color: white; background: var(--accent-blue); border-radius: var(--radius-sm); }
   .secondary-btn { padding: 7px 14px; font-size: var(--font-size-md); color: var(--text-secondary); background: var(--bg-inset); border: 1px solid var(--border-muted); border-radius: var(--radius-sm); }
   button:disabled { opacity: 0.5; cursor: not-allowed; }

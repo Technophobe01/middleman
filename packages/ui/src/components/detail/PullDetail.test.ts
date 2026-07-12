@@ -1,13 +1,27 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/svelte";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
-import type { PullDetail } from "../../api/types.js";
+import type { DiffResult, PullDetail } from "../../api/types.js";
 import { ACTIONS_KEY, API_CLIENT_KEY, NAVIGATE_KEY, STORES_KEY, UI_CONFIG_KEY } from "../../context.js";
 import { createDetailActivityViewStore } from "../../stores/detail-activity-view.svelte.js";
+import { createDetailStore } from "../../stores/detail.svelte.js";
+import type { MiddlemanClient } from "../../types.js";
 
 const markdownMockState = vi.hoisted(() => ({
   pending: false,
   pendingPromise: new Promise<string>(() => undefined),
 }));
+
+const clipboardMockState = vi.hoisted(() => ({
+  resolvers: [] as Array<(ok: boolean) => void>,
+}));
+
+vi.mock("@kenn-io/kit-ui", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@kenn-io/kit-ui")>();
+  return {
+    ...actual,
+    copyToClipboard: vi.fn(() => new Promise<boolean>((resolve) => clipboardMockState.resolvers.push(resolve))),
+  };
+});
 
 vi.mock("../../utils/markdown.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../utils/markdown.js")>();
@@ -65,6 +79,7 @@ function pullDetail(): PullDetail {
   return {
     detail_loaded: true,
     detail_fetched_at: "2026-05-01T12:05:00Z",
+    deferred_merge_pending: false,
     diff_head_sha: "head",
     merge_base_sha: "base",
     platform_base_sha: "base",
@@ -180,6 +195,7 @@ function renderPullDetail(
     updatePRContent: vi.fn(),
     refreshPendingCI: vi.fn(async () => undefined),
     editComment: vi.fn(),
+    applyReviewSuggestions: vi.fn(async () => true),
   };
 
   const rendered = render(PullDetailComponent, {
@@ -209,6 +225,117 @@ function renderPullDetail(
     ]),
   });
   return { ...rendered, detailStore };
+}
+
+function addReviewSuggestionToDetail(detail: PullDetail): void {
+  detail.repo.capabilities.review_suggestion_application = true;
+  detail.repo.operations = {
+    apply_review_suggestion: {
+      available: true,
+    },
+  } as unknown as PullDetail["repo"]["operations"];
+  detail.events = [
+    {
+      ID: 501,
+      MergeRequestID: detail.merge_request.ID,
+      PlatformID: 501,
+      PlatformExternalID: "review-comment-501",
+      EventType: "review_comment",
+      Author: "reviewer",
+      Summary: "",
+      Body: ["This can return directly.", "", "```suggestion", "return client.publishThreads();", "```"].join("\n"),
+      MetadataJSON: "",
+      CreatedAt: "2026-05-01T12:01:00Z",
+      DedupeKey: "review-comment-501",
+      ThreadID: null,
+      Resolvable: true,
+      Resolved: false,
+      diff_thread: {
+        id: "501",
+        provider_comment_id: "review-comment-501",
+        path: "src/review.ts",
+        side: "right",
+        start_side: "right",
+        start_line: 10,
+        line: 11,
+        new_line: 11,
+        line_type: "context",
+        diff_head_sha: "head",
+        commit_sha: "head",
+        body: "This can return directly.",
+        author_login: "reviewer",
+        resolved: false,
+        can_resolve: true,
+        created_at: "2026-05-01T12:01:00Z",
+        updated_at: "2026-05-01T12:01:00Z",
+      },
+    },
+  ];
+}
+
+function makeReviewSuggestionDiffStore() {
+  const diff: DiffResult = {
+    stale: false,
+    whitespace_only_count: 0,
+    files: [
+      {
+        path: "src/review.ts",
+        old_path: "src/review.ts",
+        status: "modified",
+        is_binary: false,
+        is_whitespace_only: false,
+        additions: 2,
+        deletions: 0,
+        hunks: [
+          {
+            old_start: 9,
+            old_count: 1,
+            new_start: 9,
+            new_count: 3,
+            lines: [
+              {
+                type: "context",
+                old_num: 9,
+                new_num: 9,
+                content: "const client = setup();",
+              },
+              {
+                type: "add",
+                new_num: 10,
+                content: "client.enableReviews();",
+              },
+              {
+                type: "add",
+                new_num: 11,
+                content: "client.publishThreads();",
+              },
+              {
+                type: "context",
+                old_num: 10,
+                new_num: 12,
+                content: "return client;",
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  };
+  return {
+    getDiff: () => diff,
+    isDiffLoading: () => false,
+    getCurrentPR: () => ({
+      provider: "github",
+      platformHost: "github.com",
+      owner: "acme",
+      name: "widget",
+      repoPath: "acme/widget",
+      number: 1,
+    }),
+    getTabWidth: () => 4,
+    loadDiff: vi.fn(),
+    requestScrollToLine: vi.fn(),
+  };
 }
 
 function getActionMenuLabelsButton(): HTMLButtonElement {
@@ -560,7 +687,7 @@ describe("PullDetail approvals", () => {
     const labelsIcon = labelsAction.querySelector("svg");
     const labelsItem = labelsAction.closest(".actions-menu-popover__item--labels");
 
-    expect(labelsAction.classList.contains("action-button--sm")).toBe(true);
+    expect(labelsAction.classList.contains("kit-button--sm")).toBe(true);
     expect(labelsAction.parentElement).toBe(labelsItem);
     expect(labelsItem?.classList.contains("label-editor-anchor")).toBe(true);
     expect(labelsIcon?.getAttribute("width")).toBe("14");
@@ -796,6 +923,115 @@ describe("PullDetail approvals", () => {
     expect(button.title).toBe("No user credential for writes on github.com");
   });
 
+  it("hides review suggestion apply actions when the pull request is not open", async () => {
+    const detail = pullDetail();
+    addReviewSuggestionToDetail(detail);
+    detail.merge_request.State = "closed";
+
+    renderPullDetail(detail);
+
+    expect(screen.getByText("This can return directly.")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Commit suggestion" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Add suggestion to batch" })).toBeNull();
+  });
+
+  it("disables review suggestion controls after failed apply recovery cannot refresh detail", async () => {
+    const detail = pullDetail();
+    addReviewSuggestionToDetail(detail);
+    const repoSettings = {
+      AllowSquashMerge: false,
+      AllowMergeCommit: false,
+      AllowRebaseMerge: false,
+      ViewerCanMerge: true,
+      operations: detail.repo.operations,
+    };
+    const apiClient = {
+      GET: vi.fn(async (path: string) => {
+        if (path.includes("/repos/")) {
+          return { data: repoSettings };
+        }
+        return { data: detail };
+      }),
+      POST: vi.fn(async (path: string) => {
+        if (path.endsWith("/review-suggestions/apply")) {
+          return {
+            error: {
+              code: "conflict",
+              type: "about:blank",
+              detail: "target changed since it was reviewed; refresh and retry",
+              details: { reason: "stale_state" },
+            },
+          };
+        }
+        if (path.endsWith("/sync")) {
+          return { error: undefined };
+        }
+        return { data: {} };
+      }),
+    };
+    const detailStore = createDetailStore({
+      client: apiClient as unknown as MiddlemanClient,
+    });
+    await detailStore.loadDetail("acme", "widget", 1, {
+      provider: "github",
+      platformHost: "github.com",
+      repoPath: "acme/widget",
+      sync: false,
+    });
+
+    render(PullDetailComponent, {
+      props: {
+        owner: "acme",
+        name: "widget",
+        number: 1,
+        provider: "github",
+        platformHost: "github.com",
+        repoPath: "acme/widget",
+        hideWorkspaceAction: true,
+        // Background sync would re-fetch the original fixture and race
+        // the fail-closed state this test asserts.
+        autoSync: false,
+      },
+      context: new Map<symbol, unknown>([
+        [API_CLIENT_KEY, apiClient],
+        [
+          STORES_KEY,
+          {
+            detail: detailStore,
+            pulls: { loadPulls: vi.fn() },
+            activity: { loadActivity: vi.fn() },
+            diff: makeReviewSuggestionDiffStore(),
+            diffReviewDraft: {
+              setRouteContext: vi.fn(),
+              isSubmitting: () => false,
+            },
+            detailActivityView: createDetailActivityViewStore(),
+          },
+        ],
+        [ACTIONS_KEY, { pull: [] }],
+        [UI_CONFIG_KEY, { hideStar: true }],
+        [NAVIGATE_KEY, vi.fn()],
+      ]),
+    });
+
+    const commitButton = await vi.waitFor(() => {
+      const found = screen.getByRole("button", { name: "Commit suggestion" }) as HTMLButtonElement;
+      expect(found.disabled).toBe(false);
+      return found;
+    });
+    await fireEvent.click(commitButton);
+
+    await vi.waitFor(() => {
+      const nextCommit = screen.getByRole("button", { name: "Commit suggestion" }) as HTMLButtonElement;
+      expect(nextCommit.disabled).toBe(true);
+      expect(nextCommit.title).toBe("The current pull request head is not known yet");
+      expect((screen.getByRole("button", { name: "Add suggestion to batch" }) as HTMLButtonElement).disabled).toBe(
+        true,
+      );
+    });
+    expect(detailStore.getDetail()?.platform_head_sha).toBe("");
+  });
+
   it("disables approve with reason when submit_review is unavailable", async () => {
     const detail = pullDetail();
     detail.repo.capabilities.review_mutation = true;
@@ -846,7 +1082,7 @@ describe("PullDetail approvals", () => {
 
     await fireEvent.click(await screen.findByRole("button", { name: "Squash and merge" }));
 
-    expect(screen.getByRole("heading", { name: "Merge Pull Request" })).toBeTruthy();
+    expect(screen.getByRole("dialog", { name: "Merge Pull Request" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Merge after CI is complete" })).toBeTruthy();
   });
 
@@ -865,8 +1101,47 @@ describe("PullDetail approvals", () => {
 
     await fireEvent.click(await screen.findByRole("button", { name: "Squash and merge" }));
 
-    expect(screen.getByRole("heading", { name: "Merge Pull Request" })).toBeTruthy();
+    expect(screen.getByRole("dialog", { name: "Merge Pull Request" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Merge after CI is complete" })).toBeTruthy();
+  });
+
+  it("shows the queued merge state and still allows an immediate merge while a deferred merge waits", async () => {
+    const detail = pullDetail();
+    detail.repo.capabilities.merge_mutation = true;
+    detail.deferred_merge_pending = true;
+    detail.merge_request.CIStatus = "pending";
+    detail.merge_request.CIChecksJSON = JSON.stringify([
+      {
+        name: "build",
+        status: "in_progress",
+        conclusion: "",
+        url: "https://example.com/build",
+        app: "GitHub Actions",
+      },
+    ]);
+
+    renderPullDetail(detail, {
+      AllowSquashMerge: true,
+      AllowMergeCommit: false,
+      AllowRebaseMerge: false,
+      ViewerCanMerge: true,
+    });
+
+    const queued = await vi.waitFor(() => {
+      const found = screen.queryByRole("button", { name: "Merge queued" });
+      expect(found).not.toBeNull();
+      return found as HTMLButtonElement;
+    });
+    expect(queued.disabled).toBe(false);
+    expect(queued.title).toContain("Click to merge immediately");
+
+    // Clicking the queued action reopens the merge modal so the user can
+    // force an immediate merge — but it must not offer queueing a second
+    // deferred merge, which the server would reject.
+    await fireEvent.click(queued);
+    expect(screen.getByRole("dialog", { name: "Merge Pull Request" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Merge after CI is complete" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Squash and merge" })).toBeTruthy();
   });
 
   it("opens the merge modal in normal mode when aggregate CI has already failed", async () => {
@@ -899,9 +1174,58 @@ describe("PullDetail approvals", () => {
 
     await fireEvent.click(await screen.findByRole("button", { name: "Squash and merge" }));
 
-    expect(screen.getByRole("heading", { name: "Merge Pull Request" })).toBeTruthy();
+    expect(screen.getByRole("dialog", { name: "Merge Pull Request" })).toBeTruthy();
     // A failed aggregate with a still-running check must not route to deferred
     // merge, since the backend would reject that with a 409.
     expect(screen.queryByRole("button", { name: "Merge after CI is complete" })).toBeNull();
+  });
+});
+
+describe("PullDetail body copy feedback", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    clipboardMockState.resolvers.length = 0;
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  function copyButton(): HTMLButtonElement {
+    const button = document.querySelector<HTMLButtonElement>(".kit-copy-btn.body-copy");
+    if (button === null) {
+      throw new Error("body copy button not found");
+    }
+    return button;
+  }
+
+  it("shows copied feedback when the clipboard write resolves on the same pull", async () => {
+    const detail = pullDetail();
+    detail.merge_request.Body = "body text";
+    renderPullDetail(detail);
+
+    await fireEvent.click(copyButton());
+    expect(clipboardMockState.resolvers).toHaveLength(1);
+    clipboardMockState.resolvers[0]!(true);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(document.querySelector(".body-copy--copied")).not.toBeNull();
+  });
+
+  it("drops a clipboard write that resolves after navigating to another pull", async () => {
+    const detail = pullDetail();
+    detail.merge_request.Body = "body text";
+    const { rerender } = renderPullDetail(detail);
+
+    await fireEvent.click(copyButton());
+    expect(clipboardMockState.resolvers).toHaveLength(1);
+
+    // Navigate to a different pull while the clipboard promise is pending.
+    await rerender({ number: detail.merge_request.Number + 1 });
+
+    clipboardMockState.resolvers[0]!(true);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(document.querySelector(".body-copy--copied")).toBeNull();
   });
 });

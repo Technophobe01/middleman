@@ -42,9 +42,9 @@
   import type { KataTaskViewName } from "./lib/api/kata/taskTypes.js";
   import { createDocsAPI } from "./lib/api/docs/api.js";
   import { createMessageIssueLinker } from "./lib/messages/kataMessageLinker.js";
-  import FlashBanner from "./lib/components/FlashBanner.svelte";
-  import { MonitorIcon, SpinnerIcon } from "./lib/icons.ts";
-  import { showFlash } from "./lib/stores/flash.svelte.js";
+  import { FlashBanner, Spinner } from "@kenn-io/kit-ui";
+  import { MonitorIcon } from "./lib/icons.ts";
+  import { showFlash } from "@middleman/ui/stores/flash";
   import { initItemRefHandler } from "./lib/utils/itemRefHandler.js";
   import { globalRepoForSelectedRoute } from "./lib/utils/repoSelectionSync.js";
   import { runAppStartup } from "./lib/utils/appStartup.js";
@@ -512,6 +512,24 @@
     return isPhoneLikeViewport() || shouldForceMobileRoutes();
   }
 
+  // Phone presentation gets the kit-ui touch type scale even when the
+  // pointer is not coarse (forced-mobile flags, UA-only detection, browser
+  // engines that don't emulate pointer media). Real handheld devices match
+  // the (hover: none) and (pointer: coarse) query in theme.css regardless
+  // of this class.
+  const usesPhoneTypeScale = $derived(
+    isMobilePage(getPage())
+      || shouldUseResponsiveMobileActivityPresentation()
+      || (shouldUseFocusPresentation() && useFocusLayoutClass()),
+  );
+
+  $effect(() => {
+    document.documentElement.classList.toggle("kit-type-touch", usesPhoneTypeScale);
+    return () => {
+      document.documentElement.classList.remove("kit-type-touch");
+    };
+  });
+
   function shouldUseResponsiveMobileActivityPresentation(): boolean {
     if (shouldUseDesktopOnPhone()) return false;
     if (getPage() !== "activity") return false;
@@ -766,6 +784,7 @@
     // behavior where Escape on the activity page closed the open PR drawer.
     const cleanupActivity = registerScopedActions("app:activity-drawer", [
       {
+        // kit-ui-check-ignore: string action id, not drawer markup
         id: "activity.drawer.close",
         label: "Close activity drawer",
         scope: "global",
@@ -942,6 +961,10 @@
     }}
     bind:stores
   >
+  <!-- Mounted once above the focus/full-shell branching so flashes raised
+       through the shared store stay visible in every presentation, not just
+       the desktop shell. -->
+  <FlashBanner top="var(--header-height)" />
   {#if shouldUseFocusPresentation()}
     {@const r = getRoute()}
     <main
@@ -1069,12 +1092,7 @@
       <main class="mobile-main">
         {#if !appReady}
           <div class="loading-state">
-            <SpinnerIcon
-              class="loading-spinner"
-              size="18"
-              strokeWidth="2"
-              aria-hidden="true"
-            />
+            <Spinner size={18} />
             Loading
           </div>
         {:else if getPage() === "mobile-pulls"}
@@ -1094,19 +1112,13 @@
     {#if !isHeaderHidden()}
       <AppHeader />
     {/if}
-    <FlashBanner />
 
     <main class="app-main">
       {#if getPage() === "design-system"}
         <DesignSystemPage />
       {:else if !appReady}
         <div class="loading-state">
-          <SpinnerIcon
-            class="loading-spinner"
-            size="18"
-            strokeWidth="2"
-            aria-hidden="true"
-          />
+          <Spinner size={18} />
           Loading
         </div>
       {:else if getPage() === "settings"}
@@ -1152,12 +1164,7 @@
           </div>
         {:else if !DocsFeature}
           <div class="loading-state">
-            <SpinnerIcon
-              class="loading-spinner"
-              size="18"
-              strokeWidth="2"
-              aria-hidden="true"
-            />
+            <Spinner size={18} />
             Loading Docs
           </div>
         {/if}
@@ -1169,12 +1176,7 @@
           </div>
         {:else if !MessagesFeature}
           <div class="loading-state">
-            <SpinnerIcon
-              class="loading-spinner"
-              size="18"
-              strokeWidth="2"
-              aria-hidden="true"
-            />
+            <Spinner size={18} />
             Loading Messages
           </div>
         {/if}
@@ -1193,6 +1195,7 @@
             {detailTab}
             isSidebarCollapsed={isSidebarCollapsed()}
             sidebarWidth={getSidebarWidth()}
+            sidebarOverlay={isNarrow()}
             onSidebarResize={handleSidebarResize}
           />
         {/if}
@@ -1203,6 +1206,7 @@
             {selectedIssue}
           isSidebarCollapsed={isSidebarCollapsed()}
           sidebarWidth={getSidebarWidth()}
+          sidebarOverlay={isNarrow()}
           onSidebarResize={handleSidebarResize}
         />
       {:else if getPage() === "reviews"}
@@ -1294,16 +1298,16 @@
 
 <style>
   .mobile-shell {
-    --mobile-type-xs: var(--font-size-mobile-xs, 1.08rem);
-    --mobile-type-sm: var(--font-size-mobile-sm, 1.17rem);
-    --mobile-type-body: var(--font-size-mobile-body, 1.24rem);
-    --mobile-type-title: var(--font-size-mobile-title, 1.54rem);
-    --mobile-type-display: var(--font-size-mobile-display, 2.15rem);
-    --mobile-type-metric: var(--font-size-mobile-metric, 1.97rem);
-    --mobile-chrome-space-xs: 0.5rem;
-    --mobile-chrome-space-sm: 0.75rem;
-    --mobile-chrome-space-md: 1rem;
-    --mobile-chrome-hit-target: 3.5rem;
+    --mobile-type-xs: var(--font-size-xs);
+    --mobile-type-sm: var(--font-size-sm);
+    --mobile-type-body: var(--font-size-md);
+    --mobile-type-title: var(--font-size-xl);
+    --mobile-type-display: var(--font-size-2xl);
+    --mobile-type-metric: var(--font-size-2xl);
+    --mobile-chrome-space-xs: 6.5px;
+    --mobile-chrome-space-sm: 10px;
+    --mobile-chrome-space-md: 13px;
+    --mobile-chrome-hit-target: 45.5px;
     container-type: inline-size;
     flex: 1;
     min-height: 0;
@@ -1337,14 +1341,14 @@
 
   .mobile-app-icon {
     display: block;
-    width: 1.45rem;
-    height: 1.45rem;
+    width: 19px;
+    height: 19px;
     flex: 0 0 auto;
   }
 
   .mobile-title {
     color: var(--text-primary);
-    font-size: var(--font-size-mobile-body);
+    font-size: var(--font-size-md);
     font-weight: 700;
     letter-spacing: -0.01em;
   }
@@ -1368,20 +1372,20 @@
     display: grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));
     gap: var(--mobile-chrome-space-xs);
-    padding: 0.16rem;
+    padding: 2px;
     border: thin solid var(--border-default);
     border-radius: var(--radius-md);
     background: var(--bg-inset);
   }
 
   .mobile-tabs a {
-    min-height: calc(var(--mobile-chrome-hit-target) - 0.45rem);
+    min-height: calc(var(--mobile-chrome-hit-target) - 6px);
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    border-radius: calc(var(--radius-md) - 0.16rem);
+    border-radius: calc(var(--radius-md) - 2px);
     color: var(--text-secondary);
-    font-size: var(--font-size-mobile-body);
+    font-size: var(--font-size-md);
     font-weight: 650;
     text-decoration: none;
   }
@@ -1407,7 +1411,7 @@
     padding: var(--mobile-chrome-space-sm);
   }
 
-  .mobile-main :global(.search-input) {
+  .mobile-main :global(.kit-search-input) {
     min-height: var(--mobile-chrome-hit-target);
   }
 
@@ -1420,20 +1424,20 @@
   }
 
   .focus-layout--phone {
-    --mobile-type-xs: var(--font-size-mobile-xs, 1.08rem);
-    --mobile-type-sm: var(--font-size-mobile-sm, 1.17rem);
-    --mobile-type-body: var(--font-size-mobile-body, 1.24rem);
-    --mobile-type-title: var(--font-size-mobile-title, 1.54rem);
-    --mobile-type-display: var(--font-size-mobile-display, 2.15rem);
-    --mobile-type-metric: var(--font-size-mobile-metric, 1.97rem);
+    --mobile-type-xs: var(--font-size-xs);
+    --mobile-type-sm: var(--font-size-sm);
+    --mobile-type-body: var(--font-size-md);
+    --mobile-type-title: var(--font-size-xl);
+    --mobile-type-display: var(--font-size-2xl);
+    --mobile-type-metric: var(--font-size-2xl);
     --focus-detail-type-xs: var(--mobile-type-xs);
     --focus-detail-type-sm: var(--mobile-type-sm);
     --focus-detail-type-body: var(--mobile-type-body);
     --focus-detail-type-title: var(--mobile-type-title);
-    --focus-detail-space-xs: 0.46rem;
-    --focus-detail-space-sm: 0.7rem;
-    --focus-detail-space-md: 0.9rem;
-    --focus-detail-hit-target: 3.75rem;
+    --focus-detail-space-xs: 6px;
+    --focus-detail-space-sm: 9px;
+    --focus-detail-space-md: 12px;
+    --focus-detail-hit-target: 49px;
     --detail-mobile-type-xs: var(--focus-detail-type-xs);
     --detail-mobile-type-sm: var(--focus-detail-type-sm);
     --detail-mobile-type-body: var(--focus-detail-type-body);
@@ -1443,13 +1447,13 @@
     min-width: 0;
   }
 
-  .focus-layout--phone :global(.list-layout),
-  .focus-layout--phone :global(.main-area) {
+  .focus-layout--phone :global(.kit-sidebar-layout),
+  .focus-layout--phone :global(.kit-sidebar-layout__main) {
     width: 100%;
     min-width: 0;
   }
 
-  .focus-layout--phone :global(.main-area) {
+  .focus-layout--phone :global(.kit-sidebar-layout__main) {
     overflow-y: auto;
   }
 
@@ -1459,7 +1463,7 @@
     width: 100%;
     max-width: none;
     padding: var(--focus-detail-space-sm);
-    font-size: var(--font-size-mobile-body);
+    font-size: var(--font-size-md);
     line-height: 1.58;
   }
 
@@ -1478,7 +1482,7 @@
   }
 
   .focus-layout--phone :global(.detail-title) {
-    font-size: var(--font-size-mobile-title);
+    font-size: var(--font-size-xl);
     line-height: 1.22;
     letter-spacing: -0.015em;
   }
@@ -1518,7 +1522,7 @@
   .focus-layout--phone :global(.section-title-inline),
   .focus-layout--phone :global(.loading-placeholder),
   .focus-layout--phone :global(.detail-tab) {
-    font-size: var(--font-size-mobile-sm);
+    font-size: var(--font-size-sm);
     line-height: 1.35;
   }
 
@@ -1529,7 +1533,7 @@
   .focus-layout--phone :global(.title-edit-input),
   .focus-layout--phone :global(.add-description-btn),
   .focus-layout--phone :global(.detail-load-error) {
-    font-size: var(--font-size-mobile-body);
+    font-size: var(--font-size-md);
     line-height: 1.58;
   }
 
@@ -1537,7 +1541,7 @@
     box-sizing: border-box;
     width: 100%;
     padding: var(--focus-detail-space-sm);
-    border-radius: 0.85rem;
+    border-radius: 11px;
   }
 
   .focus-layout--phone :global(.markdown-body pre),
@@ -1552,12 +1556,12 @@
   .focus-layout--phone :global(.gh-link),
   .focus-layout--phone :global(.copy-icon-btn),
   .focus-layout--phone :global(.copy-number-btn),
-  .focus-layout--phone :global(.action-button),
+  .focus-layout--phone :global(.kit-button),
   .focus-layout--phone :global(.detail-tab),
   .focus-layout--phone :global(.add-description-btn) {
     min-width: var(--focus-detail-hit-target);
     min-height: var(--focus-detail-hit-target);
-    font-size: var(--font-size-mobile-sm);
+    font-size: var(--font-size-sm);
   }
 
   .focus-layout--phone :global(.actions-row) {
@@ -1565,16 +1569,16 @@
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
-  .focus-layout--phone :global(.actions-row .action-button) {
+  .focus-layout--phone :global(.actions-row .kit-button) {
     width: 100%;
     justify-content: center;
   }
 
   .focus-layout--phone :global(.comment-editor-input) {
-    min-height: 7.5rem;
+    min-height: 97.5px;
     max-height: 45svh;
     padding: var(--focus-detail-space-sm);
-    border-radius: 0.85rem;
+    border-radius: 11px;
   }
 
   .app-main {
@@ -1589,10 +1593,10 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    gap: var(--mobile-chrome-space-sm, 0.5rem);
+    gap: var(--mobile-chrome-space-sm, 8px);
     flex: 1;
     color: var(--text-muted);
-    font-size: var(--font-size-mobile-sm);
+    font-size: var(--font-size-sm);
     animation: fade-in 0.3s ease;
   }
 
@@ -1608,15 +1612,6 @@
     display: none;
   }
 
-  :global(.loading-spinner) {
-    animation: spin 0.8s linear infinite;
-  }
-
-  @keyframes spin {
-    to {
-      transform: rotate(360deg);
-    }
-  }
 
   @keyframes fade-in {
     from {

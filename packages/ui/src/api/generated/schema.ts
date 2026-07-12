@@ -1497,6 +1497,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/host/{platform_host}/pulls/{provider}/{owner}/{name}/{number}/review-suggestions/apply": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Apply pull request review suggestions */
+        post: operations["apply-pr-review-suggestions-on-host"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/host/{platform_host}/pulls/{provider}/{owner}/{name}/{number}/review-threads/{thread_id}/resolve": {
         parameters: {
             query?: never;
@@ -2063,17 +2080,17 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/kata/workspace-target": {
+    "/kata/tasks/{issue_uid}": {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        get?: never;
+        /** Get Kata task detail with workspace target */
+        get: operations["get-kata-task-detail"];
         put?: never;
-        /** Resolve Kata workspace target */
-        post: operations["resolve-kata-workspace-target"];
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -3084,6 +3101,23 @@ export interface paths {
         put?: never;
         /** Review pull request diff */
         post: operations["publish-pr-review-draft"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/pulls/{provider}/{owner}/{name}/{number}/review-suggestions/apply": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Apply pull request review suggestions */
+        post: operations["apply-pr-review-suggestions"];
         delete?: never;
         options?: never;
         head?: never;
@@ -4233,6 +4267,43 @@ export interface components {
             /** Format: int64 */
             total_size: number;
         };
+        ApplyReviewSuggestionHostInputBody: {
+            /**
+             * Format: uri
+             * @description A URL to the JSON Schema for this object.
+             * @example /api/v1/schemas/ApplyReviewSuggestionHostInputBody.json
+             */
+            readonly $schema?: string;
+            expected_head_sha?: string;
+            message?: string;
+            suggestions: components["schemas"]["ApplyReviewSuggestionRequestItem"][] | null;
+        };
+        ApplyReviewSuggestionInputBody: {
+            /**
+             * Format: uri
+             * @description A URL to the JSON Schema for this object.
+             * @example /api/v1/schemas/ApplyReviewSuggestionInputBody.json
+             */
+            readonly $schema?: string;
+            expected_head_sha?: string;
+            message?: string;
+            suggestions: components["schemas"]["ApplyReviewSuggestionRequestItem"][] | null;
+        };
+        ApplyReviewSuggestionRequestItem: {
+            replacement: string;
+            thread_id: string;
+        };
+        ApplyReviewSuggestionResponse: {
+            /**
+             * Format: uri
+             * @description A URL to the JSON Schema for this object.
+             * @example /api/v1/schemas/ApplyReviewSuggestionResponse.json
+             */
+            readonly $schema?: string;
+            commit_sha?: string;
+            commit_url?: string;
+            status: string;
+        };
         ApprovePRHostInputBody: {
             /**
              * Format: uri
@@ -4279,6 +4350,15 @@ export interface components {
              */
             readonly $schema?: string;
             repos: components["schemas"]["BulkAddRepoRequest"][];
+        };
+        CICheck: {
+            app: string;
+            conclusion: string;
+            /** Format: int64 */
+            duration_seconds?: number;
+            name: string;
+            status: string;
+            url: string;
         };
         Capabilities: {
             commands: components["schemas"]["CommandCapabilities"];
@@ -4525,6 +4605,8 @@ export interface components {
              * @example /api/v1/schemas/DiffResponse.json
              */
             readonly $schema?: string;
+            /** @description Synced PR diff snapshot head this diff was computed from. Always set for pull request diffs (the endpoint fails when no snapshot head is synced); empty for commit and workspace diffs. Compare with the pull detail's platform_head_sha to detect stale cached diff context; unrelated to 'stale', which reports clone-refresh staleness. */
+            diff_head_sha?: string;
             files: components["schemas"]["DiffFile"][] | null;
             stale: boolean;
             /** Format: int64 */
@@ -5101,6 +5183,8 @@ export interface components {
             URL: string;
             /** Format: date-time */
             UpdatedAt: string;
+            /** @enum {string} */
+            WorkflowStatus: "new" | "reviewing" | "waiting" | "awaiting_merge";
             assignees?: string[] | null;
             labels?: components["schemas"]["Label"][] | null;
         };
@@ -5119,6 +5203,7 @@ export interface components {
             repo: components["schemas"]["RepoRefResponse"];
             repo_name: string;
             repo_owner: string;
+            workflow?: components["schemas"]["WorkflowStateMetaResponse"];
             workspace?: components["schemas"]["WorkspaceRef"];
         };
         IssueEvent: {
@@ -5178,6 +5263,8 @@ export interface components {
             URL: string;
             /** Format: date-time */
             UpdatedAt: string;
+            /** @enum {string} */
+            WorkflowStatus: "new" | "reviewing" | "waiting" | "awaiting_merge";
             assignees?: string[] | null;
             detail_fetched_at?: string;
             detail_loaded: boolean;
@@ -5240,13 +5327,20 @@ export interface components {
             provider: string;
             repo_path: string;
         };
-        KataWorkspaceTargetResponse: {
+        KataTaskDetailResponse: {
             /**
              * Format: uri
              * @description A URL to the JSON Schema for this object.
-             * @example /api/v1/schemas/KataWorkspaceTargetResponse.json
+             * @example /api/v1/schemas/KataTaskDetailResponse.json
              */
             readonly $schema?: string;
+            /** @description Verbatim Kata daemon issue detail payload */
+            detail: unknown;
+            /** @description Daemon issue detail ETag, when the daemon provided one */
+            etag?: string;
+            workspace_target: components["schemas"]["KataWorkspaceTargetResponse"];
+        };
+        KataWorkspaceTargetResponse: {
             available: boolean;
             existing_workspace?: components["schemas"]["WorkspaceRef"];
             item_key?: string;
@@ -5488,6 +5582,8 @@ export interface components {
              * @example /api/v1/schemas/MergeRequestDetailResponse.json
              */
             readonly $schema?: string;
+            checks?: components["schemas"]["CICheck"][] | null;
+            deferred_merge_pending: boolean;
             detail_fetched_at?: string;
             detail_loaded: boolean;
             diff_head_sha: string;
@@ -6026,6 +6122,7 @@ export interface components {
             ready_for_review: boolean;
             review_draft_mutation: boolean;
             review_mutation: boolean;
+            review_suggestion_application: boolean;
             review_thread_resolution: boolean;
             reviewer_mutation: boolean;
             state_mutation: boolean;
@@ -6216,6 +6313,14 @@ export interface components {
             linkedPRNumber?: number;
             name: string;
             path: string;
+            /** Format: int64 */
+            prAdditions?: number;
+            /** Format: int64 */
+            prCommentCount?: number;
+            /** Format: int64 */
+            prDeletions?: number;
+            prMergeable?: string;
+            prReviewDecision?: string;
             prState?: string;
             prTitle?: string;
             prURL?: string;
@@ -6461,6 +6566,7 @@ export interface components {
         RepoOperations: {
             add_comment: components["schemas"]["OperationAvailability"];
             add_label: components["schemas"]["OperationAvailability"];
+            apply_review_suggestion: components["schemas"]["OperationAvailability"];
             approve_workflow: components["schemas"]["OperationAvailability"];
             close_issue: components["schemas"]["OperationAvailability"];
             close_pr: components["schemas"]["OperationAvailability"];
@@ -7068,6 +7174,15 @@ export interface components {
             count: number;
             required: boolean;
         };
+        WorkflowStateMetaResponse: {
+            /** @enum {string} */
+            status: "new" | "reviewing" | "waiting" | "awaiting_merge";
+            updated_actor?: string;
+            /** Format: date-time */
+            updated_at?: string;
+            updated_reason?: string;
+            updated_source?: string;
+        };
         WorkspaceKataMetadata: {
             daemon_id: string;
             issue_uid: string;
@@ -7201,6 +7316,14 @@ export interface components {
             linkedPRNumber?: number;
             name: string;
             path: string;
+            /** Format: int64 */
+            prAdditions?: number;
+            /** Format: int64 */
+            prCommentCount?: number;
+            /** Format: int64 */
+            prDeletions?: number;
+            prMergeable?: string;
+            prReviewDecision?: string;
             prState?: string;
             prTitle?: string;
             prURL?: string;
@@ -10586,6 +10709,45 @@ export interface operations {
             };
         };
     };
+    "apply-pr-review-suggestions-on-host": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                provider: string;
+                platform_host: string;
+                owner: string;
+                name: string;
+                number: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ApplyReviewSuggestionHostInputBody"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApplyReviewSuggestionResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemError"];
+                };
+            };
+        };
+    };
     "resolve-pr-review-thread-on-host": {
         parameters: {
             query?: never;
@@ -11874,26 +12036,29 @@ export interface operations {
             };
         };
     };
-    "resolve-kata-workspace-target": {
+    "get-kata-task-detail": {
         parameters: {
             query?: never;
-            header?: never;
-            path?: never;
+            header?: {
+                /** @description Kata daemon id; the effective default daemon when empty */
+                "X-Middleman-Kata-Daemon"?: string;
+            };
+            path: {
+                /** @description Kata issue UID */
+                issue_uid: string;
+            };
             cookie?: never;
         };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["KataWorkspaceTaskRequest"];
-            };
-        };
+        requestBody?: never;
         responses: {
             /** @description OK */
             200: {
                 headers: {
+                    Vary?: string;
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["KataWorkspaceTargetResponse"];
+                    "application/json": components["schemas"]["KataTaskDetailResponse"];
                 };
             };
             /** @description Error */
@@ -14185,6 +14350,44 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ActionStatusBody"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemError"];
+                };
+            };
+        };
+    };
+    "apply-pr-review-suggestions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                provider: string;
+                owner: string;
+                name: string;
+                number: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ApplyReviewSuggestionInputBody"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApplyReviewSuggestionResponse"];
                 };
             };
             /** @description Error */
@@ -16535,9 +16738,12 @@ export const pathsWorkspacesIdFilePreviewGetParametersQueryWhitespaceValues: Rea
 export const pathsWorkspacesIdFilePreviewGetParametersQuerySideValues: ReadonlyArray<FlattenedDeepRequired<paths>["/workspaces/{id}/file-preview"]["get"]["parameters"]["query"]["side"]> = ["old", "new"];
 export const activityTime_rangeValues: ReadonlyArray<FlattenedDeepRequired<components>["schemas"]["Activity"]["time_range"]> = ["24h", "7d", "30d", "90d"];
 export const activityView_modeValues: ReadonlyArray<FlattenedDeepRequired<components>["schemas"]["Activity"]["view_mode"]> = ["flat", "threaded"];
+export const issueWorkflowStatusValues: ReadonlyArray<FlattenedDeepRequired<components>["schemas"]["Issue"]["WorkflowStatus"]> = ["new", "reviewing", "waiting", "awaiting_merge"];
+export const issueResponseWorkflowStatusValues: ReadonlyArray<FlattenedDeepRequired<components>["schemas"]["IssueResponse"]["WorkflowStatus"]> = ["new", "reviewing", "waiting", "awaiting_merge"];
 export const mergeRequestKanbanStatusValues: ReadonlyArray<FlattenedDeepRequired<components>["schemas"]["MergeRequest"]["KanbanStatus"]> = ["new", "reviewing", "waiting", "awaiting_merge"];
 export const mergeRequestStateValues: ReadonlyArray<FlattenedDeepRequired<components>["schemas"]["MergeRequest"]["State"]> = ["open", "closed", "merged"];
 export const mergeRequestResponseKanbanStatusValues: ReadonlyArray<FlattenedDeepRequired<components>["schemas"]["MergeRequestResponse"]["KanbanStatus"]> = ["new", "reviewing", "waiting", "awaiting_merge"];
 export const mergeRequestResponseStateValues: ReadonlyArray<FlattenedDeepRequired<components>["schemas"]["MergeRequestResponse"]["State"]> = ["open", "closed", "merged"];
 export const problemErrorCodeValues: ReadonlyArray<FlattenedDeepRequired<components>["schemas"]["ProblemError"]["code"]> = ["badRequest", "branchConflict", "branchInUse", "branchProtected", "commentNotFound", "conflict", "destinationExists", "forbidden", "hookFailed", "internalError", "issueNotFound", "notFound", "payloadTooLarge", "projectNotFound", "pullNotFound", "rateLimited", "repoNotFound", "serviceUnavailable", "settingsUnavailable", "toolMissing", "toolUnauthenticated", "unauthorized", "unsupportedCapability", "upstreamError", "validationError", "workspaceNotFound", "worktreeDirty"];
 export const terminalRendererValues: ReadonlyArray<FlattenedDeepRequired<components>["schemas"]["Terminal"]["renderer"]> = ["xterm", "ghostty-web"];
+export const workflowStateMetaResponseStatusValues: ReadonlyArray<FlattenedDeepRequired<components>["schemas"]["WorkflowStateMetaResponse"]["status"]> = ["new", "reviewing", "waiting", "awaiting_merge"];

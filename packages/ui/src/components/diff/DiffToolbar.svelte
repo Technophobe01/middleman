@@ -367,7 +367,7 @@
 
   .compact-menu {
     position: absolute;
-    z-index: 1000;
+    z-index: var(--z-popover);
     top: calc(100% + 4px);
     right: 0;
     width: min(224px, calc(100cqw - 20px));
@@ -467,7 +467,7 @@
   .category-btn--active {
     background: var(--bg-surface);
     color: var(--text-primary);
-    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.1);
+    box-shadow: var(--shadow-sm);
   }
 
   .category-count {
@@ -496,9 +496,10 @@
     width: 16px;
     height: 16px;
     border-radius: 50%;
+    /* kit-ui-check-ignore: switch knob stays white on the accent track in both themes */
     background: #ffffff;
     transition: transform 0.2s;
-    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
+    box-shadow: var(--shadow-sm);
   }
 
   .toggle-switch--on .toggle-knob {

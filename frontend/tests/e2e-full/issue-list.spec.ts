@@ -20,7 +20,7 @@ async function selectIssueState(page: Page, label: string): Promise<void> {
   }
 
   await page.getByRole("button", { name: "Filters" }).click();
-  await page.locator(".filter-dropdown .filter-item", { hasText: label }).first().click();
+  await page.locator(".kit-filter-dropdown__panel .kit-filter-dropdown__item", { hasText: label }).first().click();
 }
 
 async function selectIssueGrouping(page: Page, label: string): Promise<void> {
@@ -31,7 +31,7 @@ async function selectIssueGrouping(page: Page, label: string): Promise<void> {
   }
 
   await page.getByRole("button", { name: "Filters" }).click();
-  await page.locator(".filter-dropdown .filter-item", { hasText: label }).last().click();
+  await page.locator(".kit-filter-dropdown__panel .kit-filter-dropdown__item", { hasText: label }).last().click();
 }
 
 const longRepoName = "widgets-with-an-extremely-long-repository-name";
@@ -71,9 +71,9 @@ async function expectRepoChipToClipSafely(
     (node as HTMLElement).style.width = "180px";
   });
 
-  await expect(repoChip.locator(".chip__label")).toHaveText(expectedRepoPath);
-  await expect(repoChip.locator(".chip__label")).toHaveCSS("overflow", "hidden");
-  await expect(repoChip.locator(".chip__label")).toHaveCSS("text-overflow", "ellipsis");
+  await expect(repoChip.locator(".kit-chip__label")).toHaveText(expectedRepoPath);
+  await expect(repoChip.locator(".kit-chip__label")).toHaveCSS("overflow", "hidden");
+  await expect(repoChip.locator(".kit-chip__label")).toHaveCSS("text-overflow", "ellipsis");
   await expect(repoChip).toHaveAttribute("title", expectedRepoPath);
   await expect(repoChip).toHaveCSS("justify-content", "flex-start");
 
@@ -85,7 +85,7 @@ async function expectRepoChipToClipSafely(
     expect(chipBox.x + chipBox.width).toBeLessThanOrEqual(itemBox.x + itemBox.width + 1);
   }
 
-  const labelOverflow = await repoChip.locator(".chip__label").evaluate((node) => ({
+  const labelOverflow = await repoChip.locator(".kit-chip__label").evaluate((node) => ({
     clientWidth: (node as HTMLElement).clientWidth,
     scrollWidth: (node as HTMLElement).scrollWidth,
   }));
@@ -124,7 +124,7 @@ test.describe("issue list view", () => {
   });
 
   test("search filters by title", async ({ page }) => {
-    const input = page.locator(".search-input");
+    const input = page.locator(".search-wrap input");
     await input.fill("Safari");
 
     // Wait for the filtered result to appear (replaces fixed sleep).
@@ -158,7 +158,7 @@ test.describe("issue list view", () => {
       };
     });
 
-    expect(stateChipStyles.minHeight).toBe("18px");
+    expect(stateChipStyles.minHeight).toBe("16px");
     expect(stateChipStyles.fontSize).toBe("10px");
     expect(stateChipStyles.backgroundColor).not.toBe("rgba(0, 0, 0, 0)");
   });
@@ -168,7 +168,7 @@ test.describe("issue list view", () => {
     // seeded fixture (max-width 800px centered layout).
     await page.locator(".issue-item").filter({ hasText: "Safari" }).first().click();
 
-    // IssueListView renders IssueDetail into .main-area, where
+    // IssueListView renders IssueDetail into .kit-sidebar-layout__main, where
     // .issue-detail is the designated internal scroll container.
     const issueDetail = page.locator(".issue-detail");
     await expect(issueDetail).toBeVisible();
@@ -209,7 +209,7 @@ test.describe("issue list view", () => {
     // The scroll container should span the detail pane so the native
     // scrollbar is flush with the pane edge, not the centered content
     // column. The header remains in the capped content column.
-    const detailArea = page.locator(".main-area");
+    const detailArea = page.locator(".kit-sidebar-layout__main");
     const contentHeader = page.locator(".issue-detail .detail-header");
     const areaBox = await detailArea.boundingBox();
     const detailBox = await issueDetail.boundingBox();

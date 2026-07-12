@@ -316,7 +316,10 @@ const config = {
     // entries (openapi-fetch, the @lucide/svelte icon paths) resolve from
     // frontend directly. The set is exactly the cold "new dependencies
     // optimized" list emitted when mounting App.svelte in the browser tier.
-    exclude: ["@middleman/ui"],
+    // @kenn-io/kit-ui is likewise consumed as Svelte source (svelte export
+    // condition); its .svelte.ts rune modules cannot go through the dep
+    // optimizer's plain-JS parse.
+    exclude: ["@middleman/ui", "@kenn-io/kit-ui"],
     include: [
       // packages/ui-owned transitive deps, reached through the excluded barrel.
       "@middleman/ui > @pierre/diffs",
@@ -331,6 +334,38 @@ const config = {
       "@middleman/ui > prosemirror-state",
       "@middleman/ui > shiki",
       "@middleman/ui > svelte-tiptap",
+      // kit-ui-owned transitive deps, reached through its excluded barrel
+      // (the markdown pipeline peers plus its own icon set — the icon paths
+      // below are shared with the frontend list where they overlap).
+      // mermaid is reached via kit-ui's dynamic import; without pre-bundling,
+      // its CJS deps (dayjs) are served raw and fail ESM default-import interop.
+      "@kenn-io/kit-ui > mermaid",
+      "@kenn-io/kit-ui > marked",
+      "@kenn-io/kit-ui > shiki",
+      "@kenn-io/kit-ui > dompurify",
+      "@kenn-io/kit-ui > @lucide/svelte/icons/arrow-down",
+      "@kenn-io/kit-ui > @lucide/svelte/icons/arrow-up",
+      "@kenn-io/kit-ui > @lucide/svelte/icons/arrow-up-down",
+      "@kenn-io/kit-ui > @lucide/svelte/icons/calendar",
+      "@kenn-io/kit-ui > @lucide/svelte/icons/check",
+      "@kenn-io/kit-ui > @lucide/svelte/icons/chevron-down",
+      "@kenn-io/kit-ui > @lucide/svelte/icons/chevron-left",
+      "@kenn-io/kit-ui > @lucide/svelte/icons/chevron-right",
+      "@kenn-io/kit-ui > @lucide/svelte/icons/chevron-up",
+      "@kenn-io/kit-ui > @lucide/svelte/icons/copy",
+      "@kenn-io/kit-ui > @lucide/svelte/icons/ellipsis",
+      "@kenn-io/kit-ui > @lucide/svelte/icons/funnel",
+      "@kenn-io/kit-ui > @lucide/svelte/icons/maximize-2",
+      "@kenn-io/kit-ui > @lucide/svelte/icons/monitor",
+      "@kenn-io/kit-ui > @lucide/svelte/icons/moon",
+      "@kenn-io/kit-ui > @lucide/svelte/icons/panel-left-close",
+      "@kenn-io/kit-ui > @lucide/svelte/icons/panel-left-open",
+      "@kenn-io/kit-ui > @lucide/svelte/icons/refresh-cw",
+      "@kenn-io/kit-ui > @lucide/svelte/icons/rotate-ccw",
+      "@kenn-io/kit-ui > @lucide/svelte/icons/search",
+      "@kenn-io/kit-ui > @lucide/svelte/icons/sun",
+      "@kenn-io/kit-ui > @lucide/svelte/icons/wrap-text",
+      "@kenn-io/kit-ui > @lucide/svelte/icons/x",
       // Frontend-resolvable deps the barrel also pulls in.
       "openapi-fetch",
       // The complete set of @lucide/svelte icon paths imported anywhere in
@@ -366,6 +401,7 @@ const config = {
       "@lucide/svelte/icons/circle-alert",
       "@lucide/svelte/icons/circle-check-big",
       "@lucide/svelte/icons/circle-help",
+      "@lucide/svelte/icons/clock",
       "@lucide/svelte/icons/clock-3",
       "@lucide/svelte/icons/columns-2",
       "@lucide/svelte/icons/copy",
@@ -379,6 +415,7 @@ const config = {
       "@lucide/svelte/icons/folder",
       "@lucide/svelte/icons/folder-input",
       "@lucide/svelte/icons/folder-open",
+      "@lucide/svelte/icons/folder-tree",
       "@lucide/svelte/icons/funnel",
       "@lucide/svelte/icons/git-branch",
       "@lucide/svelte/icons/git-commit-horizontal",
@@ -390,6 +427,8 @@ const config = {
       "@lucide/svelte/icons/layout-panel-left",
       "@lucide/svelte/icons/layout-panel-top",
       "@lucide/svelte/icons/link",
+      "@lucide/svelte/icons/list-chevrons-down-up",
+      "@lucide/svelte/icons/list-chevrons-up-down",
       "@lucide/svelte/icons/loader-circle",
       "@lucide/svelte/icons/message-square",
       "@lucide/svelte/icons/message-square-reply",
@@ -399,6 +438,7 @@ const config = {
       "@lucide/svelte/icons/moon",
       "@lucide/svelte/icons/more-horizontal",
       "@lucide/svelte/icons/move",
+      "@lucide/svelte/icons/network",
       "@lucide/svelte/icons/octagon-x",
       "@lucide/svelte/icons/package-plus",
       "@lucide/svelte/icons/panel-bottom",

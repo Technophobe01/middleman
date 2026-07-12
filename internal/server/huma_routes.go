@@ -19,8 +19,8 @@ import (
 
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/danielgtaylor/huma/v2/adapters/humago"
-	gh "github.com/google/go-github/v84/github"
-	gitlabapi "gitlab.com/gitlab-org/api/client-go"
+	gh "github.com/google/go-github/v88/github"
+	gitlabapi "gitlab.com/gitlab-org/api/client-go/v2"
 	"go.kenn.io/middleman/internal/db"
 	"go.kenn.io/middleman/internal/gitclone"
 	ghclient "go.kenn.io/middleman/internal/github"
@@ -160,6 +160,32 @@ type publishDiffReviewDraftInput struct {
 		Action string `json:"action"`
 	}
 }
+
+type applyReviewSuggestionInput struct {
+	Provider     string `path:"provider"`
+	PlatformHost string
+	Owner        string `path:"owner"`
+	Name         string `path:"name"`
+	Number       int    `path:"number"`
+	Body         struct {
+		ExpectedHeadSHA string                             `json:"expected_head_sha,omitempty"`
+		Message         string                             `json:"message,omitempty"`
+		Suggestions     []applyReviewSuggestionRequestItem `json:"suggestions"`
+	}
+}
+
+type applyReviewSuggestionRequestItem struct {
+	ThreadID    string `json:"thread_id"`
+	Replacement string `json:"replacement"`
+}
+
+type applyReviewSuggestionResponse struct {
+	Status    string `json:"status"`
+	CommitSHA string `json:"commit_sha,omitempty"`
+	CommitURL string `json:"commit_url,omitempty"`
+}
+
+type applyReviewSuggestionOutput = bodyOutput[applyReviewSuggestionResponse]
 
 type discardDiffReviewDraftInput = repoNumberInput
 
@@ -1218,6 +1244,8 @@ func (s *Server) registerProviderRepoAPI(api huma.API) {
 	huma.Register(api, huma.Operation{OperationID: "publish-pr-review-draft-on-host", Method: http.MethodPost, Path: hostPullPath + "/review-draft/publish", DefaultStatus: http.StatusOK, Summary: "Review pull request diff", Tags: []string{"Pull Requests"}}, s.publishDiffReviewDraftOnHost)
 	huma.Register(api, huma.Operation{OperationID: "discard-pr-review-draft", Method: http.MethodDelete, Path: pullPath + "/review-draft", DefaultStatus: http.StatusOK, Summary: "Review pull request diff", Tags: []string{"Pull Requests"}}, s.discardDiffReviewDraft)
 	huma.Register(api, huma.Operation{OperationID: "discard-pr-review-draft-on-host", Method: http.MethodDelete, Path: hostPullPath + "/review-draft", DefaultStatus: http.StatusOK, Summary: "Review pull request diff", Tags: []string{"Pull Requests"}}, s.discardDiffReviewDraftOnHost)
+	huma.Register(api, huma.Operation{OperationID: "apply-pr-review-suggestions", Method: http.MethodPost, Path: pullPath + "/review-suggestions/apply", DefaultStatus: http.StatusOK, Summary: "Apply pull request review suggestions", Tags: []string{"Pull Requests"}}, s.applyReviewSuggestions)
+	huma.Register(api, huma.Operation{OperationID: "apply-pr-review-suggestions-on-host", Method: http.MethodPost, Path: hostPullPath + "/review-suggestions/apply", DefaultStatus: http.StatusOK, Summary: "Apply pull request review suggestions", Tags: []string{"Pull Requests"}}, s.applyReviewSuggestionsOnHost)
 	huma.Register(api, huma.Operation{OperationID: "resolve-pr-review-thread", Method: http.MethodPost, Path: pullPath + "/review-threads/{thread_id}/resolve", DefaultStatus: http.StatusOK, Summary: "Review pull request diff", Tags: []string{"Pull Requests"}}, s.resolveDiffReviewThread)
 	huma.Register(api, huma.Operation{OperationID: "resolve-pr-review-thread-on-host", Method: http.MethodPost, Path: hostPullPath + "/review-threads/{thread_id}/resolve", DefaultStatus: http.StatusOK, Summary: "Review pull request diff", Tags: []string{"Pull Requests"}}, s.resolveDiffReviewThreadOnHost)
 	huma.Register(api, huma.Operation{OperationID: "unresolve-pr-review-thread", Method: http.MethodPost, Path: pullPath + "/review-threads/{thread_id}/unresolve", DefaultStatus: http.StatusOK, Summary: "Review pull request diff", Tags: []string{"Pull Requests"}}, s.unresolveDiffReviewThread)
@@ -1623,20 +1651,21 @@ func (s *Server) buildPullDetailResponse(
 		return mergeRequestDetailResponse{}, problemInternal("load repo failed")
 	}
 	resp := mergeRequestDetailResponse{
-		Events:           eventResponses,
-		Repo:             s.repoRefWithOperations(*repo),
-		RepoOwner:        repo.Owner,
-		RepoName:         repo.Name,
-		PlatformHost:     repo.PlatformHost,
-		PlatformHeadSHA:  mr.PlatformHeadSHA,
-		PlatformBaseSHA:  mr.PlatformBaseSHA,
-		ReviewedHeadSHA:  verifiedReviewedHeadSHA(mr),
-		DiffHeadSHA:      mr.DiffHeadSHA,
-		MergeBaseSHA:     mr.MergeBaseSHA,
-		WorktreeLinks:    toWorktreeLinkResponses(dbLinks, s.fleetSelfKey("")),
-		WorkflowApproval: s.workflowApprovalState(ctx, repo.Owner, repo.Name, mr),
-		Warnings:         s.diffWarnings(mr),
-		DetailLoaded:     mr.DetailFetchedAt != nil,
+		Events:               eventResponses,
+		Repo:                 s.repoRefWithMergeRequestOperations(ctx, *repo, *mr),
+		RepoOwner:            repo.Owner,
+		RepoName:             repo.Name,
+		PlatformHost:         repo.PlatformHost,
+		PlatformHeadSHA:      mr.PlatformHeadSHA,
+		PlatformBaseSHA:      mr.PlatformBaseSHA,
+		ReviewedHeadSHA:      verifiedReviewedHeadSHA(mr),
+		DiffHeadSHA:          mr.DiffHeadSHA,
+		MergeBaseSHA:         mr.MergeBaseSHA,
+		WorktreeLinks:        toWorktreeLinkResponses(dbLinks, s.fleetSelfKey("")),
+		WorkflowApproval:     s.workflowApprovalState(ctx, repo.Owner, repo.Name, mr),
+		Warnings:             s.diffWarnings(mr),
+		DetailLoaded:         mr.DetailFetchedAt != nil,
+		DeferredMergePending: s.isDeferredMergePending(*repo, mr.Number),
 	}
 	if mr.DetailFetchedAt != nil {
 		resp.DetailFetchedAt = formatUTCRFC3339(*mr.DetailFetchedAt)
@@ -1659,6 +1688,15 @@ func (s *Server) buildPullDetailResponse(
 	}
 	responseMR = mergeRequestResponseModel(responseMR)
 	resp.MergeRequest = &responseMR
+
+	checks, err := decodeCIChecks(mr.CIChecksJSON)
+	if err != nil {
+		slog.Warn(
+			"decode merge request ci checks for detail failed",
+			"merge_request_id", mr.ID, "err", err,
+		)
+	}
+	resp.Checks = checks
 
 	if s.workspaces != nil {
 		wsRef, wsErr := s.workspaces.GetByMRForProvider(
@@ -2410,7 +2448,7 @@ func (s *Server) listIssues(ctx context.Context, input *listIssuesInput) (*listI
 			continue
 		}
 		resp := issueResponse{
-			Issue:        issue,
+			Issue:        issueResponseModel(issue),
 			Repo:         s.repoRefFromRepo(rp),
 			PlatformHost: rp.PlatformHost,
 			RepoOwner:    rp.Owner,
@@ -2482,7 +2520,7 @@ func (s *Server) createIssue(
 	savedIssue.ID = issueID
 
 	out := issueResponse{
-		Issue:        *savedIssue,
+		Issue:        issueResponseModel(*savedIssue),
 		Repo:         s.repoRefFromRepo(*repo),
 		PlatformHost: repo.PlatformHost,
 		RepoOwner:    repo.Owner,
@@ -2533,15 +2571,21 @@ func (s *Server) buildIssueDetailResponse(
 	if events == nil {
 		events = []db.IssueEvent{}
 	}
+	workflow, err := s.issueWorkflowMetaResponse(ctx, repo.ID, issue.Number)
+	if err != nil {
+		return issueDetailResponse{}, err
+	}
+	issueModel := issueResponseModel(*issue)
 
 	issueResp := issueDetailResponse{
-		Issue:        issue,
+		Issue:        &issueModel,
 		Events:       events,
 		Repo:         s.repoRefWithOperations(*repo),
 		PlatformHost: repo.PlatformHost,
 		RepoOwner:    repo.Owner,
 		RepoName:     repo.Name,
 		DetailLoaded: issue.DetailFetchedAt != nil,
+		Workflow:     workflow,
 	}
 	if issue.DetailFetchedAt != nil {
 		issueResp.DetailFetchedAt = formatUTCRFC3339(*issue.DetailFetchedAt)
@@ -2559,6 +2603,51 @@ func (s *Server) buildIssueDetailResponse(
 		}
 	}
 	return issueResp, nil
+}
+
+func (s *Server) issueWorkflowMetaResponse(
+	ctx context.Context,
+	repoID int64,
+	number int,
+) (*workflowStateMetaResponse, error) {
+	row, err := s.db.GetItemWorkflowState(ctx, repoID, db.ItemTypeIssue, number)
+	if err != nil {
+		return nil, problemInternal("read issue workflow state failed")
+	}
+	if row == nil {
+		return &workflowStateMetaResponse{Status: db.KanbanStatusNew}, nil
+	}
+	return &workflowStateMetaResponse{
+		Status: normalizeWorkflowStatus(
+			row.Status, "repo_id", repoID, "item_type", db.ItemTypeIssue, "item_number", number,
+		),
+		UpdatedAt:     formatUTCRFC3339(row.UpdatedAt),
+		UpdatedSource: row.UpdatedSource,
+		UpdatedActor:  row.UpdatedActor,
+		UpdatedReason: row.UpdatedReason,
+	}, nil
+}
+
+func issueResponseModel(issue db.Issue) db.Issue {
+	issue.WorkflowStatus = issueResponseWorkflowStatus(issue)
+	return issue
+}
+
+func issueResponseWorkflowStatus(issue db.Issue) db.KanbanStatus {
+	return normalizeWorkflowStatus(string(issue.WorkflowStatus), "issue_id", issue.ID)
+}
+
+func normalizeWorkflowStatus(status string, logAttrs ...any) db.KanbanStatus {
+	switch db.KanbanStatus(status) {
+	case db.KanbanStatusNew, db.KanbanStatusReviewing, db.KanbanStatusWaiting, db.KanbanStatusAwaitingMerge:
+		return db.KanbanStatus(status)
+	case "":
+		return db.KanbanStatusNew
+	default:
+		attrs := append([]any{"status", status}, logAttrs...)
+		slog.Warn("normalizing unexpected workflow status in response", attrs...)
+		return db.KanbanStatusNew
+	}
 }
 
 func (s *Server) postIssueComment(ctx context.Context, input *postIssueCommentInput) (*postIssueCommentOutput, error) {
@@ -2808,6 +2897,9 @@ func (s *Server) approvePR(ctx context.Context, input *approvePRInput) (*actionS
 	}
 	if mr == nil {
 		return nil, problemNotFound(CodePullNotFound, "pull request not found", nil)
+	}
+	if s.mergeRequestAuthoredByViewer(ctx, *repo, *mr) {
+		return nil, selfApprovalProblem(*repo)
 	}
 
 	expectedHeadSHA := approvalReviewHeadSHA(mr, input.Body.ExpectedHeadSHA)
@@ -3184,6 +3276,13 @@ func (s *Server) mergePRWithBody(
 	now := s.now().UTC()
 	_ = s.db.UpdateMRState(ctx, repo.ID, number, "merged", &now, &now)
 	s.markClosedLinkedNotificationsDone(ctx)
+
+	// The merge landed, so any deferred merge still queued for this pull
+	// request is superseded: its worker stands down silently instead of
+	// later reporting a failure for a pull request that is already merged.
+	// (A deferred worker completing through this same path supersedes its
+	// own handle, which is a no-op by the time it broadcasts completion.)
+	s.supersedeDeferredMerge(deferredMergeKey(*repo, number))
 
 	return mergePRBody{
 		Merged:  result.Merged,
@@ -4013,41 +4112,9 @@ func (s *Server) syncIssue(ctx context.Context, input *issueRepoNumberInput) (*s
 		return nil, problemNotFound(CodeIssueNotFound, "issue not found after sync", nil)
 	}
 
-	events, err := s.db.ListIssueEvents(ctx, issue.ID)
+	syncIssueResp, err := s.buildIssueDetailResponse(ctx, repo, issue)
 	if err != nil {
-		return nil, problemInternal("list issue events: " + err.Error())
-	}
-	if events == nil {
-		events = []db.IssueEvent{}
-	}
-
-	syncIssueResp := issueDetailResponse{
-		Issue:  issue,
-		Events: events,
-		// The frontend replaces the issue detail payload with this
-		// response, so it must carry operations like the detail
-		// endpoint does — a bare repo ref would clear every mutation
-		// gate until the next detail load.
-		Repo:         s.repoRefWithOperations(*repo),
-		PlatformHost: repo.PlatformHost,
-		RepoOwner:    repo.Owner,
-		RepoName:     repo.Name,
-		DetailLoaded: issue.DetailFetchedAt != nil,
-	}
-	if issue.DetailFetchedAt != nil {
-		syncIssueResp.DetailFetchedAt = formatUTCRFC3339(*issue.DetailFetchedAt)
-	}
-	if s.workspaces != nil {
-		wsRef, wsErr := s.workspaces.GetByIssueForProvider(
-			ctx, repo.Platform, repo.PlatformHost, repo.Owner, repo.Name,
-			issue.Number,
-		)
-		if wsErr == nil && wsRef != nil {
-			syncIssueResp.Workspace = &workspaceRef{
-				ID:     wsRef.ID,
-				Status: wsRef.Status,
-			}
-		}
+		return nil, err
 	}
 	return &syncIssueOutput{Body: syncIssueResp}, nil
 }
@@ -4617,6 +4684,7 @@ func (s *Server) getDiff(ctx context.Context, input *getDiffInput) (*getDiffOutp
 		Stale:               result.Stale,
 		WhitespaceOnlyCount: result.WhitespaceOnlyCount,
 		Files:               result.Files,
+		DiffHeadSHA:         resolved.diffSHAs.DiffHeadSHA,
 	}}, nil
 }
 
@@ -6372,6 +6440,14 @@ func (s *Server) launchWorkspaceRuntimeSession(
 	if targetKey == "" {
 		return nil, problemValidation("body.target_key", "target_key is required")
 	}
+	if workspaceRuntimeTargetIsAgent(s.runtime, targetKey) {
+		if err := s.workspaces.PrepareAgentLaunchContext(ctx, workspace.PrepareAgentLaunchContextOptions{
+			WorkspaceID: summary.ID,
+			TargetKey:   targetKey,
+		}); err != nil {
+			return nil, problemInternal("prepare agent context: " + err.Error())
+		}
+	}
 
 	session, err := s.runtime.Launch(
 		ctx, summary.ID, summary.WorktreePath, targetKey,
@@ -6395,6 +6471,18 @@ func (s *Server) launchWorkspaceRuntimeSession(
 	}
 	s.forgetRecordedRuntimeSessionIfExited(ctx, session)
 	return &workspaceRuntimeSessionOutput{Body: session}, nil
+}
+
+func workspaceRuntimeTargetIsAgent(runtime *localruntime.Manager, targetKey string) bool {
+	if runtime == nil {
+		return false
+	}
+	for _, target := range runtime.LaunchTargets() {
+		if target.Key == targetKey {
+			return target.Kind == localruntime.LaunchTargetAgent && target.Available
+		}
+	}
+	return false
 }
 
 func (s *Server) forgetRecordedRuntimeSessionIfExited(

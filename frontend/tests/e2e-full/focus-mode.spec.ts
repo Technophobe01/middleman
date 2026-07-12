@@ -6,9 +6,9 @@ test.describe("focus mode", () => {
     await page.locator(".focus-layout").waitFor({ state: "visible", timeout: 10_000 });
 
     await expect(page.locator(".pull-detail")).toBeVisible();
-    await expect(page.locator(".app-header")).not.toBeAttached();
-    await expect(page.locator(".sidebar")).not.toBeAttached();
-    await expect(page.locator(".status-bar")).not.toBeAttached();
+    await expect(page.locator(".app-top-bar")).not.toBeAttached();
+    await expect(page.locator(".kit-sidebar-layout__sidebar")).not.toBeAttached();
+    await expect(page.locator(".kit-status-bar")).not.toBeAttached();
   });
 
   test("issue focus route renders detail without shell chrome", async ({ page }) => {
@@ -16,9 +16,9 @@ test.describe("focus mode", () => {
     await page.locator(".focus-layout").waitFor({ state: "visible", timeout: 10_000 });
 
     await expect(page.locator(".issue-detail")).toBeVisible();
-    await expect(page.locator(".app-header")).not.toBeAttached();
-    await expect(page.locator(".sidebar")).not.toBeAttached();
-    await expect(page.locator(".status-bar")).not.toBeAttached();
+    await expect(page.locator(".app-top-bar")).not.toBeAttached();
+    await expect(page.locator(".kit-sidebar-layout__sidebar")).not.toBeAttached();
+    await expect(page.locator(".kit-status-bar")).not.toBeAttached();
   });
 
   test("narrow PR focus route shows actions only inside the actions menu", async ({ page }) => {
@@ -44,7 +44,8 @@ test.describe("focus mode", () => {
     await expect(page.locator(".label-picker")).toBeVisible();
     await expect(page.locator(".actions-menu-popover")).toBeHidden();
     await expect(page.locator(".label-editor-backdrop")).toBeVisible();
-    await expect(page.locator(".label-editor-backdrop")).toHaveCSS("background-color", "rgba(128, 128, 128, 0.3)");
+    // --overlay-bg resolves to rgba(0,0,0,0.3) in the default light theme.
+    await expect(page.locator(".label-editor-backdrop")).toHaveCSS("background-color", "rgba(0, 0, 0, 0.3)");
 
     const pickerRect = await page.locator(".label-picker").boundingBox();
     const viewport = page.viewportSize();

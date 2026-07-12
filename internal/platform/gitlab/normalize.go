@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	gitlab "gitlab.com/gitlab-org/api/client-go"
+	gitlab "gitlab.com/gitlab-org/api/client-go/v2"
 	"go.kenn.io/middleman/internal/platform"
 )
 
@@ -179,9 +179,14 @@ func normalizeMergeRequest(
 		CreatedAt:          timeValue(mr.CreatedAt),
 		UpdatedAt:          timeValue(mr.UpdatedAt),
 		LastActivityAt:     timeValue(mr.UpdatedAt),
+		MergedBy:           basicUsername(mr.MergeUser),
 		Labels:             normalizeLabelNames(repo, mr.Labels),
 		Assignees:          basicUsernames(mr.Assignees),
 		RequestedReviewers: basicUsernames(mr.Reviewers),
+	}
+	if out.MergedBy == "" {
+		//nolint:staticcheck // GitLab < 14.7 can populate merged_by without merge_user.
+		out.MergedBy = basicUsername(mr.MergedBy)
 	}
 	if mr.MergedAt != nil {
 		t := mr.MergedAt.UTC()

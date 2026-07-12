@@ -1,9 +1,9 @@
 <script lang="ts">
   import { getStores, getNavigate, getSidebar } from "../../context.js";
   import IssueItem from "./IssueItem.svelte";
-  import Chip from "../shared/Chip.svelte";
-  import FilterDropdown from "../shared/FilterDropdown.svelte";
-  import LeftSidebarToggle from "../shared/LeftSidebarToggle.svelte";
+  import { Chip, SearchInput } from "@kenn-io/kit-ui";
+  import { FilterDropdown } from "@kenn-io/kit-ui";
+  import { SidebarToggle } from "@kenn-io/kit-ui";
   import type { Issue } from "../../api/types.js";
   import {
     buildIssueRoute,
@@ -49,8 +49,7 @@
     };
   });
 
-  function onSearchInput(e: Event): void {
-    const value = (e.target as HTMLInputElement).value;
+  function onSearchInput(value: string): void {
     searchInput = value;
 
     if (debounceHandle !== null) clearTimeout(debounceHandle);
@@ -135,7 +134,7 @@
 
 <div class="issue-list">
   <div class="filter-bar" class:filter-bar--compact={useCompactFilters}>
-    <Chip size="sm" uppercase={false} class="chip--muted list-count-chip">
+    <Chip size="xs" tone="muted" uppercase={false} class="list-count-chip">
       {issues.getIssues().length} issues
     </Chip>
     <div class="state-toggle">
@@ -168,25 +167,22 @@
       />
     </div>
     {#if isSidebarToggleEnabled()}
-      <LeftSidebarToggle
+      <SidebarToggle
         state="expanded"
         label="sidebar"
         onclick={toggleSidebar}
-        class="left-sidebar-toggle--push"
+        class="kit-sidebar-toggle--push"
       />
     {/if}
   </div>
   <div class="search-bar">
-    <div class="search-input-wrap">
-      <svg class="search-icon" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-        <circle cx="6.5" cy="6.5" r="4.5" stroke="currentColor" stroke-width="1.5" />
-        <path d="M10 10L14 14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
-      </svg>
-      <input
-        class="search-input"
-        type="search"
+    <div class="search-wrap">
+      <SearchInput
+        bind:value={searchInput}
+        size="sm"
+        block
         placeholder="Search issues..."
-        value={searchInput}
+        ariaLabel="Search issues"
         oninput={onSearchInput}
       />
     </div>
@@ -315,35 +311,9 @@
     background: var(--bg-surface);
   }
 
-  .search-input-wrap {
-    position: relative;
+  .search-wrap {
     flex: 1;
     min-width: 0;
-  }
-
-  .search-icon {
-    position: absolute;
-    left: 8px;
-    top: 50%;
-    transform: translateY(-50%);
-    width: 13px;
-    height: 13px;
-    color: var(--text-muted);
-    pointer-events: none;
-  }
-
-  .search-input {
-    width: 100%;
-    font-size: var(--font-size-sm);
-    padding: 5px 8px 5px 28px;
-    background: var(--bg-inset);
-    border: 1px solid var(--border-muted);
-    border-radius: var(--radius-sm);
-  }
-
-  .search-input:focus {
-    border-color: var(--accent-blue);
-    outline: none;
   }
 
   .star-filter-btn {
@@ -516,14 +486,14 @@
     transform-origin: left center;
   }
 
-  .compact-filter-menu :global(.filter-btn) {
+  .compact-filter-menu :global(.kit-filter-dropdown__btn) {
     width: 26px;
     justify-content: center;
     padding: 3px;
   }
 
-  .compact-filter-menu :global(.filter-trigger-label),
-  .compact-filter-menu :global(.filter-trigger-detail) {
+  .compact-filter-menu :global(.kit-filter-dropdown__trigger-label),
+  .compact-filter-menu :global(.kit-filter-dropdown__trigger-detail) {
     display: none;
   }
 
@@ -540,7 +510,7 @@
   .state-btn--active {
     background: var(--bg-surface);
     color: var(--text-primary);
-    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.1);
+    box-shadow: var(--shadow-sm);
   }
   .state-note {
     font-size: var(--font-size-xs);
@@ -571,7 +541,7 @@
   .group-btn--active {
     background: var(--bg-surface);
     color: var(--text-primary);
-    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.1);
+    box-shadow: var(--shadow-sm);
   }
 
   .filter-bar--compact .state-toggle,

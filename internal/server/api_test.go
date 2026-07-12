@@ -33,7 +33,7 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/creack/pty/v2"
-	gh "github.com/google/go-github/v84/github"
+	gh "github.com/google/go-github/v88/github"
 	shellquote "github.com/kballard/go-shellquote"
 	"github.com/shurcooL/githubv4"
 	"github.com/stretchr/testify/assert"
@@ -192,6 +192,8 @@ type mockGH struct {
 	getIssueIfChangedFn        func(context.Context, string, string, int, string) (*gh.Issue, string, bool, error)
 	createIssueFn              func(context.Context, string, string, string, string) (*gh.Issue, error)
 	getUserFn                  func(context.Context, string) (*gh.User, error)
+	authenticatedViewerLoginFn func(context.Context) (string, error)
+	authenticatedViewerCalls   int
 	markReadyForReviewFn       func(context.Context, string, string, int) (*gh.PullRequest, error)
 	convertToDraftFn           func(context.Context, string, string, int) (*gh.PullRequest, error)
 	dismissReviewFn            func(context.Context, string, string, int, int64, string) (*gh.PullRequestReview, error)
@@ -203,6 +205,7 @@ type mockGH struct {
 	createReviewCommentReplyFn func(context.Context, string, string, int, string, int64) (*gh.PullRequestComment, error)
 	createReviewFn             func(context.Context, string, string, int, string, string) (*gh.PullRequestReview, error)
 	createReviewWithCommentsFn func(context.Context, string, string, int, string, string, string, []*gh.DraftReviewComment) (*gh.PullRequestReview, error)
+	applyReviewSuggestionsFn   func(context.Context, string, string, int, platform.ApplyReviewSuggestionsInput) (*platform.AppliedReviewSuggestions, error)
 	mergePullRequestFn         func(context.Context, string, string, int, string, string, string) (*gh.PullRequestMergeResult, error)
 	listWorkflowRunsForHeadFn  func(context.Context, string, string, string) ([]*gh.WorkflowRun, error)
 	approveWorkflowRunFn       func(context.Context, string, string, int64) error
@@ -214,6 +217,7 @@ type mockGH struct {
 	listIssuesPageFn           func(context.Context, string, string, string, int) ([]*gh.Issue, bool, error)
 	listCheckRunsForRefFn      func(context.Context, string, string, string) ([]*gh.CheckRun, error)
 	getCombinedStatusFn        func(context.Context, string, string, string) (*gh.CombinedStatus, error)
+	listPRTimelineEventsFn     func(context.Context, string, string, int) ([]ghclient.PullRequestTimelineEvent, error)
 	listOpenPRsErr             error
 	listOpenIssuesFn           func(context.Context, string, string) ([]*gh.Issue, error)
 	listIssueCommentsFn        func(context.Context, string, string, int) ([]*gh.IssueComment, error)
@@ -290,6 +294,14 @@ func (m *mockGH) GetUser(ctx context.Context, login string) (*gh.User, error) {
 		return m.getUserFn(ctx, login)
 	}
 	return &gh.User{Login: &login}, nil
+}
+
+func (m *mockGH) AuthenticatedViewerLogin(ctx context.Context) (string, error) {
+	m.authenticatedViewerCalls++
+	if m.authenticatedViewerLoginFn != nil {
+		return m.authenticatedViewerLoginFn(ctx)
+	}
+	return "", nil
 }
 
 func (m *mockGH) GetRateLimitSnapshot(ctx context.Context) (*ghclient.RateLimitSnapshot, error) {
@@ -401,8 +413,11 @@ func (m *mockGH) ListForcePushEvents(
 }
 
 func (m *mockGH) ListPullRequestTimelineEvents(
-	_ context.Context, _, _ string, _ int,
+	ctx context.Context, owner, repo string, number int,
 ) ([]ghclient.PullRequestTimelineEvent, error) {
+	if m.listPRTimelineEventsFn != nil {
+		return m.listPRTimelineEventsFn(ctx, owner, repo, number)
+	}
 	return nil, nil
 }
 
@@ -528,6 +543,19 @@ func (m *mockGH) CreateReviewWithComments(
 		return m.createReviewWithCommentsFn(ctx, owner, repo, number, event, body, commitID, comments)
 	}
 	return m.CreateReview(ctx, owner, repo, number, event, body)
+}
+
+func (m *mockGH) ApplyReviewSuggestions(
+	ctx context.Context,
+	owner string,
+	repo string,
+	number int,
+	input platform.ApplyReviewSuggestionsInput,
+) (*platform.AppliedReviewSuggestions, error) {
+	if m.applyReviewSuggestionsFn != nil {
+		return m.applyReviewSuggestionsFn(ctx, owner, repo, number, input)
+	}
+	return &platform.AppliedReviewSuggestions{CommitSHA: "suggestion-commit-sha"}, nil
 }
 
 func (m *mockGH) DismissReview(
@@ -659,22 +687,26 @@ func (m *mockGH) MarkNotificationThreadRead(ctx context.Context, threadID string
 func (m *mockGH) InvalidateListETagsForRepo(_, _ string, _ ...string) {}
 
 type apiTestGitLabProvider struct {
-	ref                platform.RepoRef
-	capabilities       *platform.Capabilities
-	mergeRequests      []platform.MergeRequest
-	mergeRequestEvents map[int][]platform.MergeRequestEvent
-	issues             []platform.Issue
-	issueEvents        map[int][]platform.IssueEvent
-	releases           []platform.Release
-	tags               []platform.Tag
-	ciChecks           map[string][]platform.CICheck
-	ciErr              error
-	reviewThreads      []platform.MergeRequestReviewThread
-	reviewThreadsErr   error
-	publishedReviews   []platform.PublishDiffReviewDraftInput
-	publishReviewErr   error
-	resolvedThreads    []string
-	unresolvedThreads  []string
+	ref                 platform.RepoRef
+	capabilities        *platform.Capabilities
+	mergeRequests       []platform.MergeRequest
+	mergeRequestDetail  map[int]platform.MergeRequest
+	mergeRequestEvents  map[int][]platform.MergeRequestEvent
+	issues              []platform.Issue
+	issueEvents         map[int][]platform.IssueEvent
+	releases            []platform.Release
+	tags                []platform.Tag
+	ciChecks            map[string][]platform.CICheck
+	ciErr               error
+	reviewThreads       []platform.MergeRequestReviewThread
+	reviewThreadsErr    error
+	publishedReviews    []platform.PublishDiffReviewDraftInput
+	publishReviewErr    error
+	appliedSuggestions  []platform.ApplyReviewSuggestionsInput
+	applySuggestionsErr error
+	rateLimitBuckets    map[platform.OperationName][]platform.RateLimitBucket
+	resolvedThreads     []string
+	unresolvedThreads   []string
 }
 
 func (p *apiTestGitLabProvider) Platform() platform.Kind {
@@ -699,6 +731,16 @@ func (p *apiTestGitLabProvider) Capabilities() platform.Capabilities {
 	}
 }
 
+func (p *apiTestGitLabProvider) OperationRateLimitBuckets(
+	operation platform.OperationName,
+) ([]platform.RateLimitBucket, bool) {
+	if p.rateLimitBuckets == nil {
+		return nil, false
+	}
+	buckets, ok := p.rateLimitBuckets[operation]
+	return buckets, ok
+}
+
 func (p *apiTestGitLabProvider) PublishDiffReviewDraft(
 	_ context.Context,
 	_ platform.RepoRef,
@@ -707,6 +749,19 @@ func (p *apiTestGitLabProvider) PublishDiffReviewDraft(
 ) (*platform.PublishedDiffReview, error) {
 	p.publishedReviews = append(p.publishedReviews, input)
 	return &platform.PublishedDiffReview{SubmittedAt: time.Now().UTC()}, p.publishReviewErr
+}
+
+func (p *apiTestGitLabProvider) ApplyReviewSuggestions(
+	_ context.Context,
+	_ platform.RepoRef,
+	_ int,
+	input platform.ApplyReviewSuggestionsInput,
+) (*platform.AppliedReviewSuggestions, error) {
+	if p.applySuggestionsErr != nil {
+		return nil, p.applySuggestionsErr
+	}
+	p.appliedSuggestions = append(p.appliedSuggestions, input)
+	return &platform.AppliedReviewSuggestions{CommitSHA: "suggestion-commit-sha"}, nil
 }
 
 func (p *apiTestGitLabProvider) ListMergeRequestReviewThreads(
@@ -778,6 +833,11 @@ func (p *apiTestGitLabProvider) GetMergeRequest(
 	_ platform.RepoRef,
 	number int,
 ) (platform.MergeRequest, error) {
+	if p.mergeRequestDetail != nil {
+		if mr, ok := p.mergeRequestDetail[number]; ok {
+			return mr, nil
+		}
+	}
 	for _, mr := range p.mergeRequests {
 		if mr.Number == number {
 			return mr, nil
@@ -1039,6 +1099,10 @@ func withSeedPRHeadBranch(branch string) seedPROpt {
 
 func withSeedPRTitle(title string) seedPROpt {
 	return func(pr *db.MergeRequest) { pr.Title = title }
+}
+
+func withSeedPRAuthor(author string) seedPROpt {
+	return func(pr *db.MergeRequest) { pr.Author = author }
 }
 
 func withSeedPRLifecycle(
@@ -1597,6 +1661,84 @@ func TestAPIPullResponsesNormalizeMissingKanbanStateToNew(t *testing.T) {
 	assert.Equal(db.KanbanStatusNew, detail.MergeRequest.KanbanStatus)
 }
 
+// TestAPIGetPullIncludesCIChecks confirms the PR-detail response decodes the
+// merge request's cached ci_checks_json into a top-level checks array.
+func TestAPIGetPullIncludesCIChecks(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	srv, database := setupTestServer(t)
+	ctx := t.Context()
+
+	repoID, err := database.UpsertRepo(ctx, db.GitHubRepoIdentity("github.com", "acme", "widget"))
+	require.NoError(err)
+	now := time.Now().UTC().Truncate(time.Second)
+	checksJSON := `[{"name":"build","status":"completed","conclusion":"success","url":"https://ci.example/build"},` +
+		`{"name":"lint","status":"in_progress","conclusion":"","url":"https://ci.example/lint"}]`
+	_, err = database.UpsertMergeRequest(ctx, &db.MergeRequest{
+		RepoID:         repoID,
+		PlatformID:     7000,
+		Number:         7,
+		URL:            "https://github.com/acme/widget/pull/7",
+		Title:          "Checks PR",
+		Author:         "alice",
+		State:          "open",
+		HeadBranch:     "feature/checks",
+		BaseBranch:     "main",
+		CIStatus:       "pending",
+		CIChecksJSON:   checksJSON,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		LastActivityAt: now,
+	})
+	require.NoError(err)
+
+	rawDetail := doJSON(t, srv, http.MethodGet, "/api/v1/pulls/gh/acme/widget/7", nil)
+	require.Equal(http.StatusOK, rawDetail.Code)
+	var detail mergeRequestDetailResponse
+	require.NoError(json.Unmarshal(rawDetail.Body.Bytes(), &detail))
+	require.Len(detail.Checks, 2)
+	assert.Equal("build", detail.Checks[0].Name)
+	assert.Equal("completed", detail.Checks[0].Status)
+	assert.Equal("success", detail.Checks[0].Conclusion)
+	assert.Equal("https://ci.example/build", detail.Checks[0].URL)
+	assert.Equal("lint", detail.Checks[1].Name)
+	assert.Equal("in_progress", detail.Checks[1].Status)
+}
+
+// TestAPIGetPullToleratesMalformedCIChecks confirms a corrupt ci_checks_json
+// cache does not fail the detail response: checks are simply omitted.
+func TestAPIGetPullToleratesMalformedCIChecks(t *testing.T) {
+	require := require.New(t)
+	srv, database := setupTestServer(t)
+	ctx := t.Context()
+
+	repoID, err := database.UpsertRepo(ctx, db.GitHubRepoIdentity("github.com", "acme", "widget"))
+	require.NoError(err)
+	now := time.Now().UTC().Truncate(time.Second)
+	_, err = database.UpsertMergeRequest(ctx, &db.MergeRequest{
+		RepoID:         repoID,
+		PlatformID:     7000,
+		Number:         7,
+		URL:            "https://github.com/acme/widget/pull/7",
+		Title:          "Corrupt checks PR",
+		Author:         "alice",
+		State:          "open",
+		HeadBranch:     "feature/corrupt",
+		BaseBranch:     "main",
+		CIChecksJSON:   "not valid json",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		LastActivityAt: now,
+	})
+	require.NoError(err)
+
+	rawDetail := doJSON(t, srv, http.MethodGet, "/api/v1/pulls/gh/acme/widget/7", nil)
+	require.Equal(http.StatusOK, rawDetail.Code)
+	var detail mergeRequestDetailResponse
+	require.NoError(json.Unmarshal(rawDetail.Body.Bytes(), &detail))
+	require.Empty(detail.Checks, "malformed checks cache yields no checks, not an error")
+}
+
 func TestAPIListItemsIncludeWorkspaceRefs(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
@@ -1745,6 +1887,79 @@ func TestAPIListPullsPreservesNewerActivityAfterIndexSync(t *testing.T) {
 	assert.Equal(int64(2), (*resp.JSON200)[1].Number)
 }
 
+func TestAPISyncPRUsesForcePushTimelineForPullListActivity(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	ctx := t.Context()
+	base := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	forcePushAt := base.Add(3 * time.Hour)
+	otherActivity := base.Add(2 * time.Hour)
+	headSHA := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+	str := func(v string) *string { return &v }
+	mock := &mockGH{
+		getPullRequestFn: func(_ context.Context, _, _ string, number int) (*gh.PullRequest, error) {
+			id := int64(1001)
+			return &gh.PullRequest{
+				ID:        &id,
+				Number:    &number,
+				Title:     str("Force push activity"),
+				State:     str("open"),
+				HTMLURL:   str("https://github.com/acme/widget/pull/1"),
+				User:      &gh.User{Login: str("octocat")},
+				CreatedAt: &gh.Timestamp{Time: base.Add(-time.Hour)},
+				UpdatedAt: &gh.Timestamp{Time: base},
+				Head:      &gh.PullRequestBranch{Ref: str("feature"), SHA: &headSHA},
+				Base:      &gh.PullRequestBranch{Ref: str("main")},
+			}, nil
+		},
+		listIssueCommentsFn: func(context.Context, string, string, int) ([]*gh.IssueComment, error) {
+			return nil, nil
+		},
+		listPRTimelineEventsFn: func(context.Context, string, string, int) ([]ghclient.PullRequestTimelineEvent, error) {
+			return []ghclient.PullRequestTimelineEvent{{
+				EventType: "force_push",
+				Actor:     "octocat",
+				BeforeSHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+				AfterSHA:  headSHA,
+				Ref:       "feature",
+				CreatedAt: forcePushAt,
+			}}, nil
+		},
+	}
+	srv, database := setupTestServerWithMock(t, mock)
+	seedPR(t, database, "acme", "widget", 1,
+		withSeedPRTitle("Force push activity"),
+		withSeedPRTimes(base.Add(-time.Hour), base, base),
+	)
+	seedPR(t, database, "acme", "widget", 2,
+		withSeedPRTitle("Other activity"),
+		withSeedPRTimes(base.Add(-time.Hour), otherActivity, otherActivity),
+	)
+	client := setupTestClient(t, srv)
+
+	syncResp, err := client.HTTP.SyncPullWithResponse(ctx, "gh", "acme", "widget", 1)
+	require.NoError(err)
+	require.Equal(http.StatusOK, syncResp.StatusCode(), string(syncResp.Body))
+	require.NotNil(syncResp.JSON200)
+	assert.Equal(forcePushAt, syncResp.JSON200.MergeRequest.LastActivityAt.UTC())
+
+	detailResp, err := client.HTTP.GetPullWithResponse(ctx, "gh", "acme", "widget", 1)
+	require.NoError(err)
+	require.Equal(http.StatusOK, detailResp.StatusCode(), string(detailResp.Body))
+	require.NotNil(detailResp.JSON200)
+	assert.Equal(forcePushAt, detailResp.JSON200.MergeRequest.LastActivityAt.UTC())
+
+	listResp, err := client.HTTP.ListPullsWithResponse(ctx, nil)
+	require.NoError(err)
+	require.Equal(http.StatusOK, listResp.StatusCode(), string(listResp.Body))
+	require.NotNil(listResp.JSON200)
+	require.Len(*listResp.JSON200, 2)
+	assert.Equal(int64(1), (*listResp.JSON200)[0].Number)
+	assert.Equal(forcePushAt, (*listResp.JSON200)[0].LastActivityAt.UTC())
+	assert.Equal(int64(2), (*listResp.JSON200)[1].Number)
+}
+
 func TestAPIListPullsKeepsCachedCIDecorationsAfterIndexSync(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
@@ -1880,7 +2095,8 @@ func TestAPIGitHubSyncPersistsReviewThreadsThroughPullDetail(t *testing.T) {
 	assert.Equal("right", event.DiffThread.Side)
 	assert.Equal(int64(line), event.DiffThread.Line)
 	assert.Equal("inline note", event.DiffThread.Body)
-	assert.Nil(event.DiffThread.DiffHeadSha)
+	require.NotNil(event.DiffThread.DiffHeadSha)
+	assert.Equal(commentCommitSHA, *event.DiffThread.DiffHeadSha)
 	require.NotNil(event.DiffThread.CommitSha)
 	assert.Equal(commentCommitSHA, *event.DiffThread.CommitSha)
 	require.NotNil(event.DiffThread.ProviderCommentId)
@@ -2253,6 +2469,195 @@ func TestAPISyncPRPersistsMergeableState(t *testing.T) {
 	require.NoError(err)
 	require.NotNil(stored)
 	assert.Equal("dirty", stored.MergeableState)
+}
+
+func TestAPISyncPRPersistsMergedActorInDetail(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	ctx := t.Context()
+	now := time.Now().UTC().Truncate(time.Second)
+	mergedAt := now.Add(time.Minute)
+	mergedBy := "merge-admin"
+	mock := &mockGH{
+		getPullRequestFn: func(_ context.Context, _ string, _ string, number int) (*gh.PullRequest, error) {
+			id := int64(1001)
+			sha := "abc123"
+			baseSHA := "def456"
+			state := "closed"
+			title := "Merged PR"
+			url := "https://github.com/acme/widget/pull/1"
+			updatedAt := gh.Timestamp{Time: mergedAt}
+			createdAt := gh.Timestamp{Time: now}
+			mergedAtTimestamp := gh.Timestamp{Time: mergedAt}
+			merged := true
+			return &gh.PullRequest{
+				ID:        &id,
+				Number:    &number,
+				State:     &state,
+				Title:     &title,
+				HTMLURL:   &url,
+				UpdatedAt: &updatedAt,
+				CreatedAt: &createdAt,
+				Merged:    &merged,
+				MergedAt:  &mergedAtTimestamp,
+				ClosedAt:  &mergedAtTimestamp,
+				MergedBy:  &gh.User{Login: &mergedBy},
+				Head:      &gh.PullRequestBranch{SHA: &sha, Ref: new("feature")},
+				Base:      &gh.PullRequestBranch{SHA: &baseSHA, Ref: new("main")},
+			}, nil
+		},
+	}
+
+	srv, database := setupTestServerWithMock(t, mock)
+	seedPR(t, database, "acme", "widget", 1)
+	client := setupTestClient(t, srv)
+
+	syncResp, err := client.HTTP.SyncPullWithResponse(
+		ctx, "gh", "acme", "widget", 1,
+	)
+	require.NoError(err)
+	require.Equal(http.StatusOK, syncResp.StatusCode(), string(syncResp.Body))
+
+	detailResp, err := client.HTTP.GetPullWithResponse(
+		ctx, "gh", "acme", "widget", 1,
+	)
+	require.NoError(err)
+	require.Equal(http.StatusOK, detailResp.StatusCode(), string(detailResp.Body))
+	require.NotNil(detailResp.JSON200)
+	require.NotNil(detailResp.JSON200.Events)
+	require.Len(*detailResp.JSON200.Events, 1)
+	event := (*detailResp.JSON200.Events)[0]
+	assert.Equal("merged", event.EventType)
+	assert.Equal("merge-admin", event.Author)
+	assert.Equal("merged this", event.Summary)
+	assert.True(event.CreatedAt.Equal(mergedAt))
+}
+
+func TestAPIIndexSyncPersistsMergedActorForImmediateDetail(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	ctx := t.Context()
+	now := time.Now().UTC().Truncate(time.Second)
+	mergedAt := now.Add(time.Minute)
+	mergedBy := "merge-admin"
+	var getPullCalls atomic.Int32
+	mock := &mockGH{
+		listOpenPullRequestsFn: func(_ context.Context, _, _ string) ([]*gh.PullRequest, error) {
+			number := 1
+			id := int64(1001)
+			sha := "abc123"
+			baseSHA := "def456"
+			headRef := "feature"
+			baseRef := "main"
+			state := "closed"
+			title := "Merged PR"
+			url := "https://github.com/acme/widget/pull/1"
+			updatedAt := gh.Timestamp{Time: mergedAt}
+			createdAt := gh.Timestamp{Time: now}
+			mergedAtTimestamp := gh.Timestamp{Time: mergedAt}
+			merged := true
+			return []*gh.PullRequest{{
+				ID:        &id,
+				Number:    &number,
+				State:     &state,
+				Title:     &title,
+				HTMLURL:   &url,
+				UpdatedAt: &updatedAt,
+				CreatedAt: &createdAt,
+				Merged:    &merged,
+				MergedAt:  &mergedAtTimestamp,
+				ClosedAt:  &mergedAtTimestamp,
+				MergedBy:  &gh.User{Login: &mergedBy},
+				Head:      &gh.PullRequestBranch{SHA: &sha, Ref: &headRef},
+				Base:      &gh.PullRequestBranch{SHA: &baseSHA, Ref: &baseRef},
+			}}, nil
+		},
+		getPullRequestFn: func(_ context.Context, _ string, _ string, _ int) (*gh.PullRequest, error) {
+			getPullCalls.Add(1)
+			return nil, errors.New("detail lookup should not run")
+		},
+	}
+
+	srv, database := setupTestServerWithMock(t, mock)
+	client := setupTestClient(t, srv)
+
+	syncResp, err := client.HTTP.TriggerSyncWithResponse(ctx, nil)
+	require.NoError(err)
+	require.Equal(http.StatusAccepted, syncResp.StatusCode(), string(syncResp.Body))
+
+	require.Eventually(func() bool {
+		mr, mrErr := database.GetMergeRequest(ctx, "github", "github.com", "acme", "widget", 1)
+		if mrErr != nil || mr == nil {
+			return false
+		}
+		events, eventsErr := database.ListMREvents(ctx, mr.ID)
+		if eventsErr != nil {
+			return false
+		}
+		for _, event := range events {
+			if event.EventType == "merged" && event.Author == "merge-admin" {
+				return true
+			}
+		}
+		return false
+	}, 3*time.Second, 25*time.Millisecond)
+
+	detailResp, err := client.HTTP.GetPullWithResponse(
+		ctx, "gh", "acme", "widget", 1,
+	)
+	require.NoError(err)
+	require.Equal(http.StatusOK, detailResp.StatusCode(), string(detailResp.Body))
+	require.NotNil(detailResp.JSON200)
+	require.NotNil(detailResp.JSON200.Events)
+	require.Len(*detailResp.JSON200.Events, 1)
+	event := (*detailResp.JSON200.Events)[0]
+	assert.Equal("merged", event.EventType)
+	assert.Equal("merge-admin", event.Author)
+	assert.Equal("merged this", event.Summary)
+	assert.True(event.CreatedAt.Equal(mergedAt))
+	assert.Equal(int32(0), getPullCalls.Load())
+}
+
+func TestAPIGetPullDoesNotFetchProviderForMissingMergedActor(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	ctx := t.Context()
+	now := time.Now().UTC().Truncate(time.Second)
+	mergedAt := now.Add(time.Minute)
+	var getPullCalls atomic.Int32
+	var timelineCalls atomic.Int32
+	mock := &mockGH{
+		getPullRequestFn: func(_ context.Context, _ string, _ string, _ int) (*gh.PullRequest, error) {
+			getPullCalls.Add(1)
+			return nil, errors.New("detail reads must not fetch pull request data")
+		},
+		listPRTimelineEventsFn: func(_ context.Context, _ string, _ string, _ int) ([]ghclient.PullRequestTimelineEvent, error) {
+			timelineCalls.Add(1)
+			return nil, errors.New("detail reads must not fetch timeline data")
+		},
+	}
+
+	srv, database := setupTestServerWithMock(t, mock)
+	seedPR(t, database, "acme", "widget", 1,
+		withSeedPRLifecycle(db.MergeRequestStateMerged, &mergedAt, &mergedAt),
+	)
+	client := setupTestClient(t, srv)
+
+	detailResp, err := client.HTTP.GetPullWithResponse(
+		ctx, "gh", "acme", "widget", 1,
+	)
+	require.NoError(err)
+	require.Equal(http.StatusOK, detailResp.StatusCode(), string(detailResp.Body))
+	require.NotNil(detailResp.JSON200)
+	require.NotNil(detailResp.JSON200.Events)
+	require.Len(*detailResp.JSON200.Events, 1)
+	event := (*detailResp.JSON200.Events)[0]
+	assert.Equal("merged", event.EventType)
+	assert.Empty(event.Author)
+	assert.Equal("merged this", event.Summary)
+	assert.True(event.CreatedAt.Equal(mergedAt))
+	assert.Equal(int32(0), getPullCalls.Load())
+	assert.Equal(int32(0), timelineCalls.Load())
 }
 
 func TestAPISyncPRPreservesMergeableStateWhenRefreshHasNoAnswer(t *testing.T) {
@@ -3718,6 +4123,313 @@ func TestAPIGitLabConfiguredRepoSyncThroughProviderRegistry(t *testing.T) {
 	assert.Equal("project", (*pullsResp.JSON200)[0].RepoName)
 	assert.Equal("GitLab provider MR", (*pullsResp.JSON200)[0].Title)
 	assert.Equal("dirty", (*pullsResp.JSON200)[0].MergeableState)
+}
+
+func TestAPIGitLabClosedSyncPersistsMergedActorForImmediateDetail(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	ctx := t.Context()
+	now := time.Now().UTC().Truncate(time.Second)
+	mergedAt := now.Add(time.Minute)
+
+	database := dbtest.Open(t)
+	ref := platform.RepoRef{
+		Platform:           platform.KindGitLab,
+		Host:               "gitlab.example.com",
+		Owner:              "group",
+		Name:               "project",
+		RepoPath:           "group/project",
+		PlatformID:         4242,
+		PlatformExternalID: "gid://gitlab/Project/4242",
+		WebURL:             "https://gitlab.example.com/group/project",
+		CloneURL:           "https://gitlab.example.com/group/project.git",
+		DefaultBranch:      "main",
+	}
+	openMR := platform.MergeRequest{
+		Repo:               ref,
+		PlatformID:         7001,
+		PlatformExternalID: "gid://gitlab/MergeRequest/7001",
+		Number:             7,
+		URL:                "https://gitlab.example.com/group/project/-/merge_requests/7",
+		Title:              "GitLab provider MR",
+		Author:             "ada",
+		State:              "open",
+		HeadBranch:         "feature/gitlab",
+		BaseBranch:         "main",
+		HeadSHA:            "abc123",
+		BaseSHA:            "def456",
+		CreatedAt:          now,
+		UpdatedAt:          now,
+		LastActivityAt:     now,
+	}
+	mergedMR := openMR
+	mergedMR.State = "merged"
+	mergedMR.MergedAt = &mergedAt
+	mergedMR.ClosedAt = &mergedAt
+	mergedMR.MergedBy = "merge-admin"
+	mergedMR.UpdatedAt = mergedAt
+	mergedMR.LastActivityAt = mergedAt
+	provider := &apiTestGitLabProvider{
+		ref:                ref,
+		mergeRequests:      []platform.MergeRequest{openMR},
+		mergeRequestDetail: map[int]platform.MergeRequest{7: mergedMR},
+	}
+	registry, err := platform.NewRegistry(provider)
+	require.NoError(err)
+
+	repo := ghclient.RepoRef{
+		Platform:           platform.KindGitLab,
+		Owner:              ref.Owner,
+		Name:               ref.Name,
+		PlatformHost:       ref.Host,
+		RepoPath:           ref.RepoPath,
+		PlatformRepoID:     ref.PlatformID,
+		PlatformExternalID: ref.PlatformExternalID,
+		WebURL:             ref.WebURL,
+		CloneURL:           ref.CloneURL,
+		DefaultBranch:      ref.DefaultBranch,
+	}
+	syncer := ghclient.NewSyncerWithRegistry(
+		registry, database, nil, []ghclient.RepoRef{repo}, time.Minute, nil, nil,
+	)
+	t.Cleanup(syncer.Stop)
+	srv := New(database, syncer, nil, "/", nil, ServerOptions{})
+	t.Cleanup(func() { gracefulShutdown(t, srv) })
+	client := setupTestClient(t, srv)
+
+	syncer.RunOnce(ctx)
+	provider.mergeRequests = nil
+	syncer.RunOnce(ctx)
+
+	detailResp, err := client.HTTP.GetPullOnHostWithResponse(
+		ctx, ref.Host, "gitlab", ref.Owner, ref.Name, 7,
+	)
+	require.NoError(err)
+	require.Equal(http.StatusOK, detailResp.StatusCode(), string(detailResp.Body))
+	require.NotNil(detailResp.JSON200)
+	require.NotNil(detailResp.JSON200.Events)
+	require.Len(*detailResp.JSON200.Events, 1)
+	event := (*detailResp.JSON200.Events)[0]
+	assert.Equal("merged", event.EventType)
+	assert.Equal("merge-admin", event.Author)
+	assert.Equal("merged this", event.Summary)
+	assert.True(event.CreatedAt.Equal(mergedAt))
+}
+
+func TestAPIGitLabDirectSyncPersistsMergedActorForImmediateDetail(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	ctx := t.Context()
+	now := time.Now().UTC().Truncate(time.Second)
+	mergedAt := now.Add(time.Minute)
+
+	database := dbtest.Open(t)
+	ref := platform.RepoRef{
+		Platform:           platform.KindGitLab,
+		Host:               "gitlab.example.com",
+		Owner:              "group",
+		Name:               "project",
+		RepoPath:           "group/project",
+		PlatformID:         4242,
+		PlatformExternalID: "gid://gitlab/Project/4242",
+		WebURL:             "https://gitlab.example.com/group/project",
+		CloneURL:           "https://gitlab.example.com/group/project.git",
+		DefaultBranch:      "main",
+	}
+	openMR := platform.MergeRequest{
+		Repo:               ref,
+		PlatformID:         7001,
+		PlatformExternalID: "gid://gitlab/MergeRequest/7001",
+		Number:             7,
+		URL:                "https://gitlab.example.com/group/project/-/merge_requests/7",
+		Title:              "GitLab provider MR",
+		Author:             "ada",
+		State:              "open",
+		HeadBranch:         "feature/gitlab",
+		BaseBranch:         "main",
+		HeadSHA:            "abc123",
+		BaseSHA:            "def456",
+		CreatedAt:          now,
+		UpdatedAt:          now,
+		LastActivityAt:     now,
+	}
+	mergedMR := openMR
+	mergedMR.State = "merged"
+	mergedMR.MergedAt = &mergedAt
+	mergedMR.ClosedAt = &mergedAt
+	mergedMR.MergedBy = "merge-admin"
+	mergedMR.UpdatedAt = mergedAt
+	mergedMR.LastActivityAt = mergedAt
+	provider := &apiTestGitLabProvider{
+		ref:                ref,
+		mergeRequests:      []platform.MergeRequest{openMR},
+		mergeRequestDetail: map[int]platform.MergeRequest{7: mergedMR},
+	}
+	registry, err := platform.NewRegistry(provider)
+	require.NoError(err)
+
+	repo := ghclient.RepoRef{
+		Platform:           platform.KindGitLab,
+		Owner:              ref.Owner,
+		Name:               ref.Name,
+		PlatformHost:       ref.Host,
+		RepoPath:           ref.RepoPath,
+		PlatformRepoID:     ref.PlatformID,
+		PlatformExternalID: ref.PlatformExternalID,
+		WebURL:             ref.WebURL,
+		CloneURL:           ref.CloneURL,
+		DefaultBranch:      ref.DefaultBranch,
+	}
+	syncer := ghclient.NewSyncerWithRegistry(
+		registry, database, nil, []ghclient.RepoRef{repo}, time.Minute, nil, nil,
+	)
+	t.Cleanup(syncer.Stop)
+	srv := New(database, syncer, nil, "/", nil, ServerOptions{})
+	t.Cleanup(func() { gracefulShutdown(t, srv) })
+	client := setupTestClient(t, srv)
+
+	syncer.RunOnce(ctx)
+
+	syncResp, err := client.HTTP.SyncPullOnHostWithResponse(
+		ctx, ref.Host, "gitlab", ref.Owner, ref.Name, 7,
+	)
+	require.NoError(err)
+	require.Equal(http.StatusOK, syncResp.StatusCode(), string(syncResp.Body))
+	require.NotNil(syncResp.JSON200)
+	require.NotNil(syncResp.JSON200.Events)
+	require.Len(*syncResp.JSON200.Events, 1)
+	event := (*syncResp.JSON200.Events)[0]
+	assert.Equal("merged", event.EventType)
+	assert.Equal("merge-admin", event.Author)
+	assert.Equal("merged this", event.Summary)
+	assert.True(event.CreatedAt.Equal(mergedAt))
+
+	detailResp, err := client.HTTP.GetPullOnHostWithResponse(
+		ctx, ref.Host, "gitlab", ref.Owner, ref.Name, 7,
+	)
+	require.NoError(err)
+	require.Equal(http.StatusOK, detailResp.StatusCode(), string(detailResp.Body))
+	require.NotNil(detailResp.JSON200)
+	require.NotNil(detailResp.JSON200.Events)
+	require.Len(*detailResp.JSON200.Events, 1)
+	assert.Equal("merge-admin", (*detailResp.JSON200.Events)[0].Author)
+}
+
+func TestAPIGitLabDirectSyncDoesNotDuplicateMergedActorAfterClosedFallback(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	ctx := t.Context()
+	now := time.Now().UTC().Truncate(time.Second)
+	mergedAt := now.Add(time.Minute)
+
+	database := dbtest.Open(t)
+	ref := platform.RepoRef{
+		Platform:           platform.KindGitLab,
+		Host:               "gitlab.example.com",
+		Owner:              "group",
+		Name:               "project",
+		RepoPath:           "group/project",
+		PlatformID:         4242,
+		PlatformExternalID: "gid://gitlab/Project/4242",
+		WebURL:             "https://gitlab.example.com/group/project",
+		CloneURL:           "https://gitlab.example.com/group/project.git",
+		DefaultBranch:      "main",
+	}
+	openMR := platform.MergeRequest{
+		Repo:               ref,
+		PlatformID:         7001,
+		PlatformExternalID: "gid://gitlab/MergeRequest/7001",
+		Number:             7,
+		URL:                "https://gitlab.example.com/group/project/-/merge_requests/7",
+		Title:              "GitLab provider MR",
+		Author:             "ada",
+		State:              "open",
+		HeadBranch:         "feature/gitlab",
+		BaseBranch:         "main",
+		HeadSHA:            "abc123",
+		BaseSHA:            "def456",
+		CreatedAt:          now,
+		UpdatedAt:          now,
+		LastActivityAt:     now,
+	}
+	mergedMR := openMR
+	mergedMR.State = "merged"
+	mergedMR.MergedAt = &mergedAt
+	mergedMR.ClosedAt = &mergedAt
+	mergedMR.MergedBy = "merge-admin"
+	mergedMR.UpdatedAt = mergedAt
+	mergedMR.LastActivityAt = mergedAt
+	provider := &apiTestGitLabProvider{
+		ref:                ref,
+		mergeRequests:      []platform.MergeRequest{openMR},
+		mergeRequestDetail: map[int]platform.MergeRequest{7: mergedMR},
+	}
+	registry, err := platform.NewRegistry(provider)
+	require.NoError(err)
+
+	repo := ghclient.RepoRef{
+		Platform:           platform.KindGitLab,
+		Owner:              ref.Owner,
+		Name:               ref.Name,
+		PlatformHost:       ref.Host,
+		RepoPath:           ref.RepoPath,
+		PlatformRepoID:     ref.PlatformID,
+		PlatformExternalID: ref.PlatformExternalID,
+		WebURL:             ref.WebURL,
+		CloneURL:           ref.CloneURL,
+		DefaultBranch:      ref.DefaultBranch,
+	}
+	syncer := ghclient.NewSyncerWithRegistry(
+		registry, database, nil, []ghclient.RepoRef{repo}, time.Minute, nil, nil,
+	)
+	t.Cleanup(syncer.Stop)
+	srv := New(database, syncer, nil, "/", nil, ServerOptions{})
+	t.Cleanup(func() { gracefulShutdown(t, srv) })
+	client := setupTestClient(t, srv)
+
+	syncer.RunOnce(ctx)
+	provider.mergeRequests = nil
+	syncer.RunOnce(ctx)
+
+	stored, err := database.GetMergeRequest(
+		ctx, string(ref.Platform), ref.Host, ref.Owner, ref.Name, 7,
+	)
+	require.NoError(err)
+	require.NotNil(stored)
+	events, err := database.ListMREvents(ctx, stored.ID)
+	require.NoError(err)
+	require.Len(events, 1)
+	require.Equal("merged", events[0].EventType)
+	require.Equal("merge-admin", events[0].Author)
+
+	provider.mergeRequestEvents = map[int][]platform.MergeRequestEvent{7: {{
+		Repo:               ref,
+		PlatformID:         9001,
+		PlatformExternalID: "gid://gitlab/Note/9001",
+		MergeRequestNumber: 7,
+		EventType:          "merged",
+		Author:             "merge-admin",
+		Summary:            "merged this",
+		CreatedAt:          mergedAt,
+		DedupeKey:          "gitlab:merged-note:9001",
+	}}}
+	syncResp, err := client.HTTP.SyncPullOnHostWithResponse(
+		ctx, ref.Host, "gitlab", ref.Owner, ref.Name, 7,
+	)
+	require.NoError(err)
+	require.Equal(http.StatusOK, syncResp.StatusCode(), string(syncResp.Body))
+	require.NotNil(syncResp.JSON200)
+	require.NotNil(syncResp.JSON200.Events)
+	require.Len(*syncResp.JSON200.Events, 1)
+	assert.Equal("merged", (*syncResp.JSON200.Events)[0].EventType)
+	assert.Equal("merge-admin", (*syncResp.JSON200.Events)[0].Author)
+
+	events, err = database.ListMREvents(ctx, stored.ID)
+	require.NoError(err)
+	require.Len(events, 1)
+	assert.Equal("merged", events[0].EventType)
+	assert.Equal("merge-admin", events[0].Author)
+	assert.Equal("merged this", events[0].Summary)
 }
 
 func TestAPIGitLabSyncReadsTokenFileAfterRotation(t *testing.T) {
@@ -6814,7 +7526,7 @@ func seedIssue(t *testing.T, database *db.DB, owner, name string, number int, st
 	now := time.Now().UTC().Truncate(time.Second)
 	issue := &db.Issue{
 		RepoID: repoID, PlatformID: int64(number) * 1000, Number: number,
-		URL:   "https://github.com/" + owner + "/" + name + "/issues/1",
+		URL:   fmt.Sprintf("https://github.com/%s/%s/issues/%d", owner, name, number),
 		Title: "Test Issue", Author: "testuser", State: state,
 		CreatedAt: now, UpdatedAt: now, LastActivityAt: now,
 	}
@@ -13329,6 +14041,136 @@ func TestAPIGitHubPublishReviewDraftSendsCommentsThroughServer(t *testing.T) {
 	assert.Nil(storedDraft)
 }
 
+func TestAPIGitHubPublishReviewDraftRejectsSelfApprovalBeforeProvider(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	ctx := t.Context()
+	var publishCalls int
+	mock := &mockGH{
+		authenticatedViewerLoginFn: func(context.Context) (string, error) {
+			return "marius", nil
+		},
+		createReviewWithCommentsFn: func(
+			context.Context,
+			string, string,
+			int,
+			string,
+			string,
+			string,
+			[]*gh.DraftReviewComment,
+		) (*gh.PullRequestReview, error) {
+			publishCalls++
+			return nil, errors.New("provider should not be called")
+		},
+	}
+	srv, database := setupTestServerWithMock(t, mock)
+	seedPR(t, database, "acme", "widget", 42, withSeedPRAuthor("marius"))
+	mr, err := database.GetMergeRequest(ctx, "github", "github.com", "acme", "widget", 42)
+	require.NoError(err)
+	require.NotNil(mr)
+	require.NoError(database.UpdateDiffSHAs(ctx, mr.RepoID, 42, "github-head", "base", "merge-base"))
+
+	basePath := "/api/v1/pulls/gh/acme/widget/42/review-draft"
+	createRR := doJSON(t, srv, http.MethodPost, basePath+"/comments", map[string]any{
+		"body": "Please tighten this line.",
+		"range": map[string]any{
+			"path":          "src/main.go",
+			"side":          "right",
+			"line":          42,
+			"new_line":      42,
+			"line_type":     "add",
+			"diff_head_sha": "github-head",
+			"commit_sha":    "github-head",
+		},
+	})
+	require.Equal(http.StatusCreated, createRR.Code, createRR.Body.String())
+
+	publishRR := doJSON(t, srv, http.MethodPost, basePath+"/publish", map[string]string{
+		"action": "approve",
+		"body":   "looks good",
+	})
+	require.Equal(http.StatusForbidden, publishRR.Code, publishRR.Body.String())
+	var problem rawProblemDetail
+	require.NoError(json.NewDecoder(publishRR.Body).Decode(&problem))
+	assert.Equal("forbidden", problem.Code)
+	require.NotNil(problem.Details)
+	assert.Equal(availabilityCodeSelfApproval, problem.Details["reason"])
+	assert.Zero(publishCalls)
+
+	storedDraft, err := database.GetMRReviewDraft(ctx, mr.ID)
+	require.NoError(err)
+	assert.NotNil(storedDraft, "rejected self-approval must leave the local draft intact")
+}
+
+func TestAPIGitHubReviewDraftHidesApproveForSelfAuthoredPR(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	mock := &mockGH{
+		authenticatedViewerLoginFn: func(context.Context) (string, error) {
+			return "marius", nil
+		},
+	}
+	srv, database := setupTestServerWithMock(t, mock)
+	seedPR(t, database, "acme", "widget", 42, withSeedPRAuthor("marius"))
+	seedPR(t, database, "acme", "widget", 43, withSeedPRAuthor("someone-else"))
+
+	selfRR := doJSON(t, srv, http.MethodGet, "/api/v1/pulls/gh/acme/widget/42/review-draft", nil)
+	require.Equal(http.StatusOK, selfRR.Code, selfRR.Body.String())
+	var selfDraft map[string]any
+	require.NoError(json.NewDecoder(selfRR.Body).Decode(&selfDraft))
+	assert.Equal(
+		[]any{"comment", "request_changes"},
+		selfDraft["supported_actions"],
+		"self-authored PR draft must not advertise approve",
+	)
+
+	otherRR := doJSON(t, srv, http.MethodGet, "/api/v1/pulls/gh/acme/widget/43/review-draft", nil)
+	require.Equal(http.StatusOK, otherRR.Code, otherRR.Body.String())
+	var otherDraft map[string]any
+	require.NoError(json.NewDecoder(otherRR.Body).Decode(&otherDraft))
+	assert.Equal(
+		[]any{"comment", "approve", "request_changes"},
+		otherDraft["supported_actions"],
+		"other-authored PR draft must still advertise approve",
+	)
+}
+
+func TestAPIGitHubApprovePullRejectsSelfApprovalBeforeProvider(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	var providerCalled atomic.Bool
+	mock := &mockGH{
+		authenticatedViewerLoginFn: func(context.Context) (string, error) {
+			return "marius", nil
+		},
+		createReviewWithCommentsFn: func(
+			context.Context,
+			string, string,
+			int,
+			string, string, string,
+			[]*gh.DraftReviewComment,
+		) (*gh.PullRequestReview, error) {
+			providerCalled.Store(true)
+			return nil, errors.New("provider should not be called")
+		},
+	}
+	srv, database := setupTestServerWithMock(t, mock)
+	seedPR(t, database, "acme", "widget", 42, withSeedPRAuthor("marius"))
+
+	approveRR := doJSON(
+		t, srv, http.MethodPost,
+		"/api/v1/pulls/gh/acme/widget/42/approve",
+		map[string]any{"body": ""},
+	)
+	require.Equal(http.StatusForbidden, approveRR.Code, approveRR.Body.String())
+	var problem rawProblemDetail
+	require.NoError(json.NewDecoder(approveRR.Body).Decode(&problem))
+	assert.Equal("forbidden", problem.Code)
+	require.NotNil(problem.Details)
+	assert.Equal(availabilityCodeSelfApproval, problem.Details["reason"])
+	assert.False(providerCalled.Load(), "self-approval must be rejected before the provider call")
+}
+
 func TestAPIPublishReviewDraftRejectsStoredCommentWithoutDiffHeadSHA(t *testing.T) {
 	require := require.New(t)
 	caps := platform.Capabilities{
@@ -14921,6 +15763,736 @@ func TestAPIPullDetailAttachesReviewThreadMetadata(t *testing.T) {
 	assert.InDelta(12, diffThread["line"], 0)
 	assert.Equal(false, diffThread["resolved"])
 	assert.NotContains(diffThread, "provider_thread_id")
+}
+
+func seedApplySuggestionReviewThread(t *testing.T, database *db.DB, mrID int64) db.MRReviewThread {
+	t.Helper()
+	require := require.New(t)
+	line := 11
+	require.NoError(database.UpsertMRReviewThreads(t.Context(), mrID, []db.MRReviewThread{{
+		ProviderThreadID:  "provider-thread-1",
+		ProviderCommentID: "provider-comment-1",
+		Body:              "Inline suggestion\n\n```suggestion\nreturn client.publishThreads();\n```",
+		AuthorLogin:       "ada",
+		Range: db.ReviewLineRange{
+			Path:        "src/review.ts",
+			Side:        "right",
+			Line:        line,
+			NewLine:     &line,
+			LineType:    "context",
+			DiffHeadSHA: "abc123",
+		},
+		CreatedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
+	}}))
+	threads, err := database.ListMRReviewThreads(t.Context(), mrID)
+	require.NoError(err)
+	require.Len(threads, 1)
+	return threads[0]
+}
+
+func TestAPIApplyReviewSuggestionPassesStoredThreadRangeToProvider(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	caps := platform.Capabilities{
+		ReadRepositories:            true,
+		ReadMergeRequests:           true,
+		ReadIssues:                  true,
+		ReadComments:                true,
+		ReviewSuggestionApplication: true,
+		MutationHeadBinding:         true,
+		ReadReviewThreads:           true,
+	}
+	srv, database, provider := setupGitLabCapabilityServerWithProvider(t, &caps)
+	ctx := t.Context()
+
+	repo, err := database.GetRepoByIdentity(ctx, db.RepoIdentity{
+		Platform:     "gitlab",
+		PlatformHost: "gitlab.example.com",
+		RepoPath:     "group/project",
+	})
+	require.NoError(err)
+	require.NotNil(repo)
+	mr, err := database.GetMergeRequestByRepoIDAndNumber(ctx, repo.ID, 7)
+	require.NoError(err)
+	require.NotNil(mr)
+	startLine := 10
+	line := 11
+	require.NoError(database.UpsertMRReviewThreads(ctx, mr.ID, []db.MRReviewThread{{
+		ProviderThreadID:  "provider-thread-1",
+		ProviderCommentID: "provider-comment-1",
+		Body:              "Inline suggestion\n\n```suggestion\nreturn client.publishThreads();\n```",
+		AuthorLogin:       "ada",
+		Range: db.ReviewLineRange{
+			Path:        "src/review.ts",
+			Side:        "right",
+			StartSide:   "right",
+			StartLine:   &startLine,
+			Line:        line,
+			NewLine:     &line,
+			LineType:    "context",
+			DiffHeadSHA: "abc123",
+			CommitSHA:   "abc123",
+		},
+		CreatedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
+	}}))
+	threads, err := database.ListMRReviewThreads(ctx, mr.ID)
+	require.NoError(err)
+	require.Len(threads, 1)
+
+	rr := doJSON(
+		t,
+		srv,
+		http.MethodPost,
+		"/api/v1/host/gitlab.example.com/pulls/gl/group/project/7/review-suggestions/apply",
+		map[string]any{
+			"expected_head_sha": "abc123",
+			"suggestions": []map[string]any{{
+				"thread_id":   strconv.FormatInt(threads[0].ID, 10),
+				"replacement": "return client.publishThreads();",
+			}},
+		},
+	)
+	require.Equal(http.StatusOK, rr.Code, rr.Body.String())
+	require.Len(provider.appliedSuggestions, 1)
+	applied := provider.appliedSuggestions[0]
+	require.Len(applied.Suggestions, 1)
+	assert.Equal("feature/gitlab", applied.HeadBranch)
+	assert.Equal("https://gitlab.example.com/fork/project.git", applied.HeadRepoCloneURL)
+	assert.Equal("abc123", applied.ExpectedHeadSHA)
+	assert.Equal("provider-thread-1", applied.Suggestions[0].ProviderThreadID)
+	assert.Equal("provider-comment-1", applied.Suggestions[0].ProviderCommentID)
+	assert.Equal("src/review.ts", applied.Suggestions[0].Range.Path)
+	assert.Equal("return client.publishThreads();", applied.Suggestions[0].Replacement)
+}
+
+func TestAPIApplyReviewSuggestionRejectsNonOpenPullRequest(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	caps := platform.Capabilities{
+		ReadRepositories:            true,
+		ReadMergeRequests:           true,
+		ReadIssues:                  true,
+		ReadComments:                true,
+		ReviewSuggestionApplication: true,
+		MutationHeadBinding:         true,
+		ReadReviewThreads:           true,
+	}
+	srv, database, provider := setupGitLabCapabilityServerWithProvider(t, &caps)
+	ctx := t.Context()
+
+	repo, err := database.GetRepoByIdentity(ctx, db.RepoIdentity{
+		Platform:     "gitlab",
+		PlatformHost: "gitlab.example.com",
+		RepoPath:     "group/project",
+	})
+	require.NoError(err)
+	require.NotNil(repo)
+	now := time.Now().UTC()
+	require.NoError(database.UpdateMRState(ctx, repo.ID, 7, string(db.MergeRequestStateClosed), nil, &now))
+	mr, err := database.GetMergeRequestByRepoIDAndNumber(ctx, repo.ID, 7)
+	require.NoError(err)
+	require.NotNil(mr)
+	thread := seedApplySuggestionReviewThread(t, database, mr.ID)
+
+	rr := doJSON(
+		t,
+		srv,
+		http.MethodPost,
+		"/api/v1/host/gitlab.example.com/pulls/gl/group/project/7/review-suggestions/apply",
+		map[string]any{
+			"expected_head_sha": "abc123",
+			"suggestions": []map[string]any{{
+				"thread_id":   strconv.FormatInt(thread.ID, 10),
+				"replacement": "return client.publishThreads();",
+			}},
+		},
+	)
+
+	require.Equal(http.StatusConflict, rr.Code, rr.Body.String())
+	var problem rawProblemDetail
+	require.NoError(json.NewDecoder(rr.Body).Decode(&problem))
+	assert.Equal(string(CodeConflict), problem.Code)
+	assert.Equal("pull request is not open", problem.Detail)
+	require.NotNil(problem.Details)
+	assert.Equal("not_open", problem.Details["reason"])
+	assert.Empty(provider.appliedSuggestions)
+}
+
+func TestAPIApplyReviewSuggestionRejectsUnknownHeadRepoOnGitHub(t *testing.T) {
+	tests := []struct {
+		name             string
+		headRepoCloneURL string
+	}{
+		{name: "missing clone URL"},
+		{name: "unparseable clone URL", headRepoCloneURL: "not-a-url"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
+			caps := platform.Capabilities{
+				ReadRepositories:            true,
+				ReadMergeRequests:           true,
+				ReadIssues:                  true,
+				ReadComments:                true,
+				ReviewSuggestionApplication: true,
+				MutationHeadBinding:         true,
+				ReadReviewThreads:           true,
+			}
+			srv, _, provider := setupGitHubCapabilityServerWithProvider(t, &caps, tt.headRepoCloneURL)
+
+			rr := doJSON(
+				t,
+				srv,
+				http.MethodPost,
+				"/api/v1/host/github.example.com/pulls/gh/acme/widget/7/review-suggestions/apply",
+				map[string]any{
+					"expected_head_sha": "abc123",
+					"suggestions": []map[string]any{{
+						"thread_id":   "1",
+						"replacement": "return client.publishThreads();",
+					}},
+				},
+			)
+
+			require.Equal(http.StatusConflict, rr.Code, rr.Body.String())
+			var problem rawProblemDetail
+			require.NoError(json.NewDecoder(rr.Body).Decode(&problem))
+			assert.Equal(string(CodeConflict), problem.Code)
+			assert.Equal("pull request head repository is unknown", problem.Detail)
+			require.NotNil(problem.Details)
+			assert.Equal("head_repo_unknown", problem.Details["reason"])
+			assert.Empty(provider.appliedSuggestions)
+		})
+	}
+}
+
+func TestAPIApplyReviewSuggestionPassesHeadRepoToGitHubProvider(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	caps := platform.Capabilities{
+		ReadRepositories:            true,
+		ReadMergeRequests:           true,
+		ReadIssues:                  true,
+		ReadComments:                true,
+		ReviewSuggestionApplication: true,
+		MutationHeadBinding:         true,
+		ReadReviewThreads:           true,
+	}
+	srv, database, provider := setupGitHubCapabilityServerWithProvider(
+		t, &caps, "https://github.example.com/fork/widget.git",
+	)
+	ctx := t.Context()
+
+	repo, err := database.GetRepoByIdentity(ctx, db.RepoIdentity{
+		Platform:     "github",
+		PlatformHost: "github.example.com",
+		RepoPath:     "acme/widget",
+	})
+	require.NoError(err)
+	require.NotNil(repo)
+	mr, err := database.GetMergeRequestByRepoIDAndNumber(ctx, repo.ID, 7)
+	require.NoError(err)
+	require.NotNil(mr)
+	thread := seedApplySuggestionReviewThread(t, database, mr.ID)
+
+	rr := doJSON(
+		t,
+		srv,
+		http.MethodPost,
+		"/api/v1/host/github.example.com/pulls/gh/acme/widget/7/review-suggestions/apply",
+		map[string]any{
+			"expected_head_sha": "abc123",
+			"suggestions": []map[string]any{{
+				"thread_id":   strconv.FormatInt(thread.ID, 10),
+				"replacement": "return client.publishThreads();",
+			}},
+		},
+	)
+
+	require.Equal(http.StatusOK, rr.Code, rr.Body.String())
+	require.Len(provider.appliedSuggestions, 1)
+	assert.Equal(
+		"https://github.example.com/fork/widget.git",
+		provider.appliedSuggestions[0].HeadRepoCloneURL,
+	)
+}
+
+func TestAPIApplyReviewSuggestionMapsProviderConflictReason(t *testing.T) {
+	// An open local row is not the last word: the provider re-verifies
+	// live PR state before mutating, and its stable conflict reasons
+	// must survive the wire mapping instead of collapsing into a
+	// generic conflict.
+	tests := []struct {
+		name   string
+		reason string
+	}{
+		{name: "closed upstream after sync", reason: "not_open"},
+		{name: "head repo lost after sync", reason: "head_repo_unknown"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
+			caps := platform.Capabilities{
+				ReadRepositories:            true,
+				ReadMergeRequests:           true,
+				ReadIssues:                  true,
+				ReadComments:                true,
+				ReviewSuggestionApplication: true,
+				MutationHeadBinding:         true,
+				ReadReviewThreads:           true,
+			}
+			srv, database, provider := setupGitHubCapabilityServerWithProvider(
+				t, &caps, "https://github.example.com/fork/widget.git",
+			)
+			ctx := t.Context()
+			provider.applySuggestionsErr = &platform.Error{
+				Code:         platform.ErrCodeConflict,
+				Provider:     platform.KindGitHub,
+				PlatformHost: "github.example.com",
+				Details:      map[string]string{"reason": tt.reason},
+				Err:          errors.New("live pull request state rejected the apply"),
+			}
+
+			repo, err := database.GetRepoByIdentity(ctx, db.RepoIdentity{
+				Platform:     "github",
+				PlatformHost: "github.example.com",
+				RepoPath:     "acme/widget",
+			})
+			require.NoError(err)
+			require.NotNil(repo)
+			mr, err := database.GetMergeRequestByRepoIDAndNumber(ctx, repo.ID, 7)
+			require.NoError(err)
+			require.NotNil(mr)
+			thread := seedApplySuggestionReviewThread(t, database, mr.ID)
+
+			rr := doJSON(
+				t,
+				srv,
+				http.MethodPost,
+				"/api/v1/host/github.example.com/pulls/gh/acme/widget/7/review-suggestions/apply",
+				map[string]any{
+					"expected_head_sha": "abc123",
+					"suggestions": []map[string]any{{
+						"thread_id":   strconv.FormatInt(thread.ID, 10),
+						"replacement": "return client.publishThreads();",
+					}},
+				},
+			)
+
+			require.Equal(http.StatusConflict, rr.Code, rr.Body.String())
+			var problem rawProblemDetail
+			require.NoError(json.NewDecoder(rr.Body).Decode(&problem))
+			assert.Equal(string(CodeConflict), problem.Code)
+			require.NotNil(problem.Details)
+			assert.Equal(tt.reason, problem.Details["reason"])
+		})
+	}
+}
+
+func TestAPIApplyReviewSuggestionMapsProviderStaleStateAndRefreshesDetail(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	caps := platform.Capabilities{
+		ReadRepositories:            true,
+		ReadMergeRequests:           true,
+		ReadIssues:                  true,
+		ReadComments:                true,
+		ReviewSuggestionApplication: true,
+		MutationHeadBinding:         true,
+		ReadReviewThreads:           true,
+	}
+	srv, database, provider := setupGitHubCapabilityServerWithProvider(
+		t, &caps, "https://github.example.com/fork/widget.git",
+	)
+	ctx := t.Context()
+	provider.applySuggestionsErr = &platform.Error{
+		Code:         platform.ErrCodeStaleState,
+		Provider:     platform.KindGitHub,
+		PlatformHost: "github.example.com",
+		Err:          errors.New("pull request head branch changed since it was reviewed"),
+	}
+
+	repo, err := database.GetRepoByIdentity(ctx, db.RepoIdentity{
+		Platform:     "github",
+		PlatformHost: "github.example.com",
+		RepoPath:     "acme/widget",
+	})
+	require.NoError(err)
+	require.NotNil(repo)
+	mr, err := database.GetMergeRequestByRepoIDAndNumber(ctx, repo.ID, 7)
+	require.NoError(err)
+	require.NotNil(mr)
+	thread := seedApplySuggestionReviewThread(t, database, mr.ID)
+	ch, _ := srv.Hub().Subscribe(ctx, false)
+
+	rr := doJSON(
+		t,
+		srv,
+		http.MethodPost,
+		"/api/v1/host/github.example.com/pulls/gh/acme/widget/7/review-suggestions/apply",
+		map[string]any{
+			"expected_head_sha": "abc123",
+			"suggestions": []map[string]any{{
+				"thread_id":   strconv.FormatInt(thread.ID, 10),
+				"replacement": "return client.publishThreads();",
+			}},
+		},
+	)
+
+	require.Equal(http.StatusConflict, rr.Code, rr.Body.String())
+	var problem rawProblemDetail
+	require.NoError(json.NewDecoder(rr.Body).Decode(&problem))
+	assert.Equal(string(CodeConflict), problem.Code)
+	assert.Equal("target changed since it was reviewed; refresh and retry", problem.Detail)
+	require.NotNil(problem.Details)
+	assert.Equal("stale_state", problem.Details["reason"])
+	assert.Empty(provider.appliedSuggestions)
+	changed := readEventMatching(t, ch, func(ev Event) bool {
+		return ev.Type == "data_changed"
+	})
+	assert.Equal("data_changed", changed.Type)
+}
+
+func TestAPIApplyReviewSuggestionBroadcastsAfterDetailSync(t *testing.T) {
+	require := require.New(t)
+	caps := platform.Capabilities{
+		ReadRepositories:            true,
+		ReadMergeRequests:           true,
+		ReadIssues:                  true,
+		ReadComments:                true,
+		ReviewSuggestionApplication: true,
+		MutationHeadBinding:         true,
+		ReadReviewThreads:           true,
+	}
+	srv, database, _ := setupGitLabCapabilityServerWithProvider(t, &caps)
+	ctx := t.Context()
+
+	repo, err := database.GetRepoByIdentity(ctx, db.RepoIdentity{
+		Platform:     "gitlab",
+		PlatformHost: "gitlab.example.com",
+		RepoPath:     "group/project",
+	})
+	require.NoError(err)
+	require.NotNil(repo)
+	mr, err := database.GetMergeRequestByRepoIDAndNumber(ctx, repo.ID, 7)
+	require.NoError(err)
+	require.NotNil(mr)
+	thread := seedApplySuggestionReviewThread(t, database, mr.ID)
+	ch, _ := srv.Hub().Subscribe(ctx, false)
+
+	rr := doJSON(
+		t,
+		srv,
+		http.MethodPost,
+		"/api/v1/host/gitlab.example.com/pulls/gl/group/project/7/review-suggestions/apply",
+		map[string]any{
+			"expected_head_sha": "abc123",
+			"suggestions": []map[string]any{{
+				"thread_id":   strconv.FormatInt(thread.ID, 10),
+				"replacement": "return client.publishThreads();",
+			}},
+		},
+	)
+
+	require.Equal(http.StatusOK, rr.Code, rr.Body.String())
+	changed := readEventMatching(t, ch, func(ev Event) bool {
+		return ev.Type == "data_changed"
+	})
+	require.Equal("data_changed", changed.Type)
+}
+
+func TestAPIApplyReviewSuggestionRejectsReplacementOutsideStoredSuggestion(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	caps := platform.Capabilities{
+		ReadRepositories:            true,
+		ReadMergeRequests:           true,
+		ReadIssues:                  true,
+		ReadComments:                true,
+		ReviewSuggestionApplication: true,
+		MutationHeadBinding:         true,
+		ReadReviewThreads:           true,
+	}
+	srv, database, provider := setupGitLabCapabilityServerWithProvider(t, &caps)
+	ctx := t.Context()
+
+	repo, err := database.GetRepoByIdentity(ctx, db.RepoIdentity{
+		Platform:     "gitlab",
+		PlatformHost: "gitlab.example.com",
+		RepoPath:     "group/project",
+	})
+	require.NoError(err)
+	require.NotNil(repo)
+	mr, err := database.GetMergeRequestByRepoIDAndNumber(ctx, repo.ID, 7)
+	require.NoError(err)
+	require.NotNil(mr)
+	line := 11
+	require.NoError(database.UpsertMRReviewThreads(ctx, mr.ID, []db.MRReviewThread{{
+		ProviderThreadID:  "provider-thread-1",
+		ProviderCommentID: "provider-comment-1",
+		Body:              "Please apply this.\n\n```suggestion\nreturn client.publishThreads();\n```",
+		AuthorLogin:       "ada",
+		Range: db.ReviewLineRange{
+			Path:        "src/review.ts",
+			Side:        "right",
+			Line:        line,
+			NewLine:     &line,
+			LineType:    "context",
+			DiffHeadSHA: "abc123",
+		},
+		CreatedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
+	}}))
+	threads, err := database.ListMRReviewThreads(ctx, mr.ID)
+	require.NoError(err)
+	require.Len(threads, 1)
+
+	rr := doJSON(
+		t,
+		srv,
+		http.MethodPost,
+		"/api/v1/host/gitlab.example.com/pulls/gl/group/project/7/review-suggestions/apply",
+		map[string]any{
+			"expected_head_sha": "abc123",
+			"suggestions": []map[string]any{{
+				"thread_id":   strconv.FormatInt(threads[0].ID, 10),
+				"replacement": "return maliciousRewrite();",
+			}},
+		},
+	)
+	require.Equal(http.StatusBadRequest, rr.Code, rr.Body.String())
+	assert.Contains(rr.Body.String(), "body.suggestions[0].replacement")
+	assert.Empty(provider.appliedSuggestions)
+}
+
+func TestAPIApplyReviewSuggestionRejectsReplacementInsideIndentedExampleFence(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	caps := platform.Capabilities{
+		ReadRepositories:            true,
+		ReadMergeRequests:           true,
+		ReadIssues:                  true,
+		ReadComments:                true,
+		ReviewSuggestionApplication: true,
+		MutationHeadBinding:         true,
+		ReadReviewThreads:           true,
+	}
+	srv, database, provider := setupGitLabCapabilityServerWithProvider(t, &caps)
+	ctx := t.Context()
+
+	repo, err := database.GetRepoByIdentity(ctx, db.RepoIdentity{
+		Platform:     "gitlab",
+		PlatformHost: "gitlab.example.com",
+		RepoPath:     "group/project",
+	})
+	require.NoError(err)
+	require.NotNil(repo)
+	mr, err := database.GetMergeRequestByRepoIDAndNumber(ctx, repo.ID, 7)
+	require.NoError(err)
+	require.NotNil(mr)
+	line := 11
+	require.NoError(database.UpsertMRReviewThreads(ctx, mr.ID, []db.MRReviewThread{{
+		ProviderThreadID:  "provider-thread-1",
+		ProviderCommentID: "provider-comment-1",
+		Body: strings.Join([]string{
+			"Reviewer explained this with an indented markdown example.",
+			"",
+			"   ````markdown",
+			"```suggestion",
+			"return client.publishThreads();",
+			"```",
+			"   ````",
+			"",
+			"  ```suggestion",
+			"return actualSuggestion();",
+			"  ```",
+		}, "\n"),
+		AuthorLogin: "ada",
+		Range: db.ReviewLineRange{
+			Path:        "src/review.ts",
+			Side:        "right",
+			Line:        line,
+			NewLine:     &line,
+			LineType:    "context",
+			DiffHeadSHA: "abc123",
+		},
+		CreatedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
+	}}))
+	threads, err := database.ListMRReviewThreads(ctx, mr.ID)
+	require.NoError(err)
+	require.Len(threads, 1)
+
+	rr := doJSON(
+		t,
+		srv,
+		http.MethodPost,
+		"/api/v1/host/gitlab.example.com/pulls/gl/group/project/7/review-suggestions/apply",
+		map[string]any{
+			"expected_head_sha": "abc123",
+			"suggestions": []map[string]any{{
+				"thread_id":   strconv.FormatInt(threads[0].ID, 10),
+				"replacement": "return client.publishThreads();",
+			}},
+		},
+	)
+	require.Equal(http.StatusBadRequest, rr.Code, rr.Body.String())
+	assert.Empty(provider.appliedSuggestions)
+
+	rr = doJSON(
+		t,
+		srv,
+		http.MethodPost,
+		"/api/v1/host/gitlab.example.com/pulls/gl/group/project/7/review-suggestions/apply",
+		map[string]any{
+			"expected_head_sha": "abc123",
+			"suggestions": []map[string]any{{
+				"thread_id":   strconv.FormatInt(threads[0].ID, 10),
+				"replacement": "return actualSuggestion();",
+			}},
+		},
+	)
+	require.Equal(http.StatusOK, rr.Code, rr.Body.String())
+	require.Len(provider.appliedSuggestions, 1)
+	assert.Equal("return actualSuggestion();", provider.appliedSuggestions[0].Suggestions[0].Replacement)
+}
+
+func TestAPIApplyReviewSuggestionRejectsRateLimitedOperationBeforeProviderCall(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	caps := platform.Capabilities{
+		ReadRepositories:            true,
+		ReadMergeRequests:           true,
+		ReadIssues:                  true,
+		ReadComments:                true,
+		ReviewSuggestionApplication: true,
+		MutationHeadBinding:         true,
+		ReadReviewThreads:           true,
+	}
+	srv, database, provider := setupGitLabCapabilityServerWithProvider(t, &caps)
+	ctx := t.Context()
+	provider.rateLimitBuckets = map[platform.OperationName][]platform.RateLimitBucket{
+		platform.OperationApplyReviewSuggestion: {platform.RateLimitBucketREST},
+	}
+	rt := ghclient.NewPlatformRateTracker(database, "gitlab", "gitlab.example.com", "rest")
+	srv.syncer.RateTrackers()[ghclient.RateBucketKey("gitlab", "gitlab.example.com")] = rt
+	rt.UpdateFromRate(ghclient.Rate{
+		Limit:     5000,
+		Remaining: 0,
+		Reset:     time.Now().UTC().Add(30 * time.Minute),
+	})
+
+	repo, err := database.GetRepoByIdentity(ctx, db.RepoIdentity{
+		Platform:     "gitlab",
+		PlatformHost: "gitlab.example.com",
+		RepoPath:     "group/project",
+	})
+	require.NoError(err)
+	require.NotNil(repo)
+	mr, err := database.GetMergeRequestByRepoIDAndNumber(ctx, repo.ID, 7)
+	require.NoError(err)
+	require.NotNil(mr)
+	line := 11
+	require.NoError(database.UpsertMRReviewThreads(ctx, mr.ID, []db.MRReviewThread{{
+		ProviderThreadID:  "provider-thread-1",
+		ProviderCommentID: "provider-comment-1",
+		Body:              "Please apply this.\n\n```suggestion\nreturn client.publishThreads();\n```",
+		AuthorLogin:       "ada",
+		Range: db.ReviewLineRange{
+			Path:        "src/review.ts",
+			Side:        "right",
+			Line:        line,
+			NewLine:     &line,
+			LineType:    "context",
+			DiffHeadSHA: "abc123",
+		},
+		CreatedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
+	}}))
+	threads, err := database.ListMRReviewThreads(ctx, mr.ID)
+	require.NoError(err)
+	require.Len(threads, 1)
+
+	rr := doJSON(
+		t,
+		srv,
+		http.MethodPost,
+		"/api/v1/host/gitlab.example.com/pulls/gl/group/project/7/review-suggestions/apply",
+		map[string]any{
+			"expected_head_sha": "abc123",
+			"suggestions": []map[string]any{{
+				"thread_id":   strconv.FormatInt(threads[0].ID, 10),
+				"replacement": "return client.publishThreads();",
+			}},
+		},
+	)
+	require.Equal(http.StatusTooManyRequests, rr.Code, rr.Body.String())
+	var problem rawProblemDetail
+	require.NoError(json.NewDecoder(rr.Body).Decode(&problem))
+	assert.Equal("rateLimited", problem.Code)
+	assert.Empty(provider.appliedSuggestions)
+}
+
+func TestAPIApplyReviewSuggestionRejectsStaleHead(t *testing.T) {
+	require := require.New(t)
+	caps := platform.Capabilities{
+		ReadRepositories:            true,
+		ReadMergeRequests:           true,
+		ReadIssues:                  true,
+		ReadComments:                true,
+		ReviewSuggestionApplication: true,
+		MutationHeadBinding:         true,
+		ReadReviewThreads:           true,
+	}
+	srv, database, _ := setupGitLabCapabilityServerWithProvider(t, &caps)
+	ctx := t.Context()
+
+	repo, err := database.GetRepoByIdentity(ctx, db.RepoIdentity{
+		Platform:     "gitlab",
+		PlatformHost: "gitlab.example.com",
+		RepoPath:     "group/project",
+	})
+	require.NoError(err)
+	require.NotNil(repo)
+	mr, err := database.GetMergeRequestByRepoIDAndNumber(ctx, repo.ID, 7)
+	require.NoError(err)
+	require.NotNil(mr)
+	line := 11
+	require.NoError(database.UpsertMRReviewThreads(ctx, mr.ID, []db.MRReviewThread{{
+		ProviderThreadID: "provider-thread-1",
+		Range: db.ReviewLineRange{
+			Path:        "src/review.ts",
+			Side:        "right",
+			Line:        line,
+			NewLine:     &line,
+			LineType:    "context",
+			DiffHeadSHA: "abc123",
+		},
+		CreatedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
+	}}))
+	threads, err := database.ListMRReviewThreads(ctx, mr.ID)
+	require.NoError(err)
+	require.Len(threads, 1)
+
+	rr := doJSON(
+		t,
+		srv,
+		http.MethodPost,
+		"/api/v1/host/gitlab.example.com/pulls/gl/group/project/7/review-suggestions/apply",
+		map[string]any{
+			"expected_head_sha": "stale-head",
+			"suggestions": []map[string]any{{
+				"thread_id":   strconv.FormatInt(threads[0].ID, 10),
+				"replacement": "return client.publishThreads();",
+			}},
+		},
+	)
+	require.Equal(http.StatusConflict, rr.Code, rr.Body.String())
 }
 
 func draftIDFromResponse(t *testing.T, draft map[string]any) int64 {
@@ -16620,6 +18192,7 @@ func setupGitLabCapabilityServerWithProvider(
 			State:              "open",
 			IsDraft:            true,
 			HeadBranch:         "feature/gitlab",
+			HeadRepoCloneURL:   "https://gitlab.example.com/fork/project.git",
 			BaseBranch:         "main",
 			HeadSHA:            "abc123",
 			BaseSHA:            "def456",
@@ -16654,6 +18227,78 @@ func setupGitLabCapabilityServerWithProvider(
 		PlatformExternalID: "gid://gitlab/Project/4242",
 		WebURL:             "https://gitlab.example.com/group/project",
 		CloneURL:           "https://gitlab.example.com/group/project.git",
+		DefaultBranch:      "main",
+	}
+	syncer := ghclient.NewSyncerWithRegistry(
+		registry, database, nil, []ghclient.RepoRef{repo}, time.Minute, nil, nil,
+	)
+	t.Cleanup(syncer.Stop)
+	srv := New(database, syncer, nil, "/", nil, ServerOptions{})
+	t.Cleanup(func() { gracefulShutdown(t, srv) })
+
+	syncer.RunOnce(ctx)
+	return srv, database, provider
+}
+
+func setupGitHubCapabilityServerWithProvider(
+	t *testing.T,
+	caps *platform.Capabilities,
+	headRepoCloneURL string,
+) (*Server, *db.DB, *apiTestGitLabProvider) {
+	t.Helper()
+	require := require.New(t)
+	ctx := t.Context()
+	now := time.Now().UTC().Truncate(time.Second)
+
+	database := dbtest.Open(t)
+
+	ref := platform.RepoRef{
+		Platform:           platform.KindGitHub,
+		Host:               "github.example.com",
+		Owner:              "acme",
+		Name:               "widget",
+		RepoPath:           "acme/widget",
+		PlatformID:         6262,
+		PlatformExternalID: "6262",
+		WebURL:             "https://github.example.com/acme/widget",
+		CloneURL:           "https://github.example.com/acme/widget.git",
+		DefaultBranch:      "main",
+	}
+	provider := &apiTestGitLabProvider{
+		ref:          ref,
+		capabilities: caps,
+		mergeRequests: []platform.MergeRequest{{
+			Repo:               ref,
+			PlatformID:         7101,
+			PlatformExternalID: "7101",
+			Number:             7,
+			URL:                "https://github.example.com/acme/widget/pull/7",
+			Title:              "GitHub provider PR",
+			Author:             "ada",
+			State:              "open",
+			HeadBranch:         "feature/github",
+			HeadRepoCloneURL:   headRepoCloneURL,
+			BaseBranch:         "main",
+			HeadSHA:            "abc123",
+			BaseSHA:            "def456",
+			CreatedAt:          now,
+			UpdatedAt:          now,
+			LastActivityAt:     now,
+		}},
+	}
+	registry, err := platform.NewRegistry(provider)
+	require.NoError(err)
+
+	repo := ghclient.RepoRef{
+		Platform:           platform.KindGitHub,
+		Owner:              "acme",
+		Name:               "widget",
+		PlatformHost:       "github.example.com",
+		RepoPath:           "acme/widget",
+		PlatformRepoID:     6262,
+		PlatformExternalID: "6262",
+		WebURL:             "https://github.example.com/acme/widget",
+		CloneURL:           "https://github.example.com/acme/widget.git",
 		DefaultBranch:      "main",
 	}
 	syncer := ghclient.NewSyncerWithRegistry(
@@ -18288,6 +19933,21 @@ func TestAPIGetDiff_SingleCommit(t *testing.T) {
 	require.Len(*resp.JSON200.Files, 1)
 }
 
+func TestAPIGetDiffReportsSyncedDiffHeadSHA(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+
+	client, _, _, headSHA, _ := setupTestServerWithClones(t)
+	resp, err := client.HTTP.GetPullDiffWithResponse(
+		t.Context(), "gh", "acme", "widget", 1, nil,
+	)
+	require.NoError(err)
+	require.Equal(http.StatusOK, resp.StatusCode())
+	require.NotNil(resp.JSON200)
+	require.NotNil(resp.JSON200.DiffHeadSha)
+	assert.Equal(headSHA, *resp.JSON200.DiffHeadSha)
+}
+
 func TestAPIGetRepoCommitDiff(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
@@ -18654,6 +20314,18 @@ func TestAPIListActivity(t *testing.T) {
 	assert.NotEmpty(*resp.JSON200.Items,
 		"activity feed should contain PR and comment items")
 	assert.Equal("github.com", (*resp.JSON200.Items)[0].PlatformHost)
+
+	search := "reviewer"
+	filtered, err := client.HTTP.ListActivityWithResponse(
+		ctx, &generated.ListActivityParams{Since: &since, Search: &search},
+	)
+	require.NoError(err)
+	require.Equal(http.StatusOK, filtered.StatusCode())
+	require.NotNil(filtered.JSON200)
+	require.NotNil(filtered.JSON200.Items)
+	require.Len(*filtered.JSON200.Items, 1)
+	assert.Equal("comment", (*filtered.JSON200.Items)[0].ActivityType)
+	assert.Equal("reviewer", (*filtered.JSON200.Items)[0].Author)
 }
 
 func TestAPIListActivityIncludesNotificationSyncedBeforeRepo(t *testing.T) {
@@ -26041,11 +27713,17 @@ func TestWorkspaceCreateDuplicate(t *testing.T) {
 	resp1, err := client.HTTP.CreateWorkspaceWithResponse(ctx, body)
 	require.NoError(err)
 	require.Equal(http.StatusAccepted, resp1.StatusCode())
+	require.NotNil(resp1.JSON202)
 
 	// Duplicate create returns 409.
 	resp2, err := client.HTTP.CreateWorkspaceWithResponse(ctx, body)
 	require.NoError(err)
 	require.Equal(http.StatusConflict, resp2.StatusCode())
+
+	// Drain the first create's async setup before the test returns. Otherwise
+	// the background clone can keep writing into the bare-clone temp dir and
+	// race t.TempDir cleanup, which fails RemoveAll with "directory not empty".
+	waitForWorkspaceReady(t, ctx, client, resp1.JSON202.Id)
 }
 
 func TestWorkspaceCreateFetchesCloneThroughAPI(t *testing.T) {

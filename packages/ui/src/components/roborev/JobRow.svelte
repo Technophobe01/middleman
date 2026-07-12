@@ -1,7 +1,12 @@
 <script lang="ts">
+  import ChevronRightIcon from "@lucide/svelte/icons/chevron-right";
   import type { components } from "../../api/roborev/generated/schema.js";
-  import { parseCostUsd } from "../../utils/roborev-cost.js";
-  import { timeAgo } from "../../utils/time.js";
+  import {
+    panelCostUsd,
+    panelElapsedStart,
+    panelStatusLabel,
+  } from "../../utils/roborev-panel.js";
+  import { formatRelativeTime } from "@kenn-io/kit-ui";
   import StatusBadge from "./StatusBadge.svelte";
   import VerdictBadge from "./VerdictBadge.svelte";
 
@@ -12,13 +17,30 @@
     selected: boolean;
     highlighted: boolean;
     onclick: () => void;
+    members?: ReviewJob[] | undefined;
+    member?: boolean;
+    expandable?: boolean;
+    expanded?: boolean;
+    ontoggle?: (() => void) | undefined;
   }
-  let { job, selected, highlighted, onclick }: Props =
-    $props();
+  let {
+    job,
+    selected,
+    highlighted,
+    onclick,
+    members,
+    member = false,
+    expandable = false,
+    expanded = false,
+    ontoggle,
+  }: Props = $props();
+
+  const panelStatus = $derived(panelStatusLabel(job));
 
   function formatElapsed(j: ReviewJob): string {
-    if (!j.started_at) return "--";
-    const start = new Date(j.started_at).getTime();
+    const startedAt = panelElapsedStart(j, members);
+    if (!startedAt) return "--";
+    const start = new Date(startedAt).getTime();
     const end = j.finished_at
       ? new Date(j.finished_at).getTime()
       : Date.now();
@@ -32,8 +54,8 @@
     return `${hrs}h ${remMins}m`;
   }
 
-  function formatCost(tokenUsage: string | undefined): string {
-    const cost = parseCostUsd(tokenUsage);
+  function formatCost(j: ReviewJob): string {
+    const cost = panelCostUsd(j, members);
     if (cost === null) return "--";
     return `~$${cost.toFixed(2)}`;
   }
@@ -48,6 +70,8 @@
   class="job-row"
   class:selected
   class:highlighted
+  class:member
+  aria-expanded={expandable ? expanded : undefined}
   role="button"
   tabindex="0"
   onclick={onclick}
@@ -58,23 +82,50 @@
   <td class="col-id">
     <span class="mono">{job.id}</span>
   </td>
-  <td class="col-ref">
-    <span class="ref-group">
-      {#if job.repo_name}
-        <span class="repo-name">{job.repo_name}</span>
+  <td class="col-ref" class:tree-cell={expandable || member}>
+    <span class="ref-line" class:ref-line--member={member}>
+      {#if expandable}
+        <button
+          class="chevron"
+          class:open={expanded}
+          type="button"
+          tabindex="-1"
+          aria-label={expanded ? "Collapse panel" : "Expand panel"}
+          onclick={(e) => {
+            e.stopPropagation();
+            ontoggle?.();
+          }}
+        >
+          <ChevronRightIcon size={12} strokeWidth={2} aria-hidden="true" />
+        </button>
+      {:else if member}
+        <span class="tree-spacer" aria-hidden="true"></span>
       {/if}
-      {#if job.branch}
-        <span class="branch-name">{job.branch}</span>
-      {/if}
-      <span class="git-ref mono" title={job.git_ref}>
-        {shortRef(job.git_ref)}
+      <span class="ref-stack">
+        <span class="ref-group">
+          {#if job.repo_name}
+            <span class="repo-name">{job.repo_name}</span>
+          {/if}
+          {#if job.branch}
+            <span class="branch-name">{job.branch}</span>
+          {/if}
+          <span class="git-ref mono" title={job.git_ref}>
+            {shortRef(job.git_ref)}
+          </span>
+        </span>
+        {#if job.commit_subject}
+          <span class="commit-subject" title={job.commit_subject}>
+            {job.commit_subject}
+          </span>
+        {/if}
+        {#if member && job.panel_member_name}
+          <span class="member-name">{job.panel_member_name}</span>
+        {/if}
+        {#if panelStatus}
+          <span class="panel-status">{panelStatus}</span>
+        {/if}
       </span>
     </span>
-    {#if job.commit_subject}
-      <span class="commit-subject" title={job.commit_subject}>
-        {job.commit_subject}
-      </span>
-    {/if}
   </td>
   <td class="col-agent">{job.agent}</td>
   <td class="col-status">
@@ -87,11 +138,11 @@
     {formatElapsed(job)}
   </td>
   <td class="col-cost mono">
-    {formatCost(job.token_usage)}
+    {formatCost(job)}
   </td>
   <td class="col-type">{job.job_type}</td>
   <td class="col-queued" title={job.enqueued_at}>
-    {timeAgo(job.enqueued_at)}
+    {formatRelativeTime(job.enqueued_at)}
   </td>
 </tr>
 
@@ -129,6 +180,10 @@
     );
   }
 
+  .job-row.member td {
+    background: var(--bg-inset);
+  }
+
   .job-row td {
     padding: 6px 10px;
     font-size: var(--font-size-sm);
@@ -146,12 +201,63 @@
     width: 60px;
     color: var(--text-muted);
     text-align: right;
+    white-space: nowrap;
+  }
+
+  .chevron {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    width: 14px;
+    height: 14px;
+    border-radius: var(--radius-sm);
+    color: var(--text-muted);
+    transition: transform 0.1s, background 0.1s, color 0.1s;
+    vertical-align: middle;
+    margin-right: 2px;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    cursor: pointer;
+  }
+
+  .chevron:hover {
+    background: var(--bg-inset);
+    color: var(--text-primary);
+  }
+
+  .chevron.open {
+    transform: rotate(90deg);
+    color: var(--accent-blue);
   }
 
   .col-ref {
     min-width: 160px;
     max-width: 300px;
     white-space: normal;
+  }
+
+  .ref-line {
+    display: flex;
+    align-items: flex-start;
+    gap: 4px;
+    min-width: 0;
+  }
+
+  .tree-cell .ref-line--member {
+    padding-left: 18px;
+  }
+
+  .tree-spacer {
+    flex: 0 0 14px;
+    width: 14px;
+    height: 14px;
+  }
+
+  .ref-stack {
+    display: block;
+    min-width: 0;
   }
 
   .ref-group {
@@ -183,6 +289,19 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     max-width: 280px;
+  }
+
+  .member-name {
+    display: block;
+    font-size: var(--font-size-xs);
+    color: var(--accent-blue);
+    font-weight: 500;
+  }
+
+  .panel-status {
+    display: block;
+    font-size: var(--font-size-xs);
+    color: var(--text-secondary);
   }
 
   .col-agent {

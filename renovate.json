@@ -27,15 +27,32 @@
       "matchManagers": ["bun", "custom.regex"],
       "groupName": "JavaScript dependencies",
       "groupSlug": "javascript-dependencies"
+    },
+    {
+      "matchManagers": ["github-actions"],
+      "groupName": "GitHub Actions",
+      "groupSlug": "github-actions"
+    },
+    {
+      "matchManagers": ["docker-compose", "dockerfile"],
+      "groupName": "Docker images",
+      "groupSlug": "docker-images"
+    },
+    {
+      "matchManagers": ["mise"],
+      "groupName": "Developer tools",
+      "groupSlug": "dev-tools"
+    },
+    {
+      "matchDepNames": ["golangci-lint", "golangci/golangci-lint"],
+      "groupName": "golangci-lint",
+      "groupSlug": "golangci-lint"
     }
   ],
   "customManagers": [
     {
       "customType": "regex",
-      "managerFilePatterns": [
-        "/(^|/)\\.github/workflows/.+\\.ya?ml$/",
-        "/(^|/)Dockerfile\\.dev$/"
-      ],
+      "managerFilePatterns": ["/(^|/)\\.github/workflows/.+\\.ya?ml$/", "/(^|/)Dockerfile\\.dev$/"],
       "matchStrings": [
         "bun-version:\\s*[\"']?(?<currentValue>\\d+\\.\\d+\\.\\d+)[\"']?",
         "bun-v(?<currentValue>\\d+\\.\\d+\\.\\d+)/bun-linux"
@@ -44,6 +61,16 @@
       "depNameTemplate": "oven-sh/bun",
       "extractVersionTemplate": "^bun-v(?<version>\\d+\\.\\d+\\.\\d+)$",
       "versioningTemplate": "semver"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/(^|/)\\.github/workflows/.+\\.ya?ml$/"],
+      "matchStrings": [
+        "mcr\\.microsoft\\.com/playwright@(?<currentDigest>sha256:[a-f0-9]{64})\\s*#\\s*(?<currentValue>v\\d+\\.\\d+\\.\\d+-noble)"
+      ],
+      "datasourceTemplate": "docker",
+      "depNameTemplate": "mcr.microsoft.com/playwright",
+      "versioningTemplate": "regex:^v(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)-noble$"
     }
   ]
 }

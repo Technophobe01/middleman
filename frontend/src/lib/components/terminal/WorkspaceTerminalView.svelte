@@ -1,6 +1,8 @@
 <script lang="ts">
+  import { EmptyState, Spinner } from "@kenn-io/kit-ui";
   import { tick } from "svelte";
   import { navigate } from "../../stores/router.svelte.ts";
+  import { isNarrow } from "../../stores/container.svelte.js";
   import WorkspaceListSidebar from "./WorkspaceListSidebar.svelte";
   import KataWorkspaceSidebarPane from "./KataWorkspaceSidebarPane.svelte";
   import TerminalPane from "./TerminalPane.svelte";
@@ -68,21 +70,17 @@
     clearActiveTerminalDrag,
     readRuntimeSessionDrag,
   } from "./terminal-drag";
-  import {
-    ActionButton,
-    CollapsibleResizableSidebar,
+  import { Button, CollapsibleSidebar,
     SplitResizeHandle,
     WorkspaceRightSidebar,
-    type SplitResizeEvent,
-  } from "@middleman/ui";
+    type SplitResizeEvent, } from "@middleman/ui";
   import {
     AlertIcon,
     RefreshIcon,
-    SpinnerIcon,
   } from "../../icons.ts";
   import { apiErrorMessage, client } from "../../api/runtime.js";
   import type { KataWorkspaceMetadata } from "../../api/kata/workspaces.js";
-  import { showFlash } from "../../stores/flash.svelte.js";
+  import { showFlash } from "@middleman/ui/stores/flash";
 
   interface Workspace {
     id: string;
@@ -498,7 +496,7 @@
     writeLocalStorage(WORKFLOW_PRESETS_KEY, JSON.stringify(workflowPresets));
   });
 
-  function handleSegmentClick(tab: SidebarTab): void {
+  function handleSidebarToggleClick(tab: SidebarTab): void {
     if (actionsBlocked) return;
     if (sidebarOpen && sidebarTab === tab) {
       sidebarOpen = false;
@@ -531,7 +529,7 @@
       return;
     }
 
-    handleSegmentClick(tab);
+    handleSidebarToggleClick(tab);
   }
 
   function toggleRightSidebar(): void {
@@ -2494,7 +2492,7 @@
                   class="workspace-zero-inline-action"
                   aria-label="Create Workspace example"
                 >
-                  <ActionButton
+                  <Button
                     class="workspace-zero-create-button"
                     disabled
                     tone="info"
@@ -2509,7 +2507,7 @@
                       strokeWidth="2.2"
                       aria-hidden="true"
                     />
-                  </ActionButton>
+                  </Button>
                 </span>
                 button to launch a workspace.
               </p>
@@ -2579,12 +2577,7 @@
         </div>
       {:else if !workspace || workspace.status === "creating"}
         <div class="state-message">
-          <SpinnerIcon
-            class="spinner"
-            size="18"
-            strokeWidth="2"
-            aria-hidden="true"
-          />
+          <Spinner size={18} />
           <span>Setting up workspace...</span>
         </div>
       {:else if workspace.status === "error"}
@@ -2626,7 +2619,7 @@
         </div>
       {:else}
         <div class="header-bar">
-          <div class="header-left">
+          <div class="header-start">
             <span class="header-name">
               {displayName(workspace)}
             </span>
@@ -2634,72 +2627,67 @@
               {workspace.git_head_ref}
             </code>
           </div>
-          <div class="header-right">
+          <div class="header-end">
             {#if !hideRightSidebar}
-              <div class="seg-control">
+              <div class="panel-toggle-group">
                 <button
-                  class="seg-btn"
+                  class="panel-toggle-btn"
                   class:active={sidebarOpen && sidebarTab === "diff"}
                   disabled={actionsBlocked}
-                  onclick={() => handleSegmentClick("diff")}
+                  onclick={() => handleSidebarToggleClick("diff")}
                 >
                   Diff
                 </button>
                 {#if workspace.item_type === "issue"}
                   <button
-                    class="seg-btn"
+                    class="panel-toggle-btn"
                     class:active={sidebarOpen && sidebarTab === "issue"}
                     disabled={actionsBlocked}
-                    onclick={() => handleSegmentClick("issue")}
+                    onclick={() => handleSidebarToggleClick("issue")}
                   >
                     Issue
                   </button>
                 {/if}
                 {#if workspace.item_type === "kata_task"}
                   <button
-                    class="seg-btn"
+                    class="panel-toggle-btn"
                     class:active={sidebarOpen && sidebarTab === "kata_task"}
                     disabled={actionsBlocked}
-                    onclick={() => handleSegmentClick("kata_task")}
+                    onclick={() => handleSidebarToggleClick("kata_task")}
                   >
                     Kata task
                   </button>
                 {/if}
                 {#if getWorkspacePRNumber(workspace) !== null}
                   <button
-                    class="seg-btn"
+                    class="panel-toggle-btn"
                     class:active={sidebarOpen && sidebarTab === "pr"}
                     disabled={actionsBlocked}
-                    onclick={() => handleSegmentClick("pr")}
+                    onclick={() => handleSidebarToggleClick("pr")}
                   >
                     PR
                   </button>
                 {/if}
                 {#if workspace.item_type === "pull_request"}
                   <button
-                    class="seg-btn"
+                    class="panel-toggle-btn"
                     class:active={sidebarOpen && sidebarTab === "reviews"}
                     disabled={actionsBlocked}
-                    onclick={() => handleSegmentClick("reviews")}
+                    onclick={() => handleSidebarToggleClick("reviews")}
                   >
                     Reviews
                   </button>
                 {/if}
               </div>
-              <button
-                class="header-btn header-icon-btn"
+              <!-- kit-ui-check-ignore: icon variant of the 22px header-btn rail; kit IconButton's 24px minimum breaks the rail rhythm -->
+              <button class="header-btn header-icon-btn"
                 disabled={actionsBlocked || refreshingWorkspace}
                 title="Refresh workspace details"
                 aria-label="Refresh workspace details"
                 onclick={() => void handleRefreshWorkspace()}
               >
                 {#if refreshingWorkspace}
-                  <SpinnerIcon
-                    class="header-icon spinning"
-                    size="14"
-                    strokeWidth="2.2"
-                    aria-hidden="true"
-                  />
+                  <Spinner size={14} label="Refreshing workspace" />
                 {:else}
                   <RefreshIcon
                     class="header-icon"
@@ -2757,12 +2745,7 @@
               >
                 {#if !runtimeLive}
                   <div class="state-message">
-                    <SpinnerIcon
-                      class="spinner"
-                      size="18"
-                      strokeWidth="2"
-                      aria-hidden="true"
-                    />
+                    <Spinner size={18} />
                     <span>Loading workspace runtime...</span>
                   </div>
                 {:else}
@@ -2931,7 +2914,7 @@
                     disabled={actionsBlocked}
                   />
                 {:else}
-                  <div class="sidebar-empty-state">No linked Kata task</div>
+                  <EmptyState title="No linked Kata task" />
                 {/if}
               {/snippet}
               <WorkspaceRightSidebar
@@ -2962,12 +2945,13 @@
   {#if hideWorkspaceList}
     {@render terminalMainContent()}
   {:else}
-    <CollapsibleResizableSidebar
+    <CollapsibleSidebar
       isCollapsed={isSidebarCollapsed}
       sidebarWidth={currentWorkspaceListWidth}
       minSidebarWidth={MIN_WORKSPACE_LIST_WIDTH}
       maxSidebarWidth={MAX_WORKSPACE_LIST_WIDTH}
       onSidebarResize={handleWorkspaceListResize}
+      overlay={isNarrow()}
       showCollapsedStrip={isSidebarToggleEnabled}
       onExpand={onToggleSidebar}
       mainOverflow="hidden"
@@ -2994,7 +2978,7 @@
         />
       {/snippet}
       {@render terminalMainContent()}
-    </CollapsibleResizableSidebar>
+    </CollapsibleSidebar>
   {/if}
 </div>
 
@@ -3094,7 +3078,7 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    gap: 10px;
+    gap: var(--space-4);
     flex: 1;
     color: var(--text-muted);
     font-size: var(--font-size-lg);
@@ -3109,7 +3093,7 @@
     flex-direction: column;
     align-items: flex-start;
     justify-content: center;
-    gap: 18px;
+    gap: var(--space-6);
     flex: 1;
     min-width: 0;
     overflow: auto;
@@ -3123,7 +3107,7 @@
   .workspace-zero-copy {
     display: flex;
     flex-direction: column;
-    gap: 10px;
+    gap: var(--space-4);
     min-width: 0;
   }
 
@@ -3170,16 +3154,14 @@
     border: 1px solid var(--border-default);
     border-radius: 6px;
     background: var(--bg-surface);
-    box-shadow:
-      0 1px 2px rgba(0, 0, 0, 0.04),
-      0 4px 14px rgba(0, 0, 0, 0.08);
+    box-shadow: var(--shadow-lg);
   }
 
   .workspace-zero-example {
     display: flex;
     flex-direction: column;
     align-items: center;
-    gap: 7px;
+    gap: var(--space-3);
     color: var(--text-secondary);
     font-size: var(--font-size-md);
     line-height: 1.5;
@@ -3231,7 +3213,7 @@
     height: 22px;
     border-radius: 50%;
     background: var(--accent-red);
-    color: #fff;
+    color: var(--text-on-accent);
     font-size: var(--font-size-md);
     font-weight: 700;
     flex-shrink: 0;
@@ -3266,7 +3248,7 @@
   .retry-btn.danger:hover {
     background: var(--accent-red);
     border-color: var(--accent-red);
-    color: #fff;
+    color: var(--text-on-accent);
   }
 
   .action-error {
@@ -3274,16 +3256,6 @@
     font-size: var(--font-size-sm);
   }
 
-  :global(.spinner) {
-    animation: spin 0.8s linear infinite;
-    color: var(--text-muted);
-  }
-
-  @keyframes spin {
-    to {
-      transform: rotate(360deg);
-    }
-  }
 
   .header-bar {
     display: flex;
@@ -3294,11 +3266,11 @@
     background: var(--bg-surface);
     border-bottom: 1px solid var(--border-default);
     border-left: 1px solid var(--border-default);
-    gap: 10px;
+    gap: var(--space-4);
     flex-shrink: 0;
   }
 
-  .header-left {
+  .header-start {
     display: flex;
     align-items: center;
     gap: 8px;
@@ -3327,7 +3299,7 @@
     line-height: 1.5;
   }
 
-  .header-right {
+  .header-end {
     display: flex;
     align-items: center;
     gap: 8px;
@@ -3360,10 +3332,6 @@
     display: block;
   }
 
-  :global(.header-icon.spinning) {
-    animation: spin 0.8s linear infinite;
-  }
-
   .header-btn:hover:not(:disabled) {
     background: var(--bg-surface-hover);
     color: var(--text-primary);
@@ -3377,7 +3345,7 @@
 
   .header-btn.danger:hover:not(:disabled) {
     background: var(--accent-red);
-    color: #fff;
+    color: var(--text-on-accent);
     border-color: var(--accent-red);
   }
 
@@ -3398,7 +3366,7 @@
     display: flex;
     align-items: stretch;
     justify-content: space-between;
-    gap: 10px;
+    gap: var(--space-4);
     height: 30px;
     padding: 0 6px 0 0;
     border-bottom: 1px solid var(--border-default);
@@ -3443,7 +3411,7 @@
     background: var(--bg-primary);
   }
 
-  .seg-control {
+  .panel-toggle-group {
     display: inline-flex;
     height: 22px;
     border: 1px solid var(--border-default);
@@ -3452,7 +3420,7 @@
     background: var(--bg-surface);
   }
 
-  .seg-btn {
+  .panel-toggle-btn {
     display: inline-flex;
     align-items: center;
     padding: 0 10px;
@@ -3467,32 +3435,35 @@
     transition: background-color 80ms ease, color 80ms ease;
   }
 
-  .seg-btn + .seg-btn {
+  .panel-toggle-btn + .panel-toggle-btn {
     border-left: 1px solid var(--border-default);
   }
 
-  .seg-btn:hover:not(.active):not(:disabled) {
+  .panel-toggle-btn:hover:not(.active):not(:disabled) {
     color: var(--text-primary);
     background: var(--bg-surface-hover);
   }
 
-  .seg-btn.active:not(:disabled) {
+  .panel-toggle-btn.active:not(:disabled) {
     background: var(--accent-blue);
-    color: #fff;
+    color: var(--text-on-accent);
     font-weight: 600;
   }
 
-  .seg-btn:disabled {
+  .panel-toggle-btn:disabled {
     cursor: not-allowed;
     color: color-mix(in srgb, var(--text-muted) 75%, var(--bg-surface));
     background: var(--bg-surface);
     opacity: 1;
   }
 
-  .seg-control .seg-btn.active:disabled {
+  .panel-toggle-group .panel-toggle-btn.active:disabled {
+    /* kit-ui-check-ignore: pure neutral gray desaturates the disabled-active state the same way in both themes */
     background: color-mix(in srgb, rgb(128 128 128) 28%, var(--bg-surface)) !important;
+    /* kit-ui-check-ignore: pure neutral gray desaturates the disabled-active state the same way in both themes */
     color: color-mix(in srgb, rgb(115 115 115) 80%, var(--text-primary)) !important;
     box-shadow: inset 0 0 0 1px
+      /* kit-ui-check-ignore: pure neutral gray desaturates the disabled-active state the same way in both themes */
       color-mix(in srgb, rgb(128 128 128) 35%, var(--border-muted));
   }
 
@@ -3509,21 +3480,10 @@
     overflow: hidden;
   }
 
-  .right-sidebar:has(:global(.modal-overlay)) {
+  .right-sidebar:has(:global(.kit-modal-overlay)) {
     z-index: 80;
   }
 
-  .sidebar-empty-state {
-    height: 100%;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    padding: 24px;
-    color: var(--text-muted);
-    font-size: var(--font-size-sm);
-    text-align: center;
-    background: var(--bg-surface);
-  }
 
   .rename-form {
     display: grid;

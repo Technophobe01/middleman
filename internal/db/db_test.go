@@ -2,6 +2,7 @@ package db
 
 import (
 	"database/sql"
+	"errors"
 	"io/fs"
 	"os"
 	"path"
@@ -10,6 +11,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/golang-migrate/migrate/v4"
+	migratesqlite "github.com/golang-migrate/migrate/v4/database/sqlite"
+	"github.com/golang-migrate/migrate/v4/source/iofs"
+	"github.com/stretchr/testify/assert"
 	_ "modernc.org/sqlite"
 
 	"github.com/stretchr/testify/require"
@@ -37,7 +42,7 @@ func TestOpenAndSchema(t *testing.T) {
 		"middleman_repos",
 		"middleman_merge_requests",
 		"middleman_mr_events",
-		"middleman_kanban_state",
+		"middleman_item_workflow_state",
 		"middleman_labels",
 		"middleman_merge_request_labels",
 		"middleman_issue_labels",
@@ -93,6 +98,136 @@ func TestOpenAndSchema(t *testing.T) {
 			require.Equal(column, found)
 		}
 	}
+}
+
+func TestOpenMigratesKanbanRowsToItemWorkflowState(t *testing.T) {
+	t.Parallel()
+	assert := assert.New(t)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "old.db")
+
+	openAtVersionForTest(t, path, 36, func(raw *sql.DB) {
+		_, err := raw.Exec(`INSERT INTO middleman_repos (
+				id, platform, platform_host, owner, name, repo_path,
+				owner_key, name_key, repo_path_key, created_at
+			)
+			VALUES (
+				1, 'github', 'github.com', 'acme', 'widget', 'acme/widget',
+				'acme', 'widget', 'acme/widget', datetime('now')
+			)`)
+		require.NoError(t, err)
+		_, err = raw.Exec(`INSERT INTO middleman_merge_requests
+			(id, repo_id, platform_id, number, created_at, updated_at, last_activity_at)
+			VALUES (1, 1, 101, 7, datetime('now'), datetime('now'), datetime('now'))`)
+		require.NoError(t, err)
+		_, err = raw.Exec(`INSERT INTO middleman_kanban_state (merge_request_id, status, updated_at)
+			VALUES (1, 'reviewing', '2026-07-01 10:00:00')`)
+		require.NoError(t, err)
+	})
+
+	d, err := Open(path)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, d.Close()) })
+
+	var itemType, status, source string
+	var number int
+	err = d.ReadDB().QueryRow(`SELECT item_type, item_number, status, updated_source
+		FROM middleman_item_workflow_state`).Scan(&itemType, &number, &status, &source)
+	require.NoError(t, err)
+	assert.Equal("pr", itemType)
+	assert.Equal(7, number)
+	assert.Equal("reviewing", status)
+	assert.Empty(source)
+	assert.False(tableExistsForTest(t, d.ReadDB(), "middleman_kanban_state"))
+	assert.True(tableExistsForTest(t, d.ReadDB(), "middleman_item_workflow_state"))
+}
+
+func TestOpenResyncsKanbanRowsBeforeDroppingKanbanState(t *testing.T) {
+	t.Parallel()
+	assert := assert.New(t)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "old.db")
+
+	openAtVersionForTest(t, path, 37, func(raw *sql.DB) {
+		_, err := raw.Exec(`INSERT INTO middleman_repos (
+				id, platform, platform_host, owner, name, repo_path,
+				owner_key, name_key, repo_path_key, created_at
+			)
+			VALUES (
+				1, 'github', 'github.com', 'acme', 'widget', 'acme/widget',
+				'acme', 'widget', 'acme/widget', datetime('now')
+			)`)
+		require.NoError(t, err)
+		_, err = raw.Exec(`INSERT INTO middleman_merge_requests
+			(id, repo_id, platform_id, number, created_at, updated_at, last_activity_at)
+			VALUES (1, 1, 101, 7, datetime('now'), datetime('now'), datetime('now'))`)
+		require.NoError(t, err)
+		_, err = raw.Exec(`INSERT INTO middleman_kanban_state (merge_request_id, status, updated_at)
+			VALUES (1, 'waiting', '2026-07-01 10:00:00')`)
+		require.NoError(t, err)
+		_, err = raw.Exec(`INSERT INTO middleman_item_workflow_state
+			(repo_id, item_type, item_number, status, updated_at)
+			VALUES (1, 'pr', 7, 'reviewing', '2026-07-01 10:00:00')`)
+		require.NoError(t, err)
+	})
+
+	d, err := Open(path)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, d.Close()) })
+
+	var status string
+	err = d.ReadDB().QueryRow(`SELECT status FROM middleman_item_workflow_state
+		WHERE repo_id = 1 AND item_type = 'pr' AND item_number = 7`).Scan(&status)
+	require.NoError(t, err)
+	assert.Equal("waiting", status)
+	assert.False(tableExistsForTest(t, d.ReadDB(), "middleman_kanban_state"))
+}
+
+func TestOpenNormalizesInvalidWorkflowStatusesDuringCutover(t *testing.T) {
+	t.Parallel()
+	assert := assert.New(t)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "old.db")
+
+	openAtVersionForTest(t, path, 37, func(raw *sql.DB) {
+		_, err := raw.Exec(`INSERT INTO middleman_repos (
+				id, platform, platform_host, owner, name, repo_path,
+				owner_key, name_key, repo_path_key, created_at
+			)
+			VALUES (
+				1, 'github', 'github.com', 'acme', 'widget', 'acme/widget',
+				'acme', 'widget', 'acme/widget', datetime('now')
+			)`)
+		require.NoError(t, err)
+		_, err = raw.Exec(`INSERT INTO middleman_merge_requests
+			(id, repo_id, platform_id, number, created_at, updated_at, last_activity_at)
+			VALUES (1, 1, 101, 7, datetime('now'), datetime('now'), datetime('now'))`)
+		require.NoError(t, err)
+		_, err = raw.Exec(`INSERT INTO middleman_kanban_state (merge_request_id, status, updated_at)
+			VALUES (1, 'triage', '2026-07-01 10:00:00')`)
+		require.NoError(t, err)
+		_, err = raw.Exec(`INSERT INTO middleman_item_workflow_state
+			(repo_id, item_type, item_number, status, updated_at)
+			VALUES (1, 'pr', 9, 'bogus', '2026-07-01 10:00:00')`)
+		require.NoError(t, err)
+	})
+
+	d, err := Open(path)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, d.Close()) })
+
+	var resynced, orphaned string
+	err = d.ReadDB().QueryRow(`SELECT status FROM middleman_item_workflow_state
+		WHERE repo_id = 1 AND item_type = 'pr' AND item_number = 7`).Scan(&resynced)
+	require.NoError(t, err)
+	assert.Equal("new", resynced)
+	err = d.ReadDB().QueryRow(`SELECT status FROM middleman_item_workflow_state
+		WHERE repo_id = 1 AND item_type = 'pr' AND item_number = 9`).Scan(&orphaned)
+	require.NoError(t, err)
+	assert.Equal("new", orphaned)
 }
 
 func TestOpenCreatesFile(t *testing.T) {
@@ -440,20 +575,24 @@ func TestOpenCasefoldsDuplicateRepositoryRows(t *testing.T) {
 
 	var kanbanStatus string
 	err = d.ReadDB().QueryRow(`
-		SELECT ks.status
-		FROM middleman_kanban_state ks
-		JOIN middleman_merge_requests mr ON mr.id = ks.merge_request_id
-		WHERE mr.number = 2`,
+		SELECT ws.status
+		FROM middleman_item_workflow_state ws
+		JOIN middleman_merge_requests mr
+			ON mr.repo_id = ws.repo_id AND mr.number = ws.item_number
+		WHERE ws.item_type = 'pr'
+		  AND mr.number = 2`,
 	).Scan(&kanbanStatus)
 	require.NoError(err)
 	require.Equal("reviewing", kanbanStatus)
 
 	var mergedKanbanStatus string
 	err = d.ReadDB().QueryRow(`
-		SELECT ks.status
-		FROM middleman_kanban_state ks
-		JOIN middleman_merge_requests mr ON mr.id = ks.merge_request_id
-		WHERE mr.number = 1`,
+		SELECT ws.status
+		FROM middleman_item_workflow_state ws
+		JOIN middleman_merge_requests mr
+			ON mr.repo_id = ws.repo_id AND mr.number = ws.item_number
+		WHERE ws.item_type = 'pr'
+		  AND mr.number = 1`,
 	).Scan(&mergedKanbanStatus)
 	require.NoError(err)
 	require.Equal("reviewing", mergedKanbanStatus)
@@ -881,6 +1020,29 @@ func tableExistsForTest(t *testing.T, db *sql.DB, name string) bool {
 	).Scan(&count)
 	require.NoError(t, err)
 	return count > 0
+}
+
+func openAtVersionForTest(t *testing.T, dbPath string, version uint, seed func(*sql.DB)) {
+	t.Helper()
+	require := require.New(t)
+
+	raw, err := sql.Open("sqlite", dbPath+"?_pragma=foreign_keys(1)")
+	require.NoError(err)
+
+	sourceDriver, err := iofs.New(migrationFiles, "migrations")
+	require.NoError(err)
+	databaseDriver, err := migratesqlite.WithInstance(raw, &migratesqlite.Config{
+		MigrationsTable: migrationTableName,
+	})
+	require.NoError(err)
+	m, err := migrate.NewWithInstance("iofs", sourceDriver, "sqlite", databaseDriver)
+	require.NoError(err)
+	err = m.Migrate(version)
+	if err != nil && !errors.Is(err, migrate.ErrNoChange) {
+		require.NoError(err)
+	}
+	seed(raw)
+	require.NoError(raw.Close())
 }
 
 func openSchemaVersion4DBForTest(t *testing.T) (string, *sql.DB) {

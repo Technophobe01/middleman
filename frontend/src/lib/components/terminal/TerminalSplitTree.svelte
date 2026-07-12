@@ -460,6 +460,7 @@
     border: 0;
     padding: 0;
     background: var(--border-muted);
+    /* kit-ui-check-ignore: recursive split-tree sash (n-ary, orientation-switching), not a two-pane sidebar handle */
     cursor: col-resize;
     flex-shrink: 0;
   }
@@ -478,7 +479,7 @@
     display: flex;
     flex-direction: column;
     overflow: hidden;
-    background: #0d1117;
+    background: var(--terminal-bg);
     border: var(--chrome-border-width) solid var(--border-muted);
     border-top: 0;
   }

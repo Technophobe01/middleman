@@ -1,9 +1,9 @@
 <script lang="ts">
+  import { Button } from "@kenn-io/kit-ui";
   import CheckIcon from "@lucide/svelte/icons/check";
   import { tick } from "svelte";
   import { getClient, getStores } from "../../context.js";
-  import ActionButton from "../shared/ActionButton.svelte";
-  import { runApprovePR, type PRDetailActionInput } from "./keyboard-actions.js";
+    import { runApprovePR, type PRDetailActionInput } from "./keyboard-actions.js";
 
   const client = getClient();
   const { detail, pulls } = getStores();
@@ -132,7 +132,7 @@
 </script>
 
 <div class={["approve-section", expanded && "approve-section--open"]}>
-  <ActionButton
+  <Button
     class="btn btn--approve"
     onclick={() => {
       if (disabled || submitting) return;
@@ -151,10 +151,10 @@
     {size}
   >
     <CheckIcon size="14" strokeWidth="2.4" aria-hidden="true" />
-  </ActionButton>
+  </Button>
 
   {#if expanded}
-    <div class="approve-popover" role="dialog" aria-label="Approve pull request">
+    <div class="approve-popover kit-popover-card" role="dialog" aria-label="Approve pull request">
       <textarea
         bind:this={commentInput}
         class="approve-comment"
@@ -166,7 +166,7 @@
         <p class="approve-error">{error}</p>
       {/if}
       <div class="approve-actions">
-        <ActionButton
+        <Button
           class="btn btn--secondary"
           onclick={() => { expanded = false; }}
           disabled={submitting}
@@ -174,8 +174,8 @@
           surface="outline"
         >
           Cancel
-        </ActionButton>
-        <ActionButton
+        </Button>
+        <Button
           class="btn btn--primary btn--green"
           onclick={() => void handleApprove()}
           disabled={submitting || disabled}
@@ -184,7 +184,7 @@
           title="Submit an approving code review on this pull request"
         >
           {submitting ? "Approving\u2026" : "Approve"}
-        </ActionButton>
+        </Button>
       </div>
     </div>
   {/if}
@@ -212,10 +212,6 @@
     gap: 8px;
     width: min(360px, calc(100vw - 32px));
     padding: 10px;
-    background: var(--bg-surface);
-    border: 1px solid var(--border-default);
-    border-radius: var(--radius-md);
-    box-shadow: 0 14px 32px rgba(0, 0, 0, 0.2);
   }
 
   .approve-comment {
@@ -230,6 +226,7 @@
     resize: vertical;
     max-height: 150px;
     line-height: 1.5;
+    /* kit-ui-check-ignore: inset top-edge highlight; kit shadow tokens are outer drop shadows */
     box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
   }
 
@@ -251,7 +248,7 @@
     width: 100%;
   }
 
-  @media (max-width: 420px) {
+  @media (max-width: 640px) {
     .approve-popover {
       width: min(320px, calc(100vw - 24px));
     }

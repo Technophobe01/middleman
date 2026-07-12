@@ -13,8 +13,12 @@
   import type { DetailActivityViewMode } from "../../stores/detail-activity-view.svelte.js";
   import type { StoreInstances } from "../../types.js";
   import { renderMarkdown, renderMarkdownSync } from "../../utils/markdown.js";
-  import { timeAgo } from "../../utils/time.js";
-  import { copyToClipboard } from "../../utils/clipboard.js";
+  import { copyToClipboard, formatRelativeTime } from "@kenn-io/kit-ui";
+  import {
+    parseMarkdownSuggestions,
+    type ApplySuggestionRequest,
+    type MarkdownSuggestionBlock,
+  } from "../../utils/markdown-suggestions.js";
   import { getStores } from "../../context.js";
   import {
     buildItemReferenceLink,
@@ -22,6 +26,7 @@
   } from "../../utils/item-reference.js";
   import CommentEditor from "./CommentEditor.svelte";
   import DiffReviewThreadSnippet from "../diff/DiffReviewThreadSnippet.svelte";
+  import ReviewSuggestionBlock from "./ReviewSuggestionBlock.svelte";
   import {
     reviewThreadContext,
     reviewThreadLineLabel,
@@ -37,12 +42,14 @@
     repoName?: string;
     repoPath?: string | undefined;
     number?: number | undefined;
+    currentHeadSHA?: string | undefined;
     canResolveReviewThreads?: boolean;
     canReplyToThreads?: boolean;
     filtered?: boolean;
     showCommitDetails?: boolean;
     activityViewMode?: DetailActivityViewMode;
     onEditComment?: ((event: PREvent | IssueEvent, body: string) => Promise<boolean>) | undefined;
+    onApplySuggestion?: ((input: ApplySuggestionRequest) => Promise<boolean>) | undefined;
     jumpToReviewThread?: ((thread: ReviewThread) => void) | undefined;
   }
 
@@ -55,12 +62,14 @@
     repoName,
     repoPath,
     number = undefined,
+    currentHeadSHA = "",
     canResolveReviewThreads = false,
     canReplyToThreads = false,
     filtered = false,
     showCommitDetails = true,
     activityViewMode = "normal",
     onEditComment,
+    onApplySuggestion,
     jumpToReviewThread,
   }: Props = $props();
   const stores = getStores() as StoreInstances | undefined;
@@ -68,6 +77,18 @@
   const diffStore = stores?.diff;
   const diffReviewDraft = stores?.diffReviewDraft;
   const diff = $derived(diffStore?.getDiff() ?? null);
+  // The cached diff can predate the current PR head (the store skips
+  // reloads for the same route). A preview built from that diff would
+  // show stale surrounding code for a suggestion applied to the newer
+  // head, so treat a known head mismatch as missing context.
+  const diffContextStale = $derived(
+    currentHeadSHA !== "" &&
+      diff !== null &&
+      (diff.diff_head_sha ?? "") !== "" &&
+      diff.diff_head_sha !== currentHeadSHA,
+  );
+  const suggestionDiff = $derived(diffContextStale ? null : diff);
+  let diffReloadedForHead = "";
 
   $effect(() => {
     if (!provider || !repoOwner || !repoName || !repoPath || number == null) return;
@@ -92,7 +113,12 @@
       current.repoPath === repoPath &&
       current.number === number
     ) {
-      return;
+      // Same route, but the loaded diff may predate the current head.
+      // Reload once per observed head; if the server still serves the
+      // older snapshot, the preview stays marked outdated instead of
+      // looping.
+      if (!diffContextStale || diffReloadedForHead === currentHeadSHA) return;
+      diffReloadedForHead = currentHeadSHA;
     }
     untrack(() => {
       void diffStore.loadDiff(repoOwner, repoName, number, {
@@ -149,6 +175,12 @@
 
   type TimelineReviewThread = {
     thread: ReviewThread;
+  };
+
+  type BatchedSuggestion = {
+    key: string;
+    reviewedHeadSHA: string;
+    request: ApplySuggestionRequest["suggestions"][number];
   };
 
   function threadID(event: PREvent | IssueEvent): string | null {
@@ -209,6 +241,23 @@
     return elapsedAfterMerge >= 0 && elapsedAfterMerge < mergedCloseCoalesceWindowMs;
   }
 
+  function coalescedMergedCloseEvent(
+    sourceEvents: Array<PREvent | IssueEvent>,
+    mergedEvent: PREvent | IssueEvent,
+  ): PREvent | IssueEvent | null {
+    return sourceEvents
+      .filter((event) => event.EventType === "closed" && isCoalescedMergedCloseEvent(event, mergedEvent))
+      .reduce<PREvent | IssueEvent | null>(preferredLifecycleEvent, null);
+  }
+
+  function mergedEventWithCoalescedAuthor(
+    mergedEvent: PREvent | IssueEvent,
+    coalescedCloseEvent: PREvent | IssueEvent | null,
+  ): PREvent | IssueEvent {
+    if (mergedEvent.Author || !coalescedCloseEvent?.Author) return mergedEvent;
+    return { ...mergedEvent, Author: coalescedCloseEvent.Author };
+  }
+
   function collapseLifecycleTransitions(
     sourceEvents: Array<PREvent | IssueEvent>,
   ): Array<PREvent | IssueEvent> {
@@ -217,12 +266,16 @@
       .reduce<PREvent | IssueEvent | null>(preferredLifecycleEvent, null);
 
     if (mergedEvent === null) return sourceEvents;
+    const closeEvent = coalescedMergedCloseEvent(sourceEvents, mergedEvent);
+    const displayMergedEvent = mergedEventWithCoalescedAuthor(mergedEvent, closeEvent);
 
-    return sourceEvents.filter((event) => {
-      if (event.EventType === "merged") return event.ID === mergedEvent.ID;
-      if (event.EventType === "closed" && isCoalescedMergedCloseEvent(event, mergedEvent)) return false;
-      return true;
-    });
+    return sourceEvents
+      .filter((event) => {
+        if (event.EventType === "merged") return event.ID === mergedEvent.ID;
+        if (event.EventType === "closed" && isCoalescedMergedCloseEvent(event, mergedEvent)) return false;
+        return true;
+      })
+      .map((event) => (event.ID === mergedEvent.ID ? displayMergedEvent : event));
   }
 
   function compareEventsAscending(a: PREvent | IssueEvent, b: PREvent | IssueEvent): number {
@@ -604,6 +657,10 @@
     );
   }
 
+  function isLifecycleTransitionEvent(eventType: string): boolean {
+    return eventType === "merged" || eventType === "closed" || eventType === "reopened";
+  }
+
   function shortCommit(summary: string): string {
     return summary.length > 7 ? summary.slice(0, 7) : summary;
   }
@@ -739,6 +796,9 @@
     if (event.EventType === "cross_referenced") {
       return metadataString(parseMetadata(event), "source_title") ?? event.Summary;
     }
+    if (isLifecycleTransitionEvent(event.EventType)) {
+      return "";
+    }
     return event.Summary || compactMarkdownPreview(event.Body) || systemEventLabel(event.EventType);
   }
 
@@ -838,6 +898,22 @@
   let replyDraft = $state("");
   let savingReplyThreadID = $state<string | null>(null);
   let replyError = $state<string | null>(null);
+  let applyingSuggestionKey = $state<string | null>(null);
+  let suggestionError = $state<Record<string, string>>({});
+  let batchedSuggestions = $state<BatchedSuggestion[]>([]);
+  const batchedSuggestionKeys = $derived(batchedSuggestions.map((item) => item.key));
+  // Suggestions batched before the PR head moved (or while it is unknown)
+  // must not reach batch submit; the server would reject the whole batch.
+  // A stale cached diff context also withholds the batch, matching the
+  // per-row apply gating.
+  const eligibleBatchedSuggestions = $derived(
+    diffContextStale
+      ? []
+      : batchedSuggestions.filter(
+          (item) => currentHeadSHA !== "" && item.reviewedHeadSHA === currentHeadSHA,
+        ),
+  );
+  let savingSuggestionBatch = $state(false);
 
   function canEditComment(event: PREvent | IssueEvent): boolean {
     return (
@@ -998,6 +1074,110 @@
         copyTimeout = null;
       }, 1500);
     });
+  }
+
+  function suggestionKey(event: PREvent | IssueEvent, block: MarkdownSuggestionBlock): string {
+    return `${event.ID}:${block.key}`;
+  }
+
+  function eventSuggestionBlocks(event: PREvent | IssueEvent): MarkdownSuggestionBlock[] {
+    if (!shouldRenderMarkdown(event.EventType)) return [];
+    return parseMarkdownSuggestions(event.Body);
+  }
+
+  function hasSuggestionBlocks(blocks: MarkdownSuggestionBlock[]): boolean {
+    return blocks.some((block) => block.type === "suggestion");
+  }
+
+  async function renderedMarkdownTextHtml(text: string): Promise<string> {
+    return renderMarkdown(
+      text,
+      provider && repoOwner && repoName && repoPath
+        ? { provider, platformHost, owner: repoOwner, name: repoName, repoPath }
+        : undefined,
+    );
+  }
+
+  function renderedMarkdownTextHtmlSync(text: string): string {
+    return renderMarkdownSync(
+      text,
+      provider && repoOwner && repoName && repoPath
+        ? { provider, platformHost, owner: repoOwner, name: repoName, repoPath }
+        : undefined,
+    );
+  }
+
+  function suggestionRequest(
+    thread: ReviewThread,
+    replacement: string,
+  ): ApplySuggestionRequest["suggestions"][number] {
+    return {
+      threadID: thread.id,
+      replacement,
+    };
+  }
+
+  async function commitSuggestion(
+    event: PREvent | IssueEvent,
+    block: Extract<MarkdownSuggestionBlock, { type: "suggestion" }>,
+    thread: ReviewThread,
+  ): Promise<void> {
+    if (onApplySuggestion === undefined) return;
+    const key = suggestionKey(event, block);
+    applyingSuggestionKey = key;
+    suggestionError = { ...suggestionError, [key]: "" };
+    try {
+      const ok = await onApplySuggestion({
+        suggestions: [suggestionRequest(thread, block.replacement)],
+      });
+      if (!ok) {
+        suggestionError = {
+          ...suggestionError,
+          [key]: detailStore?.getDetailError() ?? "Could not apply suggestion",
+        };
+      } else {
+        batchedSuggestions = batchedSuggestions.filter((item) => item.key !== key);
+      }
+    } finally {
+      applyingSuggestionKey = null;
+    }
+  }
+
+  function toggleSuggestionBatch(
+    event: PREvent | IssueEvent,
+    block: Extract<MarkdownSuggestionBlock, { type: "suggestion" }>,
+    thread: ReviewThread,
+  ): void {
+    const key = suggestionKey(event, block);
+    batchedSuggestions = batchedSuggestionKeys.includes(key)
+      ? batchedSuggestions.filter((item) => item.key !== key)
+      : [
+          ...batchedSuggestions,
+          {
+            key,
+            reviewedHeadSHA: thread.diff_head_sha ?? "",
+            request: suggestionRequest(thread, block.replacement),
+          },
+        ];
+  }
+
+  async function commitSuggestionBatch(): Promise<void> {
+    const eligible = eligibleBatchedSuggestions;
+    if (onApplySuggestion === undefined || eligible.length === 0) return;
+    const submittedKeys = eligible.map((item) => item.key);
+    savingSuggestionBatch = true;
+    suggestionError = {};
+    try {
+      const ok = await onApplySuggestion({ suggestions: eligible.map((item) => item.request) });
+      if (ok) {
+        batchedSuggestions = batchedSuggestions.filter((item) => !submittedKeys.includes(item.key));
+      } else {
+        const message = detailStore?.getDetailError() ?? "Could not apply suggestion batch";
+        suggestionError = Object.fromEntries(submittedKeys.map((key) => [key, message]));
+      }
+    } finally {
+      savingSuggestionBatch = false;
+    }
   }
 
   function directLinkCopyID(event: PREvent | IssueEvent): string {
@@ -1246,11 +1426,68 @@
             </div>
           {/if}
           {#if shouldRenderMarkdown(event.EventType)}
-            {#await renderedBodyHtml(event, inlineReplyEntry)}
-              {@html renderedBodyHtmlSync(event, inlineReplyEntry)}
-            {:then html}
-              {@html html}
-            {/await}
+            {@const blocks = eventSuggestionBlocks(event)}
+            {#if hasSuggestionBlocks(blocks)}
+              <div class="event-body-segments">
+                {#each blocks as block (block.key)}
+                  {#if block.type === "markdown"}
+                    {#if block.text.trim().length > 0}
+                      <div class="event-body-segment">
+                        {#await renderedMarkdownTextHtml(block.text)}
+                          {@html renderedMarkdownTextHtmlSync(block.text)}
+                        {:then html}
+                          {@html html}
+                        {/await}
+                      </div>
+                    {/if}
+                  {:else if reviewThread}
+                    {@const blockKey = suggestionKey(event, block)}
+                    <ReviewSuggestionBlock
+                      thread={reviewThread.thread}
+                      context={suggestionDiff ? reviewThreadContext(suggestionDiff, reviewThread.thread) : reviewThreadContext(null, reviewThread.thread)}
+                      replacement={block.replacement}
+                      {currentHeadSHA}
+                      applying={applyingSuggestionKey === blockKey}
+                      batched={batchedSuggestionKeys.includes(blockKey)}
+                      error={suggestionError[blockKey] || null}
+                      onCommit={onApplySuggestion !== undefined
+                        ? () => void commitSuggestion(event, block, reviewThread.thread)
+                        : undefined}
+                      onToggleBatch={onApplySuggestion !== undefined
+                        ? () => toggleSuggestionBatch(event, block, reviewThread.thread)
+                        : undefined}
+                    />
+                  {:else}
+                    {@const fallback = "```suggestion\n" + block.replacement + "\n```"}
+                    <div class="event-body-segment">
+                      {#await renderedMarkdownTextHtml(fallback)}
+                        {@html renderedMarkdownTextHtmlSync(fallback)}
+                      {:then html}
+                        {@html html}
+                      {/await}
+                    </div>
+                  {/if}
+                {/each}
+                {#if inlineReplyEntry}
+                  <button
+                    class="thread-toggle thread-reply-action thread-reply-action--inline"
+                    type="button"
+                    onclick={() => startReply(inlineReplyEntry)}
+                    aria-expanded={isReplyingToEntry(inlineReplyEntry)}
+                    disabled={savingReplyThreadID !== null}
+                  >
+                    <MessageSquareReplyIcon size={14} />
+                    Reply
+                  </button>
+                {/if}
+              </div>
+            {:else}
+              {#await renderedBodyHtml(event, inlineReplyEntry)}
+                {@html renderedBodyHtmlSync(event, inlineReplyEntry)}
+              {:then html}
+                {@html html}
+              {/await}
+            {/if}
           {:else}
             {event.Body}
           {/if}
@@ -1313,6 +1550,16 @@
 	{/if}
 {/snippet}
 
+{#snippet eventAuthorByline(event: PREvent | IssueEvent, compact = false)}
+  <span class={["event-author", compact && "compact-event-author", isLifecycleTransitionEvent(event.EventType) && event.Author && "event-author--lifecycle"]}>
+    {#if isLifecycleTransitionEvent(event.EventType) && event.Author}
+      <span class="event-author-prefix">by</span> {event.Author}
+    {:else}
+      {event.Author || "Unknown"}
+    {/if}
+  </span>
+{/snippet}
+
 {#snippet threadReplyPanel(entry: TimelineEntry, targetID: string)}
 	{#if provider && repoOwner && repoName && repoPath}
 	  <div class="thread-reply-panel">
@@ -1360,6 +1607,20 @@
 {#if events.length === 0}
   <p class="empty">{filtered ? "No activity matches the current filters" : "No activity yet"}</p>
 {:else}
+  {#if onApplySuggestion !== undefined && eligibleBatchedSuggestions.length > 0}
+    <div class="suggestion-batch-bar">
+      <span>{eligibleBatchedSuggestions.length} {eligibleBatchedSuggestions.length === 1 ? "suggestion" : "suggestions"} in batch</span>
+      <button
+        class="thread-toggle thread-reply-action"
+        type="button"
+        onclick={() => void commitSuggestionBatch()}
+        disabled={savingSuggestionBatch}
+      >
+        <CheckIcon size={14} />
+        {savingSuggestionBatch ? "Committing..." : "Commit batch"}
+      </button>
+    </div>
+  {/if}
   <ol class="timeline">
     {#each renderedTimelineEntries as entry (entry.key)}
       {@const event = entry.event}
@@ -1405,14 +1666,14 @@
                   >
                     {compactEventLabel(event.EventType)}
                   </span>
-                  <span class="event-author compact-event-author">{event.Author || "Unknown"}</span>
+                  {@render eventAuthorByline(event, true)}
                   <span class="compact-event-context" title={compactContext}>
                     {compactContext}
                   </span>
                   <span class="compact-event-summary" title={compactSummary}>
                     {compactSummary}
                   </span>
-                  <span class="event-time compact-event-time">{timeAgo(event.CreatedAt)}</span>
+                  <span class="event-time compact-event-time">{formatRelativeTime(event.CreatedAt)}</span>
                 </button>
               {:else}
                 <div class="compact-event-row">
@@ -1423,7 +1684,7 @@
                   >
                     {compactEventLabel(event.EventType)}
                   </span>
-                  <span class="event-author compact-event-author">{event.Author || "Unknown"}</span>
+                  {@render eventAuthorByline(event, true)}
                   <span class="compact-event-context" title={compactContext}>
                     {compactContext}
                   </span>
@@ -1442,7 +1703,7 @@
                       {compactSummary}
                     {/if}
                   </span>
-                  <span class="event-time compact-event-time">{timeAgo(event.CreatedAt)}</span>
+                  <span class="event-time compact-event-time">{formatRelativeTime(event.CreatedAt)}</span>
                 </div>
               {/if}
               {#if canCopyCompact}
@@ -1497,19 +1758,24 @@
                 {#if !showCommitDetails}
                   <span class="commit-title">{commitTitle(event.Body)}</span>
                 {/if}
-                <span class="event-time">{timeAgo(event.CreatedAt)}</span>
+                <span class="event-time">{formatRelativeTime(event.CreatedAt)}</span>
               {:else if event.EventType === "comment_deleted"}
                 {#if event.Author}
                   <span class="event-author">{event.Author}</span>
                 {/if}
                 <span class="system-event-summary system-event-summary--sentence">{event.Summary}</span>
-                <span class="event-time">{timeAgo(event.CreatedAt)}</span>
+                <span class="event-time">{formatRelativeTime(event.CreatedAt)}</span>
               {:else if event.EventType === "assigned" || event.EventType === "unassigned"}
                 {#if event.Author}
                   <span class="event-author">{event.Author}</span>
                 {/if}
                 <span class="system-event-summary system-event-summary--sentence">{event.Summary}</span>
-                <span class="event-time">{timeAgo(event.CreatedAt)}</span>
+                <span class="event-time">{formatRelativeTime(event.CreatedAt)}</span>
+              {:else if isLifecycleTransitionEvent(event.EventType)}
+                {#if event.Author}
+                  {@render eventAuthorByline(event)}
+                {/if}
+                <span class="event-time">{formatRelativeTime(event.CreatedAt)}</span>
               {:else if event.EventType === "cross_referenced"}
                 {#if event.Author}
                   <span class="event-author">{event.Author}</span>
@@ -1517,7 +1783,7 @@
                 {@const sourceUrl = metadataString(metadata, "source_url")}
                 {@const sourceTitle = metadataString(metadata, "source_title") ?? event.Summary}
                 {@const sourceLink = crossReferenceLink(metadata, sourceUrl)}
-                <span class="event-time">{timeAgo(event.CreatedAt)}</span>
+                <span class="event-time">{formatRelativeTime(event.CreatedAt)}</span>
                 {#if sourceLink}
                   <a
                     class={["system-event-link", { "item-ref": sourceLink.internal }]}
@@ -1535,7 +1801,7 @@
                 {#if event.Author}
                   <span class="event-author">{event.Author}</span>
                 {/if}
-                <span class="event-time">{timeAgo(event.CreatedAt)}</span>
+                <span class="event-time">{formatRelativeTime(event.CreatedAt)}</span>
                 <span class="system-event-summary">{event.Summary}</span>
               {/if}
             </div>
@@ -1560,7 +1826,7 @@
               {#if event.Author}
                 <span class="event-author">{event.Author}</span>
               {/if}
-              <span class="event-time">{timeAgo(event.CreatedAt)}</span>
+              <span class="event-time">{formatRelativeTime(event.CreatedAt)}</span>
             </div>
             {#if event.Summary && (event.EventType === "commit" || event.EventType === "force_push")}
               <p class="event-summary">{event.Summary}</p>
@@ -1614,7 +1880,7 @@
                           {#if reply.Author}
                             <span class="event-author">{reply.Author}</span>
                           {/if}
-                          <span class="event-time">{timeAgo(reply.CreatedAt)}</span>
+                          <span class="event-time">{formatRelativeTime(reply.CreatedAt)}</span>
                         </div>
                         {@render eventBody(reply, true)}
                       </div>
@@ -1637,7 +1903,21 @@
   .empty {
     font-size: var(--font-size-root);
     color: var(--text-muted);
-    padding: 1.25rem 0;
+    padding: 16px 0;
+  }
+
+  .suggestion-batch-bar {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: var(--focus-detail-space-sm, 0.62rem);
+    margin: 0.31rem 0 0.31rem 2.47rem;
+    padding: 0.46rem 0.62rem;
+    border: 1px solid var(--border-muted);
+    border-radius: var(--radius-md);
+    background: var(--bg-surface);
+    color: var(--text-secondary);
+    font-size: var(--font-size-sm);
   }
 
   .timeline {
@@ -1657,25 +1937,25 @@
     display: flex;
     flex-direction: column;
     align-items: center;
-    width: 1.85rem;
+    width: 24px;
     flex-shrink: 0;
-    padding-top: 1.08rem;
+    padding-top: 14px;
   }
 
   .dot {
-    width: 0.77rem;
-    height: 0.77rem;
+    width: 10px;
+    height: 10px;
     border-radius: 50%;
     flex-shrink: 0;
     z-index: 1;
-    box-shadow: 0 0 0 0.23rem var(--bg-primary);
+    box-shadow: 0 0 0 3px var(--bg-primary);
   }
 
   .rail-line {
-    width: 0.15rem;
+    width: 2px;
     flex: 1;
     background: var(--border-default);
-    margin-top: 0.15rem;
+    margin-top: 2px;
   }
 
   .event:last-child .rail-line {
@@ -1689,18 +1969,18 @@
     background: var(--bg-surface);
     border: 1px solid var(--border-muted);
     border-radius: var(--radius-md);
-    padding: var(--focus-detail-space-sm, 0.77rem) var(--focus-detail-space-sm, 0.92rem);
-    margin: 0.31rem 0 0.31rem var(--focus-detail-space-xs, 0.62rem);
+    padding: var(--focus-detail-space-sm, 10px) var(--focus-detail-space-sm, 12px);
+    margin: 4px 0 4px var(--focus-detail-space-xs, 8px);
   }
 
   .event-card--compact {
-    padding: var(--focus-detail-space-xs, 0.54rem) var(--focus-detail-space-sm, 0.77rem);
+    padding: var(--focus-detail-space-xs, 7px) var(--focus-detail-space-sm, 10px);
   }
 
   .event-header {
     display: flex;
     align-items: center;
-    gap: var(--focus-detail-space-xs, 0.46rem);
+    gap: var(--focus-detail-space-xs, 6px);
     flex-wrap: wrap;
   }
 
@@ -1713,23 +1993,35 @@
     margin-left: 0;
   }
 
+  .event-header--compact .event-type + .event-author--lifecycle {
+    margin-left: calc(var(--focus-detail-space-xs, 0.46rem) * -0.5);
+  }
+
   .event-card--compact-row {
     overflow: hidden;
+  }
+
+  .event-body-segments {
+    display: flow-root;
+  }
+
+  .event-body-segment:empty {
+    display: none;
   }
 
   .compact-event-line {
     display: grid;
     grid-template-columns: minmax(0, 1fr) max-content;
     align-items: center;
-    gap: var(--focus-detail-space-xs, 0.31rem);
+    gap: var(--focus-detail-space-xs, 4px);
     min-width: 0;
   }
 
   .compact-event-row {
     display: grid;
-    grid-template-columns: 1.15rem minmax(6.5rem, 7.5rem) minmax(5rem, 7rem) minmax(0, 8.5rem) minmax(0, 1fr) max-content;
+    grid-template-columns: 15px minmax(84.5px, 97.5px) minmax(65px, 91px) minmax(0, 110.5px) minmax(0, 1fr) max-content;
     align-items: center;
-    gap: var(--focus-detail-space-xs, 0.46rem);
+    gap: var(--focus-detail-space-xs, 6px);
     min-width: 0;
   }
 
@@ -1757,8 +2049,8 @@
   }
 
   .event-action-btn.compact-copy-btn {
-    width: 1.75rem;
-    height: 1.75rem;
+    width: 23px;
+    height: 23px;
     opacity: 0.72;
   }
 
@@ -1769,8 +2061,8 @@
   }
 
   .compact-expanded-content {
-    margin-top: var(--focus-detail-space-sm, 0.62rem);
-    padding-top: var(--focus-detail-space-sm, 0.62rem);
+    margin-top: var(--focus-detail-space-sm, 8px);
+    padding-top: var(--focus-detail-space-sm, 8px);
     border-top: 1px solid var(--border-muted);
   }
 
@@ -1817,6 +2109,11 @@
     color: var(--text-primary);
   }
 
+  .event-author-prefix {
+    color: var(--text-muted);
+    font-weight: 400;
+  }
+
   .event-time {
     font-size: var(--font-size-xs);
     color: var(--text-muted);
@@ -1826,7 +2123,7 @@
   .event-summary {
     font-size: var(--font-size-sm);
     color: var(--text-secondary);
-    margin-top: var(--focus-detail-space-xs, 0.31rem);
+    margin-top: var(--focus-detail-space-xs, 4px);
     font-family: var(--font-mono);
     white-space: nowrap;
     overflow: hidden;
@@ -1854,8 +2151,8 @@
   }
 
   .commit-body-details {
-    margin-top: var(--focus-detail-space-xs, 0.54rem);
-    padding-right: var(--focus-detail-space-sm, 0.77rem);
+    margin-top: var(--focus-detail-space-xs, 7px);
+    padding-right: var(--focus-detail-space-sm, 10px);
   }
 
   .system-event-summary,
@@ -1884,11 +2181,11 @@
   /* Body wrap for copy button positioning */
   .event-body-wrap {
     position: relative;
-    margin-top: var(--focus-detail-space-sm, 0.62rem);
+    margin-top: var(--focus-detail-space-sm, 8px);
   }
 
   .event-body-wrap--nested {
-    margin-top: 0.15rem;
+    margin-top: 2px;
   }
 
   .event-body-wrap--with-thread {
@@ -1896,15 +2193,15 @@
   }
 
   .event-body-wrap--with-thread :global(.thread-snippet) {
-    margin-bottom: var(--focus-detail-space-xs, 0.46rem);
+    margin-bottom: var(--focus-detail-space-xs, 6px);
   }
 
   .thread-controls {
     display: flex;
     align-items: center;
     flex-wrap: wrap;
-    gap: var(--focus-detail-space-xs, 0.46rem);
-    margin-top: var(--focus-detail-space-sm, 0.62rem);
+    gap: var(--focus-detail-space-xs, 6px);
+    margin-top: var(--focus-detail-space-sm, 8px);
   }
 
   .event-card--reply-inline {
@@ -1914,9 +2211,9 @@
   .thread-toggle {
     display: inline-flex;
     align-items: center;
-    gap: 0.35rem;
-    min-height: 1.75rem;
-    padding: 0.18rem 0.45rem 0.18rem 0.25rem;
+    gap: var(--space-2);
+    min-height: 23px;
+    padding: 2.5px 6px 2.5px 3px;
     border-radius: var(--radius-sm);
     color: var(--accent-blue);
     font-size: var(--font-size-sm);
@@ -1938,7 +2235,7 @@
   }
 
   .thread-reply-panel {
-    padding: var(--focus-detail-space-sm, 0.62rem) 0 0.15rem 1.35rem;
+    padding: var(--focus-detail-space-sm, 8px) 0 2px 17.5px;
   }
 
   .thread-replies {
@@ -1946,24 +2243,24 @@
     display: flex;
     flex-direction: column;
     gap: 0;
-    margin-top: 0.2rem;
+    margin-top: 2.5px;
     padding-left: 0;
   }
 
   .thread-reply {
     display: grid;
-    grid-template-columns: 1.35rem minmax(0, 1fr);
+    grid-template-columns: 17.5px minmax(0, 1fr);
     column-gap: 0;
     min-width: 0;
-    --thread-reply-header-padding-block: 0.18rem;
-    --thread-reply-header-line-height: 1.15rem;
+    --thread-reply-header-padding-block: 2.5px;
+    --thread-reply-header-line-height: 15px;
   }
 
   .thread-reply-rail {
     position: relative;
-    min-height: 1.5rem;
-    --thread-dot-size: 0.5rem;
-    --thread-dot-center-y: calc(var(--thread-reply-header-padding-block) + 0.575rem);
+    min-height: 19.5px;
+    --thread-dot-size: 6.5px;
+    --thread-dot-center-y: calc(var(--thread-reply-header-padding-block) + 7.5px);
   }
 
   .thread-reply-rail::before {
@@ -1997,7 +2294,7 @@
     height: var(--thread-dot-size);
     border-radius: 50%;
     background: var(--accent-blue);
-    box-shadow: 0 0 0 0.18rem var(--bg-surface);
+    box-shadow: 0 0 0 2.5px var(--bg-surface);
     z-index: 1;
   }
 
@@ -2022,22 +2319,22 @@
 
   .event-actions {
     position: absolute;
-    top: var(--focus-detail-space-xs, 0.46rem);
-    right: var(--focus-detail-space-xs, 0.46rem);
+    top: var(--focus-detail-space-xs, 6px);
+    right: var(--focus-detail-space-xs, 6px);
     display: flex;
-    gap: 0.15rem;
+    gap: 2px;
     z-index: 1;
   }
 
   .event-body-wrap--with-thread .event-actions {
     position: static;
     float: right;
-    margin: 0 0 var(--focus-detail-space-xs, 0.46rem) var(--focus-detail-space-xs, 0.46rem);
+    margin: 0 0 var(--focus-detail-space-xs, 6px) var(--focus-detail-space-xs, 6px);
   }
 
   .event-card--reply-inline .event-body-wrap--with-thread .event-actions--inline-reply {
     position: absolute;
-    top: var(--focus-detail-space-sm, 0.62rem);
+    top: var(--focus-detail-space-sm, 8px);
     right: 0;
     float: none;
     margin: 0;
@@ -2047,8 +2344,8 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    width: var(--focus-detail-hit-target, 2rem);
-    height: var(--focus-detail-hit-target, 2rem);
+    width: var(--focus-detail-hit-target, 26px);
+    height: var(--focus-detail-hit-target, 26px);
     border-radius: var(--radius-sm);
     color: var(--text-muted);
     opacity: 0;
@@ -2089,15 +2386,15 @@
   .event-body {
     font-size: var(--font-size-sm);
     color: var(--text-primary);
-    padding: var(--focus-detail-space-sm, 0.62rem) calc(var(--focus-detail-hit-target, 2rem) + var(--focus-detail-space-sm, 0.62rem)) var(--focus-detail-space-sm, 0.62rem) var(--focus-detail-space-sm, 0.77rem);
+    padding: var(--focus-detail-space-sm, 8px) calc(var(--focus-detail-hit-target, 26px) + var(--focus-detail-space-sm, 8px)) var(--focus-detail-space-sm, 8px) var(--focus-detail-space-sm, 10px);
     white-space: pre-wrap;
     word-break: break-word;
     line-height: 1.6;
   }
 
   .event-body-wrap--with-thread .event-body {
-    padding-top: 0.18rem;
-    padding-right: var(--focus-detail-space-xs, 0.46rem);
+    padding-top: 2.5px;
+    padding-right: var(--focus-detail-space-xs, 6px);
   }
 
   .event-card--reply-inline .event-body {
@@ -2109,7 +2406,7 @@
   }
 
   .event-body--nested {
-    padding: 0.12rem calc(var(--focus-detail-hit-target, 2rem) + var(--focus-detail-space-sm, 0.62rem)) 0.15rem 0;
+    padding: 1.5px calc(var(--focus-detail-hit-target, 26px) + var(--focus-detail-space-sm, 8px)) 2px 0;
     line-height: 1.25;
   }
 
@@ -2128,15 +2425,15 @@
     float: right;
     clear: right;
     display: inline-flex;
-    margin-left: var(--focus-detail-space-sm, 0.77rem);
+    margin-left: var(--focus-detail-space-sm, 10px);
   }
 
   .event-body--with-inline-reply :global(.thread-reply-action--inline) {
     display: inline-flex;
     align-items: center;
-    gap: 0.35rem;
-    min-height: 1.75rem;
-    padding: 0.18rem 0.45rem 0.18rem 0.25rem;
+    gap: var(--space-2);
+    min-height: 23px;
+    padding: 2.5px 6px 2.5px 3px;
     border-radius: var(--radius-sm);
     color: var(--text-secondary);
     font-size: var(--font-size-sm);
@@ -2171,27 +2468,27 @@
   .event-body--with-inline-reply > :global(:is(p, h1, h2, h3, h4, h5, h6):first-of-type)::before {
     content: "";
     float: right;
-    width: calc(var(--focus-detail-hit-target, 2rem) + var(--focus-detail-space-sm, 0.62rem));
-    height: calc(var(--focus-detail-hit-target, 2rem) + var(--focus-detail-space-xs, 0.46rem));
+    width: calc(var(--focus-detail-hit-target, 26px) + var(--focus-detail-space-sm, 8px));
+    height: calc(var(--focus-detail-hit-target, 26px) + var(--focus-detail-space-xs, 6px));
   }
 
   .edit-panel {
-    padding: var(--focus-detail-space-sm, 0.62rem) 0 0.15rem;
+    padding: var(--focus-detail-space-sm, 8px) 0 2px;
   }
 
   .edit-actions {
     display: flex;
     justify-content: flex-end;
-    gap: var(--focus-detail-space-sm, 0.62rem);
-    margin-top: var(--focus-detail-space-sm, 0.62rem);
+    gap: var(--focus-detail-space-sm, 8px);
+    margin-top: var(--focus-detail-space-sm, 8px);
   }
 
   .edit-action {
     display: inline-flex;
     align-items: center;
-    gap: 0.38rem;
-    min-height: var(--focus-detail-hit-target, 2.15rem);
-    padding: 0.38rem var(--focus-detail-space-sm, 0.77rem);
+    gap: var(--space-2);
+    min-height: var(--focus-detail-hit-target, 28px);
+    padding: 5px var(--focus-detail-space-sm, 10px);
     border-radius: var(--radius-sm);
     border: 1px solid var(--border-default);
     background: var(--bg-inset);
@@ -2222,7 +2519,7 @@
   }
 
   .edit-error {
-    margin-top: var(--focus-detail-space-xs, 0.46rem);
+    margin-top: var(--focus-detail-space-xs, 6px);
     font-size: var(--font-size-sm);
     color: var(--accent-red);
   }
@@ -2230,6 +2527,6 @@
   .empty-edit-btn {
     position: static;
     opacity: 1;
-    margin-top: var(--focus-detail-space-sm, 0.62rem);
+    margin-top: var(--focus-detail-space-sm, 8px);
   }
 </style>

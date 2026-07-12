@@ -243,6 +243,82 @@ components:
         - attachment_size
         - attachment_count
       type: object
+    ApplyReviewSuggestionHostInputBody:
+      additionalProperties: false
+      properties:
+        $schema:
+          description: A URL to the JSON Schema for this object.
+          examples:
+            - /api/v1/schemas/ApplyReviewSuggestionHostInputBody.json
+          format: uri
+          readOnly: true
+          type: string
+        expected_head_sha:
+          type: string
+        message:
+          type: string
+        suggestions:
+          items:
+            $ref: "#/components/schemas/ApplyReviewSuggestionRequestItem"
+          type:
+            - array
+            - "null"
+      required:
+        - suggestions
+      type: object
+    ApplyReviewSuggestionInputBody:
+      additionalProperties: false
+      properties:
+        $schema:
+          description: A URL to the JSON Schema for this object.
+          examples:
+            - /api/v1/schemas/ApplyReviewSuggestionInputBody.json
+          format: uri
+          readOnly: true
+          type: string
+        expected_head_sha:
+          type: string
+        message:
+          type: string
+        suggestions:
+          items:
+            $ref: "#/components/schemas/ApplyReviewSuggestionRequestItem"
+          type:
+            - array
+            - "null"
+      required:
+        - suggestions
+      type: object
+    ApplyReviewSuggestionRequestItem:
+      additionalProperties: false
+      properties:
+        replacement:
+          type: string
+        thread_id:
+          type: string
+      required:
+        - thread_id
+        - replacement
+      type: object
+    ApplyReviewSuggestionResponse:
+      additionalProperties: false
+      properties:
+        $schema:
+          description: A URL to the JSON Schema for this object.
+          examples:
+            - /api/v1/schemas/ApplyReviewSuggestionResponse.json
+          format: uri
+          readOnly: true
+          type: string
+        commit_sha:
+          type: string
+        commit_url:
+          type: string
+        status:
+          type: string
+      required:
+        - status
+      type: object
     ApprovePRHostInputBody:
       additionalProperties: false
       properties:
@@ -341,6 +417,29 @@ components:
           type: array
       required:
         - repos
+      type: object
+    CICheck:
+      additionalProperties: false
+      properties:
+        app:
+          type: string
+        conclusion:
+          type: string
+        duration_seconds:
+          format: int64
+          type: integer
+        name:
+          type: string
+        status:
+          type: string
+        url:
+          type: string
+      required:
+        - name
+        - status
+        - conclusion
+        - url
+        - app
       type: object
     Capabilities:
       additionalProperties: false
@@ -841,6 +940,9 @@ components:
             - /api/v1/schemas/DiffResponse.json
           format: uri
           readOnly: true
+          type: string
+        diff_head_sha:
+          description: Synced PR diff snapshot head this diff was computed from. Always set for pull request diffs (the endpoint fails when no snapshot head is synced); empty for commit and workspace diffs. Compare with the pull detail's platform_head_sha to detect stale cached diff context; unrelated to 'stale', which reports clone-refresh staleness.
           type: string
         files:
           items:
@@ -2011,6 +2113,13 @@ components:
         UpdatedAt:
           format: date-time
           type: string
+        WorkflowStatus:
+          enum:
+            - new
+            - reviewing
+            - waiting
+            - awaiting_merge
+          type: string
         assignees:
           items:
             type: string
@@ -2041,6 +2150,7 @@ components:
         - ClosedAt
         - DetailFetchedAt
         - Starred
+        - WorkflowStatus
       type: object
     IssueDetailResponse:
       additionalProperties: false
@@ -2072,6 +2182,8 @@ components:
           type: string
         repo_owner:
           type: string
+        workflow:
+          $ref: "#/components/schemas/WorkflowStateMetaResponse"
         workspace:
           $ref: "#/components/schemas/WorkspaceRef"
       required:
@@ -2195,6 +2307,13 @@ components:
         UpdatedAt:
           format: date-time
           type: string
+        WorkflowStatus:
+          enum:
+            - new
+            - reviewing
+            - waiting
+            - awaiting_merge
+          type: string
         assignees:
           items:
             type: string
@@ -2243,6 +2362,7 @@ components:
         - LastActivityAt
         - ClosedAt
         - Starred
+        - WorkflowStatus
       type: object
     ItemAssigneesResponse:
       additionalProperties: false
@@ -2363,16 +2483,30 @@ components:
         - platform_host
         - repo_path
       type: object
-    KataWorkspaceTargetResponse:
+    KataTaskDetailResponse:
       additionalProperties: false
       properties:
         $schema:
           description: A URL to the JSON Schema for this object.
           examples:
-            - /api/v1/schemas/KataWorkspaceTargetResponse.json
+            - /api/v1/schemas/KataTaskDetailResponse.json
           format: uri
           readOnly: true
           type: string
+        detail:
+          description: Verbatim Kata daemon issue detail payload
+        etag:
+          description: Daemon issue detail ETag, when the daemon provided one
+          type: string
+        workspace_target:
+          $ref: "#/components/schemas/KataWorkspaceTargetResponse"
+      required:
+        - detail
+        - workspace_target
+      type: object
+    KataWorkspaceTargetResponse:
+      additionalProperties: false
+      properties:
         available:
           type: boolean
         existing_workspace:
@@ -2909,6 +3043,14 @@ components:
           format: uri
           readOnly: true
           type: string
+        checks:
+          items:
+            $ref: "#/components/schemas/CICheck"
+          type:
+            - array
+            - "null"
+        deferred_merge_pending:
+          type: boolean
         detail_fetched_at:
           type: string
         detail_loaded:
@@ -2972,6 +3114,7 @@ components:
         - worktree_links
         - workflow_approval
         - detail_loaded
+        - deferred_merge_pending
       type: object
     MergeRequestEventResponse:
       additionalProperties: false
@@ -4198,6 +4341,8 @@ components:
           type: boolean
         review_mutation:
           type: boolean
+        review_suggestion_application:
+          type: boolean
         review_thread_resolution:
           type: boolean
         reviewer_mutation:
@@ -4239,6 +4384,7 @@ components:
         - thread_resolve
         - review_draft_mutation
         - review_thread_resolution
+        - review_suggestion_application
         - read_review_threads
         - native_multiline_ranges
         - mutation_head_binding
@@ -4653,6 +4799,19 @@ components:
         name:
           type: string
         path:
+          type: string
+        prAdditions:
+          format: int64
+          type: integer
+        prCommentCount:
+          format: int64
+          type: integer
+        prDeletions:
+          format: int64
+          type: integer
+        prMergeable:
+          type: string
+        prReviewDecision:
           type: string
         prState:
           type: string
@@ -5144,6 +5303,8 @@ components:
           $ref: "#/components/schemas/OperationAvailability"
         add_label:
           $ref: "#/components/schemas/OperationAvailability"
+        apply_review_suggestion:
+          $ref: "#/components/schemas/OperationAvailability"
         approve_workflow:
           $ref: "#/components/schemas/OperationAvailability"
         close_issue:
@@ -5201,6 +5362,7 @@ components:
         - update_content
         - reply_review_thread
         - resolve_review_thread
+        - apply_review_suggestion
       type: object
     RepoPreviewRequest:
       additionalProperties: false
@@ -6512,6 +6674,28 @@ components:
         - required
         - count
       type: object
+    WorkflowStateMetaResponse:
+      additionalProperties: false
+      properties:
+        status:
+          enum:
+            - new
+            - reviewing
+            - waiting
+            - awaiting_merge
+          type: string
+        updated_actor:
+          type: string
+        updated_at:
+          format: date-time
+          type: string
+        updated_reason:
+          type: string
+        updated_source:
+          type: string
+      required:
+        - status
+      type: object
     WorkspaceKataMetadata:
       additionalProperties: false
       properties:
@@ -6826,6 +7010,19 @@ components:
         name:
           type: string
         path:
+          type: string
+        prAdditions:
+          format: int64
+          type: integer
+        prCommentCount:
+          format: int64
+          type: integer
+        prDeletions:
+          format: int64
+          type: integer
+        prMergeable:
+          type: string
+        prReviewDecision:
           type: string
         prState:
           type: string
@@ -10866,6 +11063,58 @@ paths:
       summary: Review pull request diff
       tags:
         - Pull Requests
+  /host/{platform_host}/pulls/{provider}/{owner}/{name}/{number}/review-suggestions/apply:
+    post:
+      operationId: apply-pr-review-suggestions-on-host
+      parameters:
+        - in: path
+          name: provider
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: platform_host
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: owner
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: name
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: number
+          required: true
+          schema:
+            format: int64
+            type: integer
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ApplyReviewSuggestionHostInputBody"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApplyReviewSuggestionResponse"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemError"
+          description: Error
+      summary: Apply pull request review suggestions
+      tags:
+        - Pull Requests
   /host/{platform_host}/pulls/{provider}/{owner}/{name}/{number}/review-threads/{thread_id}/resolve:
     post:
       operationId: resolve-pr-review-thread-on-host
@@ -12613,29 +12862,41 @@ paths:
       summary: List Kata daemons
       tags:
         - Kata
-  /kata/workspace-target:
-    post:
-      operationId: resolve-kata-workspace-target
-      requestBody:
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/KataWorkspaceTaskRequest"
-        required: true
+  /kata/tasks/{issue_uid}:
+    get:
+      operationId: get-kata-task-detail
+      parameters:
+        - description: Kata issue UID
+          in: path
+          name: issue_uid
+          required: true
+          schema:
+            description: Kata issue UID
+            type: string
+        - description: Kata daemon id; the effective default daemon when empty
+          in: header
+          name: X-Middleman-Kata-Daemon
+          schema:
+            description: Kata daemon id; the effective default daemon when empty
+            type: string
       responses:
         "200":
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/KataWorkspaceTargetResponse"
+                $ref: "#/components/schemas/KataTaskDetailResponse"
           description: OK
+          headers:
+            Vary:
+              schema:
+                type: string
         default:
           content:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/ProblemError"
           description: Error
-      summary: Resolve Kata workspace target
+      summary: Get Kata task detail with workspace target
       tags:
         - Kata
   /kata/workspaces:
@@ -15181,6 +15442,53 @@ paths:
                 $ref: "#/components/schemas/ProblemError"
           description: Error
       summary: Review pull request diff
+      tags:
+        - Pull Requests
+  /pulls/{provider}/{owner}/{name}/{number}/review-suggestions/apply:
+    post:
+      operationId: apply-pr-review-suggestions
+      parameters:
+        - in: path
+          name: provider
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: owner
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: name
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: number
+          required: true
+          schema:
+            format: int64
+            type: integer
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ApplyReviewSuggestionInputBody"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApplyReviewSuggestionResponse"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemError"
+          description: Error
+      summary: Apply pull request review suggestions
       tags:
         - Pull Requests
   /pulls/{provider}/{owner}/{name}/{number}/review-threads/{thread_id}/resolve:

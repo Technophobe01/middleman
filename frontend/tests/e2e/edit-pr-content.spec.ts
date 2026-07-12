@@ -137,15 +137,17 @@ test("markdown mermaid fences render as diagrams", async ({ page }) => {
   await page.locator(".body-edit .title-edit-save").click();
 
   await expect(page.locator(".markdown-body code.language-mermaid")).toHaveCount(0);
-  await expect(page.locator(".markdown-body pre.mermaid.mermaid-viewer svg")).toBeVisible();
+  await expect(
+    page.locator(".markdown-body pre.mermaid.kit-mermaid-viewer .kit-mermaid-viewer__pan svg"),
+  ).toBeVisible();
   await expect(page.getByRole("button", { name: "Zoom in diagram" })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Zoom out diagram" })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Copy Mermaid source" })).toBeVisible();
   await expect(page.locator(".markdown-body").getByRole("button", { name: "Reset diagram view" })).toBeVisible();
   await expect(page.locator(".markdown-body").getByRole("button", { name: /Pan diagram/ })).toHaveCount(0);
 
-  const diagramViewport = page.locator(".markdown-body .mermaid-viewer__viewport");
-  const diagramPan = page.locator(".markdown-body .mermaid-viewer__pan");
+  const diagramViewport = page.locator(".markdown-body .kit-mermaid-viewer__viewport");
+  const diagramPan = page.locator(".markdown-body .kit-mermaid-viewer__pan");
   const initialTransform = await diagramPan.evaluate((element) => getComputedStyle(element).transform);
   await diagramViewport.hover();
   await page.mouse.wheel(0, -240);
@@ -248,7 +250,7 @@ test("markdown image lightbox opens above drawer layers", async ({ page }) => {
       justifyContent: "center",
       paddingTop: "80px",
       position: "fixed",
-      zIndex: "100",
+      zIndex: "90",
     });
 
     expander.replaceWith(drawer);
@@ -261,7 +263,7 @@ test("markdown image lightbox opens above drawer layers", async ({ page }) => {
 
   const dialog = page.getByRole("dialog", { name: "Expanded image" });
   await expect(dialog).toBeVisible();
-  await expect(dialog).toHaveCSS("z-index", "130");
+  await expect(dialog).toHaveCSS("z-index", "96");
   await expect
     .poll(async () =>
       page.evaluate(() =>

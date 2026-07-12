@@ -92,6 +92,22 @@ func (r *Registry) MergeRequestReader(kind Kind, host string) (MergeRequestReade
 	return reader, nil
 }
 
+func (r *Registry) MergeRequestViewerResolver(
+	kind Kind,
+	host string,
+) (MergeRequestViewerResolver, error) {
+	provider, err := r.Provider(kind, host)
+	if err != nil {
+		return nil, err
+	}
+
+	resolver, ok := provider.(MergeRequestViewerResolver)
+	if !ok {
+		return nil, UnsupportedCapability(kind, host, "merge_request_viewer")
+	}
+	return resolver, nil
+}
+
 func (r *Registry) IssueReader(kind Kind, host string) (IssueReader, error) {
 	provider, err := r.Provider(kind, host)
 	if err != nil {
@@ -333,6 +349,21 @@ func (r *Registry) DiffReviewDraftMutator(
 		return nil, UnsupportedCapability(kind, host, "review_draft_mutation")
 	}
 	return mutator, nil
+}
+
+func (r *Registry) ReviewSuggestionApplier(
+	kind Kind,
+	host string,
+) (ReviewSuggestionApplier, error) {
+	provider, err := r.Provider(kind, host)
+	if err != nil {
+		return nil, err
+	}
+	applier, ok := provider.(ReviewSuggestionApplier)
+	if !ok {
+		return nil, UnsupportedCapability(kind, host, "review_suggestion_application")
+	}
+	return applier, nil
 }
 
 func (r *Registry) DiffReviewThreadResolver(

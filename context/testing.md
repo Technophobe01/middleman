@@ -22,6 +22,30 @@ When changing structs, fields, aliases, fragments, pagination arguments, or nest
 
 CI runs the live GraphQL validation as a separate Go test step using the workflow `GITHUB_TOKEN` only in trusted contexts, such as pushes to `main`, manual `workflow_dispatch` runs, and same-repository pull requests. The general pull request Go test step does not receive a GitHub token.
 
+## CI path-gated test jobs
+
+The CI workflow classifies changed paths once in `.github/workflows/ci.yml::detect_changes`
+and uses that result to gate expensive test jobs. Keep the path buckets
+runtime-oriented rather than extension-only: the backend bucket includes Go
+files, Go modules, migrations, generated API client inputs, embedded web
+assets, and integration fixtures; the Rust bucket includes root Cargo manifests
+and the Rust workspace; the e2e bucket includes Playwright config, e2e tests,
+scripts, and integration fixtures. Frontend unit, browser, and Playwright e2e
+jobs run when either frontend paths change or backend paths change, because
+backend/API behavior can affect the SPA contract even when no TypeScript files
+moved. Manual `workflow_dispatch` forces all buckets on so maintainers can
+request a full test pass.
+
+## Dependency versions in guard tests
+
+Guard tests must not assert a literal dependency version (for example
+`assert.equal(pkg.devDependencies["@playwright/test"], "1.61.0")`); every
+Renovate bump then fails lint until someone hand-edits the test. Assert the
+shape that actually matters (exact pin, correct source of the dependency) and
+leave cross-file version lockstep to a dedicated checker such as
+`scripts/check-playwright-version.mjs`, which reads the current pin instead of
+hardcoding one.
+
 ## Provider work
 
 When adding or changing a provider, pick tests at the boundary where users would
@@ -36,6 +60,10 @@ notice the regression:
   and capability-gated actions;
 - frontend store/component tests for provider refs and generated route helpers;
 - optional live/container tests when fakes cannot validate provider API drift.
+
+Provider container fixture image bumps must keep every launch default and baked
+image tag on one release, or local e2e and bake paths can test different
+provider versions (`internal/server/gitlab_container_e2e_test.go::TestGitLabContainerE2E`).
 
 Regenerate OpenAPI and generated clients with `make api-generate` after Huma
 route or API type changes.
@@ -64,6 +92,39 @@ A UI regression can be sufficiently covered by a backend/server test for the
 real runtime path plus a component or Vitest browser test for presentation. Do
 not require a duplicate full-stack browser test when it would only replay data
 that is already proven at those two boundaries.
+
+Every `@lucide/svelte/icons/<name>` import added anywhere in `frontend/src` or
+`packages/ui/src` must also be added to the `optimizeDeps.include` list in
+`frontend/vite.config.ts`. A missing entry passes locally on a warm Vite cache
+but fails the browser-lane CI job on a cold one: the optimizer discovers the
+icon mid-run, re-bundles, and the page reload breaks unrelated suites with
+"Failed to fetch dynamically imported module". Verify with the grep documented
+above that list in the config.
+
+Full-stack e2e serves the frontend embedded in the e2e-server binary
+(`internal/web/dist`), not live sources: run `make frontend` before building
+`cmd/e2e-server` locally, or the suite silently validates a stale bundle and
+passes on frontend changes that CI then fails.
+
+Mounting `KataWorkspace.svelte` in Vitest always fetches the daemon roster and
+opens the live SSE event stream; mock both fetch routes (see
+`mockDaemonAndStreamFetch` in `KataWorkspaceEventStream.test.ts`) or the
+stream's error recovery reloads the view mid-test and silently reverts
+selections made by the test.
+
+Roborev `hide_classify_jobs` e2e fixtures must cover skipped design rows and classify-typed auto-design rows.
+Seed classify rows terminal unless testing worker mutation; live workers can rewrite queued/running rows during browser assertions (`internal/testutil/roborev_fixtures.go::seedRoborevMutationFixtures`).
+Keep injected Roborev `panel_run` failures controlled until the assertion observes them; drawer/list refresh demand can immediately retry member fetches and clear transient panel errors (`packages/ui/src/stores/roborev/jobs.svelte.ts::wantsPanelMembers`).
+The `e2e-roborev` daemon pin (`ROBOREV_REF` in `.github/workflows/ci.yml`) must be at or after the roborev commit the generated schema (`packages/ui/src/api/roborev/generated/`) was produced from; a stale pin makes the daemon silently omit newer response fields while seed inserts still succeed, because the seeder creates its own schema.
+
+Kata reachable-graph tests can use `window.__middleman_kata_graph_debug` in
+browser/e2e runs, or `kata-graph-debug.ts` directly in unit tests, to inspect
+recent graph/store events and the latest rendered node IDs. Prefer this bridge
+when debugging or asserting graph refresh ordering, missing-ref population,
+selection detail refreshes, or node/edge stability; it avoids brittle visual
+polling for state that the app already owns in JavaScript. Browser/e2e tests
+should call `reset()` before assertions, and the graph component clears the
+bridge on unmount so assertions do not read stale graph sessions.
 
 ## Huma API Contract
 
@@ -172,6 +233,12 @@ the fake or callback that observed the exact event under test. If the behavior
 is inherently observable only by polling, check once immediately, then poll with
 a short ticker bounded by a context deadline.
 
+When server e2e tests chain `POST /api/v1/sync` with another ad-hoc sync
+trigger, treat the HTTP 202 and DB row timestamps as intermediate observations.
+`TriggerRun` is non-blocking and single-flight; wait for `/api/v1/sync/status`
+to report `running=false` with a `last_run_at` before issuing the next trigger,
+or the next trigger can race the still-running sync and be skipped.
+
 `testing/synctest` is appropriate only when all goroutines and timers under test
 are pure in-process work created inside the `synctest.Run` bubble. Good
 candidates include fake-client backoff, cooldown, cancellation, and event-hub
@@ -224,14 +291,14 @@ scope.
 
 Bug classes wire-level catches:
 
-| Bug class | Why the wire matters |
-|-----------|----------------------|
-| Time serialization (`Z` vs `+00:00`) | Response bytes, not `time.Time` before marshaling. |
-| Error missing from OpenAPI doc | Generated client surfaces unknown status variants. |
-| Header rewritten or stripped by middleware | `resp.Header`, not `w.Header()` inside the handler. |
-| Status overridden by middleware | `resp.StatusCode`, not the handler return. |
+| Bug class                                     | Why the wire matters                                 |
+| --------------------------------------------- | ---------------------------------------------------- |
+| Time serialization (`Z` vs `+00:00`)          | Response bytes, not `time.Time` before marshaling.   |
+| Error missing from OpenAPI doc                | Generated client surfaces unknown status variants.   |
+| Header rewritten or stripped by middleware    | `resp.Header`, not `w.Header()` inside the handler.  |
+| Status overridden by middleware               | `resp.StatusCode`, not the handler return.           |
 | Mutation guard short-circuits before dispatch | Only `srv.ServeHTTP` runs the full middleware chain. |
-| SSE `Content-Type` / `Cache-Control` drift | Real-socket read; the recorder is buffered. |
+| SSE `Content-Type` / `Cache-Control` drift    | Real-socket read; the recorder is buffered.          |
 
 Worked examples: `internal/server/e2etest/sse_contract_test.go` pins SSE
 headers and the first cached `sync_status` frame;

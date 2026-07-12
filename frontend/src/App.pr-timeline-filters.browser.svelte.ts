@@ -277,18 +277,21 @@ function eventTypeCount(label: string): number {
 }
 
 function viewButton(): Element {
-  return inDetail(".filter-btn").find((el) => (el.textContent ?? "").includes("View"))!;
+  return inDetail(".kit-filter-dropdown__btn").find((el) => (el.textContent ?? "").includes("View"))!;
 }
 
 function filterItem(label: string): Element {
-  return Array.from(document.querySelectorAll(".pull-detail .filter-dropdown .filter-item")).find((el) =>
-    (el.textContent ?? "").includes(label),
-  )!;
+  return Array.from(
+    document.querySelectorAll(".pull-detail .kit-filter-dropdown__panel .kit-filter-dropdown__item"),
+  ).find((el) => (el.textContent ?? "").includes(label))!;
 }
 
 async function openViewMenu(): Promise<void> {
   await page.elementLocator(viewButton()).click();
-  await vi.waitFor(() => expect(document.querySelector(".pull-detail .filter-dropdown")).not.toBeNull(), WAIT);
+  await vi.waitFor(
+    () => expect(document.querySelector(".pull-detail .kit-filter-dropdown__panel")).not.toBeNull(),
+    WAIT,
+  );
 }
 
 async function toggleBucket(label: string): Promise<void> {
@@ -339,7 +342,8 @@ describe("PR timeline filters", () => {
     const mergedRows = inDetail(".event--compact").filter((el) => (el.textContent ?? "").includes("Merged"));
     expect(mergedRows.length).toBe(1);
     expect(mergedRows[0]!.textContent ?? "").toContain("alice");
-    expect(mergedRows[0]!.textContent ?? "").toContain("merged this");
+    expect(mergedRows[0]!.textContent ?? "").toContain("by alice");
+    expect(mergedRows[0]!.textContent ?? "").not.toContain("merged this");
     const mergedType = mergedRows[0]!.querySelector(".event-type");
     expect(mergedType?.getAttribute("style") ?? "").toContain("var(--accent-purple)");
     expect(mergedRows[0]!.querySelector(".dot")?.getAttribute("style") ?? "").toContain("var(--accent-purple)");

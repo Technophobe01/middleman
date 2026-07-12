@@ -2,7 +2,7 @@
   import PlusIcon from "@lucide/svelte/icons/plus";
   import RotateCcwIcon from "@lucide/svelte/icons/rotate-ccw";
   import TrashIcon from "@lucide/svelte/icons/trash-2";
-  import { ActionButton } from "@middleman/ui";
+  import { Button, SelectDropdown } from "@middleman/ui";
   import type {
     ConfigRepo,
     KataProjectRepoMapping,
@@ -51,6 +51,9 @@
       .sort((left, right) => left.label.localeCompare(right.label)),
   );
   const repoOptionsByKey = $derived.by(() => new Map(repoOptions.map((option) => [option.key, option])));
+  const repoSelectOptions = $derived(
+    repoOptions.map((option) => ({ value: option.key, label: option.label })),
+  );
   const pendingMappings = $derived(buildPendingMappings());
   const isDirty = $derived(
     JSON.stringify(pendingMappings) !== JSON.stringify(currentMappings),
@@ -182,7 +185,7 @@
         <h3>Manual mappings</h3>
         <p>Automatic `.kata.toml` matches are used when no row is configured here.</p>
       </div>
-      <ActionButton
+      <Button
         size="sm"
         type="button"
         onclick={addMapping}
@@ -190,7 +193,7 @@
       >
         <PlusIcon size="14" strokeWidth="2.2" aria-hidden="true" />
         Add mapping
-      </ActionButton>
+      </Button>
     </div>
 
     {#if repoOptions.length === 0}
@@ -234,18 +237,16 @@
                   />
                 </td>
                 <td>
-                  <select
-                    bind:value={draft.repoKey}
+                  <SelectDropdown
+                    title={`Kata project ${label} repository`}
+                    value={draft.repoKey}
+                    options={repoSelectOptions}
+                    onchange={(value) => { draft.repoKey = value; }}
                     disabled={embedded || saving}
-                    aria-label={`Kata project ${label} repository`}
-                  >
-                    {#each repoOptions as option (option.key)}
-                      <option value={option.key}>{option.label}</option>
-                    {/each}
-                  </select>
+                  />
                 </td>
                 <td class="action-cell">
-                  <ActionButton
+                  <Button
                     size="sm"
                     tone="danger"
                     surface="outline"
@@ -256,7 +257,7 @@
                     title={`Remove Kata project mapping ${label}`}
                   >
                     <TrashIcon size="14" strokeWidth="2.2" aria-hidden="true" />
-                  </ActionButton>
+                  </Button>
                 </td>
               </tr>
             {/each}
@@ -267,7 +268,7 @@
   </section>
 
   <div class="settings-actions">
-    <ActionButton
+    <Button
       size="sm"
       type="button"
       onclick={resetDraft}
@@ -275,8 +276,8 @@
     >
       <RotateCcwIcon size="14" strokeWidth="2.2" aria-hidden="true" />
       Reset
-    </ActionButton>
-    <ActionButton
+    </Button>
+    <Button
       tone="info"
       surface="solid"
       type="button"
@@ -284,7 +285,7 @@
       disabled={!canSave}
     >
       Save Kata mappings
-    </ActionButton>
+    </Button>
   </div>
 </div>
 
@@ -292,13 +293,13 @@
   .kata-project-mappings {
     display: flex;
     flex-direction: column;
-    gap: 14px;
+    gap: var(--space-5);
   }
 
   .mapping-section {
     display: flex;
     flex-direction: column;
-    gap: 10px;
+    gap: var(--space-4);
   }
 
   .mapping-section-header {
@@ -365,8 +366,7 @@
     background: var(--bg-inset);
   }
 
-  .mapping-table input,
-  .mapping-table select {
+  .mapping-table input {
     width: 100%;
     min-height: 30px;
     padding: 4px 8px;
@@ -378,10 +378,20 @@
     font-weight: 400;
   }
 
-  .mapping-table input:disabled,
-  .mapping-table select:disabled {
+  .mapping-table input:disabled {
     color: var(--text-muted);
     background: var(--bg-inset);
+  }
+
+  .mapping-table :global(.kit-select-dropdown) {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .mapping-table :global(.kit-select-dropdown__trigger) {
+    height: 30px;
+    font-size: var(--font-size-sm);
+    font-weight: 400;
   }
 
   .daemon-col {

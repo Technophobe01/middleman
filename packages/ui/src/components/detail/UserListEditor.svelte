@@ -10,9 +10,9 @@
 <script lang="ts">
   import { tick, type Snippet } from "svelte";
   import PlusIcon from "@lucide/svelte/icons/plus";
-  import Chip from "../shared/Chip.svelte";
+  import { Chip } from "@kenn-io/kit-ui";
   import UserPicker from "./UserPicker.svelte";
-  import { floatingPopoverStyle } from "../shared/floatingPosition.js";
+  import { floatingPopoverStyle } from "@kenn-io/kit-ui";
 
   interface Props {
     label: string;
@@ -228,7 +228,7 @@
     {#if canEdit}
       <Chip
         interactive
-        size="md"
+        size="sm"
         tone={users.length > 0 ? "neutral" : "muted"}
         uppercase={false}
         title={chipTitle}
@@ -247,7 +247,7 @@
       </Chip>
     {:else}
       <Chip
-        size="md"
+        size="sm"
         tone="neutral"
         uppercase={false}
         title={chipTitle}
@@ -259,7 +259,22 @@
     {/if}
   </span>
   {#if open}
-    <div class="user-list-editor__popover" style={popoverStyle} bind:this={popoverEl}>
+    <!-- Escape precedence: a non-empty filter claims Escape to clear itself
+         (kit SearchInput stops propagation), so only an Escape from an
+         already-empty field — or elsewhere in the picker — reaches this
+         handler and dismisses the popover. -->
+    <div
+      class="user-list-editor__popover"
+      style={popoverStyle}
+      bind:this={popoverEl}
+      role="presentation"
+      onkeydown={(event) => {
+        if (event.key === "Escape") {
+          event.stopPropagation();
+          closePicker();
+        }
+      }}
+    >
       <UserPicker
         title="Edit {label.toLowerCase()}"
         {candidates}

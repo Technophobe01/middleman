@@ -10,9 +10,9 @@
 <script lang="ts">
   import { untrack } from "svelte";
   import { getNavigate, getSidebar, getStores } from "../context.js";
-  import CollapsibleResizableSidebar from "../components/shared/CollapsibleResizableSidebar.svelte";
-  import SplitResizeHandle from "../components/shared/SplitResizeHandle.svelte";
-  import type { SplitResizeEvent } from "../components/shared/split-resize.js";
+  import { CollapsibleSidebar } from "@kenn-io/kit-ui";
+  import { SplitResizeHandle } from "@kenn-io/kit-ui";
+  import type { SplitResizeEvent } from "@kenn-io/kit-ui";
   import PullList from "../components/sidebar/PullList.svelte";
   import PullDetail from "../components/detail/PullDetail.svelte";
   import DiffFilesLayout from "../components/diff/DiffFilesLayout.svelte";
@@ -61,6 +61,7 @@
     issue_mutation: true,
     review_draft_mutation: false,
     review_thread_resolution: false,
+    review_suggestion_application: false,
     read_review_threads: false,
     native_multiline_ranges: false,
     mutation_head_binding: false,
@@ -73,6 +74,8 @@
     isSidebarCollapsed?: boolean;
     hideSidebar?: boolean;
     sidebarWidth?: number;
+    /** Float the expanded sidebar over the list (narrow-container hosts). */
+    sidebarOverlay?: boolean;
     autoSyncDetail?: DetailSyncMode;
     hideStaleDetailWhileLoading?: boolean;
     workflowApprovalSync?: boolean;
@@ -88,6 +91,7 @@
     isSidebarCollapsed = false,
     hideSidebar = false,
     sidebarWidth = 340,
+    sidebarOverlay = false,
     autoSyncDetail = "background",
     hideStaleDetailWhileLoading = false,
     workflowApprovalSync = true,
@@ -280,11 +284,12 @@
   });
 </script>
 
-<CollapsibleResizableSidebar
+<CollapsibleSidebar
   isCollapsed={isSidebarCollapsed}
   {hideSidebar}
   {sidebarWidth}
   {onSidebarResize}
+  overlay={sidebarOverlay}
   showCollapsedStrip={isSidebarToggleEnabled()}
   onExpand={toggleSidebar}
   mainEmpty={selectedPR === null}
@@ -409,7 +414,7 @@
       <p class="placeholder-hint">j/k to navigate &middot; 1/2 to switch views</p>
     </div>
   {/if}
-</CollapsibleResizableSidebar>
+</CollapsibleSidebar>
 
 <style>
   .detail-host {

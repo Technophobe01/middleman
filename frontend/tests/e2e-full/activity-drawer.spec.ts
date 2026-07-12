@@ -614,9 +614,9 @@ test.describe("activity split view and detail drawers", () => {
     const repoLabel = row.locator(".compact-meta > span").first();
     await expect(repoLabel).toHaveText("acme/widgets");
 
-    await page.locator(".activity-feed .filter-btn", { hasText: "View" }).click();
+    await page.locator(".activity-feed .kit-filter-dropdown__btn", { hasText: "View" }).click();
     await page
-      .locator(".activity-feed .filter-dropdown .filter-item", {
+      .locator(".activity-feed .kit-filter-dropdown__panel .kit-filter-dropdown__item", {
         hasText: "Hide org name",
       })
       .click();
@@ -851,8 +851,8 @@ test.describe("activity split view and detail drawers", () => {
     await expect(detail.locator(".issue-detail")).toBeVisible();
     expect(seenHosts).toContain("ghe.example.com");
     expect(seenHosts).not.toContain("github.com");
-    await expect(detail.locator(".list-layout > .sidebar")).toHaveCount(0);
-    await expect(detail.locator(".list-layout > .resize-handle")).toHaveCount(0);
+    await expect(detail.locator(".kit-sidebar-layout > .kit-sidebar-layout__sidebar")).toHaveCount(0);
+    await expect(detail.locator(".kit-sidebar-layout > .kit-split-resize-handle")).toHaveCount(0);
   });
 
   test("Activity issue row selection preserves platform host", async ({ page }) => {
@@ -885,7 +885,7 @@ test.describe("activity split view and detail drawers", () => {
     await expect(page.locator(".activity-detail .diff-view")).toBeVisible();
     await expect(page.locator(".activity-detail .diff-file")).toHaveCount(1);
 
-    await page.locator(".view-tab", { hasText: "PRs" }).click();
+    await page.locator(".kit-top-bar__tabs .kit-top-bar__tab", { hasText: "PRs" }).click();
 
     await expect(page).toHaveURL(/\/pulls\/github\/acme\/widgets\/1\/files$/);
     await expect(page.locator(".diff-file")).toHaveCount(1);
@@ -897,7 +897,7 @@ test.describe("activity split view and detail drawers", () => {
     await page.goto("/?selected=issue:10&provider=github&platform_host=ghe.example.com&repo_path=acme%2Fwidgets");
     await expect(page.locator(".activity-detail .issue-detail")).toBeVisible();
 
-    await page.locator(".view-tab", { hasText: "Issues" }).click();
+    await page.locator(".kit-top-bar__tabs .kit-top-bar__tab", { hasText: "Issues" }).click();
 
     await expect(page).toHaveURL(/\/host\/ghe\.example\.com\/issues\/github\/acme\/widgets\/10$/);
   });
@@ -957,8 +957,8 @@ test.describe("activity split view and detail drawers", () => {
     await expect(treeFileItems(fileSidebar)).toHaveCount(1);
     await expect(treeFileItem(fileSidebar, "src/handler.go")).toBeVisible();
     await expect(detail.locator(".stack-sidebar")).toHaveCount(0);
-    await expect(detail.locator(".list-layout > .sidebar")).toHaveCount(0);
-    await expect(detail.locator(".list-layout > .resize-handle")).toHaveCount(0);
+    await expect(detail.locator(".kit-sidebar-layout > .kit-sidebar-layout__sidebar")).toHaveCount(0);
+    await expect(detail.locator(".kit-sidebar-layout > .kit-split-resize-handle")).toHaveCount(0);
   });
 
   test("Escape from merge modal keeps activity split detail open", async ({ page }) => {
@@ -968,7 +968,7 @@ test.describe("activity split view and detail drawers", () => {
     const detail = await openActivityPRSplit(page);
     await detail.locator(".btn--merge").first().click();
 
-    const modal = page.locator(".modal", { hasText: "Merge Pull Request" });
+    const modal = page.getByRole("dialog", { name: "Merge Pull Request" });
     await expect(modal).toBeVisible();
 
     await page.keyboard.press("Escape");
@@ -1263,11 +1263,11 @@ test.describe("activity split view and detail drawers", () => {
     await openActivityPRSplit(page);
 
     const rail = page.locator(".activity-pane");
-    const viewButton = rail.locator(".filter-btn", { hasText: "View" });
+    const viewButton = rail.locator(".kit-filter-dropdown__btn", { hasText: "View" });
     await expect(viewButton).toBeVisible();
     await viewButton.click();
 
-    const dropdown = page.locator(".activity-feed .filter-dropdown");
+    const dropdown = page.locator(".activity-feed .kit-filter-dropdown__panel");
     await expect(dropdown).toBeVisible();
 
     const railBox = await rail.boundingBox();
@@ -1281,7 +1281,7 @@ test.describe("activity split view and detail drawers", () => {
     const itemBeyondRail = await page.evaluate(
       ({ x, y }) => {
         const element = document.elementFromPoint(x, y);
-        return element?.closest(".filter-dropdown") !== null;
+        return element?.closest(".kit-filter-dropdown__panel") !== null;
       },
       {
         x: railRight + 8,
@@ -1640,21 +1640,21 @@ test.describe("PR list tabs", () => {
 
     await page.goto("/pulls/github/acme/widgets/1");
 
-    // Wait for the PRListView tab bar (scoped to .main-area) to
+    // Wait for the PRListView tab bar (scoped to .kit-sidebar-layout__main) to
     // render.
-    await page.locator(".main-area .detail-tabs").first().waitFor({ state: "visible", timeout: 10_000 });
+    await page.locator(".kit-sidebar-layout__main .detail-tabs").first().waitFor({ state: "visible", timeout: 10_000 });
 
     // Exactly one tab bar is present inside the outer PRListView
     // container. If PullDetail ever stops respecting hideTabs, a
-    // second .detail-tabs element would show up inside .main-area.
-    await expect(page.locator(".main-area .detail-tabs")).toHaveCount(1);
+    // second .detail-tabs element would show up inside .kit-sidebar-layout__main.
+    await expect(page.locator(".kit-sidebar-layout__main .detail-tabs")).toHaveCount(1);
     await expect(
-      page.locator(".main-area .detail-tabs .detail-tab", {
+      page.locator(".kit-sidebar-layout__main .detail-tabs .detail-tab", {
         hasText: "Conversation",
       }),
     ).toHaveCount(1);
     await expect(
-      page.locator(".main-area .detail-tabs .detail-tab", {
+      page.locator(".kit-sidebar-layout__main .detail-tabs .detail-tab", {
         hasText: "Files changed",
       }),
     ).toHaveCount(1);
@@ -1662,23 +1662,23 @@ test.describe("PR list tabs", () => {
     // Clicking Files changed in the outer tab bar updates the URL to
     // the /files sub-route.
     await page
-      .locator(".main-area .detail-tabs .detail-tab", {
+      .locator(".kit-sidebar-layout__main .detail-tabs .detail-tab", {
         hasText: "Files changed",
       })
       .click();
     await expect(page).toHaveURL(/\/pulls\/github\/acme\/widgets\/1\/files$/);
     await expect(page.locator(".diff-view")).toBeVisible();
-    await expect(page.locator(".main-area .detail-tabs")).toHaveCount(1);
+    await expect(page.locator(".kit-sidebar-layout__main .detail-tabs")).toHaveCount(1);
 
     // Clicking Conversation routes back and keeps the tab bar
     // singular.
     await page
-      .locator(".main-area .detail-tabs .detail-tab", {
+      .locator(".kit-sidebar-layout__main .detail-tabs .detail-tab", {
         hasText: "Conversation",
       })
       .click();
     await expect(page).toHaveURL(/\/pulls\/github\/acme\/widgets\/1$/);
-    await expect(page.locator(".main-area .detail-tabs")).toHaveCount(1);
+    await expect(page.locator(".kit-sidebar-layout__main .detail-tabs")).toHaveCount(1);
   });
 
   test("direct load of provider PR files route renders the diff with a single tab bar", async ({ page }) => {
@@ -1690,12 +1690,12 @@ test.describe("PR list tabs", () => {
 
     await page.goto("/pulls/github/acme/widgets/1/files");
 
-    await page.locator(".main-area .detail-tabs").first().waitFor({ state: "visible", timeout: 10_000 });
+    await page.locator(".kit-sidebar-layout__main .detail-tabs").first().waitFor({ state: "visible", timeout: 10_000 });
 
-    await expect(page.locator(".main-area .detail-tabs")).toHaveCount(1);
+    await expect(page.locator(".kit-sidebar-layout__main .detail-tabs")).toHaveCount(1);
     await expect(page.locator(".diff-view")).toBeVisible();
     await expect(
-      page.locator(".main-area .detail-tabs .detail-tab--active", {
+      page.locator(".kit-sidebar-layout__main .detail-tabs .detail-tab--active", {
         hasText: "Files changed",
       }),
     ).toHaveCount(1);

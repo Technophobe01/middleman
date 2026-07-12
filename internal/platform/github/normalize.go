@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	gh "github.com/google/go-github/v84/github"
+	gh "github.com/google/go-github/v88/github"
 	"go.kenn.io/middleman/internal/platform"
 )
 
@@ -50,6 +50,7 @@ func NormalizePullRequest(repo platform.RepoRef, ghPR *gh.PullRequest) (platform
 		t := ghPR.MergedAt.Time
 		mr.MergedAt = &t
 	}
+	mr.MergedBy = loginOrEmpty(ghPR.GetMergedBy())
 	if ghPR.ClosedAt != nil {
 		t := ghPR.ClosedAt.Time
 		mr.ClosedAt = &t

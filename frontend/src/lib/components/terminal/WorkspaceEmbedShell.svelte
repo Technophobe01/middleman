@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount } from "svelte";
+  import { FlashBanner } from "@kenn-io/kit-ui";
   import { Provider, WorkspaceRightSidebar } from "@middleman/ui";
   import type { StoreInstances } from "@middleman/ui";
 
@@ -31,7 +32,7 @@
   import WorkspaceEmbedEmptyState from "./WorkspaceEmbedEmptyState.svelte";
   import WorkspaceFirstRunPanel from "./WorkspaceFirstRunPanel.svelte";
   import WorkspaceProjectCard from "./WorkspaceProjectCard.svelte";
-  import { showFlash } from "../../stores/flash.svelte.js";
+  import { showFlash } from "@middleman/ui/stores/flash";
 
   let stores = $state<StoreInstances | undefined>();
 
@@ -102,6 +103,11 @@
   bind:stores
 >
   {@const r = getRoute()}
+  <!-- Embed routes have no app header, so the shared flash banner pins to the
+       top of the pane. Without this mount, showFlash from embed surfaces
+       (provider errors, workspace actions) lands in the shared store with no
+       banner to render it. -->
+  <FlashBanner top="0" />
   <main class="embed-layout">
     {#if r.page === "embed-workspace-list"}
       <WorkspaceListSidebar selectedId="" />

@@ -5,13 +5,14 @@
 <script lang="ts">
   import ChevronDownIcon from "@lucide/svelte/icons/chevron-down";
   import LoaderCircleIcon from "@lucide/svelte/icons/loader-circle";
+  import { Spinner } from "@kenn-io/kit-ui";
   import DotIcon from "@lucide/svelte/icons/dot";
   import XIcon from "@lucide/svelte/icons/x";
   import CheckIcon from "@lucide/svelte/icons/check";
   import MinusIcon from "@lucide/svelte/icons/minus";
   import HelpCircleIcon from "@lucide/svelte/icons/circle-help";
   import type { CICheck } from "../../api/types.js";
-  import Chip from "../shared/Chip.svelte";
+  import { Chip } from "@kenn-io/kit-ui";
   import CITokenCluster, { composeAriaLabel } from "../shared/CITokenCluster.svelte";
   import {
     parseCIChecks,
@@ -56,7 +57,6 @@
   }: Props = $props();
 
   const instanceId = ++_ciStatusInstanceCounter.value;
-  const SHOW_MORE_THRESHOLD = 8;
 
   const parsed = $derived(parseCIChecks(checksJSON));
   const parseError = $derived(parsed.error);
@@ -66,20 +66,6 @@
   const shouldRender = $derived(hasCheckBucket || isUnavailable);
 
   const pendingAnimated = $derived(!prefersReducedMotion());
-
-  const expandedSections = $state<Record<"passed" | "skipped", boolean>>({
-    passed: false,
-    skipped: false,
-  });
-
-  $effect(() => {
-    // Referencing prKey registers the dependency so this fires on PR
-    // navigation. Reset the per-PR expansion state so a fresh PR starts
-    // collapsed.
-    void prKey;
-    expandedSections.passed = false;
-    expandedSections.skipped = false;
-  });
 
   $effect(() => {
     if (bucketed.unknown.length > 0) {
@@ -98,17 +84,6 @@
       });
     }
   });
-
-  const passedVisible = $derived(
-    expandedSections.passed
-      ? bucketed.passed
-      : bucketed.passed.slice(0, SHOW_MORE_THRESHOLD),
-  );
-  const skippedVisible = $derived(
-    expandedSections.skipped
-      ? bucketed.skipped
-      : bucketed.skipped.slice(0, SHOW_MORE_THRESHOLD),
-  );
 
   function formatDuration(seconds: number | undefined): string {
     if (seconds === undefined || seconds < 0 || !Number.isFinite(seconds)) {
@@ -211,7 +186,7 @@
       {#if isUnavailable && parseError !== null}
         <span class="ci-unavailable-wrap">
           <span
-            class="chip chip--md chip--muted ci-chip-unavailable"
+            class="ci-chip-unavailable"
             role="button"
             tabindex="0"
             aria-disabled="true"
@@ -221,7 +196,7 @@
             title="CI unavailable: {safeDiagnosticText(parseError)}"
           >CI: unavailable</span>
           <span
-            class="sr-only"
+            class="sr-only kit-sr-only"
             id="ci-unavailable-desc-{instanceId}"
           >CI unavailable: {safeDiagnosticText(parseError)}</span>
           <span
@@ -230,7 +205,7 @@
           >CI unavailable: {safeDiagnosticText(parseError)}</span>
         </span>
       {:else}
-        <Chip
+        <Chip size="sm"
           interactive={true}
           tone="neutral"
           ariaLabel={composeAriaLabel(bucketed)}
@@ -241,12 +216,14 @@
         >
           <span class="ci-label">CI</span>
           <CITokenCluster {bucketed} size="default" />
-          <ChevronDownIcon
-            class={["chip-chevron", expanded && "chip-chevron--open"].filter(Boolean).join(" ")}
-            size={12}
-            strokeWidth={2.4}
-            aria-hidden="true"
-          />
+          {#snippet trailing()}
+            <ChevronDownIcon
+              class={["chip-chevron", expanded && "chip-chevron--open"].filter(Boolean).join(" ")}
+              size={12}
+              strokeWidth={2.4}
+              aria-hidden="true"
+            />
+          {/snippet}
         </Chip>
       {/if}
     {/if}
@@ -256,9 +233,7 @@
         {#if !detailLoaded}
           {#if detailSyncing}
             <div class="loading-placeholder">
-              <span class="sync-spinner" aria-hidden="true">
-                <LoaderCircleIcon size={14} strokeWidth={2} />
-              </span>
+              <Spinner size={14} label="Loading checks" />
               Loading checks...
             </div>
           {:else}
@@ -282,36 +257,10 @@
               {@render sectionBlock("unknown", "Unknown", "ci-section-heading--purple", bucketed.unknown)}
             {/if}
             {#if bucketed.passed.length > 0}
-              {@render sectionBlock("passed", "Passed", "ci-section-heading--green", passedVisible)}
-              {#if bucketed.passed.length > SHOW_MORE_THRESHOLD}
-                <button
-                  type="button"
-                  class="ci-show-toggle"
-                  onclick={() => { expandedSections.passed = !expandedSections.passed; }}
-                >
-                  {#if expandedSections.passed}
-                    Show fewer passed
-                  {:else}
-                    Show {bucketed.passed.length - SHOW_MORE_THRESHOLD} more passed
-                  {/if}
-                </button>
-              {/if}
+              {@render sectionBlock("passed", "Passed", "ci-section-heading--green", bucketed.passed)}
             {/if}
             {#if bucketed.skipped.length > 0}
-              {@render sectionBlock("skipped", "Skipped", "ci-section-heading--muted", skippedVisible)}
-              {#if bucketed.skipped.length > SHOW_MORE_THRESHOLD}
-                <button
-                  type="button"
-                  class="ci-show-toggle"
-                  onclick={() => { expandedSections.skipped = !expandedSections.skipped; }}
-                >
-                  {#if expandedSections.skipped}
-                    Show fewer skipped
-                  {:else}
-                    Show {bucketed.skipped.length - SHOW_MORE_THRESHOLD} more skipped
-                  {/if}
-                </button>
-              {/if}
+              {@render sectionBlock("skipped", "Skipped", "ci-section-heading--muted", bucketed.skipped)}
             {/if}
           </div>
         {/if}
@@ -471,23 +420,6 @@
     font-size: var(--font-size-sm);
   }
 
-  .ci-show-toggle {
-    align-self: flex-start;
-    margin: 4px 12px 8px;
-    padding: 2px 8px;
-    background: transparent;
-    border: 1px solid var(--border-muted);
-    border-radius: var(--radius-sm);
-    color: var(--text-muted);
-    font-size: var(--font-size-2xs);
-    cursor: pointer;
-  }
-
-  .ci-show-toggle:hover {
-    color: var(--text-primary);
-    background: var(--bg-surface-hover);
-  }
-
   .loading-placeholder {
     display: inline-flex;
     align-items: center;
@@ -501,16 +433,14 @@
     white-space: nowrap;
   }
 
-  .sync-spinner {
-    display: inline-flex;
-    animation: spin 0.9s linear infinite;
-  }
-
   .spin {
     display: inline-flex;
     animation: spin 0.9s linear infinite;
   }
 
+  /* Pending-status loader icon tinted by row-icon-amber; kit-ui Spinner
+     has no tone and would drop the semantic color. */
+  /* kit-ui-check-ignore: status-colored loader icon spin */
   @keyframes spin {
     from { transform: rotate(0deg); }
     to { transform: rotate(360deg); }
@@ -548,14 +478,4 @@
     visibility: visible;
   }
 
-  .sr-only {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    padding: 0;
-    overflow: hidden;
-    clip: rect(0, 0, 0, 0);
-    white-space: nowrap;
-    border: 0;
-  }
 </style>

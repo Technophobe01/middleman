@@ -1,10 +1,10 @@
 <script lang="ts">
   import type { Issue } from "../../api/types.js";
   import { getStores } from "../../context.js";
-  import { timeAgo } from "../../utils/time.js";
-  import { repoColor } from "../../utils/repo-color.js";
-  import Chip from "../shared/Chip.svelte";
-  import GitHubLabels from "../shared/GitHubLabels.svelte";
+  import { formatRelativeTime } from "@kenn-io/kit-ui";
+  import { hashColor } from "@kenn-io/kit-ui";
+  import { Chip } from "@kenn-io/kit-ui";
+  import LabelRow from "../shared/LabelRow.svelte";
   import WorkspaceIndicator from "../shared/WorkspaceIndicator.svelte";
 
   const { issues } = getStores();
@@ -46,7 +46,7 @@
   }
 
   const labels = $derived(issue.labels ?? []);
-  const ago = $derived(timeAgo(issue.LastActivityAt));
+  const ago = $derived(formatRelativeTime(issue.LastActivityAt));
   const stateLabel = $derived(
     issue.State === "open" ? "Open" : "Closed",
   );
@@ -54,17 +54,15 @@
 
 <button class="issue-item" class:selected bind:this={el} onclick={onclick}>
   <p class="title">{issue.Title}</p>
-  {#if labels.length > 0}
-    <GitHubLabels labels={labels} mode="compact" />
-  {/if}
+  <LabelRow {labels} compact />
   {#if showRepo}
     <div class="repo-row">
       <Chip
-        size="sm"
+        size="xs"
         uppercase={false}
         title={repoSlug}
-        class="chip--muted repo-chip"
-        style={`color: ${repoColor(repoSlug)}; background: color-mix(in srgb, ${repoColor(repoSlug)} 15%, transparent);`}
+        tone="muted" class="repo-chip"
+        style={`color: ${hashColor(repoSlug)}; background: color-mix(in srgb, ${hashColor(repoSlug)} 15%, transparent);`}
       >{repoSlug}</Chip>
     </div>
   {/if}
@@ -94,7 +92,7 @@
           </svg>
         {/if}
       </span>
-      <Chip size="sm" class={`state-chip chip--${issue.State}`}>{stateLabel}</Chip>
+      <Chip size="xs" tone={issue.State === "open" ? "success" : "merged"} class="state-chip">{stateLabel}</Chip>
       <span class="time">{ago}</span>
     </span>
   </div>
@@ -154,7 +152,7 @@
     margin-bottom: 4px;
   }
 
-  :global(.chip.repo-chip) {
+  :global(.kit-chip.repo-chip) {
     flex: 0 1 auto;
     justify-content: flex-start;
     min-width: 0;
@@ -214,16 +212,16 @@
   }
 
   :global(.mobile-main) .issue-item {
-    min-height: calc(var(--focus-mobile-hit-target, 2.85rem) * 1.65);
-    font-size: var(--font-size-mobile-body);
-    padding: var(--focus-mobile-space-sm, 0.75rem) var(--focus-mobile-space-md, 1rem);
+    min-height: calc(var(--focus-mobile-hit-target, 37px) * 1.65);
+    font-size: var(--font-size-md);
+    padding: var(--focus-mobile-space-sm, 10px) var(--focus-mobile-space-md, 13px);
     border-bottom: thin solid var(--border-muted);
-    border-left-width: 0.25rem;
+    border-left-width: 3px;
   }
 
   :global(.mobile-main) .title {
-    margin-bottom: var(--focus-mobile-space-xs, 0.5rem);
-    font-size: var(--font-size-mobile-title);
+    margin-bottom: var(--focus-mobile-space-xs, 6.5px);
+    font-size: var(--font-size-xl);
     line-height: 1.3;
     white-space: normal;
     display: -webkit-box;
@@ -233,30 +231,30 @@
   }
 
   :global(.mobile-main) .repo-row {
-    margin-bottom: var(--focus-mobile-space-xs, 0.5rem);
+    margin-bottom: var(--focus-mobile-space-xs, 6.5px);
   }
 
   :global(.mobile-main) .meta-row {
-    gap: var(--focus-mobile-space-sm, 0.75rem);
+    gap: var(--focus-mobile-space-sm, 8px);
   }
 
   :global(.mobile-main) .meta-left,
   :global(.mobile-main) .time {
-    font-size: var(--font-size-mobile-sm);
+    font-size: var(--font-size-sm);
     line-height: 1.35;
   }
 
   :global(.mobile-main) .meta-right {
-    gap: var(--focus-mobile-space-xs, 0.5rem);
+    gap: var(--focus-mobile-space-xs, 6px);
   }
 
-  :global(.mobile-main) :global(.chip),
+  :global(.mobile-main) :global(.kit-chip),
   :global(.mobile-main) :global(.state-chip),
   :global(.mobile-main) :global(.status-chip) {
-    min-height: calc(var(--focus-mobile-hit-target, 2.85rem) * 0.65);
-    padding: 0.2rem var(--focus-mobile-space-xs, 0.5rem);
-    border-radius: 999rem;
-    font-size: var(--font-size-mobile-xs);
+    min-height: calc(var(--focus-mobile-hit-target, 37px) * 0.65);
+    padding: 2.5px var(--focus-mobile-space-xs, 6.5px);
+    border-radius: 999px;
+    font-size: var(--font-size-xs);
     line-height: 1.25;
   }
 </style>

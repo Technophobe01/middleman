@@ -1,5 +1,5 @@
 <script lang="ts">
-  import Modal from "./DocsModal.svelte";
+  import Modal from "../shared/Modal.svelte";
   import type { DocsAPI } from "../../api/docs/api";
   import type { GitChangesResponse, GitPublishResponse } from "../../api/docs/types";
 
@@ -266,7 +266,7 @@
   }
   .primary {
     background: var(--accent-blue);
-    color: #fff;
+    color: var(--text-on-accent);
     border-color: var(--accent-blue);
   }
   .primary:disabled,

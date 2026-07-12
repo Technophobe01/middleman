@@ -278,7 +278,7 @@
 
   .date-picker-popover {
     position: absolute;
-    z-index: 120;
+    z-index: 94;
     top: calc(100% + 3px);
     left: 0;
     width: 224px;
@@ -355,7 +355,7 @@
 
   .date-picker-day.selected {
     background: var(--accent-blue);
-    color: #fff;
+    color: var(--text-on-accent);
     font-weight: 700;
   }
 </style>

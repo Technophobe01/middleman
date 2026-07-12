@@ -95,9 +95,34 @@ describe("KataIssueProperties", () => {
 
     expect(onAddLabel).toHaveBeenCalledWith("issue-1", "blocked");
 
-    await fireEvent.click(screen.getByRole("button", { name: "Remove review" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Edit labels" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Remove label review" }));
 
     expect(onRemoveLabel).toHaveBeenCalledWith("issue-1", "review");
+  });
+
+  it("keeps labels passive until label editing is enabled", async () => {
+    const onRemoveLabel = vi.fn();
+    renderProperties({ onRemoveLabel });
+
+    const labels = screen.getByRole("list", { name: "Labels" });
+    const labelText = within(labels).getByText("review");
+    expect(labelText.closest("button")).toBeNull();
+    expect(within(labels).queryByRole("button", { name: "Remove label review" })).toBeNull();
+
+    await fireEvent.click(labelText);
+    expect(onRemoveLabel).not.toHaveBeenCalled();
+
+    await fireEvent.click(screen.getByRole("button", { name: "Edit labels" }));
+    const removeButton = within(labels).getByRole("button", { name: "Remove label review" });
+    expect(removeButton.classList.contains("kit-chip")).toBe(true);
+    expect(removeButton.classList.contains("kata-label-chip")).toBe(true);
+    expect(removeButton.textContent).toContain("review");
+    await fireEvent.click(removeButton);
+    expect(onRemoveLabel).toHaveBeenCalledWith("issue-1", "review");
+
+    await fireEvent.click(screen.getByRole("button", { name: "Done editing labels" }));
+    expect(within(labels).queryByRole("button", { name: "Remove label review" })).toBeNull();
   });
 
   it("keeps the label draft visible when label creation fails", async () => {
@@ -136,9 +161,8 @@ describe("KataIssueProperties", () => {
     expect(onPatchMetadata).toHaveBeenCalledWith("issue-1", { deadline_on: "2026-06-08" });
 
     await fireEvent.click(screen.getByRole("button", { name: "Edit priority" }));
-    await fireEvent.change(screen.getByLabelText("Priority"), {
-      target: { value: "1" },
-    });
+    await fireEvent.click(screen.getByRole("combobox", { name: /Priority/ }));
+    await fireEvent.click(screen.getByRole("option", { name: "P1" }));
 
     expect(onSetPriority).toHaveBeenCalledWith("issue-1", 1);
   });
@@ -257,7 +281,8 @@ describe("KataIssueProperties", () => {
     renderProperties({ issue: makeIssue({ priority: 2 }), onSetPriority });
 
     await fireEvent.click(screen.getByRole("button", { name: "Edit priority" }));
-    await fireEvent.change(screen.getByLabelText("Priority"), { target: { value: "" } });
+    await fireEvent.click(screen.getByRole("combobox", { name: /Priority/ }));
+    await fireEvent.click(screen.getByRole("option", { name: "No priority" }));
 
     expect(onSetPriority).toHaveBeenCalledWith("issue-1", null);
   });
