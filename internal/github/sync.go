@@ -1249,6 +1249,15 @@ func (p *gitHubClientProvider) EditMergeRequestComment(
 	return platformgithub.NormalizeCommentEvent(ref, number, comment), nil
 }
 
+func (p *gitHubClientProvider) DeleteMergeRequestComment(
+	ctx context.Context,
+	ref platform.RepoRef,
+	_ int,
+	commentID int64,
+) error {
+	return p.client.DeleteIssueComment(ctx, ref.Owner, ref.Name, commentID)
+}
+
 func (p *gitHubClientProvider) ReplyToThread(
 	ctx context.Context,
 	ref platform.RepoRef,
@@ -1303,6 +1312,15 @@ func (p *gitHubClientProvider) EditIssueComment(
 		return platform.IssueEvent{}, fmt.Errorf("provider returned no comment")
 	}
 	return platformgithub.NormalizeIssueCommentEvent(ref, number, comment), nil
+}
+
+func (p *gitHubClientProvider) DeleteIssueComment(
+	ctx context.Context,
+	ref platform.RepoRef,
+	_ int,
+	commentID int64,
+) error {
+	return p.client.DeleteIssueComment(ctx, ref.Owner, ref.Name, commentID)
 }
 
 func (p *gitHubClientProvider) SetMergeRequestState(
@@ -5109,11 +5127,8 @@ func (s *Syncer) syncOpenIssueFromBulk(
 				"upsert issue timeline events for #%d: %w", number, err,
 			)
 		}
-		if err := s.db.UpdateIssueDerivedFields(
-			ctx, repoID, number, db.IssueDerivedFields{
-				CommentCount:   normalized.CommentCount,
-				LastActivityAt: computeIssueCommentLastActivity(bulk.Issue, bulk.Comments),
-			},
+		if err := s.db.UpdateIssueActivity(
+			ctx, issueID, computeIssueCommentLastActivity(bulk.Issue, bulk.Comments),
 		); err != nil {
 			return fmt.Errorf(
 				"update issue #%d derived fields: %w", number, err,
@@ -5366,12 +5381,8 @@ func (s *Syncer) syncOpenMRFromBulk(
 		} else if nonCommentLatest.After(lastActivity) {
 			lastActivity = nonCommentLatest
 		}
-		if err := s.db.UpdateMRDerivedFields(
-			ctx, repoID, number, db.MRDerivedFields{
-				ReviewDecision: normalized.ReviewDecision,
-				CommentCount:   len(bulk.Comments),
-				LastActivityAt: lastActivity,
-			},
+		if err := s.db.UpdateMRReviewActivity(
+			ctx, mrID, normalized.ReviewDecision, lastActivity,
 		); err != nil {
 			slog.Warn("update comment-derived fields failed",
 				"repo", repo.Owner+"/"+repo.Name,
@@ -5390,12 +5401,8 @@ func (s *Syncer) syncOpenMRFromBulk(
 		lastActivity := computeLastActivity(
 			bulk.PR, bulk.Comments, bulk.Reviews, bulk.Commits, bulk.TimelineEvents,
 		)
-		if err := s.db.UpdateMRDerivedFields(
-			ctx, repoID, number, db.MRDerivedFields{
-				ReviewDecision: reviewDecision,
-				CommentCount:   len(bulk.Comments),
-				LastActivityAt: lastActivity,
-			},
+		if err := s.db.UpdateMRReviewActivity(
+			ctx, mrID, reviewDecision, lastActivity,
 		); err != nil {
 			slog.Warn("update derived fields failed",
 				"repo", repo.Owner+"/"+repo.Name,
@@ -6159,8 +6166,22 @@ func (s *Syncer) fetchProviderIssueDetail(
 	if err != nil {
 		return calls, fmt.Errorf("get issue #%d: %w", number, err)
 	}
+	events, eventsErr := reader.ListIssueEvents(ctx, platformRepoRef(repo), number)
+	calls++
+	if eventsErr != nil && !errors.Is(eventsErr, platform.ErrUnsupportedCapability) {
+		return calls, fmt.Errorf("list issue events for #%d: %w", number, eventsErr)
+	}
 
 	normalized := platform.DBIssue(repoID, issue)
+	if eventsErr == nil {
+		existing, err := s.db.GetIssueByRepoIDAndNumber(ctx, repoID, number)
+		if err != nil {
+			return calls, fmt.Errorf("get existing issue #%d: %w", number, err)
+		}
+		if existing != nil {
+			normalized.CommentCount = existing.CommentCount
+		}
+	}
 	issueID, err := s.db.UpsertIssue(ctx, normalized)
 	if err != nil {
 		return calls, fmt.Errorf(
@@ -6171,18 +6192,22 @@ func (s *Syncer) fetchProviderIssueDetail(
 		return calls, fmt.Errorf("persist labels for issue #%d: %w", number, err)
 	}
 
-	events, err := reader.ListIssueEvents(ctx, platformRepoRef(repo), number)
-	calls++
-	if err != nil && !errors.Is(err, platform.ErrUnsupportedCapability) {
-		return calls, fmt.Errorf("list issue events for #%d: %w", number, err)
-	}
-	if err == nil {
-		dbEvents := make([]db.IssueEvent, 0, len(events))
+	if eventsErr == nil {
+		commentEvents := make([]db.IssueEvent, 0, len(events))
+		nonCommentEvents := make([]db.IssueEvent, 0, len(events))
 		for _, event := range events {
-			dbEvents = append(dbEvents, platform.DBIssueEvent(issueID, event))
+			dbEvent := platform.DBIssueEvent(issueID, event)
+			if dbEvent.EventType == "issue_comment" {
+				commentEvents = append(commentEvents, dbEvent)
+			} else {
+				nonCommentEvents = append(nonCommentEvents, dbEvent)
+			}
 		}
-		if err := s.db.UpsertIssueEvents(ctx, dbEvents); err != nil {
-			return calls, fmt.Errorf("upsert issue events for #%d: %w", number, err)
+		if err := s.db.ReplaceIssueCommentEvents(ctx, issueID, commentEvents, nil); err != nil {
+			return calls, fmt.Errorf("replace comment events for issue #%d: %w", number, err)
+		}
+		if err := s.db.UpsertIssueEvents(ctx, nonCommentEvents); err != nil {
+			return calls, fmt.Errorf("upsert non-comment issue events for #%d: %w", number, err)
 		}
 	}
 
@@ -6319,11 +6344,7 @@ func (s *Syncer) refreshTimeline(
 		}
 	}
 
-	return s.db.UpdateMRDerivedFields(ctx, repoID, number, db.MRDerivedFields{
-		ReviewDecision: reviewDecision,
-		CommentCount:   len(comments),
-		LastActivityAt: lastActivityAt,
-	})
+	return s.db.UpdateMRReviewActivity(ctx, mrID, reviewDecision, lastActivityAt)
 }
 
 // RefreshMRCIStatusOnProvider fetches only CI checks for a PR's head SHA and
@@ -6671,20 +6692,7 @@ func (s *Syncer) replacePRCommentEvents(
 	mrID int64,
 	comments []*gh.IssueComment,
 ) error {
-	events := make([]db.MREvent, 0, len(comments))
-	dedupeKeys := make([]string, 0, len(comments))
-	for _, c := range comments {
-		event := NormalizeCommentEvent(mrID, c)
-		events = append(events, event)
-		dedupeKeys = append(dedupeKeys, event.DedupeKey)
-	}
-	if err := s.db.DeleteMissingMRCommentEvents(ctx, mrID, dedupeKeys); err != nil {
-		return fmt.Errorf("delete missing mr comment events: %w", err)
-	}
-	if err := s.db.UpsertMREvents(ctx, events); err != nil {
-		return fmt.Errorf("upsert mr comment events: %w", err)
-	}
-	return nil
+	return s.db.ReplaceMRCommentEvents(ctx, mrID, normalizePRComments(mrID, comments), nil)
 }
 
 func (s *Syncer) replaceIssueCommentEvents(
@@ -6692,20 +6700,23 @@ func (s *Syncer) replaceIssueCommentEvents(
 	issueID int64,
 	comments []*gh.IssueComment,
 ) error {
+	return s.db.ReplaceIssueCommentEvents(ctx, issueID, normalizeIssueComments(issueID, comments), nil)
+}
+
+func normalizePRComments(mrID int64, comments []*gh.IssueComment) []db.MREvent {
+	events := make([]db.MREvent, 0, len(comments))
+	for _, comment := range comments {
+		events = append(events, NormalizeCommentEvent(mrID, comment))
+	}
+	return events
+}
+
+func normalizeIssueComments(issueID int64, comments []*gh.IssueComment) []db.IssueEvent {
 	events := make([]db.IssueEvent, 0, len(comments))
-	dedupeKeys := make([]string, 0, len(comments))
-	for _, c := range comments {
-		event := NormalizeIssueCommentEvent(issueID, c)
-		events = append(events, event)
-		dedupeKeys = append(dedupeKeys, event.DedupeKey)
+	for _, comment := range comments {
+		events = append(events, NormalizeIssueCommentEvent(issueID, comment))
 	}
-	if err := s.db.DeleteMissingIssueCommentEvents(ctx, issueID, dedupeKeys); err != nil {
-		return fmt.Errorf("delete missing issue comment events: %w", err)
-	}
-	if err := s.db.UpsertIssueEvents(ctx, events); err != nil {
-		return fmt.Errorf("upsert issue comment events: %w", err)
-	}
-	return nil
+	return events
 }
 
 // resolveDisplayName returns the GitHub display name for a
@@ -7029,12 +7040,7 @@ func (s *Syncer) refreshIssueTimeline(
 
 	lastActivity := computeIssueCommentLastActivity(ghIssue, comments)
 
-	_, err = s.db.WriteDB().ExecContext(ctx,
-		`UPDATE middleman_issues SET comment_count = ?, last_activity_at = ?
-		 WHERE id = ?`,
-		len(comments), lastActivity, issueID,
-	)
-	return err
+	return s.db.UpdateIssueActivity(ctx, issueID, lastActivity)
 }
 
 func (s *Syncer) upsertIssueTimelineEvents(
@@ -7141,20 +7147,13 @@ func (s *Syncer) persistPRComments(
 	pr *db.MergeRequest,
 	comments []*gh.IssueComment,
 ) error {
-	if err := s.replacePRCommentEvents(ctx, pr.ID, comments); err != nil {
-		return fmt.Errorf("replace PR comment events: %w", err)
-	}
-
 	nonCommentLatest, err := s.db.GetMRLatestNonCommentEventTime(ctx, pr.ID)
 	if err != nil {
 		return fmt.Errorf("latest non-comment event for PR #%d: %w", pr.Number, err)
 	}
 
-	return s.db.UpdateMRDerivedFields(ctx, pr.RepoID, pr.Number, db.MRDerivedFields{
-		ReviewDecision: pr.ReviewDecision,
-		CommentCount:   len(comments),
-		LastActivityAt: computePRCommentRefreshLastActivity(pr, comments, nonCommentLatest),
-	})
+	lastActivityAt := computePRCommentRefreshLastActivity(pr, comments, nonCommentLatest)
+	return s.db.ReplaceMRCommentEvents(ctx, pr.ID, normalizePRComments(pr.ID, comments), &lastActivityAt)
 }
 
 func (s *Syncer) persistIssueComments(
@@ -7162,14 +7161,8 @@ func (s *Syncer) persistIssueComments(
 	issue *db.Issue,
 	comments []*gh.IssueComment,
 ) error {
-	if err := s.replaceIssueCommentEvents(ctx, issue.ID, comments); err != nil {
-		return fmt.Errorf("replace issue comment events: %w", err)
-	}
-
-	return s.db.UpdateIssueDerivedFields(ctx, issue.RepoID, issue.Number, db.IssueDerivedFields{
-		CommentCount:   len(comments),
-		LastActivityAt: computeIssueCommentRefreshLastActivity(issue, comments),
-	})
+	lastActivityAt := computeIssueCommentRefreshLastActivity(issue, comments)
+	return s.db.ReplaceIssueCommentEvents(ctx, issue.ID, normalizeIssueComments(issue.ID, comments), &lastActivityAt)
 }
 
 func (s *Syncer) fetchAndUpdateClosedIssue(

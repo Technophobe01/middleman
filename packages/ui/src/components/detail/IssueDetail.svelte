@@ -148,6 +148,13 @@
     return issues.editIssueComment(owner, name, number, event.PlatformID, body);
   }
 
+  async function deleteTimelineComment(event: { PlatformID: number | null }): Promise<string | null> {
+    if (staleIssue) return "Refresh issue details before deleting a comment";
+    if (event.PlatformID === null) return "Comment identifier is unavailable";
+    const ok = await issues.deleteIssueComment(owner, name, number, event.PlatformID);
+    return ok ? null : issues.getIssueDetailError() ?? "Could not delete comment";
+  }
+
   $effect(() => {
     const requestOwner = owner;
     const requestName = name;
@@ -393,6 +400,7 @@
   const repoOperations = $derived(issues.getIssueDetail()?.repo?.operations);
   const addCommentGate = $derived(operationGate(repoOperations?.add_comment));
   const editCommentGate = $derived(operationGate(repoOperations?.edit_comment));
+  const deleteCommentGate = $derived(operationGate(repoOperations?.delete_comment));
   const labelGate = $derived(firstUnavailableGate(
     repoOperations?.add_label, repoOperations?.remove_label,
   ));
@@ -1200,6 +1208,9 @@
             activityViewMode={detailActivityView.getMode()}
             onEditComment={capabilities.comment_mutation && !staleIssue && !editCommentGate.unavailable
               ? editTimelineComment
+              : undefined}
+            onDeleteComment={capabilities.comment_mutation && !staleIssue && !deleteCommentGate.unavailable
+              ? deleteTimelineComment
               : undefined}
           />
         {:else if issues.isIssueDetailSyncing()}

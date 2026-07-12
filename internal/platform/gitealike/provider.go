@@ -184,6 +184,16 @@ func (p *Provider) ListMergeRequestEvents(
 	return events, nil
 }
 
+func (p *Provider) ListMergeRequestComments(ctx context.Context, ref platform.RepoRef, number int) ([]platform.MergeRequestEvent, error) {
+	comments, err := collectPages(ctx, func(opts PageOptions) ([]CommentDTO, Page, error) {
+		return p.transport.ListPullRequestComments(ctx, ref, number, opts)
+	})
+	if err != nil {
+		return nil, p.mapError(err)
+	}
+	return NormalizeMergeRequestEvents(p.kind, ref, number, comments, nil, nil), nil
+}
+
 func (p *Provider) ListOpenIssues(
 	ctx context.Context,
 	ref platform.RepoRef,
@@ -234,6 +244,16 @@ func (p *Provider) ListIssueEvents(
 	}
 	events = append(events, NormalizeIssueTimelineEvents(p.kind, ref, number, timeline)...)
 	return events, nil
+}
+
+func (p *Provider) ListIssueComments(ctx context.Context, ref platform.RepoRef, number int) ([]platform.IssueEvent, error) {
+	comments, err := collectPages(ctx, func(opts PageOptions) ([]CommentDTO, Page, error) {
+		return p.transport.ListIssueComments(ctx, ref, number, opts)
+	})
+	if err != nil {
+		return nil, p.mapError(err)
+	}
+	return NormalizeIssueComments(p.kind, ref, number, comments), nil
 }
 
 func (p *Provider) listTimelineEvents(
@@ -440,6 +460,22 @@ func (p *Provider) EditMergeRequestComment(
 	return NormalizeMergeRequestEvents(p.kind, ref, number, []CommentDTO{comment}, nil, nil)[0], nil
 }
 
+func (p *Provider) DeleteMergeRequestComment(
+	ctx context.Context,
+	ref platform.RepoRef,
+	_ int,
+	commentID int64,
+) error {
+	transport, err := p.mutationTransport("comment_mutation")
+	if err != nil {
+		return err
+	}
+	if err := transport.DeleteIssueComment(ctx, ref, commentID); err != nil {
+		return p.mapError(err)
+	}
+	return nil
+}
+
 func (p *Provider) CreateIssueComment(
 	ctx context.Context,
 	ref platform.RepoRef,
@@ -473,6 +509,22 @@ func (p *Provider) EditIssueComment(
 		return platform.IssueEvent{}, p.mapError(err)
 	}
 	return NormalizeIssueComments(p.kind, ref, number, []CommentDTO{comment})[0], nil
+}
+
+func (p *Provider) DeleteIssueComment(
+	ctx context.Context,
+	ref platform.RepoRef,
+	_ int,
+	commentID int64,
+) error {
+	transport, err := p.mutationTransport("comment_mutation")
+	if err != nil {
+		return err
+	}
+	if err := transport.DeleteIssueComment(ctx, ref, commentID); err != nil {
+		return p.mapError(err)
+	}
+	return nil
 }
 
 func (p *Provider) CreateIssue(

@@ -278,6 +278,13 @@
     return detailStore.editComment(owner, name, number, event.PlatformID, body);
   }
 
+  async function deleteTimelineComment(event: { PlatformID: number | null }): Promise<string | null> {
+    if (stalePR) return "Refresh pull request details before deleting a comment";
+    if (event.PlatformID === null) return "Comment identifier is unavailable";
+    const ok = await detailStore.deleteComment(owner, name, number, event.PlatformID);
+    return ok ? null : detailStore.getDetailError() ?? "Could not delete comment";
+  }
+
   async function applyTimelineSuggestion(input: ApplySuggestionRequest): Promise<boolean> {
     if (stalePR || headActionsBlocked || applySuggestionGate.unavailable) return false;
     if (currentPR()?.State !== "open") return false;
@@ -764,6 +771,7 @@
   );
   const addCommentGate = $derived(operationGate(repoOperations?.add_comment));
   const editCommentGate = $derived(operationGate(repoOperations?.edit_comment));
+  const deleteCommentGate = $derived(operationGate(repoOperations?.delete_comment));
   const labelGate = $derived(firstUnavailableGate(
     repoOperations?.add_label, repoOperations?.remove_label,
   ));
@@ -2390,6 +2398,9 @@
             activityViewMode={detailActivityView.getMode()}
             onEditComment={capabilities.comment_mutation && !stalePR && !editCommentGate.unavailable
               ? editTimelineComment
+              : undefined}
+            onDeleteComment={capabilities.comment_mutation && !stalePR && !deleteCommentGate.unavailable
+              ? deleteTimelineComment
               : undefined}
             onApplySuggestion={capabilities.review_suggestion_application
               && !stalePR

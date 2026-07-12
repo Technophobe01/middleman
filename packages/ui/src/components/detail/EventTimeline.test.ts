@@ -7,6 +7,7 @@ import { STORES_KEY } from "../../context.js";
 import { copyToClipboard } from "@kenn-io/kit-ui";
 import type { DiffResult, PREvent } from "../../api/types.js";
 import type { DiffStore } from "../../stores/diff.svelte.js";
+import { getStackDepth, resetModalStack } from "../../stores/keyboard/modal-stack.svelte.js";
 
 vi.mock("@kenn-io/kit-ui", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@kenn-io/kit-ui")>()),
@@ -60,6 +61,7 @@ afterAll(() => {
 
 afterEach(() => {
   vi.mocked(copyToClipboard).mockClear();
+  resetModalStack();
 });
 
 function makeEvent(overrides: Partial<PREvent> = {}): PREvent {
@@ -2326,6 +2328,107 @@ describe("EventTimeline", () => {
     });
 
     expect(screen.queryByRole("button", { name: "Edit comment" })).toBeNull();
+  });
+
+  it("confirms comment deletion with author and excerpt before calling the provider", async () => {
+    const onDeleteComment = vi.fn().mockResolvedValue(null);
+    render(EventTimeline, {
+      props: {
+        events: [
+          makeEvent({
+            Author: "alice",
+            Body: "Remove this detailed comment after confirming the target.",
+            EventType: "issue_comment",
+            PlatformID: 44,
+          }),
+        ],
+        onDeleteComment,
+      },
+    });
+
+    await fireEvent.click(screen.getByRole("button", { name: "Delete comment" }));
+
+    const dialog = screen.getByRole("dialog", { name: "Delete comment?" });
+    expect(getStackDepth()).toBe(1);
+    expect(dialog.textContent).toContain("alice");
+    expect(dialog.textContent).toContain("Remove this detailed comment");
+    expect(onDeleteComment).not.toHaveBeenCalled();
+
+    await fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(onDeleteComment).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog", { name: "Delete comment?" })).toBeNull();
+    expect(getStackDepth()).toBe(0);
+  });
+
+  it("submits comment deletion once and closes after success", async () => {
+    let finishDelete: (error: string | null) => void = () => {};
+    const onDeleteComment = vi.fn(
+      () =>
+        new Promise<string | null>((resolve) => {
+          finishDelete = resolve;
+        }),
+    );
+    const comment = makeEvent({ Body: "Delete me", EventType: "issue_comment", PlatformID: 44 });
+    render(EventTimeline, { props: { events: [comment], onDeleteComment } });
+
+    await fireEvent.click(screen.getByRole("button", { name: "Delete comment" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+
+    expect(onDeleteComment).toHaveBeenCalledTimes(1);
+    expect(onDeleteComment).toHaveBeenCalledWith(comment);
+    expect(screen.getByRole("button", { name: "Deleting..." }).hasAttribute("disabled")).toBe(true);
+
+    finishDelete(null);
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog", { name: "Delete comment?" })).toBeNull();
+    });
+  });
+
+  it("keeps the confirmation open with the provider error after deletion fails", async () => {
+    const onDeleteComment = vi.fn().mockResolvedValue("provider denied deletion");
+    render(EventTimeline, {
+      props: {
+        events: [makeEvent({ Body: "Keep me", EventType: "issue_comment", PlatformID: 44 })],
+        onDeleteComment,
+      },
+    });
+
+    await fireEvent.click(screen.getByRole("button", { name: "Delete comment" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+
+    await waitFor(() => {
+      expect(screen.getByText("provider denied deletion")).toBeTruthy();
+    });
+    expect(screen.getByRole("dialog", { name: "Delete comment?" })).toBeTruthy();
+  });
+
+  it("shows a stable error when the deletion callback rejects", async () => {
+    const onDeleteComment = vi.fn().mockRejectedValue(new Error("transport exploded"));
+    render(EventTimeline, {
+      props: {
+        events: [makeEvent({ Body: "Keep me", EventType: "issue_comment", PlatformID: 44 })],
+        onDeleteComment,
+      },
+    });
+
+    await fireEvent.click(screen.getByRole("button", { name: "Delete comment" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+
+    await waitFor(() => {
+      expect(screen.getByText("transport exploded")).toBeTruthy();
+    });
+    expect(screen.getByRole("dialog", { name: "Delete comment?" })).toBeTruthy();
+  });
+
+  it("hides comment deletion when the callback is unavailable", () => {
+    render(EventTimeline, {
+      props: {
+        events: [makeEvent({ Body: "Keep me", EventType: "issue_comment", PlatformID: 44 })],
+        onDeleteComment: undefined,
+      },
+    });
+
+    expect(screen.queryByRole("button", { name: "Delete comment" })).toBeNull();
   });
 
   it("copies a direct comment link when the event exposes one", async () => {

@@ -2561,7 +2561,15 @@ func (d *DB) UpsertMREvents(ctx context.Context, events []MREvent) error {
 		return nil
 	}
 	return d.Tx(ctx, func(tx *sql.Tx) error {
-		stmt, err := tx.PrepareContext(ctx, `
+		return upsertMREventsTx(ctx, tx, events)
+	})
+}
+
+func upsertMREventsTx(ctx context.Context, tx *sql.Tx, events []MREvent) error {
+	if len(events) == 0 {
+		return nil
+	}
+	stmt, err := tx.PrepareContext(ctx, `
 			INSERT INTO middleman_mr_events
 			    (merge_request_id, platform_id, platform_external_id, event_type, author, summary, body,
 			     metadata_json, created_at, dedupe_key, direct_url, thread_id, position_json, resolvable, resolved)
@@ -2587,23 +2595,22 @@ func (d *DB) UpsertMREvents(ctx context.Context, events []MREvent) error {
 			        THEN resolvable ELSE excluded.resolvable END,
 			    resolved = CASE WHEN excluded.thread_id IS NULL
 			        THEN resolved ELSE excluded.resolved END`)
-		if err != nil {
-			return fmt.Errorf("prepare upsert mr events: %w", err)
-		}
-		defer stmt.Close()
+	if err != nil {
+		return fmt.Errorf("prepare upsert mr events: %w", err)
+	}
+	defer stmt.Close()
 
-		for i := range events {
-			e := &events[i]
-			canonicalizeMREventTimestamps(e)
-			if _, err := stmt.ExecContext(ctx,
-				e.MergeRequestID, e.PlatformID, e.PlatformExternalID, e.EventType, e.Author, e.Summary, e.Body,
-				e.MetadataJSON, e.CreatedAt, e.DedupeKey, e.DirectURL, e.ThreadID, e.PositionJSON, e.Resolvable, e.Resolved,
-			); err != nil {
-				return fmt.Errorf("insert mr event (dedupe_key=%s): %w", e.DedupeKey, err)
-			}
+	for i := range events {
+		e := &events[i]
+		canonicalizeMREventTimestamps(e)
+		if _, err := stmt.ExecContext(ctx,
+			e.MergeRequestID, e.PlatformID, e.PlatformExternalID, e.EventType, e.Author, e.Summary, e.Body,
+			e.MetadataJSON, e.CreatedAt, e.DedupeKey, e.DirectURL, e.ThreadID, e.PositionJSON, e.Resolvable, e.Resolved,
+		); err != nil {
+			return fmt.Errorf("insert mr event (dedupe_key=%s): %w", e.DedupeKey, err)
 		}
-		return nil
-	})
+	}
+	return nil
 }
 
 func (d *DB) MRCommentEventExists(
@@ -2649,6 +2656,43 @@ func (d *DB) DeleteMissingMRCommentEvents(
 		return fmt.Errorf("delete missing mr comment events: %w", err)
 	}
 	return nil
+}
+
+// ReplaceMRCommentEvents atomically replaces provider issue-comment events and
+// their parent merge request's derived comment count.
+func (d *DB) ReplaceMRCommentEvents(
+	ctx context.Context,
+	mrID int64,
+	events []MREvent,
+	lastActivityAt *time.Time,
+) error {
+	return d.Tx(ctx, func(tx *sql.Tx) error {
+		query := `DELETE FROM middleman_mr_events
+			WHERE merge_request_id = ? AND event_type = 'issue_comment'`
+		args := []any{mrID}
+		if len(events) > 0 {
+			query += ` AND dedupe_key NOT IN (` + sqlPlaceholders(len(events)) + `)`
+			for i := range events {
+				args = append(args, events[i].DedupeKey)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+			return fmt.Errorf("delete missing mr comment events: %w", err)
+		}
+		if err := upsertMREventsTx(ctx, tx, events); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE middleman_merge_requests
+			SET comment_count = (
+				SELECT COUNT(*) FROM middleman_mr_events
+				WHERE merge_request_id = ? AND event_type = 'issue_comment'
+			), last_activity_at = COALESCE(?, last_activity_at)
+			WHERE id = ?`, mrID, lastActivityAt, mrID); err != nil {
+			return fmt.Errorf("update mr derived fields: %w", err)
+		}
+		return nil
+	})
 }
 
 // GetMRLatestNonCommentEventTime returns the most recent created_at across
@@ -2907,6 +2951,24 @@ func (d *DB) UpdateMRDerivedFields(
 	return nil
 }
 
+// UpdateMRReviewActivity updates non-count fields after a complete comment
+// replacement has already derived comment_count from persisted rows.
+func (d *DB) UpdateMRReviewActivity(
+	ctx context.Context,
+	mrID int64,
+	reviewDecision string,
+	lastActivityAt time.Time,
+) error {
+	_, err := d.rw.ExecContext(ctx, `
+		UPDATE middleman_merge_requests
+		SET review_decision = ?, last_activity_at = ?
+		WHERE id = ?`, reviewDecision, lastActivityAt, mrID)
+	if err != nil {
+		return fmt.Errorf("update mr review activity: %w", err)
+	}
+	return nil
+}
+
 // UpdateIssueDerivedFields writes computed fields back to the issues row.
 func (d *DB) UpdateIssueDerivedFields(
 	ctx context.Context,
@@ -2923,6 +2985,23 @@ func (d *DB) UpdateIssueDerivedFields(
 	)
 	if err != nil {
 		return fmt.Errorf("update issue derived fields: %w", err)
+	}
+	return nil
+}
+
+// UpdateIssueActivity updates activity after a complete comment replacement
+// has already derived comment_count from persisted rows.
+func (d *DB) UpdateIssueActivity(
+	ctx context.Context,
+	issueID int64,
+	lastActivityAt time.Time,
+) error {
+	_, err := d.rw.ExecContext(ctx, `
+		UPDATE middleman_issues
+		SET last_activity_at = ?
+		WHERE id = ?`, lastActivityAt, issueID)
+	if err != nil {
+		return fmt.Errorf("update issue activity: %w", err)
 	}
 	return nil
 }
@@ -3822,7 +3901,15 @@ func (d *DB) UpsertIssueEvents(ctx context.Context, events []IssueEvent) error {
 		return nil
 	}
 	return d.Tx(ctx, func(tx *sql.Tx) error {
-		stmt, err := tx.PrepareContext(ctx, `
+		return upsertIssueEventsTx(ctx, tx, events)
+	})
+}
+
+func upsertIssueEventsTx(ctx context.Context, tx *sql.Tx, events []IssueEvent) error {
+	if len(events) == 0 {
+		return nil
+	}
+	stmt, err := tx.PrepareContext(ctx, `
 			INSERT INTO middleman_issue_events
 			    (issue_id, platform_id, platform_external_id, event_type, author, summary, body,
 			     metadata_json, created_at, dedupe_key, direct_url, thread_id)
@@ -3839,24 +3926,23 @@ func (d *DB) UpsertIssueEvents(ctx context.Context, events []IssueEvent) error {
 			    created_at     = excluded.created_at,
 			    direct_url     = COALESCE(NULLIF(excluded.direct_url, ''), direct_url),
 			    thread_id  = COALESCE(excluded.thread_id, thread_id)`)
-		if err != nil {
-			return fmt.Errorf("prepare upsert issue events: %w", err)
-		}
-		defer stmt.Close()
+	if err != nil {
+		return fmt.Errorf("prepare upsert issue events: %w", err)
+	}
+	defer stmt.Close()
 
-		for i := range events {
-			e := &events[i]
-			canonicalizeIssueEventTimestamps(e)
-			if _, err := stmt.ExecContext(ctx,
-				e.IssueID, e.PlatformID, e.PlatformExternalID, e.EventType, e.Author,
-				e.Summary, e.Body, e.MetadataJSON, e.CreatedAt,
-				e.DedupeKey, e.DirectURL, e.ThreadID,
-			); err != nil {
-				return fmt.Errorf("insert issue event (dedupe_key=%s): %w", e.DedupeKey, err)
-			}
+	for i := range events {
+		e := &events[i]
+		canonicalizeIssueEventTimestamps(e)
+		if _, err := stmt.ExecContext(ctx,
+			e.IssueID, e.PlatformID, e.PlatformExternalID, e.EventType, e.Author,
+			e.Summary, e.Body, e.MetadataJSON, e.CreatedAt,
+			e.DedupeKey, e.DirectURL, e.ThreadID,
+		); err != nil {
+			return fmt.Errorf("insert issue event (dedupe_key=%s): %w", e.DedupeKey, err)
 		}
-		return nil
-	})
+	}
+	return nil
 }
 
 func (d *DB) IssueCommentEventExists(
@@ -3902,6 +3988,43 @@ func (d *DB) DeleteMissingIssueCommentEvents(
 		return fmt.Errorf("delete missing issue comment events: %w", err)
 	}
 	return nil
+}
+
+// ReplaceIssueCommentEvents atomically replaces provider issue-comment events
+// and their parent issue's derived comment count.
+func (d *DB) ReplaceIssueCommentEvents(
+	ctx context.Context,
+	issueID int64,
+	events []IssueEvent,
+	lastActivityAt *time.Time,
+) error {
+	return d.Tx(ctx, func(tx *sql.Tx) error {
+		query := `DELETE FROM middleman_issue_events
+			WHERE issue_id = ? AND event_type = 'issue_comment'`
+		args := []any{issueID}
+		if len(events) > 0 {
+			query += ` AND dedupe_key NOT IN (` + sqlPlaceholders(len(events)) + `)`
+			for i := range events {
+				args = append(args, events[i].DedupeKey)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+			return fmt.Errorf("delete missing issue comment events: %w", err)
+		}
+		if err := upsertIssueEventsTx(ctx, tx, events); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE middleman_issues
+			SET comment_count = (
+				SELECT COUNT(*) FROM middleman_issue_events
+				WHERE issue_id = ? AND event_type = 'issue_comment'
+			), last_activity_at = COALESCE(?, last_activity_at)
+			WHERE id = ?`, issueID, lastActivityAt, issueID); err != nil {
+			return fmt.Errorf("update issue derived fields: %w", err)
+		}
+		return nil
+	})
 }
 
 // ListIssueEvents returns all events for an issue ordered by created_at DESC.

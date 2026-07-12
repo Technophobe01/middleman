@@ -2599,6 +2599,7 @@ type RepoOperations struct {
 	CloseIssue            OperationAvailability `json:"close_issue"`
 	ClosePr               OperationAvailability `json:"close_pr"`
 	CreateIssue           OperationAvailability `json:"create_issue"`
+	DeleteComment         OperationAvailability `json:"delete_comment"`
 	EditComment           OperationAvailability `json:"edit_comment"`
 	MarkDraft             OperationAvailability `json:"mark_draft"`
 	MarkReadyForReview    OperationAvailability `json:"mark_ready_for_review"`
@@ -4512,6 +4513,9 @@ type ClientInterface interface {
 
 	PostIssueCommentOnHost(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, body PostIssueCommentOnHostJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
+	// DeleteIssueCommentOnHost request
+	DeleteIssueCommentOnHost(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, commentId int64, reqEditors ...RequestEditorFn) (*http.Response, error)
+
 	// EditIssueCommentOnHostWithBody request with any body
 	EditIssueCommentOnHostWithBody(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, commentId int64, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
 
@@ -4566,6 +4570,9 @@ type ClientInterface interface {
 	PostPrCommentOnHostWithBody(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	PostPrCommentOnHost(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, body PostPrCommentOnHostJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// DeletePrCommentOnHost request
+	DeletePrCommentOnHost(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, commentId int64, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// EditPrCommentOnHostWithBody request with any body
 	EditPrCommentOnHostWithBody(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, commentId int64, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
@@ -4746,6 +4753,9 @@ type ClientInterface interface {
 	PostIssueCommentWithBody(ctx context.Context, provider string, owner string, name string, number int64, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	PostIssueComment(ctx context.Context, provider string, owner string, name string, number int64, body PostIssueCommentJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// DeleteIssueComment request
+	DeleteIssueComment(ctx context.Context, provider string, owner string, name string, number int64, commentId int64, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// EditIssueCommentWithBody request with any body
 	EditIssueCommentWithBody(ctx context.Context, provider string, owner string, name string, number int64, commentId int64, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
@@ -4957,6 +4967,9 @@ type ClientInterface interface {
 	PostPrCommentWithBody(ctx context.Context, provider string, owner string, name string, number int64, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	PostPrComment(ctx context.Context, provider string, owner string, name string, number int64, body PostPrCommentJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// DeletePrComment request
+	DeletePrComment(ctx context.Context, provider string, owner string, name string, number int64, commentId int64, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// EditPrCommentWithBody request with any body
 	EditPrCommentWithBody(ctx context.Context, provider string, owner string, name string, number int64, commentId int64, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
@@ -6403,6 +6416,18 @@ func (c *Client) PostIssueCommentOnHost(ctx context.Context, platformHost string
 	return c.Client.Do(req)
 }
 
+func (c *Client) DeleteIssueCommentOnHost(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, commentId int64, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewDeleteIssueCommentOnHostRequest(c.Server, platformHost, provider, owner, name, number, commentId)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
 func (c *Client) EditIssueCommentOnHostWithBody(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, commentId int64, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewEditIssueCommentOnHostRequestWithBody(c.Server, platformHost, provider, owner, name, number, commentId, contentType, body)
 	if err != nil {
@@ -6645,6 +6670,18 @@ func (c *Client) PostPrCommentOnHostWithBody(ctx context.Context, platformHost s
 
 func (c *Client) PostPrCommentOnHost(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, body PostPrCommentOnHostJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewPostPrCommentOnHostRequest(c.Server, platformHost, provider, owner, name, number, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+func (c *Client) DeletePrCommentOnHost(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, commentId int64, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewDeletePrCommentOnHostRequest(c.Server, platformHost, provider, owner, name, number, commentId)
 	if err != nil {
 		return nil, err
 	}
@@ -7437,6 +7474,18 @@ func (c *Client) PostIssueCommentWithBody(ctx context.Context, provider string, 
 
 func (c *Client) PostIssueComment(ctx context.Context, provider string, owner string, name string, number int64, body PostIssueCommentJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewPostIssueCommentRequest(c.Server, provider, owner, name, number, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+func (c *Client) DeleteIssueComment(ctx context.Context, provider string, owner string, name string, number int64, commentId int64, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewDeleteIssueCommentRequest(c.Server, provider, owner, name, number, commentId)
 	if err != nil {
 		return nil, err
 	}
@@ -8373,6 +8422,18 @@ func (c *Client) PostPrCommentWithBody(ctx context.Context, provider string, own
 
 func (c *Client) PostPrComment(ctx context.Context, provider string, owner string, name string, number int64, body PostPrCommentJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewPostPrCommentRequest(c.Server, provider, owner, name, number, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+func (c *Client) DeletePrComment(ctx context.Context, provider string, owner string, name string, number int64, commentId int64, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewDeletePrCommentRequest(c.Server, provider, owner, name, number, commentId)
 	if err != nil {
 		return nil, err
 	}
@@ -13635,6 +13696,75 @@ func NewPostIssueCommentOnHostRequestWithBody(server string, platformHost string
 	return req, nil
 }
 
+// NewDeleteIssueCommentOnHostRequest generates requests for DeleteIssueCommentOnHost
+func NewDeleteIssueCommentOnHostRequest(server string, platformHost string, provider string, owner string, name string, number int64, commentId int64) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "platform_host", platformHost, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam1 string
+
+	pathParam1, err = runtime.StyleParamWithOptions("simple", false, "provider", provider, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam2 string
+
+	pathParam2, err = runtime.StyleParamWithOptions("simple", false, "owner", owner, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam3 string
+
+	pathParam3, err = runtime.StyleParamWithOptions("simple", false, "name", name, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam4 string
+
+	pathParam4, err = runtime.StyleParamWithOptions("simple", false, "number", number, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "integer", Format: "int64"})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam5 string
+
+	pathParam5, err = runtime.StyleParamWithOptions("simple", false, "comment_id", commentId, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "integer", Format: "int64"})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/host/%s/issues/%s/%s/%s/%s/comments/%s", pathParam0, pathParam1, pathParam2, pathParam3, pathParam4, pathParam5)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodDelete, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
 // NewEditIssueCommentOnHostRequest calls the generic EditIssueCommentOnHost builder with application/json body
 func NewEditIssueCommentOnHostRequest(server string, platformHost string, provider string, owner string, name string, number int64, commentId int64, body EditIssueCommentOnHostJSONRequestBody) (*http.Request, error) {
 	var bodyReader io.Reader
@@ -14548,6 +14678,75 @@ func NewPostPrCommentOnHostRequestWithBody(server string, platformHost string, p
 	}
 
 	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
+// NewDeletePrCommentOnHostRequest generates requests for DeletePrCommentOnHost
+func NewDeletePrCommentOnHostRequest(server string, platformHost string, provider string, owner string, name string, number int64, commentId int64) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "platform_host", platformHost, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam1 string
+
+	pathParam1, err = runtime.StyleParamWithOptions("simple", false, "provider", provider, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam2 string
+
+	pathParam2, err = runtime.StyleParamWithOptions("simple", false, "owner", owner, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam3 string
+
+	pathParam3, err = runtime.StyleParamWithOptions("simple", false, "name", name, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam4 string
+
+	pathParam4, err = runtime.StyleParamWithOptions("simple", false, "number", number, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "integer", Format: "int64"})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam5 string
+
+	pathParam5, err = runtime.StyleParamWithOptions("simple", false, "comment_id", commentId, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "integer", Format: "int64"})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/host/%s/pulls/%s/%s/%s/%s/comments/%s", pathParam0, pathParam1, pathParam2, pathParam3, pathParam4, pathParam5)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodDelete, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
 
 	return req, nil
 }
@@ -18462,6 +18661,68 @@ func NewPostIssueCommentRequestWithBody(server string, provider string, owner st
 	return req, nil
 }
 
+// NewDeleteIssueCommentRequest generates requests for DeleteIssueComment
+func NewDeleteIssueCommentRequest(server string, provider string, owner string, name string, number int64, commentId int64) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "provider", provider, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam1 string
+
+	pathParam1, err = runtime.StyleParamWithOptions("simple", false, "owner", owner, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam2 string
+
+	pathParam2, err = runtime.StyleParamWithOptions("simple", false, "name", name, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam3 string
+
+	pathParam3, err = runtime.StyleParamWithOptions("simple", false, "number", number, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "integer", Format: "int64"})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam4 string
+
+	pathParam4, err = runtime.StyleParamWithOptions("simple", false, "comment_id", commentId, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "integer", Format: "int64"})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/issues/%s/%s/%s/%s/comments/%s", pathParam0, pathParam1, pathParam2, pathParam3, pathParam4)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodDelete, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
 // NewEditIssueCommentRequest calls the generic EditIssueComment builder with application/json body
 func NewEditIssueCommentRequest(server string, provider string, owner string, name string, number int64, commentId int64, body EditIssueCommentJSONRequestBody) (*http.Request, error) {
 	var bodyReader io.Reader
@@ -21386,6 +21647,68 @@ func NewPostPrCommentRequestWithBody(server string, provider string, owner strin
 	}
 
 	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
+// NewDeletePrCommentRequest generates requests for DeletePrComment
+func NewDeletePrCommentRequest(server string, provider string, owner string, name string, number int64, commentId int64) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "provider", provider, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam1 string
+
+	pathParam1, err = runtime.StyleParamWithOptions("simple", false, "owner", owner, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam2 string
+
+	pathParam2, err = runtime.StyleParamWithOptions("simple", false, "name", name, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam3 string
+
+	pathParam3, err = runtime.StyleParamWithOptions("simple", false, "number", number, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "integer", Format: "int64"})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam4 string
+
+	pathParam4, err = runtime.StyleParamWithOptions("simple", false, "comment_id", commentId, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "integer", Format: "int64"})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/pulls/%s/%s/%s/%s/comments/%s", pathParam0, pathParam1, pathParam2, pathParam3, pathParam4)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodDelete, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
 
 	return req, nil
 }
@@ -26862,6 +27185,9 @@ type ClientWithResponsesInterface interface {
 
 	PostIssueCommentOnHostWithResponse(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, body PostIssueCommentOnHostJSONRequestBody, reqEditors ...RequestEditorFn) (*PostIssueCommentOnHostResponse, error)
 
+	// DeleteIssueCommentOnHostWithResponse request
+	DeleteIssueCommentOnHostWithResponse(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, commentId int64, reqEditors ...RequestEditorFn) (*DeleteIssueCommentOnHostResponse, error)
+
 	// EditIssueCommentOnHostWithBodyWithResponse request with any body
 	EditIssueCommentOnHostWithBodyWithResponse(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, commentId int64, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*EditIssueCommentOnHostResponse, error)
 
@@ -26916,6 +27242,9 @@ type ClientWithResponsesInterface interface {
 	PostPrCommentOnHostWithBodyWithResponse(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PostPrCommentOnHostResponse, error)
 
 	PostPrCommentOnHostWithResponse(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, body PostPrCommentOnHostJSONRequestBody, reqEditors ...RequestEditorFn) (*PostPrCommentOnHostResponse, error)
+
+	// DeletePrCommentOnHostWithResponse request
+	DeletePrCommentOnHostWithResponse(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, commentId int64, reqEditors ...RequestEditorFn) (*DeletePrCommentOnHostResponse, error)
 
 	// EditPrCommentOnHostWithBodyWithResponse request with any body
 	EditPrCommentOnHostWithBodyWithResponse(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, commentId int64, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*EditPrCommentOnHostResponse, error)
@@ -27096,6 +27425,9 @@ type ClientWithResponsesInterface interface {
 	PostIssueCommentWithBodyWithResponse(ctx context.Context, provider string, owner string, name string, number int64, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PostIssueCommentResponse, error)
 
 	PostIssueCommentWithResponse(ctx context.Context, provider string, owner string, name string, number int64, body PostIssueCommentJSONRequestBody, reqEditors ...RequestEditorFn) (*PostIssueCommentResponse, error)
+
+	// DeleteIssueCommentWithResponse request
+	DeleteIssueCommentWithResponse(ctx context.Context, provider string, owner string, name string, number int64, commentId int64, reqEditors ...RequestEditorFn) (*DeleteIssueCommentResponse, error)
 
 	// EditIssueCommentWithBodyWithResponse request with any body
 	EditIssueCommentWithBodyWithResponse(ctx context.Context, provider string, owner string, name string, number int64, commentId int64, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*EditIssueCommentResponse, error)
@@ -27307,6 +27639,9 @@ type ClientWithResponsesInterface interface {
 	PostPrCommentWithBodyWithResponse(ctx context.Context, provider string, owner string, name string, number int64, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*PostPrCommentResponse, error)
 
 	PostPrCommentWithResponse(ctx context.Context, provider string, owner string, name string, number int64, body PostPrCommentJSONRequestBody, reqEditors ...RequestEditorFn) (*PostPrCommentResponse, error)
+
+	// DeletePrCommentWithResponse request
+	DeletePrCommentWithResponse(ctx context.Context, provider string, owner string, name string, number int64, commentId int64, reqEditors ...RequestEditorFn) (*DeletePrCommentResponse, error)
 
 	// EditPrCommentWithBodyWithResponse request with any body
 	EditPrCommentWithBodyWithResponse(ctx context.Context, provider string, owner string, name string, number int64, commentId int64, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*EditPrCommentResponse, error)
@@ -29198,6 +29533,28 @@ func (r PostIssueCommentOnHostResponse) StatusCode() int {
 	return 0
 }
 
+type DeleteIssueCommentOnHostResponse struct {
+	Body                          []byte
+	HTTPResponse                  *http.Response
+	ApplicationproblemJSONDefault *ProblemError
+}
+
+// Status returns HTTPResponse.Status
+func (r DeleteIssueCommentOnHostResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r DeleteIssueCommentOnHostResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
 type EditIssueCommentOnHostResponse struct {
 	Body                          []byte
 	HTTPResponse                  *http.Response
@@ -29490,6 +29847,28 @@ func (r PostPrCommentOnHostResponse) Status() string {
 
 // StatusCode returns HTTPResponse.StatusCode
 func (r PostPrCommentOnHostResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+type DeletePrCommentOnHostResponse struct {
+	Body                          []byte
+	HTTPResponse                  *http.Response
+	ApplicationproblemJSONDefault *ProblemError
+}
+
+// Status returns HTTPResponse.Status
+func (r DeletePrCommentOnHostResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r DeletePrCommentOnHostResponse) StatusCode() int {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.StatusCode
 	}
@@ -30585,6 +30964,28 @@ func (r PostIssueCommentResponse) Status() string {
 
 // StatusCode returns HTTPResponse.StatusCode
 func (r PostIssueCommentResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+type DeleteIssueCommentResponse struct {
+	Body                          []byte
+	HTTPResponse                  *http.Response
+	ApplicationproblemJSONDefault *ProblemError
+}
+
+// Status returns HTTPResponse.Status
+func (r DeleteIssueCommentResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r DeleteIssueCommentResponse) StatusCode() int {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.StatusCode
 	}
@@ -31842,6 +32243,28 @@ func (r PostPrCommentResponse) Status() string {
 
 // StatusCode returns HTTPResponse.StatusCode
 func (r PostPrCommentResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+type DeletePrCommentResponse struct {
+	Body                          []byte
+	HTTPResponse                  *http.Response
+	ApplicationproblemJSONDefault *ProblemError
+}
+
+// Status returns HTTPResponse.Status
+func (r DeletePrCommentResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r DeletePrCommentResponse) StatusCode() int {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.StatusCode
 	}
@@ -34705,6 +35128,15 @@ func (c *ClientWithResponses) PostIssueCommentOnHostWithResponse(ctx context.Con
 	return ParsePostIssueCommentOnHostResponse(rsp)
 }
 
+// DeleteIssueCommentOnHostWithResponse request returning *DeleteIssueCommentOnHostResponse
+func (c *ClientWithResponses) DeleteIssueCommentOnHostWithResponse(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, commentId int64, reqEditors ...RequestEditorFn) (*DeleteIssueCommentOnHostResponse, error) {
+	rsp, err := c.DeleteIssueCommentOnHost(ctx, platformHost, provider, owner, name, number, commentId, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseDeleteIssueCommentOnHostResponse(rsp)
+}
+
 // EditIssueCommentOnHostWithBodyWithResponse request with arbitrary body returning *EditIssueCommentOnHostResponse
 func (c *ClientWithResponses) EditIssueCommentOnHostWithBodyWithResponse(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, commentId int64, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*EditIssueCommentOnHostResponse, error) {
 	rsp, err := c.EditIssueCommentOnHostWithBody(ctx, platformHost, provider, owner, name, number, commentId, contentType, body, reqEditors...)
@@ -34884,6 +35316,15 @@ func (c *ClientWithResponses) PostPrCommentOnHostWithResponse(ctx context.Contex
 		return nil, err
 	}
 	return ParsePostPrCommentOnHostResponse(rsp)
+}
+
+// DeletePrCommentOnHostWithResponse request returning *DeletePrCommentOnHostResponse
+func (c *ClientWithResponses) DeletePrCommentOnHostWithResponse(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, commentId int64, reqEditors ...RequestEditorFn) (*DeletePrCommentOnHostResponse, error) {
+	rsp, err := c.DeletePrCommentOnHost(ctx, platformHost, provider, owner, name, number, commentId, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseDeletePrCommentOnHostResponse(rsp)
 }
 
 // EditPrCommentOnHostWithBodyWithResponse request with arbitrary body returning *EditPrCommentOnHostResponse
@@ -35460,6 +35901,15 @@ func (c *ClientWithResponses) PostIssueCommentWithResponse(ctx context.Context, 
 		return nil, err
 	}
 	return ParsePostIssueCommentResponse(rsp)
+}
+
+// DeleteIssueCommentWithResponse request returning *DeleteIssueCommentResponse
+func (c *ClientWithResponses) DeleteIssueCommentWithResponse(ctx context.Context, provider string, owner string, name string, number int64, commentId int64, reqEditors ...RequestEditorFn) (*DeleteIssueCommentResponse, error) {
+	rsp, err := c.DeleteIssueComment(ctx, provider, owner, name, number, commentId, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseDeleteIssueCommentResponse(rsp)
 }
 
 // EditIssueCommentWithBodyWithResponse request with arbitrary body returning *EditIssueCommentResponse
@@ -36139,6 +36589,15 @@ func (c *ClientWithResponses) PostPrCommentWithResponse(ctx context.Context, pro
 		return nil, err
 	}
 	return ParsePostPrCommentResponse(rsp)
+}
+
+// DeletePrCommentWithResponse request returning *DeletePrCommentResponse
+func (c *ClientWithResponses) DeletePrCommentWithResponse(ctx context.Context, provider string, owner string, name string, number int64, commentId int64, reqEditors ...RequestEditorFn) (*DeletePrCommentResponse, error) {
+	rsp, err := c.DeletePrComment(ctx, provider, owner, name, number, commentId, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseDeletePrCommentResponse(rsp)
 }
 
 // EditPrCommentWithBodyWithResponse request with arbitrary body returning *EditPrCommentResponse
@@ -39406,6 +39865,32 @@ func ParsePostIssueCommentOnHostResponse(rsp *http.Response) (*PostIssueCommentO
 	return response, nil
 }
 
+// ParseDeleteIssueCommentOnHostResponse parses an HTTP response from a DeleteIssueCommentOnHostWithResponse call
+func ParseDeleteIssueCommentOnHostResponse(rsp *http.Response) (*DeleteIssueCommentOnHostResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &DeleteIssueCommentOnHostResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && true:
+		var dest ProblemError
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSONDefault = &dest
+
+	}
+
+	return response, nil
+}
+
 // ParseEditIssueCommentOnHostResponse parses an HTTP response from a EditIssueCommentOnHostWithResponse call
 func ParseEditIssueCommentOnHostResponse(rsp *http.Response) (*EditIssueCommentOnHostResponse, error) {
 	bodyBytes, err := io.ReadAll(rsp.Body)
@@ -39816,6 +40301,32 @@ func ParsePostPrCommentOnHostResponse(rsp *http.Response) (*PostPrCommentOnHostR
 		}
 		response.JSON201 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && true:
+		var dest ProblemError
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSONDefault = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseDeletePrCommentOnHostResponse parses an HTTP response from a DeletePrCommentOnHostWithResponse call
+func ParseDeletePrCommentOnHostResponse(rsp *http.Response) (*DeletePrCommentOnHostResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &DeletePrCommentOnHostResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && true:
 		var dest ProblemError
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -41337,6 +41848,32 @@ func ParsePostIssueCommentResponse(rsp *http.Response) (*PostIssueCommentRespons
 		}
 		response.JSON201 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && true:
+		var dest ProblemError
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSONDefault = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseDeleteIssueCommentResponse parses an HTTP response from a DeleteIssueCommentWithResponse call
+func ParseDeleteIssueCommentResponse(rsp *http.Response) (*DeleteIssueCommentResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &DeleteIssueCommentResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && true:
 		var dest ProblemError
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -43096,6 +43633,32 @@ func ParsePostPrCommentResponse(rsp *http.Response) (*PostPrCommentResponse, err
 		}
 		response.JSON201 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && true:
+		var dest ProblemError
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSONDefault = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseDeletePrCommentResponse parses an HTTP response from a DeletePrCommentWithResponse call
+func ParseDeletePrCommentResponse(rsp *http.Response) (*DeletePrCommentResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &DeletePrCommentResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && true:
 		var dest ProblemError
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {

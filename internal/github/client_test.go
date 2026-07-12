@@ -86,6 +86,43 @@ func TestClientInterfaceIncludesListPullRequestReviewThreads(t *testing.T) {
 	require.True(t, ok)
 }
 
+func TestDeleteIssueCommentUsesWriteAPI(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	readServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		assert.Fail("delete used the read GitHub client")
+		http.Error(w, "wrong credential", http.StatusForbidden)
+	}))
+	defer readServer.Close()
+	writeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(http.MethodDelete, r.Method)
+		assert.Equal("/api/v3/repos/acme/widgets/issues/comments/44", r.URL.Path)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer writeServer.Close()
+
+	readClient, err := newEnterpriseGHClient(readServer.Client(), readServer.URL+"/api/v3/", readServer.URL+"/api/uploads/")
+	require.NoError(err)
+	writeClient, err := newEnterpriseGHClient(writeServer.Client(), writeServer.URL+"/api/v3/", writeServer.URL+"/api/uploads/")
+	require.NoError(err)
+	client := &liveClient{gh: readClient, ghWrite: writeClient}
+
+	require.NoError(client.DeleteIssueComment(t.Context(), "acme", "widgets", 44))
+}
+
+func TestDeleteIssueCommentMapsNotFound(t *testing.T) {
+	require := require.New(t)
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+
+	ghClient, err := newEnterpriseGHClient(server.Client(), server.URL+"/api/v3/", server.URL+"/api/uploads/")
+	require.NoError(err)
+	client := &liveClient{ghWrite: ghClient}
+
+	err = client.DeleteIssueComment(t.Context(), "acme", "widgets", 44)
+	require.ErrorIs(err, platform.ErrNotFound)
+}
+
 func TestApplyReviewSuggestionEdits(t *testing.T) {
 	assert := assert.New(t)
 	content := "package main\nfunc main() {\n\tfmt.Println(\"old\")\n}\n"
