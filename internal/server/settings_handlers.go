@@ -233,26 +233,56 @@ func sameConfiguredRepo(left, right config.Repo) bool {
 }
 
 func (s *Server) worktreeBasePathForRepo(
-	_ context.Context, provider, platformHost, owner, name string,
+	ctx context.Context, provider, platformHost, owner, name string,
 ) (string, bool, error) {
-	if s.cfg == nil {
+	if s.cfg != nil {
+		target := config.Repo{
+			Platform:     provider,
+			PlatformHost: platformHost,
+			Owner:        owner,
+			Name:         name,
+		}
+		configuredPath := func() string {
+			s.cfgMu.Lock()
+			defer s.cfgMu.Unlock()
+			for _, repo := range s.cfg.Repos {
+				if repo.HasNameGlob() || strings.TrimSpace(repo.WorktreeBasePath) == "" {
+					continue
+				}
+				if sameConfiguredRepo(repo, target) {
+					return repo.WorktreeBasePath
+				}
+			}
+			return ""
+		}()
+		if configuredPath != "" {
+			return configuredPath, true, nil
+		}
+	}
+	if s.db == nil {
 		return "", false, nil
 	}
-	target := config.Repo{
-		Platform:     provider,
-		PlatformHost: platformHost,
-		Owner:        owner,
-		Name:         name,
+	projects, err := s.db.ListProjects(ctx)
+	if err != nil {
+		return "", false, fmt.Errorf("list registered projects: %w", err)
 	}
-	s.cfgMu.Lock()
-	defer s.cfgMu.Unlock()
-	for _, repo := range s.cfg.Repos {
-		if repo.HasNameGlob() || strings.TrimSpace(repo.WorktreeBasePath) == "" {
+	var matchedPath string
+	for _, project := range projects {
+		identity := project.PlatformIdentity
+		if project.IsStale || identity == nil ||
+			!strings.EqualFold(identity.Platform, provider) ||
+			!samePlatformHost(identity.Host, platformHost) ||
+			!strings.EqualFold(identity.Owner, owner) ||
+			!strings.EqualFold(identity.Name, name) {
 			continue
 		}
-		if sameConfiguredRepo(repo, target) {
-			return repo.WorktreeBasePath, true, nil
+		if matchedPath != "" && matchedPath != project.LocalPath {
+			return "", false, nil
 		}
+		matchedPath = project.LocalPath
+	}
+	if matchedPath != "" {
+		return matchedPath, true, nil
 	}
 	return "", false, nil
 }
@@ -860,17 +890,11 @@ func (s *Server) deleteConfiguredRepo(
 	}
 
 	prevRepos := slices.Clone(s.cfg.Repos)
-	prevKataProjects := slices.Clone(s.cfg.KataProjects)
 	s.cfg.Repos = append(
 		s.cfg.Repos[:idx], s.cfg.Repos[idx+1:]...,
 	)
-	s.cfg.KataProjects = filterKataProjectMappingsForDeletedRepo(
-		s.cfg.KataProjects,
-		targetRef,
-	)
 	if err := s.cfg.Save(s.cfgPath); err != nil {
 		s.cfg.Repos = prevRepos
-		s.cfg.KataProjects = prevKataProjects
 		s.cfgMu.Unlock()
 		return nil, problemInternal("save config: " + err.Error())
 	}
@@ -878,35 +902,6 @@ func (s *Server) deleteConfiguredRepo(
 	s.cfgMu.Unlock()
 
 	return nil, nil
-}
-
-func filterKataProjectMappingsForDeletedRepo(
-	mappings []config.KataProjectRepoMapping,
-	repo config.Repo,
-) []config.KataProjectRepoMapping {
-	filtered := make([]config.KataProjectRepoMapping, 0, len(mappings))
-	for _, mapping := range mappings {
-		if kataProjectMappingTargetsRepo(mapping, repo) {
-			continue
-		}
-		filtered = append(filtered, mapping)
-	}
-	return filtered
-}
-
-func kataProjectMappingTargetsRepo(
-	mapping config.KataProjectRepoMapping,
-	repo config.Repo,
-) bool {
-	return strings.EqualFold(
-		strings.TrimSpace(mapping.Provider),
-		repo.PlatformOrDefault(),
-	) &&
-		samePlatformHost(mapping.PlatformHost, repo.PlatformHostOrDefault()) &&
-		strings.EqualFold(
-			strings.Trim(strings.TrimSpace(mapping.RepoPath), "/"),
-			strings.Trim(configRepoPath(repo), "/"),
-		)
 }
 
 func normalizeRouteProvider(raw string) (string, error) {

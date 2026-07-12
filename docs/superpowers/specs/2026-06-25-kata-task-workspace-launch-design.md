@@ -148,8 +148,8 @@ project name, the resolver treats the mapping as ambiguous and returns no
 workspace target. `.kata.toml` ambiguity is terminal: tracked-name fallback runs
 only when `.kata.toml` produces zero candidates. The UI should not show a
 disabled button or reason text for this state because the user asked for the
-button to be absent when there is no clear mapping; diagnostics need a new API
-field.
+button to be absent when there is no clear mapping. Settings owns mapping
+diagnostics and correction so the task detail stays quiet.
 
 ## Manual Settings
 
@@ -163,10 +163,11 @@ mappings and allows adding, editing, and removing one mapping at a time:
 - Platform host.
 - Repository path.
 
-The repository selector should be backed by configured watched repositories so a
-manual mapping cannot point to an untracked repository accidentally. If the
-underlying repository is later removed from middleman settings, the mapping is
-kept but the resolver treats it as inactive until fixed or deleted.
+The selector lists registered Middleman Projects with provider identity and
+defaults to the project matching the inferred repository. Saving persists that
+project's provider identity. Removing a watched repo keeps its mapping because a
+registered Project may still own the same identity; diagnostics report an invalid
+override when no known repository owns it.
 
 Persist manual mappings in middleman config, not in Kata metadata, because they
 describe middleman's local interpretation of external Kata projects.
@@ -415,8 +416,9 @@ Frontend coverage:
 
 This can ship behind the existing Kata mode. Automatic mapping needs no config
 migration. Manual mappings require a config schema addition but can default to an
-empty list. Workspaces require a database migration for `item_key` before the
-Kata workspace endpoint ships.
+empty list; the mapping settings category is mounted only while Kata mode is
+enabled. Workspaces require a database migration for `item_key` before the Kata
+workspace endpoint ships.
 
 The implementation should update OpenAPI artifacts after adding the endpoint and
 settings schema, then regenerate the frontend API types through the existing

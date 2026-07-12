@@ -85,12 +85,11 @@ owning provider item has not synced yet, the summary leaves
 `item_last_activity_at` absent rather than inventing a value.
 
 Kata task repository resolution is deliberately exact. Manual settings mappings
-key by optional daemon ID plus Kata project UID and point to a configured exact
-repo identity. Config validation rejects mappings whose repo target is no
-longer configured, so settings repo deletion must remove mappings for the
-deleted repo in the same save/rollback path
+key by optional daemon ID plus Kata project UID and point to a known repository
+identity, including registered Middleman Projects. Removing a watched repo does
+not delete an override because a registered Project may still own that identity
 (`internal/config/config.go::validateKataProjectRepoMappings`,
-`internal/server/settings_handlers.go::deleteConfiguredRepo`). Automatic
+`internal/server/kata_workspace.go::kataManualWorkspaceTarget`). Automatic
 resolution first uses watched exact repos with `worktree_base_path` whose clone
 contains a matching `.kata.toml`. Matching first compares both explicit
 identifiers, `project.uid` and `project.identity`, to the Kata project UID. If
@@ -100,12 +99,23 @@ only allowed per clone when that clone has no usable `project.uid` or
 `project.identity`, and then exactly one case-insensitive `project.name` match
 is required. If no `.kata.toml` mapping matches, the
 resolver may fall back to a case-insensitive exact match between the Kata
-project name and exactly one synced tracked repo matched by current repo
-configuration, whether that configuration entry is exact or globbed, but only
-for repos without readable `.kata.toml` project metadata. Ambiguous, mismatched,
-or missing matches mean the Create/Open
+project and exactly one non-stale registered Middleman Project with provider
+identity; use `.kata.toml` before display/repository name. Distinct matching
+registered checkout paths are ambiguous. A unique registered match carries its
+checkout through workspace creation, while a configured clone carries its own
+base path. Only then may one synced repo matched by exact
+or globbed config and lacking readable project metadata resolve by name.
+Ambiguous, mismatched, or missing matches
+mean the Create/Open
 workspace button must not render
 (`internal/server/kata_workspace.go::resolveKataWorkspaceRepo`).
+
+Settings lists each selected-daemon Kata project with the status and source from
+the workspace resolver. Its selector lists repository identities known from
+exact watched repositories, currently matched tracked repositories, or
+non-stale registered Projects. It defaults only to an inferred identity match
+and persists that repository identity
+(`internal/server/kata_workspace.go::getKataProjectMappings`).
 
 Persisted workspace `worktree_path` values should be absolute. Workspace setup
 runs `git worktree add` from the managed clone or configured base checkout, so
