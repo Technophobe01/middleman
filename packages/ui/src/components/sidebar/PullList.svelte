@@ -2,6 +2,8 @@
   import { getStores, getNavigate, getSidebar, getActions, getHostState } from "../../context.js";
   import { groupByWorkflow } from "../../stores/workflow.svelte.js";
   import DiffSidebar from "../diff/DiffSidebar.svelte";
+  import GroupedSidebarSection from "../shared/GroupedSidebarSection.svelte";
+  import SidebarScrollArea from "../shared/SidebarScrollArea.svelte";
   import PullItem from "./PullItem.svelte";
   import { Chip, SearchInput } from "@kenn-io/kit-ui";
   import { FilterDropdown } from "@kenn-io/kit-ui";
@@ -422,11 +424,16 @@
   {#if pulls.getFilterState() !== "open"}
     <p class="state-note">Showing items closed after middleman began tracking them</p>
   {/if}
-  <div
-    data-test="pr-list"
-    class="list-body"
-    class:list-body--diff-focus={isDiffFocus}
-    class:list-body--diff-focus-worktree={isDiffFocus && isSelectedActiveWorktree}
+  <SidebarScrollArea
+    dataTest="pr-list"
+    label="Pull requests"
+    class={[
+      "list-body",
+      {
+        "list-body--diff-focus": isDiffFocus,
+        "list-body--diff-focus-worktree": isDiffFocus && isSelectedActiveWorktree,
+      },
+    ]}
   >
     {#if settings.isSettingsLoaded() && !settings.hasConfiguredRepos()}
       <p class="state-message">No repositories configured.<br />
@@ -452,25 +459,12 @@
           {@const userCollapsed = collapsedRepos.isCollapsed("pulls", group.collapseKey)}
           {@const hasSelectedPR = keepSelectedGroupExpanded && selectedPRGroup?.key === group.key}
           {@const collapsed = userCollapsed && !hasSelectedPR}
-          <div class="repo-group">
-            <button
-              type="button"
-              class="repo-header"
-              aria-expanded={!collapsed}
-              onclick={() => collapsedRepos.toggle("pulls", group.collapseKey)}
-            >
-              <svg
-                class="repo-header__chevron"
-                class:repo-header__chevron--collapsed={collapsed}
-                width="10" height="10" viewBox="0 0 10 10"
-                fill="none" stroke="currentColor" stroke-width="1.5"
-              >
-                <polyline points="2,3 5,7 8,3" stroke-linecap="round" stroke-linejoin="round" />
-              </svg>
-              <span class="repo-header__name">{group.label}</span>
-              <span class="repo-header__count">{group.items.length}</span>
-            </button>
-            {#if !collapsed}
+          <GroupedSidebarSection
+            label={group.label}
+            count={group.items.length}
+            {collapsed}
+            onclick={() => collapsedRepos.toggle("pulls", group.collapseKey)}
+          >
               {#each group.items as pr (pr.ID)}
                 {@const prRef = routeRefForPull(pr)}
                 {@const prSelected = isSelected(prRef)}
@@ -487,8 +481,7 @@
                   </div>
                 {/if}
               {/each}
-            {/if}
-          </div>
+          </GroupedSidebarSection>
         {/each}
       {:else}
         {#each visiblePulls as pr (pr.ID)}
@@ -509,7 +502,7 @@
         {/each}
       {/if}
     {/if}
-  </div>
+  </SidebarScrollArea>
   {#if needsFallbackFileList}
     <div class="diff-files-wrap">
                   <DiffSidebar showCommits={false} />
@@ -584,33 +577,28 @@
     flex-shrink: 0;
   }
 
-  .list-body {
-    flex: 1;
-    overflow-y: auto;
-  }
-
   /* Diff focus: combine typographic mute on siblings + a continuous
      accent rail that extends from the selected card through the inline
      file list, binding them as one visual unit. */
-  .list-body--diff-focus :global(.pull-item:not(.selected) .title) {
+  .pull-list :global(.list-body--diff-focus .pull-item:not(.selected) .title) {
     color: var(--text-muted);
     font-weight: 400;
     transition: color 0.15s ease;
   }
 
-  .list-body--diff-focus :global(.pull-item:not(.selected) .state-dot) {
+  .pull-list :global(.list-body--diff-focus .pull-item:not(.selected) .state-dot) {
     opacity: 0.45;
   }
 
-  .list-body--diff-focus :global(.pull-item:not(.selected):hover .title) {
+  .pull-list :global(.list-body--diff-focus .pull-item:not(.selected):hover .title) {
     color: var(--text-secondary);
   }
 
-  .list-body--diff-focus .diff-files-wrap {
+  .pull-list :global(.list-body--diff-focus .diff-files-wrap) {
     border-left: 3px solid var(--accent-blue);
   }
 
-  .list-body--diff-focus-worktree .diff-files-wrap {
+  .pull-list :global(.list-body--diff-focus-worktree .diff-files-wrap) {
     border-left-color: var(--accent-teal, var(--accent-green));
   }
 
@@ -655,68 +643,6 @@
   @keyframes pulse {
     0%, 100% { opacity: 0.4; }
     50% { opacity: 1; }
-  }
-
-  .repo-group {
-    border-bottom: 1px solid var(--border-default);
-  }
-
-  .repo-header {
-    font-size: var(--font-size-xs);
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    color: var(--text-muted);
-    padding: 6px 12px 4px;
-    background: var(--bg-inset);
-    border-bottom: 1px solid var(--border-muted);
-    position: sticky;
-    top: 0;
-    z-index: 1;
-
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    width: 100%;
-    text-align: left;
-    border-top: none;
-    border-left: none;
-    border-right: none;
-    cursor: pointer;
-    font-family: inherit;
-  }
-
-  .repo-header:hover {
-    background: var(--bg-surface-hover);
-  }
-
-  .repo-header[aria-expanded="false"] {
-    border-bottom: none;
-  }
-
-  .repo-header__chevron {
-    color: var(--text-muted);
-    transition: transform 120ms ease;
-    flex-shrink: 0;
-  }
-
-  .repo-header__chevron--collapsed {
-    transform: rotate(-90deg);
-  }
-
-  .repo-header__name {
-    flex: 1;
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .repo-header__count {
-    font-family: var(--font-mono);
-    font-size: var(--font-size-2xs);
-    color: var(--text-muted);
-    flex-shrink: 0;
   }
 
   .sidebar-footer {
