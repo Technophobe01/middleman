@@ -13671,6 +13671,13 @@ func TestAPICapabilityGatedMutationsHandleMissingSyncer(t *testing.T) {
 			capability: "review_mutation",
 		},
 		{
+			name:       "request changes",
+			method:     http.MethodPost,
+			path:       "/api/v1/pulls/gh/acme/widget/7/request-changes",
+			body:       map[string]string{"body": "needs work"},
+			capability: "review_mutation",
+		},
+		{
 			name:       "workflow approval",
 			method:     http.MethodPost,
 			path:       "/api/v1/pulls/gh/acme/widget/7/approve-workflows",
@@ -14269,6 +14276,71 @@ func TestAPIGitHubPublishReviewDraftSendsCommentsThroughServer(t *testing.T) {
 	storedDraft, err := database.GetMRReviewDraft(ctx, mr.ID)
 	require.NoError(err)
 	assert.Nil(storedDraft)
+}
+
+func TestAPIGitHubRequestChangesDoesNotPublishSavedDraftComments(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	ctx := t.Context()
+	var captured platform.PublishDiffReviewDraftInput
+	// No getPullRequestFn: the default mock returns no PR, so this test
+	// also proves direct request-changes performs no provider head reads
+	// beyond the review submission — the same call shape as /approve.
+	mock := &mockGH{
+		createReviewWithCommentsFn: func(
+			_ context.Context,
+			_, _ string,
+			_ int,
+			event string,
+			body string,
+			commitID string,
+			comments []*gh.DraftReviewComment,
+		) (*gh.PullRequestReview, error) {
+			captured = platform.PublishDiffReviewDraftInput{
+				Body:    body,
+				Action:  platform.ReviewActionRequestChanges,
+				HeadSHA: commitID,
+			}
+			assert.Equal("REQUEST_CHANGES", event)
+			assert.Empty(comments)
+			id := int64(502)
+			state := "CHANGES_REQUESTED"
+			return &gh.PullRequestReview{ID: &id, State: &state}, nil
+		},
+	}
+	srv, database := setupTestServerWithMock(t, mock)
+	seedPR(t, database, "acme", "widget", 42)
+	mr, err := database.GetMergeRequest(ctx, "github", "github.com", "acme", "widget", 42)
+	require.NoError(err)
+	require.NotNil(mr)
+	require.NoError(database.UpdateDiffSHAs(ctx, mr.RepoID, 42, "reviewed-head", "base", "merge-base"))
+
+	basePath := "/api/v1/pulls/gh/acme/widget/42/review-draft"
+	createRR := doJSON(t, srv, http.MethodPost, basePath+"/comments", map[string]any{
+		"body": "Saved for the later inline review.",
+		"range": map[string]any{
+			"path": "src/main.go", "side": "right", "line": 42,
+			"new_line": 42, "line_type": "add", "diff_head_sha": "reviewed-head",
+		},
+	})
+	require.Equal(http.StatusCreated, createRR.Code, createRR.Body.String())
+
+	requestRR := doJSON(t, srv, http.MethodPost, "/api/v1/pulls/gh/acme/widget/42/request-changes", map[string]string{
+		"body":              " Please cover the empty state. ",
+		"expected_head_sha": "provider-head",
+	})
+	require.Equal(http.StatusOK, requestRR.Code, requestRR.Body.String())
+	assert.Equal("Please cover the empty state.", captured.Body)
+	assert.Equal(platform.ReviewActionRequestChanges, captured.Action)
+	assert.Equal("provider-head", captured.HeadSHA)
+
+	storedDraft, err := database.GetMRReviewDraft(ctx, mr.ID)
+	require.NoError(err)
+	require.NotNil(storedDraft)
+	comments, err := database.ListMRReviewDraftComments(ctx, storedDraft.ID)
+	require.NoError(err)
+	require.Len(comments, 1)
+	assert.Equal("Saved for the later inline review.", comments[0].Body)
 }
 
 func TestAPIGitHubPublishReviewDraftRejectsSelfApprovalBeforeProvider(t *testing.T) {
@@ -17997,6 +18069,29 @@ func TestAPIGitealikeApproveBeforeHeadRace(t *testing.T) {
 	assert.Contains(transport.mutationCalls, "review:7:approved:abc123")
 }
 
+func TestAPIGitealikeRequestChangesPassesReviewedHeadPinToProvider(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	ctx := t.Context()
+	transport := newAPIGitealikeHeadPinTransport(t)
+	client, _ := setupAPIGitealikeHeadPinServer(t, transport)
+	expectedHeadSHA := "abc123"
+
+	resp, err := client.HTTP.RequestPullChangesOnHostWithResponse(
+		ctx, "gitea.test", "gitea", "tea", "kettle", 7,
+		generated.RequestPullChangesOnHostJSONRequestBody{
+			Body:            "needs work",
+			ExpectedHeadSha: &expectedHeadSHA,
+		},
+	)
+
+	require.NoError(err)
+	require.Equal(http.StatusOK, resp.StatusCode(), string(resp.Body))
+	assert.Equal("REQUEST_CHANGES", transport.lastReviewOpts.State)
+	assert.Equal("needs work", transport.lastReviewOpts.Body)
+	assert.Equal("abc123", transport.lastReviewOpts.CommitID)
+}
+
 type apiTestGitealikeTransport struct {
 	repo           gitealike.RepositoryDTO
 	pulls          []gitealike.PullRequestDTO
@@ -18011,6 +18106,7 @@ type apiTestGitealikeTransport struct {
 	nextIssueIndex int
 	mutationCalls  []string
 	mergeHeadPins  []string
+	lastReviewOpts gitealike.ReviewOptions
 
 	lastMergeOpts gitealike.MergeOptions
 	// headOverrides, when non-empty, replaces the head SHA returned by
@@ -18350,6 +18446,7 @@ func (t *apiTestGitealikeTransport) CreatePullReview(
 		return gitealike.ReviewDTO{}, platform.ErrNotFound
 	}
 	t.mutationCalls = append(t.mutationCalls, fmt.Sprintf("review:%d:%s:%s", number, opts.Body, opts.CommitID))
+	t.lastReviewOpts = opts
 	return gitealike.ReviewDTO{
 		ID:        980,
 		User:      gitealike.UserDTO{UserName: "mutation-bot"},

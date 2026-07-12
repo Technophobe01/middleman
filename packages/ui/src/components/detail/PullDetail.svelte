@@ -1929,6 +1929,7 @@
               expectedHeadSha={detailHeadSha}
               platformHeadSha={latestPlatformHeadSha}
               requireHeadPin={capabilities.mutation_head_binding}
+              supportedReviewActions={capabilities.supported_review_actions ?? []}
               title={approveGate.unavailable ? approveGate.reason : undefined}
               onheadconflict={handleHeadConflict}
               oncompleted={() => { headConflict = null; headConflictContext = null; }}

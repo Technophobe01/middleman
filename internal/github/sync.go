@@ -1639,6 +1639,31 @@ func (p *gitHubClientProvider) ApproveMergeRequest(
 	return platformgithub.NormalizeReviewEvent(ref, number, review), nil
 }
 
+// RequestChanges submits a blocking review with exactly the head-binding
+// contract of ApproveMergeRequest: the pin is forwarded as the review
+// commit and GitHub attaches the review to it. No client-side head
+// verification or post-submit revocation is layered on top — a change
+// request from the review form must not carry a stronger submission
+// contract than an approval from the same form.
+func (p *gitHubClientProvider) RequestChanges(
+	ctx context.Context,
+	ref platform.RepoRef,
+	number int,
+	body string,
+	expectedHeadSHA string,
+) error {
+	review, err := p.client.CreateReviewWithComments(
+		ctx, ref.Owner, ref.Name, number, "REQUEST_CHANGES", body, expectedHeadSHA, nil,
+	)
+	if err != nil {
+		return err
+	}
+	if review == nil {
+		return fmt.Errorf("provider returned no review")
+	}
+	return nil
+}
+
 func (p *gitHubClientProvider) ListMergeRequestReviewThreads(
 	ctx context.Context,
 	ref platform.RepoRef,
@@ -2310,6 +2335,13 @@ func (s *Syncer) ReviewMutator(
 	host string,
 ) (platform.ReviewMutator, error) {
 	return s.clients.ReviewMutator(kind, canonicalRepoHost(host))
+}
+
+func (s *Syncer) RequestChangesMutator(
+	kind platform.Kind,
+	host string,
+) (platform.RequestChangesMutator, error) {
+	return s.clients.RequestChangesMutator(kind, canonicalRepoHost(host))
 }
 
 func (s *Syncer) AssigneeMutator(
