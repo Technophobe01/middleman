@@ -1,6 +1,8 @@
 <script lang="ts">
   import { getStores, getNavigate, getSidebar } from "../../context.js";
   import IssueItem from "./IssueItem.svelte";
+  import GroupedSidebarSection from "../shared/GroupedSidebarSection.svelte";
+  import SidebarScrollArea from "../shared/SidebarScrollArea.svelte";
   import { Chip, SearchInput } from "@kenn-io/kit-ui";
   import { FilterDropdown } from "@kenn-io/kit-ui";
   import { SidebarToggle } from "@kenn-io/kit-ui";
@@ -207,7 +209,7 @@
   {#if issues.getIssueFilterState() !== "open"}
     <p class="state-note">Showing items closed after middleman began tracking them</p>
   {/if}
-  <div class="list-body">
+  <SidebarScrollArea class="list-body" label="Issues">
     {#if settings.isSettingsLoaded() && !settings.hasConfiguredRepos()}
       <p class="state-message">No repositories configured.<br />
         {#if !isEmbedded()}<button class="settings-link" onclick={() => navigate("/settings")}>Add one in Settings</button>{/if}</p>
@@ -229,25 +231,12 @@
         {#each [...issues.issuesByRepo().entries()] as [repo, repoIssues] (repo)}
           {@const collapsed = collapsedRepos.isCollapsed("issues", repo)}
           {@const repoLabel = repoIssues[0]?.repo.repo_path ?? repo}
-          <div class="repo-group">
-            <button
-              type="button"
-              class="repo-header"
-              aria-expanded={!collapsed}
-              onclick={() => collapsedRepos.toggle("issues", repo)}
-            >
-              <svg
-                class="repo-header__chevron"
-                class:repo-header__chevron--collapsed={collapsed}
-                width="10" height="10" viewBox="0 0 10 10"
-                fill="none" stroke="currentColor" stroke-width="1.5"
-              >
-                <polyline points="2,3 5,7 8,3" stroke-linecap="round" stroke-linejoin="round" />
-              </svg>
-              <span class="repo-header__name">{repoLabel}</span>
-              <span class="repo-header__count">{repoIssues.length}</span>
-            </button>
-            {#if !collapsed}
+          <GroupedSidebarSection
+            label={repoLabel}
+            count={repoIssues.length}
+            {collapsed}
+            onclick={() => collapsedRepos.toggle("issues", repo)}
+          >
               {#each repoIssues as issue (issue.ID)}
                 {@const issueRef = routeRefForIssue(issue)}
                 <IssueItem
@@ -257,8 +246,7 @@
                   onclick={() => handleSelect(issueRef)}
                 />
               {/each}
-            {/if}
-          </div>
+          </GroupedSidebarSection>
         {/each}
       {:else}
         {#each issues.getIssues() as issue (issue.ID)}
@@ -272,7 +260,7 @@
         {/each}
       {/if}
     {/if}
-  </div>
+  </SidebarScrollArea>
   <div class="sidebar-footer">
     {#if !isEmbedded()}
       <button class="add-repo-link" onclick={() => navigate("/settings")}>
@@ -342,11 +330,6 @@
     flex-shrink: 0;
   }
 
-  .list-body {
-    flex: 1;
-    overflow-y: auto;
-  }
-
   .state-message {
     padding: 24px 16px;
     font-size: var(--font-size-md);
@@ -388,68 +371,6 @@
   @keyframes pulse {
     0%, 100% { opacity: 0.4; }
     50% { opacity: 1; }
-  }
-
-  .repo-group {
-    border-bottom: 1px solid var(--border-default);
-  }
-
-  .repo-header {
-    font-size: var(--font-size-xs);
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    color: var(--text-muted);
-    padding: 6px 12px 4px;
-    background: var(--bg-inset);
-    border-bottom: 1px solid var(--border-muted);
-    position: sticky;
-    top: 0;
-    z-index: 1;
-
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    width: 100%;
-    text-align: left;
-    border-top: none;
-    border-left: none;
-    border-right: none;
-    cursor: pointer;
-    font-family: inherit;
-  }
-
-  .repo-header:hover {
-    background: var(--bg-surface-hover);
-  }
-
-  .repo-header[aria-expanded="false"] {
-    border-bottom: none;
-  }
-
-  .repo-header__chevron {
-    color: var(--text-muted);
-    transition: transform 120ms ease;
-    flex-shrink: 0;
-  }
-
-  .repo-header__chevron--collapsed {
-    transform: rotate(-90deg);
-  }
-
-  .repo-header__name {
-    flex: 1;
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .repo-header__count {
-    font-family: var(--font-mono);
-    font-size: var(--font-size-2xs);
-    color: var(--text-muted);
-    flex-shrink: 0;
   }
 
   .sidebar-footer {
