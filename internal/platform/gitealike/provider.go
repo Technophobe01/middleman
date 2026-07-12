@@ -84,6 +84,11 @@ func (p *Provider) Capabilities() platform.Capabilities {
 		caps.AssigneeMutation = true
 		if _, ok := p.transport.(ReviewMutationTransport); ok {
 			caps.ReviewMutation = true
+			caps.SupportedReviewActions = []platform.ReviewAction{
+				platform.ReviewActionComment,
+				platform.ReviewActionApprove,
+				platform.ReviewActionRequestChanges,
+			}
 		}
 		if _, ok := p.transport.(ReviewRequestTransport); ok {
 			caps.ReviewerMutation = true
@@ -184,6 +189,16 @@ func (p *Provider) ListMergeRequestEvents(
 	return events, nil
 }
 
+func (p *Provider) ListMergeRequestComments(ctx context.Context, ref platform.RepoRef, number int) ([]platform.MergeRequestEvent, error) {
+	comments, err := collectPages(ctx, func(opts PageOptions) ([]CommentDTO, Page, error) {
+		return p.transport.ListPullRequestComments(ctx, ref, number, opts)
+	})
+	if err != nil {
+		return nil, p.mapError(err)
+	}
+	return NormalizeMergeRequestEvents(p.kind, ref, number, comments, nil, nil), nil
+}
+
 func (p *Provider) ListOpenIssues(
 	ctx context.Context,
 	ref platform.RepoRef,
@@ -234,6 +249,16 @@ func (p *Provider) ListIssueEvents(
 	}
 	events = append(events, NormalizeIssueTimelineEvents(p.kind, ref, number, timeline)...)
 	return events, nil
+}
+
+func (p *Provider) ListIssueComments(ctx context.Context, ref platform.RepoRef, number int) ([]platform.IssueEvent, error) {
+	comments, err := collectPages(ctx, func(opts PageOptions) ([]CommentDTO, Page, error) {
+		return p.transport.ListIssueComments(ctx, ref, number, opts)
+	})
+	if err != nil {
+		return nil, p.mapError(err)
+	}
+	return NormalizeIssueComments(p.kind, ref, number, comments), nil
 }
 
 func (p *Provider) listTimelineEvents(
@@ -440,6 +465,22 @@ func (p *Provider) EditMergeRequestComment(
 	return NormalizeMergeRequestEvents(p.kind, ref, number, []CommentDTO{comment}, nil, nil)[0], nil
 }
 
+func (p *Provider) DeleteMergeRequestComment(
+	ctx context.Context,
+	ref platform.RepoRef,
+	_ int,
+	commentID int64,
+) error {
+	transport, err := p.mutationTransport("comment_mutation")
+	if err != nil {
+		return err
+	}
+	if err := transport.DeleteIssueComment(ctx, ref, commentID); err != nil {
+		return p.mapError(err)
+	}
+	return nil
+}
+
 func (p *Provider) CreateIssueComment(
 	ctx context.Context,
 	ref platform.RepoRef,
@@ -473,6 +514,22 @@ func (p *Provider) EditIssueComment(
 		return platform.IssueEvent{}, p.mapError(err)
 	}
 	return NormalizeIssueComments(p.kind, ref, number, []CommentDTO{comment})[0], nil
+}
+
+func (p *Provider) DeleteIssueComment(
+	ctx context.Context,
+	ref platform.RepoRef,
+	_ int,
+	commentID int64,
+) error {
+	transport, err := p.mutationTransport("comment_mutation")
+	if err != nil {
+		return err
+	}
+	if err := transport.DeleteIssueComment(ctx, ref, commentID); err != nil {
+		return p.mapError(err)
+	}
+	return nil
 }
 
 func (p *Provider) CreateIssue(
@@ -589,6 +646,28 @@ func (p *Provider) ApproveMergeRequest(
 		return platform.MergeRequestEvent{}, fmt.Errorf("provider returned no review event")
 	}
 	return events[0], nil
+}
+
+func (p *Provider) RequestChanges(
+	ctx context.Context,
+	ref platform.RepoRef,
+	number int,
+	body string,
+	expectedHeadSHA string,
+) error {
+	transport, ok := p.transport.(ReviewMutationTransport)
+	if !ok || !p.options.Mutations {
+		return platform.UnsupportedCapability(p.kind, p.host, "review_action_request_changes")
+	}
+	_, err := transport.CreatePullReview(ctx, ref, number, ReviewOptions{
+		State:    "REQUEST_CHANGES",
+		Body:     body,
+		CommitID: expectedHeadSHA,
+	})
+	if err != nil {
+		return p.mapError(err)
+	}
+	return nil
 }
 
 func (p *Provider) EditMergeRequestContent(

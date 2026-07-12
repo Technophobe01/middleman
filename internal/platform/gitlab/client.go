@@ -450,6 +450,18 @@ func (c *Client) ListMergeRequestEvents(
 	return events, nil
 }
 
+func (c *Client) ListMergeRequestComments(ctx context.Context, ref platform.RepoRef, number int) ([]platform.MergeRequestEvent, error) {
+	pid, normalizedRef, err := c.projectScopedArg(ctx, ref)
+	if err != nil {
+		return nil, err
+	}
+	discussions, err := c.listMergeRequestDiscussions(ctx, pid, number)
+	if err != nil {
+		return nil, err
+	}
+	return NormalizeMergeRequestDiscussions(normalizedRef, number, gitLabMergeRequestURL(normalizedRef, number), discussions), nil
+}
+
 func (c *Client) ListOpenIssues(ctx context.Context, ref platform.RepoRef) ([]platform.Issue, error) {
 	pid, normalizedRef, err := c.projectScopedArg(ctx, ref)
 	if err != nil {
@@ -511,6 +523,18 @@ func (c *Client) ListIssueEvents(
 		gitLabIssueURL(normalizedRef, number),
 		discussions,
 	), nil
+}
+
+func (c *Client) ListIssueComments(ctx context.Context, ref platform.RepoRef, number int) ([]platform.IssueEvent, error) {
+	pid, normalizedRef, err := c.projectScopedArg(ctx, ref)
+	if err != nil {
+		return nil, err
+	}
+	discussions, err := c.listIssueDiscussions(ctx, pid, number)
+	if err != nil {
+		return nil, err
+	}
+	return NormalizeIssueDiscussions(normalizedRef, number, gitLabIssueURL(normalizedRef, number), discussions), nil
 }
 
 func (c *Client) ListReleases(ctx context.Context, ref platform.RepoRef) ([]platform.Release, error) {
@@ -878,7 +902,9 @@ func mapGitLabErrorForHost(platformHost, capability string, err error) error {
 	}
 	var gitlabErr *gitlab.ErrorResponse
 	code := platform.ErrCodeInvalidRepoRef
-	if errors.As(err, &gitlabErr) {
+	if errors.Is(err, gitlab.ErrNotFound) {
+		code = platform.ErrCodeNotFound
+	} else if errors.As(err, &gitlabErr) {
 		switch {
 		case gitlabErr.HasStatusCode(http.StatusUnauthorized), gitlabErr.HasStatusCode(http.StatusForbidden):
 			code = platform.ErrCodePermissionDenied

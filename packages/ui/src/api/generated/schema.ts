@@ -1011,7 +1011,8 @@ export interface paths {
         get?: never;
         put?: never;
         post?: never;
-        delete?: never;
+        /** Delete issue comment */
+        delete: operations["delete-issue-comment-on-host"];
         options?: never;
         head?: never;
         /** Edit issue comment */
@@ -1216,7 +1217,8 @@ export interface paths {
         get?: never;
         put?: never;
         post?: never;
-        delete?: never;
+        /** Delete pull request comment */
+        delete: operations["delete-pr-comment-on-host"];
         options?: never;
         head?: never;
         /** Edit pull request comment */
@@ -1421,6 +1423,23 @@ export interface paths {
         put?: never;
         /** Mark pull request ready for review */
         post: operations["mark-pull-ready-for-review-on-host"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/host/{platform_host}/pulls/{provider}/{owner}/{name}/{number}/request-changes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Request pull request changes */
+        post: operations["request-pull-changes-on-host"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1971,7 +1990,8 @@ export interface paths {
         get?: never;
         put?: never;
         post?: never;
-        delete?: never;
+        /** Delete issue comment */
+        delete: operations["delete-issue-comment"];
         options?: never;
         head?: never;
         /** Edit issue comment */
@@ -2072,6 +2092,23 @@ export interface paths {
         };
         /** List Kata daemons */
         get: operations["list-kata-daemons"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/kata/project-mappings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Inspect effective Kata project repository mappings */
+        get: operations["get-kata-project-mappings"];
         put?: never;
         post?: never;
         delete?: never;
@@ -2826,7 +2863,8 @@ export interface paths {
         get?: never;
         put?: never;
         post?: never;
-        delete?: never;
+        /** Delete pull request comment */
+        delete: operations["delete-pr-comment"];
         options?: never;
         head?: never;
         /** Edit pull request comment */
@@ -3031,6 +3069,23 @@ export interface paths {
         put?: never;
         /** Mark pull request ready for review */
         post: operations["mark-pull-ready-for-review"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/pulls/{provider}/{owner}/{name}/{number}/request-changes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Request pull request changes */
+        post: operations["request-pull-changes"];
         delete?: never;
         options?: never;
         head?: never;
@@ -5320,6 +5375,29 @@ export interface components {
             daemons: components["schemas"]["KataDaemonResponse"][] | null;
             source?: string;
         };
+        KataMappingTargetResponse: {
+            display_name: string;
+            repo: components["schemas"]["RepoRefResponse"];
+        };
+        KataProjectMappingDiagnostic: {
+            daemon_id: string;
+            project_name: string;
+            project_uid: string;
+            repo?: components["schemas"]["RepoRefResponse"];
+            source?: string;
+            status: string;
+        };
+        KataProjectMappingsResponse: {
+            /**
+             * Format: uri
+             * @description A URL to the JSON Schema for this object.
+             * @example /api/v1/schemas/KataProjectMappingsResponse.json
+             */
+            readonly $schema?: string;
+            daemon_id: string;
+            projects: components["schemas"]["KataProjectMappingDiagnostic"][];
+            targets: components["schemas"]["KataMappingTargetResponse"][];
+        };
         KataProjectRepoMapping: {
             daemon_id?: string;
             platform_host: string;
@@ -6170,6 +6248,9 @@ export interface components {
             short_commit: string;
             upstream?: string;
         };
+        PullRequests: {
+            allow_mid_stack_merges: boolean;
+        };
         RateLimitHostStatus: {
             /** Format: int64 */
             budget_limit: number;
@@ -6571,6 +6652,7 @@ export interface components {
             close_issue: components["schemas"]["OperationAvailability"];
             close_pr: components["schemas"]["OperationAvailability"];
             create_issue: components["schemas"]["OperationAvailability"];
+            delete_comment: components["schemas"]["OperationAvailability"];
             edit_comment: components["schemas"]["OperationAvailability"];
             mark_draft: components["schemas"]["OperationAvailability"];
             mark_ready_for_review: components["schemas"]["OperationAvailability"];
@@ -6735,6 +6817,26 @@ export interface components {
              */
             readonly $schema?: string;
             worktree_base_path: string;
+        };
+        RequestChangesPRHostInputBody: {
+            /**
+             * Format: uri
+             * @description A URL to the JSON Schema for this object.
+             * @example /api/v1/schemas/RequestChangesPRHostInputBody.json
+             */
+            readonly $schema?: string;
+            body: string;
+            expected_head_sha?: string;
+        };
+        RequestChangesPRInputBody: {
+            /**
+             * Format: uri
+             * @description A URL to the JSON Schema for this object.
+             * @example /api/v1/schemas/RequestChangesPRInputBody.json
+             */
+            readonly $schema?: string;
+            body: string;
+            expected_head_sha?: string;
         };
         ResolveDiscussionHostInputBody: {
             /**
@@ -6934,6 +7036,7 @@ export interface components {
             launch_targets?: components["schemas"]["LaunchTarget"][] | null;
             modes?: components["schemas"]["ModeVisibility"];
             notifications: components["schemas"]["NotificationsSettingsResponse"];
+            pull_requests: components["schemas"]["PullRequests"];
             repos: components["schemas"]["ConfiguredRepoStatus"][];
             terminal: components["schemas"]["Terminal"];
         };
@@ -7152,6 +7255,7 @@ export interface components {
             agents?: components["schemas"]["Agent"][];
             kata_projects?: components["schemas"]["KataProjectRepoMapping"][];
             modes?: components["schemas"]["ModeVisibility"];
+            pull_requests?: components["schemas"]["PullRequests"];
             terminal?: components["schemas"]["Terminal"];
         };
         UserRepository: {
@@ -9500,6 +9604,40 @@ export interface operations {
             };
         };
     };
+    "delete-issue-comment-on-host": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                provider: string;
+                platform_host: string;
+                owner: string;
+                name: string;
+                number: number;
+                comment_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description No Content */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemError"];
+                };
+            };
+        };
+    };
     "edit-issue-comment-on-host": {
         parameters: {
             query?: never;
@@ -9974,6 +10112,40 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["MergeRequestEventResponse"];
                 };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemError"];
+                };
+            };
+        };
+    };
+    "delete-pr-comment-on-host": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                provider: string;
+                platform_host: string;
+                owner: string;
+                name: string;
+                number: number;
+                comment_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description No Content */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Error */
             default: {
@@ -10468,6 +10640,45 @@ export interface operations {
             cookie?: never;
         };
         requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ActionStatusBody"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemError"];
+                };
+            };
+        };
+    };
+    "request-pull-changes-on-host": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                provider: string;
+                platform_host: string;
+                owner: string;
+                name: string;
+                number: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RequestChangesPRHostInputBody"];
+            };
+        };
         responses: {
             /** @description OK */
             200: {
@@ -11788,6 +11999,39 @@ export interface operations {
             };
         };
     };
+    "delete-issue-comment": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                provider: string;
+                owner: string;
+                name: string;
+                number: number;
+                comment_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description No Content */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemError"];
+                };
+            };
+        };
+    };
     "edit-issue-comment": {
         parameters: {
             query?: never;
@@ -12023,6 +12267,39 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["KataDaemonRosterResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemError"];
+                };
+            };
+        };
+    };
+    "get-kata-project-mappings": {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Kata daemon id; the effective default daemon when empty */
+                "X-Middleman-Kata-Daemon"?: string;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    Vary?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["KataProjectMappingsResponse"];
                 };
             };
             /** @description Error */
@@ -13659,6 +13936,39 @@ export interface operations {
             };
         };
     };
+    "delete-pr-comment": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                provider: string;
+                owner: string;
+                name: string;
+                number: number;
+                comment_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description No Content */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemError"];
+                };
+            };
+        };
+    };
     "edit-pr-comment": {
         parameters: {
             query?: never;
@@ -14128,6 +14438,44 @@ export interface operations {
             cookie?: never;
         };
         requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ActionStatusBody"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemError"];
+                };
+            };
+        };
+    };
+    "request-pull-changes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                provider: string;
+                owner: string;
+                name: string;
+                number: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RequestChangesPRInputBody"];
+            };
+        };
         responses: {
             /** @description OK */
             200: {

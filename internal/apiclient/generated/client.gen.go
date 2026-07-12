@@ -1493,6 +1493,31 @@ type KataDaemonRosterResponse struct {
 	Source  *string               `json:"source,omitempty"`
 }
 
+// KataMappingTargetResponse defines model for KataMappingTargetResponse.
+type KataMappingTargetResponse struct {
+	DisplayName string          `json:"display_name"`
+	Repo        RepoRefResponse `json:"repo"`
+}
+
+// KataProjectMappingDiagnostic defines model for KataProjectMappingDiagnostic.
+type KataProjectMappingDiagnostic struct {
+	DaemonId    string           `json:"daemon_id"`
+	ProjectName string           `json:"project_name"`
+	ProjectUid  string           `json:"project_uid"`
+	Repo        *RepoRefResponse `json:"repo,omitempty"`
+	Source      *string          `json:"source,omitempty"`
+	Status      string           `json:"status"`
+}
+
+// KataProjectMappingsResponse defines model for KataProjectMappingsResponse.
+type KataProjectMappingsResponse struct {
+	// Schema A URL to the JSON Schema for this object.
+	Schema   *string                        `json:"$schema,omitempty"`
+	DaemonId string                         `json:"daemon_id"`
+	Projects []KataProjectMappingDiagnostic `json:"projects"`
+	Targets  []KataMappingTargetResponse    `json:"targets"`
+}
+
 // KataProjectRepoMapping defines model for KataProjectRepoMapping.
 type KataProjectRepoMapping struct {
 	DaemonId     *string `json:"daemon_id,omitempty"`
@@ -2236,6 +2261,11 @@ type PublishResponse struct {
 	Upstream    *string          `json:"upstream,omitempty"`
 }
 
+// PullRequests defines model for PullRequests.
+type PullRequests struct {
+	AllowMidStackMerges bool `json:"allow_mid_stack_merges"`
+}
+
 // RateLimitHostStatus defines model for RateLimitHostStatus.
 type RateLimitHostStatus struct {
 	BudgetLimit        int64  `json:"budget_limit"`
@@ -2594,6 +2624,7 @@ type RepoOperations struct {
 	CloseIssue            OperationAvailability `json:"close_issue"`
 	ClosePr               OperationAvailability `json:"close_pr"`
 	CreateIssue           OperationAvailability `json:"create_issue"`
+	DeleteComment         OperationAvailability `json:"delete_comment"`
 	EditComment           OperationAvailability `json:"edit_comment"`
 	MarkDraft             OperationAvailability `json:"mark_draft"`
 	MarkReadyForReview    OperationAvailability `json:"mark_ready_for_review"`
@@ -2748,6 +2779,22 @@ type RepoWorktreeBaseRequest struct {
 	// Schema A URL to the JSON Schema for this object.
 	Schema           *string `json:"$schema,omitempty"`
 	WorktreeBasePath string  `json:"worktree_base_path"`
+}
+
+// RequestChangesPRHostInputBody defines model for RequestChangesPRHostInputBody.
+type RequestChangesPRHostInputBody struct {
+	// Schema A URL to the JSON Schema for this object.
+	Schema          *string `json:"$schema,omitempty"`
+	Body            string  `json:"body"`
+	ExpectedHeadSha *string `json:"expected_head_sha,omitempty"`
+}
+
+// RequestChangesPRInputBody defines model for RequestChangesPRInputBody.
+type RequestChangesPRInputBody struct {
+	// Schema A URL to the JSON Schema for this object.
+	Schema          *string `json:"$schema,omitempty"`
+	Body            string  `json:"body"`
+	ExpectedHeadSha *string `json:"expected_head_sha,omitempty"`
 }
 
 // ResolveDiscussionHostInputBody defines model for ResolveDiscussionHostInputBody.
@@ -2912,6 +2959,7 @@ type SettingsResponse struct {
 	LaunchTargets *[]LaunchTarget               `json:"launch_targets,omitempty"`
 	Modes         *ModeVisibility               `json:"modes,omitempty"`
 	Notifications NotificationsSettingsResponse `json:"notifications"`
+	PullRequests  PullRequests                  `json:"pull_requests"`
 	Repos         []ConfiguredRepoStatus        `json:"repos"`
 	Terminal      Terminal                      `json:"terminal"`
 }
@@ -3103,6 +3151,7 @@ type UpdateSettingsRequest struct {
 	Agents       *[]Agent                  `json:"agents,omitempty"`
 	KataProjects *[]KataProjectRepoMapping `json:"kata_projects,omitempty"`
 	Modes        *ModeVisibility           `json:"modes,omitempty"`
+	PullRequests *PullRequests             `json:"pull_requests,omitempty"`
 	Terminal     *Terminal                 `json:"terminal,omitempty"`
 }
 
@@ -3584,6 +3633,12 @@ type ListIssuesParams struct {
 	Offset   *int64  `form:"offset,omitempty" json:"offset,omitempty"`
 }
 
+// GetKataProjectMappingsParams defines parameters for GetKataProjectMappings.
+type GetKataProjectMappingsParams struct {
+	// XMiddlemanKataDaemon Kata daemon id; the effective default daemon when empty
+	XMiddlemanKataDaemon *string `json:"X-Middleman-Kata-Daemon,omitempty"`
+}
+
 // GetKataTaskDetailParams defines parameters for GetKataTaskDetail.
 type GetKataTaskDetailParams struct {
 	// XMiddlemanKataDaemon Kata daemon id; the effective default daemon when empty
@@ -3988,6 +4043,9 @@ type MergePullOnHostJSONRequestBody = MergePRInputBody
 // DeferMergePullOnHostJSONRequestBody defines body for DeferMergePullOnHost for application/json ContentType.
 type DeferMergePullOnHostJSONRequestBody = MergePRInputBody
 
+// RequestPullChangesOnHostJSONRequestBody defines body for RequestPullChangesOnHost for application/json ContentType.
+type RequestPullChangesOnHostJSONRequestBody = RequestChangesPRHostInputBody
+
 // CreatePrReviewDraftCommentOnHostJSONRequestBody defines body for CreatePrReviewDraftCommentOnHost for application/json ContentType.
 type CreatePrReviewDraftCommentOnHostJSONRequestBody = CreateDiffReviewDraftCommentHostInputBody
 
@@ -4110,6 +4168,9 @@ type MergePullJSONRequestBody = MergePRInputBody
 
 // DeferMergePullJSONRequestBody defines body for DeferMergePull for application/json ContentType.
 type DeferMergePullJSONRequestBody = MergePRInputBody
+
+// RequestPullChangesJSONRequestBody defines body for RequestPullChanges for application/json ContentType.
+type RequestPullChangesJSONRequestBody = RequestChangesPRInputBody
 
 // CreatePrReviewDraftCommentJSONRequestBody defines body for CreatePrReviewDraftComment for application/json ContentType.
 type CreatePrReviewDraftCommentJSONRequestBody = CreateDiffReviewDraftCommentInputBody
@@ -4505,6 +4566,9 @@ type ClientInterface interface {
 
 	PostIssueCommentOnHost(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, body PostIssueCommentOnHostJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
+	// DeleteIssueCommentOnHost request
+	DeleteIssueCommentOnHost(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, commentId int64, reqEditors ...RequestEditorFn) (*http.Response, error)
+
 	// EditIssueCommentOnHostWithBody request with any body
 	EditIssueCommentOnHostWithBody(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, commentId int64, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
 
@@ -4560,6 +4624,9 @@ type ClientInterface interface {
 
 	PostPrCommentOnHost(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, body PostPrCommentOnHostJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
+	// DeletePrCommentOnHost request
+	DeletePrCommentOnHost(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, commentId int64, reqEditors ...RequestEditorFn) (*http.Response, error)
+
 	// EditPrCommentOnHostWithBody request with any body
 	EditPrCommentOnHostWithBody(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, commentId int64, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
 
@@ -4612,6 +4679,11 @@ type ClientInterface interface {
 
 	// MarkPullReadyForReviewOnHost request
 	MarkPullReadyForReviewOnHost(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// RequestPullChangesOnHostWithBody request with any body
+	RequestPullChangesOnHostWithBody(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	RequestPullChangesOnHost(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, body RequestPullChangesOnHostJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// DiscardPrReviewDraftOnHost request
 	DiscardPrReviewDraftOnHost(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, reqEditors ...RequestEditorFn) (*http.Response, error)
@@ -4740,6 +4812,9 @@ type ClientInterface interface {
 
 	PostIssueComment(ctx context.Context, provider string, owner string, name string, number int64, body PostIssueCommentJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
+	// DeleteIssueComment request
+	DeleteIssueComment(ctx context.Context, provider string, owner string, name string, number int64, commentId int64, reqEditors ...RequestEditorFn) (*http.Response, error)
+
 	// EditIssueCommentWithBody request with any body
 	EditIssueCommentWithBody(ctx context.Context, provider string, owner string, name string, number int64, commentId int64, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
 
@@ -4768,6 +4843,9 @@ type ClientInterface interface {
 
 	// ListKataDaemons request
 	ListKataDaemons(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// GetKataProjectMappings request
+	GetKataProjectMappings(ctx context.Context, params *GetKataProjectMappingsParams, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// GetKataTaskDetail request
 	GetKataTaskDetail(ctx context.Context, issueUid string, params *GetKataTaskDetailParams, reqEditors ...RequestEditorFn) (*http.Response, error)
@@ -4951,6 +5029,9 @@ type ClientInterface interface {
 
 	PostPrComment(ctx context.Context, provider string, owner string, name string, number int64, body PostPrCommentJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
+	// DeletePrComment request
+	DeletePrComment(ctx context.Context, provider string, owner string, name string, number int64, commentId int64, reqEditors ...RequestEditorFn) (*http.Response, error)
+
 	// EditPrCommentWithBody request with any body
 	EditPrCommentWithBody(ctx context.Context, provider string, owner string, name string, number int64, commentId int64, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
 
@@ -5003,6 +5084,11 @@ type ClientInterface interface {
 
 	// MarkPullReadyForReview request
 	MarkPullReadyForReview(ctx context.Context, provider string, owner string, name string, number int64, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// RequestPullChangesWithBody request with any body
+	RequestPullChangesWithBody(ctx context.Context, provider string, owner string, name string, number int64, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	RequestPullChanges(ctx context.Context, provider string, owner string, name string, number int64, body RequestPullChangesJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// DiscardPrReviewDraft request
 	DiscardPrReviewDraft(ctx context.Context, provider string, owner string, name string, number int64, reqEditors ...RequestEditorFn) (*http.Response, error)
@@ -6396,6 +6482,18 @@ func (c *Client) PostIssueCommentOnHost(ctx context.Context, platformHost string
 	return c.Client.Do(req)
 }
 
+func (c *Client) DeleteIssueCommentOnHost(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, commentId int64, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewDeleteIssueCommentOnHostRequest(c.Server, platformHost, provider, owner, name, number, commentId)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
 func (c *Client) EditIssueCommentOnHostWithBody(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, commentId int64, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewEditIssueCommentOnHostRequestWithBody(c.Server, platformHost, provider, owner, name, number, commentId, contentType, body)
 	if err != nil {
@@ -6648,6 +6746,18 @@ func (c *Client) PostPrCommentOnHost(ctx context.Context, platformHost string, p
 	return c.Client.Do(req)
 }
 
+func (c *Client) DeletePrCommentOnHost(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, commentId int64, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewDeletePrCommentOnHostRequest(c.Server, platformHost, provider, owner, name, number, commentId)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
 func (c *Client) EditPrCommentOnHostWithBody(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, commentId int64, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewEditPrCommentOnHostRequestWithBody(c.Server, platformHost, provider, owner, name, number, commentId, contentType, body)
 	if err != nil {
@@ -6878,6 +6988,30 @@ func (c *Client) DeferMergePullOnHost(ctx context.Context, platformHost string, 
 
 func (c *Client) MarkPullReadyForReviewOnHost(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewMarkPullReadyForReviewOnHostRequest(c.Server, platformHost, provider, owner, name, number)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+func (c *Client) RequestPullChangesOnHostWithBody(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewRequestPullChangesOnHostRequestWithBody(c.Server, platformHost, provider, owner, name, number, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+func (c *Client) RequestPullChangesOnHost(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, body RequestPullChangesOnHostJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewRequestPullChangesOnHostRequest(c.Server, platformHost, provider, owner, name, number, body)
 	if err != nil {
 		return nil, err
 	}
@@ -7440,6 +7574,18 @@ func (c *Client) PostIssueComment(ctx context.Context, provider string, owner st
 	return c.Client.Do(req)
 }
 
+func (c *Client) DeleteIssueComment(ctx context.Context, provider string, owner string, name string, number int64, commentId int64, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewDeleteIssueCommentRequest(c.Server, provider, owner, name, number, commentId)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
 func (c *Client) EditIssueCommentWithBody(ctx context.Context, provider string, owner string, name string, number int64, commentId int64, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewEditIssueCommentRequestWithBody(c.Server, provider, owner, name, number, commentId, contentType, body)
 	if err != nil {
@@ -7562,6 +7708,18 @@ func (c *Client) CreateIssueWorkspace(ctx context.Context, provider string, owne
 
 func (c *Client) ListKataDaemons(ctx context.Context, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewListKataDaemonsRequest(c.Server)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+func (c *Client) GetKataProjectMappings(ctx context.Context, params *GetKataProjectMappingsParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewGetKataProjectMappingsRequest(c.Server, params)
 	if err != nil {
 		return nil, err
 	}
@@ -8376,6 +8534,18 @@ func (c *Client) PostPrComment(ctx context.Context, provider string, owner strin
 	return c.Client.Do(req)
 }
 
+func (c *Client) DeletePrComment(ctx context.Context, provider string, owner string, name string, number int64, commentId int64, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewDeletePrCommentRequest(c.Server, provider, owner, name, number, commentId)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
 func (c *Client) EditPrCommentWithBody(ctx context.Context, provider string, owner string, name string, number int64, commentId int64, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewEditPrCommentRequestWithBody(c.Server, provider, owner, name, number, commentId, contentType, body)
 	if err != nil {
@@ -8606,6 +8776,30 @@ func (c *Client) DeferMergePull(ctx context.Context, provider string, owner stri
 
 func (c *Client) MarkPullReadyForReview(ctx context.Context, provider string, owner string, name string, number int64, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewMarkPullReadyForReviewRequest(c.Server, provider, owner, name, number)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+func (c *Client) RequestPullChangesWithBody(ctx context.Context, provider string, owner string, name string, number int64, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewRequestPullChangesRequestWithBody(c.Server, provider, owner, name, number, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+func (c *Client) RequestPullChanges(ctx context.Context, provider string, owner string, name string, number int64, body RequestPullChangesJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewRequestPullChangesRequest(c.Server, provider, owner, name, number, body)
 	if err != nil {
 		return nil, err
 	}
@@ -13628,6 +13822,75 @@ func NewPostIssueCommentOnHostRequestWithBody(server string, platformHost string
 	return req, nil
 }
 
+// NewDeleteIssueCommentOnHostRequest generates requests for DeleteIssueCommentOnHost
+func NewDeleteIssueCommentOnHostRequest(server string, platformHost string, provider string, owner string, name string, number int64, commentId int64) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "platform_host", platformHost, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam1 string
+
+	pathParam1, err = runtime.StyleParamWithOptions("simple", false, "provider", provider, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam2 string
+
+	pathParam2, err = runtime.StyleParamWithOptions("simple", false, "owner", owner, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam3 string
+
+	pathParam3, err = runtime.StyleParamWithOptions("simple", false, "name", name, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam4 string
+
+	pathParam4, err = runtime.StyleParamWithOptions("simple", false, "number", number, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "integer", Format: "int64"})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam5 string
+
+	pathParam5, err = runtime.StyleParamWithOptions("simple", false, "comment_id", commentId, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "integer", Format: "int64"})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/host/%s/issues/%s/%s/%s/%s/comments/%s", pathParam0, pathParam1, pathParam2, pathParam3, pathParam4, pathParam5)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodDelete, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
 // NewEditIssueCommentOnHostRequest calls the generic EditIssueCommentOnHost builder with application/json body
 func NewEditIssueCommentOnHostRequest(server string, platformHost string, provider string, owner string, name string, number int64, commentId int64, body EditIssueCommentOnHostJSONRequestBody) (*http.Request, error) {
 	var bodyReader io.Reader
@@ -14541,6 +14804,75 @@ func NewPostPrCommentOnHostRequestWithBody(server string, platformHost string, p
 	}
 
 	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
+// NewDeletePrCommentOnHostRequest generates requests for DeletePrCommentOnHost
+func NewDeletePrCommentOnHostRequest(server string, platformHost string, provider string, owner string, name string, number int64, commentId int64) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "platform_host", platformHost, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam1 string
+
+	pathParam1, err = runtime.StyleParamWithOptions("simple", false, "provider", provider, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam2 string
+
+	pathParam2, err = runtime.StyleParamWithOptions("simple", false, "owner", owner, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam3 string
+
+	pathParam3, err = runtime.StyleParamWithOptions("simple", false, "name", name, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam4 string
+
+	pathParam4, err = runtime.StyleParamWithOptions("simple", false, "number", number, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "integer", Format: "int64"})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam5 string
+
+	pathParam5, err = runtime.StyleParamWithOptions("simple", false, "comment_id", commentId, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "integer", Format: "int64"})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/host/%s/pulls/%s/%s/%s/%s/comments/%s", pathParam0, pathParam1, pathParam2, pathParam3, pathParam4, pathParam5)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodDelete, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
 
 	return req, nil
 }
@@ -15597,6 +15929,81 @@ func NewMarkPullReadyForReviewOnHostRequest(server string, platformHost string, 
 	if err != nil {
 		return nil, err
 	}
+
+	return req, nil
+}
+
+// NewRequestPullChangesOnHostRequest calls the generic RequestPullChangesOnHost builder with application/json body
+func NewRequestPullChangesOnHostRequest(server string, platformHost string, provider string, owner string, name string, number int64, body RequestPullChangesOnHostJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewRequestPullChangesOnHostRequestWithBody(server, platformHost, provider, owner, name, number, "application/json", bodyReader)
+}
+
+// NewRequestPullChangesOnHostRequestWithBody generates requests for RequestPullChangesOnHost with any type of body
+func NewRequestPullChangesOnHostRequestWithBody(server string, platformHost string, provider string, owner string, name string, number int64, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "platform_host", platformHost, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam1 string
+
+	pathParam1, err = runtime.StyleParamWithOptions("simple", false, "provider", provider, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam2 string
+
+	pathParam2, err = runtime.StyleParamWithOptions("simple", false, "owner", owner, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam3 string
+
+	pathParam3, err = runtime.StyleParamWithOptions("simple", false, "name", name, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam4 string
+
+	pathParam4, err = runtime.StyleParamWithOptions("simple", false, "number", number, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "integer", Format: "int64"})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/host/%s/pulls/%s/%s/%s/%s/request-changes", pathParam0, pathParam1, pathParam2, pathParam3, pathParam4)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
 
 	return req, nil
 }
@@ -18455,6 +18862,68 @@ func NewPostIssueCommentRequestWithBody(server string, provider string, owner st
 	return req, nil
 }
 
+// NewDeleteIssueCommentRequest generates requests for DeleteIssueComment
+func NewDeleteIssueCommentRequest(server string, provider string, owner string, name string, number int64, commentId int64) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "provider", provider, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam1 string
+
+	pathParam1, err = runtime.StyleParamWithOptions("simple", false, "owner", owner, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam2 string
+
+	pathParam2, err = runtime.StyleParamWithOptions("simple", false, "name", name, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam3 string
+
+	pathParam3, err = runtime.StyleParamWithOptions("simple", false, "number", number, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "integer", Format: "int64"})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam4 string
+
+	pathParam4, err = runtime.StyleParamWithOptions("simple", false, "comment_id", commentId, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "integer", Format: "int64"})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/issues/%s/%s/%s/%s/comments/%s", pathParam0, pathParam1, pathParam2, pathParam3, pathParam4)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodDelete, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
 // NewEditIssueCommentRequest calls the generic EditIssueComment builder with application/json body
 func NewEditIssueCommentRequest(server string, provider string, owner string, name string, number int64, commentId int64, body EditIssueCommentJSONRequestBody) (*http.Request, error) {
 	var bodyReader io.Reader
@@ -18866,6 +19335,48 @@ func NewListKataDaemonsRequest(server string) (*http.Request, error) {
 	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
 	if err != nil {
 		return nil, err
+	}
+
+	return req, nil
+}
+
+// NewGetKataProjectMappingsRequest generates requests for GetKataProjectMappings
+func NewGetKataProjectMappingsRequest(server string, params *GetKataProjectMappingsParams) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/kata/project-mappings")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	if params != nil {
+
+		if params.XMiddlemanKataDaemon != nil {
+			var headerParam0 string
+
+			headerParam0, err = runtime.StyleParamWithOptions("simple", false, "X-Middleman-Kata-Daemon", *params.XMiddlemanKataDaemon, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationHeader, Type: "string", Format: ""})
+			if err != nil {
+				return nil, err
+			}
+
+			req.Header.Set("X-Middleman-Kata-Daemon", headerParam0)
+		}
+
 	}
 
 	return req, nil
@@ -21383,6 +21894,68 @@ func NewPostPrCommentRequestWithBody(server string, provider string, owner strin
 	return req, nil
 }
 
+// NewDeletePrCommentRequest generates requests for DeletePrComment
+func NewDeletePrCommentRequest(server string, provider string, owner string, name string, number int64, commentId int64) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "provider", provider, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam1 string
+
+	pathParam1, err = runtime.StyleParamWithOptions("simple", false, "owner", owner, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam2 string
+
+	pathParam2, err = runtime.StyleParamWithOptions("simple", false, "name", name, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam3 string
+
+	pathParam3, err = runtime.StyleParamWithOptions("simple", false, "number", number, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "integer", Format: "int64"})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam4 string
+
+	pathParam4, err = runtime.StyleParamWithOptions("simple", false, "comment_id", commentId, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "integer", Format: "int64"})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/pulls/%s/%s/%s/%s/comments/%s", pathParam0, pathParam1, pathParam2, pathParam3, pathParam4)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodDelete, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
 // NewEditPrCommentRequest calls the generic EditPrComment builder with application/json body
 func NewEditPrCommentRequest(server string, provider string, owner string, name string, number int64, commentId int64, body EditPrCommentJSONRequestBody) (*http.Request, error) {
 	var bodyReader io.Reader
@@ -22344,6 +22917,74 @@ func NewMarkPullReadyForReviewRequest(server string, provider string, owner stri
 	if err != nil {
 		return nil, err
 	}
+
+	return req, nil
+}
+
+// NewRequestPullChangesRequest calls the generic RequestPullChanges builder with application/json body
+func NewRequestPullChangesRequest(server string, provider string, owner string, name string, number int64, body RequestPullChangesJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewRequestPullChangesRequestWithBody(server, provider, owner, name, number, "application/json", bodyReader)
+}
+
+// NewRequestPullChangesRequestWithBody generates requests for RequestPullChanges with any type of body
+func NewRequestPullChangesRequestWithBody(server string, provider string, owner string, name string, number int64, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "provider", provider, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam1 string
+
+	pathParam1, err = runtime.StyleParamWithOptions("simple", false, "owner", owner, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam2 string
+
+	pathParam2, err = runtime.StyleParamWithOptions("simple", false, "name", name, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam3 string
+
+	pathParam3, err = runtime.StyleParamWithOptions("simple", false, "number", number, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "integer", Format: "int64"})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/pulls/%s/%s/%s/%s/request-changes", pathParam0, pathParam1, pathParam2, pathParam3)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
 
 	return req, nil
 }
@@ -26855,6 +27496,9 @@ type ClientWithResponsesInterface interface {
 
 	PostIssueCommentOnHostWithResponse(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, body PostIssueCommentOnHostJSONRequestBody, reqEditors ...RequestEditorFn) (*PostIssueCommentOnHostResponse, error)
 
+	// DeleteIssueCommentOnHostWithResponse request
+	DeleteIssueCommentOnHostWithResponse(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, commentId int64, reqEditors ...RequestEditorFn) (*DeleteIssueCommentOnHostResponse, error)
+
 	// EditIssueCommentOnHostWithBodyWithResponse request with any body
 	EditIssueCommentOnHostWithBodyWithResponse(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, commentId int64, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*EditIssueCommentOnHostResponse, error)
 
@@ -26910,6 +27554,9 @@ type ClientWithResponsesInterface interface {
 
 	PostPrCommentOnHostWithResponse(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, body PostPrCommentOnHostJSONRequestBody, reqEditors ...RequestEditorFn) (*PostPrCommentOnHostResponse, error)
 
+	// DeletePrCommentOnHostWithResponse request
+	DeletePrCommentOnHostWithResponse(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, commentId int64, reqEditors ...RequestEditorFn) (*DeletePrCommentOnHostResponse, error)
+
 	// EditPrCommentOnHostWithBodyWithResponse request with any body
 	EditPrCommentOnHostWithBodyWithResponse(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, commentId int64, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*EditPrCommentOnHostResponse, error)
 
@@ -26962,6 +27609,11 @@ type ClientWithResponsesInterface interface {
 
 	// MarkPullReadyForReviewOnHostWithResponse request
 	MarkPullReadyForReviewOnHostWithResponse(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, reqEditors ...RequestEditorFn) (*MarkPullReadyForReviewOnHostResponse, error)
+
+	// RequestPullChangesOnHostWithBodyWithResponse request with any body
+	RequestPullChangesOnHostWithBodyWithResponse(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*RequestPullChangesOnHostResponse, error)
+
+	RequestPullChangesOnHostWithResponse(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, body RequestPullChangesOnHostJSONRequestBody, reqEditors ...RequestEditorFn) (*RequestPullChangesOnHostResponse, error)
 
 	// DiscardPrReviewDraftOnHostWithResponse request
 	DiscardPrReviewDraftOnHostWithResponse(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, reqEditors ...RequestEditorFn) (*DiscardPrReviewDraftOnHostResponse, error)
@@ -27090,6 +27742,9 @@ type ClientWithResponsesInterface interface {
 
 	PostIssueCommentWithResponse(ctx context.Context, provider string, owner string, name string, number int64, body PostIssueCommentJSONRequestBody, reqEditors ...RequestEditorFn) (*PostIssueCommentResponse, error)
 
+	// DeleteIssueCommentWithResponse request
+	DeleteIssueCommentWithResponse(ctx context.Context, provider string, owner string, name string, number int64, commentId int64, reqEditors ...RequestEditorFn) (*DeleteIssueCommentResponse, error)
+
 	// EditIssueCommentWithBodyWithResponse request with any body
 	EditIssueCommentWithBodyWithResponse(ctx context.Context, provider string, owner string, name string, number int64, commentId int64, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*EditIssueCommentResponse, error)
 
@@ -27118,6 +27773,9 @@ type ClientWithResponsesInterface interface {
 
 	// ListKataDaemonsWithResponse request
 	ListKataDaemonsWithResponse(ctx context.Context, reqEditors ...RequestEditorFn) (*ListKataDaemonsResponse, error)
+
+	// GetKataProjectMappingsWithResponse request
+	GetKataProjectMappingsWithResponse(ctx context.Context, params *GetKataProjectMappingsParams, reqEditors ...RequestEditorFn) (*GetKataProjectMappingsResponse, error)
 
 	// GetKataTaskDetailWithResponse request
 	GetKataTaskDetailWithResponse(ctx context.Context, issueUid string, params *GetKataTaskDetailParams, reqEditors ...RequestEditorFn) (*GetKataTaskDetailResponse, error)
@@ -27301,6 +27959,9 @@ type ClientWithResponsesInterface interface {
 
 	PostPrCommentWithResponse(ctx context.Context, provider string, owner string, name string, number int64, body PostPrCommentJSONRequestBody, reqEditors ...RequestEditorFn) (*PostPrCommentResponse, error)
 
+	// DeletePrCommentWithResponse request
+	DeletePrCommentWithResponse(ctx context.Context, provider string, owner string, name string, number int64, commentId int64, reqEditors ...RequestEditorFn) (*DeletePrCommentResponse, error)
+
 	// EditPrCommentWithBodyWithResponse request with any body
 	EditPrCommentWithBodyWithResponse(ctx context.Context, provider string, owner string, name string, number int64, commentId int64, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*EditPrCommentResponse, error)
 
@@ -27353,6 +28014,11 @@ type ClientWithResponsesInterface interface {
 
 	// MarkPullReadyForReviewWithResponse request
 	MarkPullReadyForReviewWithResponse(ctx context.Context, provider string, owner string, name string, number int64, reqEditors ...RequestEditorFn) (*MarkPullReadyForReviewResponse, error)
+
+	// RequestPullChangesWithBodyWithResponse request with any body
+	RequestPullChangesWithBodyWithResponse(ctx context.Context, provider string, owner string, name string, number int64, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*RequestPullChangesResponse, error)
+
+	RequestPullChangesWithResponse(ctx context.Context, provider string, owner string, name string, number int64, body RequestPullChangesJSONRequestBody, reqEditors ...RequestEditorFn) (*RequestPullChangesResponse, error)
 
 	// DiscardPrReviewDraftWithResponse request
 	DiscardPrReviewDraftWithResponse(ctx context.Context, provider string, owner string, name string, number int64, reqEditors ...RequestEditorFn) (*DiscardPrReviewDraftResponse, error)
@@ -29191,6 +29857,28 @@ func (r PostIssueCommentOnHostResponse) StatusCode() int {
 	return 0
 }
 
+type DeleteIssueCommentOnHostResponse struct {
+	Body                          []byte
+	HTTPResponse                  *http.Response
+	ApplicationproblemJSONDefault *ProblemError
+}
+
+// Status returns HTTPResponse.Status
+func (r DeleteIssueCommentOnHostResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r DeleteIssueCommentOnHostResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
 type EditIssueCommentOnHostResponse struct {
 	Body                          []byte
 	HTTPResponse                  *http.Response
@@ -29489,6 +30177,28 @@ func (r PostPrCommentOnHostResponse) StatusCode() int {
 	return 0
 }
 
+type DeletePrCommentOnHostResponse struct {
+	Body                          []byte
+	HTTPResponse                  *http.Response
+	ApplicationproblemJSONDefault *ProblemError
+}
+
+// Status returns HTTPResponse.Status
+func (r DeletePrCommentOnHostResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r DeletePrCommentOnHostResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
 type EditPrCommentOnHostResponse struct {
 	Body                          []byte
 	HTTPResponse                  *http.Response
@@ -29781,6 +30491,29 @@ func (r MarkPullReadyForReviewOnHostResponse) Status() string {
 
 // StatusCode returns HTTPResponse.StatusCode
 func (r MarkPullReadyForReviewOnHostResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+type RequestPullChangesOnHostResponse struct {
+	Body                          []byte
+	HTTPResponse                  *http.Response
+	JSON200                       *ActionStatusBody
+	ApplicationproblemJSONDefault *ProblemError
+}
+
+// Status returns HTTPResponse.Status
+func (r RequestPullChangesOnHostResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r RequestPullChangesOnHostResponse) StatusCode() int {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.StatusCode
 	}
@@ -30584,6 +31317,28 @@ func (r PostIssueCommentResponse) StatusCode() int {
 	return 0
 }
 
+type DeleteIssueCommentResponse struct {
+	Body                          []byte
+	HTTPResponse                  *http.Response
+	ApplicationproblemJSONDefault *ProblemError
+}
+
+// Status returns HTTPResponse.Status
+func (r DeleteIssueCommentResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r DeleteIssueCommentResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
 type EditIssueCommentResponse struct {
 	Body                          []byte
 	HTTPResponse                  *http.Response
@@ -30738,6 +31493,29 @@ func (r ListKataDaemonsResponse) Status() string {
 
 // StatusCode returns HTTPResponse.StatusCode
 func (r ListKataDaemonsResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+type GetKataProjectMappingsResponse struct {
+	Body                          []byte
+	HTTPResponse                  *http.Response
+	JSON200                       *KataProjectMappingsResponse
+	ApplicationproblemJSONDefault *ProblemError
+}
+
+// Status returns HTTPResponse.Status
+func (r GetKataProjectMappingsResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r GetKataProjectMappingsResponse) StatusCode() int {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.StatusCode
 	}
@@ -31841,6 +32619,28 @@ func (r PostPrCommentResponse) StatusCode() int {
 	return 0
 }
 
+type DeletePrCommentResponse struct {
+	Body                          []byte
+	HTTPResponse                  *http.Response
+	ApplicationproblemJSONDefault *ProblemError
+}
+
+// Status returns HTTPResponse.Status
+func (r DeletePrCommentResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r DeletePrCommentResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
 type EditPrCommentResponse struct {
 	Body                          []byte
 	HTTPResponse                  *http.Response
@@ -32133,6 +32933,29 @@ func (r MarkPullReadyForReviewResponse) Status() string {
 
 // StatusCode returns HTTPResponse.StatusCode
 func (r MarkPullReadyForReviewResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+type RequestPullChangesResponse struct {
+	Body                          []byte
+	HTTPResponse                  *http.Response
+	JSON200                       *ActionStatusBody
+	ApplicationproblemJSONDefault *ProblemError
+}
+
+// Status returns HTTPResponse.Status
+func (r RequestPullChangesResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r RequestPullChangesResponse) StatusCode() int {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.StatusCode
 	}
@@ -34698,6 +35521,15 @@ func (c *ClientWithResponses) PostIssueCommentOnHostWithResponse(ctx context.Con
 	return ParsePostIssueCommentOnHostResponse(rsp)
 }
 
+// DeleteIssueCommentOnHostWithResponse request returning *DeleteIssueCommentOnHostResponse
+func (c *ClientWithResponses) DeleteIssueCommentOnHostWithResponse(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, commentId int64, reqEditors ...RequestEditorFn) (*DeleteIssueCommentOnHostResponse, error) {
+	rsp, err := c.DeleteIssueCommentOnHost(ctx, platformHost, provider, owner, name, number, commentId, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseDeleteIssueCommentOnHostResponse(rsp)
+}
+
 // EditIssueCommentOnHostWithBodyWithResponse request with arbitrary body returning *EditIssueCommentOnHostResponse
 func (c *ClientWithResponses) EditIssueCommentOnHostWithBodyWithResponse(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, commentId int64, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*EditIssueCommentOnHostResponse, error) {
 	rsp, err := c.EditIssueCommentOnHostWithBody(ctx, platformHost, provider, owner, name, number, commentId, contentType, body, reqEditors...)
@@ -34879,6 +35711,15 @@ func (c *ClientWithResponses) PostPrCommentOnHostWithResponse(ctx context.Contex
 	return ParsePostPrCommentOnHostResponse(rsp)
 }
 
+// DeletePrCommentOnHostWithResponse request returning *DeletePrCommentOnHostResponse
+func (c *ClientWithResponses) DeletePrCommentOnHostWithResponse(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, commentId int64, reqEditors ...RequestEditorFn) (*DeletePrCommentOnHostResponse, error) {
+	rsp, err := c.DeletePrCommentOnHost(ctx, platformHost, provider, owner, name, number, commentId, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseDeletePrCommentOnHostResponse(rsp)
+}
+
 // EditPrCommentOnHostWithBodyWithResponse request with arbitrary body returning *EditPrCommentOnHostResponse
 func (c *ClientWithResponses) EditPrCommentOnHostWithBodyWithResponse(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, commentId int64, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*EditPrCommentOnHostResponse, error) {
 	rsp, err := c.EditPrCommentOnHostWithBody(ctx, platformHost, provider, owner, name, number, commentId, contentType, body, reqEditors...)
@@ -35050,6 +35891,23 @@ func (c *ClientWithResponses) MarkPullReadyForReviewOnHostWithResponse(ctx conte
 		return nil, err
 	}
 	return ParseMarkPullReadyForReviewOnHostResponse(rsp)
+}
+
+// RequestPullChangesOnHostWithBodyWithResponse request with arbitrary body returning *RequestPullChangesOnHostResponse
+func (c *ClientWithResponses) RequestPullChangesOnHostWithBodyWithResponse(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*RequestPullChangesOnHostResponse, error) {
+	rsp, err := c.RequestPullChangesOnHostWithBody(ctx, platformHost, provider, owner, name, number, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseRequestPullChangesOnHostResponse(rsp)
+}
+
+func (c *ClientWithResponses) RequestPullChangesOnHostWithResponse(ctx context.Context, platformHost string, provider string, owner string, name string, number int64, body RequestPullChangesOnHostJSONRequestBody, reqEditors ...RequestEditorFn) (*RequestPullChangesOnHostResponse, error) {
+	rsp, err := c.RequestPullChangesOnHost(ctx, platformHost, provider, owner, name, number, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseRequestPullChangesOnHostResponse(rsp)
 }
 
 // DiscardPrReviewDraftOnHostWithResponse request returning *DiscardPrReviewDraftOnHostResponse
@@ -35455,6 +36313,15 @@ func (c *ClientWithResponses) PostIssueCommentWithResponse(ctx context.Context, 
 	return ParsePostIssueCommentResponse(rsp)
 }
 
+// DeleteIssueCommentWithResponse request returning *DeleteIssueCommentResponse
+func (c *ClientWithResponses) DeleteIssueCommentWithResponse(ctx context.Context, provider string, owner string, name string, number int64, commentId int64, reqEditors ...RequestEditorFn) (*DeleteIssueCommentResponse, error) {
+	rsp, err := c.DeleteIssueComment(ctx, provider, owner, name, number, commentId, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseDeleteIssueCommentResponse(rsp)
+}
+
 // EditIssueCommentWithBodyWithResponse request with arbitrary body returning *EditIssueCommentResponse
 func (c *ClientWithResponses) EditIssueCommentWithBodyWithResponse(ctx context.Context, provider string, owner string, name string, number int64, commentId int64, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*EditIssueCommentResponse, error) {
 	rsp, err := c.EditIssueCommentWithBody(ctx, provider, owner, name, number, commentId, contentType, body, reqEditors...)
@@ -35548,6 +36415,15 @@ func (c *ClientWithResponses) ListKataDaemonsWithResponse(ctx context.Context, r
 		return nil, err
 	}
 	return ParseListKataDaemonsResponse(rsp)
+}
+
+// GetKataProjectMappingsWithResponse request returning *GetKataProjectMappingsResponse
+func (c *ClientWithResponses) GetKataProjectMappingsWithResponse(ctx context.Context, params *GetKataProjectMappingsParams, reqEditors ...RequestEditorFn) (*GetKataProjectMappingsResponse, error) {
+	rsp, err := c.GetKataProjectMappings(ctx, params, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseGetKataProjectMappingsResponse(rsp)
 }
 
 // GetKataTaskDetailWithResponse request returning *GetKataTaskDetailResponse
@@ -36134,6 +37010,15 @@ func (c *ClientWithResponses) PostPrCommentWithResponse(ctx context.Context, pro
 	return ParsePostPrCommentResponse(rsp)
 }
 
+// DeletePrCommentWithResponse request returning *DeletePrCommentResponse
+func (c *ClientWithResponses) DeletePrCommentWithResponse(ctx context.Context, provider string, owner string, name string, number int64, commentId int64, reqEditors ...RequestEditorFn) (*DeletePrCommentResponse, error) {
+	rsp, err := c.DeletePrComment(ctx, provider, owner, name, number, commentId, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseDeletePrCommentResponse(rsp)
+}
+
 // EditPrCommentWithBodyWithResponse request with arbitrary body returning *EditPrCommentResponse
 func (c *ClientWithResponses) EditPrCommentWithBodyWithResponse(ctx context.Context, provider string, owner string, name string, number int64, commentId int64, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*EditPrCommentResponse, error) {
 	rsp, err := c.EditPrCommentWithBody(ctx, provider, owner, name, number, commentId, contentType, body, reqEditors...)
@@ -36305,6 +37190,23 @@ func (c *ClientWithResponses) MarkPullReadyForReviewWithResponse(ctx context.Con
 		return nil, err
 	}
 	return ParseMarkPullReadyForReviewResponse(rsp)
+}
+
+// RequestPullChangesWithBodyWithResponse request with arbitrary body returning *RequestPullChangesResponse
+func (c *ClientWithResponses) RequestPullChangesWithBodyWithResponse(ctx context.Context, provider string, owner string, name string, number int64, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*RequestPullChangesResponse, error) {
+	rsp, err := c.RequestPullChangesWithBody(ctx, provider, owner, name, number, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseRequestPullChangesResponse(rsp)
+}
+
+func (c *ClientWithResponses) RequestPullChangesWithResponse(ctx context.Context, provider string, owner string, name string, number int64, body RequestPullChangesJSONRequestBody, reqEditors ...RequestEditorFn) (*RequestPullChangesResponse, error) {
+	rsp, err := c.RequestPullChanges(ctx, provider, owner, name, number, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseRequestPullChangesResponse(rsp)
 }
 
 // DiscardPrReviewDraftWithResponse request returning *DiscardPrReviewDraftResponse
@@ -39399,6 +40301,32 @@ func ParsePostIssueCommentOnHostResponse(rsp *http.Response) (*PostIssueCommentO
 	return response, nil
 }
 
+// ParseDeleteIssueCommentOnHostResponse parses an HTTP response from a DeleteIssueCommentOnHostWithResponse call
+func ParseDeleteIssueCommentOnHostResponse(rsp *http.Response) (*DeleteIssueCommentOnHostResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &DeleteIssueCommentOnHostResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && true:
+		var dest ProblemError
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSONDefault = &dest
+
+	}
+
+	return response, nil
+}
+
 // ParseEditIssueCommentOnHostResponse parses an HTTP response from a EditIssueCommentOnHostWithResponse call
 func ParseEditIssueCommentOnHostResponse(rsp *http.Response) (*EditIssueCommentOnHostResponse, error) {
 	bodyBytes, err := io.ReadAll(rsp.Body)
@@ -39821,6 +40749,32 @@ func ParsePostPrCommentOnHostResponse(rsp *http.Response) (*PostPrCommentOnHostR
 	return response, nil
 }
 
+// ParseDeletePrCommentOnHostResponse parses an HTTP response from a DeletePrCommentOnHostWithResponse call
+func ParseDeletePrCommentOnHostResponse(rsp *http.Response) (*DeletePrCommentOnHostResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &DeletePrCommentOnHostResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && true:
+		var dest ProblemError
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSONDefault = &dest
+
+	}
+
+	return response, nil
+}
+
 // ParseEditPrCommentOnHostResponse parses an HTTP response from a EditPrCommentOnHostWithResponse call
 func ParseEditPrCommentOnHostResponse(rsp *http.Response) (*EditPrCommentOnHostResponse, error) {
 	bodyBytes, err := io.ReadAll(rsp.Body)
@@ -40219,6 +41173,39 @@ func ParseMarkPullReadyForReviewOnHostResponse(rsp *http.Response) (*MarkPullRea
 	}
 
 	response := &MarkPullReadyForReviewOnHostResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest ActionStatusBody
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && true:
+		var dest ProblemError
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSONDefault = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseRequestPullChangesOnHostResponse parses an HTTP response from a RequestPullChangesOnHostWithResponse call
+func ParseRequestPullChangesOnHostResponse(rsp *http.Response) (*RequestPullChangesOnHostResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &RequestPullChangesOnHostResponse{
 		Body:         bodyBytes,
 		HTTPResponse: rsp,
 	}
@@ -41342,6 +42329,32 @@ func ParsePostIssueCommentResponse(rsp *http.Response) (*PostIssueCommentRespons
 	return response, nil
 }
 
+// ParseDeleteIssueCommentResponse parses an HTTP response from a DeleteIssueCommentWithResponse call
+func ParseDeleteIssueCommentResponse(rsp *http.Response) (*DeleteIssueCommentResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &DeleteIssueCommentResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && true:
+		var dest ProblemError
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSONDefault = &dest
+
+	}
+
+	return response, nil
+}
+
 // ParseEditIssueCommentResponse parses an HTTP response from a EditIssueCommentWithResponse call
 func ParseEditIssueCommentResponse(rsp *http.Response) (*EditIssueCommentResponse, error) {
 	bodyBytes, err := io.ReadAll(rsp.Body)
@@ -41549,6 +42562,39 @@ func ParseListKataDaemonsResponse(rsp *http.Response) (*ListKataDaemonsResponse,
 	switch {
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
 		var dest KataDaemonRosterResponse
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && true:
+		var dest ProblemError
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSONDefault = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseGetKataProjectMappingsResponse parses an HTTP response from a GetKataProjectMappingsWithResponse call
+func ParseGetKataProjectMappingsResponse(rsp *http.Response) (*GetKataProjectMappingsResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &GetKataProjectMappingsResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest KataProjectMappingsResponse
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
 			return nil, err
 		}
@@ -43101,6 +44147,32 @@ func ParsePostPrCommentResponse(rsp *http.Response) (*PostPrCommentResponse, err
 	return response, nil
 }
 
+// ParseDeletePrCommentResponse parses an HTTP response from a DeletePrCommentWithResponse call
+func ParseDeletePrCommentResponse(rsp *http.Response) (*DeletePrCommentResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &DeletePrCommentResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && true:
+		var dest ProblemError
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSONDefault = &dest
+
+	}
+
+	return response, nil
+}
+
 // ParseEditPrCommentResponse parses an HTTP response from a EditPrCommentWithResponse call
 func ParseEditPrCommentResponse(rsp *http.Response) (*EditPrCommentResponse, error) {
 	bodyBytes, err := io.ReadAll(rsp.Body)
@@ -43499,6 +44571,39 @@ func ParseMarkPullReadyForReviewResponse(rsp *http.Response) (*MarkPullReadyForR
 	}
 
 	response := &MarkPullReadyForReviewResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest ActionStatusBody
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && true:
+		var dest ProblemError
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSONDefault = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseRequestPullChangesResponse parses an HTTP response from a RequestPullChangesWithResponse call
+func ParseRequestPullChangesResponse(rsp *http.Response) (*RequestPullChangesResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &RequestPullChangesResponse{
 		Body:         bodyBytes,
 		HTTPResponse: rsp,
 	}

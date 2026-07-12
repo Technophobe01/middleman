@@ -40,6 +40,121 @@ function makeDetail(events: unknown[] = [], number = 1): MockIssueDetail {
 }
 
 describe("createIssuesStore submitIssueComment", () => {
+  it("hides a deleted issue comment while ordinary sync converges", async () => {
+    const staleDetail = makeDetail([{ EventType: "issue_comment", PlatformID: 44 }]);
+    const get = vi.fn(async () => ({ data: staleDetail }));
+    const post = vi.fn(async () => ({ data: staleDetail }));
+    const del = vi.fn(async () => ({ error: undefined }));
+    const store = createIssuesStore({
+      client: {
+        GET: get,
+        POST: post,
+        PUT: vi.fn(),
+        DELETE: del,
+      } as unknown as MiddlemanClient,
+    });
+    await store.loadIssueDetail("octo", "repo", 1, issueRef);
+    await Promise.resolve();
+    get.mockClear();
+
+    const ok = await store.deleteIssueComment("octo", "repo", 1, 44);
+
+    expect(ok).toBe(true);
+    expect(del).toHaveBeenCalledWith("/issues/{provider}/{owner}/{name}/{number}/comments/{comment_id}", {
+      headers: { "Content-Type": "application/json" },
+      params: {
+        path: { provider: "github", owner: "octo", name: "repo", number: 1, comment_id: 44 },
+      },
+    });
+    expect(store.getIssueDetail()?.events).toEqual([]);
+    expect(post).toHaveBeenCalledWith("/issues/{provider}/{owner}/{name}/{number}/sync", {
+      params: { path: { provider: "github", owner: "octo", name: "repo", number: 1 } },
+    });
+    expect(get).not.toHaveBeenCalled();
+  });
+
+  it("does not expose a failed deletion from a previous issue", async () => {
+    let finishDelete: () => void = () => {};
+    const deletePending = new Promise<void>((resolve) => {
+      finishDelete = resolve;
+    });
+    const get = vi.fn(async (_path: string, request: { params: { path: { number: number } } }) => ({
+      data: makeDetail([], request.params.path.number),
+    }));
+    const store = createIssuesStore({
+      client: {
+        GET: get,
+        POST: vi.fn(async () => ({ data: undefined })),
+        PUT: vi.fn(),
+        DELETE: vi.fn(async () => {
+          await deletePending;
+          return { error: { detail: "old deletion failed" } };
+        }),
+      } as unknown as MiddlemanClient,
+    });
+    await store.loadIssueDetail("octo", "repo", 1, { ...issueRef, sync: false });
+
+    const deleting = store.deleteIssueComment("octo", "repo", 1, 44);
+    await store.loadIssueDetail("octo", "repo", 2, { ...issueRef, sync: false });
+    finishDelete();
+    await deleting;
+
+    expect(store.getIssueDetail()?.issue.Number).toBe(2);
+    expect(store.getIssueDetailError()).toBeNull();
+  });
+
+  it("keeps a provider error after reloading the same issue", async () => {
+    let finishDelete: () => void = () => {};
+    const pending = new Promise<void>((resolve) => (finishDelete = resolve));
+    const store = createIssuesStore({
+      client: {
+        GET: vi.fn(async () => ({ data: makeDetail([{ EventType: "issue_comment", PlatformID: 44 }]) })),
+        POST: vi.fn(),
+        PUT: vi.fn(),
+        DELETE: vi.fn(async () => {
+          await pending;
+          return { error: { detail: "provider denied deletion" } };
+        }),
+      } as unknown as MiddlemanClient,
+    });
+    await store.loadIssueDetail("octo", "repo", 1, { ...issueRef, sync: false });
+    const deleting = store.deleteIssueComment("octo", "repo", 1, 44);
+    await store.loadIssueDetail("octo", "repo", 1, { ...issueRef, sync: false });
+    finishDelete();
+    expect(await deleting).toBe(false);
+    expect(store.getIssueDetailError()).toBe("provider denied deletion");
+  });
+
+  it("does not restore the deleted issue over a newer selection", async () => {
+    let finishDelete: () => void = () => {};
+    const deletePending = new Promise<void>((resolve) => {
+      finishDelete = resolve;
+    });
+    const get = vi.fn(async (_path: string, request: { params: { path: { number: number } } }) => ({
+      data: makeDetail(request.params.path.number === 1 ? [] : [{ PlatformID: 99 }], request.params.path.number),
+    }));
+    const store = createIssuesStore({
+      client: {
+        GET: get,
+        POST: vi.fn(async () => ({ data: undefined })),
+        PUT: vi.fn(),
+        DELETE: vi.fn(async () => {
+          await deletePending;
+          return { error: undefined };
+        }),
+      } as unknown as MiddlemanClient,
+    });
+    await store.loadIssueDetail("octo", "repo", 1, { ...issueRef, sync: false });
+
+    const deleting = store.deleteIssueComment("octo", "repo", 1, 44);
+    await store.loadIssueDetail("octo", "repo", 2, { ...issueRef, sync: false });
+    finishDelete();
+    await deleting;
+
+    expect(store.getIssueDetail()?.issue.Number).toBe(2);
+    expect(store.getIssueDetail()?.events).toEqual([{ PlatformID: 99 }]);
+  });
+
   it("refreshes the issues list after posting a comment when on the issues page", async () => {
     const detailData = makeDetail();
     const getCalls: string[] = [];

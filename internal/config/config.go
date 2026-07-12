@@ -550,6 +550,13 @@ type Activity struct {
 	DefaultBranchMaxCommits    int    `toml:"default_branch_max_commits" json:"default_branch_max_commits"`
 }
 
+// PullRequests configures safeguards around pull-request mutations.
+type PullRequests struct {
+	// AllowMidStackMerges permits merging a stack member while an earlier
+	// member remains unmerged. The default is deliberately false.
+	AllowMidStackMerges bool `toml:"allow_mid_stack_merges,omitempty" json:"allow_mid_stack_merges"`
+}
+
 const (
 	TerminalRendererXterm   = "xterm"
 	TerminalRendererGhostty = "ghostty-web"
@@ -780,6 +787,7 @@ type Config struct {
 	Platforms         []PlatformConfig         `toml:"platforms"`
 	GitHubApps        []GitHubAppConfig        `toml:"github_apps"`
 	Activity          Activity                 `toml:"activity"`
+	PullRequests      PullRequests             `toml:"pull_requests"`
 	Notifications     Notifications            `toml:"notifications"`
 	Terminal          Terminal                 `toml:"terminal"`
 	Modes             ModeVisibility           `toml:"modes"`
@@ -1328,7 +1336,7 @@ func (c *Config) validate(skipAppCoverage bool) error {
 		}
 		seen[key] = display
 	}
-	if err := c.validateKataProjectRepoMappings(seen); err != nil {
+	if err := c.validateKataProjectRepoMappings(); err != nil {
 		return err
 	}
 
@@ -1963,7 +1971,7 @@ func kataProjectMappingKey(mapping KataProjectRepoMapping) string {
 	return strings.TrimSpace(mapping.DaemonID) + "\x00" + strings.TrimSpace(mapping.ProjectUID)
 }
 
-func (c *Config) validateKataProjectRepoMappings(configuredExact map[string]string) error {
+func (c *Config) validateKataProjectRepoMappings() error {
 	seen := make(map[string]struct{}, len(c.KataProjects))
 	for i := range c.KataProjects {
 		mapping := &c.KataProjects[i]
@@ -2009,13 +2017,6 @@ func (c *Config) validateKataProjectRepoMappings(configuredExact map[string]stri
 		}
 		seen[dupKey] = struct{}{}
 
-		if _, ok := configuredExact[repoIdentityKey(repo)]; !ok {
-			return fmt.Errorf(
-				"config: kata_projects[%d]: repo_path %q does not match a configured exact repo",
-				i,
-				mapping.RepoPath,
-			)
-		}
 	}
 	return nil
 }
@@ -2638,6 +2639,7 @@ type configFile struct {
 	Agents                    []Agent                  `toml:"agents,omitempty"`
 	DocFolders                []DocFolder              `toml:"doc_folders,omitempty"`
 	Roborev                   Roborev                  `toml:"roborev,omitempty"`
+	PullRequests              PullRequests             `toml:"pull_requests,omitempty"`
 	Msgvault                  *Msgvault                `toml:"msgvault,omitempty"`
 	Tmux                      Tmux                     `toml:"tmux,omitempty"`
 	Shell                     Shell                    `toml:"shell,omitempty"`
@@ -2672,6 +2674,7 @@ func (c *Config) Save(path string) error {
 		Agents:                  cfg.Agents,
 		DocFolders:              cfg.DocFolders,
 		Roborev:                 cfg.Roborev,
+		PullRequests:            cfg.PullRequests,
 		Msgvault:                cfg.Msgvault,
 		Tmux:                    cfg.Tmux,
 		Shell:                   cfg.Shell,

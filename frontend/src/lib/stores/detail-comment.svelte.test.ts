@@ -40,6 +40,143 @@ function makeDetail(events: unknown[] = [], number = 1): MockDetail {
 }
 
 describe("createDetailStore submitComment", () => {
+  it("hides a deleted PR comment while ordinary sync converges", async () => {
+    const staleDetail = makeDetail([{ EventType: "issue_comment", PlatformID: 44 }]);
+    const get = vi.fn(async () => ({ data: staleDetail }));
+    const post = vi.fn(async () => ({ data: staleDetail }));
+    const del = vi.fn(async () => ({ error: undefined }));
+    const store = createDetailStore({
+      client: {
+        GET: get,
+        POST: post,
+        PUT: vi.fn(),
+        DELETE: del,
+      } as unknown as MiddlemanClient,
+    });
+    await store.loadDetail("octo", "repo", 1, pullRef);
+    await Promise.resolve();
+    get.mockClear();
+
+    const ok = await store.deleteComment("octo", "repo", 1, 44);
+
+    expect(ok).toBe(true);
+    expect(del).toHaveBeenCalledWith("/pulls/{provider}/{owner}/{name}/{number}/comments/{comment_id}", {
+      headers: { "Content-Type": "application/json" },
+      params: {
+        path: { provider: "github", owner: "octo", name: "repo", number: 1, comment_id: 44 },
+      },
+    });
+    expect(store.getDetail()?.events).toEqual([]);
+    expect(post).toHaveBeenCalledWith("/pulls/{provider}/{owner}/{name}/{number}/sync", {
+      params: { path: { provider: "github", owner: "octo", name: "repo", number: 1 } },
+    });
+    expect(get).not.toHaveBeenCalled();
+  });
+
+  it("keeps PR detail unchanged when comment deletion fails", async () => {
+    const get = vi.fn(async () => ({ data: makeDetail([{ ID: 44 }]) }));
+    const store = createDetailStore({
+      client: {
+        GET: get,
+        POST: vi.fn(async () => ({ data: undefined })),
+        PUT: vi.fn(),
+        DELETE: vi.fn(async () => ({ error: { detail: "provider denied deletion" } })),
+      } as unknown as MiddlemanClient,
+    });
+    await store.loadDetail("octo", "repo", 1, pullRef);
+    await Promise.resolve();
+    get.mockClear();
+
+    const ok = await store.deleteComment("octo", "repo", 1, 44);
+
+    expect(ok).toBe(false);
+    expect(get).not.toHaveBeenCalled();
+    expect(store.getDetailError()).toBe("provider denied deletion");
+    expect(store.getDetail()?.events).toEqual([{ ID: 44 }]);
+  });
+
+  it("does not expose a failed deletion from a previous PR", async () => {
+    let finishDelete: () => void = () => {};
+    const deletePending = new Promise<void>((resolve) => {
+      finishDelete = resolve;
+    });
+    const get = vi.fn(async (_path: string, request: { params: { path: { number: number } } }) => ({
+      data: makeDetail([], request.params.path.number),
+    }));
+    const store = createDetailStore({
+      client: {
+        GET: get,
+        POST: vi.fn(async () => ({ data: undefined })),
+        PUT: vi.fn(),
+        DELETE: vi.fn(async () => {
+          await deletePending;
+          return { error: { detail: "old deletion failed" } };
+        }),
+      } as unknown as MiddlemanClient,
+    });
+    await store.loadDetail("octo", "repo", 1, { ...pullRef, sync: false });
+
+    const deleting = store.deleteComment("octo", "repo", 1, 44);
+    await store.loadDetail("octo", "repo", 2, { ...pullRef, sync: false });
+    finishDelete();
+    await deleting;
+
+    expect(store.getDetail()?.merge_request.Number).toBe(2);
+    expect(store.getDetailError()).toBeNull();
+  });
+
+  it("keeps a provider error after reloading the same PR", async () => {
+    let finishDelete: () => void = () => {};
+    const pending = new Promise<void>((resolve) => (finishDelete = resolve));
+    const store = createDetailStore({
+      client: {
+        GET: vi.fn(async () => ({ data: makeDetail([{ EventType: "issue_comment", PlatformID: 44 }]) })),
+        POST: vi.fn(),
+        PUT: vi.fn(),
+        DELETE: vi.fn(async () => {
+          await pending;
+          return { error: { detail: "provider denied deletion" } };
+        }),
+      } as unknown as MiddlemanClient,
+    });
+    await store.loadDetail("octo", "repo", 1, { ...pullRef, sync: false });
+    const deleting = store.deleteComment("octo", "repo", 1, 44);
+    await store.loadDetail("octo", "repo", 1, { ...pullRef, sync: false });
+    finishDelete();
+    expect(await deleting).toBe(false);
+    expect(store.getDetailError()).toBe("provider denied deletion");
+  });
+
+  it("does not restore the deleted PR over a newer selection", async () => {
+    let finishDelete: () => void = () => {};
+    const deletePending = new Promise<void>((resolve) => {
+      finishDelete = resolve;
+    });
+    const get = vi.fn(async (_path: string, request: { params: { path: { number: number } } }) => ({
+      data: makeDetail(request.params.path.number === 1 ? [] : [{ PlatformID: 99 }], request.params.path.number),
+    }));
+    const store = createDetailStore({
+      client: {
+        GET: get,
+        POST: vi.fn(async () => ({ data: undefined })),
+        PUT: vi.fn(),
+        DELETE: vi.fn(async () => {
+          await deletePending;
+          return { error: undefined };
+        }),
+      } as unknown as MiddlemanClient,
+    });
+    await store.loadDetail("octo", "repo", 1, { ...pullRef, sync: false });
+
+    const deleting = store.deleteComment("octo", "repo", 1, 44);
+    await store.loadDetail("octo", "repo", 2, { ...pullRef, sync: false });
+    finishDelete();
+    await deleting;
+
+    expect(store.getDetail()?.merge_request.Number).toBe(2);
+    expect(store.getDetail()?.events).toEqual([{ PlatformID: 99 }]);
+  });
+
   it("never flips loading flag while refreshing after a comment", async () => {
     const detailData = makeDetail();
     const loadingDuringRefresh: boolean[] = [];

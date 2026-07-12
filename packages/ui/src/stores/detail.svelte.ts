@@ -122,6 +122,9 @@ export function createDetailStore(opts: DetailStoreOptions) {
     key: string;
     promise: Promise<void>;
   } | null = null;
+  // Provider synchronization is eventually complete. Keep a successfully
+  // deleted comment hidden locally until an ordinary sync no longer returns it.
+  const hiddenDeletedCommentIDs: Record<string, number[]> = {};
 
   // Per-PR monotonic counters for kanban updates.
   const kanbanSeqByPR = new Map<string, number>();
@@ -192,6 +195,7 @@ export function createDetailStore(opts: DetailStoreOptions) {
   // owner/name/number (different host or provider) doesn't inherit
   // another repo's pending body.
   function withPreservedLocalBody(next: PullDetail): PullDetail {
+    next = withHiddenDeletedComments(next);
     if (!unsavedLocalBody) return next;
     if (!detail) return next;
     if (
@@ -216,6 +220,42 @@ export function createDetailStore(opts: DetailStoreOptions) {
         ...next.merge_request,
         Body: detail.merge_request.Body,
       },
+    };
+  }
+
+  function withHiddenDeletedComments(next: PullDetail): PullDetail {
+    if (Object.keys(hiddenDeletedCommentIDs).length === 0) return next;
+    const key = `${next.repo.provider}:${next.repo.platform_host ?? ""}:${next.repo.repo_path}/${next.merge_request.Number}`;
+    const hidden = hiddenDeletedCommentIDs[key];
+    if (!hidden || hidden.length === 0) return next;
+    const events = next.events ?? [];
+    const stillHidden = hidden.filter((id) =>
+      events.some((event) => event.EventType === "issue_comment" && event.PlatformID === id),
+    );
+    if (stillHidden.length === 0) {
+      delete hiddenDeletedCommentIDs[key];
+      return next;
+    }
+    hiddenDeletedCommentIDs[key] = stillHidden;
+    return {
+      ...next,
+      events: events.filter(
+        (event) =>
+          event.EventType !== "issue_comment" || event.PlatformID === null || !stillHidden.includes(event.PlatformID),
+      ),
+    };
+  }
+
+  function hideDeletedComment(ref: DetailRequestRef, commentID: number): void {
+    const key = prKey(ref);
+    const hidden = hiddenDeletedCommentIDs[key] ?? [];
+    if (!hidden.includes(commentID)) hiddenDeletedCommentIDs[key] = [...hidden, commentID];
+    if (!isDetailShowingRef(ref) || !detail) return;
+    detail = {
+      ...detail,
+      events: (detail.events ?? []).filter(
+        (event) => event.EventType !== "issue_comment" || event.PlatformID !== commentID,
+      ),
     };
   }
 
@@ -264,10 +304,10 @@ export function createDetailStore(opts: DetailStoreOptions) {
     number: number,
     expectedGen: number = syncGeneration,
     identity: DetailRequestRef,
-  ): Promise<void> {
+  ): Promise<{ ok: boolean; error?: string }> {
     const ref = detailRequestRef(owner, name, number, identity);
     try {
-      const { data } = await apiClient.GET(providerItemPath("pulls", ref, ""), {
+      const { data, error: requestError } = await apiClient.GET(providerItemPath("pulls", ref, ""), {
         params: {
           path: { ...providerRouteParams(ref), number: ref.number },
         },
@@ -275,16 +315,21 @@ export function createDetailStore(opts: DetailStoreOptions) {
       // Re-check the generation after the awaited request: if the
       // selected PR changed mid-flight, dropping the assignment keeps
       // the new selection's data from being clobbered.
-      if (expectedGen !== syncGeneration) return;
+      if (expectedGen !== syncGeneration) return { ok: false };
+      if (requestError) {
+        return { ok: false, error: apiErrorMessage(requestError, "failed to refresh pull request") };
+      }
       if (data !== undefined) {
         detail = withPreservedLocalBody({
           ...data,
           events: data.events ?? [],
         } as PullDetail);
         detailLoaded = data.detail_loaded ?? detailLoaded;
+        return { ok: true };
       }
-    } catch {
-      // Silent refresh
+      return { ok: false, error: "Pull request refresh returned no detail" };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
     }
   }
 
@@ -1101,6 +1146,36 @@ export function createDetailStore(opts: DetailStoreOptions) {
     return true;
   }
 
+  async function deleteComment(owner: string, name: string, number: number, commentID: number): Promise<boolean> {
+    const ref = currentDetailRef(owner, name, number);
+    storeError = null;
+    try {
+      const { error: requestError } = await apiClient.DELETE(providerItemPath("pulls", ref, "/comments/{comment_id}"), {
+        headers: { "Content-Type": "application/json" },
+        params: {
+          path: {
+            ...providerRouteParams(ref),
+            number,
+            comment_id: commentID,
+          },
+        },
+      });
+      if (requestError) {
+        throw new Error(apiErrorMessage(requestError, "failed to delete comment"));
+      }
+    } catch (err) {
+      if (isDetailShowingRef(ref)) {
+        storeError = err instanceof Error ? err.message : String(err);
+      }
+      return false;
+    }
+    hideDeletedComment(ref, commentID);
+    if (isDetailShowingRef(ref)) {
+      void syncDetail(owner, name, number, syncGeneration, ref);
+    }
+    return true;
+  }
+
   async function replyToDiscussion(
     owner: string,
     name: string,
@@ -1221,6 +1296,7 @@ export function createDetailStore(opts: DetailStoreOptions) {
     toggleDetailPRStar,
     submitComment,
     editComment,
+    deleteComment,
     replyToDiscussion,
     applyReviewSuggestions,
   };

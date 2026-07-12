@@ -109,6 +109,19 @@ type editCommentInput struct {
 
 type editCommentOutput = bodyOutput[mergeRequestEventResponse]
 
+type deleteCommentInput struct {
+	Provider     string `path:"provider"`
+	PlatformHost string
+	Owner        string `path:"owner"`
+	Name         string `path:"name"`
+	Number       int    `path:"number"`
+	CommentID    int64  `path:"comment_id"`
+}
+
+type deleteCommentOutput struct {
+	Status int `status:"204"`
+}
+
 type getDiffReviewDraftOutput = bodyOutput[diffReviewDraftResponse]
 
 type createDiffReviewDraftCommentInput struct {
@@ -256,6 +269,19 @@ type editIssueCommentInput struct {
 
 type editIssueCommentOutput = bodyOutput[db.IssueEvent]
 
+type deleteIssueCommentInput struct {
+	Provider     string `path:"provider"`
+	PlatformHost string
+	Owner        string `path:"owner"`
+	Name         string `path:"name"`
+	Number       int    `path:"number"`
+	CommentID    int64  `path:"comment_id"`
+}
+
+type deleteIssueCommentOutput struct {
+	Status int `status:"204"`
+}
+
 type replyToDiscussionInput struct {
 	Provider     string `path:"provider"`
 	PlatformHost string
@@ -364,6 +390,18 @@ type approvePRInput struct {
 		// Current clients capture platform_head_sha when the approval UI opens;
 		// if omitted, the server falls back to the best stored provider head
 		// for compatibility with older clients.
+		ExpectedHeadSHA string `json:"expected_head_sha,omitempty"`
+	}
+}
+
+type requestChangesPRInput struct {
+	Provider     string `path:"provider"`
+	PlatformHost string
+	Owner        string `path:"owner"`
+	Name         string `path:"name"`
+	Number       int    `path:"number"`
+	Body         struct {
+		Body            string `json:"body"`
 		ExpectedHeadSHA string `json:"expected_head_sha,omitempty"`
 	}
 }
@@ -1222,6 +1260,8 @@ func (s *Server) registerProviderRepoAPI(api huma.API) {
 	huma.Register(api, huma.Operation{OperationID: "post-pr-comment-on-host", Method: http.MethodPost, Path: hostPullPath + "/comments", DefaultStatus: http.StatusCreated, Summary: "Post pull request comment", Tags: []string{"Pull Requests"}}, s.postCommentOnHost)
 	huma.Register(api, huma.Operation{OperationID: "edit-pr-comment", Method: http.MethodPatch, Path: pullPath + "/comments/{comment_id}", DefaultStatus: http.StatusOK, Summary: "Edit pull request comment", Tags: []string{"Pull Requests"}}, s.editComment)
 	huma.Register(api, huma.Operation{OperationID: "edit-pr-comment-on-host", Method: http.MethodPatch, Path: hostPullPath + "/comments/{comment_id}", DefaultStatus: http.StatusOK, Summary: "Edit pull request comment", Tags: []string{"Pull Requests"}}, s.editCommentOnHost)
+	huma.Register(api, huma.Operation{OperationID: "delete-pr-comment", Method: http.MethodDelete, Path: pullPath + "/comments/{comment_id}", DefaultStatus: http.StatusNoContent, Summary: "Delete pull request comment", Tags: []string{"Pull Requests"}}, s.deleteComment)
+	huma.Register(api, huma.Operation{OperationID: "delete-pr-comment-on-host", Method: http.MethodDelete, Path: hostPullPath + "/comments/{comment_id}", DefaultStatus: http.StatusNoContent, Summary: "Delete pull request comment", Tags: []string{"Pull Requests"}}, s.deleteCommentOnHost)
 	huma.Register(api, huma.Operation{OperationID: "reply-to-discussion", Method: http.MethodPost, Path: pullPath + "/discussions/{discussion_id}/reply", DefaultStatus: http.StatusCreated, Summary: "Reply to pull request discussion", Tags: []string{"Pull Requests"}}, s.replyToDiscussion)
 	huma.Register(api, huma.Operation{OperationID: "reply-to-discussion-on-host", Method: http.MethodPost, Path: hostPullPath + "/discussions/{discussion_id}/reply", DefaultStatus: http.StatusCreated, Summary: "Reply to pull request discussion", Tags: []string{"Pull Requests"}}, s.replyToDiscussionOnHost)
 	huma.Register(api, huma.Operation{OperationID: "resolve-discussion", Method: http.MethodPost, Path: pullPath + "/discussions/{discussion_id}/resolve", DefaultStatus: http.StatusOK, Summary: "Resolve pull request discussion", Tags: []string{"Pull Requests"}}, s.resolveDiscussion)
@@ -1263,6 +1303,8 @@ func (s *Server) registerProviderRepoAPI(api huma.API) {
 	huma.Register(api, huma.Operation{OperationID: "edit-issue-content-on-host", Method: http.MethodPatch, Path: hostIssuePath, DefaultStatus: http.StatusOK, Summary: "Edit issue content", Tags: []string{"Issues"}}, s.editIssueContentOnHost)
 	huma.Register(api, huma.Operation{OperationID: "edit-issue-comment", Method: http.MethodPatch, Path: issuePath + "/comments/{comment_id}", DefaultStatus: http.StatusOK, Summary: "Edit issue comment", Tags: []string{"Issues"}}, s.editIssueComment)
 	huma.Register(api, huma.Operation{OperationID: "edit-issue-comment-on-host", Method: http.MethodPatch, Path: hostIssuePath + "/comments/{comment_id}", DefaultStatus: http.StatusOK, Summary: "Edit issue comment", Tags: []string{"Issues"}}, s.editIssueCommentOnHost)
+	huma.Register(api, huma.Operation{OperationID: "delete-issue-comment", Method: http.MethodDelete, Path: issuePath + "/comments/{comment_id}", DefaultStatus: http.StatusNoContent, Summary: "Delete issue comment", Tags: []string{"Issues"}}, s.deleteIssueComment)
+	huma.Register(api, huma.Operation{OperationID: "delete-issue-comment-on-host", Method: http.MethodDelete, Path: hostIssuePath + "/comments/{comment_id}", DefaultStatus: http.StatusNoContent, Summary: "Delete issue comment", Tags: []string{"Issues"}}, s.deleteIssueCommentOnHost)
 	huma.Register(api, huma.Operation{OperationID: "set-issue-labels", Method: http.MethodPut, Path: issuePath + "/labels", DefaultStatus: http.StatusOK, Summary: "Set issue labels", Tags: []string{"Issues"}}, s.setIssueLabels)
 	huma.Register(api, huma.Operation{OperationID: "set-issue-labels-on-host", Method: http.MethodPut, Path: hostIssuePath + "/labels", DefaultStatus: http.StatusOK, Summary: "Set issue labels", Tags: []string{"Issues"}}, s.setIssueLabelsOnHost)
 	huma.Register(api, huma.Operation{OperationID: "set-issue-assignees", Method: http.MethodPut, Path: issuePath + "/assignees", DefaultStatus: http.StatusOK, Summary: "Set issue assignees", Tags: []string{"Issues"}}, s.setIssueAssignees)
@@ -1335,6 +1377,10 @@ func (s *Server) registerProviderRepoAPI(api huma.API) {
 		documentOperation("approve-pull", "Approve pull request", "Pull Requests"))
 	huma.Post(api, hostPullPath+"/approve", s.approvePROnHost,
 		documentOperation("approve-pull-on-host", "Approve pull request", "Pull Requests"))
+	huma.Post(api, pullPath+"/request-changes", s.requestChangesPR,
+		documentOperation("request-pull-changes", "Request pull request changes", "Pull Requests"))
+	huma.Post(api, hostPullPath+"/request-changes", s.requestChangesPROnHost,
+		documentOperation("request-pull-changes-on-host", "Request pull request changes", "Pull Requests"))
 	huma.Post(api, pullPath+"/approve-workflows", s.approveWorkflows,
 		documentOperation("approve-pull-workflows", "Approve pull request workflows", "Pull Requests"))
 	huma.Post(api, hostPullPath+"/approve-workflows", s.approveWorkflowsOnHost,
@@ -2234,6 +2280,48 @@ func (s *Server) editComment(ctx context.Context, input *editCommentInput) (*edi
 	return &editCommentOutput{Body: mergeRequestEventResponseFromDB(event)}, nil
 }
 
+func (s *Server) deleteComment(ctx context.Context, input *deleteCommentInput) (*deleteCommentOutput, error) {
+	repo, err := s.requireRepoRouteCapability(
+		ctx,
+		input.Provider, input.PlatformHost, input.Owner, input.Name,
+		capabilityCommentMutation,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.requireSyncerCapability(*repo, capabilityCommentMutation); err != nil {
+		return nil, err
+	}
+	mutator, err := s.syncer.CommentMutator(repoProviderKind(*repo), repoProviderHost(*repo))
+	if err != nil {
+		return nil, unsupportedCapabilityProblem(*repo, capabilityCommentMutation)
+	}
+	ref := repoNumberPathRef{
+		repoID: repo.ID, owner: repo.Owner, name: repo.Name,
+		number: input.Number, platformHost: repo.PlatformHost,
+	}
+	mrID, err := s.lookupMRID(ctx, ref)
+	if err != nil {
+		return nil, problemNotFound(CodePullNotFound, err.Error(), nil)
+	}
+	commentExists, err := s.db.MRCommentEventExists(ctx, mrID, input.CommentID)
+	if err != nil {
+		return nil, problemInternal("validate comment target failed")
+	}
+	if !commentExists {
+		return nil, problemNotFound(CodeCommentNotFound, "comment not found for pull request", nil)
+	}
+	if err := mutator.DeleteMergeRequestComment(
+		ctx, platformRepoRefFromDB(*repo), input.Number, input.CommentID,
+	); err != nil {
+		return nil, providerCallProblemWithDetail(
+			err, string(repoProviderKind(*repo)), repoProviderHost(*repo),
+			"delete comment on provider failed",
+		)
+	}
+	return &deleteCommentOutput{Status: http.StatusNoContent}, nil
+}
+
 func (s *Server) replyToDiscussion(ctx context.Context, input *replyToDiscussionInput) (*replyToDiscussionOutput, error) {
 	if strings.TrimSpace(input.Body.Body) == "" {
 		return nil, problemValidation("body.body", "reply body must not be empty")
@@ -2771,6 +2859,51 @@ func (s *Server) editIssueComment(ctx context.Context, input *editIssueCommentIn
 	return &editIssueCommentOutput{Body: event}, nil
 }
 
+func (s *Server) deleteIssueComment(
+	ctx context.Context,
+	input *deleteIssueCommentInput,
+) (*deleteIssueCommentOutput, error) {
+	repo, err := s.requireRepoRouteCapability(
+		ctx,
+		input.Provider, input.PlatformHost, input.Owner, input.Name,
+		capabilityCommentMutation,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.requireSyncerCapability(*repo, capabilityCommentMutation); err != nil {
+		return nil, err
+	}
+	mutator, err := s.syncer.CommentMutator(repoProviderKind(*repo), repoProviderHost(*repo))
+	if err != nil {
+		return nil, unsupportedCapabilityProblem(*repo, capabilityCommentMutation)
+	}
+	ref := repoNumberPathRef{
+		repoID: repo.ID, owner: repo.Owner, name: repo.Name,
+		number: input.Number, platformHost: repo.PlatformHost,
+	}
+	issueID, err := s.lookupIssueID(ctx, ref)
+	if err != nil {
+		return nil, problemNotFound(CodeIssueNotFound, err.Error(), nil)
+	}
+	commentExists, err := s.db.IssueCommentEventExists(ctx, issueID, input.CommentID)
+	if err != nil {
+		return nil, problemInternal("validate comment target failed")
+	}
+	if !commentExists {
+		return nil, problemNotFound(CodeCommentNotFound, "comment not found for issue", nil)
+	}
+	if err := mutator.DeleteIssueComment(
+		ctx, platformRepoRefFromDB(*repo), input.Number, input.CommentID,
+	); err != nil {
+		return nil, providerCallProblemWithDetail(
+			err, string(repoProviderKind(*repo)), repoProviderHost(*repo),
+			"delete comment on provider failed",
+		)
+	}
+	return &deleteIssueCommentOutput{Status: http.StatusNoContent}, nil
+}
+
 func (s *Server) setStarred(ctx context.Context, input *starredInput) (*statusOnlyOutput, error) {
 	repoID, err := s.lookupStarredRepoID(ctx, input.Body)
 	if err != nil {
@@ -2949,15 +3082,81 @@ func (s *Server) approvePR(ctx context.Context, input *approvePRInput) (*actionS
 	return &actionStatusOutput{Body: actionStatusBody{Status: "approved"}}, nil
 }
 
+func (s *Server) requestChangesPR(ctx context.Context, input *requestChangesPRInput) (*actionStatusOutput, error) {
+	repo, err := s.requireRepoRouteCapability(
+		ctx,
+		input.Provider, input.PlatformHost, input.Owner, input.Name,
+		capabilityReviewMutation,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.requireSyncerCapability(*repo, capabilityReviewMutation); err != nil {
+		return nil, err
+	}
+	caps := s.capabilitiesForRepo(*repo)
+	if !reviewActionSupported(caps, platform.ReviewActionRequestChanges) {
+		return nil, problemUnsupportedCapability(*repo, "review_action_request_changes")
+	}
+	body := strings.TrimSpace(input.Body.Body)
+	if body == "" {
+		return nil, huma.Error400BadRequest("request changes review body is required")
+	}
+
+	mr, err := s.db.GetMergeRequestByRepoIDAndNumber(ctx, repo.ID, input.Number)
+	if err != nil {
+		return nil, problemInternal("get pull request failed")
+	}
+	if mr == nil {
+		return nil, problemNotFound(CodePullNotFound, "pull request not found", nil)
+	}
+	if s.mergeRequestAuthoredByViewer(ctx, *repo, *mr) {
+		return nil, problemForbidden(
+			"You cannot request changes on your own pull request",
+			map[string]any{"reason": availabilityCodeSelfApproval, "provider": string(repoProviderKind(*repo)), "platformHost": repoProviderHost(*repo)},
+		)
+	}
+	mutator, err := s.syncer.RequestChangesMutator(
+		repoProviderKind(*repo), repoProviderHost(*repo),
+	)
+	if err != nil {
+		return nil, problemUnsupportedCapability(*repo, "review_action_request_changes")
+	}
+	expectedHeadSHA := approvalReviewHeadSHA(mr, input.Body.ExpectedHeadSHA)
+	err = mutator.RequestChanges(ctx, platformRepoRefFromDB(*repo), input.Number, body, expectedHeadSHA)
+	if err != nil {
+		if errors.Is(err, platform.ErrStaleState) {
+			s.syncAfterStaleReviewDraftPublish(*repo, input.Number)
+		}
+		return nil, providerCallProblemWithDetail(
+			err,
+			string(repoProviderKind(*repo)), repoProviderHost(*repo),
+			"provider API error",
+		)
+	}
+
+	if syncErr := s.syncer.SyncMROnProvider(
+		ctx,
+		repoProviderKind(*repo), repoProviderHost(*repo),
+		repo.Owner, repo.Name, input.Number,
+	); syncErr != nil {
+		slog.Warn("sync after requesting changes", "err", syncErr)
+	}
+	return &actionStatusOutput{Body: actionStatusBody{Status: "changes_requested"}}, nil
+}
+
 // approvalReviewHeadSHA resolves the provider commit to attach a direct
-// approval to. Direct /approve is a provider-head mutation: clients should
-// send the head captured when the approval UI opened, normally
-// platform_head_sha. Omitting the pin is a compatibility path for older
-// clients; in that case middleman binds the approval to the best stored
-// provider head rather than rejecting the request. Stale supplied pins are
-// delegated to provider head-binding where available and mapped through the
-// normal stale_state path. Merge and draft-review publish use reviewedHeadSHA
-// instead because those paths require a verified diff snapshot.
+// review to. Direct /approve and /request-changes are provider-head
+// mutations sharing this resolution on purpose: both come from the same
+// review form, and a change request must not be pinned more strictly (or
+// more loosely) than an approval. Clients should send the head captured
+// when the review UI opened, normally platform_head_sha. Omitting the pin
+// is a compatibility path for older clients; in that case middleman binds
+// the review to the best stored provider head rather than rejecting the
+// request. Stale supplied pins are delegated to provider head-binding where
+// available and mapped through the normal stale_state path. Merge and
+// draft-review publish use reviewedHeadSHA instead because those paths
+// require a verified diff snapshot.
 func approvalReviewHeadSHA(mr *db.MergeRequest, clientSHA string) string {
 	if sha := strings.TrimSpace(clientSHA); sha != "" {
 		return sha
@@ -3204,6 +3403,9 @@ func (s *Server) mergePRWithBody(
 	if mr == nil {
 		return mergePRBody{}, problemNotFound(CodePullNotFound, "pull request not found", nil)
 	}
+	if err := s.requireMidStackMergeAllowed(ctx, repo.ID, number); err != nil {
+		return mergePRBody{}, err
+	}
 	expectedHeadSHA, err := s.preflightMergePR(repo, mr, number, body)
 	if err != nil {
 		return mergePRBody{}, err
@@ -3289,6 +3491,40 @@ func (s *Server) mergePRWithBody(
 		SHA:     result.SHA,
 		Message: result.Message,
 	}, nil
+}
+
+func (s *Server) requireMidStackMergeAllowed(ctx context.Context, repoID int64, number int) error {
+	s.cfgMu.Lock()
+	allowed := s.cfg != nil && s.cfg.PullRequests.AllowMidStackMerges
+	s.cfgMu.Unlock()
+	if allowed {
+		return nil
+	}
+
+	stack, members, err := s.db.GetStackForPRByRepoID(ctx, repoID, number)
+	if err != nil {
+		return problemInternal("get stack for pull request failed")
+	}
+	if stack == nil {
+		return nil
+	}
+
+	for _, member := range members {
+		if member.Number == number {
+			return nil
+		}
+		if member.State != string(db.MergeRequestStateMerged) {
+			return problemConflict(
+				CodeConflict,
+				"mid-stack merges are disabled; merge the bottom unmerged branch first",
+				map[string]any{
+					"reason":          "mid_stack_merge_disallowed",
+					"blocking_number": member.Number,
+				},
+			)
+		}
+	}
+	return nil
 }
 
 func (s *Server) preflightMergePR(
@@ -5051,9 +5287,13 @@ func (s *Server) createWorkspaceProvider(
 }
 
 func (s *Server) runWorkspaceSetup(ws *workspace.Workspace) {
+	s.runWorkspaceSetupWithBasePath(ws, "")
+}
+
+func (s *Server) runWorkspaceSetupWithBasePath(ws *workspace.Workspace, basePath string) {
 	s.runBackground(func(bgCtx context.Context) {
 		for {
-			setupErr := s.workspaces.Setup(bgCtx, ws)
+			setupErr := s.workspaces.SetupWithWorktreeBasePath(bgCtx, ws, basePath)
 			summary, getErr := s.workspaces.GetSummary(
 				bgCtx, ws.ID,
 			)

@@ -2464,6 +2464,63 @@ components:
       required:
         - daemons
       type: object
+    KataMappingTargetResponse:
+      additionalProperties: false
+      properties:
+        display_name:
+          type: string
+        repo:
+          $ref: "#/components/schemas/RepoRefResponse"
+      required:
+        - display_name
+        - repo
+      type: object
+    KataProjectMappingDiagnostic:
+      additionalProperties: false
+      properties:
+        daemon_id:
+          type: string
+        project_name:
+          type: string
+        project_uid:
+          type: string
+        repo:
+          $ref: "#/components/schemas/RepoRefResponse"
+        source:
+          type: string
+        status:
+          type: string
+      required:
+        - daemon_id
+        - project_uid
+        - project_name
+        - status
+      type: object
+    KataProjectMappingsResponse:
+      additionalProperties: false
+      properties:
+        $schema:
+          description: A URL to the JSON Schema for this object.
+          examples:
+            - /api/v1/schemas/KataProjectMappingsResponse.json
+          format: uri
+          readOnly: true
+          type: string
+        daemon_id:
+          type: string
+        projects:
+          items:
+            $ref: "#/components/schemas/KataProjectMappingDiagnostic"
+          type: array
+        targets:
+          items:
+            $ref: "#/components/schemas/KataMappingTargetResponse"
+          type: array
+      required:
+        - daemon_id
+        - projects
+        - targets
+      type: object
     KataProjectRepoMapping:
       additionalProperties: false
       properties:
@@ -4470,6 +4527,14 @@ components:
         - pushed
         - files
       type: object
+    PullRequests:
+      additionalProperties: false
+      properties:
+        allow_mid_stack_merges:
+          type: boolean
+      required:
+        - allow_mid_stack_merges
+      type: object
     RateLimitHostStatus:
       additionalProperties: false
       properties:
@@ -5313,6 +5378,8 @@ components:
           $ref: "#/components/schemas/OperationAvailability"
         create_issue:
           $ref: "#/components/schemas/OperationAvailability"
+        delete_comment:
+          $ref: "#/components/schemas/OperationAvailability"
         edit_comment:
           $ref: "#/components/schemas/OperationAvailability"
         mark_draft:
@@ -5351,6 +5418,7 @@ components:
         - review_draft
         - add_comment
         - edit_comment
+        - delete_comment
         - add_label
         - remove_label
         - set_assignees
@@ -5746,6 +5814,40 @@ components:
       required:
         - worktree_base_path
       type: object
+    RequestChangesPRHostInputBody:
+      additionalProperties: false
+      properties:
+        $schema:
+          description: A URL to the JSON Schema for this object.
+          examples:
+            - /api/v1/schemas/RequestChangesPRHostInputBody.json
+          format: uri
+          readOnly: true
+          type: string
+        body:
+          type: string
+        expected_head_sha:
+          type: string
+      required:
+        - body
+      type: object
+    RequestChangesPRInputBody:
+      additionalProperties: false
+      properties:
+        $schema:
+          description: A URL to the JSON Schema for this object.
+          examples:
+            - /api/v1/schemas/RequestChangesPRInputBody.json
+          format: uri
+          readOnly: true
+          type: string
+        body:
+          type: string
+        expected_head_sha:
+          type: string
+      required:
+        - body
+      type: object
     ResolveDiscussionHostInputBody:
       additionalProperties: false
       properties:
@@ -6137,6 +6239,8 @@ components:
           $ref: "#/components/schemas/ModeVisibility"
         notifications:
           $ref: "#/components/schemas/NotificationsSettingsResponse"
+        pull_requests:
+          $ref: "#/components/schemas/PullRequests"
         repos:
           items:
             $ref: "#/components/schemas/ConfiguredRepoStatus"
@@ -6146,6 +6250,7 @@ components:
       required:
         - repos
         - activity
+        - pull_requests
         - notifications
         - terminal
         - agents
@@ -6629,6 +6734,8 @@ components:
           type: array
         modes:
           $ref: "#/components/schemas/ModeVisibility"
+        pull_requests:
+          $ref: "#/components/schemas/PullRequests"
         terminal:
           $ref: "#/components/schemas/Terminal"
       type: object
@@ -9407,6 +9514,53 @@ paths:
       tags:
         - Issues
   /host/{platform_host}/issues/{provider}/{owner}/{name}/{number}/comments/{comment_id}:
+    delete:
+      operationId: delete-issue-comment-on-host
+      parameters:
+        - in: path
+          name: provider
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: platform_host
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: owner
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: name
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: number
+          required: true
+          schema:
+            format: int64
+            type: integer
+        - in: path
+          name: comment_id
+          required: true
+          schema:
+            format: int64
+            type: integer
+      responses:
+        "204":
+          description: No Content
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemError"
+          description: Error
+      summary: Delete issue comment
+      tags:
+        - Issues
     patch:
       operationId: edit-issue-comment-on-host
       parameters:
@@ -10054,6 +10208,53 @@ paths:
       tags:
         - Pull Requests
   /host/{platform_host}/pulls/{provider}/{owner}/{name}/{number}/comments/{comment_id}:
+    delete:
+      operationId: delete-pr-comment-on-host
+      parameters:
+        - in: path
+          name: provider
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: platform_host
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: owner
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: name
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: number
+          required: true
+          schema:
+            format: int64
+            type: integer
+        - in: path
+          name: comment_id
+          required: true
+          schema:
+            format: int64
+            type: integer
+      responses:
+        "204":
+          description: No Content
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemError"
+          description: Error
+      summary: Delete pull request comment
+      tags:
+        - Pull Requests
     patch:
       operationId: edit-pr-comment-on-host
       parameters:
@@ -10767,6 +10968,58 @@ paths:
                 $ref: "#/components/schemas/ProblemError"
           description: Error
       summary: Mark pull request ready for review
+      tags:
+        - Pull Requests
+  /host/{platform_host}/pulls/{provider}/{owner}/{name}/{number}/request-changes:
+    post:
+      operationId: request-pull-changes-on-host
+      parameters:
+        - in: path
+          name: provider
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: platform_host
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: owner
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: name
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: number
+          required: true
+          schema:
+            format: int64
+            type: integer
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RequestChangesPRHostInputBody"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ActionStatusBody"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemError"
+          description: Error
+      summary: Request pull request changes
       tags:
         - Pull Requests
   /host/{platform_host}/pulls/{provider}/{owner}/{name}/{number}/review-draft:
@@ -12572,6 +12825,48 @@ paths:
       tags:
         - Issues
   /issues/{provider}/{owner}/{name}/{number}/comments/{comment_id}:
+    delete:
+      operationId: delete-issue-comment
+      parameters:
+        - in: path
+          name: provider
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: owner
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: name
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: number
+          required: true
+          schema:
+            format: int64
+            type: integer
+        - in: path
+          name: comment_id
+          required: true
+          schema:
+            format: int64
+            type: integer
+      responses:
+        "204":
+          description: No Content
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemError"
+          description: Error
+      summary: Delete issue comment
+      tags:
+        - Issues
     patch:
       operationId: edit-issue-comment
       parameters:
@@ -12860,6 +13155,36 @@ paths:
                 $ref: "#/components/schemas/ProblemError"
           description: Error
       summary: List Kata daemons
+      tags:
+        - Kata
+  /kata/project-mappings:
+    get:
+      operationId: get-kata-project-mappings
+      parameters:
+        - description: Kata daemon id; the effective default daemon when empty
+          in: header
+          name: X-Middleman-Kata-Daemon
+          schema:
+            description: Kata daemon id; the effective default daemon when empty
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/KataProjectMappingsResponse"
+          description: OK
+          headers:
+            Vary:
+              schema:
+                type: string
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemError"
+          description: Error
+      summary: Inspect effective Kata project repository mappings
       tags:
         - Kata
   /kata/tasks/{issue_uid}:
@@ -14530,6 +14855,48 @@ paths:
       tags:
         - Pull Requests
   /pulls/{provider}/{owner}/{name}/{number}/comments/{comment_id}:
+    delete:
+      operationId: delete-pr-comment
+      parameters:
+        - in: path
+          name: provider
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: owner
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: name
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: number
+          required: true
+          schema:
+            format: int64
+            type: integer
+        - in: path
+          name: comment_id
+          required: true
+          schema:
+            format: int64
+            type: integer
+      responses:
+        "204":
+          description: No Content
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemError"
+          description: Error
+      summary: Delete pull request comment
+      tags:
+        - Pull Requests
     patch:
       operationId: edit-pr-comment
       parameters:
@@ -15178,6 +15545,53 @@ paths:
                 $ref: "#/components/schemas/ProblemError"
           description: Error
       summary: Mark pull request ready for review
+      tags:
+        - Pull Requests
+  /pulls/{provider}/{owner}/{name}/{number}/request-changes:
+    post:
+      operationId: request-pull-changes
+      parameters:
+        - in: path
+          name: provider
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: owner
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: name
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: number
+          required: true
+          schema:
+            format: int64
+            type: integer
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RequestChangesPRInputBody"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ActionStatusBody"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemError"
+          description: Error
+      summary: Request pull request changes
       tags:
         - Pull Requests
   /pulls/{provider}/{owner}/{name}/{number}/review-draft:

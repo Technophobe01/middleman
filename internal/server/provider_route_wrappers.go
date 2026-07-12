@@ -55,6 +55,15 @@ type editCommentHostInput struct {
 	}
 }
 
+type deleteCommentHostInput struct {
+	Provider     string `path:"provider"`
+	PlatformHost string `path:"platform_host"`
+	Owner        string `path:"owner"`
+	Name         string `path:"name"`
+	Number       int    `path:"number"`
+	CommentID    int64  `path:"comment_id"`
+}
+
 type replyToDiscussionHostInput struct {
 	Provider     string `path:"provider"`
 	PlatformHost string `path:"platform_host"`
@@ -125,6 +134,18 @@ type publishDiffReviewDraftHostInput struct {
 	}
 }
 
+type requestChangesPRHostInput struct {
+	Provider     string `path:"provider"`
+	PlatformHost string `path:"platform_host"`
+	Owner        string `path:"owner"`
+	Name         string `path:"name"`
+	Number       int    `path:"number"`
+	Body         struct {
+		Body            string `json:"body"`
+		ExpectedHeadSHA string `json:"expected_head_sha,omitempty"`
+	}
+}
+
 type applyReviewSuggestionHostInput struct {
 	Provider     string `path:"provider"`
 	PlatformHost string `path:"platform_host"`
@@ -178,6 +199,15 @@ type editIssueCommentHostInput struct {
 	Body         struct {
 		Body string `json:"body"`
 	}
+}
+
+type deleteIssueCommentHostInput struct {
+	Provider     string `path:"provider"`
+	PlatformHost string `path:"platform_host"`
+	Owner        string `path:"owner"`
+	Name         string `path:"name"`
+	Number       int    `path:"number"`
+	CommentID    int64  `path:"comment_id"`
 }
 
 type getRepoHostInput struct {
@@ -426,6 +456,13 @@ func (s *Server) editCommentOnHost(ctx context.Context, input *editCommentHostIn
 	return s.editComment(ctx, &next)
 }
 
+func (s *Server) deleteCommentOnHost(ctx context.Context, input *deleteCommentHostInput) (*deleteCommentOutput, error) {
+	return s.deleteComment(ctx, &deleteCommentInput{
+		Provider: input.Provider, PlatformHost: input.PlatformHost,
+		Owner: input.Owner, Name: input.Name, Number: input.Number, CommentID: input.CommentID,
+	})
+}
+
 func (s *Server) replyToDiscussionOnHost(ctx context.Context, input *replyToDiscussionHostInput) (*replyToDiscussionOutput, error) {
 	next := replyToDiscussionInput{
 		Provider:     input.Provider,
@@ -663,6 +700,16 @@ func (s *Server) editIssueCommentOnHost(ctx context.Context, input *editIssueCom
 	return s.editIssueComment(ctx, &next)
 }
 
+func (s *Server) deleteIssueCommentOnHost(
+	ctx context.Context,
+	input *deleteIssueCommentHostInput,
+) (*deleteIssueCommentOutput, error) {
+	return s.deleteIssueComment(ctx, &deleteIssueCommentInput{
+		Provider: input.Provider, PlatformHost: input.PlatformHost,
+		Owner: input.Owner, Name: input.Name, Number: input.Number, CommentID: input.CommentID,
+	})
+}
+
 func (s *Server) setIssueLabelsOnHost(ctx context.Context, input *setIssueLabelsHostInput) (*setLabelsOutput, error) {
 	next := setIssueLabelsInput{
 		Provider:     input.Provider,
@@ -730,6 +777,21 @@ func (s *Server) approvePROnHost(ctx context.Context, input *approvePRHostInput)
 		Body:         input.Body,
 	}
 	return s.approvePR(ctx, &next)
+}
+
+func (s *Server) requestChangesPROnHost(
+	ctx context.Context,
+	input *requestChangesPRHostInput,
+) (*actionStatusOutput, error) {
+	next := requestChangesPRInput{
+		Provider:     input.Provider,
+		PlatformHost: input.PlatformHost,
+		Owner:        input.Owner,
+		Name:         input.Name,
+		Number:       input.Number,
+		Body:         input.Body,
+	}
+	return s.requestChangesPR(ctx, &next)
 }
 
 func (s *Server) approveWorkflowsOnHost(ctx context.Context, input *repoNumberHostInput) (*actionStatusOutput, error) {

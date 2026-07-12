@@ -92,8 +92,10 @@ type CommentMutator interface {
 		commentID int64,
 		body string,
 	) (MergeRequestEvent, error)
+	DeleteMergeRequestComment(ctx context.Context, ref RepoRef, number int, commentID int64) error
 	CreateIssueComment(ctx context.Context, ref RepoRef, number int, body string) (IssueEvent, error)
 	EditIssueComment(ctx context.Context, ref RepoRef, number int, commentID int64, body string) (IssueEvent, error)
+	DeleteIssueComment(ctx context.Context, ref RepoRef, number int, commentID int64) error
 }
 
 type StateMutator interface {
@@ -173,6 +175,23 @@ type ReviewMutator interface {
 		body string,
 		expectedHeadSHA string,
 	) (MergeRequestEvent, error)
+}
+
+type RequestChangesMutator interface {
+	// RequestChanges submits a blocking review pinned to expectedHeadSHA
+	// with the same head-binding semantics as
+	// ReviewMutator.ApproveMergeRequest: the pin is forwarded to the
+	// provider, which attaches the review to that commit or rejects a
+	// stale head where it can natively. Implementations must not layer
+	// extra client-side head verification or post-submit revocation on
+	// top — request changes and approve share one submission contract.
+	RequestChanges(
+		ctx context.Context,
+		ref RepoRef,
+		number int,
+		body string,
+		expectedHeadSHA string,
+	) error
 }
 
 type ThreadReplier interface {

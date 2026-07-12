@@ -46,12 +46,17 @@ func TestProviderCapabilitiesEnableProvenMutations(t *testing.T) {
 		IssueMutation:       true,
 		AssigneeMutation:    true,
 		MutationHeadBinding: true,
+		SupportedReviewActions: []platform.ReviewAction{
+			platform.ReviewActionComment,
+			platform.ReviewActionApprove,
+			platform.ReviewActionRequestChanges,
+		},
 		// ReviewerMutation stays false: fakeTransport does not
 		// implement ReviewRequestTransport.
 	}, provider.Capabilities())
 }
 
-func TestProviderCapabilitiesDoNotAdvertiseInlineReviewSupportByDefault(t *testing.T) {
+func TestProviderCapabilitiesDoNotAdvertiseInlineReviewDraftSupportByDefault(t *testing.T) {
 	assert := assert.New(t)
 	provider := NewProvider(
 		platform.KindForgejo,
@@ -67,7 +72,6 @@ func TestProviderCapabilitiesDoNotAdvertiseInlineReviewSupportByDefault(t *testi
 	assert.False(caps.ReviewThreadResolution)
 	assert.False(caps.ReadReviewThreads)
 	assert.False(caps.NativeMultilineRanges)
-	assert.Empty(caps.SupportedReviewActions)
 }
 
 func TestProviderMutationsNormalizeTransportResponses(t *testing.T) {
@@ -92,6 +96,8 @@ func TestProviderMutationsNormalizeTransportResponses(t *testing.T) {
 	require.NoError(err)
 	editedComment, err := provider.EditIssueComment(context.Background(), ref, 8, 10, "edited")
 	require.NoError(err)
+	require.NoError(provider.DeleteMergeRequestComment(context.Background(), ref, 7, 10))
+	require.NoError(provider.DeleteIssueComment(context.Background(), ref, 8, 10))
 	issue, err := provider.CreateIssue(context.Background(), ref, "issue", "body")
 	require.NoError(err)
 	closedPR, err := provider.SetMergeRequestState(context.Background(), ref, 7, "closed")
@@ -118,7 +124,7 @@ func TestProviderMutationsNormalizeTransportResponses(t *testing.T) {
 	assert.Equal("abc", merged.SHA)
 	assert.Equal("edited", editedPR.Title)
 	assert.Equal([]string{
-		"create_pr_comment", "create_issue_comment", "edit_issue_comment", "create_issue",
+		"create_pr_comment", "create_issue_comment", "edit_issue_comment", "delete_comment", "delete_comment", "create_issue",
 		"edit_pull:closed", "edit_issue:closed", "merge:squash", "edit_pull:",
 	}, transport.mutationCalls)
 }
@@ -366,6 +372,7 @@ type fakeTransport struct {
 	issue       IssueDTO
 	merge       MergeResultDTO
 	review      ReviewDTO
+	reviewErr   error
 
 	userRepoPages []int
 	orgRepoPages  []int
@@ -484,6 +491,11 @@ func (t *fakeTransport) EditIssueComment(_ context.Context, _ platform.RepoRef, 
 	return comment, nil
 }
 
+func (t *fakeTransport) DeleteIssueComment(context.Context, platform.RepoRef, int64) error {
+	t.mutationCalls = append(t.mutationCalls, "delete_comment")
+	return nil
+}
+
 func (t *fakeTransport) CreateIssue(context.Context, platform.RepoRef, string, string) (IssueDTO, error) {
 	t.mutationCalls = append(t.mutationCalls, "create_issue")
 	return t.issue, nil
@@ -518,7 +530,7 @@ func (t *fakeTransport) MergePullRequest(_ context.Context, _ platform.RepoRef, 
 
 func (t *fakeTransport) CreatePullReview(_ context.Context, _ platform.RepoRef, _ int, opts ReviewOptions) (ReviewDTO, error) {
 	t.mutationCalls = append(t.mutationCalls, "review:"+opts.State+":"+opts.CommitID)
-	return t.review, nil
+	return t.review, t.reviewErr
 }
 
 func pageFor[T any](pages [][]T, page int) ([]T, Page, error) {
@@ -585,4 +597,21 @@ func TestProviderApproveSubmitsReview(t *testing.T) {
 	assert.Equal("review", event.EventType)
 	assert.Equal("APPROVED", event.Summary)
 	assert.Equal("review:APPROVED:reviewed-head", transport.mutationCalls[len(transport.mutationCalls)-1])
+}
+
+func TestProviderRequestChangesSubmitsReviewAndMapsErrors(t *testing.T) {
+	require := Require.New(t)
+	assert := assert.New(t)
+	ref := platform.RepoRef{Owner: "acme", Name: "widget"}
+	transport := &fakeTransport{}
+	provider := NewProvider(platform.KindGitea, "gitea.example.com", transport, WithMutations())
+
+	err := provider.RequestChanges(context.Background(), ref, 7, "needs work", "reviewed-head")
+	require.NoError(err)
+	assert.Equal("review:REQUEST_CHANGES:reviewed-head", transport.mutationCalls[len(transport.mutationCalls)-1])
+
+	transport.reviewErr = &HTTPError{StatusCode: 403, Message: "forbidden"}
+	err = provider.RequestChanges(context.Background(), ref, 7, "needs work", "reviewed-head")
+	require.Error(err)
+	assert.ErrorIs(err, platform.ErrPermissionDenied)
 }

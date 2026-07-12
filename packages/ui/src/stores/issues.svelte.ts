@@ -112,6 +112,9 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
     promise: Promise<void> | null;
     syncMode: IssueDetailSyncMode;
   } | null = null;
+  // Provider synchronization is eventually complete. Keep a successfully
+  // deleted comment hidden locally until an ordinary sync no longer returns it.
+  const hiddenDeletedCommentIDs: Record<string, number[]> = {};
 
   // --- list reads ---
 
@@ -281,6 +284,7 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
   // owner/name/number (different host or provider) doesn't inherit
   // another repo's pending body.
   function withPreservedLocalBody(next: IssueDetail): IssueDetail {
+    next = withHiddenDeletedComments(next);
     if (!unsavedLocalBody) return next;
     if (!issueDetail) return next;
     if (
@@ -302,6 +306,42 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
     return {
       ...next,
       issue: { ...next.issue, Body: issueDetail.issue.Body },
+    };
+  }
+
+  function withHiddenDeletedComments(next: IssueDetail): IssueDetail {
+    if (Object.keys(hiddenDeletedCommentIDs).length === 0) return next;
+    const key = `${next.repo.provider}:${next.repo.platform_host ?? ""}:${next.repo.repo_path}/${next.issue.Number}`;
+    const hidden = hiddenDeletedCommentIDs[key];
+    if (!hidden || hidden.length === 0) return next;
+    const events = next.events ?? [];
+    const stillHidden = hidden.filter((id) =>
+      events.some((event) => event.EventType === "issue_comment" && event.PlatformID === id),
+    );
+    if (stillHidden.length === 0) {
+      delete hiddenDeletedCommentIDs[key];
+      return next;
+    }
+    hiddenDeletedCommentIDs[key] = stillHidden;
+    return {
+      ...next,
+      events: events.filter(
+        (event) =>
+          event.EventType !== "issue_comment" || event.PlatformID === null || !stillHidden.includes(event.PlatformID),
+      ),
+    };
+  }
+
+  function hideDeletedComment(ref: IssueDetailRequestRef, commentID: number): void {
+    const key = `${ref.provider}:${ref.platformHost ?? ""}:${ref.repoPath}/${ref.number}`;
+    const hidden = hiddenDeletedCommentIDs[key] ?? [];
+    if (!hidden.includes(commentID)) hiddenDeletedCommentIDs[key] = [...hidden, commentID];
+    if (!isIssueDetailShowingRef(ref) || !issueDetail) return;
+    issueDetail = {
+      ...issueDetail,
+      events: (issueDetail.events ?? []).filter(
+        (event) => event.EventType !== "issue_comment" || event.PlatformID !== commentID,
+      ),
     };
   }
 
@@ -511,9 +551,9 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
     number: number,
     ref: IssueDetailRequestRef,
     expectedGen: number = issueSyncGeneration,
-  ): Promise<void> {
+  ): Promise<{ ok: boolean; error?: string }> {
     try {
-      const { data } = await apiClient.GET(providerItemPath("issues", ref, ""), {
+      const { data, error: requestError } = await apiClient.GET(providerItemPath("issues", ref, ""), {
         params: {
           path: { ...providerRouteParams(ref), number: ref.number },
         },
@@ -521,16 +561,21 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
       // Re-check the generation after the awaited request: if the
       // selected issue changed mid-flight, dropping the assignment
       // keeps the new selection's data from being clobbered.
-      if (expectedGen !== issueSyncGeneration) return;
+      if (expectedGen !== issueSyncGeneration) return { ok: false };
+      if (requestError) {
+        return { ok: false, error: apiErrorMessage(requestError, "failed to refresh issue") };
+      }
       if (data !== undefined) {
         issueDetail = withPreservedLocalBody({
           ...data,
           events: data.events ?? [],
         } as IssueDetail);
         issueDetailLoaded = data.detail_loaded ?? issueDetailLoaded;
+        return { ok: true };
       }
-    } catch {
-      /* silent */
+      return { ok: false, error: "Issue refresh returned no detail" };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
     }
   }
 
@@ -685,6 +730,39 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
       return false;
     }
     await refreshIssueDetail(owner, name, number, ref);
+    return true;
+  }
+
+  async function deleteIssueComment(owner: string, name: string, number: number, commentID: number): Promise<boolean> {
+    const ref = currentIssueDetailRef(owner, name, number);
+    detailError = null;
+    try {
+      const { error: requestError } = await apiClient.DELETE(
+        providerItemPath("issues", ref, "/comments/{comment_id}"),
+        {
+          headers: { "Content-Type": "application/json" },
+          params: {
+            path: {
+              ...providerRouteParams(ref),
+              number,
+              comment_id: commentID,
+            },
+          },
+        },
+      );
+      if (requestError) {
+        throw new Error(apiErrorMessage(requestError, "failed to delete comment"));
+      }
+    } catch (err) {
+      if (isIssueDetailShowingRef(ref)) {
+        detailError = err instanceof Error ? err.message : String(err);
+      }
+      return false;
+    }
+    hideDeletedComment(ref, commentID);
+    if (isIssueDetailShowingRef(ref)) {
+      void syncIssueDetail(owner, name, number, issueSyncGeneration, ref);
+    }
     return true;
   }
 
@@ -999,6 +1077,7 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
     setIssueAssignees,
     submitIssueComment,
     editIssueComment,
+    deleteIssueComment,
     setLocalIssueBody,
     saveIssueBodyInBackground,
     hasUnsavedLocalBody,

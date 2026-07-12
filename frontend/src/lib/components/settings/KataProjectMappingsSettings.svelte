@@ -2,17 +2,21 @@
   import PlusIcon from "@lucide/svelte/icons/plus";
   import RotateCcwIcon from "@lucide/svelte/icons/rotate-ccw";
   import TrashIcon from "@lucide/svelte/icons/trash-2";
-  import { Button, SelectDropdown } from "@middleman/ui";
-  import type {
-    ConfigRepo,
-    KataProjectRepoMapping,
-  } from "@middleman/ui/api/types";
+  import { onMount, untrack } from "svelte";
+  import { Button, Chip, SelectDropdown } from "@middleman/ui";
+  import type { KataProjectRepoMapping } from "@middleman/ui/api/types";
   import { updateSettings } from "../../api/settings.js";
+  import { fetchKataDaemons, type KataDaemonInfo } from "../../api/kata/daemons.js";
+  import {
+    getKataProjectMappings,
+    type KataProjectMappingDiagnostic,
+    type KataProjectMappingsResponse,
+  } from "../../api/kata/workspaces.js";
   import { isEmbedded } from "../../stores/embed-config.svelte.js";
 
   interface Props {
     mappings?: KataProjectRepoMapping[] | undefined;
-    repos: ConfigRepo[];
+    enabled?: boolean;
     onUpdate: (mappings: KataProjectRepoMapping[]) => void;
   }
 
@@ -23,33 +27,62 @@
     repoKey: string;
   }
 
+  type MappingRepoRef = Pick<
+    KataProjectMappingsResponse["targets"][number]["repo"],
+    "provider" | "platform_host" | "owner" | "name" | "repo_path"
+  >;
+
   interface RepoOption {
     key: string;
     label: string;
-    repo: ConfigRepo;
+    displayName: string;
+    repo: MappingRepoRef;
   }
 
-  let { mappings, repos, onUpdate }: Props = $props();
+  let { mappings, enabled = true, onUpdate }: Props = $props();
 
   const embedded = isEmbedded();
   let nextID = 0;
   let saving = $state(false);
   let error = $state<string | null>(null);
+  let daemons = $state.raw<KataDaemonInfo[]>([]);
+  let selectedDaemonID = $state("");
+  let diagnostics = $state.raw<KataProjectMappingsResponse | null>(null);
+  let diagnosticsLoading = $state(true);
+  let diagnosticsError = $state<string | null>(null);
+  let diagnosticsEnabled = false;
+  let previousEnabled = false;
   // svelte-ignore state_referenced_locally
   let currentMappings = $state(normalizeMappings(mappings));
   // svelte-ignore state_referenced_locally
   let drafts = $state<MappingDraft[]>(draftsFromMappings(currentMappings));
 
-  const repoOptions = $derived.by(() =>
-    repos
-      .filter((repo) => !repo.is_glob)
-      .map((repo) => ({
-        key: repoKey(repo.provider, repo.platform_host, repo.repo_path),
-        label: repoLabel(repo),
-        repo,
-      }))
-      .sort((left, right) => left.label.localeCompare(right.label)),
-  );
+  const repoOptions = $derived.by(() => {
+    const targets: RepoOption[] = (diagnostics?.targets ?? []).map((target) => ({
+      key: repoKey(target.repo.provider, target.repo.platform_host, target.repo.repo_path),
+      label: `${target.display_name} · ${target.repo.repo_path}`,
+      displayName: target.display_name,
+      repo: target.repo,
+    }));
+    for (const mapping of currentMappings) {
+      const key = repoKeyFromMapping(mapping);
+      if (targets.some((option) => option.key === key)) continue;
+      targets.push({
+        key,
+        label: `${mapping.repo_path} · unavailable`,
+        displayName: mapping.repo_path,
+        repo: {
+          provider: mapping.provider,
+          platform_host: mapping.platform_host,
+          owner: mapping.repo_path.slice(0, mapping.repo_path.lastIndexOf("/")),
+          name: mapping.repo_path.slice(mapping.repo_path.lastIndexOf("/") + 1),
+          repo_path: mapping.repo_path,
+        },
+      });
+    }
+    return [...new Map(targets.map((option) => [option.key, option])).values()]
+      .sort((left, right) => left.label.localeCompare(right.label));
+  });
   const repoOptionsByKey = $derived.by(() => new Map(repoOptions.map((option) => [option.key, option])));
   const repoSelectOptions = $derived(
     repoOptions.map((option) => ({ value: option.key, label: option.label })),
@@ -62,6 +95,44 @@
     drafts.some((draft) => draft.projectUID.trim() === "" || !repoOptionsByKey.has(draft.repoKey)),
   );
   const canSave = $derived(!embedded && !saving && isDirty && !hasInvalidDraft);
+  const daemonOptions = $derived(daemons.map((daemon) => ({ value: daemon.id, label: daemon.id })));
+
+  onMount(() => {
+    diagnosticsEnabled = true;
+  });
+
+  $effect(() => {
+    if (!diagnosticsEnabled) return;
+    if (!enabled) {
+      diagnostics = null;
+      diagnosticsError = null;
+      diagnosticsLoading = false;
+      previousEnabled = false;
+      return;
+    }
+    if (!previousEnabled) {
+      previousEnabled = true;
+      untrack(() => void loadDiagnostics());
+    }
+  });
+
+  async function loadDiagnostics(daemonID = selectedDaemonID): Promise<void> {
+    diagnosticsLoading = true;
+    diagnosticsError = null;
+    try {
+      if (daemons.length === 0) {
+        daemons = await fetchKataDaemons();
+      }
+      const effectiveID = daemonID || daemons.find((daemon) => daemon.default)?.id || daemons[0]?.id || "";
+      selectedDaemonID = effectiveID;
+      diagnostics = await getKataProjectMappings(effectiveID || undefined);
+    } catch (err) {
+      diagnosticsError = err instanceof Error ? err.message : String(err);
+      diagnostics = null;
+    } finally {
+      diagnosticsLoading = false;
+    }
+  }
 
   function nextDraftID(): string {
     nextID += 1;
@@ -70,10 +141,6 @@
 
   function repoKey(provider: string, platformHost: string, repoPath: string): string {
     return `${provider}\u0000${platformHost}\u0000${repoPath}`;
-  }
-
-  function repoLabel(repo: ConfigRepo): string {
-    return `${repo.provider} / ${repo.platform_host} / ${repo.repo_path}`;
   }
 
   function repoKeyFromMapping(mapping: KataProjectRepoMapping): string {
@@ -131,16 +198,59 @@
   }
 
   function addMapping(): void {
-    const firstRepo = repoOptions[0]?.key ?? "";
     drafts = [
       ...drafts,
       {
         id: nextDraftID(),
         daemonID: "",
         projectUID: "",
-        repoKey: firstRepo,
+        repoKey: "",
       },
     ];
+  }
+
+  function addOverride(project: KataProjectMappingDiagnostic): void {
+    const daemonID = diagnostics?.daemon_id ?? selectedDaemonID;
+    const existing = drafts.find(
+      (draft) => draft.projectUID === project.project_uid && draft.daemonID === daemonID,
+    );
+    if (existing) return;
+    const mappedRepo = project.repo
+      ? repoKey(project.repo.provider, project.repo.platform_host, project.repo.repo_path)
+      : "";
+    drafts = [
+      ...drafts,
+      {
+        id: nextDraftID(),
+        daemonID,
+        projectUID: project.project_uid,
+        repoKey: repoOptionsByKey.has(mappedRepo) ? mappedRepo : "",
+      },
+    ];
+  }
+
+  function sourceLabel(source?: string): string {
+    return ({
+      manual_daemon: "Manual, daemon-specific",
+      manual_global: "Manual, all daemons",
+      configured_clone: "Watched clone metadata",
+      registered_project: "Registered project",
+      tracked_repo: "Tracked repository name",
+    } as Record<string, string>)[source ?? ""] ?? "No matching repository";
+  }
+
+  function statusTone(status: string): "success" | "warning" | "danger" | "muted" {
+    if (status === "mapped") return "success";
+    if (status === "ambiguous" || status === "invalid") return "danger";
+    if (status === "unmapped") return "warning";
+    return "muted";
+  }
+
+  function statusLabel(status: string): string {
+    if (status === "mapped") return "Mapped";
+    if (status === "ambiguous") return "Ambiguous";
+    if (status === "invalid") return "Invalid override";
+    return "Unmapped";
   }
 
   function removeMapping(id: string): void {
@@ -166,6 +276,7 @@
       currentMappings = normalizeMappings(nextMappings);
       drafts = draftsFromMappings(currentMappings);
       onUpdate(nextMappings);
+      await loadDiagnostics();
     } catch (err) {
       error = err instanceof Error ? err.message : String(err);
     } finally {
@@ -179,11 +290,98 @@
     <p class="settings-error" role="alert">{error}</p>
   {/if}
 
+  <section class="mapping-section" aria-label="Effective Kata project mappings">
+    <div class="mapping-section-header">
+      <div>
+        <h3>Effective mappings</h3>
+        <p>What workspace creation resolves for each project reported by Kata.</p>
+      </div>
+      {#if daemonOptions.length > 1}
+        <div class="daemon-picker">
+          <span>Daemon</span>
+          <SelectDropdown
+            title="Kata mapping daemon"
+            value={selectedDaemonID}
+            options={daemonOptions}
+            onchange={(value) => { void loadDiagnostics(value); }}
+            disabled={diagnosticsLoading}
+          />
+        </div>
+      {/if}
+    </div>
+
+    {#if diagnosticsLoading}
+      <p class="empty-mappings">Loading effective mappings...</p>
+    {:else if diagnosticsError}
+      <p class="settings-error" role="alert">{diagnosticsError}</p>
+    {:else if !diagnostics || diagnostics.projects.length === 0}
+      <p class="empty-mappings">This Kata daemon reports no projects.</p>
+    {:else}
+      <div class="mapping-table-wrap">
+        <table class="mapping-table effective-table" aria-label="Effective Kata project mappings">
+          <thead>
+            <tr>
+              <th scope="col">Kata project</th>
+              <th scope="col">Repository target</th>
+              <th scope="col">Resolution</th>
+              <th scope="col" aria-label="Mapping actions"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {#each diagnostics.projects as project (project.project_uid)}
+              {@const inferredTarget = project.repo
+                ? repoOptionsByKey.get(repoKey(project.repo.provider, project.repo.platform_host, project.repo.repo_path))
+                : undefined}
+              <tr>
+                <td>
+                  <strong>{project.project_name || project.project_uid}</strong>
+                  <span class="mapping-meta">{project.project_uid}</span>
+                </td>
+                <td>
+                  {#if inferredTarget}
+                    <span>{inferredTarget.displayName}</span>
+                    <span class="mapping-meta">{inferredTarget.repo.repo_path}</span>
+                  {:else if project.repo}
+                    <span class="mapping-empty">No selectable repository</span>
+                    <span class="mapping-meta">Inferred repository: {project.repo.repo_path}</span>
+                  {:else}
+                    <span class="mapping-empty">No inferred project</span>
+                  {/if}
+                </td>
+                <td>
+                  <Chip size="xs" tone={statusTone(project.status)} uppercase={false}>
+                    {statusLabel(project.status)}
+                  </Chip>
+                  <span class="mapping-meta">{sourceLabel(project.source)}</span>
+                </td>
+                <td class="action-cell">
+                  {#if !project.source?.startsWith("manual_")}
+                    <Button
+                      size="sm"
+                      surface="outline"
+                      type="button"
+                      onclick={() => addOverride(project)}
+                      disabled={embedded || saving || repoOptions.length === 0}
+                    >
+                      Add override
+                    </Button>
+                  {:else}
+                    <span class="mapping-meta">Edit below</span>
+                  {/if}
+                </td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
+    {/if}
+  </section>
+
   <section class="mapping-section" aria-label="Kata project repository mappings">
     <div class="mapping-section-header">
       <div>
         <h3>Manual mappings</h3>
-        <p>Automatic `.kata.toml` matches are used when no row is configured here.</p>
+        <p>Overrides take precedence over the effective automatic mapping shown above.</p>
       </div>
       <Button
         size="sm"
@@ -196,10 +394,12 @@
       </Button>
     </div>
 
-    {#if repoOptions.length === 0}
-      <p class="empty-mappings">No exact watched repositories are configured.</p>
-    {:else if drafts.length === 0}
-      <p class="empty-mappings">No manual Kata project mappings configured.</p>
+    {#if drafts.length === 0}
+      <p class="empty-mappings">
+        {repoOptions.length === 0
+          ? "No known repository targets are available."
+          : "No manual Kata project mappings configured."}
+      </p>
     {:else}
       <div class="mapping-table-wrap">
         <table class="mapping-table" aria-label="Kata project mappings">
@@ -213,7 +413,7 @@
             <tr>
               <th scope="col">Daemon</th>
               <th scope="col">Project UID</th>
-              <th scope="col">Repository</th>
+              <th scope="col">Repository target</th>
               <th scope="col" aria-label="Mapping actions"></th>
             </tr>
           </thead>
@@ -238,9 +438,9 @@
                 </td>
                 <td>
                   <SelectDropdown
-                    title={`Kata project ${label} repository`}
+                    title={`Kata project ${label} repository target`}
                     value={draft.repoKey}
-                    options={repoSelectOptions}
+                    options={[{ value: "", label: "Select a repository" }, ...repoSelectOptions]}
                     onchange={(value) => { draft.repoKey = value; }}
                     disabled={embedded || saving}
                   />
@@ -306,7 +506,7 @@
     display: flex;
     justify-content: space-between;
     align-items: flex-start;
-    gap: 12px;
+    gap: var(--space-5);
   }
 
   .mapping-section-header h3 {
@@ -383,6 +583,39 @@
     background: var(--bg-inset);
   }
 
+  .effective-table strong,
+  .effective-table > tbody > tr > td > span:first-child {
+    display: block;
+    color: var(--text-primary);
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+  }
+
+  .mapping-meta {
+    display: block;
+    margin-top: var(--space-1);
+    color: var(--text-muted);
+    font-size: var(--font-size-xs);
+    line-height: 1.35;
+  }
+
+  .mapping-empty {
+    color: var(--text-muted);
+    font-size: var(--font-size-sm);
+  }
+
+  .daemon-picker {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    color: var(--text-secondary);
+    font-size: var(--font-size-xs);
+  }
+
+  .daemon-picker :global(.kit-select-dropdown) {
+    min-width: 160px;
+  }
+
   .mapping-table :global(.kit-select-dropdown) {
     width: 100%;
     min-width: 0;
@@ -417,7 +650,7 @@
   .settings-actions {
     display: flex;
     justify-content: flex-end;
-    gap: 8px;
+    gap: var(--space-4);
   }
 
   @media (max-width: 759px) {

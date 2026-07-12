@@ -202,6 +202,7 @@ type mockGH struct {
 	editIssueContentFn         func(context.Context, string, string, int, *string, *string) (*gh.Issue, error)
 	createIssueCommentFn       func(context.Context, string, string, int, string) (*gh.IssueComment, error)
 	editIssueCommentFn         func(context.Context, string, string, int64, string) (*gh.IssueComment, error)
+	deleteIssueCommentFn       func(context.Context, string, string, int64) error
 	createReviewCommentReplyFn func(context.Context, string, string, int, string, int64) (*gh.PullRequestComment, error)
 	createReviewFn             func(context.Context, string, string, int, string, string) (*gh.PullRequestReview, error)
 	createReviewWithCommentsFn func(context.Context, string, string, int, string, string, string, []*gh.DraftReviewComment) (*gh.PullRequestReview, error)
@@ -485,6 +486,15 @@ func (m *mockGH) EditIssueComment(
 		CreatedAt: &now,
 		UpdatedAt: &now,
 	}, nil
+}
+
+func (m *mockGH) DeleteIssueComment(
+	ctx context.Context, owner, repo string, commentID int64,
+) error {
+	if m.deleteIssueCommentFn != nil {
+		return m.deleteIssueCommentFn(ctx, owner, repo, commentID)
+	}
+	return nil
 }
 
 func (m *mockGH) CreatePullRequestReviewCommentReply(
@@ -6869,6 +6879,217 @@ func TestAPIEditIssueCommentRejectsCommentFromDifferentIssue(t *testing.T) {
 	require.Equal(int32(0), editCalls.Load())
 }
 
+func TestAPIDeletePrCommentLeavesLocalStateForSync(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	commentID := int64(9876)
+	var deleteCalls atomic.Int32
+	mock := &mockGH{
+		deleteIssueCommentFn: func(_ context.Context, owner, repo string, gotCommentID int64) error {
+			deleteCalls.Add(1)
+			assert.Equal("acme", owner)
+			assert.Equal("widget", repo)
+			assert.Equal(commentID, gotCommentID)
+			return nil
+		},
+	}
+	srv, database := setupTestServerWithMock(t, mock)
+	mrID := seedPR(t, database, "acme", "widget", 7)
+	require.NoError(database.UpsertMREvents(t.Context(), []db.MREvent{{
+		MergeRequestID: mrID,
+		PlatformID:     &commentID,
+		EventType:      "issue_comment",
+		Author:         "maintainer",
+		Body:           "remove me",
+		CreatedAt:      time.Now().UTC(),
+		DedupeKey:      "comment-9876",
+	}}))
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/pulls/gh/acme/widget/7/comments/9876", nil)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	assert.Equal(http.StatusNoContent, rec.Code)
+	assert.Equal(int32(1), deleteCalls.Load())
+	events, err := database.ListMREvents(t.Context(), mrID)
+	require.NoError(err)
+	require.Len(events, 1)
+	assert.Equal("remove me", events[0].Body)
+}
+
+func TestAPIDeleteIssueCommentKeepsLocalCommentWhenProviderRejects(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	commentID := int64(1234)
+	mock := &mockGH{
+		deleteIssueCommentFn: func(context.Context, string, string, int64) error {
+			return errors.New("provider denied deletion")
+		},
+	}
+	srv, database := setupTestServerWithMock(t, mock)
+	issueID := seedIssue(t, database, "acme", "widget", 5, "open")
+	require.NoError(database.UpsertIssueEvents(t.Context(), []db.IssueEvent{{
+		IssueID:    issueID,
+		PlatformID: &commentID,
+		EventType:  "issue_comment",
+		Author:     "maintainer",
+		Body:       "keep me",
+		CreatedAt:  time.Now().UTC(),
+		DedupeKey:  "issue-comment-1234",
+	}}))
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/issues/gh/acme/widget/5/comments/1234", nil)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	assert.Equal(http.StatusBadGateway, rec.Code)
+	events, err := database.ListIssueEvents(t.Context(), issueID)
+	require.NoError(err)
+	require.Len(events, 1)
+	assert.Equal("keep me", events[0].Body)
+}
+
+func TestAPIDeletePrCommentKeepsLocalCommentWhenProviderReportsNotFound(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	commentID := int64(4321)
+	mock := &mockGH{
+		deleteIssueCommentFn: func(context.Context, string, string, int64) error {
+			return platform.ErrNotFound
+		},
+	}
+	srv, database := setupTestServerWithMock(t, mock)
+	mrID := seedPR(t, database, "acme", "widget", 7)
+	require.NoError(database.UpsertMREvents(t.Context(), []db.MREvent{{
+		MergeRequestID: mrID,
+		PlatformID:     &commentID,
+		EventType:      "issue_comment",
+		Author:         "maintainer",
+		Body:           "already absent upstream",
+		CreatedAt:      time.Now().UTC(),
+		DedupeKey:      "comment-4321",
+	}}))
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/pulls/gh/acme/widget/7/comments/4321", nil)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	assert.Equal(http.StatusNotFound, rec.Code)
+	events, err := database.ListMREvents(t.Context(), mrID)
+	require.NoError(err)
+	require.Len(events, 1)
+	assert.Equal("already absent upstream", events[0].Body)
+}
+
+func TestAPIDeleteIssueCommentKeepsLocalCommentWhenProviderReportsNotFound(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	commentID := int64(4321)
+	mock := &mockGH{
+		deleteIssueCommentFn: func(context.Context, string, string, int64) error {
+			return platform.ErrNotFound
+		},
+	}
+	srv, database := setupTestServerWithMock(t, mock)
+	issueID := seedIssue(t, database, "acme", "widget", 5, "open")
+	require.NoError(database.UpsertIssueEvents(t.Context(), []db.IssueEvent{{
+		IssueID:    issueID,
+		PlatformID: &commentID,
+		EventType:  "issue_comment",
+		Author:     "maintainer",
+		Body:       "keep until deletion is confirmed",
+		CreatedAt:  time.Now().UTC(),
+		DedupeKey:  "issue-comment-4321",
+	}}))
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/issues/gh/acme/widget/5/comments/4321", nil)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	assert.Equal(http.StatusNotFound, rec.Code)
+	events, err := database.ListIssueEvents(t.Context(), issueID)
+	require.NoError(err)
+	require.Len(events, 1)
+	assert.Equal("keep until deletion is confirmed", events[0].Body)
+}
+
+func TestAPIDeleteIssueCommentLeavesLocalStateForSync(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	commentID := int64(5432)
+	var deleteCalls atomic.Int32
+	mock := &mockGH{
+		deleteIssueCommentFn: func(context.Context, string, string, int64) error {
+			deleteCalls.Add(1)
+			return nil
+		},
+	}
+	srv, database := setupTestServerWithMock(t, mock)
+	issueID := seedIssue(t, database, "acme", "widget", 5, "open")
+	require.NoError(database.UpsertIssueEvents(t.Context(), []db.IssueEvent{{
+		IssueID:    issueID,
+		PlatformID: &commentID,
+		EventType:  "issue_comment",
+		Author:     "maintainer",
+		Body:       "remove from issue detail",
+		CreatedAt:  time.Now().UTC(),
+		DedupeKey:  "issue-comment-5432",
+	}}))
+
+	deleteReq := httptest.NewRequest(http.MethodDelete, "/api/v1/issues/gh/acme/widget/5/comments/5432", nil)
+	deleteReq.Header.Set("Content-Type", "application/json")
+	deleteRec := httptest.NewRecorder()
+	srv.ServeHTTP(deleteRec, deleteReq)
+	require.Equal(http.StatusNoContent, deleteRec.Code, deleteRec.Body.String())
+	assert.Equal(int32(1), deleteCalls.Load())
+
+	detailReq := httptest.NewRequest(http.MethodGet, "/api/v1/issues/gh/acme/widget/5", nil)
+	detailRec := httptest.NewRecorder()
+	srv.ServeHTTP(detailRec, detailReq)
+	require.Equal(http.StatusOK, detailRec.Code, detailRec.Body.String())
+	var detail issueDetailResponse
+	require.NoError(json.NewDecoder(detailRec.Body).Decode(&detail))
+	require.Len(detail.Events, 1)
+	assert.Equal("remove from issue detail", detail.Events[0].Body)
+}
+
+func TestAPIDeletePrCommentRejectsAnotherParentBeforeProviderCall(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	commentID := int64(6543)
+	var deleteCalls atomic.Int32
+	mock := &mockGH{
+		deleteIssueCommentFn: func(context.Context, string, string, int64) error {
+			deleteCalls.Add(1)
+			return nil
+		},
+	}
+	srv, database := setupTestServerWithMock(t, mock)
+	seedPR(t, database, "acme", "widget", 7)
+	otherMRID := seedPR(t, database, "acme", "widget", 8)
+	require.NoError(database.UpsertMREvents(t.Context(), []db.MREvent{{
+		MergeRequestID: otherMRID,
+		PlatformID:     &commentID,
+		EventType:      "issue_comment",
+		Author:         "maintainer",
+		Body:           "belongs to another pull request",
+		CreatedAt:      time.Now().UTC(),
+		DedupeKey:      "comment-6543",
+	}}))
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/pulls/gh/acme/widget/7/comments/6543", nil)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	assert.Equal(http.StatusNotFound, rec.Code)
+	assert.Equal(int32(0), deleteCalls.Load())
+}
+
 func TestAPICommentAutocomplete(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
@@ -10418,6 +10639,9 @@ func TestE2EPRDetailRefreshesEditedCommentBody(t *testing.T) {
 		CreatedAt: &gh.Timestamp{Time: commentCreatedAt},
 		UpdatedAt: &gh.Timestamp{Time: commentCreatedAt},
 	}}
+	// A complete provider snapshot can contain overlapping pages or duplicate
+	// identities. Detail count must follow the unique synchronized event row.
+	mockComments = append(mockComments, mockComments[0])
 	mock.listIssueCommentsFn = func(_ context.Context, _, _ string, _ int) ([]*gh.IssueComment, error) {
 		return mockComments, nil
 	}
@@ -10548,6 +10772,9 @@ func TestE2EPRDetailRemovesDeletedCommentWhenPRListIsUnchanged(t *testing.T) {
 		CreatedAt: &gh.Timestamp{Time: commentCreatedAt},
 		UpdatedAt: &gh.Timestamp{Time: commentCreatedAt},
 	}}
+	// Exercise the PR detail API with the same duplicate-identity snapshot
+	// that the atomic replacement layer must collapse.
+	mockComments = append(mockComments, mockComments[0])
 	mock.listIssueCommentsFn = func(_ context.Context, _, _ string, _ int) ([]*gh.IssueComment, error) {
 		return mockComments, nil
 	}
@@ -10923,6 +11150,9 @@ func TestE2EIssueDetailRemovesDeletedCommentWhenIssueListIsUnchanged(t *testing.
 		CreatedAt: &gh.Timestamp{Time: commentCreatedAt},
 		UpdatedAt: &gh.Timestamp{Time: commentCreatedAt},
 	}}
+	// The issue detail API must expose the unique persisted count even when a
+	// complete provider snapshot repeats the same comment identity.
+	mockComments = append(mockComments, mockComments[0])
 	mock.listIssueCommentsFn = func(_ context.Context, _, _ string, _ int) ([]*gh.IssueComment, error) {
 		return mockComments, nil
 	}
@@ -13441,6 +13671,13 @@ func TestAPICapabilityGatedMutationsHandleMissingSyncer(t *testing.T) {
 			capability: "review_mutation",
 		},
 		{
+			name:       "request changes",
+			method:     http.MethodPost,
+			path:       "/api/v1/pulls/gh/acme/widget/7/request-changes",
+			body:       map[string]string{"body": "needs work"},
+			capability: "review_mutation",
+		},
+		{
 			name:       "workflow approval",
 			method:     http.MethodPost,
 			path:       "/api/v1/pulls/gh/acme/widget/7/approve-workflows",
@@ -14039,6 +14276,71 @@ func TestAPIGitHubPublishReviewDraftSendsCommentsThroughServer(t *testing.T) {
 	storedDraft, err := database.GetMRReviewDraft(ctx, mr.ID)
 	require.NoError(err)
 	assert.Nil(storedDraft)
+}
+
+func TestAPIGitHubRequestChangesDoesNotPublishSavedDraftComments(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	ctx := t.Context()
+	var captured platform.PublishDiffReviewDraftInput
+	// No getPullRequestFn: the default mock returns no PR, so this test
+	// also proves direct request-changes performs no provider head reads
+	// beyond the review submission — the same call shape as /approve.
+	mock := &mockGH{
+		createReviewWithCommentsFn: func(
+			_ context.Context,
+			_, _ string,
+			_ int,
+			event string,
+			body string,
+			commitID string,
+			comments []*gh.DraftReviewComment,
+		) (*gh.PullRequestReview, error) {
+			captured = platform.PublishDiffReviewDraftInput{
+				Body:    body,
+				Action:  platform.ReviewActionRequestChanges,
+				HeadSHA: commitID,
+			}
+			assert.Equal("REQUEST_CHANGES", event)
+			assert.Empty(comments)
+			id := int64(502)
+			state := "CHANGES_REQUESTED"
+			return &gh.PullRequestReview{ID: &id, State: &state}, nil
+		},
+	}
+	srv, database := setupTestServerWithMock(t, mock)
+	seedPR(t, database, "acme", "widget", 42)
+	mr, err := database.GetMergeRequest(ctx, "github", "github.com", "acme", "widget", 42)
+	require.NoError(err)
+	require.NotNil(mr)
+	require.NoError(database.UpdateDiffSHAs(ctx, mr.RepoID, 42, "reviewed-head", "base", "merge-base"))
+
+	basePath := "/api/v1/pulls/gh/acme/widget/42/review-draft"
+	createRR := doJSON(t, srv, http.MethodPost, basePath+"/comments", map[string]any{
+		"body": "Saved for the later inline review.",
+		"range": map[string]any{
+			"path": "src/main.go", "side": "right", "line": 42,
+			"new_line": 42, "line_type": "add", "diff_head_sha": "reviewed-head",
+		},
+	})
+	require.Equal(http.StatusCreated, createRR.Code, createRR.Body.String())
+
+	requestRR := doJSON(t, srv, http.MethodPost, "/api/v1/pulls/gh/acme/widget/42/request-changes", map[string]string{
+		"body":              " Please cover the empty state. ",
+		"expected_head_sha": "provider-head",
+	})
+	require.Equal(http.StatusOK, requestRR.Code, requestRR.Body.String())
+	assert.Equal("Please cover the empty state.", captured.Body)
+	assert.Equal(platform.ReviewActionRequestChanges, captured.Action)
+	assert.Equal("provider-head", captured.HeadSHA)
+
+	storedDraft, err := database.GetMRReviewDraft(ctx, mr.ID)
+	require.NoError(err)
+	require.NotNil(storedDraft)
+	comments, err := database.ListMRReviewDraftComments(ctx, storedDraft.ID)
+	require.NoError(err)
+	require.Len(comments, 1)
+	assert.Equal("Saved for the later inline review.", comments[0].Body)
 }
 
 func TestAPIGitHubPublishReviewDraftRejectsSelfApprovalBeforeProvider(t *testing.T) {
@@ -14929,6 +15231,7 @@ func setupActualGitLabReviewServer(
 		"gitlab.example.com",
 		testTokenSource("token"),
 		platformgitlab.WithBaseURLForTesting(gitlabServerURL+"/api/v4"),
+		platformgitlab.WithoutRetriesForTesting(),
 	)
 	require.NoError(err)
 	registry, err := platform.NewRegistry(client)
@@ -17766,6 +18069,29 @@ func TestAPIGitealikeApproveBeforeHeadRace(t *testing.T) {
 	assert.Contains(transport.mutationCalls, "review:7:approved:abc123")
 }
 
+func TestAPIGitealikeRequestChangesPassesReviewedHeadPinToProvider(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	ctx := t.Context()
+	transport := newAPIGitealikeHeadPinTransport(t)
+	client, _ := setupAPIGitealikeHeadPinServer(t, transport)
+	expectedHeadSHA := "abc123"
+
+	resp, err := client.HTTP.RequestPullChangesOnHostWithResponse(
+		ctx, "gitea.test", "gitea", "tea", "kettle", 7,
+		generated.RequestPullChangesOnHostJSONRequestBody{
+			Body:            "needs work",
+			ExpectedHeadSha: &expectedHeadSHA,
+		},
+	)
+
+	require.NoError(err)
+	require.Equal(http.StatusOK, resp.StatusCode(), string(resp.Body))
+	assert.Equal("REQUEST_CHANGES", transport.lastReviewOpts.State)
+	assert.Equal("needs work", transport.lastReviewOpts.Body)
+	assert.Equal("abc123", transport.lastReviewOpts.CommitID)
+}
+
 type apiTestGitealikeTransport struct {
 	repo           gitealike.RepositoryDTO
 	pulls          []gitealike.PullRequestDTO
@@ -17780,6 +18106,7 @@ type apiTestGitealikeTransport struct {
 	nextIssueIndex int
 	mutationCalls  []string
 	mergeHeadPins  []string
+	lastReviewOpts gitealike.ReviewOptions
 
 	lastMergeOpts gitealike.MergeOptions
 	// headOverrides, when non-empty, replaces the head SHA returned by
@@ -17979,6 +18306,21 @@ func (t *apiTestGitealikeTransport) EditIssueComment(
 	return comment, nil
 }
 
+func (t *apiTestGitealikeTransport) DeleteIssueComment(
+	_ context.Context,
+	_ platform.RepoRef,
+	commentID int64,
+) error {
+	t.mutationCalls = append(t.mutationCalls, fmt.Sprintf("delete_comment:%d", commentID))
+	t.pullComments = slices.DeleteFunc(t.pullComments, func(comment gitealike.CommentDTO) bool {
+		return comment.ID == commentID
+	})
+	t.issueComments = slices.DeleteFunc(t.issueComments, func(comment gitealike.CommentDTO) bool {
+		return comment.ID == commentID
+	})
+	return nil
+}
+
 func (t *apiTestGitealikeTransport) CreateIssue(
 	_ context.Context,
 	ref platform.RepoRef,
@@ -18104,6 +18446,7 @@ func (t *apiTestGitealikeTransport) CreatePullReview(
 		return gitealike.ReviewDTO{}, platform.ErrNotFound
 	}
 	t.mutationCalls = append(t.mutationCalls, fmt.Sprintf("review:%d:%s:%s", number, opts.Body, opts.CommitID))
+	t.lastReviewOpts = opts
 	return gitealike.ReviewDTO{
 		ID:        980,
 		User:      gitealike.UserDTO{UserName: "mutation-bot"},
@@ -27336,18 +27679,20 @@ func gitOutput(t *testing.T, dir string, args ...string) string {
 }
 
 type rawWorkspaceStatusResponse struct {
-	ID                 string  `json:"id"`
-	PlatformHost       string  `json:"platform_host"`
-	RepoOwner          string  `json:"repo_owner"`
-	RepoName           string  `json:"repo_name"`
-	ItemType           string  `json:"item_type"`
-	ItemNumber         int     `json:"item_number"`
-	GitHeadRef         string  `json:"git_head_ref"`
-	WorktreePath       string  `json:"worktree_path"`
-	TmuxSession        string  `json:"tmux_session"`
-	Status             string  `json:"status"`
-	ErrorMessage       *string `json:"error_message"`
-	AssociatedPRNumber *int    `json:"associated_pr_number"`
+	ID                 string                    `json:"id"`
+	PlatformHost       string                    `json:"platform_host"`
+	RepoOwner          string                    `json:"repo_owner"`
+	RepoName           string                    `json:"repo_name"`
+	ItemType           string                    `json:"item_type"`
+	ItemNumber         int                       `json:"item_number"`
+	ItemKey            string                    `json:"item_key"`
+	GitHeadRef         string                    `json:"git_head_ref"`
+	WorktreePath       string                    `json:"worktree_path"`
+	TmuxSession        string                    `json:"tmux_session"`
+	Status             string                    `json:"status"`
+	ErrorMessage       *string                   `json:"error_message"`
+	AssociatedPRNumber *int                      `json:"associated_pr_number"`
+	Kata               *db.WorkspaceKataMetadata `json:"kata"`
 }
 
 type rawIssueWorkspaceRef struct {
@@ -28415,6 +28760,156 @@ func TestWorkspaceManualRefreshDiscoversAndSyncsAssociatedPR(t *testing.T) {
 	assert.Equal(42, *stored.AssociatedPRNumber)
 
 	repo, err := fixture.database.GetRepoByIdentity(ctx, db.GitHubRepoIdentity("github.com", "acme", "widget"))
+	require.NoError(err)
+	require.NotNil(repo)
+	pr, err := fixture.database.GetMergeRequestByRepoIDAndNumber(ctx, repo.ID, 42)
+	require.NoError(err)
+	require.NotNil(pr)
+	assert.Equal(prTitleFromDetail, pr.Title)
+	assert.Equal(headSHA, pr.PlatformHeadSHA)
+}
+
+func TestKataWorkspaceManualRefreshDiscoversAndSyncsAssociatedPR(t *testing.T) {
+	t.Parallel()
+
+	assert := assert.New(t)
+	require := require.New(t)
+	ctx := t.Context()
+
+	const headRef = "kata-task-1"
+	var headSHA string
+	now := time.Now().UTC().Truncate(time.Second)
+	prID := int64(42001)
+	prTitleFromList := "Indexed PR title"
+	prTitleFromDetail := "Fresh PR detail title"
+	prState := "open"
+	prBody := "fresh body"
+	prURL := "https://github.com/acme/widget/pull/42"
+	baseRef := "main"
+	baseSHA := "base-sha"
+	author := "alice"
+	cloneURL := "https://github.com/acme/widget.git"
+	intPointer := func(value int) *int { return &value }
+	mock := &mockGH{
+		listOpenPullRequestsFn: func(context.Context, string, string) ([]*gh.PullRequest, error) {
+			return []*gh.PullRequest{{
+				ID:        &prID,
+				Number:    intPointer(42),
+				Title:     &prTitleFromList,
+				State:     &prState,
+				HTMLURL:   &prURL,
+				User:      &gh.User{Login: &author},
+				CreatedAt: &gh.Timestamp{Time: now},
+				UpdatedAt: &gh.Timestamp{Time: now},
+				Head: &gh.PullRequestBranch{
+					Ref:  new(headRef),
+					SHA:  &headSHA,
+					Repo: &gh.Repository{CloneURL: &cloneURL},
+				},
+				Base: &gh.PullRequestBranch{Ref: &baseRef, SHA: &baseSHA},
+			}}, nil
+		},
+		getPullRequestFn: func(context.Context, string, string, int) (*gh.PullRequest, error) {
+			return &gh.PullRequest{
+				ID:        &prID,
+				Number:    intPointer(42),
+				Title:     &prTitleFromDetail,
+				Body:      &prBody,
+				State:     &prState,
+				HTMLURL:   &prURL,
+				User:      &gh.User{Login: &author},
+				CreatedAt: &gh.Timestamp{Time: now},
+				UpdatedAt: &gh.Timestamp{Time: now},
+				Head: &gh.PullRequestBranch{
+					Ref:  new(headRef),
+					SHA:  &headSHA,
+					Repo: &gh.Repository{CloneURL: &cloneURL},
+				},
+				Base: &gh.PullRequestBranch{Ref: &baseRef, SHA: &baseSHA},
+			}, nil
+		},
+	}
+	fixture := setupWorkspaceServerFixtureWithMockHostAndOptions(
+		t, nil, mock, "github.com",
+		ServerOptions{
+			PtyOwnerInProcess:                  true,
+			DisableWorkspaceBackgroundMonitors: true,
+		},
+	)
+
+	worktreePath := filepath.Join(t.TempDir(), "kata-worktree")
+	runGit(t, t.TempDir(), "clone", fixture.remote, worktreePath)
+	runGit(t, worktreePath, "config", "user.email", "test@test.com")
+	runGit(t, worktreePath, "config", "user.name", "Test")
+	runGit(t, worktreePath, "checkout", "-b", headRef)
+	require.NoError(os.WriteFile(
+		filepath.Join(worktreePath, "feature.txt"),
+		[]byte("feature\n"),
+		0o644,
+	))
+	runGit(t, worktreePath, "add", ".")
+	runGit(t, worktreePath, "commit", "-m", "feature commit")
+	runGit(t, worktreePath, "push", "-u", "origin", headRef)
+	runGit(
+		t, worktreePath,
+		"remote", "set-url", "origin", "git@github.com:acme/widget.git",
+	)
+	headSHA = testGitSHA(t, worktreePath, "HEAD")
+	kataMetadata := db.WorkspaceKataMetadata{
+		DaemonID:   "local",
+		ProjectUID: "project-1",
+		IssueUID:   "issue-1",
+		ShortID:    "task-1",
+		Title:      "Track Kata workspace association",
+	}
+	kataItemKey := db.KataWorkspaceItemKey(kataMetadata)
+	require.NoError(fixture.database.InsertWorkspace(ctx, &db.Workspace{
+		ID:              "ws-kata-refresh",
+		Platform:        "github",
+		PlatformHost:    "github.com",
+		RepoOwner:       "acme",
+		RepoName:        "widget",
+		ItemType:        db.WorkspaceItemTypeKataTask,
+		ItemKey:         kataItemKey,
+		GitHeadRef:      headRef,
+		WorkspaceBranch: headRef,
+		WorktreePath:    worktreePath,
+		TmuxSession:     "middleman-ws-kata-refresh",
+		Status:          "ready",
+		KataMetadata:    &kataMetadata,
+	}))
+
+	refreshRR := doJSON(
+		t,
+		fixture.server,
+		http.MethodPost,
+		"/api/v1/workspaces/ws-kata-refresh/refresh",
+		nil,
+	)
+	require.Equal(http.StatusOK, refreshRR.Code, refreshRR.Body.String())
+
+	var refreshed rawWorkspaceStatusResponse
+	require.NoError(json.NewDecoder(refreshRR.Body).Decode(&refreshed))
+	assert.Equal(db.WorkspaceItemTypeKataTask, refreshed.ItemType)
+	assert.Equal(kataItemKey, refreshed.ItemKey)
+	require.NotNil(refreshed.Kata)
+	assert.Equal(kataMetadata, *refreshed.Kata)
+	require.NotNil(refreshed.AssociatedPRNumber)
+	assert.Equal(42, *refreshed.AssociatedPRNumber)
+
+	stored, err := fixture.database.GetWorkspace(ctx, "ws-kata-refresh")
+	require.NoError(err)
+	require.NotNil(stored)
+	assert.Equal(kataItemKey, stored.ItemKey)
+	require.NotNil(stored.KataMetadata)
+	assert.Equal(kataMetadata, *stored.KataMetadata)
+	require.NotNil(stored.AssociatedPRNumber)
+	assert.Equal(42, *stored.AssociatedPRNumber)
+
+	repo, err := fixture.database.GetRepoByIdentity(
+		ctx,
+		db.GitHubRepoIdentity("github.com", "acme", "widget"),
+	)
 	require.NoError(err)
 	require.NotNil(repo)
 	pr, err := fixture.database.GetMergeRequestByRepoIDAndNumber(ctx, repo.ID, 42)

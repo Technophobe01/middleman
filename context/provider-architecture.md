@@ -65,6 +65,14 @@ Rules:
 - Capability flags and implemented interfaces must agree.
 - Handlers must check capabilities before performing mutations. A missing
   capability is a feature-level failure, not a whole-provider failure.
+- Provider-backed comment deletes remove synchronized local rows only after upstream
+  synchronization observes provider absence. DELETE itself changes no SQLite comment
+  state; the UI hides a confirmed deletion while ordinary sync converges. Authoritative
+  replacement updates comment rows and the parent count in one transaction
+  (`internal/server/huma_routes.go::deleteComment`,
+  `internal/server/huma_routes.go::deleteIssueComment`,
+  `internal/db/queries.go::ReplaceMRCommentEvents`,
+  `internal/db/queries.go::ReplaceIssueCommentEvents`).
 - Keep operation availability split by scope. `repoOperations` handles
   repo-level gates: provider capability, write credentials, rate limits, and
   repo-wide viewer permissions. Detail responses may add item-level gates with

@@ -27,6 +27,15 @@ func (c *Client) EditMergeRequestComment(
 	return c.provider.EditMergeRequestComment(ctx, ref, number, commentID, body)
 }
 
+func (c *Client) DeleteMergeRequestComment(
+	ctx context.Context,
+	ref platform.RepoRef,
+	number int,
+	commentID int64,
+) error {
+	return c.provider.DeleteMergeRequestComment(ctx, ref, number, commentID)
+}
+
 func (c *Client) CreateIssueComment(
 	ctx context.Context,
 	ref platform.RepoRef,
@@ -44,6 +53,15 @@ func (c *Client) EditIssueComment(
 	body string,
 ) (platform.IssueEvent, error) {
 	return c.provider.EditIssueComment(ctx, ref, number, commentID, body)
+}
+
+func (c *Client) DeleteIssueComment(
+	ctx context.Context,
+	ref platform.RepoRef,
+	number int,
+	commentID int64,
+) error {
+	return c.provider.DeleteIssueComment(ctx, ref, number, commentID)
 }
 
 func (c *Client) CreateIssue(
@@ -93,6 +111,16 @@ func (c *Client) ApproveMergeRequest(
 	expectedHeadSHA string,
 ) (platform.MergeRequestEvent, error) {
 	return c.provider.ApproveMergeRequest(ctx, ref, number, body, expectedHeadSHA)
+}
+
+func (c *Client) RequestChanges(
+	ctx context.Context,
+	ref platform.RepoRef,
+	number int,
+	body string,
+	expectedHeadSHA string,
+) error {
+	return c.provider.RequestChanges(ctx, ref, number, body, expectedHeadSHA)
 }
 
 func (t *transport) CreatePullReview(
@@ -233,6 +261,23 @@ func (t *transport) EditIssueComment(
 		return gitealike.CommentDTO{}, giteaHTTPError(resp, err)
 	}
 	return convertComment(comment), nil
+}
+
+func (t *transport) DeleteIssueComment(
+	ctx context.Context,
+	ref platform.RepoRef,
+	commentID int64,
+) error {
+	var resp *giteasdk.Response
+	err := t.withRequestContext(ctx, func() error {
+		var err error
+		resp, err = t.api.DeleteIssueComment(ref.Owner, ref.Name, commentID)
+		return err
+	})
+	if err != nil {
+		return giteaHTTPError(resp, err)
+	}
+	return nil
 }
 
 func (t *transport) CreateIssue(

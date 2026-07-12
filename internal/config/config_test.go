@@ -2333,6 +2333,28 @@ endpoint = "http://custom:9999"
 	assert.Equal("http://custom:9999", cfg2.RoborevEndpoint())
 }
 
+func TestPullRequestsConfigRoundTrip(t *testing.T) {
+	assert := assert.New(t)
+	path := writeConfig(t, `
+[[repos]]
+owner = "a"
+name = "b"
+
+[pull_requests]
+allow_mid_stack_merges = true
+`)
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.True(cfg.PullRequests.AllowMidStackMerges)
+
+	savePath := filepath.Join(t.TempDir(), "saved.toml")
+	require.NoError(t, cfg.Save(savePath))
+
+	cfg2, err := Load(savePath)
+	require.NoError(t, err)
+	assert.True(cfg2.PullRequests.AllowMidStackMerges)
+}
+
 func TestTerminalConfigRoundTrip(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
@@ -2545,8 +2567,8 @@ repo_path = "acme/widget"
 	assert.Contains(t, err.Error(), "duplicate kata project mapping")
 }
 
-func TestKataProjectMappingsRejectUnconfiguredRepos(t *testing.T) {
-	_, err := Load(writeConfig(t, `
+func TestKataProjectMappingsAllowRegisteredProjectTargets(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `
 [[repos]]
 owner = "acme"
 name = "widget"
@@ -2557,8 +2579,9 @@ provider = "github"
 platform_host = "github.com"
 repo_path = "acme/other"
 `))
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "does not match a configured exact repo")
+	require.NoError(t, err)
+	require.Len(t, cfg.KataProjects, 1)
+	assert.Equal(t, "acme/other", cfg.KataProjects[0].RepoPath)
 }
 
 func TestTerminalRendererRejectsInvalidValue(t *testing.T) {
