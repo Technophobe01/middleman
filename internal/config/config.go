@@ -550,6 +550,13 @@ type Activity struct {
 	DefaultBranchMaxCommits    int    `toml:"default_branch_max_commits" json:"default_branch_max_commits"`
 }
 
+// PullRequests configures safeguards around pull-request mutations.
+type PullRequests struct {
+	// AllowMidStackMerges permits merging a stack member while an earlier
+	// member remains unmerged. The default is deliberately false.
+	AllowMidStackMerges bool `toml:"allow_mid_stack_merges,omitempty" json:"allow_mid_stack_merges"`
+}
+
 const (
 	TerminalRendererXterm   = "xterm"
 	TerminalRendererGhostty = "ghostty-web"
@@ -780,6 +787,7 @@ type Config struct {
 	Platforms         []PlatformConfig         `toml:"platforms"`
 	GitHubApps        []GitHubAppConfig        `toml:"github_apps"`
 	Activity          Activity                 `toml:"activity"`
+	PullRequests      PullRequests             `toml:"pull_requests"`
 	Notifications     Notifications            `toml:"notifications"`
 	Terminal          Terminal                 `toml:"terminal"`
 	Modes             ModeVisibility           `toml:"modes"`
@@ -2638,6 +2646,7 @@ type configFile struct {
 	Agents                    []Agent                  `toml:"agents,omitempty"`
 	DocFolders                []DocFolder              `toml:"doc_folders,omitempty"`
 	Roborev                   Roborev                  `toml:"roborev,omitempty"`
+	PullRequests              PullRequests             `toml:"pull_requests,omitempty"`
 	Msgvault                  *Msgvault                `toml:"msgvault,omitempty"`
 	Tmux                      Tmux                     `toml:"tmux,omitempty"`
 	Shell                     Shell                    `toml:"shell,omitempty"`
@@ -2672,6 +2681,7 @@ func (c *Config) Save(path string) error {
 		Agents:                  cfg.Agents,
 		DocFolders:              cfg.DocFolders,
 		Roborev:                 cfg.Roborev,
+		PullRequests:            cfg.PullRequests,
 		Msgvault:                cfg.Msgvault,
 		Tmux:                    cfg.Tmux,
 		Shell:                   cfg.Shell,
