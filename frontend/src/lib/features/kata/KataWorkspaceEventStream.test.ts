@@ -478,7 +478,6 @@ describe("KataWorkspace", () => {
       expect(screen.getByRole("button", { name: /Pay rent/ })).toBeTruthy();
       expect(streamControllers).toHaveLength(1);
     });
-
     streamControllers[0]?.close();
     await waitFor(() => {
       expect(streamControllers).toHaveLength(2);
@@ -509,7 +508,7 @@ describe("KataWorkspace", () => {
     expect(streamHeaders[2]?.get("Last-Event-ID")).toBe("6");
   });
 
-  it("ignores queued old-stream messages after a daemon switch aborts the stream", async () => {
+  it("drains queued old-stream messages before enabling a daemon switch", async () => {
     const streamControllers: ReadableStreamDefaultController<Uint8Array>[] = [];
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
       const url = new URL(input instanceof Request ? input.url : String(input), window.location.origin);
@@ -551,6 +550,7 @@ describe("KataWorkspace", () => {
     };
     const api = createDaemonWorkspaceAPI(rowsByDaemon);
     let stallNextViewLoad = false;
+    let completedViewLoads = 0;
     const oldStreamRefreshStarted = deferred<void>();
     const releaseOldStreamRefresh = deferred<void>();
     vi.mocked(api.issues).mockImplementation(async (query: KataTaskIssuesQuery) => {
@@ -560,13 +560,15 @@ describe("KataWorkspace", () => {
         await releaseOldStreamRefresh.promise;
       }
       const rows = rowsByDaemon[getActiveKataDaemon() ?? getDefaultKataDaemon() ?? "home"] ?? [];
-      return buildKataTaskView({
+      const view = buildKataTaskView({
         view: query.view,
         issues: rows.filter((item) => (query.project_uid ? item.project_uid === query.project_uid : true)),
         projects,
         today: "2026-05-15",
         fetched_at: fetchedAt,
       });
+      completedViewLoads += 1;
+      return view;
     });
 
     render(KataWorkspace, { props: { api } });
@@ -575,6 +577,7 @@ describe("KataWorkspace", () => {
       expect(screen.getByRole("button", { name: /Pay rent/ })).toBeTruthy();
       expect(streamControllers).toHaveLength(1);
     });
+    const viewLoadsBeforeEvents = completedViewLoads;
 
     stallNextViewLoad = true;
     streamControllers[0]?.enqueue(
@@ -584,20 +587,75 @@ describe("KataWorkspace", () => {
       ),
     );
     await oldStreamRefreshStarted.promise;
-
-    await fireEvent.click(screen.getByTestId("daemon-chip"));
-    await fireEvent.click(screen.getByTestId("daemon-row-work"));
-    await waitFor(() => {
-      expect(screen.getByRole("heading", { name: "Email Susan re: Q3" })).toBeTruthy();
-      expect(streamControllers).toHaveLength(2);
-    });
-    const viewLoadsAfterSwitch = vi.mocked(api.issues).mock.calls.length;
+    expect((screen.getByTestId("daemon-chip") as HTMLButtonElement).disabled).toBe(true);
 
     releaseOldStreamRefresh.resolve();
+    await waitFor(() => {
+      expect(completedViewLoads).toBe(viewLoadsBeforeEvents + 2);
+      expect((screen.getByTestId("daemon-chip") as HTMLButtonElement).disabled).toBe(false);
+    });
+
+    const viewLoadsAfterDrain = vi.mocked(api.issues).mock.calls.length;
     await Promise.resolve();
     await Promise.resolve();
 
-    expect(api.issues).toHaveBeenCalledTimes(viewLoadsAfterSwitch);
+    expect(api.issues).toHaveBeenCalledTimes(viewLoadsAfterDrain);
+  });
+
+  it("releases the daemon switch gate and reconnects when a stream refresh fails", async () => {
+    const streamControllers: ReadableStreamDefaultController<Uint8Array>[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = new URL(input instanceof Request ? input.url : String(input), window.location.origin);
+      if (url.pathname === "/api/v1/kata/daemons") {
+        return Response.json({
+          daemons: [
+            {
+              id: "home",
+              url: "http://127.0.0.1:7777",
+              default: true,
+              auth: "none",
+              health: "connected",
+            },
+          ],
+        });
+      }
+      if (url.pathname === "/api/v1/kata/proxy/api/v1/events/stream") {
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              streamControllers.push(controller);
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "text/event-stream" } },
+        );
+      }
+      return new Response("not found", { status: 404 });
+    });
+    const { api } = createWorkspaceAPI([initialIssues[0]!]);
+    const failedRefresh = deferred<Awaited<ReturnType<KataTaskAPI["issues"]>>>();
+
+    render(KataWorkspace, { props: { api } });
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /Pay rent/ })).toBeTruthy();
+      expect(streamControllers).toHaveLength(1);
+    });
+
+    vi.mocked(api.issues).mockImplementationOnce(() => failedRefresh.promise);
+    streamControllers[0]?.enqueue(
+      new TextEncoder().encode(
+        `id: 6\nevent: sync.reset_required\ndata: ${JSON.stringify({ event_id: 6, reset_after_id: 6 })}\n\n`,
+      ),
+    );
+    await waitFor(() => {
+      expect((screen.getByTestId("daemon-chip") as HTMLButtonElement).disabled).toBe(true);
+    });
+
+    failedRefresh.reject(new Error("stream refresh failed"));
+    await waitFor(() => {
+      expect((screen.getByTestId("daemon-chip") as HTMLButtonElement).disabled).toBe(false);
+      expect(streamControllers).toHaveLength(2);
+    });
+    expect(screen.getByRole("button", { name: /Pay rent/ })).toBeTruthy();
   });
 
   it("restarts the live stream after a stale daemon switch completion", async () => {

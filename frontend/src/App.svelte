@@ -172,6 +172,7 @@
   let fullShellStores: StoreInstances | undefined;
   const appIconSrc = `${getBasePath().replace(/\/$/, "")}/favicon.svg`;
   const kataAPI = createKataTaskAPI();
+  const kataWorkspaceAPI = createKataTaskAPI();
   const docsAPI = createDocsAPI();
   const messageIssueLinker = createMessageIssueLinker(kataAPI);
 
@@ -207,6 +208,7 @@
     issue?: string | null;
     view?: KataTaskViewName | null;
     scope?: string | null;
+    daemon?: string | null;
   };
 
   function currentKataRouteUpdate(): KataRouteUpdate {
@@ -216,6 +218,7 @@
       issue: route.issue ?? null,
       view: route.view ?? null,
       scope: route.scope ?? null,
+      daemon: route.daemon ?? null,
     };
   }
 
@@ -224,27 +227,28 @@
     if (update.view) params.set("view", update.view);
     if (update.scope) params.set("scope", update.scope);
     if (update.issue) params.set("issue", update.issue);
+    if (update.daemon) params.set("daemon", update.daemon);
     const query = params.toString();
     return query ? `/kata?${query}` : "/kata";
   }
 
-  function kataIssueHref(uid: string): string {
-    return kataHref({ ...currentKataRouteUpdate(), issue: uid });
+  function kataIssueHref(uid: string, daemon?: string): string {
+    return kataHref({ ...currentKataRouteUpdate(), issue: uid, daemon: daemon ?? null });
   }
 
   function openKataIssue(uid: string | null, daemonId?: string): void {
-    if (daemonId && getKataDaemonRoster().includes(daemonId)) {
-      setActiveKataDaemon(daemonId);
-    }
     if (uid === null) {
       navigate("/kata");
       return;
     }
-    navigate(kataIssueHref(uid));
+    const targetDaemon = daemonId && getKataDaemonRoster().includes(daemonId) ? daemonId : undefined;
+    navigate(kataIssueHref(uid, targetDaemon));
   }
 
-  function updateKataRoute(update: KataRouteUpdate): void {
-    navigate(kataHref({ ...currentKataRouteUpdate(), ...update }));
+  function updateKataRoute(update: KataRouteUpdate, options?: { replace?: boolean }): void {
+    const href = kataHref({ ...currentKataRouteUpdate(), ...update });
+    if (options?.replace) replaceUrl(href);
+    else navigate(href);
   }
 
   function updateRepoBrowserRoute(route: RepoBrowserRouteRef, options?: { replace?: boolean }): void {
@@ -1147,10 +1151,11 @@
         {@const route = getRoute()}
         {#if route.page === "kata"}
           <KataFeature
-            api={kataAPI}
+            api={kataWorkspaceAPI}
             selectedIssueUID={route.issue ?? null}
             routeViewName={route.view ?? null}
             routeScopeUID={route.scope ?? null}
+            requestedDaemonId={route.daemon ?? null}
             onSelectedIssueChange={openKataIssue}
             onRouteStateChange={updateKataRoute}
             onOpenMessage={isModeVisible("messages") ? openMessage : undefined}

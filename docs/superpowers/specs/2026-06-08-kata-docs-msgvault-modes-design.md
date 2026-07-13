@@ -329,6 +329,46 @@ Kata frontend adaptation:
 - Task-list header controls should expand every visible task tree recursively
   through the task-detail API, and collapse should hide cached descendants
   without reintroducing them as top-level flat rows.
+- Project-scoped task filters must resolve the Kata project UID and read the
+  daemon's project issue list instead of filtering the all-project issue list
+  locally (`frontend/src/lib/api/kata/taskClient.ts::searchProject`).
+- Kata workspace owns a dedicated task client; accepted provenance pins its
+  selector, row actions, reloads, workspace identity, events, and stream while
+  other surfaces follow their own selection (`frontend/src/App.svelte::kataWorkspaceAPI`).
+- Removed accepted daemons remain selected and visibly unavailable until the
+  user chooses a configured daemon (`frontend/src/lib/features/kata/KataDaemonSwitcher.svelte::displayId`).
+- Daemon switching is disabled during initial bootstrap, writes, view work
+  (including live-event refresh callbacks), and switches. The entire Kata
+  workspace is inert while a switch is provisional. Cursor catch-up is part of
+  target and rollback acceptance; dual failure clears partial state and stops
+  the stream
+  (`frontend/src/lib/features/kata/KataWorkspace.svelte::switchKataDaemon`).
+- Cross-mode task links carry their daemon target in route state until the
+  workspace accepts that switch; linked issue selection must not run against
+  the previously accepted daemon (`frontend/src/App.svelte::openKataIssue`).
+- Daemon-route cleanup replaces the transient history entry. Unknown targets
+  stay unresolved with an error, and failed initial acceptance restores the
+  prior daemon preference (`frontend/src/lib/features/kata/KataWorkspace.svelte::routedDaemonError`).
+- Browser route changes remain queued while a daemon switch or rollback is
+  provisional, then apply to the accepted workspace after the transaction
+  settles. A successful bootstrap does not publish its provisional selection
+  when the route signature changed during the switch. If target and rollback
+  both fail, no workspace is accepted and route effects remain suppressed until
+  a later successful bootstrap
+  (`frontend/src/lib/features/kata/KataWorkspace.svelte::routeSignature`).
+- Kata route synchronization is level-triggered: the URL is the source of
+  truth and a single reconciler converges the workspace to it whenever they
+  differ, with no memory of what was previously synchronized. Interactions
+  load optimistically and must emit the matching route update afterwards
+  (their consumers echo it synchronously); store state that should survive
+  navigation lives in the URL
+  (`frontend/src/lib/features/kata/KataWorkspace.svelte::reconcileRoute`).
+- Event-driven proxy reads keep switching fail-closed until they settle. The
+  Kata proxy applies a 30-second total deadline to ordinary TCP and Unix-socket
+  requests, including response bodies, while the live event stream stays
+  exempt. Rejection releases the view-work gate and propagates to stream
+  reconnect handling
+  (`internal/server/kata_proxy.go::newKataDaemonProxyEntryWithTimeout`).
 - Replace direct daemon URL/localStorage bootstrap with calls to middleman's
   Kata daemon roster and proxy.
 - Use a middleman-owned selector header for proxied daemon requests.

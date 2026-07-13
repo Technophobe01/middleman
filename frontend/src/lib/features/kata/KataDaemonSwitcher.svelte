@@ -10,21 +10,27 @@
     activeId: string | undefined;
     activeStatusLabel?: string | undefined;
     activeStatusTone?: "error" | undefined;
+    disabled?: boolean | undefined;
     onSelect: (id: string) => void;
   }
 
-  let { daemons, activeId, activeStatusLabel = undefined, activeStatusTone = undefined, onSelect }: Props = $props();
+  let {
+    daemons,
+    activeId,
+    activeStatusLabel = undefined,
+    activeStatusTone = undefined,
+    disabled = false,
+    onSelect,
+  }: Props = $props();
 
   let open = $state(false);
-  const active = $derived(
-    daemons.find((daemon) => daemon.id === activeId) ??
-      daemons.find((daemon) => daemon.default) ??
-      daemons[0],
-  );
+  const active = $derived(daemons.find((daemon) => daemon.id === activeId));
+  const displayId = $derived(activeId ?? daemons.find((daemon) => daemon.default)?.id ?? daemons[0]?.id);
 
   function choose(id: string): void {
+    if (disabled) return;
     open = false;
-    if (id !== active?.id) onSelect(id);
+    if (id !== activeId) onSelect(id);
   }
 
   function daemonStatusLabel(daemon: KataDaemonInfo): string {
@@ -45,16 +51,24 @@
     type="button"
     class="daemon-chip"
     data-testid="daemon-chip"
-    aria-label={`Switch Kata daemon: ${active?.id ?? "default"}`}
+    aria-label={`Switch Kata daemon: ${displayId ?? "default"}`}
     title="Switch Kata daemon"
     aria-haspopup="menu"
     aria-expanded={open}
-    onclick={() => (open = !open)}
+    {disabled}
+    onclick={() => {
+      if (!disabled) open = !open;
+    }}
   >
     <ServerIcon class="chip-icon" size={13} strokeWidth={1.9} aria-hidden="true" />
-    <span class="chip-label">{active?.id ?? "kata"}</span>
+    <span class="chip-label">{displayId ?? "kata"}</span>
     <ChevronDownIcon size={12} strokeWidth={2} aria-hidden="true" />
   </button>
+  {#if activeStatusLabel}
+    <span class="daemon-status" class:error={activeStatusTone === "error"} role="status" aria-label="Connection: error">
+      {activeStatusLabel}
+    </span>
+  {/if}
 
   {#if open}
     <div class="daemon-menu" data-align="start" role="menu" aria-label="Configured Kata daemons">
@@ -62,16 +76,17 @@
         <button
           type="button"
           class="daemon-row"
-          class:selected={daemon.id === active?.id}
+          class:selected={daemon.id === activeId}
           data-testid={`daemon-row-${daemon.id}`}
           role="menuitemradio"
-          aria-checked={daemon.id === active?.id}
+          aria-checked={daemon.id === activeId}
+          {disabled}
           onclick={() => choose(daemon.id)}
         >
           <span class={`dot dot--${daemonStatusTone(daemon)}`} aria-hidden="true"></span>
           <span class="row-name">{daemon.id}</span>
           <span class="row-meta" title={daemonStatusLabel(daemon)}>{daemonStatusLabel(daemon)}</span>
-          {#if daemon.id === active?.id}
+          {#if daemon.id === activeId}
             <CheckIcon class="check" size={13} strokeWidth={2} aria-hidden="true" />
           {/if}
           {#if daemon.hint}
@@ -119,6 +134,16 @@
   .chip-icon {
     color: var(--text-muted);
     flex: none;
+  }
+
+  .daemon-status {
+    align-self: center;
+    color: var(--text-muted);
+    font-size: var(--font-size-xs);
+  }
+
+  .daemon-status.error {
+    color: var(--accent-red);
   }
 
   .dot {

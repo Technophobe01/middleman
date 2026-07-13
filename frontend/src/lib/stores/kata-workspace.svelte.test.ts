@@ -199,6 +199,7 @@ type FakeKataTaskAPI = KataTaskAPI & {
     ifMatch: string,
   ): Promise<{ changed: boolean; issue?: KataTaskSummary; etag?: string; new_short_id: string }>;
   mocks: {
+    bindWorkflowDaemon: ReturnType<typeof vi.fn>;
     instance: ReturnType<typeof vi.fn>;
     projects: ReturnType<typeof vi.fn>;
     createProject: ReturnType<typeof vi.fn>;
@@ -230,6 +231,7 @@ type FakeKataTaskAPI = KataTaskAPI & {
 };
 
 function createFakeKataTaskAPI(): FakeKataTaskAPI {
+  const bindWorkflowDaemon = vi.fn();
   const instance = vi.fn(
     async (): Promise<KataInstanceResponse> => ({
       instance_uid: "instance-1",
@@ -292,13 +294,16 @@ function createFakeKataTaskAPI(): FakeKataTaskAPI {
       );
       rows = rows.filter((item) => allowed.has(item.project_uid));
     }
-    return buildKataTaskView({
-      view: query.view,
-      issues: rows,
-      projects,
-      today: "2026-05-15",
-      fetched_at: fetchedAt,
-    });
+    return {
+      ...buildKataTaskView({
+        view: query.view,
+        issues: rows,
+        projects,
+        today: "2026-05-15",
+        fetched_at: fetchedAt,
+      }),
+      daemon_id: "home",
+    };
   });
   const search = vi.fn(async (filters: KataTaskSearchFilters): Promise<KataTaskSearchResponse> => {
     const query = filters.query.trim().toLowerCase();
@@ -317,7 +322,7 @@ function createFakeKataTaskAPI(): FakeKataTaskAPI {
       }
       return true;
     });
-    return { filters, issues: rows, fetched_at: fetchedAt };
+    return { filters, issues: rows, fetched_at: fetchedAt, daemon_id: "home" };
   });
   const issueMock = vi.fn(async (uid: string) => detailFor(uid));
   const reachableGraph = vi.fn(
@@ -413,6 +418,7 @@ function createFakeKataTaskAPI(): FakeKataTaskAPI {
   }));
   const deleteRecurrence = vi.fn(async () => undefined);
   return {
+    bindWorkflowDaemon,
     instance,
     projects: projectsMock,
     createProject,
@@ -441,6 +447,7 @@ function createFakeKataTaskAPI(): FakeKataTaskAPI {
     patchRecurrence,
     deleteRecurrence,
     mocks: {
+      bindWorkflowDaemon,
       instance,
       projects: projectsMock,
       createProject,
@@ -845,7 +852,7 @@ describe("kata workspace store", () => {
       label: "",
       query: "",
     });
-    expect(api.mocks.issues).toHaveBeenLastCalledWith({ view: "inbox" });
+    expect(api.mocks.issues).toHaveBeenLastCalledWith({ view: "inbox" }, { daemonId: "home" });
   });
 
   test("normalizes duplicate candidates from tolerant task error details", () => {
@@ -1282,7 +1289,10 @@ describe("kata workspace store", () => {
     });
 
     expect(api.mocks.search).not.toHaveBeenCalled();
-    expect(api.mocks.issues).toHaveBeenCalledWith({ view: "upcoming", project_uid: "project-kata" });
+    expect(api.mocks.issues).toHaveBeenCalledWith(
+      { view: "upcoming", project_uid: "project-kata" },
+      { daemonId: "home" },
+    );
     expect(store.currentView.name).toBe("upcoming");
   });
 
@@ -1304,7 +1314,10 @@ describe("kata workspace store", () => {
       "followup",
     );
     expect(api.mocks.search).not.toHaveBeenCalled();
-    expect(api.mocks.issues).toHaveBeenCalledWith({ view: "upcoming", project_uid: "project-kata" });
+    expect(api.mocks.issues).toHaveBeenCalledWith(
+      { view: "upcoming", project_uid: "project-kata" },
+      { daemonId: "home" },
+    );
     expect(store.currentView.name).toBe("upcoming");
     expect(store.selectedIssue?.issue.uid).toBe("issue-read-design-notes");
   });
@@ -1370,6 +1383,32 @@ describe("kata workspace store", () => {
       deadline_on: "2026-05-21",
     });
     expect(store.selectedIssue?.issue.revision).toBe(3);
+  });
+
+  test("keeps daemon switching blocked until queued metadata patches finish", async () => {
+    const api = createFakeKataTaskAPI();
+    const firstPatch = deferred<{ changed: boolean; issue: KataTaskSummary; etag: string }>();
+    const secondPatch = deferred<{ changed: boolean; issue: KataTaskSummary; etag: string }>();
+    api.mocks.patchIssueMetadata.mockReturnValueOnce(firstPatch.promise).mockReturnValueOnce(secondPatch.promise);
+    const store = createKataWorkspaceStore({ api });
+    await store.bootstrap();
+
+    const first = store.patchMetadata("issue-pay-rent", "fixture-user", { scheduled_on: "2026-05-20" });
+    const second = store.patchMetadata("issue-pay-rent", "fixture-user", { deadline_on: "2026-05-21" });
+    await vi.waitFor(() => {
+      expect(api.mocks.patchIssueMetadata).toHaveBeenCalledTimes(1);
+      expect(store.hasPendingMutations).toBe(true);
+    });
+
+    firstPatch.resolve({ changed: true, issue: { ...issues[0]!, revision: 2 }, etag: '"rev-2"' });
+    await vi.waitFor(() => {
+      expect(api.mocks.patchIssueMetadata).toHaveBeenCalledTimes(2);
+      expect(store.hasPendingMutations).toBe(true);
+    });
+    secondPatch.resolve({ changed: true, issue: { ...issues[0]!, revision: 3 }, etag: '"rev-3"' });
+    await Promise.all([first, second]);
+
+    expect(store.hasPendingMutations).toBe(false);
   });
 
   test("moveIssue uses the selected ETag and refreshes projects", async () => {
@@ -1493,6 +1532,7 @@ describe("kata workspace store", () => {
       filters: { scope: { kind: "all" }, status: "open", owner: "", label: "", query: "new" },
       issues: [issues[1]!],
       fetched_at: "new",
+      daemon_id: "work",
     });
     await second;
 
@@ -1500,6 +1540,7 @@ describe("kata workspace store", () => {
       filters: { scope: { kind: "all" }, status: "open", owner: "", label: "", query: "old" },
       issues: [issues[0]!],
       fetched_at: "old",
+      daemon_id: "home",
     });
     await first;
 
@@ -1508,6 +1549,8 @@ describe("kata workspace store", () => {
       "Call dentist",
     ]);
     expect(store.selectedIssue?.issue.uid).toBe("issue-call-dentist");
+    expect(store.daemonId).toBe("work");
+    expect(api.mocks.bindWorkflowDaemon).toHaveBeenLastCalledWith("work");
   });
 
   test("ignores stale bootstrap view data after newer navigation", async () => {
@@ -1757,7 +1800,7 @@ describe("kata workspace store", () => {
     await store.syncEventCursor();
 
     expect(store.eventCursor).toBe(2);
-    expect(api.mocks.issues).toHaveBeenCalledWith({ view: "inbox" });
+    expect(api.mocks.issues).toHaveBeenCalledWith({ view: "inbox" }, { daemonId: "home" });
     expect(store.selectedIssue?.issue.uid).toBe("issue-renew-passport");
   });
 
@@ -1810,7 +1853,7 @@ describe("kata workspace store", () => {
     });
 
     expect(store.eventCursor).toBe(lowID);
-    expect(api.mocks.issues).toHaveBeenCalledWith({ view: "today" });
+    expect(api.mocks.issues).toHaveBeenCalledWith({ view: "today" }, { daemonId: "home" });
   });
 
   test("remote events do not advance the cursor when refreshing the view fails", async () => {
@@ -1864,7 +1907,7 @@ describe("kata workspace store", () => {
     });
 
     expect(store.eventCursor).toBe(77);
-    expect(api.mocks.issues).toHaveBeenCalledWith({ view: "today" });
+    expect(api.mocks.issues).toHaveBeenCalledWith({ view: "today" }, { daemonId: "home" });
     expect(api.mocks.issue).toHaveBeenCalledWith("issue-pay-rent", { signal: expect.any(AbortSignal) });
     expect(store.selectedIssue?.comments.map((comment) => comment.body)).toContain("Remote note.");
   });
@@ -1897,7 +1940,7 @@ describe("kata workspace store", () => {
     });
 
     expect(store.eventCursor).toBe(77);
-    expect(api.mocks.issues).toHaveBeenCalledWith({ view: "today" });
+    expect(api.mocks.issues).toHaveBeenCalledWith({ view: "today" }, { daemonId: "home" });
     expect(store.selectedIssue?.issue.metadata).toMatchObject({
       scheduled_on: "2026-05-20",
       someday: true,
@@ -1997,7 +2040,7 @@ describe("kata workspace store", () => {
 
     await store.syncEventCursor();
 
-    expect(api.mocks.issues).toHaveBeenCalledWith({ view: "inbox" });
+    expect(api.mocks.issues).toHaveBeenCalledWith({ view: "inbox" }, { daemonId: "home" });
     expect(store.eventCursor).toBe(25);
   });
 
@@ -2014,7 +2057,7 @@ describe("kata workspace store", () => {
     });
 
     expect(store.eventCursor).toBe(100);
-    expect(api.mocks.issues).toHaveBeenLastCalledWith({ view: "inbox" });
+    expect(api.mocks.issues).toHaveBeenLastCalledWith({ view: "inbox" }, { daemonId: "home" });
     expect(store.currentView.name).toBe("inbox");
     expect(store.connection.status).toBe("online");
   });
@@ -2044,7 +2087,7 @@ describe("kata workspace store", () => {
       owner: "agent:planner",
       query: "design",
     });
-    expect(api.mocks.search).toHaveBeenLastCalledWith(store.searchFilters);
+    expect(api.mocks.search).toHaveBeenLastCalledWith(store.searchFilters, { daemonId: "home" });
     expect(store.selectedIssue?.issue.uid).toBe("issue-read-design-notes");
   });
 
