@@ -109,6 +109,7 @@
   let captureOpen = $state(false);
   let listResetGeneration = $state(0);
   let checklistRevealed = $state(false);
+  let pendingMoveIssueUIDs = $state.raw<ReadonlySet<string>>(new Set());
   let recurrenceDialogs = $state<KataRecurrenceDialogController | null>(null);
   let workspaceActionBusy = $state(false);
   let listMode = $state<ListMode>("tasks");
@@ -236,6 +237,7 @@
   async function runViewTask(
     task: () => Promise<void | boolean>,
     failureSurface: FailureSurface = "request",
+    shouldSurfaceFailure: () => boolean = () => true,
   ): Promise<boolean> {
     const loadingGeneration = beginViewLoading();
     clearTaskErrors();
@@ -247,7 +249,9 @@
       }
       return ok;
     } catch (err) {
-      surfaceTaskError(kataRequestErrorMessage(err), failureSurface);
+      if (shouldSurfaceFailure()) {
+        surfaceTaskError(kataRequestErrorMessage(err), failureSurface);
+      }
       return false;
     } finally {
       endViewLoading(loadingGeneration);
@@ -606,6 +610,11 @@
       return;
     }
     if (mismatch === "daemon" && daemonSwitchGated()) return;
+    // A project route load applies its scope before its optional view load
+    // finishes. That intermediate state can leave only the issue selection
+    // mismatched, but selecting now would be aborted when the remaining view
+    // load clears selection. Wait for the complete route load to settle.
+    if (viewScopeLoadSignature !== null && mismatch !== "viewScope") return;
     if (mismatch === "viewScope" && viewScopeLoadSignature === fullRouteSignature()) return;
     void untrack(() => reconcileRoute());
   });
@@ -827,10 +836,6 @@
     return created!;
   }
 
-  async function renameKataProject(id: number, name: string): Promise<void> {
-    await runViewTaskOrThrow(() => store.renameProject(id, name));
-  }
-
   async function submitQuickCapture(title: string): Promise<void> {
     await withRouteEmission(async () => {
       await runViewTaskOrThrow(async () => {
@@ -974,10 +979,23 @@
     graphSourceIssue = null;
   }
 
-  async function moveSelectedIssue(toProjectUID: string | null): Promise<void> {
+  async function moveSelectedIssue(toProjectUID: string): Promise<boolean> {
     const selected = store.selectedIssue?.issue;
-    if (!selected || !toProjectUID) return;
-    await runViewTask(() => store.moveIssue(selected.uid, actor, toProjectUID));
+    if (!selected || pendingMoveIssueUIDs.has(selected.uid)) return false;
+    const sourceIssueUID = selected.uid;
+    const generation = navigationGeneration;
+    pendingMoveIssueUIDs = new Set(pendingMoveIssueUIDs).add(sourceIssueUID);
+    try {
+      return await runViewTask(
+        () => store.moveIssue(sourceIssueUID, actor, toProjectUID),
+        "request",
+        () => isCurrentNavigation(generation),
+      );
+    } finally {
+      const nextPendingMoves = new Set(pendingMoveIssueUIDs);
+      nextPendingMoves.delete(sourceIssueUID);
+      pendingMoveIssueUIDs = nextPendingMoves;
+    }
   }
 
   async function patchSelectedMetadata(uid: string, patch: Record<string, unknown>): Promise<boolean> {
@@ -1184,7 +1202,6 @@
         scheduleProjectScope(projectUID);
       }}
       onCreateProject={createKataProject}
-      onRenameProject={renameKataProject}
     />
 
     <main class="kata-main" aria-label="Kata tasks">
@@ -1266,6 +1283,7 @@
       {unlinkError}
       selectedRecurrences={store.selectedRecurrences}
       {checklistRevealed}
+      movePending={pendingMoveIssueUIDs.has(store.selectedIssue.issue.uid)}
       onMoveIssue={moveSelectedIssue}
       onPatchMetadata={patchSelectedMetadata}
       onAddComment={addSelectedComment}
