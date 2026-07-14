@@ -7,6 +7,7 @@
   import { FilterDropdown } from "@kenn-io/kit-ui";
   import { SidebarToggle } from "@kenn-io/kit-ui";
   import type { Issue } from "../../api/types.js";
+  import { createRepoLabelFormatter } from "../../utils/repo-label.js";
   import {
     buildIssueRoute,
     type IssueRouteRef,
@@ -27,13 +28,25 @@
     { byRepo: true, label: "By Repo" },
     { byRepo: false, label: "All" },
   ];
-  // Playwright-measured with a buffered "9999 issues" count label:
-  // the full issue filter row first fits at 373px.
-  const COMPACT_FILTER_MAX_WIDTH = 372;
+  // Playwright-measured with a buffered "9999 issues" count label and the
+  // icon-only visibility control: the full issue filter row first fits at 402px.
+  const COMPACT_FILTER_MAX_WIDTH = 401;
 
   let searchInput = $state(issues.getIssueSearchQuery() ?? "");
   let debounceHandle: ReturnType<typeof setTimeout> | null = null;
   let refreshHandle: ReturnType<typeof setInterval> | null = null;
+  const repoLabelFormatter = $derived(
+    createRepoLabelFormatter(
+      issues.getIssues().map((issue) => ({
+        provider: issue.repo.provider,
+        platformHost: issue.repo.platform_host,
+        owner: issue.repo.owner,
+        name: issue.repo.name,
+        repoPath: issue.repo.repo_path,
+      })),
+      { showOrgNames: !grouping.getHideOrgName() },
+    ),
+  );
 
   $effect(() => {
     void issues.loadIssues();
@@ -72,6 +85,24 @@
     void issues.loadIssues();
   }
 
+  function resetCompactView(): void {
+    if (issues.getIssueFilterState() !== "open") setIssueState("open");
+    grouping.setGroupByRepo(true);
+    grouping.setHideOrgName(false);
+  }
+
+  const visibilityFilterSection = $derived({
+    title: "Visibility",
+    items: [
+      {
+        id: "hide-org-name",
+        label: "Hide org name",
+        active: grouping.getHideOrgName(),
+        onSelect: () => grouping.setHideOrgName(!grouping.getHideOrgName()),
+      },
+    ],
+  });
+
   const compactFilterSections = $derived.by(() => [
     {
       title: "State",
@@ -91,10 +122,13 @@
         onSelect: () => grouping.setGroupByRepo(option.byRepo),
       })),
     },
+    visibilityFilterSection,
   ]);
 
   const hasCompactFilterChanges = $derived(
-    issues.getIssueFilterState() !== "open" || !grouping.getGroupByRepo(),
+    issues.getIssueFilterState() !== "open"
+      || !grouping.getGroupByRepo()
+      || grouping.getHideOrgName(),
   );
   const useCompactFilters = $derived(
     sidebarWidth <= COMPACT_FILTER_MAX_WIDTH,
@@ -165,7 +199,21 @@
         active={hasCompactFilterChanges}
         showBadge={false}
         sections={compactFilterSections}
+        resetLabel="Reset view"
+        onReset={resetCompactView}
         minWidth="160px"
+      />
+    </div>
+    <div class="issue-visibility-menu">
+      <FilterDropdown
+        label="Visibility"
+        title="Issue visibility"
+        active={grouping.getHideOrgName()}
+        showBadge={false}
+        sections={[visibilityFilterSection]}
+        resetLabel="Reset visibility"
+        onReset={() => grouping.setHideOrgName(false)}
+        minWidth="180px"
       />
     </div>
     {#if isSidebarToggleEnabled()}
@@ -230,7 +278,13 @@
       {#if grouping.getGroupByRepo()}
         {#each [...issues.issuesByRepo().entries()] as [repo, repoIssues] (repo)}
           {@const collapsed = collapsedRepos.isCollapsed("issues", repo)}
-          {@const repoLabel = repoIssues[0]?.repo.repo_path ?? repo}
+          {@const repoLabel = repoIssues[0] ? repoLabelFormatter.format({
+            provider: repoIssues[0].repo.provider,
+            platformHost: repoIssues[0].repo.platform_host,
+            owner: repoIssues[0].repo.owner,
+            name: repoIssues[0].repo.name,
+            repoPath: repoIssues[0].repo.repo_path,
+          }) : repo}
           <GroupedSidebarSection
             label={repoLabel}
             count={repoIssues.length}
@@ -241,6 +295,13 @@
                 {@const issueRef = routeRefForIssue(issue)}
                 <IssueItem
                   {issue}
+                  repoLabel={repoLabelFormatter.format({
+                    provider: issue.repo.provider,
+                    platformHost: issue.repo.platform_host,
+                    owner: issue.repo.owner,
+                    name: issue.repo.name,
+                    repoPath: issue.repo.repo_path,
+                  })}
                   showRepo={false}
                   selected={isSelected(issueRef)}
                   onclick={() => handleSelect(issueRef)}
@@ -253,6 +314,13 @@
           {@const issueRef = routeRefForIssue(issue)}
           <IssueItem
             {issue}
+            repoLabel={repoLabelFormatter.format({
+              provider: issue.repo.provider,
+              platformHost: issue.repo.platform_host,
+              owner: issue.repo.owner,
+              name: issue.repo.name,
+              repoPath: issue.repo.repo_path,
+            })}
             showRepo={true}
             selected={isSelected(issueRef)}
             onclick={() => handleSelect(issueRef)}
@@ -407,6 +475,21 @@
     transform-origin: left center;
   }
 
+  .issue-visibility-menu {
+    display: block;
+  }
+
+  .issue-visibility-menu :global(.kit-filter-dropdown__btn) {
+    width: 28px;
+    justify-content: center;
+    padding-inline: 0;
+  }
+
+  .issue-visibility-menu :global(.kit-filter-dropdown__trigger-label),
+  .issue-visibility-menu :global(.kit-filter-dropdown__trigger-detail) {
+    display: none;
+  }
+
   .compact-filter-menu :global(.kit-filter-dropdown__btn) {
     width: 26px;
     justify-content: center;
@@ -467,6 +550,10 @@
 
   .filter-bar--compact .state-toggle,
   .filter-bar--compact .group-toggle {
+    display: none;
+  }
+
+  .filter-bar--compact .issue-visibility-menu {
     display: none;
   }
 

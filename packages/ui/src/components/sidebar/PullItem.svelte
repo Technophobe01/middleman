@@ -16,6 +16,7 @@
   import { Chip } from "@kenn-io/kit-ui";
   import LabelRow from "../shared/LabelRow.svelte";
   import WorkspaceIndicator from "../shared/WorkspaceIndicator.svelte";
+  import { repoIdentityKey } from "../../utils/repo-label.js";
 
   const { pulls } = getStores();
   const hostState = getHostState();
@@ -24,6 +25,7 @@
     pr: PullRequest;
     selected: boolean;
     showRepo: boolean;
+    repoLabel: string;
     onclick: () => void;
     importAction?: Action | undefined;
   }
@@ -32,13 +34,10 @@
     pr,
     selected,
     showRepo,
+    repoLabel,
     onclick,
     importAction,
   }: Props = $props();
-
-  const repoSlug = $derived(
-    `${pr.repo_owner ?? ""}/${pr.repo_name ?? ""}`,
-  );
 
   function handleStarClick(e: MouseEvent): void {
     e.stopPropagation();
@@ -111,6 +110,13 @@
     pr.State === "open",
   );
   const labels = $derived(pr.labels ?? []);
+  const repoColorKey = $derived(repoIdentityKey({
+    provider: pr.repo.provider,
+    platformHost: pr.repo.platform_host,
+    owner: pr.repo.owner,
+    name: pr.repo.name,
+    repoPath: pr.repo.repo_path,
+  }));
   const reviewDecision = $derived(pr.ReviewDecision.trim().toUpperCase());
   const reviewIndicator = $derived.by(
     ():
@@ -176,10 +182,10 @@
       <Chip
         size="xs"
         uppercase={false}
-        title={repoSlug}
+        title={repoLabel}
         tone="muted" class="repo-chip"
-        style={`color: ${hashColor(repoSlug)}; background: color-mix(in srgb, ${hashColor(repoSlug)} 15%, transparent);`}
-      >{repoSlug}</Chip>
+        style={`color: ${hashColor(repoColorKey)}; background: color-mix(in srgb, ${hashColor(repoColorKey)} 15%, transparent);`}
+      >{repoLabel}</Chip>
     </div>
   {/if}
   <div class="meta-row">

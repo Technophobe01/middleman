@@ -6,6 +6,7 @@
   import { ScrollBox } from "@kenn-io/kit-ui";
   import IssueItem from "../components/sidebar/IssueItem.svelte";
   import type { Issue, PullRequest } from "../api/types.js";
+  import { createRepoLabelFormatter } from "../utils/repo-label.js";
   import {
     buildFocusIssueRoute,
     buildFocusPullRequestRoute,
@@ -150,6 +151,31 @@
   const issueLoading = $derived(issues.isIssuesLoading());
   const issueError = $derived(issues.getIssuesError());
 
+  const prRepoLabelFormatter = $derived(
+    createRepoLabelFormatter(
+      prItems.map((pr) => ({
+        provider: pr.repo.provider,
+        platformHost: pr.repo.platform_host,
+        owner: pr.repo.owner,
+        name: pr.repo.name,
+        repoPath: pr.repo.repo_path,
+      })),
+      { showOrgNames: !grouping.getHideOrgName() },
+    ),
+  );
+  const issueRepoLabelFormatter = $derived(
+    createRepoLabelFormatter(
+      issueItems.map((issue) => ({
+        provider: issue.repo.provider,
+        platformHost: issue.repo.platform_host,
+        owner: issue.repo.owner,
+        name: issue.repo.name,
+        repoPath: issue.repo.repo_path,
+      })),
+      { showOrgNames: !grouping.getHideOrgName() },
+    ),
+  );
+
   const itemCount = $derived(
     listType === "mrs" ? prItems.length : issueItems.length,
   );
@@ -266,6 +292,13 @@
               {@const prRef = routeRefForPull(pr)}
               <PullItem
                 {pr}
+                repoLabel={prRepoLabelFormatter.format({
+                  provider: pr.repo.provider,
+                  platformHost: pr.repo.platform_host,
+                  owner: pr.repo.owner,
+                  name: pr.repo.name,
+                  repoPath: pr.repo.repo_path,
+                })}
                 showRepo={!repo}
                 selected={false}
                 {importAction}
@@ -279,6 +312,13 @@
           {@const prRef = routeRefForPull(pr)}
           <PullItem
             {pr}
+            repoLabel={prRepoLabelFormatter.format({
+              provider: pr.repo.provider,
+              platformHost: pr.repo.platform_host,
+              owner: pr.repo.owner,
+              name: pr.repo.name,
+              repoPath: pr.repo.repo_path,
+            })}
             showRepo={!repo}
             selected={false}
             {importAction}
@@ -307,6 +347,13 @@
           {@const issueRef = routeRefForIssue(issue)}
           <IssueItem
             {issue}
+            repoLabel={issueRepoLabelFormatter.format({
+              provider: issue.repo.provider,
+              platformHost: issue.repo.platform_host,
+              owner: issue.repo.owner,
+              name: issue.repo.name,
+              repoPath: issue.repo.repo_path,
+            })}
             showRepo={!repo}
             selected={false}
             onclick={() => handleIssueSelect(issueRef)}
