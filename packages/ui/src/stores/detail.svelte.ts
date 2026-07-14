@@ -1,6 +1,12 @@
 import type { KanbanStatus, Label, PullDetail } from "../api/types.js";
 import type { ApplySuggestionRequest } from "../utils/markdown-suggestions.js";
-import { isProblem, problemConflictReason, type ConflictReason, type ProblemBody } from "../api/problems.js";
+import {
+  isProblem,
+  problemConflictContext,
+  problemConflictReason,
+  type ConflictReason,
+  type ProblemBody,
+} from "../api/problems.js";
 import {
   providerDefaultHost,
   providerItemPath,
@@ -41,6 +47,14 @@ export interface DetailStoreOptions {
     subscribeSyncComplete: (cb: () => void) => () => void;
     refreshSyncStatus?: () => Promise<void>;
   };
+}
+
+export interface ApplySuggestionConflict {
+  reason: Exclude<ConflictReason, "conflict">;
+  context?: string | undefined;
+  expectedHeadSha: string;
+  ref: ProviderRouteRef;
+  number: number;
 }
 
 function apiErrorMessage(error: { detail?: string; title?: string }, fallback: string): string {
@@ -99,6 +113,8 @@ export function createDetailStore(opts: DetailStoreOptions) {
   let storeError = $state<string | null>(null);
   let detailLoaded = $state(false);
   let syncGeneration = 0;
+  let selectionGeneration = 0;
+  let activeSelectionKey: string | null = null;
   // Tracks the PR (if any) whose local body has been edited since
   // the last server confirmation. While set, background sync paths
   // preserve the local body when applying refreshed server data for
@@ -398,6 +414,8 @@ export function createDetailStore(opts: DetailStoreOptions) {
 
   function clearDetail(): void {
     ++syncGeneration;
+    ++selectionGeneration;
+    activeSelectionKey = null;
     activeLoad = null;
     detail = null;
     loading = false;
@@ -414,6 +432,10 @@ export function createDetailStore(opts: DetailStoreOptions) {
     // sync mode joins the in-flight load and may promote the sync
     // intent if its requested mode is stronger.
     const key = prKey(requestRef);
+    if (activeSelectionKey !== key) {
+      activeSelectionKey = key;
+      ++selectionGeneration;
+    }
     if (loading && activeLoad?.key === key && activeLoad.promise !== null) {
       activeLoad.syncMode = strongerSyncMode(activeLoad.syncMode, syncMode);
       activeLoad.workflowApprovalSync ||= options.workflowApprovalSync ?? true;
@@ -550,11 +572,11 @@ export function createDetailStore(opts: DetailStoreOptions) {
     name: string,
     number: number,
     identity: DetailRequestOptions,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const ref = detailRequestRef(owner, name, number, identity);
     activeLoad = null;
     const gen = ++syncGeneration;
-    await syncDetail(owner, name, number, gen, ref);
+    return syncDetail(owner, name, number, gen, ref);
   }
 
   async function refreshPendingCI(
@@ -580,7 +602,7 @@ export function createDetailStore(opts: DetailStoreOptions) {
         });
         if (gen !== syncGeneration) return;
         if (requestError) {
-          showFlash(apiErrorMessage(requestError, "Failed to refresh CI checks"));
+          showFlash(apiErrorMessage(requestError, "Failed to refresh CI checks"), { tone: "danger" });
           return;
         }
         if (data) {
@@ -592,7 +614,7 @@ export function createDetailStore(opts: DetailStoreOptions) {
           detailLoaded = data.detail_loaded ?? detailLoaded;
           const warning = data.warnings?.[0];
           if (warning) {
-            showFlash(warning);
+            showFlash(warning, { tone: "warning" });
           }
           if (needsWorkflowApprovalSync(detail, identity.workflowApprovalSync ?? true)) {
             await syncDetail(owner, name, number, gen, ref);
@@ -645,7 +667,7 @@ export function createDetailStore(opts: DetailStoreOptions) {
       }
     } catch (err) {
       if (seq === kanbanSeqByPR.get(key)) {
-        storeError = err instanceof Error ? err.message : String(err);
+        showFlash(err instanceof Error ? err.message : String(err), { tone: "danger" });
         if (prevDetailStatus !== undefined && isDetailShowingRef(ref)) {
           detail = {
             ...detail!,
@@ -690,7 +712,7 @@ export function createDetailStore(opts: DetailStoreOptions) {
     });
     if (requestError) {
       const message = apiErrorMessage(requestError, "failed to update labels");
-      storeError = message;
+      showFlash(message, { tone: "danger" });
       throw new Error(message);
     }
     const nextLabels = (data?.labels ?? []) as Label[];
@@ -717,7 +739,6 @@ export function createDetailStore(opts: DetailStoreOptions) {
     });
     if (requestError) {
       const message = apiErrorMessage(requestError, "failed to update assignees");
-      storeError = message;
       throw new Error(message);
     }
     const nextAssignees = data?.assignees ?? [];
@@ -744,7 +765,6 @@ export function createDetailStore(opts: DetailStoreOptions) {
     });
     if (requestError) {
       const message = apiErrorMessage(requestError, "failed to update reviewers");
-      storeError = message;
       throw new Error(message);
     }
     const nextReviewers = data?.reviewers ?? [];
@@ -812,7 +832,7 @@ export function createDetailStore(opts: DetailStoreOptions) {
         }
       }
     } catch (err) {
-      storeError = err instanceof Error ? err.message : String(err);
+      showFlash(err instanceof Error ? err.message : String(err), { tone: "danger" });
       // Revert optimistic update.
       if (isDetailShowingRef(ref) && detail) {
         detail = {
@@ -935,7 +955,7 @@ export function createDetailStore(opts: DetailStoreOptions) {
         detail = data as PullDetail;
       }
     } catch (err) {
-      storeError = err instanceof Error ? err.message : String(err);
+      showFlash(err instanceof Error ? err.message : String(err), { tone: "danger" });
     }
     // Clear the unsaved-body flag only when the captured local body
     // matched what we sent — i.e. no newer toggle landed during the
@@ -959,7 +979,7 @@ export function createDetailStore(opts: DetailStoreOptions) {
 
   // Fire-and-forget PATCH for the PR body. Does NOT apply an optimistic
   // update or revert on failure — the caller already owns local state.
-  // On error, storeError is set so the surface can surface a banner.
+  // On error, the shared flash surfaces the failure without poisoning load state.
   //
   // The caller passes the full route ref so the PATCH always targets
   // the captured PR even if the user has since navigated away. Only
@@ -1068,7 +1088,7 @@ export function createDetailStore(opts: DetailStoreOptions) {
         }
       }
     } catch (err) {
-      storeError = err instanceof Error ? err.message : String(err);
+      showFlash(err instanceof Error ? err.message : String(err), { tone: "danger" });
       if (detail !== null) {
         detail = {
           ...detail,
@@ -1083,9 +1103,8 @@ export function createDetailStore(opts: DetailStoreOptions) {
     await refreshPullsIfActive();
   }
 
-  async function submitComment(owner: string, name: string, number: number, body: string): Promise<void> {
+  async function submitComment(owner: string, name: string, number: number, body: string): Promise<boolean> {
     const ref = currentDetailRef(owner, name, number);
-    storeError = null;
     try {
       const { error: requestError } = await apiClient.POST(providerItemPath("pulls", ref, "/comments"), {
         params: {
@@ -1097,8 +1116,8 @@ export function createDetailStore(opts: DetailStoreOptions) {
         throw new Error(requestError.detail ?? requestError.title ?? "failed to post comment");
       }
     } catch (err) {
-      storeError = err instanceof Error ? err.message : String(err);
-      return;
+      showFlash(err instanceof Error ? err.message : String(err), { tone: "danger" });
+      return false;
     }
     // Supersede any in-flight syncDetail so its stale response
     // cannot overwrite the detail we are about to fetch.
@@ -1113,6 +1132,7 @@ export function createDetailStore(opts: DetailStoreOptions) {
     if (gen === syncGeneration) {
       void syncDetail(owner, name, number, gen, currentDetailRef(owner, name, number));
     }
+    return true;
   }
 
   async function editComment(
@@ -1123,7 +1143,6 @@ export function createDetailStore(opts: DetailStoreOptions) {
     body: string,
   ): Promise<boolean> {
     const ref = currentDetailRef(owner, name, number);
-    storeError = null;
     try {
       const { error: requestError } = await apiClient.PATCH(providerItemPath("pulls", ref, "/comments/{comment_id}"), {
         params: {
@@ -1139,7 +1158,7 @@ export function createDetailStore(opts: DetailStoreOptions) {
         throw new Error(requestError.detail ?? requestError.title ?? "failed to edit comment");
       }
     } catch (err) {
-      storeError = err instanceof Error ? err.message : String(err);
+      showFlash(err instanceof Error ? err.message : String(err), { tone: "danger" });
       return false;
     }
     await refreshDetail(owner, name, number, syncGeneration, currentDetailRef(owner, name, number));
@@ -1184,7 +1203,6 @@ export function createDetailStore(opts: DetailStoreOptions) {
     body: string,
   ): Promise<boolean> {
     const ref = currentDetailRef(owner, name, number);
-    storeError = null;
     try {
       const { error: requestError } = await apiClient.POST(
         providerItemPath("pulls", ref, "/discussions/{discussion_id}/reply"),
@@ -1203,7 +1221,7 @@ export function createDetailStore(opts: DetailStoreOptions) {
         throw new Error(requestError.detail ?? requestError.title ?? "failed to reply to thread");
       }
     } catch (err) {
-      storeError = err instanceof Error ? err.message : String(err);
+      showFlash(err instanceof Error ? err.message : String(err), { tone: "danger" });
       return false;
     }
     await refreshDetail(owner, name, number, syncGeneration, currentDetailRef(owner, name, number));
@@ -1215,12 +1233,13 @@ export function createDetailStore(opts: DetailStoreOptions) {
     name: string,
     number: number,
     input: ApplySuggestionRequest,
+    onConflict?: (conflict: ApplySuggestionConflict) => void,
   ): Promise<boolean> {
     const ref = currentDetailRef(owner, name, number);
+    const requestSelectionGeneration = selectionGeneration;
     const expectedHeadSHA = detail?.platform_head_sha ?? "";
-    storeError = null;
     try {
-      const { error: requestError } = await apiClient.POST(
+      const { data: applyResult, error: requestError } = await apiClient.POST(
         providerItemPath("pulls", ref, "/review-suggestions/apply"),
         {
           params: {
@@ -1239,12 +1258,31 @@ export function createDetailStore(opts: DetailStoreOptions) {
           },
         },
       );
+      if (requestSelectionGeneration !== selectionGeneration || !isDetailShowingRef(ref)) {
+        // A typed stale-head response belongs to the original detail view;
+        // do not attach its inline conflict handling to a new selection.
+        if (requestError && isProblem(requestError) && applySuggestionRefreshReason(requestError)) return false;
+        if (requestError) throw new Error(apiErrorMessage(requestError, "failed to apply suggestion"));
+        showFlash("Suggestion was applied after navigation. Refresh before applying it again.", {
+          tone: "warning",
+        });
+        return true;
+      }
       if (requestError) {
         const message = apiErrorMessage(requestError, "failed to apply suggestion");
         const refreshReason = isProblem(requestError) ? applySuggestionRefreshReason(requestError) : undefined;
         if (refreshReason) {
-          if (isDetailShowingRef(ref)) {
-            const refreshed = await syncDetail(owner, name, number, syncGeneration, ref);
+          if (onConflict) {
+            onConflict({
+              reason: refreshReason,
+              context: isProblem(requestError) ? problemConflictContext(requestError) : undefined,
+              expectedHeadSha: expectedHeadSHA,
+              ref,
+              number,
+            });
+          } else if (isDetailShowingRef(ref)) {
+            const refreshGeneration = ++syncGeneration;
+            const refreshed = await syncDetail(owner, name, number, refreshGeneration, ref);
             if (!refreshed && isDetailShowingRef(ref)) {
               failClosedAfterApplySuggestionConflict(refreshReason);
             }
@@ -1255,19 +1293,11 @@ export function createDetailStore(opts: DetailStoreOptions) {
         throw new Error(message);
       }
     } catch (err) {
-      storeError = err instanceof Error ? err.message : String(err);
+      showFlash(err instanceof Error ? err.message : String(err), { tone: "danger" });
       return false;
     }
-    // The provider commit moved the head; a cached GET can race the
-    // server's async post-apply sync and leave stale controls enabled.
-    // Await a sync-enabled refresh so the detail reflects the new head,
-    // falling back to the cached view when the sync fails.
-    const identity = currentDetailRef(owner, name, number);
-    const synced = await syncDetail(owner, name, number, syncGeneration, identity);
-    if (!synced) {
-      await refreshDetail(owner, name, number, syncGeneration, identity);
-    }
-    await refreshPullsIfActive();
+    const refreshGeneration = ++syncGeneration;
+    await syncDetail(owner, name, number, refreshGeneration, ref);
     return true;
   }
 

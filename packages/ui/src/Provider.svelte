@@ -224,12 +224,13 @@
           platformHost: ref.platformHost,
           repoPath: ref.repoPath,
         }),
-      onStalePublish: (ref, number) =>
-        detailStore.syncDetailNow(ref.owner, ref.name, number, {
+      onStalePublish: async (ref, number) => {
+        await detailStore.syncDetailNow(ref.owner, ref.name, number, {
           provider: ref.provider,
           platformHost: ref.platformHost,
           repoPath: ref.repoPath,
-        }),
+        });
+      },
     });
 
     function hydrateSettings(
@@ -355,7 +356,7 @@
         if (event.status === "merged") {
           notificationCb?.(`${event.owner}/${event.name}#${event.number} merged after CI passed.`);
         } else {
-          (notificationCb ?? errorCb)?.(
+          errorCb?.(
             `Deferred merge for ${event.owner}/${event.name}#${event.number} failed: ${event.error ?? "checks did not pass"}`,
           );
         }

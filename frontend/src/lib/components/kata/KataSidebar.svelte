@@ -7,6 +7,7 @@
   import PlusIcon from "@lucide/svelte/icons/plus";
   import StarIcon from "@lucide/svelte/icons/star";
   import { GroupedSidebarSection, ScrollBox } from "@middleman/ui";
+  import { showFlash } from "@middleman/ui/stores/flash";
 
   import type { KataProjectSummary, KataTaskSearchFilters, KataTaskViewName } from "../../api/kata/taskTypes.js";
   import type { KataAreaSummary, KataCurrentView } from "../../stores/kata-workspace.svelte.js";
@@ -47,7 +48,6 @@
   let creatingProject = $state(false);
   let createDraft = $state("");
   let createSaving = $state(false);
-  let createError = $state<string | null>(null);
   let createInput: HTMLInputElement | null = $state(null);
   let collapsedAreas = $state<string[]>([]);
 
@@ -73,28 +73,25 @@
   function startCreatingProject(): void {
     creatingProject = true;
     createDraft = "";
-    createError = null;
     queueMicrotask(() => createInput?.focus());
   }
 
   function cancelCreatingProject(): void {
     creatingProject = false;
     createDraft = "";
-    createError = null;
   }
 
   async function submitCreateProject(): Promise<void> {
     const name = createDraft.trim();
     if (!name || createSaving) return;
     createSaving = true;
-    createError = null;
     try {
       const project = await onCreateProject(name);
       creatingProject = false;
       createDraft = "";
       await onOpenProject(project.uid);
     } catch (err) {
-      createError = err instanceof Error ? err.message : "Could not create project.";
+      showFlash(err instanceof Error ? err.message : "Could not create project.", { tone: "danger" });
     } finally {
       createSaving = false;
     }
@@ -171,9 +168,6 @@
           disabled={createSaving}
         />
       </form>
-      {#if createError}
-        <p class="sidebar-error" role="alert">{createError}</p>
-      {/if}
     {:else}
       <button type="button" class="project-create-button" onclick={startCreatingProject}>
         <PlusIcon size={13} strokeWidth={1.9} />
@@ -298,12 +292,6 @@
     outline: none;
     border-color: var(--accent-blue);
     box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent-blue) 18%, transparent);
-  }
-
-  .sidebar-error {
-    margin: 4px 6px;
-    color: var(--accent-red);
-    font-size: var(--font-size-xs);
   }
 
   @media (max-width: 900px) {

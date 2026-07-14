@@ -4609,11 +4609,14 @@ func (s *Syncer) indexUpsertMergeRequest(
 		}
 	}
 
-	mrID, err := s.db.UpsertMergeRequest(ctx, normalized)
+	mrID, accepted, err := s.db.UpsertMergeRequestSnapshot(ctx, normalized)
 	if err != nil {
 		return fmt.Errorf(
 			"upsert MR #%d: %w", mr.Number, err,
 		)
+	}
+	if !accepted {
+		return nil
 	}
 	if needsCIDetailRefresh {
 		if err := s.clearMRDetailFetchedByRepoID(ctx, repoID, mr.Number); err != nil {
@@ -4719,11 +4722,14 @@ func (s *Syncer) indexUpsertMR(
 		}
 	}
 
-	mrID, err := s.db.UpsertMergeRequest(ctx, normalized)
+	mrID, accepted, err := s.db.UpsertMergeRequestSnapshot(ctx, normalized)
 	if err != nil {
 		return fmt.Errorf(
 			"upsert MR #%d: %w", ghPR.GetNumber(), err,
 		)
+	}
+	if !accepted {
+		return nil
 	}
 	if needsCIDetailRefresh {
 		if err := s.clearMRDetailFetchedByRepoID(ctx, repoID, ghPR.GetNumber()); err != nil {
@@ -5266,9 +5272,12 @@ func (s *Syncer) syncOpenMRFromBulk(
 		}
 	}
 
-	mrID, err := s.db.UpsertMergeRequest(ctx, normalized)
+	mrID, accepted, err := s.db.UpsertMergeRequestSnapshot(ctx, normalized)
 	if err != nil {
 		return fmt.Errorf("upsert MR #%d: %w", number, err)
+	}
+	if !accepted {
+		return nil
 	}
 
 	// UpsertMergeRequest preserves ci_had_pending across upserts, so
@@ -5595,11 +5604,14 @@ func (s *Syncer) fetchMRDetail(
 		calls++ // GetUser
 	}
 
-	mrID, err := s.db.UpsertMergeRequest(ctx, normalized)
+	mrID, accepted, err := s.db.UpsertMergeRequestSnapshot(ctx, normalized)
 	if err != nil {
 		return calls, fmt.Errorf(
 			"upsert MR #%d: %w", number, err,
 		)
+	}
+	if !accepted {
+		return calls, nil
 	}
 	if err := s.replaceMergeRequestLabels(ctx, repoID, mrID, normalized.Labels); err != nil {
 		return calls, fmt.Errorf("persist labels for MR #%d: %w", number, err)
@@ -5824,11 +5836,14 @@ func (s *Syncer) fetchProviderMRDetail(
 	}
 	preserveMergeableStateIfOmitted(normalized, existing)
 
-	mrID, err := s.db.UpsertMergeRequest(ctx, normalized)
+	mrID, accepted, err := s.db.UpsertMergeRequestSnapshot(ctx, normalized)
 	if err != nil {
 		return calls, fmt.Errorf(
 			"upsert MR #%d: %w", number, err,
 		)
+	}
+	if !accepted {
+		return calls, nil
 	}
 	if err := s.replaceMergeRequestLabels(ctx, repoID, mrID, normalized.Labels); err != nil {
 		return calls, fmt.Errorf("persist labels for MR #%d: %w", number, err)
@@ -6462,7 +6477,10 @@ func (s *Syncer) refreshCIStatus(
 	if !result.Updated {
 		return nil
 	}
-	return s.db.UpdateMRCIStatus(ctx, repoID, number, result.Status, result.ChecksJSON)
+	return s.db.UpdateMRCIStatusForHead(
+		ctx, repoID, number, headSHA,
+		result.Status, result.ChecksJSON, ciHasPending(result.ChecksJSON),
+	)
 }
 
 const ciRefreshWarning = "Could not refresh CI checks; showing last known status."
@@ -7592,9 +7610,8 @@ func (s *Syncer) backfillRepo(
 					pageFailed = true
 					break
 				}
-				if mrID, uErr := s.db.UpsertMergeRequest(
-					ctx, normalized,
-				); uErr != nil {
+				mrID, accepted, uErr := s.db.UpsertMergeRequestSnapshot(ctx, normalized)
+				if uErr != nil {
 					slog.Warn("backfill upsert PR failed",
 						"repo", repo.Owner+"/"+repo.Name,
 						"number", ghPR.GetNumber(),
@@ -7602,6 +7619,8 @@ func (s *Syncer) backfillRepo(
 					)
 					pageFailed = true
 					break
+				} else if !accepted {
+					continue
 				} else if err := s.replaceMergeRequestLabels(ctx, repoID, mrID, normalized.Labels); err != nil {
 					slog.Warn("backfill replace PR labels failed",
 						"repo", repo.Owner+"/"+repo.Name,
@@ -7964,9 +7983,12 @@ func (s *Syncer) syncMRForRepo(
 		}
 	}
 
-	mrID, err := s.db.UpsertMergeRequest(ctx, normalized)
+	mrID, accepted, err := s.db.UpsertMergeRequestSnapshot(ctx, normalized)
 	if err != nil {
 		return fmt.Errorf("upsert MR #%d: %w", number, err)
+	}
+	if !accepted {
+		return nil
 	}
 	if err := s.markClosedLinkedNotificationsDone(ctx); err != nil {
 		return err
@@ -8644,9 +8666,12 @@ func (s *Syncer) fetchAndUpdateClosedMergeRequest(
 		return fmt.Errorf("get closed MR #%d: %w", number, err)
 	}
 	normalized := platform.DBMergeRequest(repoID, mr)
-	mrID, err := s.db.UpsertMergeRequest(ctx, normalized)
+	mrID, accepted, err := s.db.UpsertMergeRequestSnapshot(ctx, normalized)
 	if err != nil {
 		return fmt.Errorf("upsert closed MR #%d: %w", number, err)
+	}
+	if !accepted {
+		return nil
 	}
 	if err := s.replaceMergeRequestLabels(ctx, repoID, mrID, normalized.Labels); err != nil {
 		return fmt.Errorf("persist labels for closed MR #%d: %w", number, err)

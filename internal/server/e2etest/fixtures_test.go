@@ -289,11 +289,11 @@ func (m *mockGH) CreateReviewWithComments(
 	return nil, nil
 }
 func (m *mockGH) ApplyReviewSuggestions(
-	context.Context,
-	string,
-	string,
-	int,
-	platform.ApplyReviewSuggestionsInput,
+	_ context.Context,
+	_ string,
+	_ string,
+	_ int,
+	input platform.ApplyReviewSuggestionsInput,
 ) (*platform.AppliedReviewSuggestions, error) {
 	return nil, nil
 }

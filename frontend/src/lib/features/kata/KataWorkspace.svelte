@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount, untrack } from "svelte";
   import { IconButton } from "@kenn-io/kit-ui";
+  import { showFlash } from "@middleman/ui/stores/flash";
   import LayoutPanelLeftIcon from "@lucide/svelte/icons/layout-panel-left";
   import LayoutPanelTopIcon from "@lucide/svelte/icons/layout-panel-top";
   import PlusIcon from "@lucide/svelte/icons/plus";
@@ -76,7 +77,7 @@
   }
 
   type SplitOrientation = "vertical" | "horizontal";
-  type FailureSurface = "request" | "daemon" | "none";
+  type FailureSurface = "flash" | "daemon" | "view" | "none";
   type ListMode = "tasks" | "reachableGraph";
 
   function graphLayoutDirectionForSplit(orientation: SplitOrientation): KataGraphLayoutDirection {
@@ -99,10 +100,9 @@
   let viewLoadingGeneration = 0;
   let viewWorkCount = $state(0);
   let error = $state<string | null>(null);
-  let requestError = $state<string | null>(null);
+  let viewError = $state<string | null>(null);
   let lastTaskError: string | null = null;
   let unlinkBusyIds = $state<ReadonlySet<number>>(new Set());
-  let unlinkError = $state<string | null>(null);
   let daemonInfos = $state.raw<KataDaemonInfo[]>([]);
   let switchingDaemon = $state(false);
   let terminalDaemonFailure = $state(false);
@@ -219,28 +219,30 @@
     return err instanceof Error ? err.message : "Kata request failed.";
   }
 
-  function clearTaskErrors(): void {
-    error = null;
-    requestError = null;
+  function clearTaskErrors(surface: FailureSurface = "daemon"): void {
+    if (surface === "daemon") error = null;
+    if (surface === "view") viewError = null;
     lastTaskError = null;
   }
 
   function surfaceTaskError(message: string, surface: FailureSurface): void {
     lastTaskError = message;
-    if (surface === "request") {
-      requestError = message;
+    if (surface === "flash") {
+      showFlash(message, { tone: "danger" });
     } else if (surface === "daemon") {
       error = message;
+    } else if (surface === "view") {
+      viewError = message;
     }
   }
 
   async function runViewTask(
     task: () => Promise<void | boolean>,
-    failureSurface: FailureSurface = "request",
+    failureSurface: FailureSurface = "daemon",
     shouldSurfaceFailure: () => boolean = () => true,
   ): Promise<boolean> {
     const loadingGeneration = beginViewLoading();
-    clearTaskErrors();
+    clearTaskErrors(failureSurface);
     const expansionSignature = currentExpansionSignature();
     try {
       const ok = (await task()) ?? true;
@@ -260,10 +262,10 @@
 
   async function runViewTaskOrThrow(
     task: () => Promise<void>,
-    failureSurface: FailureSurface = "request",
+    failureSurface: FailureSurface = "daemon",
   ): Promise<void> {
     const loadingGeneration = beginViewLoading();
-    clearTaskErrors();
+    clearTaskErrors(failureSurface);
     try {
       await task();
     } catch (err) {
@@ -439,7 +441,7 @@
     viewScopeLoadSignature = signature;
     const viewName = routeViewName ?? null;
     const scopeUID = routeScopeUID ?? null;
-    void runViewTask(() => loadRouteViewScope(viewName, scopeUID)).then((ok) => {
+    void runViewTask(() => loadRouteViewScope(viewName, scopeUID), "view").then((ok) => {
       if (viewScopeLoadSignature === signature) {
         viewScopeLoadSignature = null;
       }
@@ -497,7 +499,7 @@
         if (failedRouteSignature !== null && failedRouteSignature !== signature) {
           // The route moved off a failed target; drop the stale failure
           // surface so the new destination starts clean.
-          clearTaskErrors();
+          clearTaskErrors("view");
           failedRouteSignature = null;
         }
         if (failedRouteSignature === signature) return;
@@ -528,8 +530,13 @@
           beginNavigation();
           resetDetailDrafts();
           const uid = selectedIssueUID!;
-          const ok = await runViewTask(() => store.selectIssue(uid));
+          const ok = await runViewTask(() => store.selectIssue(uid), "view");
           if (!ok) {
+            // A competing refresh can supersede this detail read without an
+            // error. Leave the route retryable; the refresh completion will
+            // re-run the reconciler. Only an actual request failure makes the
+            // current route a terminal failed target.
+            if (lastTaskError === null) return;
             // The routed task cannot be shown; keeping the previous
             // detail under the new URL would lie about what is open.
             if (fullRouteSignature() === signature) {
@@ -545,7 +552,7 @@
         }
         // mismatch === "clear"
         beginNavigation();
-        clearTaskErrors();
+        clearTaskErrors("view");
         resetDetailDrafts();
         store.clearSelection();
         selectionFromRoute = false;
@@ -598,7 +605,7 @@
     if (failedRouteSignature !== null && failedRouteSignature !== fullRouteSignature()) {
       // The route moved off a failed target; drop the stale failure
       // surface even when the new route is already converged.
-      clearTaskErrors();
+      clearTaskErrors("view");
       failedRouteSignature = null;
     }
     if (failedRouteSignature === fullRouteSignature()) return;
@@ -763,7 +770,7 @@
       if (!selectedIssueMatchesStatusFilter(nextStatus)) {
         store.clearSelection();
       }
-      await runViewTask(() => store.updateSearchFilters(filters));
+      await runViewTask(() => store.updateSearchFilters(filters), "view");
       if (!isCurrentNavigation(generation)) return;
       const nextScopeUID = scopeUIDFromFilters(store.searchFilters);
       if (nextScopeUID !== (routeScopeUID ?? null)) {
@@ -791,7 +798,7 @@
       // this navigation has already discarded.
       store.clearSelection();
       selectionFromRoute = false;
-      await runViewTask(() => store.openView(viewName, { selectFirst: false }));
+      await runViewTask(() => store.openView(viewName, { selectFirst: false }), "view");
       if (!isCurrentNavigation(generation)) return;
       onRouteStateChange?.({
         view: viewName,
@@ -812,8 +819,9 @@
       // detail request can't fail into a stale workspace error while the
       // scoped list is still loading.
       store.invalidatePendingLoads();
-      const ok = await runViewTask(() =>
-        store.updateSearchFilters({ scope: { kind: "project", project_uid: projectUID } }),
+      const ok = await runViewTask(
+        () => store.updateSearchFilters({ scope: { kind: "project", project_uid: projectUID } }),
+        "view",
       );
       if (!ok || !isCurrentNavigation(generation)) return;
       onRouteStateChange?.({
@@ -948,7 +956,7 @@
     await withRouteEmission(async () => {
       const generation = beginNavigation();
       resetDetailDrafts();
-      const ok = await runViewTask(() => store.selectIssue(uid));
+      const ok = await runViewTask(() => store.selectIssue(uid), "view");
       if (!ok || !isCurrentNavigation(generation)) return;
       if (notify) onSelectedIssueChange?.(uid);
     });
@@ -988,7 +996,7 @@
     try {
       return await runViewTask(
         () => store.moveIssue(sourceIssueUID, actor, toProjectUID),
-        "request",
+        "flash",
         () => isCurrentNavigation(generation),
       );
     } finally {
@@ -999,35 +1007,35 @@
   }
 
   async function patchSelectedMetadata(uid: string, patch: Record<string, unknown>): Promise<boolean> {
-    return runViewTask(() => store.patchMetadata(uid, actor, patch));
+    return runViewTask(() => store.patchMetadata(uid, actor, patch), "flash");
   }
 
   async function addSelectedComment(uid: string, body: string): Promise<boolean> {
-    return runViewTask(() => store.addComment(uid, actor, body));
+    return runViewTask(() => store.addComment(uid, actor, body), "flash");
   }
 
   async function editSelectedIssue(uid: string, patch: KataTaskEditPatch): Promise<boolean> {
-    return runViewTask(() => store.editIssue(uid, actor, patch));
+    return runViewTask(() => store.editIssue(uid, actor, patch), "flash");
   }
 
   async function assignSelectedOwner(uid: string, owner: string): Promise<boolean> {
-    return runViewTask(() => store.assignOwner(uid, actor, owner));
+    return runViewTask(() => store.assignOwner(uid, actor, owner), "flash");
   }
 
   async function unassignSelectedOwner(uid: string): Promise<boolean> {
-    return runViewTask(() => store.unassignOwner(uid, actor));
+    return runViewTask(() => store.unassignOwner(uid, actor), "flash");
   }
 
   async function setSelectedPriority(uid: string, priority: number | null): Promise<boolean> {
-    return runViewTask(() => store.setPriority(uid, actor, priority));
+    return runViewTask(() => store.setPriority(uid, actor, priority), "flash");
   }
 
   async function addSelectedLabel(uid: string, label: string): Promise<boolean> {
-    return runViewTask(() => store.addLabel(uid, actor, label));
+    return runViewTask(() => store.addLabel(uid, actor, label), "flash");
   }
 
   async function removeSelectedLabel(uid: string, label: string): Promise<void> {
-    await runViewTask(() => store.removeLabel(uid, actor, label));
+    await runViewTask(() => store.removeLabel(uid, actor, label), "flash");
   }
 
   function selectedMessageLinks(): MessageLinkRef[] {
@@ -1042,7 +1050,6 @@
     const selected = store.selectedIssue?.issue;
     if (!selected || workspaceActionBusy) return;
     workspaceActionBusy = true;
-    requestError = null;
     try {
       const created = await createKataWorkspaceForTask(
         kataWorkspaceIdentityFromIssue(
@@ -1053,7 +1060,7 @@
       );
       openWorkspace(created.id);
     } catch (err) {
-      requestError = kataRequestErrorMessage(err);
+      showFlash(kataRequestErrorMessage(err), { tone: "danger" });
     } finally {
       workspaceActionBusy = false;
     }
@@ -1095,7 +1102,7 @@
   }
 
   async function deleteRecurrence(recurrence: KataRecurrence): Promise<boolean> {
-    return runViewTask(() => store.deleteRecurrence(recurrence.id, actor));
+    return runViewTask(() => store.deleteRecurrence(recurrence.id, actor), "flash");
   }
 
   async function closeSelectedIssue(
@@ -1104,18 +1111,20 @@
   ): Promise<boolean> {
     const selected = store.selectedIssue;
     if (!selected) return false;
-    return runViewTask(() =>
-      store.closeIssue(selected.issue.uid, actor, {
-        reason,
-        message,
-      }),
+    return runViewTask(
+      () =>
+        store.closeIssue(selected.issue.uid, actor, {
+          reason,
+          message,
+        }),
+      "flash",
     );
   }
 
   async function reopenSelectedIssue(): Promise<void> {
     const selected = store.selectedIssue;
     if (!selected) return;
-    await runViewTask(() => store.reopenIssue(selected.issue.uid, actor));
+    await runViewTask(() => store.reopenIssue(selected.issue.uid, actor), "flash");
   }
 
   async function deleteSelectedIssue(): Promise<boolean> {
@@ -1133,11 +1142,10 @@
     const metadataPatch: Record<string, unknown> = { mail_links: patch.mail_links };
 
     unlinkBusyIds = new Set(links.map((item) => item.message_id));
-    unlinkError = null;
     try {
       const ok = await runViewTask(() => store.patchMetadata(uid, actor, metadataPatch), "none");
       if (!ok) {
-        unlinkError = lastTaskError || "Could not unlink message.";
+        showFlash(lastTaskError || "Could not unlink message.", { tone: "danger" });
       }
     } finally {
       unlinkBusyIds = new Set();
@@ -1185,9 +1193,6 @@
     </div>
   </header>
 
-  {#if requestError}
-    <p class="kata-request-error" role="alert">{requestError}</p>
-  {/if}
 
   <div class="kata-layout">
     <KataSidebar
@@ -1205,6 +1210,9 @@
     />
 
     <main class="kata-main" aria-label="Kata tasks">
+      {#if viewError}
+        <p class="kata-view-error" role="alert">{viewError}</p>
+      {/if}
       <KataResizableSash
         orientation={splitOrientation}
         primarySize={activeSplitSize}
@@ -1280,7 +1288,6 @@
       ownerOptions={ownerOptions()}
       messageLinks={selectedMessageLinks()}
       unlinkBusyIds={unlinkBusyIds}
-      {unlinkError}
       selectedRecurrences={store.selectedRecurrences}
       {checklistRevealed}
       movePending={pendingMoveIssueUIDs.has(store.selectedIssue.issue.uid)}
@@ -1343,6 +1350,13 @@
     flex-direction: column;
   }
 
+  .kata-view-error {
+    flex: 0 0 auto;
+    margin: var(--space-4) var(--space-5) 0;
+    color: var(--accent-red);
+    font-size: var(--font-size-sm);
+  }
+
   .kata-header {
     min-height: 56px;
     padding: 16px 20px;
@@ -1384,17 +1398,6 @@
     align-items: center;
     gap: var(--space-4);
     flex: 0 0 auto;
-  }
-
-  .kata-request-error {
-    margin: 10px 20px 0;
-    padding: 8px 10px;
-    border: 1px solid color-mix(in srgb, var(--accent-red) 42%, var(--border-default));
-    border-radius: var(--radius-sm);
-    background: color-mix(in srgb, var(--accent-red) 9%, var(--bg-primary));
-    color: var(--accent-red);
-    font-size: var(--font-size-sm);
-    line-height: 1.35;
   }
 
   .header-action {

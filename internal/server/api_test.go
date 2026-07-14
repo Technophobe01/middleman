@@ -697,26 +697,37 @@ func (m *mockGH) MarkNotificationThreadRead(ctx context.Context, threadID string
 func (m *mockGH) InvalidateListETagsForRepo(_, _ string, _ ...string) {}
 
 type apiTestGitLabProvider struct {
-	ref                 platform.RepoRef
-	capabilities        *platform.Capabilities
-	mergeRequests       []platform.MergeRequest
-	mergeRequestDetail  map[int]platform.MergeRequest
-	mergeRequestEvents  map[int][]platform.MergeRequestEvent
-	issues              []platform.Issue
-	issueEvents         map[int][]platform.IssueEvent
-	releases            []platform.Release
-	tags                []platform.Tag
-	ciChecks            map[string][]platform.CICheck
-	ciErr               error
-	reviewThreads       []platform.MergeRequestReviewThread
-	reviewThreadsErr    error
-	publishedReviews    []platform.PublishDiffReviewDraftInput
-	publishReviewErr    error
-	appliedSuggestions  []platform.ApplyReviewSuggestionsInput
-	applySuggestionsErr error
-	rateLimitBuckets    map[platform.OperationName][]platform.RateLimitBucket
-	resolvedThreads     []string
-	unresolvedThreads   []string
+	mu                               sync.Mutex
+	ref                              platform.RepoRef
+	capabilities                     *platform.Capabilities
+	mergeRequests                    []platform.MergeRequest
+	mergeRequestDetail               map[int]platform.MergeRequest
+	mergeRequestEvents               map[int][]platform.MergeRequestEvent
+	issues                           []platform.Issue
+	issueEvents                      map[int][]platform.IssueEvent
+	releases                         []platform.Release
+	tags                             []platform.Tag
+	ciChecks                         map[string][]platform.CICheck
+	ciErr                            error
+	reviewThreads                    []platform.MergeRequestReviewThread
+	reviewThreadsErr                 error
+	publishedReviews                 []platform.PublishDiffReviewDraftInput
+	publishReviewErr                 error
+	appliedSuggestions               []platform.ApplyReviewSuggestionsInput
+	applySuggestionsErr              error
+	applySuggestionsErrAfterMutation error
+	applySuggestionResult            *platform.AppliedReviewSuggestions
+	applySuggestionReturnsNil        bool
+	applySuggestionHead              string
+	applySuggestionsStarted          chan struct{}
+	applySuggestionsRelease          <-chan struct{}
+	cancelAfterApply                 func()
+	blockNextMRFetch                 atomic.Bool
+	mrFetchStarted                   chan struct{}
+	mrFetchRelease                   <-chan struct{}
+	rateLimitBuckets                 map[platform.OperationName][]platform.RateLimitBucket
+	resolvedThreads                  []string
+	unresolvedThreads                []string
 }
 
 func (p *apiTestGitLabProvider) Platform() platform.Kind {
@@ -764,14 +775,44 @@ func (p *apiTestGitLabProvider) PublishDiffReviewDraft(
 func (p *apiTestGitLabProvider) ApplyReviewSuggestions(
 	_ context.Context,
 	_ platform.RepoRef,
-	_ int,
+	number int,
 	input platform.ApplyReviewSuggestionsInput,
 ) (*platform.AppliedReviewSuggestions, error) {
+	if p.applySuggestionsStarted != nil {
+		p.applySuggestionsStarted <- struct{}{}
+	}
+	if p.applySuggestionsRelease != nil {
+		<-p.applySuggestionsRelease
+	}
 	if p.applySuggestionsErr != nil {
 		return nil, p.applySuggestionsErr
 	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.appliedSuggestions = append(p.appliedSuggestions, input)
-	return &platform.AppliedReviewSuggestions{CommitSHA: "suggestion-commit-sha"}, nil
+	result := platform.AppliedReviewSuggestions{CommitSHA: "suggestion-commit-sha"}
+	if p.applySuggestionResult != nil {
+		result = *p.applySuggestionResult
+	}
+	providerHead := result.CommitSHA
+	if p.applySuggestionHead != "" {
+		providerHead = p.applySuggestionHead
+	}
+	for i := range p.mergeRequests {
+		if p.mergeRequests[i].Number == number && providerHead != "" {
+			p.mergeRequests[i].HeadSHA = providerHead
+		}
+	}
+	if p.cancelAfterApply != nil {
+		p.cancelAfterApply()
+	}
+	if p.applySuggestionsErrAfterMutation != nil {
+		return nil, p.applySuggestionsErrAfterMutation
+	}
+	if p.applySuggestionReturnsNil {
+		return nil, nil
+	}
+	return &result, nil
 }
 
 func (p *apiTestGitLabProvider) ListMergeRequestReviewThreads(
@@ -835,7 +876,9 @@ func (p *apiTestGitLabProvider) ListOpenMergeRequests(
 	context.Context,
 	platform.RepoRef,
 ) ([]platform.MergeRequest, error) {
-	return p.mergeRequests, nil
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return slices.Clone(p.mergeRequests), nil
 }
 
 func (p *apiTestGitLabProvider) GetMergeRequest(
@@ -843,15 +886,35 @@ func (p *apiTestGitLabProvider) GetMergeRequest(
 	_ platform.RepoRef,
 	number int,
 ) (platform.MergeRequest, error) {
+	p.mu.Lock()
+	var found platform.MergeRequest
+	foundOK := false
 	if p.mergeRequestDetail != nil {
 		if mr, ok := p.mergeRequestDetail[number]; ok {
-			return mr, nil
+			found = mr
+			foundOK = true
 		}
 	}
-	for _, mr := range p.mergeRequests {
-		if mr.Number == number {
-			return mr, nil
+	if !foundOK {
+		for _, mr := range p.mergeRequests {
+			if mr.Number == number {
+				found = mr
+				foundOK = true
+				break
+			}
 		}
+	}
+	p.mu.Unlock()
+	if foundOK {
+		if p.blockNextMRFetch.CompareAndSwap(true, false) {
+			if p.mrFetchStarted != nil {
+				p.mrFetchStarted <- struct{}{}
+			}
+			if p.mrFetchRelease != nil {
+				<-p.mrFetchRelease
+			}
+		}
+		return found, nil
 	}
 	return platform.MergeRequest{}, fmt.Errorf("missing merge request %d", number)
 }
@@ -16158,6 +16221,10 @@ func TestAPIApplyReviewSuggestionPassesStoredThreadRangeToProvider(t *testing.T)
 		},
 	)
 	require.Equal(http.StatusOK, rr.Code, rr.Body.String())
+	var response applyReviewSuggestionResponse
+	require.NoError(json.NewDecoder(rr.Body).Decode(&response))
+	assert.Equal("applied", response.Status)
+	assert.Equal("suggestion-commit-sha", response.CommitSHA)
 	require.Len(provider.appliedSuggestions, 1)
 	applied := provider.appliedSuggestions[0]
 	require.Len(applied.Suggestions, 1)
@@ -16324,10 +16391,6 @@ func TestAPIApplyReviewSuggestionPassesHeadRepoToGitHubProvider(t *testing.T) {
 }
 
 func TestAPIApplyReviewSuggestionMapsProviderConflictReason(t *testing.T) {
-	// An open local row is not the last word: the provider re-verifies
-	// live PR state before mutating, and its stable conflict reasons
-	// must survive the wire mapping instead of collapsing into a
-	// generic conflict.
 	tests := []struct {
 		name   string
 		reason string
@@ -16454,6 +16517,156 @@ func TestAPIApplyReviewSuggestionMapsProviderStaleStateAndRefreshesDetail(t *tes
 	require.NotNil(problem.Details)
 	assert.Equal("stale_state", problem.Details["reason"])
 	assert.Empty(provider.appliedSuggestions)
+	changed := readEventMatching(t, ch, func(ev Event) bool {
+		return ev.Type == "data_changed"
+	})
+	assert.Equal("data_changed", changed.Type)
+}
+
+func TestAPIApplyReviewSuggestionReturnsAppliedWithoutCommitMetadata(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	caps := platform.Capabilities{
+		ReadRepositories:            true,
+		ReadMergeRequests:           true,
+		ReadIssues:                  true,
+		ReadComments:                true,
+		ReviewSuggestionApplication: true,
+		MutationHeadBinding:         true,
+		ReadReviewThreads:           true,
+	}
+	srv, database, provider := setupGitLabCapabilityServerWithProvider(t, &caps)
+	ctx := t.Context()
+	provider.applySuggestionResult = &platform.AppliedReviewSuggestions{}
+
+	repo, err := database.GetRepoByIdentity(ctx, db.RepoIdentity{
+		Platform:     "gitlab",
+		PlatformHost: "gitlab.example.com",
+		RepoPath:     "group/project",
+	})
+	require.NoError(err)
+	require.NotNil(repo)
+	mr, err := database.GetMergeRequestByRepoIDAndNumber(ctx, repo.ID, 7)
+	require.NoError(err)
+	require.NotNil(mr)
+	thread := seedApplySuggestionReviewThread(t, database, mr.ID)
+
+	rr := doJSON(
+		t,
+		srv,
+		http.MethodPost,
+		"/api/v1/host/gitlab.example.com/pulls/gl/group/project/7/review-suggestions/apply",
+		map[string]any{
+			"expected_head_sha": "abc123",
+			"suggestions": []map[string]any{{
+				"thread_id":   strconv.FormatInt(thread.ID, 10),
+				"replacement": "return client.publishThreads();",
+			}},
+		},
+	)
+
+	require.Equal(http.StatusOK, rr.Code, rr.Body.String())
+	var response applyReviewSuggestionResponse
+	require.NoError(json.NewDecoder(rr.Body).Decode(&response))
+	assert.Equal("applied", response.Status)
+	assert.Empty(response.CommitSHA)
+	assert.Empty(response.CommitURL)
+}
+
+func TestAPIApplyReviewSuggestionReturnsAppliedForNilProviderResult(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	caps := platform.Capabilities{
+		ReadRepositories:            true,
+		ReadMergeRequests:           true,
+		ReadIssues:                  true,
+		ReadComments:                true,
+		ReviewSuggestionApplication: true,
+		MutationHeadBinding:         true,
+		ReadReviewThreads:           true,
+	}
+	srv, database, provider := setupGitLabCapabilityServerWithProvider(t, &caps)
+	ctx := t.Context()
+	provider.applySuggestionReturnsNil = true
+
+	repo, err := database.GetRepoByIdentity(ctx, db.RepoIdentity{
+		Platform:     "gitlab",
+		PlatformHost: "gitlab.example.com",
+		RepoPath:     "group/project",
+	})
+	require.NoError(err)
+	require.NotNil(repo)
+	mr, err := database.GetMergeRequestByRepoIDAndNumber(ctx, repo.ID, 7)
+	require.NoError(err)
+	require.NotNil(mr)
+	thread := seedApplySuggestionReviewThread(t, database, mr.ID)
+
+	rr := doJSON(
+		t,
+		srv,
+		http.MethodPost,
+		"/api/v1/host/gitlab.example.com/pulls/gl/group/project/7/review-suggestions/apply",
+		map[string]any{
+			"expected_head_sha": "abc123",
+			"suggestions": []map[string]any{{
+				"thread_id":   strconv.FormatInt(thread.ID, 10),
+				"replacement": "return client.publishThreads();",
+			}},
+		},
+	)
+
+	require.Equal(http.StatusOK, rr.Code, rr.Body.String())
+	var response applyReviewSuggestionResponse
+	require.NoError(json.NewDecoder(rr.Body).Decode(&response))
+	assert.Equal("applied", response.Status)
+	assert.Empty(response.CommitSHA)
+	assert.Empty(response.CommitURL)
+}
+
+func TestAPIApplyReviewSuggestionProviderErrorQueuesDetailSync(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	caps := platform.Capabilities{
+		ReadRepositories:            true,
+		ReadMergeRequests:           true,
+		ReadIssues:                  true,
+		ReadComments:                true,
+		ReviewSuggestionApplication: true,
+		MutationHeadBinding:         true,
+		ReadReviewThreads:           true,
+	}
+	srv, database, provider := setupGitLabCapabilityServerWithProvider(t, &caps)
+	ctx := t.Context()
+	provider.applySuggestionsErr = errors.New("provider response was lost")
+
+	repo, err := database.GetRepoByIdentity(ctx, db.RepoIdentity{
+		Platform:     "gitlab",
+		PlatformHost: "gitlab.example.com",
+		RepoPath:     "group/project",
+	})
+	require.NoError(err)
+	require.NotNil(repo)
+	mr, err := database.GetMergeRequestByRepoIDAndNumber(ctx, repo.ID, 7)
+	require.NoError(err)
+	require.NotNil(mr)
+	thread := seedApplySuggestionReviewThread(t, database, mr.ID)
+	ch, _ := srv.Hub().Subscribe(ctx, false)
+
+	rr := doJSON(
+		t,
+		srv,
+		http.MethodPost,
+		"/api/v1/host/gitlab.example.com/pulls/gl/group/project/7/review-suggestions/apply",
+		map[string]any{
+			"expected_head_sha": "abc123",
+			"suggestions": []map[string]any{{
+				"thread_id":   strconv.FormatInt(thread.ID, 10),
+				"replacement": "return client.publishThreads();",
+			}},
+		},
+	)
+
+	require.Equal(http.StatusBadGateway, rr.Code, rr.Body.String())
 	changed := readEventMatching(t, ch, func(ev Event) bool {
 		return ev.Type == "data_changed"
 	})
@@ -16738,6 +16951,57 @@ func TestAPIApplyReviewSuggestionRejectsRateLimitedOperationBeforeProviderCall(t
 	require.NoError(json.NewDecoder(rr.Body).Decode(&problem))
 	assert.Equal("rateLimited", problem.Code)
 	assert.Empty(provider.appliedSuggestions)
+}
+
+func TestAPIApplyReviewSuggestionPreProviderValidationFailureDoesNotQueueDetailSync(t *testing.T) {
+	require := require.New(t)
+	caps := platform.Capabilities{
+		ReadRepositories:            true,
+		ReadMergeRequests:           true,
+		ReadIssues:                  true,
+		ReadComments:                true,
+		ReviewSuggestionApplication: true,
+		MutationHeadBinding:         true,
+		ReadReviewThreads:           true,
+	}
+	srv, database, provider := setupGitLabCapabilityServerWithProvider(t, &caps)
+	ctx := t.Context()
+
+	repo, err := database.GetRepoByIdentity(ctx, db.RepoIdentity{
+		Platform:     "gitlab",
+		PlatformHost: "gitlab.example.com",
+		RepoPath:     "group/project",
+	})
+	require.NoError(err)
+	require.NotNil(repo)
+	mr, err := database.GetMergeRequestByRepoIDAndNumber(ctx, repo.ID, 7)
+	require.NoError(err)
+	require.NotNil(mr)
+	thread := seedApplySuggestionReviewThread(t, database, mr.ID)
+	provider.blockNextMRFetch.Store(true)
+	provider.mrFetchStarted = make(chan struct{}, 1)
+
+	rr := doJSON(
+		t,
+		srv,
+		http.MethodPost,
+		"/api/v1/host/gitlab.example.com/pulls/gl/group/project/7/review-suggestions/apply",
+		map[string]any{
+			"expected_head_sha": "stale-head",
+			"suggestions": []map[string]any{{
+				"thread_id":   strconv.FormatInt(thread.ID, 10),
+				"replacement": "return client.publishThreads();",
+			}},
+		},
+	)
+
+	require.Equal(http.StatusConflict, rr.Code, rr.Body.String())
+	require.Empty(provider.appliedSuggestions)
+	select {
+	case <-provider.mrFetchStarted:
+		require.Fail("pre-provider validation failure queued detail sync")
+	case <-time.After(100 * time.Millisecond):
+	}
 }
 
 func TestAPIApplyReviewSuggestionRejectsStaleHead(t *testing.T) {
@@ -17611,7 +17875,7 @@ func TestAPIGitealikeApproveSubmitsReview(t *testing.T) {
 	assert.Contains(transport.mutationCalls, "review:7:lgtm:abc123")
 }
 
-func TestAPIGitealikeApproveDoesNotReadRacingHead(t *testing.T) {
+func TestAPIGitealikeApproveRefreshesAfterMutation(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 	transport := &apiTestGitealikeTransport{}
@@ -17628,7 +17892,7 @@ func TestAPIGitealikeApproveDoesNotReadRacingHead(t *testing.T) {
 	)
 	require.NoError(err)
 	require.Equal(http.StatusOK, resp.StatusCode(), string(resp.Body))
-	assert.Equal(0, transport.headCalls)
+	assert.Equal(1, transport.headCalls)
 	assert.Contains(transport.mutationCalls, "review:7:lgtm:abc123")
 }
 
@@ -22100,7 +22364,11 @@ func TestCICheckDedupLatestRunWinsE2E(t *testing.T) {
 
 	srv, database := setupTestServerWithMock(t, mock)
 	client := setupTestClient(t, srv)
-	seedPR(t, database, "acme", "widget", prNumber)
+	seedPR(
+		t, database, "acme", "widget", prNumber,
+		withSeedPRHeadSHA(headSHA),
+		withSeedPRTimes(older, older, older),
+	)
 
 	resp, err := client.HTTP.SyncPullWithResponse(
 		context.Background(), "gh", "acme", "widget", int64(prNumber),

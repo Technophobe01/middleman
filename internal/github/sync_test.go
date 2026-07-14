@@ -9481,6 +9481,59 @@ func TestRefreshCIStatusPreservesExistingStatusWhenChecksFail(t *testing.T) {
 	assert.Contains(mr.CIChecksJSON, "in_progress")
 }
 
+func TestRefreshCIStatusForHeadRetainsMixedPendingChecks(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	ctx := t.Context()
+	d := openTestDB(t)
+	repoID, err := d.UpsertRepo(ctx, db.GitHubRepoIdentity("github.com", "acme", "widget"))
+	require.NoError(err)
+	now := time.Now().UTC()
+	_, err = d.UpsertMergeRequest(ctx, &db.MergeRequest{
+		RepoID:          repoID,
+		PlatformID:      1001,
+		Number:          1,
+		Title:           "mixed checks",
+		State:           "open",
+		PlatformHeadSHA: "abc123",
+		CreatedAt:       now,
+		UpdatedAt:       now,
+		LastActivityAt:  now,
+	})
+	require.NoError(err)
+
+	mock := &mockClient{
+		checkRuns: []*gh.CheckRun{
+			{Name: new("failed"), Status: new("completed"), Conclusion: new("failure")},
+			{Name: new("running"), Status: new("in_progress")},
+		},
+		ciStatus: &gh.CombinedStatus{},
+	}
+	syncer := NewSyncer(
+		map[string]Client{"github.com": mock},
+		d, nil,
+		[]RepoRef{{Owner: "acme", Name: "widget", PlatformHost: "github.com"}},
+		time.Minute,
+		nil,
+		nil,
+	)
+
+	err = syncer.refreshCIStatus(
+		ctx,
+		RepoRef{Owner: "acme", Name: "widget", PlatformHost: "github.com"},
+		repoID,
+		1,
+		"abc123",
+	)
+	require.NoError(err)
+	mr, err := d.GetMergeRequestByRepoIDAndNumber(ctx, repoID, 1)
+	require.NoError(err)
+	require.NotNil(mr)
+	assert.Equal("failure", mr.CIStatus)
+	assert.True(mr.CIHadPending)
+	assert.Contains(mr.CIChecksJSON, "in_progress")
+}
+
 func TestRefreshCIStatusFallsBackToCombinedWhenNoCheckRuns(t *testing.T) {
 	assert := assert.New(t)
 	d := openTestDB(t)

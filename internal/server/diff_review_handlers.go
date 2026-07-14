@@ -177,6 +177,26 @@ func (s *Server) applyReviewSuggestions(
 	if err := s.requireReviewSuggestionCapabilities(*repo); err != nil {
 		return nil, err
 	}
+	if len(input.Body.Suggestions) == 0 {
+		return nil, problemValidation("body.suggestions", "at least one suggestion is required")
+	}
+	caps := s.capabilitiesForRepo(*repo)
+	expectedHeadSHA := strings.TrimSpace(input.Body.ExpectedHeadSHA)
+	if expectedHeadSHA == "" && caps.MutationHeadBinding {
+		return nil, problemValidation(
+			"body.expected_head_sha",
+			"required for this provider: echo the platform_head_sha you rendered",
+		)
+	}
+	applier, err := s.syncer.ReviewSuggestionApplier(
+		repoProviderKind(*repo), repoProviderHost(*repo),
+	)
+	if err != nil {
+		return nil, huma.Error404NotFound(err.Error())
+	}
+	if rate := s.mutationOperationRateLimit(*repo, descApplyReviewSuggestion); rate.limited {
+		return nil, problemOperationRateLimited(*repo, rate)
+	}
 	mr, err := s.db.GetMergeRequestByRepoIDAndNumber(ctx, repo.ID, input.Number)
 	if err != nil {
 		return nil, huma.Error500InternalServerError("get pull request failed")
@@ -198,26 +218,8 @@ func (s *Server) applyReviewSuggestions(
 			map[string]any{"reason": "head_repo_unknown"},
 		)
 	}
-	if len(input.Body.Suggestions) == 0 {
-		return nil, problemValidation("body.suggestions", "at least one suggestion is required")
-	}
-	caps := s.capabilitiesForRepo(*repo)
-	expectedHeadSHA := strings.TrimSpace(input.Body.ExpectedHeadSHA)
-	if expectedHeadSHA == "" && caps.MutationHeadBinding {
-		return nil, problemValidation(
-			"body.expected_head_sha",
-			"required for this provider: echo the platform_head_sha you rendered",
-		)
-	}
-	if err := s.verifyClientReviewedHead(repo, input.Number, expectedHeadSHA, mr.PlatformHeadSHA); err != nil {
+	if err := verifyClientReviewedHeadWithoutRefresh(expectedHeadSHA, mr.PlatformHeadSHA); err != nil {
 		return nil, err
-	}
-
-	applier, err := s.syncer.ReviewSuggestionApplier(
-		repoProviderKind(*repo), repoProviderHost(*repo),
-	)
-	if err != nil {
-		return nil, huma.Error404NotFound(err.Error())
 	}
 	suggestions := make([]platform.ReviewSuggestion, 0, len(input.Body.Suggestions))
 	seenThreadIDs := make(map[int64]struct{}, len(input.Body.Suggestions))
@@ -258,10 +260,6 @@ func (s *Server) applyReviewSuggestions(
 			Replacement:       replacement,
 		})
 	}
-	if rate := s.mutationOperationRateLimit(*repo, descApplyReviewSuggestion); rate.limited {
-		return nil, problemOperationRateLimited(*repo, rate)
-	}
-
 	result, err := applier.ApplyReviewSuggestions(
 		ctx,
 		platformRepoRefFromDB(*repo),
@@ -274,10 +272,8 @@ func (s *Server) applyReviewSuggestions(
 			Suggestions:      suggestions,
 		},
 	)
+	s.syncAfterReviewSuggestionApply(*repo, input.Number)
 	if err != nil {
-		if errors.Is(err, platform.ErrStaleState) {
-			s.syncAfterReviewSuggestionApply(*repo, input.Number)
-		}
 		return nil, providerCallProblemWithDetail(
 			err,
 			string(repoProviderKind(*repo)),
@@ -285,7 +281,6 @@ func (s *Server) applyReviewSuggestions(
 			"apply review suggestions on provider failed",
 		)
 	}
-	s.syncAfterReviewSuggestionApply(*repo, input.Number)
 	response := applyReviewSuggestionResponse{Status: "applied"}
 	if result != nil {
 		response.CommitSHA = result.CommitSHA

@@ -40,7 +40,6 @@
     ownerOptions: TypeaheadOption[];
     messageLinks: MessageLinkRef[];
     unlinkBusyIds: ReadonlySet<number>;
-    unlinkError: string | null;
     selectedRecurrences: KataRecurrence[];
     checklistRevealed: boolean;
     movePending?: boolean | undefined;
@@ -80,7 +79,6 @@
     ownerOptions,
     messageLinks,
     unlinkBusyIds,
-    unlinkError,
     selectedRecurrences,
     checklistRevealed,
     movePending = false,
@@ -109,6 +107,8 @@
 
   let editingTitle = $state(false);
   let editingBody = $state(false);
+  let savingTitle = $state(false);
+  let savingBody = $state(false);
   let titleDraft = $state("");
   let bodyDraft = $state("");
   let titleInput: HTMLInputElement | null = $state(null);
@@ -132,6 +132,8 @@
     lastIssueUID = uid;
     editingTitle = false;
     editingBody = false;
+    savingTitle = false;
+    savingBody = false;
     cancelingTitle = false;
   });
 
@@ -159,15 +161,25 @@
   }
 
   async function commitTitle(): Promise<void> {
+    if (savingTitle) return;
     if (cancelingTitle) {
       cancelingTitle = false;
       editingTitle = false;
       return;
     }
     const next = titleDraft.trim();
-    editingTitle = false;
-    if (!next || next === issue.issue.title) return;
-    await onEditIssue(issue.issue.uid, { title: next });
+    if (!next || next === issue.issue.title) {
+      editingTitle = false;
+      return;
+    }
+    savingTitle = true;
+    try {
+      if (await onEditIssue(issue.issue.uid, { title: next })) {
+        editingTitle = false;
+      }
+    } finally {
+      savingTitle = false;
+    }
   }
 
   function handleTitleKeydown(event: KeyboardEvent): void {
@@ -188,10 +200,20 @@
   }
 
   async function commitBody(): Promise<void> {
+    if (savingBody) return;
     const next = bodyDraft;
-    editingBody = false;
-    if (next === issue.issue.body) return;
-    await onEditIssue(issue.issue.uid, { body: next });
+    if (next === issue.issue.body) {
+      editingBody = false;
+      return;
+    }
+    savingBody = true;
+    try {
+      if (await onEditIssue(issue.issue.uid, { body: next })) {
+        editingBody = false;
+      }
+    } finally {
+      savingBody = false;
+    }
   }
 
   function handleBodyKeydown(event: KeyboardEvent): void {
@@ -220,6 +242,7 @@
           aria-label="Edit title"
           bind:this={titleInput}
           bind:value={titleDraft}
+          disabled={savingTitle}
           onkeydown={handleTitleKeydown}
           onblur={() => {
             void commitTitle();
@@ -293,13 +316,16 @@
         rows="8"
         bind:this={bodyTextarea}
         bind:value={bodyDraft}
+        disabled={savingBody}
         onkeydown={handleBodyKeydown}
       ></textarea>
       <div class="body-edit-actions">
         <span>Cmd/Ctrl+Enter saves</span>
         <div>
-          <button type="button" class="ghost-button" onclick={() => { editingBody = false; }}>Cancel</button>
-          <button type="button" class="accent-button" onclick={() => { void commitBody(); }}>Save</button>
+          <button type="button" class="ghost-button" disabled={savingBody} onclick={() => { editingBody = false; }}>Cancel</button>
+          <button type="button" class="accent-button" disabled={savingBody} onclick={() => { void commitBody(); }}>
+            {savingBody ? "Saving..." : "Save"}
+          </button>
         </div>
       </div>
     {:else if issue.issue.body}
@@ -334,9 +360,6 @@
       void onUnlinkMessage(link);
     }}
   />
-  {#if unlinkError}
-    <p class="unlink-error" role="alert">{unlinkError}</p>
-  {/if}
 
   <KataChecklistEditor {issue} revealed={checklistRevealed} onPatchMetadata={onPatchMetadata} onReveal={onRevealChecklist} />
 
@@ -646,9 +669,4 @@
     opacity: 0.62;
   }
 
-  .unlink-error {
-    margin: 8px 0 18px;
-    color: var(--color-danger-fg, #991b1b);
-    font-size: var(--font-size-sm);
-  }
 </style>

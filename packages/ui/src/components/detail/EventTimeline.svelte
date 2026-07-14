@@ -52,9 +52,14 @@
     activityViewMode?: DetailActivityViewMode;
     onEditComment?: ((event: PREvent | IssueEvent, body: string) => Promise<boolean>) | undefined;
     onDeleteComment?: ((event: PREvent | IssueEvent) => Promise<string | null>) | undefined;
-    onApplySuggestion?: ((input: ApplySuggestionRequest) => Promise<boolean>) | undefined;
+    onApplySuggestion?: ((input: ApplySuggestionRequest) => Promise<boolean | SuggestionApplyResult>) | undefined;
     jumpToReviewThread?: ((thread: ReviewThread) => void) | undefined;
   }
+
+  type SuggestionApplyResult = {
+    ok: boolean;
+    error?: string | undefined;
+  };
 
   const {
     events,
@@ -906,7 +911,7 @@
   let savingReplyThreadID = $state<string | null>(null);
   let replyError = $state<string | null>(null);
   let applyingSuggestionKey = $state<string | null>(null);
-  let suggestionError = $state<Record<string, string>>({});
+  let suggestionErrors = $state<Record<string, string>>({});
   let batchedSuggestions = $state<BatchedSuggestion[]>([]);
   const batchedSuggestionKeys = $derived(batchedSuggestions.map((item) => item.key));
   // Suggestions batched before the PR head moved (or while it is unknown)
@@ -1083,8 +1088,6 @@
       const ok = await detailStore?.replyToDiscussion(repoOwner, repoName, number, targetID, body);
       if (ok) {
         cancelReply();
-      } else {
-        replyError = detailStore?.getDetailError() ?? "Could not reply to thread";
       }
     } finally {
       savingReplyThreadID = null;
@@ -1109,8 +1112,6 @@
       const ok = await onEditComment(event, nextBody);
       if (ok) {
         cancelEdit();
-      } else {
-        editError = "Could not edit comment";
       }
     } finally {
       savingEditId = null;
@@ -1177,19 +1178,21 @@
   ): Promise<void> {
     if (onApplySuggestion === undefined) return;
     const key = suggestionKey(event, block);
+    const { [key]: _discardedError, ...remainingErrors } = suggestionErrors;
+    suggestionErrors = remainingErrors;
     applyingSuggestionKey = key;
-    suggestionError = { ...suggestionError, [key]: "" };
     try {
-      const ok = await onApplySuggestion({
+      const result = await onApplySuggestion({
         suggestions: [suggestionRequest(thread, block.replacement)],
       });
-      if (!ok) {
-        suggestionError = {
-          ...suggestionError,
-          [key]: detailStore?.getDetailError() ?? "Could not apply suggestion",
-        };
-      } else {
+      const ok = typeof result === "boolean" ? result : result.ok;
+      if (ok) {
         batchedSuggestions = batchedSuggestions.filter((item) => item.key !== key);
+      } else if (typeof result !== "boolean" && result.error) {
+        suggestionErrors = {
+          ...suggestionErrors,
+          [key]: result.error,
+        };
       }
     } finally {
       applyingSuggestionKey = null;
@@ -1218,15 +1221,20 @@
     const eligible = eligibleBatchedSuggestions;
     if (onApplySuggestion === undefined || eligible.length === 0) return;
     const submittedKeys = eligible.map((item) => item.key);
+    suggestionErrors = Object.fromEntries(
+      Object.entries(suggestionErrors).filter(([key]) => !submittedKeys.includes(key)),
+    );
     savingSuggestionBatch = true;
-    suggestionError = {};
     try {
-      const ok = await onApplySuggestion({ suggestions: eligible.map((item) => item.request) });
+      const result = await onApplySuggestion({ suggestions: eligible.map((item) => item.request) });
+      const ok = typeof result === "boolean" ? result : result.ok;
       if (ok) {
         batchedSuggestions = batchedSuggestions.filter((item) => !submittedKeys.includes(item.key));
-      } else {
-        const message = detailStore?.getDetailError() ?? "Could not apply suggestion batch";
-        suggestionError = Object.fromEntries(submittedKeys.map((key) => [key, message]));
+      } else if (typeof result !== "boolean" && result.error) {
+        suggestionErrors = {
+          ...suggestionErrors,
+          ...Object.fromEntries(submittedKeys.map((key) => [key, result.error!])),
+        };
       }
     } finally {
       savingSuggestionBatch = false;
@@ -1518,7 +1526,7 @@
                       {currentHeadSHA}
                       applying={applyingSuggestionKey === blockKey}
                       batched={batchedSuggestionKeys.includes(blockKey)}
-                      error={suggestionError[blockKey] || null}
+                      error={suggestionErrors[blockKey] ?? null}
                       onCommit={onApplySuggestion !== undefined
                         ? () => void commitSuggestion(event, block, reviewThread.thread)
                         : undefined}

@@ -2209,13 +2209,36 @@ func (d *DB) UpdateIssueAssignees(ctx context.Context, repoID, issueID int64, as
 }
 
 func (d *DB) UpsertMergeRequest(ctx context.Context, mr *MergeRequest) (int64, error) {
+	id, _, err := d.UpsertMergeRequestSnapshot(ctx, mr)
+	return id, err
+}
+
+// UpsertMergeRequestSnapshot reports whether the provider snapshot was
+// accepted. A false result means a newer timestamp already owns the row, so
+// callers must skip all downstream writes derived from the rejected snapshot.
+func (d *DB) UpsertMergeRequestSnapshot(
+	ctx context.Context,
+	mr *MergeRequest,
+) (int64, bool, error) {
 	canonicalizeMergeRequestTimestamps(mr)
-	_, err := d.rw.ExecContext(ctx, `
+	return upsertMergeRequestSnapshot(ctx, d.rw, mr)
+}
+
+type mergeRequestSnapshotExecutor interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func upsertMergeRequestSnapshot(
+	ctx context.Context,
+	executor mergeRequestSnapshotExecutor,
+	mr *MergeRequest,
+) (int64, bool, error) {
+	result, err := executor.ExecContext(ctx, `
 		INSERT INTO middleman_merge_requests
 		    (repo_id, platform_id, platform_external_id, number, url, title, author, author_display_name,
 		     state, is_draft, is_locked, body, head_branch, base_branch,
-		     platform_head_sha, platform_base_sha,
-		     head_repo_clone_url,
+		     platform_head_sha, platform_base_sha, head_repo_clone_url,
 		     additions, deletions, comment_count,
 		     review_decision, ci_status, ci_checks_json,
 		     detail_fetched_at, ci_had_pending,
@@ -2262,8 +2285,7 @@ func (d *DB) UpsertMergeRequest(ctx context.Context, mr *MergeRequest) (int64, e
 		mr.RepoID, mr.PlatformID, mr.PlatformExternalID, mr.Number, mr.URL, mr.Title,
 		mr.Author, mr.AuthorDisplayName,
 		mr.State, mr.IsDraft, mr.IsLocked, mr.Body, mr.HeadBranch, mr.BaseBranch,
-		mr.PlatformHeadSHA, mr.PlatformBaseSHA,
-		mr.HeadRepoCloneURL,
+		mr.PlatformHeadSHA, mr.PlatformBaseSHA, mr.HeadRepoCloneURL,
 		mr.Additions, mr.Deletions, mr.CommentCount, mr.ReviewDecision,
 		mr.CIStatus, mr.CIChecksJSON,
 		mr.DetailFetchedAt, mr.CIHadPending,
@@ -2272,17 +2294,21 @@ func (d *DB) UpsertMergeRequest(ctx context.Context, mr *MergeRequest) (int64, e
 		mr.AssigneesJSON, mr.ReviewersJSON,
 	)
 	if err != nil {
-		return 0, fmt.Errorf("upsert merge request: %w", err)
+		return 0, false, fmt.Errorf("upsert merge request: %w", err)
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return 0, false, fmt.Errorf("read upsert merge request result: %w", err)
 	}
 	var id int64
-	err = d.ro.QueryRowContext(ctx,
+	err = executor.QueryRowContext(ctx,
 		`SELECT id FROM middleman_merge_requests WHERE repo_id = ? AND number = ?`,
 		mr.RepoID, mr.Number,
 	).Scan(&id)
 	if err != nil {
-		return 0, fmt.Errorf("get mr id after upsert: %w", err)
+		return 0, false, fmt.Errorf("get mr id after upsert: %w", err)
 	}
-	return id, nil
+	return id, rowsAffected > 0, nil
 }
 
 // GetMergeRequest returns a merge request by repository identity and MR number, or nil if not found.
@@ -3102,8 +3128,8 @@ func (d *DB) UpdateClosedMRState(
 // UpdateDiffSHAs stores the locally-verified diff SHAs for a merge request.
 // Called after a successful bare clone fetch and merge-base computation.
 func (d *DB) UpdateDiffSHAs(ctx context.Context, repoID int64, number int, diffHead, diffBase, mergeBase string) error {
-	_, err := d.rw.ExecContext(ctx,
-		`UPDATE middleman_merge_requests
+	_, err := d.rw.ExecContext(ctx, `
+		UPDATE middleman_merge_requests
 		 SET diff_head_sha = ?, diff_base_sha = ?, merge_base_sha = ?
 		 WHERE repo_id = ? AND number = ?`,
 		diffHead, diffBase, mergeBase, repoID, number,
@@ -3121,8 +3147,8 @@ func (d *DB) UpdatePlatformSHAs(
 	repoID int64, number int,
 	platformHead, platformBase string,
 ) error {
-	_, err := d.rw.ExecContext(ctx,
-		`UPDATE middleman_merge_requests
+	_, err := d.rw.ExecContext(ctx, `
+		UPDATE middleman_merge_requests
 		 SET platform_head_sha = ?, platform_base_sha = ?
 		 WHERE repo_id = ? AND number = ?`,
 		platformHead, platformBase, repoID, number,

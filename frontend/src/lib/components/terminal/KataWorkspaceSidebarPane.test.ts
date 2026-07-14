@@ -5,6 +5,10 @@ import type { KataProjectSummary, KataTaskDetail, KataTaskSummary } from "../../
 import type { KataWorkspaceMetadata } from "../../api/kata/workspaces.js";
 import KataWorkspaceSidebarPane from "./KataWorkspaceSidebarPane.svelte";
 
+const { showFlash } = vi.hoisted(() => ({ showFlash: vi.fn() }));
+
+vi.mock("@middleman/ui/stores/flash", () => ({ showFlash }));
+
 const fetchedAt = "2026-06-01T12:00:00Z";
 
 function project(id: number, uid: string, name: string, role?: string): KataProjectSummary {
@@ -93,6 +97,7 @@ const kata: KataWorkspaceMetadata = {
 describe("KataWorkspaceSidebarPane", () => {
   afterEach(() => {
     cleanup();
+    showFlash.mockReset();
     vi.unstubAllGlobals();
   });
 
@@ -106,7 +111,9 @@ describe("KataWorkspaceSidebarPane", () => {
     await fireEvent.click(screen.getByRole("menuitem", { name: "Move to another project" }));
     await fireEvent.click(screen.getByRole("button", { name: /Roadmap/ }));
 
-    expect((await screen.findByRole("alert")).textContent).toContain("Could not move task.");
+    await waitFor(() => {
+      expect(showFlash).toHaveBeenCalledWith("Could not move task.", { tone: "danger" });
+    });
     expect(screen.getByRole("searchbox", { name: "Find project" })).toBeTruthy();
 
     await fireEvent.click(screen.getByRole("button", { name: /Roadmap/ }));

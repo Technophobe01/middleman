@@ -13,6 +13,8 @@
     RepoOperations,
   } from "../../api/types.js";
   import type { DetailSyncMode } from "../../stores/detail.svelte.js";
+  import type { ConflictReason } from "../../api/problems.js";
+  import { showFlash } from "../../stores/flash.svelte.js";
   import {
     getStores, getClient, getActions,
     getUIConfig, getNavigate,
@@ -78,6 +80,7 @@
     providerItemPath,
     providerRepoPath,
     providerRouteParams,
+    type ProviderRouteRef,
   } from "../../api/provider-routes.js";
   import { supportsLocked } from "../../api/provider-capabilities.js";
   import { buildDiffSummaryKey } from "./diff-summary-key.js";
@@ -286,10 +289,35 @@
     return ok ? null : detailStore.getDetailError() ?? "Could not delete comment";
   }
 
-  async function applyTimelineSuggestion(input: ApplySuggestionRequest): Promise<boolean> {
-    if (stalePR || headActionsBlocked || applySuggestionGate.unavailable) return false;
+  async function applyTimelineSuggestion(
+    input: ApplySuggestionRequest,
+  ): Promise<boolean | { ok: false; error: string }> {
+    if (stalePR || headActionsUnavailable || applySuggestionGate.unavailable) return false;
     if (currentPR()?.State !== "open") return false;
-    return detailStore.applyReviewSuggestions(owner, name, number, input);
+    headMutationCount += 1;
+    const requestGeneration = mutationRouteGeneration;
+    let durableConflict = false;
+    try {
+      const ok = await detailStore.applyReviewSuggestions(owner, name, number, input, (conflict) => {
+        durableConflict = handleStateConflict(
+          conflict.reason,
+          conflict.context,
+          conflict.expectedHeadSha,
+          conflict.ref,
+          conflict.number,
+          requestGeneration,
+        );
+      });
+      if (!ok && durableConflict) {
+        return {
+          ok: false,
+          error: detailStore.getDetailError() ?? "Pull request state changed.",
+        };
+      }
+      return ok;
+    } finally {
+      headMutationCount = Math.max(0, headMutationCount - 1);
+    }
   }
 
   function updateTimelineFilter(next: PRTimelineFilterState): void {
@@ -439,6 +467,8 @@
     cancelAnimationFrame(pullDetailScrollRestoreRaf);
   });
 
+  let mutationRouteGeneration = $state(0);
+
   // Clear modal/edit state on route change so PR A's open modal
   // can't reappear for PR B once `stalePR` clears.
   $effect(() => {
@@ -451,6 +481,7 @@
     void provider;
     void platformHost;
     void repoPath;
+    mutationRouteGeneration = untrack(() => mutationRouteGeneration) + 1;
     const keepStackExpanded = untrack(() => {
       const keepExpanded = keepStackExpandedOnRouteChange &&
         expandedPanel === "stack";
@@ -458,8 +489,12 @@
       return keepExpanded;
     });
     showMergeModal = false;
-    headConflict = null;
+    conflictRefreshRequestID += 1;
+    conflictRefreshBusy = false;
+    stateConflict = null;
     headConflictContext = null;
+    conflictReviewedHead = null;
+    conflictRefreshError = null;
     expandedPanel = keepStackExpanded ? "stack" : null;
     editingTitle = false;
     editingBody = false;
@@ -501,7 +536,6 @@
   }
 
   let stateSubmitting = $state(false);
-  let stateError = $state<string | null>(null);
 
   // Title editing
   let editingTitle = $state(false);
@@ -623,7 +657,6 @@
       return;
     }
     stateSubmitting = true;
-    stateError = null;
     try {
       const { error: requestError } = await client.POST(
         providerItemPath("pulls", routeRef, "/github-state"),
@@ -644,11 +677,12 @@
         platformHost,
         repoPath,
       });
+      stateConflict = null;
+      headConflictContext = null;
       await refreshPulls();
       await activity.loadActivity();
     } catch (err) {
-      stateError =
-        err instanceof Error ? err.message : String(err);
+      showFlash(err instanceof Error ? err.message : String(err), { tone: "danger" });
     } finally {
       stateSubmitting = false;
     }
@@ -669,28 +703,34 @@
   // Head-pinning conflict state (context/provider-architecture.md
   // "Head binding"). Merge echoes the rendered reviewed head, while
   // approve sends the latest synced provider head when known. A 409
-  // conflict with reason stale_state or head_unknown lands here.
-  let headConflict = $state<"stale_state" | "head_unknown" | null>(null);
+  // typed merge or head-binding conflicts land here and force a refresh.
+  let stateConflict = $state<Exclude<ConflictReason, "conflict"> | null>(null);
+  let headMutationCount = $state(0);
   // Provider side-effect context from the conflict response (an
   // approval that could not be revoked, posted review text a retry
   // would repeat); rendered with the stale banner so the consequence
   // is not hidden behind the generic re-review prompt.
   let headConflictContext = $state<string | null>(null);
+  let conflictReviewedHead = $state<string | null>(null);
+  let conflictRefreshBusy = $state(false);
+  let conflictRefreshError = $state<string | null>(null);
+  let conflictRefreshRequestID = 0;
   const detailHeadSha = $derived(
     detailStore.getDetail()?.reviewed_head_sha ?? "",
   );
   const latestPlatformHeadSha = $derived(
     detailStore.getDetail()?.platform_head_sha ?? "",
   );
-  // After head_unknown the reviewed head stays unbound until diff sync
-  // records a current snapshot,
-  // so merge is disabled until the refreshed detail carries a reviewed
-  // head SHA again. Once the SHA arrives this clears on its own; the
-  // stale_state prompt instead stays until the user completes a
-  // head-bound action or navigates away.
-  const headActionsBlocked = $derived(
-    headConflict === "head_unknown" && detailHeadSha === "",
-  );
+  // A typed conflict invalidates the state the user reviewed. Keep every
+  // head-bound action closed until route navigation or a successful state
+  // mutation establishes a fresh workflow context.
+  const headActionsBlocked = $derived(stateConflict !== null);
+  const headMutationInFlight = $derived(headMutationCount > 0);
+  const headActionsUnavailable = $derived(headActionsBlocked || headMutationInFlight);
+
+  function handleHeadMutationChange(active: boolean): void {
+    headMutationCount = Math.max(0, headMutationCount + (active ? 1 : -1));
+  }
   // Preflight guard for merge: a head-binding provider must never merge
   // against an unbound reviewed diff, so merge stays disabled until diff
   // sync proves the rendered code matches the current head — no request,
@@ -719,21 +759,95 @@
     midStackBlocker !== undefined && !allowMidStackMerges,
   );
 
-  function handleHeadConflict(
-    reason: "stale_state" | "head_unknown",
+  function handleStateConflict(
+    reason: Exclude<ConflictReason, "conflict">,
     context?: string,
-  ): void {
-    headConflict = reason;
+    failedHeadSha?: string,
+    failedRef: ProviderRouteRef = routeRef,
+    failedNumber: number = number,
+    failedGeneration: number = mutationRouteGeneration,
+  ): boolean {
+    if (
+      failedGeneration !== mutationRouteGeneration
+      || failedNumber !== number
+      || failedRef.provider !== routeRef.provider
+      || failedRef.platformHost !== routeRef.platformHost
+      || failedRef.owner !== routeRef.owner
+      || failedRef.name !== routeRef.name
+      || failedRef.repoPath !== routeRef.repoPath
+    ) return false;
+    conflictReviewedHead = failedHeadSha ?? detailHeadSha;
+    stateConflict = reason;
     headConflictContext = context ?? null;
+    conflictRefreshError = null;
     showMergeModal = false;
-    // loadDetail's default sync mode pulls fresh provider state, which
-    // is what re-binds the head (stale_state) or populates a missing
-    // one (head_unknown).
-    void detailStore.loadDetail(owner, name, number, {
+    void refreshConflictState(false);
+    return true;
+  }
+
+  function conflictHasFreshContext(
+    reason: Exclude<ConflictReason, "conflict">,
+    reviewedHeadAtConflict: string | null,
+  ): boolean {
+    const detail = detailStore.getDetail();
+    if (!detail) return false;
+    const currentReviewedHead = detail.reviewed_head_sha.trim();
+    const currentPlatformHead = detail.platform_head_sha.trim();
+    const headIsCurrent = currentReviewedHead !== ""
+      && currentReviewedHead === currentPlatformHead;
+
+    if (reason === "not_open") {
+      return detail.merge_request.State === "open" && headIsCurrent;
+    }
+    if (reason === "head_repo_unknown") {
+      return detail.merge_request.HeadRepoCloneURL.trim() !== "" && headIsCurrent;
+    }
+    if (reason === "stale_state") {
+      return headIsCurrent && currentReviewedHead !== reviewedHeadAtConflict;
+    }
+    return headIsCurrent;
+  }
+
+  async function refreshConflictState(allowRecovery = true): Promise<void> {
+    const reason = stateConflict;
+    if (!reason || conflictRefreshBusy) return;
+    const requestID = ++conflictRefreshRequestID;
+    const routeKey = `${provider}\n${platformHost}\n${repoPath}\n${owner}\n${name}\n${number}`;
+    const reviewedHeadAtConflict = conflictReviewedHead;
+    conflictRefreshBusy = true;
+    conflictRefreshError = null;
+    const refreshed = await detailStore.syncDetailNow(owner, name, number, {
       provider,
       platformHost,
       repoPath,
     });
+    const currentRouteKey = `${provider}\n${platformHost}\n${repoPath}\n${owner}\n${name}\n${number}`;
+    if (requestID !== conflictRefreshRequestID || routeKey !== currentRouteKey) {
+      return;
+    }
+    if (stateConflict !== reason) {
+      conflictRefreshBusy = false;
+      return;
+    }
+    if (!refreshed) {
+      conflictRefreshError = "Could not refresh the pull request. Try again.";
+    } else if (allowRecovery && conflictHasFreshContext(reason, reviewedHeadAtConflict)) {
+      stateConflict = null;
+      headConflictContext = null;
+      conflictReviewedHead = null;
+    }
+    conflictRefreshBusy = false;
+  }
+
+  function handleHeadConflict(
+    reason: "stale_state" | "head_unknown",
+    context: string | undefined,
+    failedHeadSha: string,
+    failedRef: ProviderRouteRef,
+    failedNumber: number,
+    failedGeneration: number,
+  ): void {
+    handleStateConflict(reason, context, failedHeadSha, failedRef, failedNumber, failedGeneration);
   }
 
   $effect(() => {
@@ -857,7 +971,7 @@
       repoSettings,
       // Treat a blocked head as stale for gating: the merge modal must
       // not open while the reviewed head is unknown.
-      stale: stalePR || headActionsBlocked || midStackMergeBlocked,
+      stale: stalePR || headActionsUnavailable || midStackMergeBlocked,
       stores: { detail: detailStore, pulls },
       client,
       requireHeadPin: capabilities.mutation_head_binding,
@@ -906,7 +1020,6 @@
 
   const workspace = $derived(detailStore.getDetail()?.workspace);
   let wsCreating = $state(false);
-  let wsError = $state<string | null>(null);
   const createWorkspaceTitle =
     "Create a PR head worktree, then open Workspaces to launch agents, shells, or local review sessions on that branch.";
   const createWorkspaceDescriptionId =
@@ -1073,8 +1186,8 @@
     const nextNames = nextCatalogLabelNames(labels, labelCatalog, labelName);
     try {
       await detailStore.setPullLabels(owner, name, number, nextNames);
-    } catch (err) {
-      labelPickerError = err instanceof Error ? err.message : String(err);
+    } catch {
+      // The detail store reports mutation failures through the shared flash.
     } finally {
       pendingLabel = null;
     }
@@ -1087,8 +1200,8 @@
     labelPickerError = null;
     try {
       await detailStore.setPullLabels(owner, name, number, []);
-    } catch (err) {
-      labelPickerError = err instanceof Error ? err.message : String(err);
+    } catch {
+      // The detail store reports mutation failures through the shared flash.
     } finally {
       pendingLabel = null;
     }
@@ -1163,7 +1276,6 @@
     if (!detail) return;
 
     wsCreating = true;
-    wsError = null;
     try {
       const { data, error: reqError } = await client.POST(
         "/workspaces",
@@ -1186,7 +1298,7 @@
         navigate(`/terminal/${data.id}`);
       }
     } catch (err) {
-      wsError = err instanceof Error ? err.message : String(err);
+      showFlash(err instanceof Error ? err.message : String(err), { tone: "danger" });
     } finally {
       wsCreating = false;
     }
@@ -1927,14 +2039,16 @@
               {platformHost}
               {repoPath}
               size="sm"
-              disabled={stalePR || headActionsBlocked || approveGate.unavailable}
+              disabled={stalePR || headActionsUnavailable || approveGate.unavailable}
               expectedHeadSha={detailHeadSha}
               platformHeadSha={latestPlatformHeadSha}
               requireHeadPin={capabilities.mutation_head_binding}
               supportedReviewActions={capabilities.supported_review_actions ?? []}
+              routeGeneration={mutationRouteGeneration}
               title={approveGate.unavailable ? approveGate.reason : undefined}
               onheadconflict={handleHeadConflict}
-              oncompleted={() => { headConflict = null; headConflictContext = null; }}
+              onmutationchange={handleHeadMutationChange}
+              oncompleted={() => { stateConflict = null; headConflictContext = null; }}
             />
           {/if}
           {#if capabilities.workflow_approval && workflowApproval?.checked && workflowApproval.required}
@@ -1963,7 +2077,9 @@
               ? `Merge #${midStackBlocker?.number ?? "the bottom branch"} first; mid-stack merges are disabled in settings`
               : mergeDisabledByConflicts
                 ? "Resolve merge conflicts before merging"
-              : headPinMissing
+              : stateConflict
+                ? "Refresh and re-review the pull request before merging"
+                : headPinMissing
                 ? "The reviewed head commit has not been synced yet; merging is disabled until the next sync records it"
                 : mergeOpUnavailable
                   ? mergeOp?.unavailable_reason ?? ""
@@ -1972,10 +2088,10 @@
                     : ""}
             <Button
               class={deferredMergePending ? "btn--merge btn--merge-queued" : "btn--merge"}
-              disabled={stalePR || midStackMergeBlocked || mergeDisabledByConflicts || mergeOpUnavailable || headActionsBlocked || headPinMissing}
+              disabled={stalePR || midStackMergeBlocked || mergeDisabledByConflicts || mergeOpUnavailable || headActionsUnavailable || headPinMissing}
               title={mergeTitle}
               onclick={() => {
-                if (stalePR || midStackMergeBlocked || mergeOpUnavailable || headActionsBlocked || headPinMissing) return;
+                if (stalePR || midStackMergeBlocked || mergeOpUnavailable || headActionsUnavailable || headPinMissing) return;
                 runOpenMerge(buildOpenMergeInput(pr, capabilities));
               }}
               tone="success"
@@ -2091,9 +2207,6 @@
             {#if !hideWorkspaceAction}
               <div class="primary-workspace-action">
                 {@render workspaceActionButton()}
-                {#if wsError}
-                  <span class="action-error action-error--workspace-compact">{wsError}</span>
-                {/if}
               </div>
             {/if}
           </div>
@@ -2120,27 +2233,47 @@
                   <div class="actions-menu-popover__item">
                     {@render workspaceActionButton()}
                   </div>
-                  {#if wsError}
-                    <span class="action-error">{wsError}</span>
-                  {/if}
                 {/if}
               </div>
             {/if}
           </div>
-          {#if stateError}
-            <span class="action-error action-error--state">{stateError}</span>
-          {/if}
-          {#if headConflict === "stale_state"}
+          {#if stateConflict === "stale_state"}
             <span class="action-error action-error--state" role="status">
               The head commit changed since this pull request was reviewed. Re-review the latest changes before approving or merging.
               {#if headConflictContext}
                 {" "}{headConflictContext}.
               {/if}
             </span>
+          {:else if stateConflict === "not_open"}
+            <span class="action-error action-error--state" role="status">
+              This pull request is no longer open. Its current state is being refreshed before any further action.
+            </span>
+          {:else if stateConflict === "head_repo_unknown"}
+            <span class="action-error action-error--state" role="status">
+              The head repository is no longer available. Merge is unavailable while the pull request state refreshes.
+            </span>
           {:else if headActionsBlocked}
             <span class="action-error action-error--state" role="status">
-              The head commit has not been synced yet. Approve and merge are unavailable until the next sync records it.
+              The head commit has not been synced yet. After the next sync records it, refresh the reviewed state before approving or merging.
             </span>
+          {/if}
+          {#if stateConflict}
+            <div class="state-conflict-recovery">
+              <Button
+                class="btn--conflict-refresh"
+                disabled={conflictRefreshBusy}
+                onclick={() => void refreshConflictState()}
+                tone="neutral"
+                surface="soft"
+                size="sm"
+                label={conflictRefreshBusy ? "Refreshing reviewed state..." : "Refresh reviewed state"}
+              >
+                <RefreshCwIcon size="14" aria-hidden="true" />
+              </Button>
+              {#if conflictRefreshError}
+                <span class="action-error" role="alert">{conflictRefreshError}</span>
+              {/if}
+            </div>
           {/if}
         </div>
       {/if}
@@ -2149,9 +2282,6 @@
         <!-- Workspace actions -->
         <div class="actions-row actions-row--workspace">
           {@render workspaceActionButton()}
-          {#if wsError}
-            <span class="action-error">{wsError}</span>
-          {/if}
         </div>
       {/if}
 
@@ -2240,12 +2370,15 @@
           allowRebase={repoSettings.allowRebase}
           expectedHeadSha={detailHeadSha}
           requireHeadPin={capabilities.mutation_head_binding}
+          routeGeneration={mutationRouteGeneration}
           deferUntilChecksPass={shouldDeferMergeForCI(p.CIStatus, p.CIChecksJSON)}
           alreadyQueued={deferredMergePending}
           midStackWarning={midStackBlocker
             ? `This is stack position ${d.stack?.position ?? "?"} of ${d.stack?.size ?? "?"}. Branch #${midStackBlocker.number} below it has not been merged.`
             : undefined}
-          onheadconflict={handleHeadConflict}
+          onstateconflict={handleStateConflict}
+          onmutationchange={handleHeadMutationChange}
+          mutationUnavailable={headActionsUnavailable}
           onclose={() => { showMergeModal = false; }}
           onqueued={() => {
             showMergeModal = false;
@@ -2259,7 +2392,7 @@
           }}
           onmerged={() => {
             showMergeModal = false;
-            headConflict = null;
+            stateConflict = null;
             headConflictContext = null;
             void detailStore.loadDetail(owner, name, number, {
               provider,
@@ -2408,7 +2541,7 @@
             onApplySuggestion={capabilities.review_suggestion_application
               && !stalePR
               && pr.State === "open"
-              && !headActionsBlocked
+              && !headActionsUnavailable
               && !applySuggestionGate.unavailable
                 ? applyTimelineSuggestion
                 : undefined}
@@ -3021,8 +3154,10 @@
     margin-top: 6px;
   }
 
-  .action-error--workspace-compact {
-    display: block;
+  .state-conflict-recovery {
+    display: flex;
+    align-items: center;
+    gap: 8px;
     margin-top: 6px;
   }
 

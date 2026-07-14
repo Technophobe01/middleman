@@ -50,6 +50,9 @@ type FixtureClient struct {
 	ListRepositoriesByOwnerFn func(context.Context, string) ([]*gh.Repository, error)
 	mu                        sync.RWMutex
 	nextID                    int64
+	mergePullRequestError     error
+	reviewSuggestionResult    *platform.AppliedReviewSuggestions
+	reviewSuggestionBaseSHA   string
 }
 
 // NewFixtureClient returns a FixtureClient with empty fixture maps.
@@ -87,6 +90,22 @@ func (c *FixtureClient) MarkNotificationThreadRead(
 ) error {
 	c.MarkReadNotifications = append(c.MarkReadNotifications, threadID)
 	return nil
+}
+
+func (c *FixtureClient) SetMergePullRequestError(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.mergePullRequestError = err
+}
+
+func (c *FixtureClient) SetReviewSuggestionResult(
+	result *platform.AppliedReviewSuggestions,
+	baseSHA string,
+) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.reviewSuggestionResult = result
+	c.reviewSuggestionBaseSHA = baseSHA
 }
 
 func repoKey(owner, repo string) string {
@@ -946,13 +965,22 @@ func (c *FixtureClient) CreateReviewWithComments(
 }
 
 func (c *FixtureClient) ApplyReviewSuggestions(
-	context.Context,
-	string,
-	string,
-	int,
-	platform.ApplyReviewSuggestionsInput,
+	_ context.Context,
+	owner string,
+	repo string,
+	number int,
+	input platform.ApplyReviewSuggestionsInput,
 ) (*platform.AppliedReviewSuggestions, error) {
-	return nil, errFixtureReadOnly
+	c.mu.RLock()
+	if c.reviewSuggestionResult == nil {
+		c.mu.RUnlock()
+		return nil, errFixtureReadOnly
+	}
+	result := *c.reviewSuggestionResult
+	baseSHA := c.reviewSuggestionBaseSHA
+	c.mu.RUnlock()
+	c.UpdatePullRequestSHAs(owner, repo, number, result.CommitSHA, baseSHA)
+	return &result, nil
 }
 
 func (c *FixtureClient) DismissReview(
@@ -995,12 +1023,15 @@ func (c *FixtureClient) ConvertPullRequestToDraft(
 	return clonePullRequest(pr), nil
 }
 
-// MergePullRequest returns an error (mutations not supported).
+// MergePullRequest updates the seeded pull request unless a test configured a failure.
 func (c *FixtureClient) MergePullRequest(
 	_ context.Context, owner, repo string, number int, _, _, _, _ string,
 ) (*gh.PullRequestMergeResult, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.mergePullRequestError != nil {
+		return nil, c.mergePullRequestError
+	}
 
 	pr := c.findPullRequest(owner, repo, number)
 	if pr == nil {

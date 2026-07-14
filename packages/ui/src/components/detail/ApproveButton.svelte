@@ -4,7 +4,7 @@
   import { tick } from "svelte";
   import { getClient, getStores } from "../../context.js";
   import { isProblem, problemConflictContext, problemConflictReason } from "../../api/problems.js";
-  import { providerItemPath, providerRouteParams } from "../../api/provider-routes.js";
+  import { providerItemPath, providerRouteParams, type ProviderRouteRef } from "../../api/provider-routes.js";
   import { showFlash } from "../../stores/flash.svelte.js";
   import { submitApprovePR, type PRDetailActionInput } from "./keyboard-actions.js";
 
@@ -27,7 +27,16 @@
     /** capabilities.mutation_head_binding for this repo's provider. */
     requireHeadPin?: boolean;
     supportedReviewActions?: string[];
-    onheadconflict?: ((reason: "stale_state" | "head_unknown", context?: string) => void) | undefined;
+    routeGeneration?: number;
+    onheadconflict?: ((
+      reason: "stale_state" | "head_unknown",
+      context: string | undefined,
+      expectedHeadSha: string,
+      ref: ProviderRouteRef,
+      number: number,
+      routeGeneration: number,
+    ) => void) | undefined;
+    onmutationchange?: ((active: boolean) => void) | undefined;
     oncompleted?: (() => void) | undefined;
     /** Tooltip override; pass the unavailable_reason when disabling. */
     title?: string | undefined;
@@ -46,7 +55,9 @@
     platformHeadSha,
     requireHeadPin = false,
     supportedReviewActions = [],
+    routeGeneration = 0,
     onheadconflict,
+    onmutationchange,
     oncompleted,
     title = undefined,
   }: Props = $props();
@@ -57,12 +68,12 @@
   // Approve and Request changes submit this same pin — the two form
   // actions share one head-binding contract.
   let pinAtOpen = $state("");
+  let generationAtOpen = $state(0);
 
   let expanded = $state(false);
   let body = $state("");
   let submitting = $state(false);
   let submittingAction = $state<"approve" | "request_changes" | null>(null);
-  let error = $state<string | null>(null);
   let commentInput = $state<HTMLTextAreaElement | undefined>();
   const canRequestChanges = $derived(supportedReviewActions.includes("request_changes"));
 
@@ -79,8 +90,8 @@
     void number;
     expanded = false;
     body = "";
-    error = null;
     pinAtOpen = "";
+    generationAtOpen = routeGeneration;
   });
 
   $effect(() => {
@@ -91,7 +102,7 @@
     });
   });
 
-  function buildInput(): PRDetailActionInput {
+  function buildInput(onHandledHeadConflict?: () => void): PRDetailActionInput {
     return {
       pr: {
         State: "open", IsDraft: false, MergeableState: "",
@@ -110,24 +121,36 @@
       client,
       approveCommentBody: body,
       ...(pinAtOpen !== "" && { expectedHeadSha: pinAtOpen }),
-      onHeadConflict: handleHeadConflict,
+      onHeadConflict: (...args) => {
+        onHandledHeadConflict?.();
+        handleHeadConflict(...args);
+      },
     };
   }
 
-  function handleHeadConflict(reason: "stale_state" | "head_unknown", context?: string): void {
+  function handleHeadConflict(
+    reason: "stale_state" | "head_unknown",
+    context: string | undefined,
+    failedHeadSha: string,
+    failedRef: ProviderRouteRef,
+    failedNumber: number,
+  ): void {
+    const failedGeneration = generationAtOpen;
     expanded = false;
-    error = null;
     pinAtOpen = "";
-    onheadconflict?.(reason, context);
+    onheadconflict?.(reason, context, failedHeadSha, failedRef, failedNumber, failedGeneration);
   }
 
   async function handleApprove(): Promise<void> {
     if (disabled || submitting) return;
     submitting = true;
     submittingAction = "approve";
-    error = null;
+    onmutationchange?.(true);
+    let handledHeadConflict = false;
     try {
-      const approved = await submitApprovePR(buildInput());
+      const approved = await submitApprovePR(buildInput(() => {
+        handledHeadConflict = true;
+      }));
       if (!approved) return;
       body = "";
       expanded = false;
@@ -141,12 +164,11 @@
         showFlash("Pull request approved, but it could not be refreshed.");
       }
     } catch (err) {
-      if (expanded) {
-        error = err instanceof Error ? err.message : String(err);
-      }
+      if (!handledHeadConflict) showFlash(err instanceof Error ? err.message : String(err), { tone: "danger" });
     } finally {
       submitting = false;
       submittingAction = null;
+      onmutationchange?.(false);
     }
   }
 
@@ -158,7 +180,8 @@
     if (disabled || submitting || body.trim() === "") return;
     submitting = true;
     submittingAction = "request_changes";
-    error = null;
+    onmutationchange?.(true);
+    let handledHeadConflict = false;
     try {
       const { error: requestError } = await client.POST(providerItemPath("pulls", {
         provider, platformHost, owner, name, repoPath,
@@ -172,9 +195,13 @@
       if (requestError) {
         const reason = isProblem(requestError) ? problemConflictReason(requestError) : undefined;
         if (reason === "stale_state" || reason === "head_unknown") {
+          handledHeadConflict = true;
           handleHeadConflict(
             reason,
             isProblem(requestError) ? problemConflictContext(requestError) : undefined,
+			pinAtOpen,
+			{ provider, platformHost, owner, name, repoPath },
+			number,
           );
         }
         throw new Error(requestError.detail ?? requestError.title ?? "failed to request changes");
@@ -191,12 +218,11 @@
         showFlash("Changes were requested, but the pull request could not be refreshed.");
       }
     } catch (err) {
-      if (expanded) {
-        error = err instanceof Error ? err.message : String(err);
-      }
+      if (!handledHeadConflict) showFlash(err instanceof Error ? err.message : String(err), { tone: "danger" });
     } finally {
       submitting = false;
       submittingAction = null;
+      onmutationchange?.(false);
     }
   }
 </script>
@@ -206,7 +232,10 @@
     class="btn btn--approve"
     onclick={() => {
       if (disabled || submitting) return;
-      if (!expanded) pinAtOpen = (platformHeadSha ?? expectedHeadSha ?? "").trim();
+      if (!expanded) {
+        pinAtOpen = (platformHeadSha ?? expectedHeadSha ?? "").trim();
+        generationAtOpen = routeGeneration;
+      }
       expanded = !expanded;
     }}
     disabled={disabled || submitting}
@@ -232,9 +261,6 @@
         bind:value={body}
         rows={3}
       ></textarea>
-      {#if error}
-        <p class="approve-error">{error}</p>
-      {/if}
       <div class="approve-actions">
         <Button
           class="btn btn--secondary"
@@ -318,11 +344,6 @@
     border-color: var(--accent-blue);
     outline: none;
     box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent-blue) 32%, transparent);
-  }
-
-  .approve-error {
-    font-size: var(--font-size-sm);
-    color: var(--accent-red);
   }
 
   .approve-actions {

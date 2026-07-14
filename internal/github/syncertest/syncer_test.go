@@ -146,11 +146,11 @@ func (m *mockClient) CreateReviewWithComments(
 	return nil, nil
 }
 func (m *mockClient) ApplyReviewSuggestions(
-	context.Context,
-	string,
-	string,
-	int,
-	platform.ApplyReviewSuggestionsInput,
+	_ context.Context,
+	_ string,
+	_ string,
+	_ int,
+	input platform.ApplyReviewSuggestionsInput,
 ) (*platform.AppliedReviewSuggestions, error) {
 	return nil, nil
 }

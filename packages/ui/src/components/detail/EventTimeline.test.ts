@@ -653,6 +653,95 @@ describe("EventTimeline", () => {
     });
   });
 
+  it("shows an inline error only when suggestion application reports a durable conflict", async () => {
+    const applySuggestion = vi.fn(async () => ({
+      ok: false,
+      error: "pull request state changed",
+    }));
+    render(EventTimeline, {
+      props: {
+        events: [
+          makeReviewThreadEvent({
+            Body: ["This can return directly.", "", "```suggestion", "return client.publishThreads();", "```"].join(
+              "\n",
+            ),
+            diff_thread: {
+              ...makeReviewThreadEvent().diff_thread!,
+              diff_head_sha: "abc123",
+            },
+          }),
+        ],
+        provider: "github",
+        platformHost: "github.com",
+        repoOwner: "acme",
+        repoName: "widget",
+        repoPath: "acme/widget",
+        number: 7,
+        currentHeadSHA: "abc123",
+        onApplySuggestion: applySuggestion,
+      },
+      context: new Map([
+        [
+          STORES_KEY,
+          {
+            diff: makeDiffStore(),
+            diffReviewDraft: {
+              setRouteContext: vi.fn(),
+              isSubmitting: () => false,
+            },
+          },
+        ],
+      ]),
+    });
+
+    expect(screen.queryByText("pull request state changed")).toBeNull();
+    await fireEvent.click(screen.getByRole("button", { name: "Commit suggestion" }));
+
+    await waitFor(() => {
+      expect(screen.getByText("pull request state changed")).toBeTruthy();
+    });
+  });
+
+  it("does not reuse a stale detail error for a generic suggestion failure", async () => {
+    render(EventTimeline, {
+      props: {
+        events: [
+          makeReviewThreadEvent({
+            Body: ["Try this.", "", "```suggestion", "return publish();", "```"].join("\n"),
+            diff_thread: {
+              ...makeReviewThreadEvent().diff_thread!,
+              diff_head_sha: "abc123",
+            },
+          }),
+        ],
+        provider: "github",
+        platformHost: "github.com",
+        repoOwner: "acme",
+        repoName: "widget",
+        repoPath: "acme/widget",
+        number: 7,
+        currentHeadSHA: "abc123",
+        onApplySuggestion: vi.fn(async () => false),
+      },
+      context: new Map([
+        [
+          STORES_KEY,
+          {
+            detail: { getDetailError: () => "unrelated previous error" },
+            diff: makeDiffStore(),
+            diffReviewDraft: {
+              setRouteContext: vi.fn(),
+              isSubmitting: () => false,
+            },
+          },
+        ],
+      ]),
+    });
+
+    await fireEvent.click(screen.getByRole("button", { name: "Commit suggestion" }));
+    await waitFor(() => expect(screen.queryByText("unrelated previous error")).toBeNull());
+  });
+
   it("keeps hidden selected suggestions in the batch apply request", async () => {
     const applySuggestion = vi.fn(async () => true);
     const baseThread = makeReviewThreadEvent().diff_thread!;
@@ -726,6 +815,57 @@ describe("EventTimeline", () => {
         replacement: "return secondSuggestion();",
       },
     ]);
+  });
+
+  it("clears a batch error before a successful retry", async () => {
+    const applySuggestion = vi
+      .fn()
+      .mockImplementationOnce(async () => ({
+        ok: false,
+        error: "pull request state changed",
+      }))
+      .mockImplementationOnce(async () => true);
+    render(EventTimeline, {
+      props: {
+        events: [
+          makeReviewThreadEvent({
+            Body: ["Batch this.", "", "```suggestion", "return publish();", "```"].join("\n"),
+            diff_thread: {
+              ...makeReviewThreadEvent().diff_thread!,
+              diff_head_sha: "abc123",
+            },
+          }),
+        ],
+        provider: "github",
+        platformHost: "github.com",
+        repoOwner: "acme",
+        repoName: "widget",
+        repoPath: "acme/widget",
+        number: 7,
+        currentHeadSHA: "abc123",
+        onApplySuggestion: applySuggestion,
+      },
+      context: new Map([
+        [
+          STORES_KEY,
+          {
+            diff: makeDiffStore(),
+            diffReviewDraft: {
+              setRouteContext: vi.fn(),
+              isSubmitting: () => false,
+            },
+          },
+        ],
+      ]),
+    });
+
+    await fireEvent.click(screen.getByRole("button", { name: "Add suggestion to batch" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Commit batch" }));
+    await waitFor(() => expect(screen.getByText("pull request state changed")).toBeTruthy());
+
+    await fireEvent.click(screen.getByRole("button", { name: "Commit batch" }));
+    await waitFor(() => expect(screen.queryByText("pull request state changed")).toBeNull());
+    expect(applySuggestion).toHaveBeenCalledTimes(2);
   });
 
   it("disables suggestion application when the reviewed head is missing", async () => {

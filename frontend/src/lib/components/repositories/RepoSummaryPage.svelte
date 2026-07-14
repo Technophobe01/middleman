@@ -7,6 +7,7 @@
   } from "@middleman/ui/api/provider-routes";
   import type { RepoSummary } from "@middleman/ui/api/types";
   import { buildIssueRoute, buildRepoBrowserRoute } from "@middleman/ui/routes";
+  import { showFlash } from "@middleman/ui/stores/flash";
 
   import {
     RefreshIcon,
@@ -52,6 +53,7 @@
   let issueSubmittingByRepo = $state<Record<string, boolean>>(
     {},
   );
+  let issueOutcomeUnknownByRepo = $state<Record<string, boolean>>({});
   let searchQuery = $state(initialFilters.searchQuery);
   let activeFilter = $state<RepoFilter>(initialFilters.activeFilter);
   let sortMode = $state<RepoSort>(initialFilters.sortMode);
@@ -176,23 +178,35 @@
     if (showSpinner) loading = true;
     loadError = null;
 
-    const { data, error } = await client.GET("/repos/summary");
-    if (error) {
-      loadError = apiErrorMessage(
-        error,
-        "failed to load repositories",
-      );
-      if (showSpinner) loading = false;
-      return;
-    }
+    try {
+      const { data, error } = await client.GET("/repos/summary");
+      if (error) {
+        loadError = apiErrorMessage(
+          error,
+          "failed to load repositories",
+        );
+        return;
+      }
 
-    summaries = normalizeSummaries(data as RepoSummary[] | null);
-    loading = false;
+      summaries = normalizeSummaries(data as RepoSummary[] | null);
+    } catch (err) {
+      loadError = err instanceof Error ? err.message : "failed to load repositories";
+    } finally {
+      loading = false;
+    }
   }
 
   async function refreshSummaries(): Promise<void> {
-    await client.POST("/sync");
-    await loadSummaries();
+    try {
+      const { error } = await client.POST("/sync");
+      if (error) {
+        showFlash(apiErrorMessage(error, "failed to refresh repositories"), { tone: "danger" });
+        return;
+      }
+      await loadSummaries();
+    } catch (err) {
+      showFlash(err instanceof Error ? err.message : "failed to refresh repositories", { tone: "danger" });
+    }
   }
 
   function setFilter(filter: RepoFilter): void {
@@ -245,7 +259,7 @@
     if (!summary.repo.capabilities.issue_mutation) return;
     const key = repoStateKey(summary);
     composerSummary = summary;
-    issueErrorByRepo[key] = null;
+    if (!issueOutcomeUnknownByRepo[key]) issueErrorByRepo[key] = null;
     if (issueTitleByRepo[key] === undefined) {
       issueTitleByRepo[key] = "";
     }
@@ -258,7 +272,7 @@
     if (composerSummary && repoStateKey(composerSummary) === key) {
       composerSummary = null;
     }
-    issueErrorByRepo[key] = null;
+    if (!issueOutcomeUnknownByRepo[key]) issueErrorByRepo[key] = null;
   }
 
   function updateIssueTitle(
@@ -278,6 +292,7 @@
     if (!summary.repo.capabilities.issue_mutation) return;
     const key = repoStateKey(summary);
     if (issueSubmittingByRepo[key]) return;
+    if (issueOutcomeUnknownByRepo[key]) return;
 
     const title = (issueTitleByRepo[key] ?? "").trim();
     if (title === "") {
@@ -295,47 +310,69 @@
       name: summary.repo.name,
       repoPath: summary.repo.repo_path,
     };
-    const { data, error } = await client.POST(
-      providerCollectionPath("issues", ref),
-      {
-        params: {
-          path: providerRouteParams(ref),
+    try {
+      const { data, error, response } = await client.POST(
+        providerCollectionPath("issues", ref),
+        {
+          params: {
+            path: providerRouteParams(ref),
+          },
+          body: {
+            title,
+            body: issueBodyByRepo[key] ?? "",
+          },
         },
-        body: {
-          title,
-          body: issueBodyByRepo[key] ?? "",
-        },
-      },
-    );
-
-    issueSubmittingByRepo[key] = false;
-    if (error || !data) {
-      issueErrorByRepo[key] = apiErrorMessage(
-        error,
-        "failed to create issue",
       );
-      return;
-    }
+      if (error || !data) {
+        const message = apiErrorMessage(error, "failed to create issue");
+        if (response?.status >= 500) {
+          const warning = `${message} The request outcome is unknown; check the issue list before retrying.`;
+          issueOutcomeUnknownByRepo[key] = true;
+          issueErrorByRepo[key] = warning;
+          showFlash(warning, { tone: "danger" });
+        } else {
+          issueOutcomeUnknownByRepo[key] = false;
+          showFlash(message, { tone: "danger" });
+        }
+        return;
+      }
 
-    issueTitleByRepo[key] = "";
-    issueBodyByRepo[key] = "";
-    composerSummary = null;
-    setGlobalRepo(repoStateKey(summary));
-    navigate(
-      buildIssueRoute({
-        provider: summary.repo.provider,
-        platformHost: summary.repo.platform_host,
-        owner: summary.repo.owner,
-        name: summary.repo.name,
-        repoPath: summary.repo.repo_path,
-        number: data.Number,
-      }),
-    );
+      issueTitleByRepo[key] = "";
+      issueBodyByRepo[key] = "";
+      issueOutcomeUnknownByRepo[key] = false;
+      composerSummary = null;
+      setGlobalRepo(repoStateKey(summary));
+      navigate(
+        buildIssueRoute({
+          provider: summary.repo.provider,
+          platformHost: summary.repo.platform_host,
+          owner: summary.repo.owner,
+          name: summary.repo.name,
+          repoPath: summary.repo.repo_path,
+          number: data.Number,
+        }),
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "failed to create issue";
+      const warning = `${message} The request outcome is unknown; check the issue list before retrying.`;
+      issueOutcomeUnknownByRepo[key] = true;
+      issueErrorByRepo[key] = warning;
+      showFlash(warning, {
+        tone: "danger",
+      });
+    } finally {
+      issueSubmittingByRepo[key] = false;
+    }
   }
 
   function submitActiveIssue(): void {
     if (!composerSummary) return;
     void submitIssue(composerSummary);
+  }
+
+  function acknowledgeUnknownIssueOutcome(key: string): void {
+    issueOutcomeUnknownByRepo[key] = false;
+    issueErrorByRepo[key] = null;
   }
 
   onMount(() => {
@@ -518,10 +555,12 @@
       body={issueBodyByRepo[key] ?? ""}
       error={issueErrorByRepo[key] ?? null}
       submitting={issueSubmittingByRepo[key] ?? false}
+      outcomeUnknown={issueOutcomeUnknownByRepo[key] ?? false}
       ontitlechange={(title) => updateIssueTitle(key, title)}
       onbodychange={(body) => updateIssueBody(key, body)}
       oncancel={() => closeComposer(key)}
       onsubmitissue={submitActiveIssue}
+      onacknowledgeoutcome={() => acknowledgeUnknownIssueOutcome(key)}
     />
   {/if}
 </section>

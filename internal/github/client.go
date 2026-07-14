@@ -2662,7 +2662,17 @@ func (c *liveClient) ApplyReviewSuggestions(
 		})
 	}
 
-	return c.createCommitForReviewSuggestions(ctx, owner, repo, number, headFullName, headBranch, expectedHeadSHA, strings.TrimSpace(input.Message), additions)
+	return c.createCommitForReviewSuggestions(
+		ctx,
+		owner,
+		repo,
+		number,
+		headFullName,
+		headBranch,
+		expectedHeadSHA,
+		strings.TrimSpace(input.Message),
+		additions,
+	)
 }
 
 func (c *liveClient) ensureReviewSuggestionPullMutable(

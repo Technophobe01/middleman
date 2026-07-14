@@ -3016,7 +3016,6 @@ func (s *Server) approvePR(ctx context.Context, input *approvePRInput) (*actionS
 	if err := s.requireSyncerCapability(*repo, capabilityReviewMutation); err != nil {
 		return nil, err
 	}
-
 	mutator, err := s.syncer.ReviewMutator(
 		repoProviderKind(*repo), repoProviderHost(*repo),
 	)
@@ -3065,18 +3064,12 @@ func (s *Server) approvePR(ctx context.Context, input *approvePRInput) (*actionS
 	event := platform.DBMREvent(mr.ID, platformEvent)
 	_ = s.db.UpsertMREvents(ctx, []db.MREvent{event})
 
-	// Providers like GitLab store the approval body as a separate upstream
-	// comment that is not part of the returned event. Sync inline so the
-	// comment is visible in the next local detail load instead of waiting
-	// for the periodic sync.
-	if strings.TrimSpace(input.Body.Body) != "" && platformEvent.Body == "" {
-		if syncErr := s.syncer.SyncMROnProvider(
-			ctx,
-			repoProviderKind(*repo), repoProviderHost(*repo),
-			repo.Owner, repo.Name, input.Number,
-		); syncErr != nil {
-			slog.Warn("sync after approval with comment", "err", syncErr)
-		}
+	if syncErr := s.syncer.SyncMROnProvider(
+		ctx,
+		repoProviderKind(*repo), repoProviderHost(*repo),
+		repo.Owner, repo.Name, input.Number,
+	); syncErr != nil {
+		slog.Warn("sync after approval", "err", syncErr)
 	}
 
 	return &actionStatusOutput{Body: actionStatusBody{Status: "approved"}}, nil
@@ -3182,7 +3175,6 @@ func (s *Server) approveWorkflows(ctx context.Context, input *repoNumberInput) (
 	if err := s.requireSyncerCapability(*repo, capabilityWorkflowApproval); err != nil {
 		return nil, err
 	}
-
 	mr, err := s.db.GetMergeRequestByRepoIDAndNumber(ctx, repo.ID, input.Number)
 	if err != nil {
 		return nil, problemInternal("get pull request failed")
@@ -3292,7 +3284,6 @@ func (s *Server) readyForReview(ctx context.Context, input *repoNumberInput) (*a
 	if err := s.requireSyncerCapability(*repo, capabilityReadyForReview); err != nil {
 		return nil, err
 	}
-
 	mutator, err := s.syncer.ReadyForReviewMutator(
 		repoProviderKind(*repo), repoProviderHost(*repo),
 	)
@@ -3350,11 +3341,9 @@ func (s *Server) readyForReview(ctx context.Context, input *repoNumberInput) (*a
 		)
 	}
 
-	if repo != nil {
-		normalized := platform.DBMergeRequest(repo.ID, pr)
-		if mrID, upsertErr := s.db.UpsertMergeRequest(ctx, normalized); upsertErr == nil {
-			_ = s.db.EnsureKanbanState(ctx, mrID)
-		}
+	normalized := platform.DBMergeRequest(repo.ID, pr)
+	if mrID, accepted, upsertErr := s.db.UpsertMergeRequestSnapshot(ctx, normalized); upsertErr == nil && accepted {
+		_ = s.db.EnsureKanbanState(ctx, mrID)
 	}
 
 	return &actionStatusOutput{Body: actionStatusBody{Status: "ready_for_review"}}, nil
@@ -3388,7 +3377,6 @@ func (s *Server) mergePRWithBody(
 	if err := s.requireSyncerCapability(*repo, capabilityMergeMutation); err != nil {
 		return mergePRBody{}, err
 	}
-
 	mutator, err := s.syncer.MergeMutator(
 		repoProviderKind(*repo), repoProviderHost(*repo),
 	)
@@ -3533,6 +3521,13 @@ func (s *Server) preflightMergePR(
 	number int,
 	body mergePRInputBody,
 ) (string, error) {
+	if mr.State == db.MergeRequestStateClosed || mr.State == db.MergeRequestStateMerged {
+		return "", problemConflict(
+			CodeConflict,
+			"pull request is not open",
+			map[string]any{"reason": "not_open"},
+		)
+	}
 	validMethods := map[string]bool{"merge": true, "squash": true, "rebase": true}
 	if !validMethods[body.Method] {
 		return "", problemValidation(
@@ -3617,7 +3612,26 @@ func (s *Server) verifyClientReviewedHead(
 	number int,
 	clientSHA, boundSHA string,
 ) error {
+	err := verifyClientReviewedHeadWithoutRefresh(clientSHA, boundSHA)
+	if err == nil || strings.TrimSpace(clientSHA) == "" || strings.TrimSpace(boundSHA) == "" ||
+		strings.TrimSpace(clientSHA) == strings.TrimSpace(boundSHA) {
+		return err
+	}
+	s.runBackground(func(bgCtx context.Context) {
+		if syncErr := s.syncer.SyncMROnProvider(
+			bgCtx,
+			repoProviderKind(*repo), repoProviderHost(*repo),
+			repo.Owner, repo.Name, number,
+		); syncErr != nil {
+			slog.Warn("background sync after stale client head", "err", syncErr)
+		}
+	})
+	return err
+}
+
+func verifyClientReviewedHeadWithoutRefresh(clientSHA, boundSHA string) error {
 	clientSHA = strings.TrimSpace(clientSHA)
+	boundSHA = strings.TrimSpace(boundSHA)
 	if clientSHA == "" {
 		return nil
 	}
@@ -3629,15 +3643,6 @@ func (s *Server) verifyClientReviewedHead(
 		)
 	}
 	if clientSHA != boundSHA {
-		s.runBackground(func(bgCtx context.Context) {
-			if syncErr := s.syncer.SyncMROnProvider(
-				bgCtx,
-				repoProviderKind(*repo), repoProviderHost(*repo),
-				repo.Owner, repo.Name, number,
-			); syncErr != nil {
-				slog.Warn("background sync after stale client head", "err", syncErr)
-			}
-		})
 		return problemConflict(
 			CodeConflict,
 			"target changed since it was reviewed; refresh and retry",
@@ -3808,7 +3813,7 @@ func (s *Server) setPRGitHubState(
 							string(repoProviderKind(*repo)), repoProviderHost(*repo),
 						)
 					}
-					_, _ = s.db.UpsertMergeRequest(ctx, normalized)
+					_, _, _ = s.db.UpsertMergeRequestSnapshot(ctx, normalized)
 					s.markClosedLinkedNotificationsDone(ctx)
 					if ghPR.GetMerged() {
 						return nil, problemConflict(

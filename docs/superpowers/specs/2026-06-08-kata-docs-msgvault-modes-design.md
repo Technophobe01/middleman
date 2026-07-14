@@ -363,6 +363,9 @@ Kata frontend adaptation:
   (their consumers echo it synchronously); store state that should survive
   navigation lives in the URL
   (`frontend/src/lib/features/kata/KataWorkspace.svelte::reconcileRoute`).
+- Superseded route detail reads remain retryable; only a real request failure
+  may pin a route as failed, or an event refresh can strand a valid deep link
+  (`frontend/src/lib/features/kata/KataWorkspace.svelte::reconcileRoute`).
 - Routed issue selection waits for any in-flight view/scope load to settle;
   intermediate list state may clear selection and abort an early detail read
   (`frontend/src/lib/features/kata/KataWorkspace.svelte::viewScopeLoadSignature`).

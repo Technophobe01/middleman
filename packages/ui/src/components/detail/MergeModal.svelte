@@ -2,9 +2,15 @@
   import { Button, Modal } from "@kenn-io/kit-ui";
   import { onMount, untrack } from "svelte";
 
-  import { isProblem, problemConflictContext, problemConflictReason } from "../../api/problems.js";
-  import { providerItemPath, providerRouteParams } from "../../api/provider-routes.js";
+  import {
+    isProblem,
+    problemConflictContext,
+    problemConflictReason,
+    type ConflictReason,
+  } from "../../api/problems.js";
+  import { providerItemPath, providerRouteParams, type ProviderRouteRef } from "../../api/provider-routes.js";
   import { getClient } from "../../context.js";
+  import { showFlash } from "../../stores/flash.svelte.js";
   import { pushModalFrame } from "../../stores/keyboard/modal-stack.svelte.js";
 
   const client = getClient();
@@ -29,6 +35,7 @@
     expectedHeadSha?: string | undefined;
     /** capabilities.mutation_head_binding for this repo's provider. */
     requireHeadPin?: boolean;
+    routeGeneration?: number;
     /** When true, the primary action waits for currently pending CI before merging. */
     deferUntilChecksPass?: boolean;
     /**
@@ -43,17 +50,27 @@
     onmerged: () => void;
     /** Called when a deferred merge was accepted and now waits on CI. */
     onqueued: () => void;
-    onheadconflict?: ((reason: "stale_state" | "head_unknown", context?: string) => void) | undefined;
+    onstateconflict?: ((
+      reason: Exclude<ConflictReason, "conflict">,
+      context: string | undefined,
+      expectedHeadSha: string,
+      ref: ProviderRouteRef,
+      number: number,
+      routeGeneration: number,
+    ) => void) | undefined;
+    onmutationchange?: ((active: boolean) => void) | undefined;
+    mutationUnavailable?: boolean;
   }
 
   const {
     owner, name, number, provider, platformHost, repoPath, prTitle, prBody,
     prAuthor, prAuthorDisplayName,
     allowSquash, allowMerge, allowRebase,
-    expectedHeadSha, requireHeadPin = false,
+    expectedHeadSha, requireHeadPin = false, routeGeneration = 0,
     deferUntilChecksPass = false,
     alreadyQueued = false, midStackWarning,
-    onclose, onmerged, onqueued, onheadconflict,
+    onclose, onmerged, onqueued, onstateconflict, onmutationchange,
+    mutationUnavailable = false,
   }: Props = $props();
 
   // Offer to queue a deferred merge only when none is queued yet.
@@ -64,6 +81,7 @@
   // while the form is already on screen. If the head really moved, the
   // server rejects this stale pin and the conflict flow takes over.
   const pinnedHeadShaAtOpen = untrack(() => (expectedHeadSha ?? "").trim());
+  const routeGenerationAtOpen = untrack(() => routeGeneration);
 
   // A head-binding provider cannot merge without a pinned head; the user
   // must wait for sync and re-review before merging.
@@ -133,17 +151,31 @@
   function handleMergeError(requestError: { detail?: string; title?: string; details?: unknown } | undefined): boolean {
     if (!requestError) return false;
     const reason = isProblem(requestError) ? problemConflictReason(requestError) : undefined;
-    if (reason === "stale_state" || reason === "head_unknown") {
-      onheadconflict?.(reason, isProblem(requestError) ? problemConflictContext(requestError) : undefined);
+    if (reason && reason !== "conflict") {
+      onstateconflict?.(
+        reason,
+        isProblem(requestError) ? problemConflictContext(requestError) : undefined,
+        pinnedHeadShaAtOpen,
+        { provider, platformHost, owner, name, repoPath },
+        number,
+        routeGenerationAtOpen,
+      );
       onclose();
       return true;
     }
-    throw new Error(requestError.detail ?? requestError.title ?? "failed to merge pull request");
+    const message = requestError.detail ?? requestError.title ?? "failed to merge pull request";
+    if (reason === "conflict") {
+      error = message;
+    } else {
+      showFlash(message, { tone: "danger" });
+    }
+    return true;
   }
 
   async function submitMerge(deferred: boolean): Promise<void> {
-    if (headPinMissing) return;
+    if (headPinMissing || mutationUnavailable) return;
     activeMergeSubmission = deferred ? "deferred" : "immediate";
+    onmutationchange?.(true);
     error = null;
     try {
       // Pin the merge to the head the user reviewed; the server rejects
@@ -166,9 +198,10 @@
       }
       onmerged();
     } catch (err) {
-      error = err instanceof Error ? err.message : String(err);
+      showFlash(err instanceof Error ? err.message : String(err), { tone: "danger" });
     } finally {
       activeMergeSubmission = null;
+      onmutationchange?.(false);
     }
   }
 
@@ -297,7 +330,7 @@
     <Button
       class="btn btn--primary btn--green"
       onclick={handleMerge}
-      disabled={merging || headPinMissing}
+      disabled={merging || headPinMissing || mutationUnavailable}
       tone="success"
       surface="solid"
     >
@@ -307,7 +340,7 @@
       <Button
         class="btn btn--merge-anyway"
         onclick={handleMergeAnyway}
-        disabled={merging || headPinMissing}
+        disabled={merging || headPinMissing || mutationUnavailable}
         tone="success"
         surface="soft"
       >
