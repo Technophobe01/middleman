@@ -67,6 +67,35 @@ func TestDockerEntrypointSeedsLoadableConfig(t *testing.T) {
 		assert.False(cfg.TrustReverseProxy)
 	})
 
+	t.Run("base path prefix is seeded", func(t *testing.T) {
+		assert := assert.New(t)
+		cfg := seedConfig(t, t.TempDir(), map[string]string{
+			"MIDDLEMAN_PORT":      "18091",
+			"MIDDLEMAN_BASE_PATH": "/middleman",
+		})
+		// config.Load normalizes a non-root prefix to a trailing slash.
+		assert.Equal("/middleman/", cfg.BasePath)
+	})
+
+	t.Run("no base path defaults to root", func(t *testing.T) {
+		cfg := seedConfig(t, t.TempDir(), map[string]string{
+			"MIDDLEMAN_PORT": "18091",
+		})
+		assert.Equal(t, "/", cfg.BasePath)
+	})
+
+	t.Run("hostile base path still produces valid TOML", func(t *testing.T) {
+		assert := assert.New(t)
+		// Quotes/backslashes must not break the generated TOML; config.Load
+		// succeeding (inside seedConfig) is the core assertion.
+		cfg := seedConfig(t, t.TempDir(), map[string]string{
+			"MIDDLEMAN_PORT":      "18091",
+			"MIDDLEMAN_BASE_PATH": "/ev\"il\\path",
+		})
+		assert.NotContains(cfg.BasePath, "\"")
+		assert.NotContains(cfg.BasePath, "\\")
+	})
+
 	t.Run("trust_reverse_proxy only for truthy values", func(t *testing.T) {
 		truthy := []string{"1", "true", "TRUE", "yes"}
 		for _, v := range truthy {

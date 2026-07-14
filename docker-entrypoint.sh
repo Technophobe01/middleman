@@ -54,6 +54,12 @@ if [ ! -f "${CONFIG}" ]; then
     case "${MIDDLEMAN_TRUST_REVERSE_PROXY:-}" in
       1|true|TRUE|yes) echo 'trust_reverse_proxy = true' ;;
     esac
+    # Optional URL sub-path so a reverse proxy (e.g. Kenn Console) can front
+    # middleman under a prefix behind one login. Empty leaves the default "/".
+    # Top-level key: emit before any table below.
+    if [ -n "${MIDDLEMAN_BASE_PATH:-}" ]; then
+      echo "base_path = \"$(toml_safe "${MIDDLEMAN_BASE_PATH}")\""
+    fi
     # Front door -> roborev proxy target (table must follow the top-level keys).
     if [ -n "${MIDDLEMAN_ROBOREV_ENDPOINT:-}" ]; then
       echo ''
