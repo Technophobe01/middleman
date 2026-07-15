@@ -288,15 +288,17 @@ func (m *Manager) Create(
 	}
 
 	ws := &Workspace{
-		ID:              id,
-		Platform:        repo.Platform,
-		PlatformHost:    platformHost,
-		RepoOwner:       owner,
-		RepoName:        name,
-		ItemType:        db.WorkspaceItemTypePullRequest,
-		ItemNumber:      mrNumber,
-		GitHeadRef:      mr.HeadBranch,
-		MRHeadRepo:      workspaceHeadRepo(platformHost, owner, name, mr.HeadRepoCloneURL),
+		ID:           id,
+		Platform:     repo.Platform,
+		PlatformHost: platformHost,
+		RepoOwner:    owner,
+		RepoName:     name,
+		ItemType:     db.WorkspaceItemTypePullRequest,
+		ItemNumber:   mrNumber,
+		GitHeadRef:   mr.HeadBranch,
+		MRHeadRepo: workspaceHeadRepo(
+			repo.Platform, platformHost, owner, name, mr.HeadRepoCloneURL,
+		),
 		WorkspaceBranch: workspaceBranchUnknown,
 		WorktreePath: filepath.Join(
 			m.worktreeDir, repo.Platform, platformHost, owner, name,
@@ -608,20 +610,22 @@ func issueWorkspaceBranchConflict(
 	}
 }
 
-func workspaceHeadRepo(platformHost, owner, name, cloneURL string) *string {
-	if cloneURL == "" {
-		return nil
-	}
+func workspaceHeadRepo(provider, platformHost, owner, name, cloneURL string) *string {
 	// MRHeadRepo means "this PR head must be resolved through fork-safe refs"
 	// in setup. GitHub also fills head.repo.clone_url for same-repo PRs, so
 	// compare clone identities before treating a non-empty URL as fork metadata.
-	headRepo := normalizeCloneRepoIdentity(cloneURL)
+	headRepo := normalizeCloneRepoIdentity(provider, cloneURL)
+	if headRepo == "" {
+		unknown := ""
+		return &unknown
+	}
 	baseRepo := strings.ToLower(strings.Join([]string{
+		strings.TrimSpace(provider),
 		normalizePlatformHostIdentity(platformHost),
 		strings.TrimSpace(owner),
 		strings.TrimSpace(name),
 	}, "/"))
-	if headRepo != "" && headRepo == baseRepo {
+	if headRepo == baseRepo {
 		return nil
 	}
 	s := cloneURL
@@ -648,6 +652,12 @@ func (m *Manager) SetupWithWorktreeBasePath(
 		ws.ID, workspaceSetupStageSetup, "started",
 		"starting workspace setup",
 	)
+	if err := m.refreshWorkspaceHeadRepo(ctx, ws); err != nil {
+		return m.failSetup(
+			ctx, ws.ID, workspaceSetupStageSetup,
+			fmt.Errorf("refresh workspace head repository: %w", err),
+		)
+	}
 
 	branch, reusedWorktree, err := m.reuseExistingWorkspaceWorktree(ctx, ws)
 	var gitDir string
@@ -669,6 +679,21 @@ func (m *Manager) SetupWithWorktreeBasePath(
 			return m.failSetup(
 				ctx,
 				ws.ID, workspaceSetupStageWorktree, err,
+			)
+		}
+	}
+	if ws.ItemType == db.WorkspaceItemTypePullRequest && ws.MRHeadRepo != nil {
+		currentBranch, branchErr := worktreeCurrentBranch(ctx, ws.WorktreePath)
+		if branchErr == nil && currentBranch != "" {
+			branchErr = clearBranchUpstream(ctx, ws.WorktreePath, currentBranch)
+		}
+		if branchErr != nil {
+			if !reusedWorktree {
+				m.rollbackWorktree(ctx, gitDir, ws, branch)
+			}
+			return m.failSetup(
+				ctx, ws.ID, workspaceSetupStageWorktree,
+				fmt.Errorf("clear untrusted branch upstream: %w", branchErr),
 			)
 		}
 	}
@@ -724,6 +749,36 @@ func (m *Manager) SetupWithWorktreeBasePath(
 			fmt.Errorf("update status to ready: %w", err),
 		)
 	}
+	return nil
+}
+
+func (m *Manager) refreshWorkspaceHeadRepo(
+	ctx context.Context, ws *Workspace,
+) error {
+	if ws.ItemType != db.WorkspaceItemTypePullRequest {
+		return nil
+	}
+	repo, err := m.workspaceRepo(
+		ctx, ws.Platform, ws.PlatformHost, ws.RepoOwner, ws.RepoName,
+	)
+	if err != nil {
+		return fmt.Errorf("look up workspace repo: %w", err)
+	}
+	cloneURL := ""
+	if repo != nil {
+		mr, lookupErr := m.db.GetMergeRequestByRepoIDAndNumber(
+			ctx, repo.ID, ws.ItemNumber,
+		)
+		if lookupErr != nil {
+			return fmt.Errorf("look up workspace merge request: %w", lookupErr)
+		}
+		if mr != nil {
+			cloneURL = mr.HeadRepoCloneURL
+		}
+	}
+	ws.MRHeadRepo = workspaceHeadRepo(
+		ws.Platform, ws.PlatformHost, ws.RepoOwner, ws.RepoName, cloneURL,
+	)
 	return nil
 }
 
@@ -1453,6 +1508,14 @@ func (m *Manager) addWorktreeLocked(
 		"-b", fallbackBranch, startRef,
 	)
 	if fallbackErr == nil {
+		if upErr := configureFallbackBranchUpstream(
+			ctx, cloneDir, ws, fallbackBranch,
+		); upErr != nil {
+			cleanupWorktreeAddOnUpstreamFailure(
+				ctx, cloneDir, ws.WorktreePath, fallbackBranch,
+			)
+			return "", fmt.Errorf("configure branch upstream: %w", upErr)
+		}
 		return fallbackBranch, nil
 	}
 	return "", fmt.Errorf(
@@ -1531,15 +1594,8 @@ func (m *Manager) addPreferredWorktree(
 			ctx, ws.WorktreePath, ws.GitHeadRef,
 			"origin", "refs/heads/"+ws.GitHeadRef,
 		); err != nil {
-			cleanupCtx, cancel := cleanupContext(ctx)
-			defer cancel()
-			_ = runGitWithoutHooks(
-				cleanupCtx, cloneDir,
-				"worktree", "remove", "--force", ws.WorktreePath,
-			)
-			_ = runGitWithoutHooks(
-				cleanupCtx, cloneDir,
-				"branch", "-D", "--", ws.GitHeadRef,
+			cleanupWorktreeAddOnUpstreamFailure(
+				ctx, cloneDir, ws.WorktreePath, ws.GitHeadRef,
 			)
 			return "", fmt.Errorf("configure branch upstream: %w", err)
 		}
@@ -1575,11 +1631,10 @@ func (m *Manager) addPreferredWorktree(
 			ctx, ws.WorktreePath, ws.GitHeadRef,
 			"origin", "refs/heads/"+ws.GitHeadRef,
 		); err != nil {
-			cleanupCtx, cancel := cleanupContext(ctx)
-			defer cancel()
-			_ = runGitWithoutHooks(
-				cleanupCtx, cloneDir,
-				"worktree", "remove", "--force", ws.WorktreePath,
+			// Empty branch: the branch pre-existed this workspace and
+			// stays in place; only the worktree is rolled back.
+			cleanupWorktreeAddOnUpstreamFailure(
+				ctx, cloneDir, ws.WorktreePath, "",
 			)
 			return "", fmt.Errorf("configure branch upstream: %w", err)
 		}
@@ -1625,6 +1680,67 @@ func syntheticPRWorktreeBranch(mrNumber int) string {
 	return fmt.Sprintf("middleman/pr-%d", mrNumber)
 }
 
+// cleanupWorktreeAddOnUpstreamFailure rolls back a just-added worktree (and,
+// when middleman created it, its branch) after configuring the branch
+// upstream failed. Callers must already hold the per-repo lock for cloneDir.
+// An empty branch leaves a pre-existing user-owned branch in place.
+func cleanupWorktreeAddOnUpstreamFailure(
+	ctx context.Context, cloneDir, worktreePath, branch string,
+) {
+	cleanupCtx, cancel := cleanupContext(ctx)
+	defer cancel()
+	_ = runGitWithoutHooks(
+		cleanupCtx, cloneDir,
+		"worktree", "remove", "--force", worktreePath,
+	)
+	if branch == "" {
+		return
+	}
+	_ = runGitWithoutHooks(
+		cleanupCtx, cloneDir,
+		"branch", "-D", "--", branch,
+	)
+}
+
+// configureFallbackBranchUpstream points the synthetic PR fallback branch at
+// the PR's head branch on origin, so divergence counts, push, and pull treat
+// the remote PR branch as the sync target exactly like a preferred-name
+// checkout would. Setup classifies MRHeadRepo from the current merge-request
+// row before reaching this path, so nil is explicit same-repository evidence.
+// The SHA check is an additional checkout-consistency check, not repository
+// identity evidence: forks preserve commit IDs. Fork and unknown heads take
+// the merge-request-ref path and remain without an origin upstream.
+func configureFallbackBranchUpstream(
+	ctx context.Context,
+	cloneDir string,
+	ws *Workspace,
+	fallbackBranch string,
+) error {
+	if ws.MRHeadRepo != nil {
+		return nil
+	}
+	trackingSHA, ok, err := gitRefSHA(
+		ctx, cloneDir, "refs/remotes/origin/"+ws.GitHeadRef,
+	)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil
+	}
+	headSHA, err := gitHeadSHA(ctx, ws.WorktreePath)
+	if err != nil {
+		return err
+	}
+	if trackingSHA != headSHA {
+		return nil
+	}
+	return setBranchUpstream(
+		ctx, ws.WorktreePath, fallbackBranch,
+		"origin", "refs/heads/"+ws.GitHeadRef,
+	)
+}
+
 func setBranchUpstream(
 	ctx context.Context,
 	worktreePath, branch, remote, mergeRef string,
@@ -1639,6 +1755,21 @@ func setBranchUpstream(
 		ctx, worktreePath,
 		"config", "branch."+branch+".merge", mergeRef,
 	)
+}
+
+func clearBranchUpstream(ctx context.Context, worktreePath, branch string) error {
+	for _, suffix := range []string{"remote", "merge"} {
+		key := "branch." + branch + "." + suffix
+		if _, err := gitConfigValue(ctx, worktreePath, key); err != nil {
+			continue
+		}
+		if err := runGitWithoutHooks(
+			ctx, worktreePath, "config", "--unset-all", key,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func validateLocalBranchName(

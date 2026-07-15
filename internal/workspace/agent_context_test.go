@@ -59,6 +59,22 @@ func TestBuildAgentContext(t *testing.T) {
 			},
 		},
 		{
+			name: "pull request with unknown head repo has no push target",
+			ws: WorkspaceSummary{
+				Workspace: db.Workspace{
+					ID: "ws-unknown-pr", Platform: "github", PlatformHost: "github.com",
+					RepoOwner: "acme", RepoName: "widget", ItemType: db.WorkspaceItemTypePullRequest,
+					ItemNumber: 44, GitHeadRef: "feature/unknown",
+					MRHeadRepo: ptr(""),
+				},
+			},
+			want: []string{
+				"Source kind: pull request",
+				"PR: #44",
+				"PR head: feature/unknown; repository identity unavailable; no push upstream configured",
+			},
+		},
+		{
 			name: "provider issue",
 			ws: WorkspaceSummary{
 				Workspace: db.Workspace{
@@ -327,6 +343,41 @@ func TestPrepareAgentLaunchContextUsesSyncedHeadBranchForPushTarget(t *testing.T
 	require.NoError(err)
 	assert.Contains(string(content), "Push branch: feature/widgets-renamed on origin (updates this PR)")
 	assert.NotContains(string(content), "Working branch")
+}
+
+func TestPrepareAgentLaunchContextRefreshesLegacyUnknownHeadRepo(t *testing.T) {
+	t.Parallel()
+	assert := assert.New(t)
+	require := require.New(t)
+	d := openTestDB(t)
+
+	repoID := seedRepo(t, d, "github.com", "acme", "widget")
+	seedMRWithHeadRepo(t, d, repoID, 42, "feature/widgets", "")
+	mgr := NewManager(d, t.TempDir())
+	ws, err := mgr.Create(t.Context(), "github", "github.com", "acme", "widget", 42)
+	require.NoError(err)
+	worktree := ws.WorktreePath
+	initWorkspaceGitRepoAt(t, worktree)
+	require.NoError(d.UpdateWorkspaceBranch(t.Context(), ws.ID, "feature/widgets"))
+	require.NoError(d.UpdateWorkspaceStatus(t.Context(), ws.ID, "ready", nil))
+	_, err = d.WriteDB().ExecContext(
+		t.Context(),
+		`UPDATE middleman_workspaces SET mr_head_repo = NULL WHERE id = ?`,
+		ws.ID,
+	)
+	require.NoError(err)
+
+	require.NoError(mgr.PrepareAgentLaunchContext(t.Context(), PrepareAgentLaunchContextOptions{
+		WorkspaceID: ws.ID,
+		TargetKey:   "codex",
+	}))
+
+	content, err := os.ReadFile(filepath.Join(worktree, "AGENTS.local.md"))
+	require.NoError(err)
+	assert.Contains(
+		string(content),
+		"PR head: feature/widgets; repository identity unavailable; no push upstream configured",
+	)
 }
 
 func TestPrepareAgentLaunchContextPreservesUserFileAndRefreshesMarkedFile(t *testing.T) {

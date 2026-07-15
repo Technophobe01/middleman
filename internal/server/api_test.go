@@ -1216,25 +1216,26 @@ func seedPR(t *testing.T, database *db.DB, owner, name string, number int, opts 
 	numberText := strconv.Itoa(number)
 	now := time.Now().UTC().Truncate(time.Second)
 	pr := &db.MergeRequest{
-		RepoID:         repoID,
-		PlatformID:     int64(number) * 1000,
-		Number:         number,
-		URL:            "https://github.com/" + owner + "/" + name + "/pull/" + numberText,
-		Title:          "Test PR #" + numberText,
-		Author:         "testuser",
-		State:          "open",
-		IsDraft:        false,
-		Body:           "test body",
-		HeadBranch:     "feature",
-		BaseBranch:     "main",
-		Additions:      5,
-		Deletions:      2,
-		CommentCount:   0,
-		ReviewDecision: "",
-		CIStatus:       "",
-		CreatedAt:      now,
-		UpdatedAt:      now,
-		LastActivityAt: now,
+		RepoID:           repoID,
+		PlatformID:       int64(number) * 1000,
+		Number:           number,
+		URL:              "https://github.com/" + owner + "/" + name + "/pull/" + numberText,
+		Title:            "Test PR #" + numberText,
+		Author:           "testuser",
+		State:            "open",
+		IsDraft:          false,
+		Body:             "test body",
+		HeadBranch:       "feature",
+		HeadRepoCloneURL: "https://github.com/" + owner + "/" + name + ".git",
+		BaseBranch:       "main",
+		Additions:        5,
+		Deletions:        2,
+		CommentCount:     0,
+		ReviewDecision:   "",
+		CIStatus:         "",
+		CreatedAt:        now,
+		UpdatedAt:        now,
+		LastActivityAt:   now,
 	}
 	for _, opt := range opts {
 		opt(pr)
@@ -25616,6 +25617,74 @@ func TestWorkspaceListReportsCommitsAheadBehindE2E(t *testing.T) {
 	assert.Equal(int64(0), *found.CommitsBehind)
 }
 
+// TestWorkspaceListRestoresAheadBehindAfterUpstreamHealE2E covers the repair
+// path for workspaces whose branch lost (or never received) an upstream —
+// the state every synthetic middleman/pr-N fallback branch was created in
+// before upstreams were configured at worktree add. The list must omit the
+// counts while the upstream is missing, and a pushed-head observer pass must
+// rewire the branch to the PR head branch so the counts come back without
+// recreating the workspace.
+func TestWorkspaceListRestoresAheadBehindAfterUpstreamHealE2E(t *testing.T) {
+	t.Parallel()
+
+	require := require.New(t)
+	assert := assert.New(t)
+
+	client, database, _, _, srv := setupTestServerWithWorkspacesServer(t, nil)
+	ctx := context.Background()
+	ws := createReadyWorkspace(t, ctx, client)
+
+	// The observer only rewires an upstream when the merge-request row
+	// positively places the head branch in the base repository.
+	seedPR(t, database, "acme", "widget", 1,
+		withSeedPRHeadRepoCloneURL("https://github.com/acme/widget.git"))
+
+	runGit(t, ws.WorktreePath, "config", "user.email", "test@test.com")
+	runGit(t, ws.WorktreePath, "config", "user.name", "Test")
+	require.NoError(os.WriteFile(
+		filepath.Join(ws.WorktreePath, "ahead-1.txt"),
+		[]byte("a1\n"), 0o644,
+	))
+	runGit(t, ws.WorktreePath, "add", ".")
+	runGit(t, ws.WorktreePath, "commit", "-m", "ahead 1")
+
+	// Strip the branch's upstream configuration to reproduce a workspace
+	// created by the fallback path.
+	branch := ws.GitHeadRef
+	runGit(t, ws.WorktreePath, "config", "--unset", "branch."+branch+".remote")
+	runGit(t, ws.WorktreePath, "config", "--unset", "branch."+branch+".merge")
+
+	findWorkspace := func() *generated.WorkspaceResponse {
+		listResp, err := client.HTTP.ListWorkspacesWithResponse(ctx)
+		require.NoError(err)
+		require.Equal(http.StatusOK, listResp.StatusCode())
+		require.NotNil(listResp.JSON200)
+		require.NotNil(listResp.JSON200.Workspaces)
+		for i := range *listResp.JSON200.Workspaces {
+			entry := &(*listResp.JSON200.Workspaces)[i]
+			if entry.Id == ws.Id {
+				return entry
+			}
+		}
+		require.Fail("workspace missing from list", ws.Id)
+		return nil
+	}
+
+	broken := findWorkspace()
+	require.Nil(broken.CommitsAhead,
+		"counts must be omitted while the branch has no upstream")
+	require.Nil(broken.CommitsBehind)
+
+	srv.runWorkspacePushedHeadObserverPass(ctx)
+
+	healed := findWorkspace()
+	require.NotNil(healed.CommitsAhead,
+		"observer pass must restore the branch upstream")
+	require.NotNil(healed.CommitsBehind)
+	assert.Equal(int64(1), *healed.CommitsAhead)
+	assert.Equal(int64(0), *healed.CommitsBehind)
+}
+
 func TestWorkspaceDiffEndpointsReportHeadAndPushedE2E(t *testing.T) {
 	t.Parallel()
 
@@ -29781,6 +29850,61 @@ func TestWorkspaceCreateSameRepoHeadCloneURLTracksOriginBranchE2E(t *testing.T) 
 			t, ws.WorktreePath,
 			"config", "--get", "branch.feature.merge",
 		),
+	)
+}
+
+func TestWorkspaceRetryLegacyUnknownHeadRepoLeavesBranchUntrackedE2E(t *testing.T) {
+	t.Parallel()
+
+	assert := assert.New(t)
+	require := require.New(t)
+	fixture := setupWorkspaceServerFixture(t, nil)
+	ctx := t.Context()
+
+	headSHA := testGitSHA(t, fixture.remote, "refs/heads/feature")
+	runGit(t, fixture.remote, "update-ref", "refs/pull/2/head", headSHA)
+	seedPR(
+		t, fixture.database, "acme", "widget", 2,
+		withSeedPRHeadRepoCloneURL(""),
+	)
+	errMessage := "retry legacy workspace"
+	const workspaceID = "legacy-unknown-head-repo"
+	require.NoError(fixture.database.InsertWorkspace(ctx, &db.Workspace{
+		ID:              workspaceID,
+		Platform:        "github",
+		PlatformHost:    "github.com",
+		RepoOwner:       "acme",
+		RepoName:        "widget",
+		ItemType:        db.WorkspaceItemTypePullRequest,
+		ItemNumber:      2,
+		GitHeadRef:      "feature",
+		MRHeadRepo:      nil,
+		WorkspaceBranch: "__middleman_unknown__",
+		WorktreePath:    filepath.Join(fixture.worktrees, workspaceID),
+		TmuxSession:     "middleman-" + workspaceID,
+		Status:          "error",
+		ErrorMessage:    &errMessage,
+	}))
+
+	retryResp, err := fixture.client.HTTP.RetryWorkspaceWithResponse(ctx, workspaceID)
+	require.NoError(err)
+	require.Equal(http.StatusAccepted, retryResp.StatusCode())
+
+	ready := waitForWorkspaceReady(t, ctx, fixture.client, workspaceID)
+	assert.Equal(headSHA, testGitSHA(t, ready.WorktreePath, "HEAD"))
+	branch := gitOutput(t, ready.WorktreePath, "branch", "--show-current")
+	remoteOut, remoteErrOut, upstreamErr := gitcmd.New().Run(
+		ctx, ready.WorktreePath, nil,
+		"config", "--get", "branch."+branch+".remote",
+	)
+	mergeOut, _, _ := gitcmd.New().Run(
+		ctx, ready.WorktreePath, nil,
+		"config", "--get", "branch."+branch+".merge",
+	)
+	assert.Error(
+		upstreamErr,
+		"legacy unknown workspace must remain untracked after retry; branch=%q remote=%q merge=%q stderr=%q",
+		branch, strings.TrimSpace(string(remoteOut)), strings.TrimSpace(string(mergeOut)), strings.TrimSpace(string(remoteErrOut)),
 	)
 }
 

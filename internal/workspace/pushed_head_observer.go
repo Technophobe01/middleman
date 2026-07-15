@@ -68,6 +68,7 @@ type remoteHeadGitReader interface {
 	BranchName(ctx context.Context, dir string) (string, error)
 	UpstreamState(ctx context.Context, dir, branch string) (upstreamState, error)
 	RemoteTrackingSHA(ctx context.Context, dir, remote, branch string) (string, string, bool, error)
+	SetBranchUpstream(ctx context.Context, dir, branch, remote, mergeRef string) error
 }
 
 const (
@@ -87,6 +88,12 @@ func (gitRemoteHeadReader) UpstreamState(ctx context.Context, dir, branch string
 	gitCtx, cancel := context.WithTimeout(ctx, pushedHeadGitTimeout)
 	defer cancel()
 	return gitUpstreamState(gitCtx, dir, branch)
+}
+
+func (gitRemoteHeadReader) SetBranchUpstream(ctx context.Context, dir, branch, remote, mergeRef string) error {
+	gitCtx, cancel := context.WithTimeout(ctx, pushedHeadGitTimeout)
+	defer cancel()
+	return setBranchUpstream(gitCtx, dir, branch, remote, mergeRef)
 }
 
 func (gitRemoteHeadReader) RemoteTrackingSHA(ctx context.Context, dir, remote, branch string) (string, string, bool, error) {
@@ -209,7 +216,9 @@ func pushedHeadWorkspaceEligible(ws *Workspace) bool {
 	if strings.TrimSpace(ws.PlatformHost) == "" || strings.TrimSpace(ws.RepoOwner) == "" || strings.TrimSpace(ws.RepoName) == "" {
 		return false
 	}
-	return ws.ItemType == db.WorkspaceItemTypePullRequest || ws.ItemType == db.WorkspaceItemTypeIssue
+	return ws.ItemType == db.WorkspaceItemTypePullRequest ||
+		ws.ItemType == db.WorkspaceItemTypeIssue ||
+		ws.ItemType == db.WorkspaceItemTypeKataTask
 }
 
 func (o *PushedHeadObserver) resolveWorkspacePR(ctx context.Context, ws *Workspace) (*WorkspacePRAssociation, *db.Repo, *db.MergeRequest, bool, error) {
@@ -231,9 +240,11 @@ func (o *PushedHeadObserver) resolveWorkspacePR(ctx context.Context, ws *Workspa
 	switch ws.ItemType {
 	case db.WorkspaceItemTypePullRequest:
 		prNumber = ws.ItemNumber
-	case db.WorkspaceItemTypeIssue:
+	case db.WorkspaceItemTypeIssue, db.WorkspaceItemTypeKataTask:
 		if ws.AssociatedPRNumber != nil {
 			prNumber = *ws.AssociatedPRNumber
+		} else if ws.ItemType == db.WorkspaceItemTypeKataTask {
+			return nil, repo, nil, false, nil
 		} else {
 			detected, ok, err := o.monitor.detectAssociatedPR(ctx, ws)
 			if err != nil {
@@ -300,20 +311,28 @@ func (o *PushedHeadObserver) observeWorkspacePR(ctx context.Context, ws *Workspa
 		return PushedHeadUpdate{}, false, err
 	}
 	if !upstream.hasTracking || upstream.remoteName == "" || upstream.branchName == "" {
-		slog.Debug("workspace pushed-head observer missing upstream", "workspace_id", ws.ID, "branch", branch)
-		return PushedHeadUpdate{}, false, nil
+		healed, healErr := o.configureMissingUpstream(ctx, ws, mr, branch, trackingCache)
+		if healErr != nil {
+			return PushedHeadUpdate{}, false, healErr
+		}
+		if !healed {
+			slog.Debug("workspace pushed-head observer missing upstream", "workspace_id", ws.ID, "branch", branch)
+			return PushedHeadUpdate{}, false, nil
+		}
+		upstream = upstreamState{
+			hasTracking: true,
+			remoteName:  "origin",
+			branchName:  mr.HeadBranch,
+		}
 	}
 	if upstream.branchName != mr.HeadBranch {
 		return PushedHeadUpdate{}, false, nil
 	}
 
-	cacheKey := ws.WorktreePath + "\x00" + upstream.remoteName + "\x00" + upstream.branchName
-	lookup, cached := trackingCache[cacheKey]
-	if !cached {
-		sha, ref, ok, err := o.git.RemoteTrackingSHA(ctx, ws.WorktreePath, upstream.remoteName, upstream.branchName)
-		lookup = trackingLookup{sha: strings.TrimSpace(sha), ref: ref, ok: ok, err: err}
-		trackingCache[cacheKey] = lookup
-	}
+	lookup := o.lookupRemoteTrackingSHA(
+		ctx, ws.WorktreePath, upstream.remoteName, upstream.branchName,
+		trackingCache,
+	)
 	if lookup.err != nil {
 		return PushedHeadUpdate{}, false, lookup.err
 	}
@@ -381,6 +400,75 @@ func (o *PushedHeadObserver) observeWorkspacePR(ctx context.Context, ws *Workspa
 	prior.ObservedAt = observedAt
 	o.observed[key] = prior
 	return update, true, nil
+}
+
+// lookupRemoteTrackingSHA resolves a remote-tracking ref through the pass's
+// per-worktree cache so the heal probe and the observation share one git call.
+func (o *PushedHeadObserver) lookupRemoteTrackingSHA(
+	ctx context.Context, dir, remote, branch string,
+	trackingCache map[string]trackingLookup,
+) trackingLookup {
+	cacheKey := dir + "\x00" + remote + "\x00" + branch
+	lookup, cached := trackingCache[cacheKey]
+	if !cached {
+		sha, ref, ok, err := o.git.RemoteTrackingSHA(ctx, dir, remote, branch)
+		lookup = trackingLookup{sha: strings.TrimSpace(sha), ref: ref, ok: ok, err: err}
+		trackingCache[cacheKey] = lookup
+	}
+	return lookup
+}
+
+// configureMissingUpstream restores tracking configuration for a workspace
+// branch that should follow the open PR's head branch but has no upstream —
+// the state every synthetic fallback branch was created in before upstreams
+// were configured at worktree add. Without an upstream, every derived surface
+// (sidebar ahead/behind counts, push, pull, unpushed-commit flags) silently
+// reports nothing.
+//
+// The rewiring demands positive evidence before touching config. A nil
+// workspace MRHeadRepo is not proof of a same-repo head: it is also nil when
+// head-repo metadata was unavailable at creation, and issue workspaces never
+// set it even when their associated PR is fork-backed. The merge-request row
+// must place the head branch in the base repository, the checked-out branch
+// must be the PR head branch or middleman's synthetic PR branch (an unrelated
+// user branch must not be rewired), and the remote-tracking ref must already
+// exist — mirroring worktree creation — so the branch never ends up tracking
+// a ref that resolves to nothing.
+func (o *PushedHeadObserver) configureMissingUpstream(
+	ctx context.Context, ws *Workspace, mr db.MergeRequest, branch string,
+	trackingCache map[string]trackingLookup,
+) (bool, error) {
+	head := strings.TrimSpace(mr.HeadBranch)
+	if head == "" {
+		return false, nil
+	}
+	if strings.TrimSpace(mr.HeadRepoCloneURL) == "" || workspaceHeadRepo(
+		ws.Platform, ws.PlatformHost, ws.RepoOwner, ws.RepoName, mr.HeadRepoCloneURL,
+	) != nil {
+		return false, nil
+	}
+	synthetic := ws.ItemType == db.WorkspaceItemTypePullRequest &&
+		branch == syntheticPRWorktreeBranch(ws.ItemNumber)
+	if branch != head && !synthetic {
+		return false, nil
+	}
+	lookup := o.lookupRemoteTrackingSHA(
+		ctx, ws.WorktreePath, "origin", head, trackingCache,
+	)
+	if lookup.err != nil {
+		return false, lookup.err
+	}
+	if !lookup.ok || lookup.sha == "" {
+		return false, nil
+	}
+	if err := o.git.SetBranchUpstream(
+		ctx, ws.WorktreePath, branch, "origin", "refs/heads/"+head,
+	); err != nil {
+		return false, fmt.Errorf("configure branch upstream: %w", err)
+	}
+	slog.Info("configured missing workspace branch upstream",
+		"workspace_id", ws.ID, "branch", branch, "head_branch", head)
+	return true, nil
 }
 
 func (o *PushedHeadObserver) recordFailure(workspaceID string, err error) {
