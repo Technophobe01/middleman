@@ -1,6 +1,7 @@
 <script lang="ts">
   import Check from "@lucide/svelte/icons/check";
   import ChevronDown from "@lucide/svelte/icons/chevron-down";
+  import Download from "@lucide/svelte/icons/download";
   import FileText from "@lucide/svelte/icons/file-text";
   import FolderIcon from "@lucide/svelte/icons/folder";
   import MoreHorizontal from "@lucide/svelte/icons/more-horizontal";
@@ -117,7 +118,8 @@
   let folderIsRepo: Record<string, boolean> = $state({});
 
   let publishOpen = $state(false);
-  let publishSuccess: string | null = $state(null);
+  let gitNotice: { kind: "success" | "error"; text: string } | null = $state(null);
+  let pulling = $state(false);
 
   let lastFolderLoaded: string | null = null;
   let lastDocLoaded: string | null = null;
@@ -469,8 +471,13 @@
     // loading, and edits A's body into B's path.
     if (!editReady || docContent === null) return;
     if (!route.folder || !route.doc) return;
+    // A pull may rewrite this doc on disk; an editor opened mid-pull would
+    // capture the pre-pull body and a later save would overwrite the pulled
+    // content with it. The Edit button is disabled while pulling; re-check
+    // after the lazy import too, since a pull can start during that await.
+    if (pulling) return;
     await loadEditor();
-    if (!DocMarkdownEditor) return;
+    if (!DocMarkdownEditor || pulling) return;
     editorDraft = docContent;
     editorDirty = false;
     saveError = null;
@@ -939,9 +946,47 @@
   });
 
   async function onPublishedSuccess(result: GitPublishResponse) {
-    publishSuccess =
-      `Committed and pushed ${result.files.length} ${result.files.length === 1 ? "file" : "files"} as ${result.short_commit}.`;
+    gitNotice = {
+      kind: "success",
+      text: `Committed and pushed ${result.files.length} ${result.files.length === 1 ? "file" : "files"} as ${result.short_commit}.`,
+    };
     if (route.folder) await loadGitStatus(route.folder);
+  }
+
+  async function pullFromGit() {
+    const folderID = route.folder;
+    if (!folderID || pulling) return;
+    pulling = true;
+    // The user may switch folders while the pull or any refresh below is
+    // awaited. An old-folder refresh issued after the switch would take a
+    // newer request token and supersede the new folder's loads, so
+    // re-check the route after every await and abandon the rest — the
+    // next visit to this folder loads fresh state anyway.
+    const stillCurrent = () => route.folder === folderID;
+    try {
+      const result = await api.gitPull(folderID);
+      if (!stillCurrent()) return;
+      await loadTree(folderID);
+      if (!stillCurrent()) return;
+      await loadGitStatus(folderID);
+      if (!stillCurrent()) return;
+      // The pulled commit may have rewritten the open document on disk.
+      // `!editing` is a backstop: Edit and Pull disable each other, so a
+      // draft can't normally exist here — but reloading over one would
+      // silently discard it, so never take that risk.
+      if (route.doc && !editing) await loadDoc(folderID, route.doc);
+      if (!stillCurrent()) return;
+      gitNotice = {
+        kind: "success",
+        text: result.up_to_date ? "Already up to date." : `Pulled to ${result.short_commit}.`,
+      };
+    } catch (err) {
+      if (route.folder === folderID) {
+        gitNotice = { kind: "error", text: err instanceof Error ? err.message : "Pull failed" };
+      }
+    } finally {
+      pulling = false;
+    }
   }
 </script>
 
@@ -993,6 +1038,19 @@
             <Plus size={14} strokeWidth={2} />
           </button>
           {#if activeFolderIsRepo}
+            <!-- Disabled while the editor is open: a pull that rewrites the
+                 open document would recreate the editor and silently discard
+                 an unsaved draft. -->
+            <button
+              type="button"
+              class="list-action"
+              aria-label="Pull from git"
+              title="Pull from git"
+              onclick={pullFromGit}
+              disabled={pulling || editing}
+            >
+              <Download size={14} strokeWidth={1.75} />
+            </button>
             <button
               type="button"
               class="list-action"
@@ -1168,7 +1226,7 @@
                 type="button"
                 class="toolbar-btn"
                 onclick={() => void beginEdit()}
-                disabled={!editReady || editorLoading}
+                disabled={!editReady || editorLoading || pulling}
               >{editorLoading ? "Loading…" : "Edit"}</button>
               <button
                 type="button"
@@ -1391,8 +1449,14 @@
   />
 {/if}
 
-{#if publishSuccess}
-  <p class="publish-success kit-popover-card" role="status">{publishSuccess}</p>
+{#if gitNotice}
+  <p
+    class="publish-success kit-popover-card"
+    class:notice-error={gitNotice.kind === "error"}
+    role="status"
+  >
+    {gitNotice.text}
+  </p>
 {/if}
 
 <Modal
@@ -1982,6 +2046,10 @@
     padding: 8px 14px;
     color: var(--text-primary);
     font-size: var(--font-size-sm);
+  }
+
+  .publish-success.notice-error {
+    color: var(--accent-red);
   }
 
   .doc-scroll {
