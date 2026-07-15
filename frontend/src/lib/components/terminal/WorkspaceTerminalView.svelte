@@ -31,6 +31,11 @@
     type WorkspaceRuntimeState,
   } from "../../api/workspace-runtime.js";
   import {
+    beginWorkspaceSwitch,
+    cancelWorkspaceSwitch,
+    recordWorkspaceSwitchPhase,
+  } from "../../instrumentation/workspaceSwitchTiming.js";
+  import {
     activateWorkflowTab,
     addTerminalGroup,
     appendWorkflowTabToLeaf,
@@ -1005,6 +1010,7 @@
     // back to the previous workspace).
     const id = workspaceId;
     const hostKey = workspaceHostKey;
+    recordWorkspaceSwitchPhase("workspace-request-start", id, hostKey);
     try {
       if (hostKey) {
         const { data, error, response } = await client.GET(
@@ -1013,6 +1019,9 @@
             params: { path: { host_key: hostKey, id } },
           },
         );
+        recordWorkspaceSwitchPhase("workspace-request-end", id, hostKey, {
+          status: response.status,
+        });
         if (!isCurrentWorkspace(id, hostKey)) return;
         if (!data) {
           loadError = apiErrorMessage(
@@ -1043,6 +1052,9 @@
           params: { path: { id } },
         },
       );
+      recordWorkspaceSwitchPhase("workspace-request-end", id, hostKey, {
+        status: response.status,
+      });
       if (!isCurrentWorkspace(id, hostKey)) return;
       if (!data) {
         loadError = apiErrorMessage(
@@ -1065,6 +1077,9 @@
         stopRuntimePolling();
       }
     } catch (err) {
+      recordWorkspaceSwitchPhase("workspace-request-end", id, hostKey, {
+        error: true,
+      });
       if (!isCurrentWorkspace(id, hostKey)) return;
       loadError =
         err instanceof Error
@@ -1094,8 +1109,12 @@
     const seq = runtimeFetchSeq + 1;
     runtimeFetchSeq = seq;
     const fetchPromise = (async () => {
+      recordWorkspaceSwitchPhase("runtime-request-start", id, hostKey);
       try {
         const data = await getWorkspaceRuntime(id, hostKey);
+        recordWorkspaceSwitchPhase("runtime-request-end", id, hostKey, {
+          sessions: data.sessions.length,
+        });
         if (!isCurrentWorkspace(id, hostKey) || seq !== runtimeFetchSeq) return null;
         runtime = data;
         runtimeForId = id;
@@ -1118,6 +1137,9 @@
         );
         return data;
       } catch (err) {
+        recordWorkspaceSwitchPhase("runtime-request-end", id, hostKey, {
+          error: true,
+        });
         if (!isCurrentWorkspace(id, hostKey) || seq !== runtimeFetchSeq) return null;
         runtimeError =
           err instanceof Error
@@ -2330,6 +2352,17 @@
   // it in place.
   $effect(() => {
     const id = workspaceId;
+    // Route selection is the zero point for workspace-switch timing:
+    // every workspace-switch:* measure is a duration from this call.
+    // The token lets the cleanup below cancel exactly this switch when
+    // the user leaves the workspace surface entirely, without being
+    // able to cancel a newer switch begun elsewhere.
+    let switchToken: string | null = null;
+    if (id) {
+      switchToken = beginWorkspaceSwitch(id, workspaceHostKey);
+    } else {
+      cancelWorkspaceSwitch();
+    }
     const storageId = id ? workspaceStorageId(id, workspaceHostKey) : "";
     const restoredLayout = id ? loadTerminalLayout(storageId) : defaultTerminalLayout();
     const restoredTab = restoreWorkspaceTab(storageId);
@@ -2446,6 +2479,16 @@
       source.close();
       if (eventSource === source) {
         eventSource = null;
+      }
+      // Leaving the workspace surface (view unmount) must end the
+      // switch so late responses and pane callbacks cannot append
+      // phases. On a switch to another workspace this cleanup runs
+      // just before the next effect run, cancelling the old switch the
+      // new beginWorkspaceSwitch was about to supersede anyway; the
+      // token guard only prevents cancelling a switch this run does
+      // not own.
+      if (switchToken !== null) {
+        cancelWorkspaceSwitch(switchToken);
       }
     };
   });

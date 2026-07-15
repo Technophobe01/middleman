@@ -26,12 +26,14 @@ import (
 
 	gh "github.com/google/go-github/v88/github"
 	gitcmd "go.kenn.io/kit/git/cmd"
+	oteltelemetry "go.kenn.io/kit/telemetry"
 	"go.kenn.io/middleman/internal/config"
 	"go.kenn.io/middleman/internal/db"
 	"go.kenn.io/middleman/internal/gitclone"
 	ghclient "go.kenn.io/middleman/internal/github"
 	"go.kenn.io/middleman/internal/platform"
 	"go.kenn.io/middleman/internal/procutil"
+	"go.kenn.io/middleman/internal/profiler"
 	"go.kenn.io/middleman/internal/server"
 	"go.kenn.io/middleman/internal/stacks"
 	"go.kenn.io/middleman/internal/testutil"
@@ -106,6 +108,7 @@ type e2eServerInfo struct {
 	BaseURL    string `json:"base_url"`
 	PID        int    `json:"pid"`
 	ConfigPath string `json:"config_path"`
+	PprofAddr  string `json:"pprof_addr,omitempty"`
 }
 
 type staticTokenSource string
@@ -2001,6 +2004,47 @@ func run(
 		PID:        os.Getpid(),
 		ConfigPath: state.cfgPath,
 	}
+
+	// OTel export is opt-in via OTEL_TRACES_EXPORTER; a malformed value
+	// must not take down the e2e suite, so warn and continue instead of
+	// failing startup the way the primary server does.
+	if otelShutdown, err := oteltelemetry.Init(ctx); err != nil {
+		slog.Warn("e2e telemetry init failed", "err", err)
+	} else {
+		defer func() {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := otelShutdown(shutdownCtx); err != nil {
+				slog.Warn("e2e telemetry shutdown failed", "err", err)
+			}
+		}()
+	}
+
+	// The workspace-switch profiling harness sets MIDDLEMAN_PPROF_ADDR
+	// (typically 127.0.0.1:0) so it can capture Go-side pprof data for
+	// the same window as the browser trace. Failure to bind must not
+	// take down the e2e suite for an unrelated env var.
+	if pprofAddr := strings.TrimSpace(os.Getenv("MIDDLEMAN_PPROF_ADDR")); pprofAddr != "" {
+		pprofSrv, pprofErr := profiler.Start(pprofAddr)
+		if pprofErr != nil {
+			slog.Warn("e2e pprof listener not started", "err", pprofErr)
+		} else if pprofSrv != nil {
+			defer func() {
+				shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				if err := pprofSrv.Shutdown(shutdownCtx); err != nil {
+					slog.Warn("e2e pprof listener shutdown failed", "err", err)
+				}
+			}()
+			// Addr() is non-nil whenever Start succeeded, but its
+			// signature allows nil; guard so nilaway can prove it.
+			if addr := pprofSrv.Addr(); addr != nil {
+				info.PprofAddr = addr.String()
+				slog.Info(fmt.Sprintf("e2e pprof listener at http://%s/debug/pprof/", info.PprofAddr))
+			}
+		}
+	}
+
 	if err := writeServerInfoFile(serverInfoFile, info); err != nil {
 		return fmt.Errorf("write server info file: %w", err)
 	}

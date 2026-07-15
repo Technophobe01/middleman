@@ -134,6 +134,34 @@ Notes:
 The `[tmux] command` setting follows the same wrap-it-in-systemd-run
 pattern for similar reasons; the two are independent.
 
+## Switch-Timing Instrumentation
+
+The frontend emits one-shot `workspace-switch:<phase>` User Timing measures per
+workspace switch (route selection through terminal first paint), recorded via
+`frontend/src/lib/instrumentation/workspaceSwitchTiming.ts`. The phase names
+are stable API for before/after performance comparisons — do not rename them,
+and record new phases through that module so superseded-switch and duplicate
+guards keep applying. `make profile-workspace-switch` captures a reproducible
+profile; see `frontend/tests/profiling/README.md`. Each measure's `detail.traceId`
+joins it to the same request's server-side OTel trace, whose export is opt-in
+via `OTEL_TRACES_EXPORTER`.
+
+- Every frontend HTTP path, including hand-written runtime requests, must use
+  the shared traced fetch boundary so `traceparent` and `baggage` are not lost
+  when code bypasses the generated client (`frontend/src/lib/api/runtime.ts::tracedFetch`).
+- Base-path routing must preserve the inner Huma route pattern for outer OTel
+  middleware; otherwise prefixed API spans collapse to the base-path pattern
+  (`internal/server/otel_middleware.go::stripPrefixPreservingPattern`).
+- A workspace-switch trace ends at terminal first paint or after 30 seconds;
+  cancellation and supersession must clear the matching fallback timer
+  (`frontend/src/lib/instrumentation/workspaceSwitchTiming.ts::endSwitchTrace`).
+- Automatic HTTP tracing excludes only exact long-lived stream routes/modes;
+  short endpoints such as telemetry event capture remain traced
+  (`internal/server/otel_middleware.go::otelTraceable`).
+- Fleet proxy and SSH terminal WebSockets need their own bounded attach span,
+  ending after setup and before the long-lived bridge
+  (`internal/server/fleet_proxy.go::startFleetAttachSpan`).
+
 ## Testing Expectations
 
 Prefer full-stack coverage when the bug crosses backend lifecycle and frontend

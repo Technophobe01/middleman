@@ -7,6 +7,8 @@
   import { WebglAddon } from "@xterm/addon-webgl";
   import "@xterm/xterm/css/xterm.css";
   import { workspaceTmuxWebSocketPath } from "../../api/workspace-runtime.js";
+  import { createWorkspaceSwitchPaneTimer } from "../../instrumentation/workspaceSwitchTiming.js";
+  import { traceHeadersForRequest } from "../../instrumentation/traceContext.js";
   import {
     createTerminalPastePayload,
     isMultilinePaste,
@@ -61,8 +63,12 @@
   let appliedFontLigatures = false;
   let disposed = false;
   let exited = false;
+  let sawFirstBytes = false;
   const encoder = new TextEncoder();
   const tmuxMouseDragFilter = createTmuxMouseDragFilter();
+  // Binds this pane to the workspace switch that was live at creation;
+  // panes surviving from a previous workspace record nothing.
+  const switchTimer = createWorkspaceSwitchPaneTimer();
 
   const MAX_RECONNECT_DELAY = 30000;
   const TERMINAL_SMOOTH_SCROLL_DURATION = 0;
@@ -116,7 +122,10 @@
   ): string {
     const sep = url.includes("?") ? "&" : "?";
     const resizeActive = active ? "1" : "0";
-    return `${url}${sep}cols=${cols}&rows=${rows}&resize_active=${resizeActive}`;
+    const { traceparent, baggage } = traceHeadersForRequest();
+    let result = `${url}${sep}cols=${cols}&rows=${rows}&resize_active=${resizeActive}&traceparent=${encodeURIComponent(traceparent)}`;
+    if (baggage !== null) result += `&baggage=${encodeURIComponent(baggage)}`;
+    return result;
   }
 
   function buildWsUrl(
@@ -310,6 +319,7 @@
     ws = socket;
 
     socket.onopen = () => {
+      switchTimer.record("socket-open");
       reconnectDelay = 1000;
       sendResizeActive(active);
       if (active) scheduleTerminalRefresh();
@@ -318,7 +328,28 @@
     socket.onmessage = (ev: MessageEvent) => {
       if (!terminal) return;
       if (ev.data instanceof ArrayBuffer) {
-        terminal.write(new Uint8Array(ev.data));
+        const bytes = new Uint8Array(ev.data);
+        if (!sawFirstBytes) {
+          sawFirstBytes = true;
+          // first-paint must describe the same pane as first-bytes, so
+          // only the pane whose first-bytes actually recorded chains
+          // the paint measurement. The write callback fires once the
+          // payload is parsed; the double animation frame lands after
+          // the frame showing that content has painted.
+          if (switchTimer.record("first-bytes", { byteLength: bytes.byteLength })) {
+            terminal.write(bytes, () => {
+              requestAnimationFrame(() => {
+                requestAnimationFrame(() => {
+                  switchTimer.record("first-paint");
+                });
+              });
+            });
+          } else {
+            terminal.write(bytes);
+          }
+        } else {
+          terminal.write(bytes);
+        }
       } else if (typeof ev.data === "string") {
         try {
           const msg = JSON.parse(ev.data) as {
@@ -506,6 +537,7 @@
       terminal = term;
 
       term.open(containerEl);
+      switchTimer.record("terminal-constructed");
       containerEl.addEventListener("paste", handleTerminalPaste, true);
 
       const fit = new FitAddon();
@@ -570,8 +602,12 @@
     // looks like cursor/prompt overlap in the running shell.
     const fontsReady = document.fonts?.ready;
     if (fontsReady) {
-      void fontsReady.then(start);
+      void fontsReady.then(() => {
+        switchTimer.record("fonts-ready");
+        start();
+      });
     } else {
+      switchTimer.record("fonts-ready", { unsupported: true });
       start();
     }
 
