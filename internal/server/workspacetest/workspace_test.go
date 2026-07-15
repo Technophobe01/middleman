@@ -232,18 +232,26 @@ func TestWorkspaceCommitsOmitsPushStatusWithoutUpstreamE2E(t *testing.T) {
 
 	fixture := setupWorkspaceServerFixture(t, nil)
 	ctx := t.Context()
+	runGit(t, fixture.remote,
+		"update-ref", "refs/pull/1/head", "refs/heads/feature")
+	repo, err := fixture.database.GetRepoByIdentity(
+		ctx, db.GitHubRepoIdentity("github.com", "acme", "widget"),
+	)
+	require.NoError(err)
+	require.NotNil(repo)
+	mr, err := fixture.database.GetMergeRequestByRepoIDAndNumber(ctx, repo.ID, 1)
+	require.NoError(err)
+	require.NotNil(mr)
+	mr.HeadRepoCloneURL = "https://github.com/contributor/widget.git"
+	_, err = fixture.database.UpsertMergeRequest(ctx, mr)
+	require.NoError(err)
 	ws := createReadyWorkspace(t, ctx, fixture.client)
 	require.NotEmpty(ws.WorktreePath)
 	require.NotEmpty(ws.GitHeadRef)
 
-	// Drop the branch's upstream so the worktree mimics a fork PR head: the
-	// commits exist but @{upstream} no longer resolves. Push status is then
+	// Fork PR heads have no origin upstream. Push status is therefore
 	// unknowable, so the endpoint must omit it rather than report every commit
 	// as unpushed (the false "Not pushed to remote" regression roborev flagged).
-	runGit(t, ws.WorktreePath,
-		"config", "--unset", "branch."+ws.GitHeadRef+".remote")
-	runGit(t, ws.WorktreePath,
-		"config", "--unset", "branch."+ws.GitHeadRef+".merge")
 
 	resp, err := fixture.client.HTTP.GetWorkspaceCommitsWithResponse(ctx, ws.Id)
 	require.NoError(err)

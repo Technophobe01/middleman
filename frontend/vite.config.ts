@@ -495,6 +495,28 @@ const config = {
     },
   },
   test: {
+    onUnhandledError(error) {
+      // Vitest's global state manager owns unhandled errors across projects,
+      // so this must live in the root config rather than the browser project.
+      // Ignore only Vite's module-runner socket rejection during teardown;
+      // all application errors still fail.
+      const serializedStacks = "stacks" in error ? error.stacks : undefined;
+      const hasViteClientFrame =
+        error.stack?.includes("@vite/client") ||
+        (Array.isArray(serializedStacks) &&
+          serializedStacks.some(
+            (frame: unknown) =>
+              typeof frame === "object" &&
+              frame !== null &&
+              "file" in frame &&
+              typeof frame.file === "string" &&
+              frame.file.includes("@vite/client"),
+          ));
+      if (error.message === "WebSocket closed without opened." && hasViteClientFrame) {
+        return false;
+      }
+      return undefined;
+    },
     projects: [defineProject(unitTestProject), browserTestProject],
   },
   build: {

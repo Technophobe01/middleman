@@ -88,6 +88,7 @@ func setupWorkspaceServerFixture(
 	if cfg != nil && cfg.BasePath != "" {
 		basePath = cfg.BasePath
 	}
+	seedPROnHost(t, database, "github.com", "acme", "widget", 1)
 	srv := server.New(database, syncer, nil, basePath, cfg, server.ServerOptions{
 		Clones:      clones,
 		WorktreeDir: worktreeDir,
@@ -101,8 +102,6 @@ func setupWorkspaceServerFixture(
 		defer cancel()
 		require.NoError(t, srv.Shutdown(ctx))
 	})
-
-	seedPROnHost(t, database, "github.com", "acme", "widget", 1)
 
 	clientBaseURL := "http://middleman.test"
 	if basePath != "/" {
@@ -187,25 +186,26 @@ func seedPROnHost(
 
 	now := time.Now().UTC().Truncate(time.Second)
 	pr := &db.MergeRequest{
-		RepoID:         repoID,
-		PlatformID:     int64(number) * 1000,
-		Number:         number,
-		URL:            fmt.Sprintf("https://%s/%s/%s/pull/%d", host, owner, name, number),
-		Title:          fmt.Sprintf("Test PR #%d", number),
-		Author:         "testuser",
-		State:          "open",
-		IsDraft:        false,
-		Body:           "test body",
-		HeadBranch:     "feature",
-		BaseBranch:     "main",
-		Additions:      5,
-		Deletions:      2,
-		CommentCount:   0,
-		ReviewDecision: "",
-		CIStatus:       "",
-		CreatedAt:      now,
-		UpdatedAt:      now,
-		LastActivityAt: now,
+		RepoID:           repoID,
+		PlatformID:       int64(number) * 1000,
+		Number:           number,
+		URL:              fmt.Sprintf("https://%s/%s/%s/pull/%d", host, owner, name, number),
+		Title:            fmt.Sprintf("Test PR #%d", number),
+		Author:           "testuser",
+		State:            "open",
+		IsDraft:          false,
+		Body:             "test body",
+		HeadBranch:       "feature",
+		HeadRepoCloneURL: fmt.Sprintf("https://%s/%s/%s.git", host, owner, name),
+		BaseBranch:       "main",
+		Additions:        5,
+		Deletions:        2,
+		CommentCount:     0,
+		ReviewDecision:   "",
+		CIStatus:         "",
+		CreatedAt:        now,
+		UpdatedAt:        now,
+		LastActivityAt:   now,
 	}
 
 	prID, err := database.UpsertMergeRequest(ctx, pr)
