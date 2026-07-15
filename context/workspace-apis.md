@@ -50,6 +50,18 @@ state.
 - `GET /workspaces`: list middleman's persisted workspaces for the workspaces
   page and terminal picker.
 - `GET /workspaces/{id}`: load one persisted workspace for terminal view.
+- List/detail reads return persisted plus last-known-good enrichment without
+  foreground git or tmux probes; stale components reconcile through bounded
+  background workers (`internal/server/workspace_enrichment.go::toCachedWorkspaceResponse`).
+- `enrichment_status` is aggregate across reads and refresh/push/pull responses:
+  failed reconciliation retains last-known-good components while preserving
+  failure status/error
+  (`internal/server/workspace_enrichment.go::refreshWorkspaceResponse`).
+- Overlapping tmux probes wait for the active sample within the caller budget;
+  fallback carries an error only when waiting or sample production fails
+  (`internal/server/huma_routes.go::probeOneTmuxSession`).
+- Background completion emits `workspace_status` so clients refetch promptly
+  (`internal/server/workspace_enrichment.go::runWorkspaceEnrichmentJob`).
 - `DELETE /workspaces/{id}`: tear down a middleman-managed workspace and its
   local resources.
 

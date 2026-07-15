@@ -7344,6 +7344,15 @@ export interface components {
             /** Format: int64 */
             commits_behind?: number;
             created_at: string;
+            /** @description Combined error from the most recent reconciliation attempt; populated component fields may still contain last-known-good values. */
+            enrichment_error?: string;
+            /** @description Oldest successful refresh time across the populated enrichment components. */
+            enrichment_refreshed_at?: string;
+            /**
+             * @description Aggregate git-divergence and tmux-activity reconciliation status. Failed responses retain last-known-good component fields when available.
+             * @enum {string}
+             */
+            enrichment_status: "not_applicable" | "pending" | "fresh" | "stale" | "failed";
             error_message?: string;
             git_head_ref: string;
             id: string;
@@ -17156,3 +17165,4 @@ export const mergeRequestResponseStateValues: ReadonlyArray<FlattenedDeepRequire
 export const problemErrorCodeValues: ReadonlyArray<FlattenedDeepRequired<components>["schemas"]["ProblemError"]["code"]> = ["badRequest", "branchConflict", "branchInUse", "branchProtected", "commentNotFound", "conflict", "destinationExists", "forbidden", "hookFailed", "internalError", "issueNotFound", "notFound", "payloadTooLarge", "projectNotFound", "pullNotFound", "rateLimited", "repoNotFound", "serviceUnavailable", "settingsUnavailable", "toolMissing", "toolUnauthenticated", "unauthorized", "unsupportedCapability", "upstreamError", "validationError", "workspaceNotFound", "worktreeDirty"];
 export const terminalRendererValues: ReadonlyArray<FlattenedDeepRequired<components>["schemas"]["Terminal"]["renderer"]> = ["xterm", "ghostty-web"];
 export const workflowStateMetaResponseStatusValues: ReadonlyArray<FlattenedDeepRequired<components>["schemas"]["WorkflowStateMetaResponse"]["status"]> = ["new", "reviewing", "waiting", "awaiting_merge"];
+export const workspaceResponseEnrichment_statusValues: ReadonlyArray<FlattenedDeepRequired<components>["schemas"]["WorkspaceResponse"]["enrichment_status"]> = ["not_applicable", "pending", "fresh", "stale", "failed"];

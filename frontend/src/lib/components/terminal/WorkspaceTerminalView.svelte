@@ -106,6 +106,7 @@
     worktree_path: string;
     tmux_session: string;
     status: string;
+    enrichment_status: string;
     error_message?: string | null;
     created_at: string;
     mr_title?: string | null;
@@ -158,6 +159,13 @@
 
   let workspace = $state<Workspace | null>(null);
   let runtime = $state.raw<WorkspaceRuntimeState | null>(null);
+  let appliedRuntimeState:
+    | {
+        workspaceId: string;
+        hostKey: string | undefined;
+        fingerprint: string;
+      }
+    | null = null;
   let runtimeFetchSeq = 0;
   let runtimeFetchInFlight:
     | Promise<WorkspaceRuntimeState | null>
@@ -358,6 +366,24 @@
       workspace?.id === workspaceId &&
       selectedWorkspaceHostKey(workspace) === workspaceHostKey,
   );
+
+  function hasAppliedRuntimeFor(
+    id: string,
+    hostKey: string | undefined,
+  ): boolean {
+    return (
+      appliedRuntimeState?.workspaceId === id &&
+      appliedRuntimeState.hostKey === hostKey
+    );
+  }
+
+  function invalidateRuntimeSnapshot(): void {
+    runtimeFetchSeq += 1;
+    runtimeFetchInFlight = null;
+    runtimeFetchInFlightId = "";
+    runtimeFetchInFlightHostKey = undefined;
+    appliedRuntimeState = null;
+  }
   const runtimeSessions = $derived(
     runtimeLive
       ? (runtime?.sessions ?? []).filter(
@@ -389,6 +415,7 @@
       session,
     ];
     if (runtimeLive && runtime) {
+      invalidateRuntimeSnapshot();
       runtime = {
         ...runtime,
         sessions: [
@@ -1040,7 +1067,9 @@
         }
         if (nextWorkspace.status === "ready") {
           startRuntimePolling();
-          void fetchRuntime();
+          if (!hasAppliedRuntimeFor(id, hostKey)) {
+            void fetchRuntime();
+          }
         } else {
           stopRuntimePolling();
         }
@@ -1072,7 +1101,9 @@
       }
       if (data.status === "ready") {
         startRuntimePolling();
-        void fetchRuntime();
+        if (!hasAppliedRuntimeFor(id, hostKey)) {
+          void fetchRuntime();
+        }
       } else {
         stopRuntimePolling();
       }
@@ -1116,9 +1147,18 @@
           sessions: data.sessions.length,
         });
         if (!isCurrentWorkspace(id, hostKey) || seq !== runtimeFetchSeq) return null;
+        const fingerprint = JSON.stringify(data);
+        if (
+          hasAppliedRuntimeFor(id, hostKey) &&
+          appliedRuntimeState?.fingerprint === fingerprint
+        ) {
+          runtimeError = null;
+          return data;
+        }
         runtime = data;
         runtimeForId = id;
         runtimeForHostKey = hostKey;
+        appliedRuntimeState = { workspaceId: id, hostKey, fingerprint };
         runtimeError = null;
         terminalLayout = normalizeLayoutForSessions(data.sessions);
         if (
@@ -1625,6 +1665,9 @@
         hostKey,
       );
       if (!isCurrentWorkspace(id, hostKey)) return;
+      if (runtime) {
+        invalidateRuntimeSnapshot();
+      }
       runtime = runtime
         ? {
             ...runtime,
@@ -2352,6 +2395,13 @@
   // it in place.
   $effect(() => {
     const id = workspaceId;
+    const hostKey = workspaceHostKey;
+    if (
+      appliedRuntimeState?.workspaceId !== id ||
+      appliedRuntimeState.hostKey !== hostKey
+    ) {
+      appliedRuntimeState = null;
+    }
     // Route selection is the zero point for workspace-switch timing:
     // every workspace-switch:* measure is a duration from this call.
     // The token lets the cleanup below cancel exactly this switch when
@@ -2359,11 +2409,11 @@
     // able to cancel a newer switch begun elsewhere.
     let switchToken: string | null = null;
     if (id) {
-      switchToken = beginWorkspaceSwitch(id, workspaceHostKey);
+      switchToken = beginWorkspaceSwitch(id, hostKey);
     } else {
       cancelWorkspaceSwitch();
     }
-    const storageId = id ? workspaceStorageId(id, workspaceHostKey) : "";
+    const storageId = id ? workspaceStorageId(id, hostKey) : "";
     const restoredLayout = id ? loadTerminalLayout(storageId) : defaultTerminalLayout();
     const restoredTab = restoreWorkspaceTab(storageId);
     const restoredActiveTab =
@@ -2429,6 +2479,8 @@
     const evtUrl = `${basePath}/api/v1/events`;
     const source = new EventSource(evtUrl);
     eventSource = source;
+    const workspaceRequest = fetchWorkspace();
+    void fetchRuntime();
 
     source.addEventListener(
       "workspace_status",
@@ -2437,7 +2489,7 @@
           const data = JSON.parse(
             e.data as string,
           ) as { id?: string };
-          if (data.id === id) {
+          if (!data.id || data.id === id) {
             void fetchWorkspace();
           }
         } catch {
@@ -2445,6 +2497,19 @@
         }
       },
     );
+    source.addEventListener("open", () => {
+      void workspaceRequest.then(() => {
+        if (
+          eventSource === source &&
+          isCurrentWorkspace(id, hostKey) &&
+          workspace?.id === id &&
+          selectedWorkspaceHostKey(workspace) === hostKey &&
+          workspace.enrichment_status === "pending"
+        ) {
+          void fetchWorkspace();
+        }
+      });
+    });
     source.addEventListener(
       "workspace_pr_associated",
       (e: MessageEvent) => {
@@ -2465,7 +2530,7 @@
       void fetchRuntime();
     });
 
-    void fetchWorkspace().then(() => {
+    void workspaceRequest.then(() => {
       if (workspace?.status === "creating") {
         startPolling();
       } else if (workspace?.status === "ready") {
