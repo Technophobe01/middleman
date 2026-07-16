@@ -292,32 +292,27 @@
   async function applyTimelineSuggestion(
     input: ApplySuggestionRequest,
   ): Promise<boolean | { ok: false; error: string }> {
-    if (stalePR || headActionsUnavailable || applySuggestionGate.unavailable) return false;
+    if (stalePR || headActionsBlocked || applySuggestionGate.unavailable) return false;
     if (currentPR()?.State !== "open") return false;
-    headMutationCount += 1;
     const requestGeneration = mutationRouteGeneration;
     let durableConflict = false;
-    try {
-      const ok = await detailStore.applyReviewSuggestions(owner, name, number, input, (conflict) => {
-        durableConflict = handleStateConflict(
-          conflict.reason,
-          conflict.context,
-          conflict.expectedHeadSha,
-          conflict.ref,
-          conflict.number,
-          requestGeneration,
-        );
-      });
-      if (!ok && durableConflict) {
-        return {
-          ok: false,
-          error: detailStore.getDetailError() ?? "Pull request state changed.",
-        };
-      }
-      return ok;
-    } finally {
-      headMutationCount = Math.max(0, headMutationCount - 1);
+    const ok = await detailStore.applyReviewSuggestions(owner, name, number, input, (conflict) => {
+      durableConflict = handleStateConflict(
+        conflict.reason,
+        conflict.context,
+        conflict.expectedHeadSha,
+        conflict.ref,
+        conflict.number,
+        requestGeneration,
+      );
+    });
+    if (!ok && durableConflict) {
+      return {
+        ok: false,
+        error: detailStore.getDetailError() ?? "Pull request state changed.",
+      };
     }
+    return ok;
   }
 
   function updateTimelineFilter(next: PRTimelineFilterState): void {
@@ -677,8 +672,6 @@
         platformHost,
         repoPath,
       });
-      stateConflict = null;
-      headConflictContext = null;
       await refreshPulls();
       await activity.loadActivity();
     } catch (err) {
@@ -705,7 +698,6 @@
   // approve sends the latest synced provider head when known. A 409
   // typed merge or head-binding conflicts land here and force a refresh.
   let stateConflict = $state<Exclude<ConflictReason, "conflict"> | null>(null);
-  let headMutationCount = $state(0);
   // Provider side-effect context from the conflict response (an
   // approval that could not be revoked, posted review text a retry
   // would repeat); rendered with the stale banner so the consequence
@@ -722,15 +714,9 @@
     detailStore.getDetail()?.platform_head_sha ?? "",
   );
   // A typed conflict invalidates the state the user reviewed. Keep every
-  // head-bound action closed until route navigation or a successful state
-  // mutation establishes a fresh workflow context.
+  // head-bound action closed until route navigation or explicit conflict
+  // recovery verifies a fresh workflow context.
   const headActionsBlocked = $derived(stateConflict !== null);
-  const headMutationInFlight = $derived(headMutationCount > 0);
-  const headActionsUnavailable = $derived(headActionsBlocked || headMutationInFlight);
-
-  function handleHeadMutationChange(active: boolean): void {
-    headMutationCount = Math.max(0, headMutationCount + (active ? 1 : -1));
-  }
   // Preflight guard for merge: a head-binding provider must never merge
   // against an unbound reviewed diff, so merge stays disabled until diff
   // sync proves the rendered code matches the current head — no request,
@@ -971,7 +957,7 @@
       repoSettings,
       // Treat a blocked head as stale for gating: the merge modal must
       // not open while the reviewed head is unknown.
-      stale: stalePR || headActionsUnavailable || midStackMergeBlocked,
+      stale: stalePR || headActionsBlocked || midStackMergeBlocked,
       stores: { detail: detailStore, pulls },
       client,
       requireHeadPin: capabilities.mutation_head_binding,
@@ -2039,7 +2025,7 @@
               {platformHost}
               {repoPath}
               size="sm"
-              disabled={stalePR || headActionsUnavailable || approveGate.unavailable}
+              disabled={stalePR || headActionsBlocked || approveGate.unavailable}
               expectedHeadSha={detailHeadSha}
               platformHeadSha={latestPlatformHeadSha}
               requireHeadPin={capabilities.mutation_head_binding}
@@ -2047,8 +2033,6 @@
               routeGeneration={mutationRouteGeneration}
               title={approveGate.unavailable ? approveGate.reason : undefined}
               onheadconflict={handleHeadConflict}
-              onmutationchange={handleHeadMutationChange}
-              oncompleted={() => { stateConflict = null; headConflictContext = null; }}
             />
           {/if}
           {#if capabilities.workflow_approval && workflowApproval?.checked && workflowApproval.required}
@@ -2088,10 +2072,10 @@
                     : ""}
             <Button
               class={deferredMergePending ? "btn--merge btn--merge-queued" : "btn--merge"}
-              disabled={stalePR || midStackMergeBlocked || mergeDisabledByConflicts || mergeOpUnavailable || headActionsUnavailable || headPinMissing}
+              disabled={stalePR || midStackMergeBlocked || mergeDisabledByConflicts || mergeOpUnavailable || headActionsBlocked || headPinMissing}
               title={mergeTitle}
               onclick={() => {
-                if (stalePR || midStackMergeBlocked || mergeOpUnavailable || headActionsUnavailable || headPinMissing) return;
+                if (stalePR || midStackMergeBlocked || mergeOpUnavailable || headActionsBlocked || headPinMissing) return;
                 runOpenMerge(buildOpenMergeInput(pr, capabilities));
               }}
               tone="success"
@@ -2377,8 +2361,6 @@
             ? `This is stack position ${d.stack?.position ?? "?"} of ${d.stack?.size ?? "?"}. Branch #${midStackBlocker.number} below it has not been merged.`
             : undefined}
           onstateconflict={handleStateConflict}
-          onmutationchange={handleHeadMutationChange}
-          mutationUnavailable={headActionsUnavailable}
           onclose={() => { showMergeModal = false; }}
           onqueued={() => {
             showMergeModal = false;
@@ -2392,8 +2374,6 @@
           }}
           onmerged={() => {
             showMergeModal = false;
-            stateConflict = null;
-            headConflictContext = null;
             void detailStore.loadDetail(owner, name, number, {
               provider,
               platformHost,
@@ -2541,7 +2521,7 @@
             onApplySuggestion={capabilities.review_suggestion_application
               && !stalePR
               && pr.State === "open"
-              && !headActionsUnavailable
+              && !headActionsBlocked
               && !applySuggestionGate.unavailable
                 ? applyTimelineSuggestion
                 : undefined}

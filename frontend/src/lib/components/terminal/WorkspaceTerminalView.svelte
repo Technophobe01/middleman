@@ -1,6 +1,6 @@
 <script lang="ts">
   import { EmptyState, Spinner } from "@kenn-io/kit-ui";
-  import { tick } from "svelte";
+  import { onDestroy, tick } from "svelte";
   import { navigate } from "../../stores/router.svelte.ts";
   import { isNarrow } from "../../stores/container.svelte.js";
   import WorkspaceListSidebar from "./WorkspaceListSidebar.svelte";
@@ -202,11 +202,14 @@
   let renameInputValue = $state("");
   let renameSaving = $state(false);
   let renameInputEl = $state<HTMLInputElement | null>(null);
-  // Bumps on every workspace route change so non-delete async
-  // callbacks can detect stale responses for the previous route.
-  // Delete requests track their own target separately because the
-  // same workspace must stay blocked across A -> B -> A navigation.
+  // Bumps on every workspace route change so async callbacks can detect
+  // stale, non-destructive responses from a previous visit. Delete targets
+  // remain blocked across A -> B -> A navigation, while a successful delete
+  // still navigates away if the user returned to the destroyed workspace.
   let workspaceGen = 0;
+  onDestroy(() => {
+    workspaceGen += 1;
+  });
   let runtimeError = $state<string | null>(null);
   let pollTimer = $state<ReturnType<
     typeof setInterval
@@ -2213,6 +2216,7 @@
     if (actionsBlocked) return;
     const targetId = workspaceId;
     const targetHostKey = workspaceHostKey;
+    const targetGen = workspaceGen;
     // Capture the trigger synchronously: the click handler runs
     // before `inert` is applied to .terminal-view, so this is the
     // last point we can read the originating focused element. By
@@ -2231,6 +2235,10 @@
         : await client.DELETE("/workspaces/{id}", {
             params: { path: { id: targetId } },
           });
+      const responseFailed =
+        response.status === 409 ||
+        (!response.ok && response.status !== 204);
+      if (responseFailed && targetGen !== workspaceGen) return;
       // Different workspace now: the user has moved on and nothing
       // about this response applies.
       if (!isCurrentWorkspace(targetId, targetHostKey)) return;
@@ -2318,13 +2326,15 @@
               query: { force: true },
             },
           });
+      const responseFailed =
+        !response.ok && response.status !== 204;
+      if (responseFailed && targetGen !== workspaceGen) return;
       // The force-delete on the server is destructive and runs to
       // completion either way; once the user has moved to a
       // different workspace we just drop the response on the
       // floor so navigate() doesn't pull them away.
       if (!isCurrentWorkspace(targetId, targetHostKey)) return;
       if (!response.ok && response.status !== 204) {
-        if (targetGen !== workspaceGen) return;
         showFlash(
           apiErrorMessage(error, `Delete failed (${response.status})`),
           { tone: "danger" },
