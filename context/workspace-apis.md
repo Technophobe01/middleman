@@ -60,8 +60,12 @@ state.
 - Overlapping tmux probes wait for the active sample within the caller budget;
   fallback carries an error only when waiting or sample production fails
   (`internal/server/huma_routes.go::probeOneTmuxSession`).
-- Background completion emits `workspace_status` so clients refetch promptly
-  (`internal/server/workspace_enrichment.go::runWorkspaceEnrichmentJob`).
+- Background completion emits `workspace_status` only for durable changes:
+  first completion, divergence movement, or error-state change — never for
+  tmux-activity-only movement, and tmux prune broadcasts only when it pruned.
+  Unconditional broadcasts made every client refetch schedule the next
+  enrichment, a permanent refresh loop
+  (`internal/server/workspace_enrichment.go::workspaceEnrichmentBroadcastWorthy`).
 - `DELETE /workspaces/{id}`: tear down a middleman-managed workspace and its
   local resources.
 
@@ -199,6 +203,17 @@ Test fixtures that seed PR rows must either carry a same-repo
 `HeadRepoCloneURL` or publish `refs/pull/<n>/head` on the fixture remote:
 unknown-provenance setup resolves heads exclusively through the fork-safe ref
 and fails outright when the remote does not serve it.
+
+## Pushed-Head Refresh Convergence
+
+A tracking-ref/provider-head mismatch is not proof of a local push: when the
+PR advanced from another checkout, the local tracking ref is the stale side
+and a provider sync can never converge. The observer therefore enqueues a PR
+sync on mismatch, retries on failure after `pushedHeadRefreshRetryInterval`,
+but must stop once a refresh for the same observed SHA succeeded and the
+provider head still differs (`LastRefreshSucceededAt >= LastRefreshEnqueuedAt`)
+— otherwise the visible PR is re-synced and re-rendered forever. A tracking-ref
+move restarts the cycle.
 
 ## Sidebar Ordering
 
