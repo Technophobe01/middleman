@@ -1,5 +1,7 @@
 import { expect, test, type Locator } from "@playwright/test";
 
+import { authoredScrollbarWidths } from "../support/scrollbarStyles";
+
 async function constrainScrollArea(scrollArea: Locator): Promise<void> {
   await scrollArea.locator("..").evaluate((node) => {
     const root = node as HTMLElement;
@@ -8,60 +10,36 @@ async function constrainScrollArea(scrollArea: Locator): Promise<void> {
   });
 }
 
-test("grouped rail scroll indicator floats above sticky headers", async ({ page }) => {
+test("grouped rail uses native scrollbars with sticky content", async ({ page, browserName }) => {
   await page.goto("/pulls");
   await expect(page.locator(".pull-item").first()).toBeVisible();
 
   const scrollArea = page.getByRole("region", { name: "Pull requests" });
-  const scrollRoot = scrollArea.locator("..");
-  const indicator = scrollRoot.locator(".kit-scrollbox__indicator");
-  const thumb = indicator.locator(".kit-scrollbox__thumb");
   const stickyHeader = scrollArea.locator(".sidebar-group-header").first();
   await constrainScrollArea(scrollArea);
 
   const initialGeometry = await scrollArea.evaluate((node) => ({
-    clientWidth: node.clientWidth,
-    offsetWidth: (node as HTMLElement).offsetWidth,
     clientHeight: node.clientHeight,
     scrollHeight: node.scrollHeight,
+    scrollbarColor: getComputedStyle(node).scrollbarColor,
+    scrollbarWidth: getComputedStyle(node).scrollbarWidth,
+    webkitWidth: getComputedStyle(node, "::-webkit-scrollbar").width,
   }));
   expect(initialGeometry.scrollHeight).toBeGreaterThan(initialGeometry.clientHeight);
-  expect(initialGeometry.clientWidth).toBe(initialGeometry.offsetWidth);
-  await expect(indicator).toHaveCSS("opacity", "0");
-
-  await scrollArea.evaluate((node) => {
-    node.scrollTop = 20;
-  });
-  await expect(indicator).toHaveCSS("opacity", "1");
-
-  const stacking = await scrollArea.evaluate((node) => {
-    const root = node.parentElement;
-    const header = node.querySelector(".sidebar-group-header");
-    const overlay = root?.querySelector(".kit-scrollbox__indicator");
-    return {
-      header: Number.parseInt(getComputedStyle(header!).zIndex, 10),
-      overlay: Number.parseInt(getComputedStyle(overlay!).zIndex, 10),
-    };
-  });
-  expect(stacking.overlay).toBeGreaterThan(stacking.header);
-
-  const headerBox = await stickyHeader.boundingBox();
-  const thumbBox = await thumb.boundingBox();
-  expect(headerBox).not.toBeNull();
-  expect(thumbBox).not.toBeNull();
-  if (headerBox !== null && thumbBox !== null) {
-    expect(thumbBox.y).toBeLessThan(headerBox.y + headerBox.height);
-    expect(thumbBox.x).toBeGreaterThan(headerBox.x);
+  expect(initialGeometry.scrollbarColor).toBe("auto");
+  expect(await authoredScrollbarWidths(scrollArea)).toEqual([]);
+  if (browserName === "chromium") {
+    expect(initialGeometry.scrollbarWidth).toBe("auto");
+    expect(initialGeometry.webkitWidth).toBe("auto");
   }
+  await expect(stickyHeader).toBeVisible();
 
   await scrollArea.focus();
   await page.keyboard.press("End");
-  await expect.poll(() => scrollArea.evaluate((node) => node.scrollTop)).toBeGreaterThan(20);
-  await expect(indicator).toHaveCSS("opacity", "1");
-  await expect(indicator).toHaveCSS("opacity", "0", { timeout: 1_500 });
+  await expect.poll(() => scrollArea.evaluate((node) => node.scrollTop)).toBeGreaterThan(0);
 });
 
-test("grouped rails share labeled overlay scroll regions", async ({ page }) => {
+test("grouped rails share labeled native scroll regions", async ({ page, browserName }) => {
   const rails = [
     { path: "/pulls", label: "Pull requests" },
     { path: "/issues", label: "Issues" },
@@ -80,7 +58,14 @@ test("grouped rails share labeled overlay scroll regions", async ({ page }) => {
     const scrollArea = scope.getByRole("region", { name: rail.label, exact: true });
     await expect(scrollArea).toBeVisible();
     await expect(scrollArea).toHaveAttribute("tabindex", "0");
-    await expect(scrollArea.locator("..").locator(".kit-scrollbox__indicator")).toHaveCount(1);
+    await expect(scrollArea.locator("..").locator(".kit-scrollbox__indicator")).toHaveCount(0);
+    const scrollbarStyles = await scrollArea.evaluate((node) => ({
+      color: getComputedStyle(node).scrollbarColor,
+      width: getComputedStyle(node).scrollbarWidth,
+    }));
+    expect(scrollbarStyles.color).toBe("auto");
+    expect(await authoredScrollbarWidths(scrollArea)).toEqual([]);
+    if (browserName === "chromium") expect(scrollbarStyles.width).toBe("auto");
   }
 });
 
