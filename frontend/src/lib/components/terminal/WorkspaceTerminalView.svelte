@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { EmptyState, Spinner } from "@kenn-io/kit-ui";
+  import { EmptyState, IconButton, Spinner } from "@kenn-io/kit-ui";
   import { onDestroy, tick } from "svelte";
   import { navigate } from "../../stores/router.svelte.ts";
   import { isNarrow } from "../../stores/container.svelte.js";
@@ -435,6 +435,22 @@
       (session) => sessionRegion(session) === "workflow",
     ),
   );
+  function workflowSessionStatus(
+    session: RuntimeSession,
+    label: string,
+  ): WorkflowTabDescriptor["status"] {
+    if (session.status === "running") {
+      return { value: "idle", label: `${label} running` };
+    }
+    if (session.status === "starting") {
+      return { value: "stale", label: `${label} starting` };
+    }
+    if (session.status === "error") {
+      return { value: "unclean", label: `${label} unavailable` };
+    }
+    return undefined;
+  }
+
   const workflowTabDescriptors = $derived.by<WorkflowTabDescriptor[]>(() => {
     const tabs: WorkflowTabDescriptor[] = [
       {
@@ -455,11 +471,12 @@
       });
     }
     for (const session of workflowSessions) {
+      const label = sessionDisplayLabels[session.key] ?? session.label;
       tabs.push({
         key: workflowTabKeyForSession(session.key),
-        label: sessionDisplayLabels[session.key] ?? session.label,
+        label,
         kind: session.kind === "plain_shell" ? "plain_shell" : "agent",
-        status: session.status,
+        status: workflowSessionStatus(session, label),
         renamable: true,
         movableToTerminal: true,
         closable: true,
@@ -585,6 +602,7 @@
   }
 
   let containerEl = $state<HTMLElement | null>(null);
+  let containerWidth = $state(0);
 
   function maxRightSidebarWidth(
     containerWidth: number,
@@ -596,6 +614,15 @@
         RIGHT_SIDEBAR_RESIZE_HANDLE_WIDTH,
     );
   }
+
+  const rightSidebarAriaMax = $derived(
+    containerWidth > 0
+      ? maxRightSidebarWidth(containerWidth)
+      : Math.max(MIN_SIDEBAR_WIDTH, sidebarWidth),
+  );
+  const rightSidebarAriaMin = $derived(
+    Math.min(MIN_SIDEBAR_WIDTH, rightSidebarAriaMax),
+  );
 
   function clampRightSidebarWidth(
     containerWidth: number,
@@ -650,7 +677,7 @@
       sidebarResizeMinWidth,
       Math.min(
         sidebarResizeMaxWidth,
-        sidebarResizeStartWidth - event.deltaX,
+        sidebarResizeStartWidth - event.delta,
       ),
     );
   }
@@ -2783,11 +2810,11 @@
                   </button>
                 {/if}
               </div>
-              <!-- kit-ui-check-ignore: icon variant of the 22px header-btn rail; kit IconButton's 24px minimum breaks the rail rhythm -->
-              <button class="header-btn header-icon-btn"
+              <IconButton
+                class="workspace-refresh-button"
+                size="sm"
                 disabled={actionsBlocked || refreshingWorkspace}
-                title="Refresh workspace details"
-                aria-label="Refresh workspace details"
+                ariaLabel="Refresh workspace details"
                 onclick={() => void handleRefreshWorkspace()}
               >
                 {#if refreshingWorkspace}
@@ -2800,7 +2827,7 @@
                     aria-hidden="true"
                   />
                 {/if}
-              </button>
+              </IconButton>
             {/if}
             <button
               class="header-btn danger"
@@ -2812,7 +2839,11 @@
             </button>
           </div>
         </div>
-        <div class="terminal-and-sidebar" bind:this={containerEl}>
+        <div
+          class="terminal-and-sidebar"
+          bind:this={containerEl}
+          bind:clientWidth={containerWidth}
+        >
           <div class="terminal-area">
             <div class="workspace-surface">
               <div class="workspace-toolbar">
@@ -3003,6 +3034,10 @@
             <SplitResizeHandle
               class="sidebar-resize-handle"
               ariaLabel="Resize workspace details"
+              orientation="horizontal"
+              ariaValueMin={rightSidebarAriaMin}
+              ariaValueMax={rightSidebarAriaMax}
+              ariaValueNow={sidebarWidth}
               onResizeStart={handleSidebarResizeStart}
               onResize={handleSidebarResize}
             />
@@ -3418,12 +3453,8 @@
       border-color 80ms ease;
   }
 
-  .header-icon-btn {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 24px;
-    padding: 0;
+  :global(.workspace-refresh-button.kit-icon-button) {
+    border: 1px solid var(--border-default);
   }
 
   :global(.header-icon) {
@@ -3556,13 +3587,10 @@
   }
 
   .panel-toggle-group .panel-toggle-btn.active:disabled {
-    /* kit-ui-check-ignore: pure neutral gray desaturates the disabled-active state the same way in both themes */
-    background: color-mix(in srgb, rgb(128 128 128) 28%, var(--bg-surface)) !important;
-    /* kit-ui-check-ignore: pure neutral gray desaturates the disabled-active state the same way in both themes */
-    color: color-mix(in srgb, rgb(115 115 115) 80%, var(--text-primary)) !important;
+    background: color-mix(in srgb, var(--text-muted) 28%, var(--bg-surface)) !important;
+    color: color-mix(in srgb, var(--text-muted) 80%, var(--text-primary)) !important;
     box-shadow: inset 0 0 0 1px
-      /* kit-ui-check-ignore: pure neutral gray desaturates the disabled-active state the same way in both themes */
-      color-mix(in srgb, rgb(128 128 128) 35%, var(--border-muted));
+      color-mix(in srgb, var(--text-muted) 35%, var(--border-muted));
   }
 
   .terminal-and-sidebar {

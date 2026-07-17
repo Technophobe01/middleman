@@ -1,4 +1,5 @@
 <script lang="ts">
+  import type { TypeaheadOption } from "@kenn-io/kit-ui";
   import NetworkIcon from "@lucide/svelte/icons/network";
   import PencilIcon from "@lucide/svelte/icons/pencil";
   import { renderMarkdown, renderMarkdownSync } from "@middleman/ui/utils/markdown";
@@ -16,7 +17,6 @@
   import type { MessageLinkRef } from "../../messages/types";
   import IssueMessageLinks from "../../features/kata/IssueMessageLinks.svelte";
   import RecurrencePanel from "../recurrence/RecurrencePanel.svelte";
-  import type { TypeaheadOption } from "../shared/TypeaheadTrigger.svelte";
   import KataChecklistEditor from "./KataChecklistEditor.svelte";
   import KataIssueActions from "./KataIssueActions.svelte";
   import KataIssueDiscussion from "./KataIssueDiscussion.svelte";
@@ -422,12 +422,12 @@
 
   .crumb-project {
     min-width: 0;
-    max-width: clamp(160px, 22vw, 292px);
     overflow: hidden;
-    color: var(--text-primary);
-    font-weight: 600;
     text-overflow: ellipsis;
     white-space: nowrap;
+    color: var(--text-primary);
+    font-size: var(--font-size-xs);
+    font-weight: 600;
   }
 
   .crumb-id {

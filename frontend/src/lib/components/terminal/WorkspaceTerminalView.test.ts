@@ -373,6 +373,7 @@ describe("WorkspaceTerminalView", () => {
       "ResizeObserver",
       class {
         observe(): void {}
+        unobserve(): void {}
         disconnect(): void {}
       },
     );
@@ -472,6 +473,36 @@ describe("WorkspaceTerminalView", () => {
     expect(screen.queryByRole("button", { name: /Claude review agent/i })).toBeNull();
     expect((screen.getByRole("button", { name: /Configured Agent/i }) as HTMLButtonElement).disabled).toBe(true);
     expect((screen.getByRole("button", { name: /Shell/i }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("uses an idle status for a live workflow session without changing the tab name", async () => {
+    render(WorkspaceTerminalView, {
+      props: {
+        workspaceId: "ws-1",
+      },
+    });
+
+    expect(await screen.findByRole("tab", { name: "Helper, Helper running" })).toBeTruthy();
+    expect(screen.getByLabelText("Helper running").classList.contains("kit-status-dot--idle")).toBe(true);
+  });
+
+  it.each([
+    ["starting", "Helper starting", "kit-status-dot--stale"],
+    ["error", "Helper unavailable", "kit-status-dot--unclean"],
+  ] as const)("maps a %s workflow session to a semantic tab status", async (status, label, className) => {
+    mocks.getWorkspaceRuntime.mockResolvedValue({
+      launch_targets: [],
+      sessions: [{ ...runningSession, status }],
+    });
+
+    render(WorkspaceTerminalView, {
+      props: {
+        workspaceId: "ws-1",
+      },
+    });
+
+    expect(await screen.findByRole("tab", { name: `Helper, ${label}` })).toBeTruthy();
+    expect(screen.getByLabelText(label).classList.contains(className)).toBe(true);
   });
 
   it("closes an agent tab immediately when its terminal exits", async () => {
@@ -639,7 +670,7 @@ describe("WorkspaceTerminalView", () => {
     expect(runtimePoll).toBeTruthy();
     runtimePoll!.callback();
 
-    await waitFor(() => expect(screen.getByRole("tab", { name: /^Helper$/ })).toBeTruthy());
+    await waitFor(() => expect(screen.getByRole("tab", { name: "Helper, Helper running" })).toBeTruthy());
     expect(screen.queryByRole("tab", { name: /Review helper/ })).toBeNull();
   });
 
@@ -665,7 +696,7 @@ describe("WorkspaceTerminalView", () => {
       },
     });
 
-    await screen.findByRole("tab", { name: /^Helper$/ });
+    await screen.findByRole("tab", { name: "Helper, Helper running" });
     const runtimePoll = intervalCallbacks.find((interval) => interval.delay === 3000);
     expect(runtimePoll).toBeTruthy();
     runtimePoll!.callback();
@@ -1157,7 +1188,7 @@ describe("WorkspaceTerminalView", () => {
       },
     });
 
-    await waitFor(() => expect(screen.getAllByRole("tab", { name: "Helper" })).toHaveLength(2));
+    await waitFor(() => expect(screen.getAllByRole("tab", { name: "Helper, Helper running" })).toHaveLength(2));
     expect(screen.queryByRole("tab", { name: /Helper 2/ })).toBeNull();
   });
 
@@ -1170,7 +1201,7 @@ describe("WorkspaceTerminalView", () => {
       },
     });
 
-    await screen.findByRole("tab", { name: /^Helper$/ });
+    await screen.findByRole("tab", { name: "Helper, Helper running" });
     await screen.findByRole("tab", { name: /Helper 2/ });
 
     await fireEvent.click(screen.getByRole("button", { name: "Rename Helper" }));

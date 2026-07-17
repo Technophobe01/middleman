@@ -873,11 +873,11 @@ async function clickTreeFileItem(pageOrLocator: Page | ReturnType<Page["locator"
 
 async function jumpToFile(page: Page, path: string): Promise<void> {
   await page.getByRole("button", { name: "Jump to file" }).click();
-  const menu = page.locator(".file-jump-menu");
-  await expect(menu).toBeVisible();
-  await menu.getByRole("searchbox", { name: "Jump to file" }).fill(path);
-  await menu.locator(".file-jump-option").first().click();
-  await expect(menu).toBeHidden();
+  const dialog = page.getByRole("dialog", { name: "Jump to file" });
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole("combobox", { name: "Jump to file" }).fill(path);
+  await dialog.getByRole("option").first().click();
+  await expect(dialog).toBeHidden();
 }
 
 async function scrollFileTreeToTop(page: Page): Promise<void> {
@@ -1654,7 +1654,7 @@ test.describe("diff view", () => {
     const fileTree = page.getByRole("complementary", {
       name: "Changed files",
     });
-    const resizeHandle = page.getByRole("button", {
+    const resizeHandle = page.getByRole("separator", {
       name: "Resize file tree",
     });
     await expect(fileTree).toBeVisible();
@@ -2212,12 +2212,12 @@ test.describe("diff view", () => {
     await openDiffFilterMenu(page);
     const wrapToggle = page.getByRole("switch", { name: "Word wrap" });
 
-    await expect(wrapToggle).toHaveAttribute("aria-checked", "false");
+    await expect(wrapToggle).not.toBeChecked();
     await expect(firstCodeLine).toHaveCSS("white-space", "pre");
 
     await wrapToggle.click();
 
-    await expect(wrapToggle).toHaveAttribute("aria-checked", "true");
+    await expect(wrapToggle).toBeChecked();
     await expect(firstCodeLine).toHaveCSS("white-space", "pre-wrap");
   });
 
@@ -2249,10 +2249,10 @@ test.describe("diff view", () => {
     const previewToggle = page.getByRole("switch", {
       name: "Rich preview",
     });
-    await expect(previewToggle).toHaveAttribute("aria-checked", "false");
+    await expect(previewToggle).not.toBeChecked();
 
     await previewToggle.click();
-    await expect(previewToggle).toHaveAttribute("aria-checked", "true");
+    await expect(previewToggle).toBeChecked();
     const markdownPreview = page.locator(".markdown-rich-diff--unified");
     await expect(markdownPreview.getByRole("heading", { name: "Rendered preview" })).toBeVisible();
     await expect(markdownPreview).toContainText("Markdown task");
@@ -2793,9 +2793,9 @@ test.describe("diff view", () => {
     const sideBySide = page.getByRole("switch", {
       name: "Side-by-side diffs",
     });
-    await expect(sideBySide).toHaveAttribute("aria-checked", "false");
+    await expect(sideBySide).not.toBeChecked();
     await sideBySide.click();
-    await expect(sideBySide).toHaveAttribute("aria-checked", "true");
+    await expect(sideBySide).toBeChecked();
     await expect
       .poll(async () => {
         return await firstFile.locator(".pierre-diff").evaluate((host) => {
@@ -3367,7 +3367,7 @@ test.describe("diff view", () => {
     await waitForSidebarFilesLoaded(page);
 
     // Filter input is visible because diff has 50 files (>= 10 threshold).
-    const filterInput = page.locator(".diff-files-filter__input").first();
+    const filterInput = page.getByRole("searchbox", { name: "Filter files" }).first();
     await expect(filterInput).toBeVisible();
     await expect(treeFileItems(page)).toHaveCount(50);
 
@@ -3387,7 +3387,7 @@ test.describe("diff view", () => {
     await waitForDiffLoaded(page);
     await waitForSidebarFilesLoaded(page);
 
-    const filterInput = page.locator(".diff-files-filter__input").first();
+    const filterInput = page.getByRole("searchbox", { name: "Filter files" }).first();
     await filterInput.fill("file_1");
     await expect(treeFileItems(page)).toHaveCount(11);
     await expect(treeFileItem(page, targetPath)).toHaveCount(0);
@@ -3421,7 +3421,7 @@ test.describe("diff view", () => {
     await waitForSidebarFilesLoaded(page);
 
     // smallDiff has 4 files; filter input should not be rendered.
-    await expect(page.locator(".diff-files-filter__input")).toHaveCount(0);
+    await expect(page.getByRole("searchbox", { name: "Filter files" })).toHaveCount(0);
   });
 
   test("file filter resets when switching PRs (large -> large)", async ({ page }) => {
@@ -3448,7 +3448,7 @@ test.describe("diff view", () => {
     await waitForSidebarFilesLoaded(page);
 
     // Type into filter on PR 1.
-    const filterInput = page.locator(".diff-files-filter__input").first();
+    const filterInput = page.getByRole("searchbox", { name: "Filter files" }).first();
     await filterInput.fill("file_1");
     await expect(treeFileItems(page)).toHaveCount(11);
 
@@ -3457,7 +3457,7 @@ test.describe("diff view", () => {
     await waitForSidebarFilesLoaded(page);
 
     // Filter input is empty and full list shows.
-    const filterOnPR2 = page.locator(".diff-files-filter__input").first();
+    const filterOnPR2 = page.getByRole("searchbox", { name: "Filter files" }).first();
     await expect(filterOnPR2).toHaveValue("");
     await expect(treeFileItems(page)).toHaveCount(50);
   });
@@ -3486,7 +3486,7 @@ test.describe("diff view", () => {
     await waitForSidebarFilesLoaded(page);
 
     // Type into filter on PR 1.
-    await page.locator(".diff-files-filter__input").first().fill("nomatch");
+    await page.getByRole("searchbox", { name: "Filter files" }).first().fill("nomatch");
     await expect(treeFileItems(page)).toHaveCount(0);
 
     // Switch to PR 2 (small diff — filter input hidden).
@@ -3494,7 +3494,7 @@ test.describe("diff view", () => {
     await waitForSidebarFilesLoaded(page);
 
     // Filter input is hidden and all 4 files show (stale query doesn't apply).
-    await expect(page.locator(".diff-files-filter__input")).toHaveCount(0);
+    await expect(page.getByRole("searchbox", { name: "Filter files" })).toHaveCount(0);
     await expect(treeFileItems(page)).toHaveCount(4);
   });
 
@@ -3748,8 +3748,21 @@ test.describe("diff view performance", () => {
       })
       .toBeGreaterThan(0);
 
-    await page.getByRole("button", { name: "Jump to file" }).click();
-    await expect(page.locator(".file-jump-menu")).toBeVisible();
+    const jumpTrigger = page.getByRole("button", { name: "Jump to file" });
+    await jumpTrigger.click();
+    const jumpDialog = page.getByRole("dialog", { name: "Jump to file" });
+    const jumpInput = jumpDialog.getByRole("combobox", { name: "Jump to file" });
+    await expect(jumpDialog).toBeVisible();
+    await expect(jumpInput).toBeFocused();
+    for (let i = 0; i < 20; i++) {
+      await jumpInput.press("ArrowDown");
+    }
+    const highlightedOptionID = await jumpInput.getAttribute("aria-activedescendant");
+    expect(highlightedOptionID).not.toBeNull();
+    await expect(jumpDialog.locator(`#${highlightedOptionID}`)).toBeInViewport();
+    await jumpInput.press("Escape");
+    await expect(jumpDialog).toBeHidden();
+    await expect(jumpTrigger).toBeFocused();
     expect(pageErrors).toEqual([]);
   });
 

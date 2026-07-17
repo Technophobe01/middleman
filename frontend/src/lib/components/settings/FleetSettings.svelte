@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { Checkbox, Typeahead, type TypeaheadOption } from "@kenn-io/kit-ui";
   import PlusIcon from "@lucide/svelte/icons/plus";
   import RotateCcwIcon from "@lucide/svelte/icons/rotate-ccw";
   import TrashIcon from "@lucide/svelte/icons/trash-2";
@@ -12,7 +13,6 @@
   import { showFlash } from "@middleman/ui/stores/flash";
   import { updateFleetSettings } from "../../api/settings.js";
   import { isEmbedded } from "../../stores/embed-config.svelte.js";
-  import TypeaheadTrigger, { type TypeaheadOption } from "../shared/TypeaheadTrigger.svelte";
 
   interface Props {
     fleet: FleetSettingsType;
@@ -39,9 +39,9 @@
 
   const embedded = isEmbedded();
   const basePlatformOptions: TypeaheadOption[] = [
-    { value: "macos", label: "macOS" },
-    { value: "linux", label: "linux" },
-    { value: "windows", label: "windows" },
+    { name: "macos", label: "macOS" },
+    { name: "linux", label: "linux" },
+    { name: "windows", label: "windows" },
   ];
   // svelte-ignore state_referenced_locally
   let currentFleet = $state(fleet);
@@ -207,10 +207,10 @@
 
   function platformOptions(value: string): TypeaheadOption[] {
     const trimmed = value.trim();
-    if (trimmed === "" || basePlatformOptions.some((option) => option.value === trimmed)) {
+    if (trimmed === "" || basePlatformOptions.some((option) => option.name === trimmed)) {
       return basePlatformOptions;
     }
-    return [...basePlatformOptions, { value: trimmed, label: trimmed }];
+    return [...basePlatformOptions, { name: trimmed, label: trimmed }];
   }
 
   async function save(): Promise<void> {
@@ -230,20 +230,19 @@
 </script>
 
 <div class="fleet-settings">
-  <label class="toggle-row">
+  <Checkbox
+    class="toggle-row"
+    bind:checked={enabledDraft}
+    disabled={embedded || saving}
+    ariaLabel="Enable fleet federation"
+  >
     <span>
       <span class="field-label">Enable fleet federation</span>
       <span class="field-help">
         Remote hosts stay unavailable while federation is off.
       </span>
     </span>
-    <input
-      type="checkbox"
-      bind:checked={enabledDraft}
-      disabled={embedded || saving}
-      aria-label="Enable fleet federation"
-    />
-  </label>
+  </Checkbox>
 
   {#if currentFleet.restart_required}
     <p class="restart-banner">Restart required</p>
@@ -283,17 +282,17 @@
     </label>
   </div>
 
-  <label class="check-row">
-    <input
-      type="checkbox"
-      bind:checked={includeUnmanagedDetailsDraft}
-      disabled={embedded || saving}
-    />
+  <Checkbox
+    class="check-row"
+    bind:checked={includeUnmanagedDetailsDraft}
+    disabled={embedded || saving}
+    ariaLabel="Include unmanaged tmux details"
+  >
     <span>
       <span class="field-label">Include unmanaged tmux details</span>
       <span class="field-help">Changing this monitor setting applies after restart.</span>
     </span>
-  </label>
+  </Checkbox>
 
   <section class="peer-section" aria-label="HTTP fleet peers">
     <div class="peer-section-header">
@@ -444,22 +443,19 @@
                   />
                 </td>
                 <td class="platform-cell">
-                  <TypeaheadTrigger
-                    ariaLabel={`SSH peer ${label} platform`}
-                    selected={peer.platform.trim() === "" ? null : peer.platform}
+                  <Typeahead
+                    value={peer.platform}
+                    fallbackLabel="Unspecified"
                     options={platformOptions(peer.platform)}
+                    triggerPrefix={`SSH peer ${label} platform:`}
                     allowClear
                     allowCustom
                     clearLabel="Unspecified"
-                    placeholder="Platform..."
+                    placeholder={`SSH peer ${label} platform`}
                     emptyLabel="Enter a platform"
                     placement="top"
-                    triggerAriaLabel={`SSH peer ${label} platform: ${
-                      platformOptions(peer.platform).find((option) => option.value === peer.platform)?.label ??
-                        "Unspecified"
-                    }`}
-                    onChange={(value) => {
-                      peer.platform = value ?? "";
+                    onselect={(value) => {
+                      peer.platform = value;
                     }}
                     disabled={embedded || saving}
                   />
@@ -523,20 +519,23 @@
     gap: var(--space-5);
   }
 
-  .toggle-row,
-  .check-row {
+  :global(.toggle-row) {
     display: flex;
     justify-content: space-between;
     align-items: flex-start;
     gap: 16px;
   }
 
-  .check-row {
-    justify-content: flex-start;
+  :global(.toggle-row .kit-checkbox__box) {
+    order: 2;
+    margin-top: 2px;
   }
 
-  .toggle-row input,
-  .check-row input {
+  :global(.check-row) {
+    align-items: flex-start;
+  }
+
+  :global(.check-row .kit-checkbox__box) {
     margin-top: 2px;
   }
 
@@ -570,8 +569,8 @@
 
   .field input,
   .peer-table input,
-  .platform-cell :global(.typeahead-trigger),
-  .platform-cell :global(.typeahead-input) {
+  .platform-cell :global(.kit-typeahead__trigger),
+  .platform-cell :global(.kit-typeahead__input) {
     width: 100%;
     min-height: 30px;
     padding: 4px 8px;
@@ -585,18 +584,22 @@
 
   .field input:disabled,
   .peer-table input:disabled,
-  .platform-cell :global(.typeahead-trigger:disabled) {
+  .platform-cell :global(.kit-typeahead__trigger:disabled) {
     color: var(--text-muted);
     background: var(--bg-inset);
   }
 
-  .platform-cell :global(.typeahead) {
+  .platform-cell :global(.kit-typeahead) {
     width: 100%;
     min-width: 0;
   }
 
-  .platform-cell :global(.typeahead-trigger),
-  .platform-cell :global(.typeahead-input) {
+  .platform-cell :global(.kit-typeahead__prefix) {
+    display: none;
+  }
+
+  .platform-cell :global(.kit-typeahead__trigger),
+  .platform-cell :global(.kit-typeahead__input) {
     height: 30px;
   }
 

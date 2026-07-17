@@ -1,10 +1,9 @@
 <script lang="ts">
   import FileSearchIcon from "@lucide/svelte/icons/file-search";
-  import SearchIcon from "@lucide/svelte/icons/search";
   import { tick } from "svelte";
   import type { DiffFile } from "../../api/types.js";
   import { getStores } from "../../context.js";
-  import { floatingPopoverStyle } from "@kenn-io/kit-ui";
+  import { Card, IconButton, SearchInput, floatingPopoverStyle } from "@kenn-io/kit-ui";
 
   interface Props {
     disabled?: boolean;
@@ -16,17 +15,17 @@
   let open = $state(false);
   let query = $state("");
   let highlightIndex = $state(0);
-  let inputEl = $state<HTMLInputElement>();
+  let inputEl = $state<HTMLInputElement>(undefined!);
   let pickerEl = $state<HTMLDivElement>();
-  let triggerEl = $state<HTMLButtonElement>();
+  let triggerEl = $state<HTMLSpanElement>();
   let menuEl = $state<HTMLDivElement>();
   let menuStyle = $state("");
 
   const files = $derived(diff.getVisibleFileList()?.files ?? diff.getVisibleDiffFiles());
   const filteredFiles = $derived.by(() => {
-    const q = query.trim().toLowerCase();
-    if (!q) return files;
-    return files.filter((file) => file.path.toLowerCase().includes(q));
+    const normalizedQuery = query.trim().toLowerCase();
+    if (!normalizedQuery) return files;
+    return files.filter((file) => file.path.toLowerCase().includes(normalizedQuery));
   });
   const activeFile = $derived(diff.getActiveFile());
 
@@ -43,10 +42,6 @@
   $effect(() => {
     if (!open) return;
 
-    function updatePosition(): void {
-      positionMenu();
-    }
-
     function handleDocumentClick(event: MouseEvent): void {
       const target = event.target;
       if (target instanceof Node && pickerEl?.contains(target)) return;
@@ -55,29 +50,29 @@
     }
 
     function handleDocumentKeydown(event: KeyboardEvent): void {
-      if (event.key === "Escape") close();
+      if (event.key === "Escape") close(true);
     }
 
     document.addEventListener("mousedown", handleDocumentClick);
     document.addEventListener("keydown", handleDocumentKeydown);
-    window.addEventListener("resize", updatePosition);
-    window.addEventListener("scroll", updatePosition, true);
+    window.addEventListener("resize", positionMenu);
+    window.addEventListener("scroll", positionMenu, true);
     return () => {
       document.removeEventListener("mousedown", handleDocumentClick);
       document.removeEventListener("keydown", handleDocumentKeydown);
-      window.removeEventListener("resize", updatePosition);
-      window.removeEventListener("scroll", updatePosition, true);
+      window.removeEventListener("resize", positionMenu);
+      window.removeEventListener("scroll", positionMenu, true);
     };
   });
 
   function fileName(path: string): string {
-    const idx = path.lastIndexOf("/");
-    return idx >= 0 ? path.slice(idx + 1) : path;
+    const index = path.lastIndexOf("/");
+    return index >= 0 ? path.slice(index + 1) : path;
   }
 
   function directory(path: string): string {
-    const idx = path.lastIndexOf("/");
-    return idx >= 0 ? path.slice(0, idx) : "";
+    const index = path.lastIndexOf("/");
+    return index >= 0 ? path.slice(0, index) : "";
   }
 
   async function toggle(): Promise<void> {
@@ -88,13 +83,11 @@
     }
     open = true;
     query = "";
-    highlightIndex = Math.max(
-      files.findIndex((file) => file.path === activeFile),
-      0,
-    );
+    highlightIndex = Math.max(files.findIndex((file) => file.path === activeFile), 0);
     await tick();
     positionMenu();
     inputEl?.focus();
+    await scrollHighlightedOptionIntoView();
   }
 
   function positionMenu(): void {
@@ -102,7 +95,6 @@
     const measuredSize = menuEl
       ? { popoverWidth: menuEl.offsetWidth, popoverHeight: menuEl.offsetHeight }
       : {};
-
     menuStyle = floatingPopoverStyle({
       trigger: triggerEl.getBoundingClientRect(),
       viewportWidth: window.innerWidth,
@@ -116,170 +108,149 @@
     });
   }
 
-  function close(): void {
+  function close(restoreFocus = false): void {
     open = false;
     query = "";
     highlightIndex = 0;
+    if (restoreFocus) {
+      void tick().then(() => {
+        triggerEl?.querySelector<HTMLButtonElement>("button")?.focus();
+      });
+    }
   }
 
-  function selectFile(file: DiffFile): void {
+  function selectFile(file: DiffFile, restoreFocus = false): void {
     if (disabled) return;
     diff.requestScrollToFile(file.path);
-    close();
+    close(restoreFocus);
   }
 
   function handleInput(): void {
     highlightIndex = 0;
   }
 
+  async function scrollHighlightedOptionIntoView(): Promise<void> {
+    await tick();
+    menuEl
+      ?.querySelector<HTMLElement>(`#changed-file-option-${highlightIndex}`)
+      ?.scrollIntoView?.({ block: "nearest" });
+  }
+
+  function moveHighlight(nextIndex: number): void {
+    highlightIndex = nextIndex;
+    void scrollHighlightedOptionIntoView();
+  }
+
   function handleKeydown(event: KeyboardEvent): void {
     if (event.key === "ArrowDown") {
       event.preventDefault();
-      highlightIndex = Math.min(highlightIndex + 1, filteredFiles.length - 1);
+      moveHighlight(Math.min(highlightIndex + 1, filteredFiles.length - 1));
     } else if (event.key === "ArrowUp") {
       event.preventDefault();
-      highlightIndex = Math.max(highlightIndex - 1, 0);
+      moveHighlight(Math.max(highlightIndex - 1, 0));
     } else if (event.key === "Enter") {
       event.preventDefault();
       const selected = filteredFiles[highlightIndex];
-      if (selected) selectFile(selected);
+      if (selected) selectFile(selected, true);
     }
   }
 </script>
 
 <div class="file-jump" bind:this={pickerEl}>
-  <button
-    bind:this={triggerEl}
-    class="file-jump-trigger"
-    class:file-jump-trigger--active={open}
-    type="button"
-    aria-label="Jump to file"
-    aria-expanded={open}
-    title="Jump to file"
-    disabled={disabled || files.length === 0}
-    onclick={toggle}
-  >
-    <FileSearchIcon size={16} strokeWidth={1.9} aria-hidden="true" />
-  </button>
+  <span class="file-jump-trigger-anchor" bind:this={triggerEl}>
+    <IconButton
+      size="sm"
+      tone="info"
+      ariaLabel="Jump to file"
+      title="Jump to file"
+      ariaExpanded={open}
+      ariaHaspopup="listbox"
+      {...(open ? { ariaControls: "changed-files-listbox" } : {})}
+      ariaPressed={open}
+      disabled={disabled || files.length === 0}
+      onclick={toggle}
+    >
+      <FileSearchIcon size={16} strokeWidth={1.9} aria-hidden="true" />
+    </IconButton>
+  </span>
   {#if open}
-    <div class="file-jump-menu" bind:this={menuEl} style={menuStyle}>
-      <div class="file-jump-search">
-        <SearchIcon size={14} strokeWidth={1.8} aria-hidden="true" />
-        <input
-          bind:this={inputEl}
-          type="text"
-          role="searchbox"
-          aria-label="Jump to file"
-          placeholder="Jump to file"
-          autocomplete="off"
-          bind:value={query}
-          oninput={handleInput}
-          onkeydown={handleKeydown}
-        />
-      </div>
-      <!-- kit-ui-check-ignore: command-palette-style jump list with rich rows and active-file state, not a form dropdown -->
-      <div class="file-jump-list" role="listbox" aria-label="Changed files">
-        {#each filteredFiles as file, index (file.path)}
-          {@const dir = directory(file.path)}
-          <button
-            class="file-jump-option"
-            class:file-jump-option--active={file.path === activeFile}
-            class:file-jump-option--highlighted={index === highlightIndex}
-            type="button"
-            role="option"
-            aria-selected={file.path === activeFile}
-            disabled={disabled}
-            onmouseenter={() => {
-              highlightIndex = index;
-            }}
-            onclick={() => selectFile(file)}
-          >
-            <span class="file-jump-name">{fileName(file.path)}</span>
-            {#if dir}
-              <span class="file-jump-dir">{dir}</span>
-            {/if}
-          </button>
-        {:else}
-          <div class="file-jump-empty">No matching files</div>
-        {/each}
-      </div>
+    <div class="file-jump-menu" bind:this={menuEl} style={menuStyle} role="dialog" aria-label="Jump to file">
+      <Card level="default" padding="none" class="file-jump-menu-card">
+        <div class="file-jump-search">
+          <!-- kit-ui-check-ignore: command-style jump list needs active-file highlight and clear-before-close Escape, which form Typeahead does not expose -->
+          <SearchInput role="combobox"
+            bind:inputEl
+            bind:value={query}
+            size="sm"
+            block
+            ariaExpanded={open}
+            ariaControls="changed-files-listbox"
+            {...(filteredFiles.length > 0
+              ? { ariaActivedescendant: `changed-file-option-${highlightIndex}` }
+              : {})}
+            ariaAutocomplete="list"
+            ariaLabel="Jump to file"
+            placeholder="Jump to file"
+            oninput={handleInput}
+            onkeydown={handleKeydown}
+          />
+        </div>
+        <!-- kit-ui-check-ignore: same command-style picker exception as the combobox above; kit Typeahead cannot preserve its active-file keyboard contract -->
+        <div id="changed-files-listbox" class="file-jump-list" role="listbox" aria-label="Jump to file">
+          {#each filteredFiles as file, index (file.path)}
+            {@const dir = directory(file.path)}
+            <button
+              id={`changed-file-option-${index}`}
+              class="file-jump-option"
+              class:file-jump-option--active={file.path === activeFile}
+              class:file-jump-option--highlighted={index === highlightIndex}
+              type="button"
+              role="option"
+              aria-selected={file.path === activeFile}
+              disabled={disabled}
+              onmouseenter={() => {
+                highlightIndex = index;
+              }}
+              onclick={() => selectFile(file)}
+            >
+              <span class="file-jump-name">{fileName(file.path)}</span>
+              {#if dir}
+                <span class="file-jump-dir">{dir}</span>
+              {/if}
+            </button>
+          {:else}
+            <div class="file-jump-empty">No matching files</div>
+          {/each}
+        </div>
+      </Card>
     </div>
   {/if}
 </div>
 
 <style>
   .file-jump {
-    /* Local stacking only: the host and its fixed menu render inside the
-       diff toolbar's own stacking context, so this z competes only with
-       toolbar siblings — the menu's global order comes from the toolbar's
-       plane. That was equally true of the old 1200/2000 literals; they
-       never escaped the toolbar's context either. */
     position: relative;
     z-index: 10;
     flex-shrink: 0;
   }
 
-  .file-jump-trigger {
+  .file-jump-trigger-anchor {
     display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 28px;
-    height: 24px;
-    border: 1px solid var(--border-muted);
-    border-radius: var(--radius-sm);
-    color: var(--text-muted);
-    background: var(--bg-surface);
-  }
-
-  .file-jump-trigger:hover:not(:disabled),
-  .file-jump-trigger--active {
-    color: var(--accent-blue);
-    border-color: var(--accent-blue);
-  }
-
-  .file-jump-trigger:disabled {
-    cursor: default;
-    opacity: 0.45;
   }
 
   .file-jump-menu {
     position: fixed;
     z-index: var(--z-popover);
+  }
+
+  :global(.file-jump-menu-card) {
     max-height: min(520px, 70vh);
     overflow: hidden;
-    border: 1px solid var(--border-default);
-    border-radius: var(--radius-sm);
-    background: var(--bg-surface);
     box-shadow: var(--shadow-md);
-    padding: 2px;
   }
 
   .file-jump-search {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    height: 28px;
-    margin: 2px;
-    padding: 0 8px;
-    border: 1px solid var(--border-muted);
-    border-radius: var(--radius-sm);
-    background: var(--bg-inset);
-    color: var(--text-muted);
-  }
-
-  .file-jump-search input {
-    width: 100%;
-    min-width: 0;
-    border: 0;
-    outline: none;
-    background: transparent;
-    color: var(--text-primary);
-    font: inherit;
-    font-size: var(--font-size-xs);
-  }
-
-  .file-jump-search input::placeholder {
-    color: var(--text-muted);
+    margin: 4px;
   }
 
   .file-jump-list {

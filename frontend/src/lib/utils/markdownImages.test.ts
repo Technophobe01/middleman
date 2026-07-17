@@ -129,25 +129,51 @@ describe("expandMarkdownImages", () => {
     const closeButton = overlay?.querySelector<HTMLButtonElement>('button[aria-label="Close expanded image"]');
     expect(document.activeElement).toBe(overlay);
 
-    const tabFromOverlay = new KeyboardEvent("keydown", { bubbles: true, cancelable: true, key: "Tab" });
-    overlay?.dispatchEvent(tabFromOverlay);
-    expect(tabFromOverlay.defaultPrevented).toBe(true);
+    Object.defineProperty(closeButton, "offsetParent", {
+      configurable: true,
+      value: overlay,
+    });
+
+    const shiftTabFromOverlay = new KeyboardEvent("keydown", {
+      bubbles: true,
+      cancelable: true,
+      key: "Tab",
+      shiftKey: true,
+    });
+    overlay?.dispatchEvent(shiftTabFromOverlay);
+    expect(shiftTabFromOverlay.defaultPrevented).toBe(true);
     expect(document.activeElement).toBe(closeButton);
 
     const tabFromClose = new KeyboardEvent("keydown", { bubbles: true, cancelable: true, key: "Tab" });
     closeButton?.dispatchEvent(tabFromClose);
     expect(tabFromClose.defaultPrevented).toBe(true);
     expect(document.activeElement).toBe(closeButton);
+  });
 
-    const shiftTabFromClose = new KeyboardEvent("keydown", {
-      bubbles: true,
-      cancelable: true,
-      key: "Tab",
-      shiftKey: true,
-    });
-    closeButton?.dispatchEvent(shiftTabFromClose);
-    expect(shiftTabFromClose.defaultPrevented).toBe(true);
-    expect(document.activeElement).toBe(closeButton);
+  test("traps focus and scroll in the image owner's document", () => {
+    const iframe = document.createElement("iframe");
+    document.body.append(iframe);
+    const doc = iframe.contentDocument!;
+    doc.body.innerHTML = '<div class="markdown-body"><p><img src="/shots/frame.png" alt="Frame image"></p></div>';
+
+    try {
+      expandMarkdownImages(doc);
+      const opener = doc.querySelector<HTMLButtonElement>('button[aria-label="Open image in expanded view"]')!;
+      opener.focus();
+      opener.click();
+
+      const overlay = doc.querySelector<HTMLElement>(".markdown-image-lightbox");
+      expect(overlay).not.toBeNull();
+      expect(doc.activeElement).toBe(overlay);
+      expect(doc.body.style.overflow).toBe("hidden");
+      expect(document.body.style.overflow).toBe("");
+
+      overlay?.querySelector<HTMLButtonElement>('button[aria-label="Close expanded image"]')?.click();
+      expect(doc.body.style.overflow).toBe("");
+      expect(doc.activeElement).toBe(opener);
+    } finally {
+      iframe.remove();
+    }
   });
 
   test("lets the expanded image use the viewport instead of a fixed-height canvas", () => {
@@ -171,10 +197,10 @@ describe("expandMarkdownImages", () => {
     expect(panelStyle.get("border-radius")).toBe("0");
   });
 
-  test("places the expanded image overlay above shared modal layers", () => {
+  test("uses the shared overlay stacking token", () => {
     const overlayStyle = declarationsFor(".markdown-image-lightbox");
 
-    expect(Number(overlayStyle.get("z-index"))).toBeGreaterThan(94);
+    expect(overlayStyle.get("z-index")).toBe("var(--z-overlay)");
   });
 
   test("keeps the zoom affordance hidden until image hover or keyboard focus", () => {

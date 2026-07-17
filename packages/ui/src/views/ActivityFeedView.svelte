@@ -3,8 +3,7 @@
   import { getStackDepth } from "../stores/keyboard/modal-stack.svelte.js";
   import ActivityFeed from "../components/ActivityFeed.svelte";
   import CommitDiffPanel from "../components/CommitDiffPanel.svelte";
-  import { SidebarToggle } from "@kenn-io/kit-ui";
-  import { SplitResizeHandle } from "@kenn-io/kit-ui";
+  import { IconButton, SidebarToggle, SplitResizeHandle } from "@kenn-io/kit-ui";
   import type { SplitResizeEvent } from "@kenn-io/kit-ui";
   import type { PullRequestRouteRef } from "../routes.js";
   import PRListView from "./PRListView.svelte";
@@ -128,6 +127,11 @@
   // widening it restores the rail toward the requested width.
   const activityPaneWidth = $derived(
     clampActivityPaneWidth(requestedActivityPaneWidth),
+  );
+  const activityPaneAriaMax = $derived(
+    Number.isFinite(maxActivityPaneWidth)
+      ? maxActivityPaneWidth
+      : Math.max(minActivityPaneWidth, activityPaneWidth),
   );
 
   const controlled = $derived(
@@ -260,7 +264,7 @@
     event: SplitResizeEvent,
   ): void {
     requestedActivityPaneWidth = clampActivityPaneWidth(
-      activityResizeStartWidth + event.deltaX,
+      activityResizeStartWidth + event.delta,
     );
     persistActivityPaneWidth(requestedActivityPaneWidth);
   }
@@ -342,6 +346,10 @@
     <SplitResizeHandle
       class="activity-split-resize-handle"
       ariaLabel="Resize Activity rail"
+      orientation="horizontal"
+      ariaValueMin={minActivityPaneWidth}
+      ariaValueMax={activityPaneAriaMax}
+      ariaValueNow={activityPaneWidth}
       onResizeStart={handleActivityPaneResizeStart}
       onResize={handleActivityPaneResize}
     />
@@ -357,14 +365,13 @@
             {activeDrawer.owner}/{activeDrawer.name}#{activeDrawer.number}
           {/if}
         </span>
-        <button
-          class="activity-rail-close"
+        <IconButton
+          size="sm"
           onclick={handleClose}
-          title="Close Activity selection"
-          type="button"
+          ariaLabel="Close Activity selection"
         >
-          &times;
-        </button>
+          <span aria-hidden="true">&times;</span>
+        </IconButton>
       </div>
 
       {#if commitDrawer}
@@ -473,24 +480,6 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-  }
-
-  .activity-rail-close {
-    width: 22px;
-    height: 22px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    border: 1px solid var(--border-muted);
-    border-radius: var(--radius-sm);
-    color: var(--text-muted);
-    background: var(--bg-inset);
-  }
-
-  .activity-rail-close:hover {
-    color: var(--text-primary);
-    border-color: var(--border-default);
-    background: var(--bg-surface-hover);
   }
 
   .activity-detail {

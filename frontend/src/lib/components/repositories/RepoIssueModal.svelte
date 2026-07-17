@@ -1,11 +1,9 @@
 <script lang="ts">
-  import { onMount } from "svelte";
-  import { Button, Chip,
-    CommentEditor, } from "@middleman/ui";
-  import { pushModalFrame } from "@middleman/ui/stores/keyboard/modal-stack";
+  import { Checkbox, TextInput } from "@kenn-io/kit-ui";
+  import { Button, Chip, CommentEditor } from "@middleman/ui";
+  import Modal from "../shared/Modal.svelte";
   import {
     repoKey,
-    repoStateKey,
     shouldShowPlatformHost,
     type RepoSummaryCard,
   } from "./repoSummary.js";
@@ -39,44 +37,16 @@
   }: Props = $props();
 
   const key = $derived(repoKey(summary));
-  const stateKey = $derived(repoStateKey(summary));
-  const titleId = $derived(
-    `repo-issue-modal-title-${stateKey}`,
-  );
   const showPlatformHost = $derived(shouldShowPlatformHost(summary));
-
-  let titleInput = $state<HTMLInputElement | null>(null);
-
-  onMount(() => {
-    titleInput?.focus();
-  });
-
-  onMount(() => pushModalFrame("repo-issue-modal", []));
-
-  function handleWindowKeydown(event: KeyboardEvent): void {
-    if (event.key !== "Escape") return;
-    event.preventDefault();
-    oncancel();
-  }
 </script>
 
-<svelte:window onkeydown={handleWindowKeydown} />
-
-<div
-  class="issue-modal__backdrop"
-  role="presentation"
-  onclick={(event) => {
-    if (event.target === event.currentTarget) {
-      oncancel();
-    }
-  }}
+<Modal
+  open
+  ariaLabel={`New issue in ${key}`}
+  width={680}
+  frameId="repo-issue-modal"
+  onClose={oncancel}
 >
-  <div
-    class="issue-modal"
-    role="dialog"
-    aria-modal="true"
-    aria-labelledby={titleId}
-  >
     <form
       class="issue-modal__form"
       onsubmit={(event) => {
@@ -86,7 +56,7 @@
     >
       <header class="issue-modal__header">
         <div class="issue-modal__title-group">
-          <h2 id={titleId}>New issue in {key}</h2>
+          <h2>New issue in {key}</h2>
           {#if showPlatformHost}
             <Chip size="xs" tone="muted" uppercase={false}>
               {summary.platform_host}
@@ -101,14 +71,14 @@
       <div class="issue-modal__body">
         <label class="issue-modal__field">
           <span>Title</span>
-          <input
-            bind:this={titleInput}
-            type="text"
-            placeholder="Issue title"
+          <TextInput
+            class="issue-modal__title-input"
             value={title}
+            placeholder="Issue title"
+            ariaLabel="Issue title"
             disabled={submitting}
-            oninput={(event) =>
-              ontitlechange(event.currentTarget.value)}
+            autofocus
+            oninput={ontitlechange}
           />
         </label>
 
@@ -132,15 +102,13 @@
           <p class="issue-modal__error">{error}</p>
         {/if}
         {#if outcomeUnknown}
-          <label class="issue-modal__acknowledgement">
-            <input
-              type="checkbox"
-              onchange={(event) => {
-                if (event.currentTarget.checked) onacknowledgeoutcome();
-              }}
-            />
-            <span>I checked the issue list and want to retry.</span>
-          </label>
+          <Checkbox
+            class="issue-modal__acknowledgement"
+            label="I checked the issue list and want to retry."
+            onchange={(checked) => {
+              if (checked) onacknowledgeoutcome();
+            }}
+          />
         {/if}
       </div>
 
@@ -155,41 +123,27 @@
         </Button>
       </footer>
     </form>
-  </div>
-</div>
+</Modal>
 
 <style>
-  .issue-modal__backdrop {
-    position: fixed;
-    /* kit-ui-check-ignore: bottom-sheet placement on narrow viewports (media query below) — kit Modal only centers; revisit if kit grows a placement prop */
-    inset: 0;
-    z-index: 40;
-    display: grid;
-    place-items: center;
-    padding: 24px;
-    background: var(--overlay-bg);
+  :global(.kit-modal-panel:has(.issue-modal__form)) {
+    width: min(680px, calc(100vw - 24px));
+    max-height: min(720px, calc(100vh - 24px));
   }
 
-  .issue-modal {
-    width: min(680px, 100%);
-    max-height: min(720px, calc(100vh - 48px));
+  :global(.kit-modal-body:has(> .modal-scope > .issue-modal__form)) {
+    padding: 0;
     overflow: hidden;
-    border: 1px solid var(--border-default);
-    border-radius: var(--radius-lg);
-    background: var(--bg-surface);
-    box-shadow: var(--shadow-lg);
   }
 
   .issue-modal__form {
-    max-height: min(720px, calc(100vh - 48px));
+    max-height: min(720px, calc(100vh - 24px));
     display: grid;
     grid-template-rows: auto minmax(0, 1fr) auto;
   }
 
-  .issue-modal__acknowledgement {
-    display: flex;
+  :global(.issue-modal__acknowledgement.kit-checkbox) {
     align-items: flex-start;
-    gap: var(--space-2);
     color: var(--text-secondary);
   }
 
@@ -245,7 +199,7 @@
     font-weight: 600;
   }
 
-  .issue-modal__field input {
+  :global(.issue-modal__title-input.kit-text-input) {
     width: 100%;
   }
 
@@ -259,14 +213,15 @@
   }
 
   @media (max-width: 640px) {
-    .issue-modal__backdrop {
-      align-items: end;
-      padding: 12px;
+    :global(.kit-modal-overlay:has(.issue-modal__form)) {
+      align-items: flex-end;
     }
 
-    .issue-modal,
-    .issue-modal__form {
-      max-height: calc(100vh - 24px);
+    :global(.kit-modal-panel:has(.issue-modal__form)) {
+      width: 100%;
+      max-width: 100%;
+      max-height: calc(100dvh - 12px);
+      border-radius: var(--radius-lg) var(--radius-lg) 0 0;
     }
 
     .issue-modal__header {

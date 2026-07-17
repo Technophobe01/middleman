@@ -89,9 +89,8 @@ describe("Palette", () => {
     const dialog = screen.getByRole("dialog", {
       name: "Command palette",
     });
-    const input = dialog.querySelector(".palette-input");
-    expect(input).not.toBeNull();
-    await fireEvent.keyDown(input!, { key: "ArrowDown" });
+    const input = screen.getByRole("textbox", { name: "Search command palette" });
+    await fireEvent.keyDown(input, { key: "ArrowDown" });
     await rerender({});
     const preview = dialog.querySelector(".palette-preview");
     expect(preview).not.toBeNull();
@@ -111,9 +110,8 @@ describe("Palette", () => {
     const dialog = screen.getByRole("dialog", {
       name: "Command palette",
     });
-    const input = dialog.querySelector(".palette-input");
-    expect(input).not.toBeNull();
-    await fireEvent.keyDown(input!, { key: "ArrowUp" });
+    const input = screen.getByRole("textbox", { name: "Search command palette" });
+    await fireEvent.keyDown(input, { key: "ArrowUp" });
     await rerender({});
     const preview = dialog.querySelector(".palette-preview");
     expect(preview).not.toBeNull();
@@ -143,9 +141,8 @@ describe("Palette", () => {
     const dialog = screen.getByRole("dialog", {
       name: "Command palette",
     });
-    const input = dialog.querySelector(".palette-input");
-    expect(input).not.toBeNull();
-    await fireEvent.keyDown(input!, { key: "Enter" });
+    const input = screen.getByRole("textbox", { name: "Search command palette" });
+    await fireEvent.keyDown(input, { key: "Enter" });
     await rerender({});
     expect(ran).toBe(true);
     expect(screen.queryByRole("dialog", { name: "Command palette" })).toBeNull();
@@ -178,6 +175,38 @@ describe("Palette", () => {
     await rerender({});
     expect(ran).toBe(true);
     expect(screen.queryByRole("dialog", { name: "Command palette" })).toBeNull();
+  });
+
+  it("keeps focus claimed by a command after the palette closes", async () => {
+    const previous = document.createElement("button");
+    const destination = document.createElement("button");
+    document.body.append(previous, destination);
+    previous.focus();
+    registerScopedActions("test-focus-command", [
+      {
+        id: "test.focus",
+        label: "Focus destination",
+        scope: "global",
+        binding: null,
+        priority: 0,
+        when: trueWhen,
+        handler: () => destination.focus(),
+      },
+    ]);
+
+    try {
+      const { rerender } = render(Palette, { props: {} });
+      openPalette();
+      await rerender({});
+      await fireEvent.click(screen.getByRole("button", { name: /Focus destination/ }));
+      await rerender({});
+
+      await waitFor(() => expect(screen.queryByRole("dialog", { name: "Command palette" })).toBeNull());
+      expect(document.activeElement).toBe(destination);
+    } finally {
+      previous.remove();
+      destination.remove();
+    }
   });
 
   it("renders no Recently used header when localStorage is empty", async () => {
@@ -224,9 +253,8 @@ describe("Palette", () => {
     );
     expect(headersBefore).toContain("Recently used");
 
-    const input = dialog.querySelector(".palette-input");
-    expect(input).not.toBeNull();
-    await fireEvent.input(input!, { target: { value: "x" } });
+    const input = screen.getByRole("textbox", { name: "Search command palette" });
+    await fireEvent.input(input, { target: { value: "x" } });
     await rerender({});
     const headersAfter = Array.from(dialog.querySelectorAll(".palette-group-header")).map((el) => el.textContent ?? "");
     expect(headersAfter).not.toContain("Recently used");
@@ -324,9 +352,8 @@ describe("Palette", () => {
     openPalette();
     await rerender({ modeSearch });
     const dialog = screen.getByRole("dialog", { name: "Command palette" });
-    const input = dialog.querySelector(".palette-input");
-    expect(input).not.toBeNull();
-    await fireEvent.input(input!, { target: { value: "budget" } });
+    const input = screen.getByRole("textbox", { name: "Search command palette" });
+    await fireEvent.input(input, { target: { value: "budget" } });
     const list = dialog.querySelector<HTMLElement>(".palette-list");
     expect(list).not.toBeNull();
 
@@ -382,9 +409,8 @@ describe("Palette", () => {
     openPalette();
     await rerender(props);
     let dialog = screen.getByRole("dialog", { name: "Command palette" });
-    let input = dialog.querySelector(".palette-input");
-    expect(input).not.toBeNull();
-    await fireEvent.input(input!, { target: { value: "budget" } });
+    let input = screen.getByRole("textbox", { name: "Search command palette" });
+    await fireEvent.input(input, { target: { value: "budget" } });
     let list = dialog.querySelector<HTMLElement>(".palette-list");
     expect(list).not.toBeNull();
     await waitFor(() => expect(within(list!).getByText("Set monthly budget")).toBeTruthy());
@@ -394,9 +420,8 @@ describe("Palette", () => {
     openPalette();
     await rerender(props);
     dialog = screen.getByRole("dialog", { name: "Command palette" });
-    input = dialog.querySelector(".palette-input");
-    expect(input).not.toBeNull();
-    await fireEvent.input(input!, { target: { value: "budget" } });
+    input = screen.getByRole("textbox", { name: "Search command palette" });
+    await fireEvent.input(input, { target: { value: "budget" } });
     list = dialog.querySelector<HTMLElement>(".palette-list");
     expect(list).not.toBeNull();
     await waitFor(() => expect(within(list!).getByText("finance/budget.md")).toBeTruthy());

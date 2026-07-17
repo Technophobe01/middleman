@@ -1539,6 +1539,45 @@ test("messages narrow viewport hides facets while keeping search usable", async 
   }
 });
 
+test("messages keeps persisted pane geometry inside rendered bounds as the viewport narrows", async ({ page }) => {
+  const fixture = await startConfiguredMessagesFixture(page, "panebounds");
+
+  try {
+    await page.setViewportSize({ width: 700, height: 768 });
+    await page.addInitScript(() => localStorage.setItem("middleman:messagesLayout/v1", "900"));
+    await page.goto(`${fixture.server.info.base_url}/messages?q=project`);
+
+    const wrapper = page.locator(".messages-sash-wrapper");
+    const listPane = page.locator(".messages-pane-list");
+    const detailPane = page.locator(".messages-pane-detail");
+    const separator = page.getByRole("separator", { name: "Resize messages message list" });
+    await expect(listPane).toBeVisible({ timeout: 8_000 });
+
+    await expect.poll(async () => Math.round((await listPane.boundingBox())?.width ?? 0)).toBe(376);
+    await expect(separator).toHaveAttribute("aria-valuenow", "376");
+    await expect.poll(() => page.evaluate(() => localStorage.getItem("middleman:messagesLayout/v1"))).toBe("376");
+
+    await page.setViewportSize({ width: 500, height: 768 });
+
+    await expect.poll(async () => Math.round((await listPane.boundingBox())?.width ?? 0)).toBe(176);
+    await expect(separator).toHaveAttribute("aria-valuemin", "176");
+    await expect(separator).toHaveAttribute("aria-valuemax", "176");
+    await expect(separator).toHaveAttribute("aria-valuenow", "176");
+    await expect.poll(async () => Math.round((await detailPane.boundingBox())?.width ?? 0)).toBeGreaterThanOrEqual(320);
+    await expect
+      .poll(async () => {
+        const wrapperWidth = (await wrapper.boundingBox())?.width ?? 0;
+        const listWidth = (await listPane.boundingBox())?.width ?? 0;
+        const detailWidth = (await detailPane.boundingBox())?.width ?? 0;
+        return Math.round(listWidth + detailWidth + 4 - wrapperWidth);
+      })
+      .toBeLessThanOrEqual(0);
+    await expect.poll(() => page.evaluate(() => localStorage.getItem("middleman:messagesLayout/v1"))).toBe("176");
+  } finally {
+    await fixture.stop();
+  }
+});
+
 test("messages quick views apply saved-view queries through the real workspace", async ({ page }) => {
   const fixture = await startConfiguredMessagesFixture(page, "quickviews");
 
@@ -1974,7 +2013,8 @@ test("message links a message to an external Kata task and refreshes linked mess
     await page.getByRole("button", { name: "Link to task" }).click();
     const dialog = page.getByRole("dialog", { name: "Link to task" });
     await expect(dialog).toBeVisible();
-    await dialog.getByLabel("Search tasks").fill("q3");
+    await dialog.getByRole("button", { name: "Title or qualified ID..." }).click();
+    await dialog.getByRole("combobox", { name: "Title or qualified ID..." }).fill("q3");
     await dialog.getByRole("option", { name: /Kata#kat-7.*Email Susan re: Q3/ }).click();
     await dialog.getByRole("button", { name: "Link", exact: true }).click();
 

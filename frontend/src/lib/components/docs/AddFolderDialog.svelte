@@ -3,6 +3,7 @@
   import FolderIcon from "@lucide/svelte/icons/folder";
   import FolderOpen from "@lucide/svelte/icons/folder-open";
   import RefreshCw from "@lucide/svelte/icons/refresh-cw";
+  import { Button, Card, Checkbox, IconButton, TextInput } from "@kenn-io/kit-ui";
   import { SelectDropdown } from "@middleman/ui";
   import { showFlash } from "@middleman/ui/stores/flash";
   import Modal from "../shared/Modal.svelte";
@@ -169,9 +170,9 @@
   >
     <label class="modal-field">
       <span>Folder path</span>
-      <input
-        type="text"
+      <TextInput
         bind:value={path}
+        block
         placeholder="~/Notes"
         disabled={saving}
       />
@@ -190,43 +191,37 @@
       </label>
     {/if}
 
-    <div class="picker" aria-label="Folder browser">
+    <Card class="docs-folder-picker" level="inset" padding="none" ariaLabel="Folder browser">
       <div class="picker-head">
-        <button
-          type="button"
-          class="picker-btn"
+        <IconButton
+          size="sm"
           onclick={navigateUp}
           disabled={!parent || loadingBrowse}
-          aria-label="Go up"
-          title="Go up"
+          ariaLabel="Go up"
         >
           <ArrowUp size={13} strokeWidth={2} />
-        </button>
+        </IconButton>
         <span class="picker-path" title={browsePath}>
           {browsePath || "Loading…"}
         </span>
-        <button
-          type="button"
-          class="picker-btn"
+        <IconButton
+          size="sm"
           onclick={refresh}
           disabled={loadingBrowse}
-          aria-label="Refresh"
-          title="Refresh"
+          ariaLabel="Refresh"
         >
           <RefreshCw size={13} strokeWidth={2} />
-        </button>
-        <button
-          type="button"
-          class="picker-use"
+        </IconButton>
+        <Button
+          size="sm"
           onclick={useCurrentFolder}
           disabled={loadingBrowse || !browsePath}
         >
           Use this folder
-        </button>
+        </Button>
       </div>
 
-      <!-- kit-ui-check-ignore: directory browser (navigate-into-subfolder rows inside a dialog), not a dropdown -->
-      <ul class="picker-list" role="listbox" aria-label="Subfolders">
+      <ul class="picker-list" aria-label="Subfolders">
         {#if browseError}
           <li class="picker-msg error">{browseError}</li>
         {:else if loadingBrowse && entries.length === 0}
@@ -273,37 +268,39 @@
       </ul>
 
       {#if hiddenCount > 0}
-        <label class="picker-hidden-toggle">
-          <input type="checkbox" bind:checked={showHidden} />
-          <span>Show hidden ({hiddenCount})</span>
-        </label>
+        <Checkbox
+          class="picker-hidden-toggle"
+          bind:checked={showHidden}
+          label={`Show hidden (${hiddenCount})`}
+        />
       {/if}
-    </div>
+    </Card>
 
-    <button
-      type="button"
+    <Button
       class="advanced-toggle"
+      size="sm"
+      surface="soft"
       onclick={() => (showAdvanced = !showAdvanced)}
-      aria-expanded={showAdvanced}
+      ariaExpanded={showAdvanced}
     >
       {showAdvanced ? "Hide" : "Show"} advanced options
-    </button>
+    </Button>
 
     {#if showAdvanced}
       <label class="modal-field">
         <span>Display name (optional)</span>
-        <input
-          type="text"
+        <TextInput
           bind:value={name}
+          block
           placeholder="(defaults to folder name)"
           disabled={saving}
         />
       </label>
       <label class="modal-field">
         <span>Folder id (optional)</span>
-        <input
-          type="text"
+        <TextInput
           bind:value={id}
+          block
           placeholder="(defaults to folder name, lowercased)"
           disabled={saving}
         />
@@ -318,12 +315,10 @@
     {/if}
 
     <div class="modal-actions">
-      <button type="button" class="toolbar-btn" onclick={onClose} disabled={saving}>
-        Cancel
-      </button>
-      <button type="submit" class="toolbar-btn primary" disabled={saving || !path.trim()}>
+      <Button onclick={onClose} disabled={saving}>Cancel</Button>
+      <Button type="submit" tone="info" surface="solid" disabled={saving || !path.trim()}>
         {saving ? "Adding…" : "Add folder"}
-      </button>
+      </Button>
     </div>
   </form>
 </Modal>
@@ -349,21 +344,6 @@
     letter-spacing: 0.05em;
   }
 
-  .modal-field input {
-    width: 100%;
-    padding: 6px 8px;
-    border: 1px solid var(--border-default);
-    border-radius: var(--radius-sm);
-    background: var(--bg-input);
-    color: var(--text-primary);
-    font-size: var(--font-size-sm);
-  }
-
-  .modal-field input:focus {
-    outline: none;
-    border-color: var(--border-focus);
-  }
-
   .modal-field :global(.kit-select-dropdown) {
     width: 100%;
     min-width: 0;
@@ -375,10 +355,7 @@
     font-weight: 400;
   }
 
-  .picker {
-    border: 1px solid var(--border-default);
-    border-radius: var(--radius-md);
-    background: var(--bg-input);
+  :global(.docs-folder-picker) {
     overflow: hidden;
   }
 
@@ -401,48 +378,6 @@
     text-overflow: ellipsis;
     direction: rtl;
     text-align: left;
-  }
-
-  .picker-btn {
-    width: 22px;
-    height: 22px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    border-radius: var(--radius-sm);
-    color: var(--text-muted);
-    border: none;
-    background: none;
-    cursor: pointer;
-  }
-
-  .picker-btn:hover:not(:disabled) {
-    background: var(--bg-surface-hover);
-    color: var(--text-primary);
-  }
-
-  .picker-btn:disabled {
-    opacity: 0.4;
-    cursor: not-allowed;
-  }
-
-  .picker-use {
-    padding: 3px 8px;
-    font-size: var(--font-size-xs);
-    border-radius: var(--radius-sm);
-    border: 1px solid var(--border-default);
-    background: var(--bg-surface);
-    color: var(--text-primary);
-    cursor: pointer;
-  }
-
-  .picker-use:hover:not(:disabled) {
-    background: var(--bg-surface-hover);
-  }
-
-  .picker-use:disabled {
-    opacity: 0.4;
-    cursor: not-allowed;
   }
 
   .picker-list {
@@ -513,29 +448,21 @@
     color: var(--text-error, #cf222e);
   }
 
-  .picker-hidden-toggle {
-    display: flex;
-    align-items: center;
-    gap: 6px;
+  :global(.picker-hidden-toggle) {
+    width: 100%;
+    box-sizing: border-box;
     padding: 6px 10px;
-    font-size: var(--font-size-xs);
-    color: var(--text-muted);
     border-top: 1px solid var(--border-default);
     background: var(--bg-surface);
   }
 
-  .advanced-toggle {
-    align-self: flex-start;
-    border: none;
-    background: none;
+  :global(.picker-hidden-toggle .kit-checkbox__label) {
     color: var(--text-muted);
     font-size: var(--font-size-xs);
-    cursor: pointer;
-    padding: 2px 0;
   }
 
-  .advanced-toggle:hover {
-    color: var(--text-primary);
+  :global(.advanced-toggle) {
+    align-self: flex-start;
   }
 
   .modal-hint {

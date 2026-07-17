@@ -172,6 +172,84 @@ test.describe("repository summaries", () => {
     ).toBeVisible();
   });
 
+  test("anchors the new issue dialog to the bottom of a phone viewport", async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.goto("/repos");
+
+    const widgetsCard = page
+      .locator(".repo-card")
+      .filter({ has: page.getByRole("button", { name: /acme\s*\/\s*widgets/ }) })
+      .first();
+    await widgetsCard.waitFor({ state: "visible", timeout: 10_000 });
+    await widgetsCard.getByRole("button", { name: "New issue" }).click();
+
+    const dialog = page.getByRole("dialog", { name: "New issue in acme/widgets" });
+    await expect(dialog).toBeVisible();
+    await expect(dialog.getByRole("heading", { name: "New issue in acme/widgets" })).toBeVisible();
+    await expect(dialog.getByRole("button", { name: "Create issue" })).toBeVisible();
+
+    const box = await dialog.boundingBox();
+    expect(box).not.toBeNull();
+    expect(Math.abs(844 - (box!.y + box!.height))).toBeLessThanOrEqual(2);
+  });
+
+  test("stacks the repository toolbar before its controls overflow", async ({ page }) => {
+    await page.setViewportSize({ width: 940, height: 900 });
+    await page.goto("/repos");
+    await page.locator(".repo-page__toolbar").waitFor({ state: "visible" });
+
+    const narrow = await page.evaluate(() => {
+      const toolbar = document.querySelector<HTMLElement>(".repo-page__toolbar");
+      const search = document.querySelector<HTMLElement>(".repo-page__search");
+      const filters = document.querySelector<HTMLElement>(".repo-page__filters");
+      const sort = document.querySelector<HTMLElement>(".repo-page__sort");
+      if (!toolbar || !search || !filters || !sort) return null;
+      const toolbarRect = toolbar.getBoundingClientRect();
+      const searchRect = search.getBoundingClientRect();
+      const filtersRect = filters.getBoundingClientRect();
+      const sortRect = sort.getBoundingClientRect();
+      return {
+        overflowX: toolbar.scrollWidth - toolbar.clientWidth,
+        searchBottom: searchRect.bottom,
+        filtersTop: filtersRect.top,
+        sortTop: sortRect.top,
+        sortRight: sortRect.right,
+        toolbarRight: toolbarRect.right,
+      };
+    });
+    expect(narrow).not.toBeNull();
+    expect(narrow!.overflowX).toBeLessThanOrEqual(1);
+    expect(narrow!.filtersTop).toBeGreaterThanOrEqual(narrow!.searchBottom);
+    expect(narrow!.sortTop).toBeGreaterThan(narrow!.filtersTop);
+    expect(narrow!.sortRight).toBeLessThanOrEqual(narrow!.toolbarRight + 1);
+
+    await page.setViewportSize({ width: 961, height: 900 });
+    const wide = await page.evaluate(() => {
+      const toolbar = document.querySelector<HTMLElement>(".repo-page__toolbar");
+      const search = document.querySelector<HTMLElement>(".repo-page__search");
+      const filters = document.querySelector<HTMLElement>(".repo-page__filters");
+      const sort = document.querySelector<HTMLElement>(".repo-page__sort");
+      if (!toolbar || !search || !filters || !sort) return null;
+      const toolbarRect = toolbar.getBoundingClientRect();
+      const searchRect = search.getBoundingClientRect();
+      const filtersRect = filters.getBoundingClientRect();
+      const sortRect = sort.getBoundingClientRect();
+      return {
+        overflowX: toolbar.scrollWidth - toolbar.clientWidth,
+        searchTop: searchRect.top,
+        filtersTop: filtersRect.top,
+        sortTop: sortRect.top,
+        sortRight: sortRect.right,
+        toolbarRight: toolbarRect.right,
+      };
+    });
+    expect(wide).not.toBeNull();
+    expect(wide!.overflowX).toBeLessThanOrEqual(1);
+    expect(Math.abs(wide!.filtersTop - wide!.searchTop)).toBeLessThanOrEqual(1);
+    expect(Math.abs(wide!.sortTop - wide!.searchTop)).toBeLessThanOrEqual(1);
+    expect(wide!.sortRight).toBeLessThanOrEqual(wide!.toolbarRight + 1);
+  });
+
   test("keeps an issue draft retryable after the first request is interrupted", async ({ page }) => {
     const server = await startIsolatedE2EServer();
     try {

@@ -1,5 +1,10 @@
 <script lang="ts">
-  import { copyToClipboard, SearchInput } from "@kenn-io/kit-ui";
+  import {
+    copyToClipboard,
+    SearchInput,
+    StatusDot,
+    type StatusDotStatus,
+  } from "@kenn-io/kit-ui";
   import { onMount, tick } from "svelte";
   import { navigate } from "../../stores/router.svelte.ts";
   import GitBranchIcon from "@lucide/svelte/icons/git-branch";
@@ -553,10 +558,18 @@
     );
   }
 
-  function statusDotClass(ws: Workspace): string {
-    if (ws.status === "ready") return "daemon-dot ready";
-    if (ws.status === "error") return "daemon-dot error";
-    return "daemon-dot pending";
+  function workspaceStatus(ws: Workspace): StatusDotStatus {
+    if (ws.status === "ready") return "idle";
+    if (ws.status === "creating") return "working";
+    if (ws.status === "error") return "unclean";
+    return "stale";
+  }
+
+  function workspaceStatusLabel(ws: Workspace): string {
+    if (ws.status === "ready") return "Workspace ready";
+    if (ws.status === "creating") return "Creating workspace";
+    if (ws.status === "error") return "Workspace error";
+    return `Workspace ${ws.status}`;
   }
 
   function workingTitle(ws: Workspace): string {
@@ -767,7 +780,6 @@
   }
 
   function workspaceBusyLabel(ws: Workspace): string {
-    if (workspaceActionsDisabled(ws)) return "Deleting workspace";
     if (!workspaceActionMatches(ws)) return "";
     if (workspaceAction?.action === "push") return "Pushing branch";
     if (workspaceAction?.action === "pull") return "Pulling branch";
@@ -1131,24 +1143,16 @@
           >
             <div class="ws-row-text">
               <div class="ws-row-title">
-                <span
-                  class={statusDotClass(ws)}
-                  class:spinning={ws.status === "creating"}
-                  aria-hidden="true"
-                ></span>
+                <StatusDot
+                  status={workspaceStatus(ws)}
+                  label={workspaceStatusLabel(ws)}
+                  size={6}
+                />
                 <span class="ws-name">{displayName(ws)}</span>
                 {#if ws.tmux_working}
-                  <span
-                    class="working-pulse"
-                    title={workingTitle(ws)}
-                    aria-label={workingTitle(ws)}
-                  ></span>
-                {:else if workspaceActionMatches(ws) || workspaceActionsDisabled(ws)}
-                  <span
-                    class="working-pulse"
-                    title={workspaceBusyLabel(ws)}
-                    aria-label={workspaceBusyLabel(ws)}
-                  ></span>
+                  <StatusDot status="working" label={workingTitle(ws)} size={6} />
+                {:else if workspaceActionMatches(ws)}
+                  <StatusDot status="working" label={workspaceBusyLabel(ws)} size={6} />
                 {/if}
               </div>
               <div class="ws-row-meta">
@@ -1688,39 +1692,6 @@
     min-width: 0;
   }
 
-  .daemon-dot {
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    flex-shrink: 0;
-  }
-
-  .daemon-dot.ready {
-    background: var(--accent-green);
-  }
-
-  .daemon-dot.error {
-    background: var(--accent-red);
-  }
-
-  .daemon-dot.pending {
-    background: var(--accent-amber);
-  }
-
-  .daemon-dot.spinning {
-    animation: pulse 1.2s ease-in-out infinite;
-  }
-
-  @keyframes pulse {
-    0%,
-    100% {
-      opacity: 1;
-    }
-    50% {
-      opacity: 0.3;
-    }
-  }
-
   .ws-name {
     flex: 1;
     min-width: 0;
@@ -1738,27 +1709,6 @@
     font-weight: 600;
   }
 
-  .working-pulse {
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: var(--accent-amber);
-    box-shadow: 0 0 6px color-mix(in srgb, var(--accent-amber) 70%, transparent);
-    animation: workingBlink 1.4s ease-in-out infinite;
-    flex-shrink: 0;
-  }
-
-  @keyframes workingBlink {
-    0%,
-    100% {
-      opacity: 1;
-      transform: scale(1);
-    }
-    50% {
-      opacity: 0.45;
-      transform: scale(0.8);
-    }
-  }
 
   .repo-context {
     /* Flat sorts drop the per-repo group headers, so each row

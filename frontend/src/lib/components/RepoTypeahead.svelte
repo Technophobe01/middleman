@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { Card } from "@kenn-io/kit-ui";
   import { onMount, tick } from "svelte";
   import {
     canonicalRepoFilterValue,
@@ -338,7 +339,7 @@
       aria-label="Filter repos"
       autocomplete="off"
     />
-    <!-- kit-ui-check-ignore: grouped provider tree with expand/collapse + cheatsheet-registered keys; kit Typeahead is flat (kit-ui#t662) -->
+    <!-- kit-ui-check-ignore: checkable provider tree owns tri-state multi-selection, All repos, persistent expansion, and provider-host-qualified identity; kit Typeahead is single-select -->
     <ul class="typeahead-list kit-popover-card" role="listbox" onmousedown={preventBlur}>
       <li
         class="typeahead-option"
@@ -378,7 +379,13 @@
       {/each}
     </ul>
   {:else}
-    <button class="typeahead-trigger" onclick={openDropdown} title="Select repository">
+    <Card
+      class="typeahead-trigger"
+      level="inset"
+      padding="none"
+      ariaLabel={`Select repository: ${displayValue}`}
+      onclick={openDropdown}
+    >
       <span class="typeahead-value">{displayValue}</span>
       <ChevronDownIcon
         class="typeahead-chevron"
@@ -386,7 +393,7 @@
         strokeWidth="2"
         aria-hidden="true"
       />
-    </button>
+    </Card>
   {/if}
 </div>
 
@@ -397,25 +404,20 @@
     max-width: 260px;
   }
 
-  .typeahead-trigger {
+  :global(.typeahead-trigger.kit-card) {
     height: 26px;
     width: 100%;
-    display: flex;
-    align-items: center;
     gap: 4px;
     padding: 0 8px;
-    background: var(--bg-inset);
-    border: 1px solid var(--border-muted);
-    border-radius: var(--radius-sm);
     font-size: var(--font-size-xs);
     color: var(--text-secondary);
-    cursor: pointer;
-    transition: border-color 0.15s;
-    text-align: left;
   }
 
-  .typeahead-trigger:hover {
-    border-color: var(--border-default);
+  :global(.typeahead-trigger .kit-card__body) {
+    display: flex;
+    width: 100%;
+    align-items: center;
+    gap: 4px;
   }
 
   .typeahead-value {

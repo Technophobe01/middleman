@@ -109,9 +109,11 @@ prebundled: keep it in vite `optimizeDeps.exclude` with transitive deps as
   use the viewport edge (`frontend/src/App.svelte:968`).
 
 `kit-ui-check` gates at zero findings in both `make frontend-check` and the
-Vite+ `frontend-check` task behind CI's `vp run -w check`. Suppress only
-with a per-line `kit-ui-check-ignore` (same line or the line above) that
-states a reason.
+Vite+ `frontend-check` task behind CI's `vp run -w check`. If a rule mistakes
+application-owned UI for component debt, fix the rule rather than expanding
+kit-ui or adding an ignore solely to silence the checker. New kit-ui behavior
+requires an independently justified, reusable contract; checker cleanliness
+alone is never justification.
 
 ## Shared primitives
 
@@ -186,19 +188,34 @@ Use it inside left sidebar headers and collapsed strips. Pass a specific label s
 
 ### GroupedSidebarSection
 
-Use `GroupedSidebarSection` for collapsible groups in PR, issue, and workspace list rails. Keep group chrome and the `--sidebar-*` surface/row-state tokens shared; domain-specific row content stays with its owner. Wrap large always-visible vertical scroll panes (list rails, diff area, pull/issue detail, activity views) in `ScrollBox` so the floating scroll indicator overlays content and sticky headers, appears only during scrolling, and does not reserve a permanent gutter; bind `viewport` when a host needs imperative scroll logic, and note the scrolling element is the viewport, not the host's content wrapper class. Give each scroll area a concise accessible label so keyboard users can identify and scroll the region. (`packages/ui/src/components/shared/GroupedSidebarSection.svelte`, `packages/ui/src/components/shared/ScrollBox.svelte`, `frontend/src/app.css:39`)
+Use `GroupedSidebarSection` for collapsible groups in PR, issue, and workspace list rails. Keep group chrome and the `--sidebar-*` surface/row-state tokens shared; domain-specific row content stays with its owner. Wrap large always-visible vertical scroll panes (list rails, diff area, pull/issue detail, activity views) in `ScrollBox` for consistent flex sizing, native vertical scrolling, and a labelled focusable region; bind `viewport` when a host needs imperative scroll logic, and note the scrolling element is the viewport, not the host's content wrapper class. Give each scroll area a concise accessible label so keyboard users can identify and scroll the region. (`packages/ui/src/components/shared/GroupedSidebarSection.svelte`, `ScrollBox` from `@kenn-io/kit-ui` — see kit-ui's `docs/components/scroll-box.md`, `frontend/src/app.css:39`)
 
-### SplitResizeHandle
+### SplitResizeHandle and BottomDock
 
-Use kit-ui's `SplitResizeHandle` (re-exported from `@middleman/ui`) for draggable pane dividers in split views.
+Use kit-ui `SplitResizeHandle` for horizontal and vertical pane dividers,
+including handles inside application-owned recursive trees. The app retains
+tree topology, ratio/size bounds, state, and persistence; the shared handle owns
+pointer/keyboard interaction and separator semantics. Pass a specific label
+such as `Resize Activity rail`.
 
-Intent:
+Use kit-ui `BottomDock` for resizable inline bottom panels. The app owns whether
+the dock is open plus its domain header/body/footer content; the shared dock
+owns shell geometry, top-edge resizing, bounds, close control, and body
+scrolling.
 
-- one shared drag lifecycle, keyboard resize behavior, hit target, cursor, focus, and hover treatment
-- keep pane-specific width bounds and direction math in the owning layout
-- avoid one-off splitter handles in sidebars, drawers, terminal panes, and diff views
+### Styling shared components
 
-Use it between resizable panes. Pass a specific accessible label such as `Resize Activity rail` or `Resize file tree`.
+Treat component props, documented CSS custom properties, and the shared root
+class as the supported styling contract. Prefer wrapping a component with an
+application layout element or setting a public custom property over reaching
+into child markup.
+
+An inner selector such as `.kit-typeahead__trigger` or
+`.kit-checkbox__label` is allowed only when the installed component has no
+public hook for a required application layout, the dependency is pinned, and
+the affected computed layout or interaction has browser coverage. Keep such
+selectors scoped below an application-owned class; never use an unscoped
+global override. Re-audit these selectors whenever the kit-ui revision moves.
 
 ### TabbedPanelTree
 
@@ -332,6 +349,9 @@ Responsive layout work should separate presentation mode from sizing mode.
 - Use phone/mobile sizing only for phone-like contexts, such as coarse pointer, mobile user agent, or explicit force-mobile test paths.
 - Do not use one broad "phone viewport" predicate for both decisions. That makes desktop-narrow windows inherit oversized mobile typography, action grids, and touch-only geometry.
 - When a compact canonical route reuses focus presentation, keep desktop-scale tokens unless the environment is phone-like.
+- Shared breakpoints are defaults, not overflow overrides: max-content toolbars
+  must stack at the first width that contains their controls, with the boundary
+  pinned by browser geometry (`frontend/src/lib/components/repositories/RepoSummaryPage.svelte::.repo-page__toolbar`).
 
 Before adding UI styling:
 

@@ -133,7 +133,7 @@ export type { FilterDropdownItem, FilterDropdownSection } from "@kenn-io/kit-ui"
 export { SelectDropdown } from "@kenn-io/kit-ui";
 export type { SelectDropdownOption } from "@kenn-io/kit-ui";
 export { SplitResizeHandle } from "@kenn-io/kit-ui";
-export type { SplitResizeEvent } from "@kenn-io/kit-ui";
+export type { SplitResizeEvent, SplitResizeOrientation } from "@kenn-io/kit-ui";
 export { default as TabbedPanelTree } from "./components/shared/TabbedPanelTree.svelte";
 export {
   clearActiveTabbedPanelDrag,
@@ -162,6 +162,7 @@ export type {
   TabbedPanelLeaf,
   TabbedPanelNode,
   TabbedPanelSplit,
+  TabbedPanelStatus,
   TabbedPanelSplitEdge,
 } from "./components/shared/tabbed-panel-layout.js";
 export { default as WorkspaceRightSidebar } from "./components/workspace/WorkspaceRightSidebar.svelte";

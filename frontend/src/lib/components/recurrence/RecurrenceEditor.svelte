@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { Checkbox } from "@kenn-io/kit-ui";
   import { SelectDropdown } from "@middleman/ui";
   import type {
     KataCreateRecurrenceInput,
@@ -604,11 +605,12 @@
                    disabled={dayInMonthMode !== "dayOfMonth" || dayInMonthLastDay} />
             of the month
           </label>
-          <label class="last-day">
-            <input type="checkbox" bind:checked={dayInMonthLastDay}
-                   disabled={dayInMonthMode !== "dayOfMonth"} />
-            Last day of month
-          </label>
+          <Checkbox
+            class="last-day"
+            bind:checked={dayInMonthLastDay}
+            disabled={dayInMonthMode !== "dayOfMonth"}
+            label="Last day of month"
+          />
           <label>
             <input type="radio" name="monthlyMode" value="nthWeekday"
                    checked={dayInMonthMode === "nthWeekday"}

@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onDestroy } from "svelte";
+  import { Card } from "@kenn-io/kit-ui";
   import {
     EditorView,
     keymap,
@@ -173,15 +174,24 @@
   }
 </script>
 
-<div class="editor-host" bind:this={host}></div>
+<Card level="default" padding="none" class="editor-card">
+  <div class="editor-host" bind:this={host}></div>
+</Card>
 
 <style>
+  :global(.editor-card) {
+    height: 100%;
+    overflow: hidden;
+  }
+
+  :global(.editor-card > .kit-card__body) {
+    flex: 1;
+    min-height: 0;
+  }
+
   .editor-host {
     height: 100%;
     overflow: hidden;
-    border: 1px solid var(--border-muted);
-    border-radius: var(--radius-md);
-    background: var(--bg-surface);
   }
 
   .editor-host :global(.cm-editor) {

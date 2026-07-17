@@ -24,8 +24,13 @@
   import { moveTaskListItem, toggleTaskListItem } from "../../utils/task-list.js";
   import type { ApplySuggestionRequest } from "../../utils/markdown-suggestions.js";
   import { firstUnavailableGate, operationGate } from "./operation-gates.js";
-  import { CopyButton, formatRelativeTime } from "@kenn-io/kit-ui";
-  import { copyToClipboard } from "@kenn-io/kit-ui";
+  import {
+    Card,
+    CopyButton,
+    copyToClipboard,
+    formatRelativeTime,
+    StatusDot,
+  } from "@kenn-io/kit-ui";
   import EventTimeline from "./EventTimeline.svelte";
   import DetailActivityViewMenu from "./DetailActivityViewMenu.svelte";
   import CommentBox from "./CommentBox.svelte";
@@ -1650,8 +1655,8 @@
 
       {#if detailStore.isStaleRefreshing()}
         <div class="refresh-banner">
-          <span class="sync-dot"></span>
-          Refreshing...
+          <StatusDot status="working" label="Refreshing pull request details" size={5} />
+          <span aria-hidden="true">Refreshing...</span>
         </div>
       {/if}
       <!-- Header -->
@@ -1898,9 +1903,6 @@
           {/snippet}
         </UserListEditor>
         {#if labelPickerOpen}
-          {#if labelPickerLaunchedFromActionMenu}
-            <div class="label-editor-backdrop" aria-hidden="true"></div>
-          {/if}
           <!-- Escape precedence: a non-empty filter claims Escape to clear itself
                (kit SearchInput stops propagation); only an empty-field Escape
                bubbles here and dismisses the picker. -->
@@ -2440,24 +2442,26 @@
               title="Copy to clipboard"
               copiedTitle="Copied!"
             />
-            <!-- svelte-ignore a11y_click_events_have_key_events -->
-            <!-- svelte-ignore a11y_no_static_element_interactions -->
-            <div
-              class="inset-box markdown-body"
-              class:dragging={dragSourceIndex !== null}
-              onclick={onBodyClick}
-              ondragstart={onBodyDragStart}
-              ondragover={onBodyDragOver}
-              ondragleave={onBodyDragLeave}
-              ondrop={onBodyDrop}
-              ondragend={onBodyDragEnd}
-            >
-              {#await renderMarkdown(pr.Body, { provider, platformHost, owner, name, repoPath }, { interactiveTasks: capabilities.state_mutation && !contentGate.unavailable })}
-                {@html renderMarkdownSync(pr.Body, { provider, platformHost, owner, name, repoPath })}
-              {:then html}
-                {@html html}
-              {/await}
-            </div>
+            <Card level="inset" padding="none" class="inset-box">
+              <!-- svelte-ignore a11y_click_events_have_key_events -->
+              <!-- svelte-ignore a11y_no_static_element_interactions -->
+              <div
+                class="inset-box__content markdown-body"
+                class:dragging={dragSourceIndex !== null}
+                onclick={onBodyClick}
+                ondragstart={onBodyDragStart}
+                ondragover={onBodyDragOver}
+                ondragleave={onBodyDragLeave}
+                ondrop={onBodyDrop}
+                ondragend={onBodyDragEnd}
+              >
+                {#await renderMarkdown(pr.Body, { provider, platformHost, owner, name, repoPath }, { interactiveTasks: capabilities.state_mutation && !contentGate.unavailable })}
+                  {@html renderMarkdownSync(pr.Body, { provider, platformHost, owner, name, repoPath })}
+                {:then html}
+                  {@html html}
+                {/await}
+              </div>
+            </Card>
           </div>
         {:else if capabilities.state_mutation && !stalePR}
           <button
@@ -2619,14 +2623,6 @@
   .label-editor-popover {
     position: fixed;
     z-index: 60;
-  }
-
-  .label-editor-backdrop {
-    position: fixed;
-    /* kit-ui-check-ignore: dimmed click-catcher behind the label-editor popover, not a dialog surface */
-    inset: 0;
-    z-index: 55;
-    background: var(--overlay-bg);
   }
 
   .detail-header {
@@ -3195,13 +3191,14 @@
     opacity: 1;
   }
 
-  .inset-box {
+  :global(.inset-box) {
+    overflow: hidden;
+  }
+
+  .inset-box__content {
+    padding: 10px 12px;
     font-size: var(--font-size-root);
     color: var(--text-primary);
-    background: var(--bg-inset);
-    border: 1px solid var(--border-muted);
-    border-radius: var(--radius-sm);
-    padding: 10px 12px;
     word-break: break-word;
     line-height: 1.6;
   }
@@ -3261,18 +3258,6 @@
     margin-bottom: 8px;
   }
 
-  .sync-dot {
-    width: 5px;
-    height: 5px;
-    border-radius: 50%;
-    background: var(--accent-green);
-    animation: pulse 1.5s ease-in-out infinite;
-  }
-
-  @keyframes pulse {
-    0%, 100% { opacity: 0.4; }
-    50% { opacity: 1; }
-  }
 
   .loading-placeholder {
     display: flex;
@@ -3428,19 +3413,6 @@
       line-height: 1.35;
     }
 
-    /* Phone-only touch bump: between 480px and the 640px mobile block the
-       copy-number button stays text-compact (the mid-narrow focus grid
-       depends on that); only true phone widths get the 44px hit target. */
-    /* kit-ui-check-ignore: intentional sub-tier inside the shared 640px block, not a layout breakpoint */
-    @media (max-width: 480px) {
-      .pull-detail-content .meta-row :global(.copy-number-btn) {
-        min-width: max(44px, var(--detail-mobile-hit-target));
-        min-height: max(44px, var(--detail-mobile-hit-target));
-        padding: var(--detail-mobile-space-xs);
-        border-radius: var(--radius-sm);
-      }
-    }
-
     .meta-row,
     .chips-row,
     .actions-row,
@@ -3470,7 +3442,7 @@
       display: none;
     }
 
-    .inset-box,
+    .inset-box__content,
     .body-edit-textarea,
     .title-edit-input,
     .title-edit-save,
@@ -3482,9 +3454,8 @@
       line-height: 1.55;
     }
 
-    .inset-box {
+    .inset-box__content {
       padding: var(--detail-mobile-space-sm) var(--detail-mobile-space-md);
-      border-radius: 10px;
     }
 
     :global(.markdown-body pre),

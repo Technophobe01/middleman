@@ -43,6 +43,14 @@ type TestClientOptions = {
   refs?: Array<{ type: "branch" | "tag"; name: string; sha: string; stale: boolean }>;
 };
 
+function mockPointerCapture(element: HTMLElement): void {
+  Object.defineProperties(element, {
+    setPointerCapture: { configurable: true, value: vi.fn() },
+    hasPointerCapture: { configurable: true, value: vi.fn(() => true) },
+    releasePointerCapture: { configurable: true, value: vi.fn() },
+  });
+}
+
 const runtimeQuerySerializerOptions: QuerySerializerOptions = {
   array: {
     style: "form",
@@ -197,6 +205,54 @@ describe("RepoBrowserFeature", () => {
     expect(client.GET).toHaveBeenCalledTimes(5);
   });
 
+  it("does not reload the repo when a view-mode route adds the resolved branch SHA", async () => {
+    const client = testClient();
+    const onRouteChange = vi.fn();
+    const initialRoute = {
+      ...route,
+      refType: "branch" as const,
+      refName: "main",
+      mode: "source" as const,
+    };
+    const { rerender } = render(RepoBrowserFeature, {
+      props: {
+        client,
+        route: initialRoute,
+        onRouteChange,
+      },
+    });
+
+    await waitFor(() => expect(client.GET).toHaveBeenCalledTimes(5));
+    await fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    await waitFor(() => expect(onRouteChange).toHaveBeenCalled());
+    const [nextRoute] = onRouteChange.mock.calls.at(-1)!;
+
+    await rerender({
+      client,
+      route: {
+        ...initialRoute,
+        refSHA: nextRoute.refSHA,
+        mode: nextRoute.viewMode,
+      },
+      onRouteChange,
+    });
+
+    await screen.findByRole("link", { name: "Guide" });
+    expect(client.GET).toHaveBeenCalledTimes(5);
+
+    await rerender({
+      client,
+      route: {
+        ...initialRoute,
+        anchor: "install",
+      },
+      onRouteChange,
+    });
+
+    await tick();
+    expect(client.GET).toHaveBeenCalledTimes(5);
+  });
+
   it("reloads the repo when the same branch route moves to a different resolved SHA", async () => {
     const client = testClient();
     const onRouteChange = vi.fn();
@@ -296,7 +352,7 @@ describe("RepoBrowserFeature", () => {
       target: { value: "v1" },
     });
     await fireEvent.click(screen.getByRole("tab", { name: "Tags 1" }));
-    await fireEvent.click(screen.getByRole("option", { name: "v1.0.0 tag-sha" }));
+    await fireEvent.mouseDown(screen.getByRole("option", { name: "v1.0.0 tag-sha" }));
     await waitFor(() => expect(client.GET).toHaveBeenCalledTimes(9));
     await waitFor(() => {
       expect(onRouteChange).toHaveBeenLastCalledWith(
@@ -323,6 +379,117 @@ describe("RepoBrowserFeature", () => {
 
     await tick();
     expect(client.GET).toHaveBeenCalledTimes(9);
+  });
+
+  it("keeps the ref picker open and the route unchanged when the selected ref tree fails", async () => {
+    const base = testClient();
+    let tagTreeAttempts = 0;
+    const client = {
+      GET: vi.fn((path: string, options?: TestGetOptions) => {
+        if (
+          testURL(path, options) ===
+          "/repo/github/acme/widgets/browser/tree?repo_path=acme%2Fwidgets&ref_type=tag&ref_name=v1.0.0&ref_sha=tag-sha"
+        ) {
+          tagTreeAttempts += 1;
+          if (tagTreeAttempts === 1) {
+            return Promise.resolve({
+              error: { detail: "tree failed" },
+              response: new Response(null, { status: 500 }),
+            });
+          }
+        }
+        return (base.GET as unknown as (path: string, options?: TestGetOptions) => unknown)(path, options);
+      }),
+    } as unknown as MiddlemanClient;
+    const onRouteChange = vi.fn();
+    render(RepoBrowserFeature, {
+      props: {
+        client,
+        route: {
+          ...route,
+          refType: "branch",
+          refName: "main",
+          refSHA: "main-sha",
+        },
+        onRouteChange,
+      },
+    });
+
+    await waitFor(() => expect(client.GET).toHaveBeenCalledTimes(5));
+    await fireEvent.click(await screen.findByRole("button", { name: "Select repository ref: branch: main main-sha" }));
+    const search = screen.getByRole("combobox", { name: "Search repository refs" });
+    await fireEvent.input(search, { target: { value: "v1" } });
+    await fireEvent.click(screen.getByRole("tab", { name: "Tags 1" }));
+    await fireEvent.mouseDown(screen.getByRole("option", { name: "v1.0.0 tag-sha" }));
+
+    expect(await screen.findByText("Couldn't load repository ref")).toBeTruthy();
+    expect((screen.getByRole("combobox", { name: "Search repository refs" }) as HTMLInputElement).value).toBe("v1");
+    expect(screen.getByText("main")).toBeTruthy();
+    expect(onRouteChange).not.toHaveBeenCalled();
+
+    await fireEvent.mouseDown(screen.getByRole("option", { name: "v1.0.0 tag-sha" }));
+
+    await waitFor(() => {
+      expect(onRouteChange).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          refType: "tag",
+          refName: "v1.0.0",
+          refSHA: "tag-sha",
+          path: "README.md",
+        }),
+        undefined,
+      );
+    });
+    expect(screen.queryByRole("combobox", { name: "Search repository refs" })).toBeNull();
+  });
+
+  it("reloads the original ref when browser history returns after a user ref change", async () => {
+    const client = testClient();
+    const onRouteChange = vi.fn();
+    const { rerender } = render(RepoBrowserFeature, {
+      props: {
+        client,
+        route,
+        onRouteChange,
+      },
+    });
+
+    await waitFor(() => expect(client.GET).toHaveBeenCalledTimes(5));
+    await fireEvent.click(await screen.findByRole("button", { name: "Select repository ref: branch: main main-sha" }));
+    await fireEvent.input(screen.getByRole("combobox", { name: "Search repository refs" }), {
+      target: { value: "v1" },
+    });
+    await fireEvent.click(screen.getByRole("tab", { name: "Tags 1" }));
+    await fireEvent.mouseDown(screen.getByRole("option", { name: "v1.0.0 tag-sha" }));
+    await waitFor(() => expect(client.GET).toHaveBeenCalledTimes(9));
+
+    await rerender({
+      client,
+      route: {
+        ...route,
+        refType: "tag",
+        refName: "v1.0.0",
+        refSHA: "tag-sha",
+        path: "README.md",
+      },
+      onRouteChange,
+    });
+    await tick();
+
+    await rerender({
+      client,
+      route: {
+        ...route,
+        refType: "branch",
+        refName: "main",
+        refSHA: "main-sha",
+        path: "README.md",
+      },
+      onRouteChange,
+    });
+
+    await waitFor(() => expect(client.GET).toHaveBeenCalledTimes(14));
+    expect(await screen.findByRole("button", { name: "Select repository ref: branch: main main-sha" })).toBeTruthy();
   });
 
   it("filters branch and tag refs in separate typeahead tabs", async () => {
@@ -354,8 +521,73 @@ describe("RepoBrowserFeature", () => {
     await fireEvent.click(screen.getByRole("tab", { name: "Tags 2" }));
 
     expect(screen.getByRole("tab", { name: "Tags 2" }).getAttribute("aria-selected")).toBe("true");
+    expect((screen.getByRole("combobox", { name: "Search repository refs" }) as HTMLInputElement).value).toBe("v1");
     expect(screen.getByRole("option", { name: "v1.0.0 tag-sha" })).toBeTruthy();
+    expect(screen.queryByRole("option", { name: "feature-preview preview-" })).toBeNull();
     expect(screen.queryByRole("option", { name: "branch: release/v1 release-" })).toBeNull();
+  });
+
+  it("matches repository refs by the complete SHA", async () => {
+    render(RepoBrowserFeature, {
+      props: {
+        client: testClient({
+          refs: [
+            { type: "branch", name: "main", sha: "main-sha", stale: false },
+            {
+              type: "branch",
+              name: "needle-branch",
+              sha: "0123456789abcdef0123456789abcdef01234567",
+              stale: false,
+            },
+          ],
+        }),
+        route,
+        onRouteChange: vi.fn(),
+      },
+    });
+
+    await fireEvent.click(await screen.findByRole("button", { name: "Select repository ref: branch: main main-sha" }));
+    await fireEvent.input(screen.getByRole("combobox", { name: "Search repository refs" }), {
+      target: { value: "cdef01234567" },
+    });
+
+    expect(screen.getByRole("option", { name: "needle-branch 01234567" })).toBeTruthy();
+  });
+
+  it("searches the full ref collection before applying the render limit", async () => {
+    const overflowRef = {
+      type: "branch" as const,
+      name: "target/beyond-limit",
+      sha: "target-sha",
+      stale: false,
+    };
+    const refs = [
+      { type: "branch" as const, name: "main", sha: "main-sha", stale: false },
+      ...Array.from({ length: 100 }, (_, index) => ({
+        type: "branch" as const,
+        name: `feature/${String(index).padStart(3, "0")}`,
+        sha: `feature-${String(index).padStart(3, "0")}`,
+        stale: false,
+      })),
+      overflowRef,
+    ];
+    render(RepoBrowserFeature, {
+      props: {
+        client: testClient({ refs }),
+        route,
+        onRouteChange: vi.fn(),
+      },
+    });
+
+    await fireEvent.click(await screen.findByRole("button", { name: "Select repository ref: branch: main main-sha" }));
+    expect(screen.queryByRole("option", { name: "target/beyond-limit target-s" })).toBeNull();
+
+    await fireEvent.input(screen.getByRole("combobox", { name: "Search repository refs" }), {
+      target: { value: "beyond-limit" },
+    });
+
+    expect(screen.getByRole("option", { name: "target/beyond-limit target-s" })).toBeTruthy();
+    expect(screen.queryByText(/Showing first/)).toBeNull();
   });
 
   it("does not reload when the active ref is selected again", async () => {
@@ -371,7 +603,7 @@ describe("RepoBrowserFeature", () => {
 
     await waitFor(() => expect(client.GET).toHaveBeenCalledTimes(5));
     await fireEvent.click(await screen.findByRole("button", { name: "Select repository ref: branch: main main-sha" }));
-    await fireEvent.click(screen.getByRole("option", { name: "main main-sha" }));
+    await fireEvent.mouseDown(screen.getByRole("option", { name: "main main-sha" }));
     await tick();
 
     expect(client.GET).toHaveBeenCalledTimes(5);
@@ -444,36 +676,38 @@ describe("RepoBrowserFeature", () => {
     setReadonlyNumber(content!, "clientWidth", 1200);
     sidebar!.getBoundingClientRect = () => ({ width: Number.parseInt(sidebar!.style.width || "340", 10) }) as DOMRect;
 
-    const filesHandle = screen.getByRole("button", { name: "Resize file tree" });
+    const filesHandle = screen.getByRole("separator", { name: "Resize file tree" });
     expect(sidebar!.getAttribute("style")).toContain("width: 340px");
 
-    await fireEvent.mouseDown(filesHandle, { clientX: 200 });
-    await fireEvent.mouseMove(window, { clientX: 300 });
+    mockPointerCapture(filesHandle);
+    await fireEvent.pointerDown(filesHandle, { button: 0, clientX: 200, pointerId: 1 });
+    await fireEvent.pointerMove(filesHandle, { clientX: 300, pointerId: 1 });
     expect(sidebar!.getAttribute("style")).toContain("width: 440px");
 
-    await fireEvent.mouseMove(window, { clientX: 700 });
+    await fireEvent.pointerMove(filesHandle, { clientX: 700, pointerId: 1 });
     expect(sidebar!.getAttribute("style")).toContain("width: 512px");
 
-    await fireEvent.mouseMove(window, { clientX: -100 });
+    await fireEvent.pointerMove(filesHandle, { clientX: -100, pointerId: 1 });
     expect(sidebar!.getAttribute("style")).toContain("width: 260px");
-    await fireEvent.mouseUp(window, { clientX: -100 });
+    await fireEvent.pointerUp(filesHandle, { clientX: -100, pointerId: 1 });
 
     await fireEvent.keyDown(filesHandle, { key: "ArrowRight" });
     expect(sidebar!.getAttribute("style")).toContain("width: 284px");
 
-    const historyHandle = screen.getByRole("button", { name: "Resize file history" });
+    const historyHandle = screen.getByRole("separator", { name: "Resize file history" });
     expect(history.getAttribute("style")).toContain("width: 320px");
 
-    await fireEvent.mouseDown(historyHandle, { clientX: 800 });
-    await fireEvent.mouseMove(window, { clientX: 700 });
+    mockPointerCapture(historyHandle);
+    await fireEvent.pointerDown(historyHandle, { button: 0, clientX: 800, pointerId: 2 });
+    await fireEvent.pointerMove(historyHandle, { clientX: 700, pointerId: 2 });
     expect(history.getAttribute("style")).toContain("width: 420px");
 
-    await fireEvent.mouseMove(window, { clientX: 350 });
+    await fireEvent.pointerMove(historyHandle, { clientX: 350, pointerId: 2 });
     expect(history.getAttribute("style")).toContain("width: 548px");
 
-    await fireEvent.mouseMove(window, { clientX: 1200 });
+    await fireEvent.pointerMove(historyHandle, { clientX: 1200, pointerId: 2 });
     expect(history.getAttribute("style")).toContain("width: 260px");
-    await fireEvent.mouseUp(window, { clientX: 1200 });
+    await fireEvent.pointerUp(historyHandle, { clientX: 1200, pointerId: 2 });
 
     await fireEvent.keyDown(historyHandle, { key: "ArrowLeft" });
     expect(history.getAttribute("style")).toContain("width: 284px");

@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { PullRequest } from "../../api/types.js";
-  import { formatRelativeTime } from "@kenn-io/kit-ui";
+  import { Card, formatRelativeTime } from "@kenn-io/kit-ui";
   import { kanbanDragPayloadFromPull } from "./drag.js";
 
   interface Props {
@@ -22,42 +22,44 @@
   }
 </script>
 
-<button
-  class="kanban-card"
-  {onclick}
+<div
+  class="kanban-card-drag"
+  role="presentation"
   draggable="true"
   ondragstart={handleDragStart}
 >
-  <p class="card-title">{pr.Title}</p>
-  <p class="card-meta">{repoLabel} #{pr.Number}</p>
-  <div class="card-footer">
-    <span class="card-author">{pr.Author}</span>
-    <span class="card-time">{ago}</span>
-  </div>
-</button>
+  <Card level="raised" padding="sm" class="kanban-card" {onclick}>
+    <p class="card-title">{pr.Title}</p>
+    <p class="card-meta">{repoLabel} #{pr.Number}</p>
+    <div class="card-footer">
+      <span class="card-author">{pr.Author}</span>
+      <span class="card-time">{ago}</span>
+    </div>
+  </Card>
+</div>
 
 <style>
-  .kanban-card {
-    display: block;
-    width: 100%;
-    text-align: left;
-    padding: 10px 12px;
-    background: var(--bg-surface);
-    border: 1px solid var(--border-muted);
-    border-radius: var(--radius-md);
+  .kanban-card-drag {
     cursor: grab;
-    transition: box-shadow 0.15s, border-color 0.15s, opacity 0.15s;
-    box-shadow: var(--shadow-sm);
   }
 
-  .kanban-card:hover {
-    box-shadow: var(--shadow-md);
-    border-color: var(--border-default);
-  }
-
-  .kanban-card:active {
+  .kanban-card-drag:active {
     cursor: grabbing;
     opacity: 0.7;
+  }
+
+  :global(.kanban-card.kit-card) {
+    width: 100%;
+    cursor: grab;
+  }
+
+  .kanban-card-drag:active :global(.kanban-card.kit-card) {
+    cursor: grabbing;
+  }
+
+  :global(.kanban-card:hover) {
+    border-color: var(--border-default);
+    box-shadow: var(--shadow-md);
   }
 
   .card-title {

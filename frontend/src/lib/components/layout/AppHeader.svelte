@@ -134,10 +134,22 @@
   // Settings and the design-system gallery are not modes, but while one of
   // those pages is current it needs a tab entry: the collapsed dropdown
   // otherwise presents the first mode as the current page.
+  const reviewsDaemonUnavailable = $derived(
+    settings.isModeVisible("reviews")
+      && stores.roborevDaemon !== undefined
+      && !stores.roborevDaemon.isAvailable(),
+  );
+
   const tabs: TopBarTab[] = $derived.by(() => {
     const entries: TopBarTab[] = modeNavOptions
       .filter((option) => settings.isModeVisible(option.mode))
-      .map(({ value, label }) => ({ id: value, label }));
+      .map(({ value, label }) => {
+        const tab: TopBarTab = { id: value, label };
+        if (value === "reviews" && reviewsDaemonUnavailable) {
+          tab.indicator = { tone: "danger", title: "Reviews daemon unavailable" };
+        }
+        return tab;
+      });
 
     if (getPage() === "design-system") {
       entries.push({ id: "design-system", label: "Design system" });
@@ -233,12 +245,6 @@
     else if (value === "settings") navigateTab("settings");
     else if (value === "design-system") navigateTab("design-system");
   }
-
-  const showReviewsDaemonIndicator = $derived(
-    settings.isModeVisible("reviews")
-      && stores.roborevDaemon !== undefined
-      && !stores.roborevDaemon.isAvailable(),
-  );
 </script>
 
 <!-- The app header renders through kit TopBar; app-top-bar is the app-owned
@@ -285,19 +291,6 @@
   {/snippet}
 
   {#snippet right()}
-    {#if showReviewsDaemonIndicator}
-      <!-- Lives here rather than on the Reviews tab: kit TopBarTab has no
-           indicator affordance yet (kata kit-ui#b3zf); the dot must also
-           survive the tabs collapsing into the dropdown. role="img" +
-           aria-label name it for AT since it is detached from the Reviews tab
-           and a bare title on a non-interactive span announces unreliably. -->
-      <span
-        class="daemon-indicator"
-        role="img"
-        aria-label="Reviews daemon unavailable"
-        title="Daemon unavailable"
-      ></span>
-    {/if}
     <HeaderIconButton onclick={openPalette} title="Open command palette">
       <SearchIcon size="14" strokeWidth="1.75" aria-hidden="true" />
       <KbdBadge binding={{ key: "K", ctrlOrMeta: true }} />
@@ -401,7 +394,7 @@
   }
 
   .sync-icon--spinning {
-    animation: header-spin 0.9s linear infinite;
+    animation: kit-spin 0.9s linear infinite;
   }
 
   .sync-label {
@@ -415,15 +408,6 @@
     visibility: hidden;
   }
 
-  /* Busy state spins the sync affordance icon itself, matching kit-ui
-     RefreshControl's pattern; the sync button carries app-specific
-     label/disable semantics RefreshControl does not model. */
-  /* kit-ui-check-ignore: RefreshControl-style icon spin on an app button */
-  @keyframes header-spin {
-    from { transform: rotate(0deg); }
-    to { transform: rotate(360deg); }
-  }
-
   .action-btn:hover:not(:disabled) {
     background: var(--bg-surface-hover);
     color: var(--text-primary);
@@ -433,16 +417,6 @@
   .action-btn:disabled {
     opacity: 0.6;
     cursor: not-allowed;
-  }
-
-  .daemon-indicator {
-    display: inline-block;
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: var(--text-muted);
-    margin-right: 2px;
-    opacity: 0.6;
   }
 
   /* kit's collapse probe is a position:absolute row that always renders the

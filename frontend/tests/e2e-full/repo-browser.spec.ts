@@ -138,10 +138,13 @@ async function dragResizeHandle(page: Page, handle: Locator, deltaX: number): Pr
   const box = await handle.boundingBox();
   expect(box).not.toBeNull();
   if (!box) throw new Error("resize handle missing");
+  const viewport = page.viewportSize();
+  const startX = box.x + box.width / 2;
+  const targetX = viewport ? Math.max(1, Math.min(viewport.width - 1, startX + deltaX)) : startX + deltaX;
 
-  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await page.mouse.move(startX, box.y + box.height / 2);
   await page.mouse.down();
-  await page.mouse.move(box.x + box.width / 2 + deltaX, box.y + box.height / 2, { steps: 10 });
+  await page.mouse.move(targetX, box.y + box.height / 2, { steps: 10 });
   await page.mouse.up();
 }
 
@@ -265,6 +268,114 @@ test.describe("repository source browser", () => {
     }
   });
 
+  test("reloads the previous ref when browser history returns after a user ref change", async ({ page }) => {
+    const server = await startIsolatedE2EServer();
+    try {
+      const mainTreeURLs = collectRepoBrowserResponseURLs(page, "tree", "main");
+      const featureTreeURLs = collectRepoBrowserResponseURLs(page, "tree", "feature/caching");
+      const mainTreeLoaded = treeResponse(page, "main");
+
+      await page.goto(
+        `${server.info.base_url}/repo/browser?provider=github&repo_path=acme%2Fwidgets&ref_type=branch&ref_name=main&path=README.md`,
+      );
+      await mainTreeLoaded;
+      const initialRoute = page.url();
+
+      const browser = page.getByRole("region", { name: "Repository source browser" });
+      await browser.getByRole("button", { name: /Select repository ref: branch: main/ }).click();
+      await browser.getByRole("combobox", { name: "Search repository refs" }).fill("feature");
+      const featureTreeLoaded = treeResponse(page, "feature/caching");
+      await browser.getByRole("option", { name: /feature\/caching/ }).click();
+      await featureTreeLoaded;
+      await expect(page).toHaveURL(/ref_name=feature%2Fcaching/);
+
+      const restoredMainTree = treeResponse(page, "main");
+      await page.goBack();
+      await restoredMainTree;
+
+      expect(page.url()).toBe(initialRoute);
+      await expect(browser.locator(".repo-browser__ref")).toHaveText("main");
+      await expect(browser.getByRole("main", { name: "Selected file" }).locator(".repo-browser__source")).toContainText(
+        "# Widget Service",
+      );
+      expect(mainTreeURLs).toHaveLength(2);
+      expect(featureTreeURLs).toHaveLength(1);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  test("keeps a failed ref switch out of history and retries the same ref", async ({ page }) => {
+    const server = await startIsolatedE2EServer();
+    try {
+      const mainTreeLoaded = treeResponse(page, "main");
+      await page.goto(
+        `${server.info.base_url}/repo/browser?provider=github&repo_path=acme%2Fwidgets&ref_type=branch&ref_name=main&path=README.md`,
+      );
+      await mainTreeLoaded;
+      const routeBeforeSwitch = page.url();
+
+      const browser = page.getByRole("region", { name: "Repository source browser" });
+      const viewer = browser.getByRole("main", { name: "Selected file" });
+      await expect(viewer.locator(".repo-browser__path")).toHaveText("README.md");
+      await expect(viewer.locator(".repo-browser__source")).toContainText("# Widget Service");
+
+      let releaseGuideRequest!: () => void;
+      let markGuideRequestStarted!: () => void;
+      const guideRequestRelease = new Promise<void>((resolve) => {
+        releaseGuideRequest = resolve;
+      });
+      const guideRequestStarted = new Promise<void>((resolve) => {
+        markGuideRequestStarted = resolve;
+      });
+      await page.route("**/browser/blob**", async (route) => {
+        if (new URL(route.request().url()).searchParams.get("path") === "docs/guide.md") {
+          markGuideRequestStarted();
+          await guideRequestRelease;
+        }
+        await route.continue();
+      });
+      await browser.getByRole("treeitem", { name: "guide.md" }).click();
+      await guideRequestStarted;
+      await expect(viewer.locator(".repo-browser__path")).toHaveText("docs/guide.md");
+
+      const failNextTree = await page.request.post(`${server.info.base_url}/__e2e/repo-browser/tree/fail-next`);
+      expect(failNextTree.ok()).toBe(true);
+
+      await browser.getByRole("button", { name: /Select repository ref: branch: main/ }).click();
+      const search = browser.getByRole("combobox", { name: "Search repository refs" });
+      await search.fill("feature");
+      const failedTree = page.waitForResponse(
+        (response) =>
+          repoBrowserRequestMatches(response.request(), "tree", "feature/caching") && response.status() === 500,
+      );
+      await browser.getByRole("option", { name: /feature\/caching/ }).click();
+      await failedTree;
+
+      expect(page.url()).toBe(routeBeforeSwitch);
+      await expect(search).toHaveValue("feature");
+      await expect(browser.getByRole("alert")).toHaveText("Couldn't load repository ref");
+      await expect(browser.locator(".repo-browser__ref")).toHaveText("main");
+      await expect(viewer.locator(".repo-browser__path")).toHaveText("README.md");
+      await expect(viewer.locator(".repo-browser__source")).toContainText("# Widget Service");
+      await expect(browser.getByRole("treeitem", { name: "guide.md" })).toBeVisible();
+
+      releaseGuideRequest();
+      await expect(viewer.locator(".repo-browser__path")).toHaveText("README.md");
+      await expect(viewer.locator(".repo-browser__source")).toContainText("# Widget Service");
+
+      const featureTreeLoaded = treeResponse(page, "feature/caching");
+      await browser.getByRole("option", { name: /feature\/caching/ }).click();
+      await featureTreeLoaded;
+
+      await expect(page).toHaveURL(/ref_name=feature%2Fcaching/);
+      await expect(browser.locator(".repo-browser__ref")).toHaveText("feature/caching");
+      await expect(browser.getByRole("combobox", { name: "Search repository refs" })).toHaveCount(0);
+    } finally {
+      await server.stop();
+    }
+  });
+
   test("does not reload repository data when the active ref is selected again", async ({ page }) => {
     const server = await startIsolatedE2EServer();
     try {
@@ -360,7 +471,7 @@ test.describe("repository source browser", () => {
       await page.keyboard.press(process.platform === "darwin" ? "Meta+K" : "Control+K");
       const palette = page.getByRole("dialog", { name: "Command palette" });
       await expect(palette).toBeVisible();
-      await palette.locator(".palette-input").fill("repo.browser.open");
+      await palette.getByRole("textbox", { name: "Search command palette" }).fill("repo.browser.open");
       await palette.getByRole("button", { name: /View repository source/ }).click();
       await readmeLoaded;
 
@@ -473,8 +584,8 @@ test.describe("repository source browser", () => {
       const sidebar = browser.locator(".repo-browser__sidebar");
       const viewer = browser.getByRole("main", { name: "Selected file" });
       const history = browser.getByRole("complementary", { name: "File history" });
-      const filesHandle = browser.getByRole("button", { name: "Resize file tree" });
-      const historyHandle = browser.getByRole("button", { name: "Resize file history" });
+      const filesHandle = browser.getByRole("separator", { name: "Resize file tree" });
+      const historyHandle = browser.getByRole("separator", { name: "Resize file history" });
 
       await expect(viewer.locator(".repo-browser__path")).toContainText("README.md");
       await expect(viewer.locator(".repo-browser__source")).toContainText("# Widget Service");
@@ -513,6 +624,7 @@ test.describe("repository source browser", () => {
       const constrainedHistoryWidth = Math.round(await boundingWidth(history));
       const constrainedViewerWidth = Math.round(await boundingWidth(viewer));
       await browser.getByRole("button", { name: "Preview" }).click();
+      await expect(page).toHaveURL(/mode=preview/);
       await expect(viewer.locator(".repo-browser__markdown h1")).toHaveText("Widget Service");
       expect(Math.round(await boundingWidth(sidebar))).toBe(constrainedFilesWidth);
       expect(Math.round(await boundingWidth(history))).toBe(constrainedHistoryWidth);

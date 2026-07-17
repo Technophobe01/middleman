@@ -7,16 +7,77 @@ export interface MarkdownImageExpansionController {
 
 const IMAGE_SELECTOR = ".markdown-body img, .doc-markdown img";
 const EXPANDER_CLASS = "markdown-image-expander";
-const FOCUSABLE_SELECTOR = [
-  "a[href]",
-  "button:not([disabled])",
-  "input:not([disabled])",
-  "select:not([disabled])",
-  "textarea:not([disabled])",
-  // kit-ui-check-ignore: imperative lightbox mounted into a caller-provided document; kit trapFocus binds the component's own document and body
-  '[tabindex]:not([tabindex="-1"])',
-].join(",");
 let closeActiveMarkdownImageLightbox: (() => void) | null = null;
+const documentScrollLocks = new WeakMap<Document, { count: number; previousOverflow: string }>();
+
+function lockDocumentBody(doc: Document): () => void {
+  const lock = documentScrollLocks.get(doc) ?? {
+    count: 0,
+    previousOverflow: doc.body.style.overflow,
+  };
+  lock.count += 1;
+  documentScrollLocks.set(doc, lock);
+  if (lock.count === 1) doc.body.style.setProperty("overflow", "hidden");
+
+  return () => {
+    lock.count -= 1;
+    if (lock.count > 0) return;
+    if (lock.previousOverflow) doc.body.style.setProperty("overflow", lock.previousOverflow);
+    else doc.body.style.removeProperty("overflow");
+    documentScrollLocks.delete(doc);
+  };
+}
+
+function trapFocusInOwnerDocument(surface: HTMLElement): () => void {
+  const doc = surface.ownerDocument;
+  const HTMLElementCtor = doc.defaultView?.HTMLElement;
+  const previous =
+    HTMLElementCtor && doc.activeElement instanceof HTMLElementCtor ? (doc.activeElement as HTMLElement) : null;
+  const tabbableSelector = [
+    "a[href]",
+    "button:not([disabled])",
+    "input:not([disabled])",
+    "select:not([disabled])",
+    "textarea:not([disabled])",
+    // kit-ui-check-ignore: lightboxes can live in an iframe document, while kit-ui trapFocus currently binds global document/body
+    '[tabindex]:not([tabindex="-1"])',
+  ].join(", ");
+
+  surface.focus();
+
+  function tabbables(): HTMLElement[] {
+    return Array.from(surface.querySelectorAll<HTMLElement>(tabbableSelector)).filter(
+      (element) => element.offsetParent !== null || element === doc.activeElement,
+    );
+  }
+
+  function handleKeydown(event: KeyboardEvent): void {
+    if (event.defaultPrevented || event.key !== "Tab") return;
+    const items = tabbables();
+    if (items.length === 0) {
+      event.preventDefault();
+      surface.focus();
+      return;
+    }
+    const first = items[0]!;
+    const last = items[items.length - 1]!;
+    if (event.shiftKey && (doc.activeElement === first || doc.activeElement === surface)) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && doc.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  }
+
+  surface.addEventListener("keydown", handleKeydown);
+  const unlockScroll = lockDocumentBody(doc);
+  return () => {
+    surface.removeEventListener("keydown", handleKeydown);
+    unlockScroll();
+    previous?.focus();
+  };
+}
 
 export function expandMarkdownImages(root: ParentNode): number {
   let enhanced = 0;
@@ -85,7 +146,6 @@ function openMarkdownImageLightbox(sourceImage: HTMLImageElement): void {
   closeActiveMarkdownImageLightbox?.();
 
   const doc = sourceImage.ownerDocument;
-  const HTMLElementCtor = doc.defaultView?.HTMLElement ?? HTMLElement;
   const overlay = doc.createElement("div");
   overlay.className = "markdown-image-lightbox";
   overlay.setAttribute("aria-label", "Expanded image");
@@ -116,17 +176,12 @@ function openMarkdownImageLightbox(sourceImage: HTMLImageElement): void {
   panel.append(expanded, closeButton);
   overlay.append(panel);
 
-  const restoreFocusTo = doc.activeElement instanceof HTMLElementCtor ? doc.activeElement : null;
   const popModalFrame = pushModalFrame("markdown-image-lightbox", []);
   const onKeyDown = (event: KeyboardEvent) => {
     event.stopPropagation();
     if (event.key === "Escape") {
       event.preventDefault();
       closeLightbox();
-      return;
-    }
-    if (event.key === "Tab") {
-      trapLightboxFocus(event);
     }
   };
 
@@ -136,41 +191,18 @@ function openMarkdownImageLightbox(sourceImage: HTMLImageElement): void {
   overlay.addEventListener("keydown", onKeyDown);
   doc.addEventListener("keydown", onKeyDown);
   doc.body.append(overlay);
+  const releaseFocus = trapFocusInOwnerDocument(overlay);
   closeActiveMarkdownImageLightbox = closeLightbox;
-  overlay.focus({ preventScroll: true });
 
   function closeLightbox(): void {
     overlay.removeEventListener("keydown", onKeyDown);
     doc.removeEventListener("keydown", onKeyDown);
     popModalFrame();
+    releaseFocus();
     overlay.remove();
     if (closeActiveMarkdownImageLightbox === closeLightbox) {
       closeActiveMarkdownImageLightbox = null;
     }
-    restoreFocusTo?.focus({ preventScroll: true });
-  }
-
-  function trapLightboxFocus(event: KeyboardEvent): void {
-    const focusableElements = Array.from(overlay.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(
-      (element) => !element.hidden,
-    );
-    event.preventDefault();
-
-    if (focusableElements.length === 0) {
-      overlay.focus({ preventScroll: true });
-      return;
-    }
-
-    const activeElement = doc.activeElement instanceof HTMLElementCtor ? doc.activeElement : null;
-    const currentIndex = activeElement ? focusableElements.indexOf(activeElement) : -1;
-    const nextIndex = event.shiftKey
-      ? currentIndex <= 0
-        ? focusableElements.length - 1
-        : currentIndex - 1
-      : currentIndex >= focusableElements.length - 1
-        ? 0
-        : currentIndex + 1;
-    focusableElements[nextIndex]?.focus({ preventScroll: true });
   }
 }
 

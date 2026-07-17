@@ -25,6 +25,18 @@ Interactive surfaces must agree on which item is selected.
   `{ owner, name, number }`-style shapes.
 - When a view changes from item A to item B, reset transient action state that
   could otherwise submit or render against the wrong item.
+- Catalog-backed routes must normalize missing selections even when the catalog
+  is empty: select the first available item or `null`, and clear dependent route
+  identity (`frontend/src/lib/components/docs/DocsWorkspace.svelte::loadFolders`).
+- Commit user-initiated repository ref routes only after the selected tree
+  loads; failed switches keep the picker query, prior ref identity, and last
+  usable tree/path snapshot, remain retryable, and must not advance the URL
+  to unloaded content
+  (`frontend/src/lib/features/repo-browser/RepoBrowserFeature.svelte::selectRefFromPicker`).
+- Treat an unresolved ref and its resolved-SHA route as equivalent only for the
+  successful load that produced the alias; path/anchor changes reuse that load,
+  while repository, ref, or resolved-SHA changes invalidate it
+  (`frontend/src/lib/features/repo-browser/RepoBrowserFeature.svelte::loadRoute`).
 - When a background refresh replaces the selected item's backing object but
   the stable item identity is unchanged, preserve already-resolved action
   affordances instead of treating the refresh as item A -> B. Key invalidation
@@ -73,6 +85,9 @@ Whenever a control persists, document and test:
 - where it persists
 - whether it is global, per-view, or per-item
 - what happens after navigating away and back
+- for layout dimensions, clamping on restore and whenever container bounds
+  change, with the normalized value re-persisted so stale geometry cannot return
+  (`frontend/src/lib/components/messages/MessagesWorkspace.svelte::handleSashWidth`)
 
 ## Keyboard Scope Precedence
 
