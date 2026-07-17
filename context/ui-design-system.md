@@ -107,6 +107,9 @@ prebundled: keep it in vite `optimizeDeps.exclude` with transitive deps as
   mounts once per shell in a page-level fixed layer below measured shell chrome
   and above modal backdrops, never inside feature containers; headerless shells
   use the viewport edge (`frontend/src/App.svelte:968`).
+- Commit timeline rows keep type, author, SHA, and relative time together in the
+  compact header; the SHA is metadata, not card action content
+  (`packages/ui/src/components/detail/EventTimeline.svelte`).
 
 `kit-ui-check` gates at zero findings in both `make frontend-check` and the
 Vite+ `frontend-check` task behind CI's `vp run -w check`. If a rule mistakes

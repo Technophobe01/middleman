@@ -1,4 +1,4 @@
-import { expect, test, type Page, type Route } from "@playwright/test";
+import { devices, expect, test, type Page, type Route } from "@playwright/test";
 
 import { mockApi } from "./support/mockApi";
 
@@ -227,6 +227,106 @@ test("copies a direct provider link from a pull request timeline comment", async
   await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe(directURL);
 });
 
+test("keeps timeline comment actions quiet until hover or keyboard focus", async ({ page }) => {
+  const event: TimelineEvent = {
+    ID: 11,
+    MergeRequestID: 1,
+    PlatformID: 9101,
+    EventType: "issue_comment",
+    Author: "marius",
+    Summary: "",
+    Body: "Quiet timeline comment",
+    MetadataJSON: "",
+    CreatedAt: "2026-03-30T14:00:00Z",
+    DedupeKey: "comment-quiet-9101",
+  };
+
+  await page.route(/\/api\/v1\/pulls\/github\/acme\/widgets\/42(?:[/?]|$)/, async (route) => {
+    if (route.request().method() !== "GET") {
+      await route.fallback();
+      return;
+    }
+    await fulfillJson(route, prDetail(event.Body, event));
+  });
+
+  await page.goto("/pulls/github/acme/widgets/42");
+  const card = page.locator(".event-timeline .kit-comment-card", { hasText: event.Body });
+  const actions = card.locator(".kit-card__actions");
+  const edit = card.getByRole("button", { name: "Edit comment" });
+
+  await expect(actions).toHaveCSS("opacity", "0");
+  await expect(actions).toHaveCSS("pointer-events", "none");
+
+  await card.hover();
+  await expect(actions).toHaveCSS("opacity", "1");
+  await expect(actions).toHaveCSS("pointer-events", "auto");
+
+  await page.mouse.move(0, 0);
+  await edit.focus();
+  await expect(actions).toHaveCSS("opacity", "1");
+  await expect(actions).toHaveCSS("pointer-events", "auto");
+});
+
+test("keeps the pre-kit commit SHA in the compact header before the timestamp", async ({ page }) => {
+  const event: TimelineEvent = {
+    ID: 12,
+    MergeRequestID: 1,
+    PlatformID: 9102,
+    EventType: "commit",
+    Author: "wesm",
+    Summary: "3bab070 Close fixture authority revival paths",
+    Body: "Close fixture authority revival paths",
+    MetadataJSON: "",
+    CreatedAt: "2026-03-30T14:00:00Z",
+    DedupeKey: "commit-3bab070",
+  };
+
+  await page.route(/\/api\/v1\/pulls\/github\/acme\/widgets\/42(?:[/?]|$)/, async (route) => {
+    if (route.request().method() !== "GET") {
+      await route.fallback();
+      return;
+    }
+    await fulfillJson(route, prDetail(event.Body, event));
+  });
+
+  await page.goto("/pulls/github/acme/widgets/42");
+  const card = page.locator(".event-timeline .event-card--commit");
+  const type = card.locator(".event-type");
+  const author = card.locator(".event-author");
+  const sha = card.locator(".commit-sha");
+  const subject = card.locator(".commit-body-details");
+  const time = card.locator(".event-time");
+
+  await expect(type).toHaveText("Commit");
+  await expect(author).toHaveText("wesm");
+  await expect(sha).toHaveText("3bab070");
+  await expect(subject).toHaveText("Close fixture authority revival paths");
+  await expect(time).toBeVisible();
+
+  const header = card.locator(".event-header");
+  await expect(header).toHaveCount(1);
+  await expect(header.locator(":scope > span")).toHaveCount(4);
+  await expect(header.locator(".commit-sha")).toHaveCount(1);
+
+  const typeBox = await type.boundingBox();
+  const authorBox = await author.boundingBox();
+  const shaBox = await sha.boundingBox();
+  const subjectBox = await subject.boundingBox();
+  const timeBox = await time.boundingBox();
+  expect(typeBox).not.toBeNull();
+  expect(authorBox).not.toBeNull();
+  expect(shaBox).not.toBeNull();
+  expect(subjectBox).not.toBeNull();
+  expect(timeBox).not.toBeNull();
+  expect(typeBox!.x + typeBox!.width).toBeLessThanOrEqual(authorBox!.x);
+  expect(authorBox!.x + authorBox!.width).toBeLessThanOrEqual(shaBox!.x);
+  expect(shaBox!.x + shaBox!.width).toBeLessThanOrEqual(timeBox!.x);
+  expect(timeBox!.x - (shaBox!.x + shaBox!.width)).toBeLessThanOrEqual(8);
+  const headerCenters = [typeBox!, authorBox!, shaBox!, timeBox!].map((box) => box.y + box.height / 2);
+  expect(Math.max(...headerCenters) - Math.min(...headerCenters)).toBeLessThanOrEqual(1);
+  expect(subjectBox!.y).toBeGreaterThan(shaBox!.y + shaBox!.height);
+});
+
 test("confirms and deletes a pull request timeline comment", async ({ page }) => {
   let deleted = false;
   let deleteContentType = "";
@@ -311,4 +411,45 @@ test("edits an issue timeline comment", async ({ page }) => {
 
   await expect.poll(() => patchedBody).toBe("Edited issue comment");
   await expect(page.getByText("Edited issue comment")).toBeVisible();
+});
+
+test.describe("touch timeline actions", () => {
+  const iPhone13 = devices["iPhone 13"];
+  test.use({
+    viewport: iPhone13.viewport,
+    deviceScaleFactor: iPhone13.deviceScaleFactor,
+    userAgent: iPhone13.userAgent,
+    hasTouch: iPhone13.hasTouch,
+  });
+
+  test("keeps timeline comment actions visible without hover", async ({ page }) => {
+    const event: TimelineEvent = {
+      ID: 31,
+      MergeRequestID: 1,
+      PlatformID: 9301,
+      EventType: "issue_comment",
+      Author: "marius",
+      Summary: "",
+      Body: "Touch-visible timeline comment",
+      MetadataJSON: "",
+      CreatedAt: "2026-03-30T14:00:00Z",
+      DedupeKey: "comment-touch-9301",
+    };
+
+    await page.route(/\/api\/v1\/pulls\/github\/acme\/widgets\/42(?:[/?]|$)/, async (route) => {
+      if (route.request().method() !== "GET") {
+        await route.fallback();
+        return;
+      }
+      await fulfillJson(route, prDetail(event.Body, event));
+    });
+
+    await page.goto("/pulls/github/acme/widgets/42");
+    const card = page.locator(".event-timeline .kit-comment-card", { hasText: event.Body });
+    const actions = card.locator(".kit-card__actions");
+
+    await expect(actions).toHaveCSS("opacity", "1");
+    await expect(actions).toHaveCSS("pointer-events", "auto");
+    await expect(card.getByRole("button", { name: "Edit comment" })).toBeVisible();
+  });
 });

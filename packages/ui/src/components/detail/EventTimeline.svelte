@@ -1665,8 +1665,9 @@
       </div>
     </Card>
   {/if}
-  <Timeline ariaLabel="Item activity">
-    {#each renderedTimelineEntries as entry (entry.key)}
+  <div class="event-timeline">
+    <Timeline ariaLabel="Item activity">
+      {#each renderedTimelineEntries as entry (entry.key)}
       {@const event = entry.event}
       {@const targetID = replyTargetID(entry)}
       {@const hasReplyOnlyAction = entry.replies.length === 0 && canReplyToThread(entry)}
@@ -1774,25 +1775,33 @@
               time={formatRelativeTime(event.CreatedAt)}
             />
           {:else if event.EventType === "commit"}
-            <CommentCard
-              class="event-card--compact"
-              typeLabel="Commit"
-              tone={eventTimelineTone(event.EventType)}
-              author={event.Author || undefined}
-              time={formatRelativeTime(event.CreatedAt)}
+            <Card
+              level="default"
+              padding="sm"
+              class="event-card--compact event-card--commit"
             >
               <div class="event-header event-header--compact">
+                <span
+                  class="event-type"
+                  style="color: var(--accent-green)"
+                >
+                  {systemEventLabel(event.EventType)}
+                </span>
+                {#if event.Author}
+                  <span class="event-author">{event.Author}</span>
+                {/if}
                 <span class="commit-sha">{shortCommit(event.Summary)}</span>
                 {#if !showCommitDetails}
                   <span class="commit-title">{commitTitle(event.Body)}</span>
                 {/if}
+                <span class="event-time">{formatRelativeTime(event.CreatedAt)}</span>
               </div>
               {#if showCommitDetails && commitDetails}
                 <div class="event-body commit-body-details" transition:slide={{ duration: 100 }}>
                   {commitDetails}
                 </div>
               {/if}
-            </CommentCard>
+            </Card>
           {:else if event.EventType === "cross_referenced"}
             {@const sourceUrl = metadataString(metadata, "source_url")}
             {@const sourceTitle = metadataString(metadata, "source_title") ?? event.Summary}
@@ -1912,8 +1921,9 @@
           </CommentCard>
         {/if}
       </TimelineItem>
-    {/each}
-  </Timeline>
+      {/each}
+    </Timeline>
+  </div>
 {/if}
 
 {#if deleteTarget}
@@ -1973,6 +1983,10 @@
   .event-header--compact {
     min-width: 0;
     flex-wrap: nowrap;
+  }
+
+  .event-header--compact .event-time {
+    margin-left: 0;
   }
 
   .event-card--compact-row {
@@ -2107,6 +2121,25 @@
     font-family: var(--font-mono);
     font-size: var(--font-size-sm);
     color: var(--text-secondary);
+  }
+
+  .event-timeline :global(.kit-comment-card:not(.event-card--commit) .kit-card__actions) {
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.15s;
+  }
+
+  .event-timeline :global(.kit-comment-card:not(.event-card--commit):hover .kit-card__actions),
+  .event-timeline :global(.kit-comment-card:not(.event-card--commit):focus-within .kit-card__actions) {
+    opacity: 1;
+    pointer-events: auto;
+  }
+
+  @media (hover: none), (pointer: coarse) {
+    .event-timeline :global(.kit-comment-card:not(.event-card--commit) .kit-card__actions) {
+      opacity: 1;
+      pointer-events: auto;
+    }
   }
 
   .commit-title,

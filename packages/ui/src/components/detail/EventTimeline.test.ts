@@ -1595,7 +1595,8 @@ describe("EventTimeline", () => {
     expect(document.querySelector(".event--compact")).toBeTruthy();
     expect(document.querySelector(".commit-title")).toBeNull();
     expect(document.querySelector(".commit-body-details")?.classList.contains("event-body")).toBe(true);
-    expect(document.querySelector(".kit-card__meta")?.textContent).toBe("4h ago");
+    expect(document.querySelector(".event-card--commit .event-header")?.textContent).toContain("abcdef1");
+    expect(document.querySelector(".event-card--commit .event-time")?.textContent).toBe("4h ago");
   });
 
   it("expands single-line commit messages when commit details are shown", () => {
@@ -1642,7 +1643,7 @@ describe("EventTimeline", () => {
     expect(screen.getByText("feat: add timeline filters")).toBeTruthy();
     expect(screen.getByText("4h ago")).toBeTruthy();
     expect(screen.queryByText("Long body")).toBeNull();
-    expect(document.querySelector(".kit-card__meta")?.textContent).toBe("4h ago");
+    expect(document.querySelector(".event-card--commit .event-time")?.textContent).toBe("4h ago");
   });
 
   it("renders force pushes as boundaries between commit generations", () => {
@@ -2505,6 +2506,35 @@ describe("EventTimeline", () => {
     expect(screen.getByRole("button", { name: "Delete comment" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Copy direct link" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Copy comment" })).toBeTruthy();
+  });
+
+  it("reveals detail-card actions on hover, focus, and touch without hiding commit SHAs", () => {
+    const hiddenActions = findCompiledStyleRule(
+      ".event-timeline .kit-comment-card:not(.event-card--commit) .kit-card__actions",
+      [":hover", ":focus-within"],
+    );
+
+    expect(hiddenActions.getPropertyValue("opacity")).toBe("0");
+    expect(hiddenActions.getPropertyValue("pointer-events")).toBe("none");
+    expect(findCompiledStyleRule(":hover .kit-card__actions").getPropertyValue("opacity")).toBe("1");
+    expect(findCompiledStyleRule(":focus-within .kit-card__actions").getPropertyValue("opacity")).toBe("1");
+
+    const style = document.createElement("style");
+    style.textContent = compiledCss;
+    document.head.appendChild(style);
+    const touchMedia = Array.from(style.sheet?.cssRules ?? []).find(
+      (rule): rule is CSSMediaRule =>
+        "conditionText" in rule && rule.conditionText === "(hover: none), (pointer: coarse)",
+    );
+    const touchActions = Array.from(touchMedia?.cssRules ?? []).find(
+      (rule): rule is CSSStyleRule =>
+        "selectorText" in rule &&
+        rule.selectorText.includes(".event-timeline") &&
+        rule.selectorText.includes(":not(.event-card--commit)"),
+    );
+
+    expect(touchActions?.style.opacity).toBe("1");
+    expect(touchActions?.style.pointerEvents).toBe("auto");
   });
 
   it("opens the editor when editing a collapsed compact comment", async () => {
