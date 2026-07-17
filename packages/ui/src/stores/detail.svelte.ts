@@ -138,6 +138,13 @@ export function createDetailStore(opts: DetailStoreOptions) {
     key: string;
     promise: Promise<void>;
   } | null = null;
+  // Latest detail_fetched_at seen in any server payload for the current
+  // selection. The store's own detail_fetched_at intentionally freezes
+  // while refreshes are content-identical, so background-sync convergence
+  // must baseline against this value — the frozen store timestamp would
+  // make the previous cycle's sync look like this cycle's completion and
+  // end the convergence loop before the new sync has landed.
+  let lastObservedFetchedAt: string | undefined;
   // Provider synchronization is eventually complete. Keep a successfully
   // deleted comment hidden locally until an ordinary sync no longer returns it.
   const hiddenDeletedCommentIDs: Record<string, number[]> = {};
@@ -314,13 +321,42 @@ export function createDetailStore(opts: DetailStoreOptions) {
     }
   }
 
+  // A refreshed payload whose content matches the displayed detail must
+  // not replace it: the sync timestamp moves on every background poll,
+  // and swapping in an equal-but-new object re-rendered the whole PR
+  // panel (and re-ran the scroll-restore effect) every polling cycle
+  // even though nothing about the PR changed.
+  function detailContentUnchanged(next: PullDetail): boolean {
+    if (detail === null) return false;
+    // Only the fetch timestamp is volatile-by-design; everything else —
+    // including warnings, which the PR panel renders — is content.
+    const strip = (d: PullDetail): string => {
+      const { detail_fetched_at: _fetchedAt, ...rest } = d;
+      return JSON.stringify(rest);
+    };
+    return strip(detail) === strip(next);
+  }
+
+  function applyRefreshedDetail(next: PullDetail): void {
+    if (detailContentUnchanged(next)) return;
+    detail = next;
+  }
+
+  function noteObservedFetchedAt(fetchedAt: string | null | undefined): void {
+    if (fetchedAt != null) lastObservedFetchedAt = fetchedAt;
+  }
+
+  function observedFetchedAtBaseline(): string | undefined {
+    return lastObservedFetchedAt ?? detail?.detail_fetched_at;
+  }
+
   async function refreshDetail(
     owner: string,
     name: string,
     number: number,
     expectedGen: number = syncGeneration,
     identity: DetailRequestRef,
-  ): Promise<{ ok: boolean; error?: string }> {
+  ): Promise<{ ok: boolean; error?: string; fetchedAt?: string }> {
     const ref = detailRequestRef(owner, name, number, identity);
     try {
       const { data, error: requestError } = await apiClient.GET(providerItemPath("pulls", ref, ""), {
@@ -336,12 +372,15 @@ export function createDetailStore(opts: DetailStoreOptions) {
         return { ok: false, error: apiErrorMessage(requestError, "failed to refresh pull request") };
       }
       if (data !== undefined) {
-        detail = withPreservedLocalBody({
-          ...data,
-          events: data.events ?? [],
-        } as PullDetail);
+        applyRefreshedDetail(
+          withPreservedLocalBody({
+            ...data,
+            events: data.events ?? [],
+          } as PullDetail),
+        );
+        noteObservedFetchedAt(data.detail_fetched_at);
         detailLoaded = data.detail_loaded ?? detailLoaded;
-        return { ok: true };
+        return { ok: true, ...(data.detail_fetched_at != null && { fetchedAt: data.detail_fetched_at }) };
       }
       return { ok: false, error: "Pull request refresh returned no detail" };
     } catch (err) {
@@ -371,10 +410,13 @@ export function createDetailStore(opts: DetailStoreOptions) {
       }
       if (data) {
         storeError = null;
-        detail = withPreservedLocalBody({
-          ...data,
-          events: data.events ?? [],
-        } as PullDetail);
+        applyRefreshedDetail(
+          withPreservedLocalBody({
+            ...data,
+            events: data.events ?? [],
+          } as PullDetail),
+        );
+        noteObservedFetchedAt(data.detail_fetched_at);
         detailLoaded = data.detail_loaded ?? detailLoaded;
         refreshed = true;
       }
@@ -423,6 +465,7 @@ export function createDetailStore(opts: DetailStoreOptions) {
     storeError = null;
     detailLoaded = false;
     unsavedLocalBody = null;
+    lastObservedFetchedAt = undefined;
   }
 
   async function loadDetail(owner: string, name: string, number: number, options: DetailRequestOptions): Promise<void> {
@@ -435,6 +478,9 @@ export function createDetailStore(opts: DetailStoreOptions) {
     if (activeSelectionKey !== key) {
       activeSelectionKey = key;
       ++selectionGeneration;
+      // The observed-timestamp baseline belongs to the previous selection;
+      // carrying it over would let another PR's sync clock gate this one.
+      lastObservedFetchedAt = undefined;
     }
     if (loading && activeLoad?.key === key && activeLoad.promise !== null) {
       activeLoad.syncMode = strongerSyncMode(activeLoad.syncMode, syncMode);
@@ -487,6 +533,7 @@ export function createDetailStore(opts: DetailStoreOptions) {
               events: data.events ?? [],
             } as PullDetail)
           : null;
+        noteObservedFetchedAt(data?.detail_fetched_at);
         detailLoaded = data?.detail_loaded ?? false;
       } catch (err) {
         if (gen !== syncGeneration) return;
@@ -506,7 +553,7 @@ export function createDetailStore(opts: DetailStoreOptions) {
           void syncDetail(owner, name, number, gen, requestRef);
           return;
         }
-        void enqueueBackgroundDetailSync(owner, name, number, gen, detail?.detail_fetched_at, requestRef);
+        void enqueueBackgroundDetailSync(owner, name, number, gen, observedFetchedAtBaseline(), requestRef);
       }
     })();
     currentLoad.promise = promise;
@@ -548,9 +595,12 @@ export function createDetailStore(opts: DetailStoreOptions) {
     for (const ms of [300, 700, 1_500, 3_000, 5_000]) {
       await delay(ms);
       if (gen !== syncGeneration) return;
-      await refreshDetail(owner, name, number, gen, identity);
+      // Convergence is judged on the response's fetch timestamp, not the
+      // store's: content-identical refreshes intentionally leave the
+      // store untouched, so the store timestamp can stay frozen while
+      // the background sync has in fact completed.
+      const { fetchedAt } = await refreshDetail(owner, name, number, gen, identity);
       if (gen !== syncGeneration) return;
-      const fetchedAt = detail?.detail_fetched_at;
       if (fetchedAt && fetchedAt !== previousFetchedAt) {
         return;
       }
@@ -607,10 +657,13 @@ export function createDetailStore(opts: DetailStoreOptions) {
         }
         if (data) {
           storeError = null;
-          detail = withPreservedLocalBody({
-            ...data,
-            events: data.events ?? [],
-          } as PullDetail);
+          applyRefreshedDetail(
+            withPreservedLocalBody({
+              ...data,
+              events: data.events ?? [],
+            } as PullDetail),
+          );
+          noteObservedFetchedAt(data.detail_fetched_at);
           detailLoaded = data.detail_loaded ?? detailLoaded;
           const warning = data.warnings?.[0];
           if (warning) {
@@ -1020,7 +1073,7 @@ export function createDetailStore(opts: DetailStoreOptions) {
     const ref = detailRequestRef(owner, name, number, identity);
     stopDetailPolling();
     detailPollHandle = setInterval(() => {
-      void enqueueBackgroundDetailSync(owner, name, number, syncGeneration, detail?.detail_fetched_at, ref);
+      void enqueueBackgroundDetailSync(owner, name, number, syncGeneration, observedFetchedAtBaseline(), ref);
     }, 60_000);
     if (syncDep) {
       unsubSyncComplete = syncDep.subscribeSyncComplete(() => {
