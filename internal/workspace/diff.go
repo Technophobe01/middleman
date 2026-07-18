@@ -6,14 +6,18 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 
 	gitcmd "go.kenn.io/kit/git/cmd"
 	"go.kenn.io/middleman/internal/gitclone"
 	"go.kenn.io/middleman/internal/procutil"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/semaphore"
 )
 
 type WorktreeDiffBase string
@@ -25,6 +29,23 @@ const (
 )
 
 const maxUntrackedTextFileBytes = 1 << 20
+
+var workspaceDiffTracer = otel.Tracer("go.kenn.io/middleman/internal/workspace/diff")
+
+var untrackedFileReads = newUntrackedReadPool(runtime.GOMAXPROCS(0))
+
+type untrackedReadPool struct {
+	limit int
+	sem   *semaphore.Weighted
+}
+
+func newUntrackedReadPool(limit int) *untrackedReadPool {
+	limit = max(limit, 1)
+	return &untrackedReadPool{
+		limit: limit,
+		sem:   semaphore.NewWeighted(int64(limit)),
+	}
+}
 
 func WorktreeDiffFiles(
 	ctx context.Context,
@@ -126,10 +147,9 @@ func worktreeDiffFilesFromRefs(
 	includeUntracked bool,
 ) ([]gitclone.DiffFile, error) {
 	rawArgs := appendWorktreeHeadRef(gitclone.AddDiffWhitespaceFlag(gitclone.DiffArgs(
-		"--raw", "-z", "-M", "-C", "--find-copies-harder",
-		baseRef,
+		"--raw", "-z", "-M", "-C", "--find-copies-harder", baseRef,
 	), hideWhitespace), headRef)
-	rawOut, err := worktreeGitOutput(ctx, dir, rawArgs...)
+	rawOut, err := worktreeDiffGitPhase(ctx, "workspace.diff.git.raw", dir, rawArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("git diff --raw: %w", err)
 	}
@@ -137,31 +157,49 @@ func worktreeDiffFilesFromRefs(
 	if files == nil {
 		files = []gitclone.DiffFile{}
 	}
-	if hideWhitespace {
-		wsFiles, err := worktreeWhitespaceOnlyFiles(ctx, dir, baseRef, headRef, "")
-		if err != nil {
-			return nil, fmt.Errorf("whitespace files: %w", err)
-		}
-		files = filterWorktreeWhitespaceOnlyFiles(files, wsFiles)
-	}
 
 	numstatArgs := appendWorktreeHeadRef(gitclone.AddDiffWhitespaceFlag(gitclone.DiffArgs(
-		"--numstat", "-z", "-M", "-C", "--find-copies-harder",
-		baseRef,
+		"--numstat", "-z", "-M", "-C", "--find-copies-harder", baseRef,
 	), hideWhitespace), headRef)
-	numstatOut, err := worktreeGitOutput(ctx, dir, numstatArgs...)
+	numstatOut, err := worktreeDiffGitPhase(
+		ctx, "workspace.diff.git.numstat", dir, numstatArgs...,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("git diff --numstat: %w", err)
 	}
 	counts := parseWorktreeNumstatZ(numstatOut)
 	applyWorktreeNumstat(files, counts)
+	whitespaceFiles, err := worktreeWhitespaceOnlyFilesAggregate(
+		ctx, dir, baseRef, headRef, "",
+	)
+	if err != nil {
+		return nil, fmt.Errorf("whitespace files: %w", err)
+	}
+	for i := range files {
+		files[i].IsWhitespaceOnly = whitespaceFiles[files[i].Path]
+	}
 	if hideWhitespace {
-		files = dropWhitespaceOnlyModifications(files, counts)
+		filtered := files[:0]
+		for i := range files {
+			if files[i].Status == "modified" && whitespaceFiles[files[i].Path] {
+				continue
+			}
+			filtered = append(filtered, files[i])
+		}
+		files = filtered
 	}
 	if includeUntracked {
-		files = append(files, worktreeUntrackedFiles(ctx, dir, false, hideWhitespace)...)
+		untracked, untrackedErr := worktreeUntrackedFiles(ctx, dir, false, hideWhitespace)
+		if untrackedErr != nil {
+			return nil, fmt.Errorf("untracked files: %w", untrackedErr)
+		}
+		files = append(files, untracked...)
 	}
-	markWorktreeGeneratedFiles(ctx, dir, files)
+	attributeSource := ""
+	if !includeUntracked {
+		attributeSource = headRef
+	}
+	markWorktreeGeneratedFiles(ctx, dir, attributeSource, files)
 	gitclone.SortDiffFiles(files)
 	return files, nil
 }
@@ -421,17 +459,12 @@ func worktreeDiffFromRefsPath(
 		return nil, err
 	}
 
-	wsCount, err := worktreeWhitespaceOnlyCount(ctx, dir, baseRef, headRef, path)
-	if err != nil {
-		return nil, fmt.Errorf("whitespace count: %w", err)
-	}
-
 	rawArgs := appendWorktreeHeadRef(gitclone.AddDiffWhitespaceFlag(gitclone.DiffArgs(
 		"--raw", "-z", "-M", "-C", "--find-copies-harder",
 		baseRef,
 	), hideWhitespace), headRef)
 	rawArgs = appendWorktreePathspec(rawArgs, path)
-	rawOut, err := worktreeGitOutput(ctx, dir, rawArgs...)
+	rawOut, err := worktreeDiffGitPhase(ctx, "workspace.diff.git.raw", dir, rawArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("git diff --raw: %w", err)
 	}
@@ -442,7 +475,7 @@ func worktreeDiffFromRefsPath(
 		baseRef,
 	), hideWhitespace), headRef)
 	numstatArgs = appendWorktreePathspec(numstatArgs, path)
-	numstatOut, err := worktreeGitOutput(ctx, dir, numstatArgs...)
+	numstatOut, err := worktreeDiffGitPhase(ctx, "workspace.diff.git.numstat", dir, numstatArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("git diff --numstat: %w", err)
 	}
@@ -451,10 +484,12 @@ func worktreeDiffFromRefsPath(
 		"-M", "-C", "--find-copies-harder", "-U3", baseRef,
 	), hideWhitespace), headRef)
 	patchArgs = appendWorktreePathspec(patchArgs, path)
-	patchOut, err := worktreeGitOutput(ctx, dir, patchArgs...)
+	patchOut, err := worktreeDiffGitPhase(ctx, "workspace.diff.git.patch", dir, patchArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("git diff patch: %w", err)
 	}
+	assembleCtx, assembleSpan := workspaceDiffTracer.Start(ctx, "workspace.diff.assemble")
+	defer assembleSpan.End()
 	files = gitclone.ParsePatch(patchOut, files)
 	if files == nil {
 		files = []gitclone.DiffFile{}
@@ -465,25 +500,75 @@ func worktreeDiffFromRefsPath(
 		files = dropWhitespaceOnlyModifications(files, counts)
 	}
 
-	if !hideWhitespace {
-		wsFiles, err := worktreeWhitespaceOnlyFiles(ctx, dir, baseRef, headRef, path)
-		if err == nil {
-			for i := range files {
-				files[i].IsWhitespaceOnly = wsFiles[files[i].Path]
-			}
+	wsCount := 0
+	whitespaceCtx, whitespaceSpan := workspaceDiffTracer.Start(
+		assembleCtx, "workspace.diff.whitespace",
+	)
+	if hideWhitespace {
+		wsCount, err = worktreeWhitespaceOnlyCountFromPatch(
+			whitespaceCtx, dir, baseRef, headRef, path,
+		)
+		if err != nil {
+			whitespaceSpan.RecordError(err)
+			whitespaceSpan.End()
+			return nil, fmt.Errorf("whitespace count: %w", err)
+		}
+	} else {
+		wsCount, err = classifyWorkspaceWhitespaceOnly(
+			whitespaceCtx,
+			dir,
+			baseRef,
+			headRef,
+			includeUntracked,
+			files,
+			worktreeRawModeChanges(rawOut),
+		)
+		if err != nil {
+			whitespaceSpan.RecordError(err)
+			whitespaceSpan.End()
+			return nil, fmt.Errorf("classify whitespace-only files: %w", err)
 		}
 	}
+	whitespaceSpan.SetAttributes(attribute.Int("workspace.diff.whitespace_only_files", wsCount))
+	whitespaceSpan.End()
+	untrackedCtx, untrackedSpan := workspaceDiffTracer.Start(
+		assembleCtx, "workspace.diff.untracked",
+	)
 	if includeUntracked && path == "" {
-		files = append(files, worktreeUntrackedFiles(ctx, dir, true, hideWhitespace)...)
+		untracked, untrackedErr := worktreeUntrackedFiles(
+			untrackedCtx, dir, true, hideWhitespace,
+		)
+		if untrackedErr != nil {
+			untrackedSpan.RecordError(untrackedErr)
+			untrackedSpan.End()
+			return nil, fmt.Errorf("untracked files: %w", untrackedErr)
+		}
+		files = append(files, untracked...)
 	} else if includeUntracked {
-		if file, ok := worktreeUntrackedFile(
-			ctx, dir, path, true, hideWhitespace,
-		); ok {
+		file, ok, untrackedErr := worktreeUntrackedFile(
+			untrackedCtx, dir, path, true, hideWhitespace,
+		)
+		if untrackedErr != nil {
+			untrackedSpan.RecordError(untrackedErr)
+			untrackedSpan.End()
+			return nil, fmt.Errorf("untracked file: %w", untrackedErr)
+		}
+		if ok {
 			files = append(files, file)
 		}
 	}
-	markWorktreeGeneratedFiles(ctx, dir, files)
+	untrackedSpan.End()
+	generatedCtx, generatedSpan := workspaceDiffTracer.Start(
+		assembleCtx, "workspace.diff.generated_attributes",
+	)
+	attributeSource := ""
+	if !includeUntracked {
+		attributeSource = headRef
+	}
+	markWorktreeGeneratedFiles(generatedCtx, dir, attributeSource, files)
+	generatedSpan.End()
 	gitclone.SortDiffFiles(files)
+	assembleSpan.SetAttributes(attribute.Int("workspace.diff.file_count", len(files)))
 
 	return &gitclone.DiffResult{
 		WhitespaceOnlyCount: wsCount,
@@ -522,51 +607,39 @@ func readWorktreeFileContent(
 	path string,
 	maxBytes int64,
 ) (*gitclone.FileContent, error) {
-	fullPath := filepath.Join(dir, path)
-	info, err := os.Lstat(fullPath)
+	opened, err := openWorktreePath(dir, path)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", gitclone.ErrNotFound, err)
 	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		target, err := os.Readlink(fullPath)
-		if err != nil {
-			return nil, fmt.Errorf("%w: %v", gitclone.ErrNotFound, err)
-		}
-		data := []byte(target)
+	if opened.file == nil {
+		data := []byte(opened.symlinkTarget)
 		if maxBytes > 0 && int64(len(data)) > maxBytes {
 			return nil, fmt.Errorf("%w: %d bytes", gitclone.ErrTooLarge, len(data))
 		}
 		return &gitclone.FileContent{Path: path, Data: data, Size: int64(len(data))}, nil
 	}
-	if !info.Mode().IsRegular() {
-		return nil, gitclone.ErrNotFound
+	defer opened.file.Close()
+	if maxBytes > 0 && opened.info.Size() > maxBytes {
+		return nil, fmt.Errorf("%w: %d bytes", gitclone.ErrTooLarge, opened.info.Size())
 	}
-
-	file, info, err := openRegularUntrackedFile(fullPath)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", gitclone.ErrNotFound, err)
-	}
-	defer file.Close()
-	if maxBytes > 0 && info.Size() > maxBytes {
-		return nil, fmt.Errorf("%w: %d bytes", gitclone.ErrTooLarge, info.Size())
-	}
-	limit := info.Size()
+	limit := opened.info.Size()
 	if maxBytes > 0 {
 		limit = maxBytes + 1
 	}
-	data, err := io.ReadAll(io.LimitReader(file, limit))
+	data, err := io.ReadAll(io.LimitReader(opened.file, limit))
 	if err != nil {
 		return nil, err
 	}
 	if maxBytes > 0 && int64(len(data)) > maxBytes {
 		return nil, fmt.Errorf("%w: %d bytes", gitclone.ErrTooLarge, len(data))
 	}
-	return &gitclone.FileContent{Path: path, Data: data, Size: info.Size()}, nil
+	return &gitclone.FileContent{Path: path, Data: data, Size: opened.info.Size()}, nil
 }
 
 func markWorktreeGeneratedFiles(
 	ctx context.Context,
 	dir string,
+	attributeSource string,
 	files []gitclone.DiffFile,
 ) {
 	if len(files) == 0 {
@@ -575,10 +648,12 @@ func markWorktreeGeneratedFiles(
 	generated := map[string]bool{}
 	input := gitclone.GeneratedAttributeInput(files)
 	if len(input) > 0 {
-		out, err := worktreeGitOutputWithInput(
-			ctx, dir, input,
-			"check-attr", "-z", "--stdin", "linguist-generated",
-		)
+		args := []string{"check-attr", "-z", "--stdin"}
+		if attributeSource != "" {
+			args = append(args, "--source", attributeSource)
+		}
+		args = append(args, "linguist-generated")
+		out, err := worktreeGitOutputWithInput(ctx, dir, input, args...)
 		if err == nil {
 			generated = gitclone.ParseLinguistGeneratedAttributes(out)
 		}
@@ -623,23 +698,6 @@ func dropWhitespaceOnlyModifications(
 	return out
 }
 
-func filterWorktreeWhitespaceOnlyFiles(
-	files []gitclone.DiffFile,
-	wsFiles map[string]bool,
-) []gitclone.DiffFile {
-	if len(files) == 0 || len(wsFiles) == 0 {
-		return files
-	}
-	filtered := files[:0]
-	for _, file := range files {
-		if wsFiles[file.Path] {
-			continue
-		}
-		filtered = append(filtered, file)
-	}
-	return filtered
-}
-
 func appendWorktreePathspec(args []string, path string) []string {
 	if path == "" {
 		return args
@@ -679,12 +737,15 @@ func worktreeUntrackedFiles(
 	dir string,
 	withHunks bool,
 	hideWhitespace bool,
-) []gitclone.DiffFile {
+) ([]gitclone.DiffFile, error) {
 	out, err := worktreeGitOutput(
 		ctx, dir, "ls-files", "--others", "--exclude-standard", "-z",
 	)
 	if err != nil {
-		return nil
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		return nil, nil
 	}
 	parts := bytes.Split(out, []byte{0})
 	paths := make([]string, 0, len(parts))
@@ -696,7 +757,7 @@ func worktreeUntrackedFiles(
 		paths = append(paths, path)
 	}
 	return worktreeUntrackedFilesFromPaths(
-		dir, paths, withHunks, hideWhitespace,
+		ctx, dir, paths, withHunks, hideWhitespace,
 	)
 }
 
@@ -706,107 +767,227 @@ func worktreeUntrackedFile(
 	path string,
 	withHunks bool,
 	hideWhitespace bool,
-) (gitclone.DiffFile, bool) {
+) (gitclone.DiffFile, bool, error) {
 	out, err := worktreeGitOutput(
 		ctx, dir, "ls-files", "--others", "--exclude-standard", "-z",
 		"--", path,
 	)
 	if err != nil {
-		return gitclone.DiffFile{}, false
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return gitclone.DiffFile{}, false, ctxErr
+		}
+		return gitclone.DiffFile{}, false, nil
 	}
 	for part := range bytes.SplitSeq(out, []byte{0}) {
 		if string(part) != path {
 			continue
 		}
-		files := worktreeUntrackedFilesFromPaths(
-			dir, []string{path}, withHunks, hideWhitespace,
+		files, filesErr := worktreeUntrackedFilesFromPaths(
+			ctx, dir, []string{path}, withHunks, hideWhitespace,
 		)
-		if len(files) == 0 {
-			return gitclone.DiffFile{}, false
+		if filesErr != nil {
+			return gitclone.DiffFile{}, false, filesErr
 		}
-		return files[0], true
+		if len(files) == 0 {
+			return gitclone.DiffFile{}, false, nil
+		}
+		return files[0], true, nil
 	}
-	return gitclone.DiffFile{}, false
+	return gitclone.DiffFile{}, false, nil
 }
 
 func worktreeUntrackedFilesFromPaths(
+	ctx context.Context,
 	dir string,
 	paths []string,
 	withHunks bool,
 	hideWhitespace bool,
-) []gitclone.DiffFile {
-	files := make([]gitclone.DiffFile, 0, len(paths))
-	for _, path := range paths {
-		if path == "" {
-			continue
-		}
-		file := gitclone.DiffFile{
-			Path:    filepath.ToSlash(path),
-			OldPath: filepath.ToSlash(path),
-			Status:  "added",
-			Hunks:   []gitclone.Hunk{},
-		}
-		content, ok := readUntrackedFileContent(
-			filepath.Join(dir, path),
-		)
-		if !ok {
-			continue
-		}
-		if content == nil {
-			file.IsBinary = true
-			files = append(files, file)
-			continue
-		}
-		if hideWhitespace && len(content) > 0 &&
-			!bytes.Contains(content, []byte{0}) &&
-			len(bytes.TrimSpace(content)) == 0 {
-			continue
-		}
-		file.Additions = countAddedLines(content)
-		if bytes.Contains(content, []byte{0}) {
-			file.IsBinary = true
-		} else if withHunks {
-			file.Hunks = []gitclone.Hunk{
-				untrackedFileHunk(content),
-			}
-			file.Patch = gitclone.BuildPatch(file)
-		}
-		files = append(files, file)
+) ([]gitclone.DiffFile, error) {
+	type result struct {
+		file gitclone.DiffFile
+		ok   bool
 	}
-	return files
+	results := make([]result, len(paths))
+	err := untrackedFileReads.run(ctx, paths, func(
+		readCtx context.Context, index int, path string,
+	) error {
+		file, ok, readErr := buildUntrackedDiffFile(
+			readCtx, dir, path, withHunks, hideWhitespace,
+		)
+		if readErr != nil {
+			return readErr
+		}
+		results[index] = result{file: file, ok: ok}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	files := make([]gitclone.DiffFile, 0, len(results))
+	for _, result := range results {
+		if result.ok {
+			files = append(files, result.file)
+		}
+	}
+	return files, nil
 }
 
-func readUntrackedFileContent(path string) ([]byte, bool) {
-	info, err := os.Lstat(path)
-	if err != nil {
-		return nil, false
+func (p *untrackedReadPool) run(
+	ctx context.Context,
+	paths []string,
+	read func(context.Context, int, string) error,
+) error {
+	type job struct {
+		index int
+		path  string
 	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		target, err := os.Readlink(path)
-		if err != nil {
-			return nil, false
+	group, groupCtx := errgroup.WithContext(ctx)
+	jobs := make(chan job)
+	workerCount := min(p.limit, len(paths))
+	for range workerCount {
+		group.Go(func() error {
+			for {
+				select {
+				case <-groupCtx.Done():
+					return groupCtx.Err()
+				case item, ok := <-jobs:
+					if !ok {
+						return nil
+					}
+					if err := p.sem.Acquire(groupCtx, 1); err != nil {
+						return err
+					}
+					readErr := read(groupCtx, item.index, item.path)
+					p.sem.Release(1)
+					if readErr != nil {
+						return readErr
+					}
+				}
+			}
+		})
+	}
+
+	for index, path := range paths {
+		select {
+		case jobs <- job{index: index, path: path}:
+		case <-groupCtx.Done():
+			close(jobs)
+			if err := group.Wait(); err != nil {
+				return err
+			}
+			return ctx.Err()
 		}
-		return []byte(target), true
 	}
-	if !info.Mode().IsRegular() {
-		return nil, false
+	close(jobs)
+	if err := group.Wait(); err != nil {
+		return err
 	}
-	file, info, err := openRegularUntrackedFile(path)
+	return ctx.Err()
+}
+
+func buildUntrackedDiffFile(
+	ctx context.Context,
+	dir string,
+	path string,
+	withHunks bool,
+	hideWhitespace bool,
+) (gitclone.DiffFile, bool, error) {
+	if path == "" {
+		return gitclone.DiffFile{}, false, nil
+	}
+	file := gitclone.DiffFile{
+		Path:    filepath.ToSlash(path),
+		OldPath: filepath.ToSlash(path),
+		Status:  "added",
+		Hunks:   []gitclone.Hunk{},
+	}
+	content, ok, err := readUntrackedFileContent(ctx, dir, path)
+	if err != nil || !ok {
+		return gitclone.DiffFile{}, false, err
+	}
+	if content == nil {
+		file.IsBinary = true
+		return file, true, nil
+	}
+	if hideWhitespace && len(content) > 0 &&
+		!bytes.Contains(content, []byte{0}) &&
+		len(bytes.TrimSpace(content)) == 0 {
+		return gitclone.DiffFile{}, false, nil
+	}
+	file.Additions = countAddedLines(content)
+	if bytes.Contains(content, []byte{0}) {
+		file.IsBinary = true
+	} else if withHunks {
+		file.Hunks = []gitclone.Hunk{
+			untrackedFileHunk(content),
+		}
+		file.Patch = gitclone.BuildPatch(file)
+	}
+	return file, true, nil
+}
+
+func readUntrackedFileContent(
+	ctx context.Context,
+	root string,
+	relative string,
+) ([]byte, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	clean, err := cleanWorktreeDiffPath(relative)
 	if err != nil {
-		return nil, false
+		return nil, false, err
 	}
-	defer file.Close()
-	if info.Size() > maxUntrackedTextFileBytes {
-		return nil, true
-	}
-	content, err := io.ReadAll(io.LimitReader(file, maxUntrackedTextFileBytes+1))
+	opened, err := openWorktreePath(root, clean)
 	if err != nil {
-		return nil, false
+		if err := ctx.Err(); err != nil {
+			return nil, false, err
+		}
+		return nil, false, nil
+	}
+	if opened.file == nil {
+		return []byte(opened.symlinkTarget), true, nil
+	}
+	defer opened.file.Close()
+	if opened.info.Size() > maxUntrackedTextFileBytes {
+		return nil, true, nil
+	}
+	content, err := readAllWithContext(ctx, opened.file, maxUntrackedTextFileBytes+1)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, false, ctxErr
+		}
+		return nil, false, nil
 	}
 	if len(content) > maxUntrackedTextFileBytes {
-		return nil, true
+		return nil, true, nil
 	}
-	return content, true
+	return content, true, nil
+}
+
+func readAllWithContext(ctx context.Context, reader io.Reader, limit int64) ([]byte, error) {
+	limited := io.LimitReader(reader, limit)
+	buffer := bytes.NewBuffer(nil)
+	chunk := make([]byte, 32*1024)
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		read, err := limited.Read(chunk)
+		if read > 0 {
+			_, _ = buffer.Write(chunk[:read])
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		if errors.Is(err, io.EOF) {
+			return buffer.Bytes(), nil
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
 }
 
 func countAddedLines(content []byte) int {
@@ -895,50 +1076,97 @@ func parseWorktreeNumstatInt(value string) int {
 func worktreeWhitespaceOnlyCount(
 	ctx context.Context, dir string, baseRef string, headRef string, path string,
 ) (int, error) {
-	files, err := worktreeWhitespaceOnlyFiles(ctx, dir, baseRef, headRef, path)
-	if err != nil {
-		return 0, err
-	}
-	return len(files), nil
+	files, err := worktreeWhitespaceOnlyFilesAggregate(ctx, dir, baseRef, headRef, path)
+	return len(files), err
 }
 
-func worktreeWhitespaceOnlyFiles(
+func worktreeWhitespaceOnlyFilesAggregate(
 	ctx context.Context, dir string, baseRef string, headRef string, path string,
 ) (map[string]bool, error) {
-	allArgs := appendWorktreePathspec(appendWorktreeHeadRef(gitclone.DiffArgs(
+	rawArgs := appendWorktreePathspec(appendWorktreeHeadRef(gitclone.DiffArgs(
 		"--raw", "-z", "--no-renames", baseRef,
 	), headRef), path)
-	outAll, err := worktreeGitOutput(ctx, dir, allArgs...)
+	rawOut, err := worktreeDiffGitPhase(ctx, "workspace.diff.git.raw", dir, rawArgs...)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("git diff --raw: %w", err)
 	}
-
-	allFiles := worktreeRawPaths(outAll)
+	numstatArgs := appendWorktreePathspec(appendWorktreeHeadRef(gitclone.DiffArgs(
+		"--numstat", "-z", "--no-renames", "-w", baseRef,
+	), headRef), path)
+	numstatOut, err := worktreeDiffGitPhase(
+		ctx, "workspace.diff.git.numstat", dir, numstatArgs...,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("git diff --numstat -w: %w", err)
+	}
+	nonWhitespace := parseWorktreeNumstatZ(numstatOut)
+	modeChanges := worktreeRawModeChanges(rawOut)
 	result := make(map[string]bool)
-	for file := range allFiles {
-		args := appendWorktreeHeadRef(gitclone.DiffArgs(
-			"--numstat", "-z", "--no-renames", "-w", baseRef,
-		), headRef)
-		outNoWhitespace, err := worktreeGitOutput(
-			ctx, dir, appendWorktreePathspec(args, file)...,
-		)
-		if err != nil {
-			return nil, err
+	for _, file := range gitclone.ParseRawZ(rawOut) {
+		if file.Status != "modified" || modeChanges[file.Path] {
+			continue
 		}
-		if len(outNoWhitespace) == 0 {
-			result[file] = true
+		if _, ok := nonWhitespace[file.Path]; !ok {
+			result[file.Path] = true
 		}
 	}
 	return result, nil
 }
 
-func worktreeRawPaths(data []byte) map[string]bool {
-	files := gitclone.ParseRawZ(data)
-	paths := make(map[string]bool, len(files))
-	for _, file := range files {
-		paths[file.Path] = true
+func worktreeWhitespaceOnlyCountFromPatch(
+	ctx context.Context, dir string, baseRef string, headRef string, path string,
+) (int, error) {
+	rawArgs := appendWorktreePathspec(appendWorktreeHeadRef(gitclone.DiffArgs(
+		"--raw", "-z", "-M", "-C", "--find-copies-harder", baseRef,
+	), headRef), path)
+	rawOut, err := worktreeDiffGitPhase(ctx, "workspace.diff.git.raw", dir, rawArgs...)
+	if err != nil {
+		return 0, fmt.Errorf("git diff --raw: %w", err)
 	}
-	return paths
+	patchArgs := appendWorktreePathspec(appendWorktreeHeadRef(gitclone.DiffArgs(
+		"-M", "-C", "--find-copies-harder", "-U3", baseRef,
+	), headRef), path)
+	patchOut, err := worktreeDiffGitPhase(ctx, "workspace.diff.git.patch", dir, patchArgs...)
+	if err != nil {
+		return 0, fmt.Errorf("git diff patch: %w", err)
+	}
+	files := gitclone.ParsePatch(patchOut, gitclone.ParseRawZ(rawOut))
+	if files == nil {
+		files = []gitclone.DiffFile{}
+	}
+	return classifyWhitespaceOnly(files, worktreeRawModeChanges(rawOut)), nil
+}
+
+func worktreeRawModeChanges(data []byte) map[string]bool {
+	parts := bytes.Split(data, []byte{0})
+	changed := make(map[string]bool)
+	for i := 0; i < len(parts); i++ {
+		header := string(parts[i])
+		if !strings.HasPrefix(header, ":") {
+			continue
+		}
+		fields := strings.Fields(header)
+		if len(fields) < 5 {
+			continue
+		}
+		i++
+		if i >= len(parts) {
+			break
+		}
+		path := string(parts[i])
+		status := fields[4]
+		if strings.HasPrefix(status, "R") || strings.HasPrefix(status, "C") {
+			i++
+			if i >= len(parts) {
+				break
+			}
+			path = string(parts[i])
+		}
+		if fields[0] != ":"+fields[1] && path != "" {
+			changed[path] = true
+		}
+	}
+	return changed
 }
 
 func worktreeDiffBaseRef(
@@ -1001,6 +1229,22 @@ func worktreeGitOutput(
 	args ...string,
 ) ([]byte, error) {
 	return worktreeGitOutputWithInput(ctx, dir, nil, args...)
+}
+
+func worktreeDiffGitPhase(
+	ctx context.Context,
+	name string,
+	dir string,
+	args ...string,
+) ([]byte, error) {
+	phaseCtx, span := workspaceDiffTracer.Start(ctx, name)
+	defer span.End()
+	out, err := worktreeGitOutput(phaseCtx, dir, args...)
+	span.SetAttributes(attribute.Int("workspace.diff.output_bytes", len(out)))
+	if err != nil {
+		span.RecordError(err)
+	}
+	return out, err
 }
 
 func worktreeGitOutputWithInput(

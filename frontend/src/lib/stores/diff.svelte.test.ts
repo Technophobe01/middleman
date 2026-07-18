@@ -185,10 +185,144 @@ describe("createDiffStore loadDiff", () => {
     });
   });
 
+  it("keeps a coherent workspace diff visible during a preserving refresh", async () => {
+    const filesA = makeFilesResult(["a.ts"], { snapshot_version: "generation:1" });
+    const diffA = { ...makeDiffResult(["a.ts"]), snapshot_version: "generation:1" };
+    const filesB = makeFilesResult(["b.ts"], { snapshot_version: "generation:2" });
+    const diffB = { ...makeDiffResult(["b.ts"]), snapshot_version: "generation:2" };
+    let filesCalls = 0;
+    let diffCalls = 0;
+    let signalDiffStarted: () => void = () => {};
+    let releaseDiff: () => void = () => {};
+    const diffStarted = new Promise<void>((resolve) => {
+      signalDiffStarted = resolve;
+    });
+    const diffGate = new Promise<void>((resolve) => {
+      releaseDiff = resolve;
+    });
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("/workspaces/ws-1/files")) {
+        filesCalls += 1;
+        return Response.json(filesCalls === 1 ? filesA : filesB);
+      }
+      if (url.includes("/workspaces/ws-1/diff")) {
+        diffCalls += 1;
+        if (diffCalls === 2) {
+          signalDiffStarted();
+          await diffGate;
+        }
+        return Response.json(diffCalls === 1 ? diffA : diffB);
+      }
+      return Response.json({}, { status: 404 });
+    });
+
+    const store = createDiffStore({ client: testClient() });
+    await store.loadWorkspaceDiff("ws-1", "head");
+
+    const refresh = store.loadWorkspaceDiff("ws-1", "head", false, { preserveVisible: true });
+    await diffStarted;
+    expect(store.getFileList()?.files[0]?.path).toBe("a.ts");
+    expect(store.getDiff()?.files[0]?.path).toBe("a.ts");
+
+    releaseDiff();
+    await refresh;
+    expect(store.getFileList()?.files[0]?.path).toBe("b.ts");
+    expect(store.getDiff()?.files[0]?.path).toBe("b.ts");
+  });
+
+  it("keeps retrying a preserving workspace refresh until both responses are fresh", async () => {
+    vi.useFakeTimers();
+    try {
+      let filesCalls = 0;
+      let diffCalls = 0;
+      let signalStalePair: () => void = () => {};
+      const stalePairSeen = new Promise<void>((resolve) => {
+        signalStalePair = resolve;
+      });
+
+      vi.spyOn(globalThis, "fetch").mockImplementation(async (input: RequestInfo | URL) => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+        if (url.includes("/workspaces/ws-1/files")) {
+          filesCalls += 1;
+          return Response.json(
+            makeFilesResult(["a.ts"], {
+              stale: filesCalls === 2,
+              snapshot_version: "generation:1",
+            }),
+          );
+        }
+        if (url.includes("/workspaces/ws-1/diff")) {
+          diffCalls += 1;
+          if (diffCalls === 2) signalStalePair();
+          return Response.json({
+            ...makeDiffResult(["a.ts"]),
+            stale: diffCalls === 2,
+            snapshot_version: "generation:1",
+          });
+        }
+        return Response.json({}, { status: 404 });
+      });
+
+      const store = createDiffStore({ client: testClient() });
+      await store.loadWorkspaceDiff("ws-1", "head");
+      const refresh = store.loadWorkspaceDiff("ws-1", "head", false, { preserveVisible: true });
+      await stalePairSeen;
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(store.getDiff()?.stale).toBe(false);
+
+      await vi.runOnlyPendingTimersAsync();
+      await refresh;
+      expect(store.getDiff()?.stale).toBe(false);
+      expect(filesCalls).toBe(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("retries a workspace diff pair when its pinned revision changes", async () => {
+    const calls: string[] = [];
+    let filesCalls = 0;
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      calls.push(url);
+      if (url.includes("/workspaces/ws-1/files")) {
+        filesCalls += 1;
+        return Response.json(
+          makeFilesResult([filesCalls === 1 ? "old.ts" : "new.ts"], {
+            snapshot_version: `generation:${filesCalls}`,
+          }),
+        );
+      }
+      if (url.includes("revision=generation%3A1")) {
+        return Response.json(
+          { code: "conflict", detail: "snapshot changed", details: { reason: "snapshot_changed" } },
+          { status: 409 },
+        );
+      }
+      if (url.includes("revision=generation%3A2")) {
+        return Response.json({ ...makeDiffResult(["new.ts"]), snapshot_version: "generation:2" });
+      }
+      return Response.json({}, { status: 404 });
+    });
+
+    const store = createDiffStore({ client: testClient() });
+    await store.loadWorkspaceDiff("ws-1", "head");
+
+    expect(filesCalls).toBe(2);
+    expect(store.getFileList()?.files[0]?.path).toBe("new.ts");
+    expect(store.getDiff()?.files[0]?.path).toBe("new.ts");
+    expect(calls).toContain("/api/v1/workspaces/ws-1/diff?base=head&revision=generation%3A1");
+    expect(calls).toContain("/api/v1/workspaces/ws-1/diff?base=head&revision=generation%3A2");
+  });
+
   it("loads remote workspace files, diff, commits, and previews through the fleet host route", async () => {
     const calls: string[] = [];
-    const files = makeFilesResult(["src/remote.go"]);
-    const diff = makeDiffResult(["src/remote.go"]);
+    const files = makeFilesResult(["src/remote.go"], { snapshot_version: "generation:1" });
+    const diff = { ...makeDiffResult(["src/remote.go"]), snapshot_version: "generation:1" };
 
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input: RequestInfo | URL) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
@@ -227,12 +361,159 @@ describe("createDiffStore loadDiff", () => {
     await store.loadFilePreview("owner", "repo", 1, "src/remote.go", "new");
 
     expect(calls).toContain("/api/v1/fleet/hosts/member/workspaces/ws-1/files?base=merge-target");
-    expect(calls).toContain("/api/v1/fleet/hosts/member/workspaces/ws-1/diff?base=merge-target");
+    expect(calls).toContain(
+      "/api/v1/fleet/hosts/member/workspaces/ws-1/diff?base=merge-target&revision=generation%3A1",
+    );
     expect(calls).toContain("/api/v1/fleet/hosts/member/workspaces/ws-1/commits");
     expect(calls).toContain(
-      "/api/v1/fleet/hosts/member/workspaces/ws-1/file-preview?base=merge-target&path=src%2Fremote.go&side=new",
+      "/api/v1/fleet/hosts/member/workspaces/ws-1/file-preview?base=merge-target&path=src%2Fremote.go&side=new&revision=generation%3A1",
     );
     expect(calls.some((url) => url.includes("/api/v1/workspaces/ws-1/"))).toBe(false);
+  });
+
+  it("reloads the coherent workspace snapshot and retries a conflicted preview once", async () => {
+    const calls: string[] = [];
+    let filesCalls = 0;
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      calls.push(url);
+      if (url.includes("/workspaces/ws-1/files")) {
+        filesCalls += 1;
+        return Response.json(makeFilesResult(["src/app.go"], { snapshot_version: `generation:${filesCalls}` }));
+      }
+      if (url.includes("/workspaces/ws-1/diff")) {
+        return Response.json({ ...makeDiffResult(["src/app.go"]), snapshot_version: `generation:${filesCalls}` });
+      }
+      if (url.includes("revision=generation%3A1")) {
+        return Response.json(
+          { code: "conflict", detail: "snapshot changed", details: { reason: "snapshot_changed" } },
+          { status: 409 },
+        );
+      }
+      if (url.includes("revision=generation%3A2")) {
+        return Response.json({ path: "src/app.go", content: "package refreshed" });
+      }
+      return Response.json({}, { status: 404 });
+    });
+
+    const store = createDiffStore({ client: testClient() });
+    await store.loadWorkspaceDiff("ws-1", "head");
+
+    const preview = await store.loadFilePreview("owner", "repo", 1, "src/app.go", "new");
+
+    expect(preview.content).toBe("package refreshed");
+    expect(filesCalls).toBe(2);
+    expect(calls).toContain(
+      "/api/v1/workspaces/ws-1/file-preview?base=head&path=src%2Fapp.go&side=new&revision=generation%3A1",
+    );
+    expect(calls).toContain(
+      "/api/v1/workspaces/ws-1/file-preview?base=head&path=src%2Fapp.go&side=new&revision=generation%3A2",
+    );
+  });
+
+  it("rejects stale preview recovery after a newer same-workspace load takes ownership", async () => {
+    let filesCalls = 0;
+    let releasePreview: () => void = () => {};
+    let signalPreviewStarted: () => void = () => {};
+    const previewStarted = new Promise<void>((resolve) => {
+      signalPreviewStarted = resolve;
+    });
+    const previewGate = new Promise<void>((resolve) => {
+      releasePreview = resolve;
+    });
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("/workspaces/ws-1/files")) {
+        filesCalls += 1;
+        const path = filesCalls === 1 ? "original.ts" : filesCalls === 2 ? "replacement.ts" : "stale.ts";
+        return Response.json(makeFilesResult([path], { snapshot_version: `generation:${filesCalls}` }));
+      }
+      if (url.includes("/workspaces/ws-1/diff")) {
+        const path = filesCalls === 1 ? "original.ts" : filesCalls === 2 ? "replacement.ts" : "stale.ts";
+        return Response.json({ ...makeDiffResult([path]), snapshot_version: `generation:${filesCalls}` });
+      }
+      if (url.includes("/workspaces/ws-1/file-preview")) {
+        signalPreviewStarted();
+        await previewGate;
+        return Response.json(
+          { code: "conflict", detail: "snapshot changed", details: { reason: "snapshot_changed" } },
+          { status: 409 },
+        );
+      }
+      return Response.json({}, { status: 404 });
+    });
+
+    const store = createDiffStore({ client: testClient() });
+    const initialToken = {};
+    const replacementToken = {};
+    await store.loadWorkspaceDiff("ws-1", "head", false, { loadToken: initialToken });
+    const preview = store.loadFilePreview("owner", "repo", 1, "original.ts", "new");
+    await previewStarted;
+
+    await store.loadWorkspaceDiff("ws-1", "head", false, { loadToken: replacementToken });
+    releasePreview();
+
+    await expect(preview).rejects.toThrow("Workspace changed while refreshing file preview");
+    expect(store.getDiff()?.files[0]?.path).toBe("replacement.ts");
+    expect(filesCalls).toBe(2);
+  });
+
+  it("rejects preview recovery superseded while its workspace reload is pending", async () => {
+    let filesCalls = 0;
+    let previewCalls = 0;
+    let releaseRecovery: () => void = () => {};
+    let signalRecoveryStarted: () => void = () => {};
+    const recoveryStarted = new Promise<void>((resolve) => {
+      signalRecoveryStarted = resolve;
+    });
+    const recoveryGate = new Promise<void>((resolve) => {
+      releaseRecovery = resolve;
+    });
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("/workspaces/ws-1/files")) {
+        filesCalls += 1;
+        if (filesCalls === 2) {
+          signalRecoveryStarted();
+          await recoveryGate;
+        }
+        return Response.json(makeFilesResult(["original.ts"], { snapshot_version: `generation:${filesCalls}` }));
+      }
+      if (url.includes("/workspaces/ws-1/diff")) {
+        return Response.json({
+          ...makeDiffResult(["original.ts"]),
+          snapshot_version: `generation:${filesCalls}`,
+        });
+      }
+      if (url.includes("/workspaces/ws-1/file-preview")) {
+        previewCalls += 1;
+        if (previewCalls === 1) {
+          return Response.json(
+            { code: "conflict", detail: "snapshot changed", details: { reason: "snapshot_changed" } },
+            { status: 409 },
+          );
+        }
+        return Response.json({ path: "original.ts", content: "superseded retry" });
+      }
+      return Response.json({}, { status: 404 });
+    });
+
+    const store = createDiffStore({ client: testClient() });
+    const initialToken = {};
+    const replacementToken = {};
+    await store.loadWorkspaceDiff("ws-1", "head", false, { loadToken: initialToken });
+    const preview = store.loadFilePreview("owner", "repo", 1, "original.ts", "new");
+    await recoveryStarted;
+
+    await store.loadWorkspaceDiff("ws-1", "head", false, { loadToken: replacementToken });
+    releaseRecovery();
+
+    await expect(preview).rejects.toThrow("Workspace changed while refreshing file preview");
+    expect(previewCalls).toBe(1);
+    expect(store.getDiff()?.snapshot_version).toBe("generation:3");
   });
 
   it("loads workspace diffs against the merge target", async () => {
@@ -600,6 +881,143 @@ describe("createDiffStore loadDiff", () => {
     expect(calls).not.toContain("/api/v1/fleet/hosts/member-a/workspaces/ws-1/files?base=merge-target");
     expect(calls).not.toContain("/api/v1/fleet/hosts/member-a/workspaces/ws-1/diff?base=merge-target");
     expect(store.getDiff()?.files[0]?.path).toBe("member-b.ts");
+  });
+
+  it("does not resume a canceled workspace load after commit refresh", async () => {
+    const calls: string[] = [];
+    let commitCalls = 0;
+    let releaseRefresh: () => void = () => {};
+    let signalRefresh: () => void = () => {};
+    const refreshStarted = new Promise<void>((resolve) => {
+      signalRefresh = resolve;
+    });
+    const refreshGate = new Promise<void>((resolve) => {
+      releaseRefresh = resolve;
+    });
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      calls.push(url);
+      if (url.includes("/workspaces/ws-1/commits")) {
+        commitCalls += 1;
+        if (commitCalls === 2) {
+          signalRefresh();
+          await refreshGate;
+        }
+        return Response.json({ commits: [] });
+      }
+      if (url.includes("/workspaces/ws-1/files")) {
+        return Response.json(makeFilesResult(["a.ts"]));
+      }
+      if (url.includes("/workspaces/ws-1/diff")) {
+        return Response.json(makeDiffResult(["a.ts"]));
+      }
+      return Response.json({}, { status: 404 });
+    });
+
+    const store = createDiffStore({ client: testClient() });
+    await store.loadWorkspaceDiff("ws-1", "head");
+    await store.loadCommits();
+    calls.length = 0;
+
+    const refresh = store.loadWorkspaceDiff("ws-1", "head", false, { refreshCommits: true });
+    await refreshStarted;
+    store.cancelWorkspaceDiff("ws-1");
+    releaseRefresh();
+    await refresh;
+
+    expect(calls).toEqual(["/api/v1/workspaces/ws-1/commits"]);
+    expect(store.isDiffLoading()).toBe(false);
+  });
+
+  it("does not let a superseded same-workspace owner cancel the replacement load", async () => {
+    const tokenA = {};
+    const tokenB = {};
+    let commitCalls = 0;
+    let filesCalls = 0;
+    let releaseCommitRefresh: () => void = () => {};
+    let signalCommitRefresh: () => void = () => {};
+    const commitRefreshStarted = new Promise<void>((resolve) => {
+      signalCommitRefresh = resolve;
+    });
+    const commitRefreshGate = new Promise<void>((resolve) => {
+      releaseCommitRefresh = resolve;
+    });
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("/workspaces/ws-1/commits")) {
+        commitCalls += 1;
+        if (commitCalls === 2) {
+          signalCommitRefresh();
+          await commitRefreshGate;
+        }
+        return Response.json({ commits: [] });
+      }
+      if (url.includes("/workspaces/ws-1/files")) {
+        filesCalls += 1;
+        return Response.json(makeFilesResult([filesCalls === 1 ? "original.ts" : "replacement.ts"]));
+      }
+      if (url.includes("/workspaces/ws-1/diff")) {
+        return Response.json(makeDiffResult([filesCalls === 1 ? "original.ts" : "replacement.ts"]));
+      }
+      return Response.json({}, { status: 404 });
+    });
+
+    const store = createDiffStore({ client: testClient() });
+    await store.loadWorkspaceDiff("ws-1", "head", false, { loadToken: tokenA });
+    await store.loadCommits();
+
+    const replacement = store.loadWorkspaceDiff("ws-1", "head", false, {
+      loadToken: tokenB,
+      refreshCommits: true,
+    });
+    await commitRefreshStarted;
+    store.cancelWorkspaceDiff("ws-1", undefined, tokenA);
+    releaseCommitRefresh();
+    await replacement;
+
+    expect(store.getDiff()?.files[0]?.path).toBe("replacement.ts");
+    expect(store.getDiffError()).toBeNull();
+  });
+
+  it("keeps the workspace owner token through a commit-scope reload", async () => {
+    const token = {};
+    let scopeSignal: AbortSignal | undefined;
+    let signalScopeRequest: () => void = () => {};
+    const scopeRequestStarted = new Promise<void>((resolve) => {
+      signalScopeRequest = resolve;
+    });
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("/workspaces/ws-1/commits")) {
+        return Response.json({
+          commits: [{ sha: "sha2", message: "second", author_name: "Alice" }],
+        });
+      }
+      if (url.includes("commit=sha2")) {
+        scopeSignal = init?.signal ?? undefined;
+        signalScopeRequest();
+        return new Promise<Response>(() => {});
+      }
+      if (url.includes("/workspaces/ws-1/files")) {
+        return Response.json(makeFilesResult(["original.ts"]));
+      }
+      if (url.includes("/workspaces/ws-1/diff")) {
+        return Response.json(makeDiffResult(["original.ts"]));
+      }
+      return Response.json({}, { status: 404 });
+    });
+
+    const store = createDiffStore({ client: testClient() });
+    await store.loadWorkspaceDiff("ws-1", "head", false, { loadToken: token });
+    await store.loadCommits();
+    store.selectCommit("sha2");
+    await scopeRequestStarted;
+
+    store.cancelWorkspaceDiff("ws-1", undefined, token);
+
+    expect(scopeSignal?.aborted).toBe(true);
   });
 
   it("resets workspace commit scope when refresh removes the selected commit", async () => {

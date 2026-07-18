@@ -26248,6 +26248,499 @@ func TestWorkspaceDiffEndpointMarksGeneratedFilesE2E(t *testing.T) {
 	assert.False(requireWorkspaceDiffFile(t, *diff.Files, "src.ts").IsGenerated)
 }
 
+func TestWorkspaceDiffSnapshotRefreshesSameSizeEditAndPinsRevisionE2E(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	assert := assert.New(t)
+
+	client, _, _, _, srv := setupTestServerWithWorkspacesServer(t, nil)
+	ws := createReadyWorkspace(t, context.Background(), client)
+	path := filepath.Join(ws.WorktreePath, "same-size.txt")
+	require.NoError(os.WriteFile(path, []byte("a1\n"), 0o644))
+
+	firstFiles := requestWorkspaceFiles(t, srv, ws.Id, "head")
+	require.NotNil(firstFiles.SnapshotVersion)
+	firstVersion := *firstFiles.SnapshotVersion
+	firstDiff := requestWorkspaceDiffQuery(
+		t, srv, ws.Id,
+		"base=head&revision="+url.QueryEscape(firstVersion),
+	)
+	require.NotNil(firstDiff.SnapshotVersion)
+	assert.Equal(firstVersion, *firstDiff.SnapshotVersion)
+
+	events, _ := srv.hub.Subscribe(t.Context(), false)
+	require.NoError(os.WriteFile(path, []byte("b1\n"), 0o644))
+	key := workspaceDiffLogicalKey{
+		WorkspaceID: ws.Id,
+		Spec: workspace.DiffSnapshotSpec{
+			WorktreePath: ws.WorktreePath,
+			Base:         workspace.WorktreeDiffBaseHead,
+		},
+	}
+	require.NoError(srv.workspaceDiffCache.validate(t.Context(), key))
+
+	select {
+	case event := <-events:
+		assert.Equal("workspace_diff_changed", event.Event.Type)
+	case <-time.After(time.Second):
+		require.Fail("workspace diff change event not received")
+	}
+
+	staleReq := newWorkspaceFixtureRequest(
+		http.MethodGet,
+		"/api/v1/workspaces/"+ws.Id+"/diff?base=head&revision="+url.QueryEscape(firstVersion),
+		nil,
+	)
+	staleRR := httptest.NewRecorder()
+	srv.ServeHTTP(staleRR, staleReq)
+	assert.Equal(http.StatusConflict, staleRR.Code)
+	var staleProblem rawProblemDetail
+	require.NoError(json.Unmarshal(staleRR.Body.Bytes(), &staleProblem))
+	assert.Equal("conflict", staleProblem.Code)
+	assert.Equal("snapshot_changed", staleProblem.Details["reason"])
+	stalePreviewReq := newWorkspaceFixtureRequest(
+		http.MethodGet,
+		"/api/v1/workspaces/"+ws.Id+"/file-preview?base=head&path=same-size.txt&revision="+url.QueryEscape(firstVersion),
+		nil,
+	)
+	stalePreviewRR := httptest.NewRecorder()
+	srv.ServeHTTP(stalePreviewRR, stalePreviewReq)
+	assert.Equal(http.StatusConflict, stalePreviewRR.Code)
+	var stalePreviewProblem rawProblemDetail
+	require.NoError(json.Unmarshal(stalePreviewRR.Body.Bytes(), &stalePreviewProblem))
+	assert.Equal("snapshot_changed", stalePreviewProblem.Details["reason"])
+
+	secondFiles := requestWorkspaceFiles(t, srv, ws.Id, "head")
+	require.NotNil(secondFiles.SnapshotVersion)
+	assert.NotEqual(firstVersion, *secondFiles.SnapshotVersion)
+	secondDiff := requestWorkspaceDiffQuery(
+		t, srv, ws.Id,
+		"base=head&revision="+url.QueryEscape(*secondFiles.SnapshotVersion),
+	)
+	file := requireWorkspaceDiffFile(t, *secondDiff.Files, "same-size.txt")
+	assert.Contains(file.Patch, "+b1\n")
+}
+
+func TestWorkspaceDiffPairLeaseSurvivesCostPressureE2E(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+
+	client, _, _, _, srv := setupTestServerWithWorkspacesServer(t, nil)
+	ws := createReadyWorkspace(t, context.Background(), client)
+	require.NoError(os.WriteFile(filepath.Join(ws.WorktreePath, "pair.txt"), []byte("pair\n"), 0o644))
+	files := requestWorkspaceFiles(t, srv, ws.Id, "head")
+	require.NotNil(files.SnapshotVersion)
+
+	now := time.Now()
+	entry := func() *workspaceDiffCacheEntry {
+		return &workspaceDiffCacheEntry{
+			snapshot:   &workspaceDiffSnapshot{SizeBytes: workspaceDiffCacheMaxBytes},
+			lastAccess: now,
+		}
+	}
+	first := workspaceDiffLogicalKey{WorkspaceID: "pressure-1"}
+	second := workspaceDiffLogicalKey{WorkspaceID: "pressure-2"}
+	srv.workspaceDiffCache.mu.Lock()
+	storedFirst := srv.workspaceDiffCache.storeEntryLocked(first, entry(), now)
+	storedSecond := srv.workspaceDiffCache.storeEntryLocked(second, entry(), now)
+	srv.workspaceDiffCache.mu.Unlock()
+	require.True(storedFirst)
+	require.True(storedSecond)
+
+	diff := requestWorkspaceDiffQuery(
+		t, srv, ws.Id,
+		"base=head&revision="+url.QueryEscape(*files.SnapshotVersion),
+	)
+	require.NotNil(diff.SnapshotVersion)
+	require.Equal(*files.SnapshotVersion, *diff.SnapshotVersion)
+}
+
+func TestWorkspaceDiffSelectionLeaseFollowsScopedEventStreamE2E(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	assert := assert.New(t)
+
+	client, _, _, _, srv := setupTestServerWithWorkspacesServer(t, nil)
+	ws := createReadyWorkspace(t, context.Background(), client)
+	srv.workspaceDiffCache.deps.resolve = func(
+		_ context.Context, spec workspace.DiffSnapshotSpec,
+	) (workspace.ResolvedDiffSnapshotSpec, bool, error) {
+		return workspace.ResolvedDiffSnapshotSpec{
+			DiffSnapshotSpec: spec,
+			BaseRef:          "HEAD",
+			BaseOID:          "base",
+			HeadOID:          "head",
+		}, true, nil
+	}
+	srv.workspaceDiffCache.deps.fingerprint = func(
+		context.Context, workspace.ResolvedDiffSnapshotSpec,
+	) (workspace.DiffFingerprint, error) {
+		return "ready", nil
+	}
+	srv.workspaceDiffCache.deps.prepare = func(
+		context.Context, workspace.ResolvedDiffSnapshotSpec,
+	) (*gitclone.DiffResult, error) {
+		return workspaceDiffTestResult("ready.txt"), nil
+	}
+	httpServer := httptest.NewServer(srv)
+	t.Cleanup(httpServer.Close)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	request, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodGet,
+		httpServer.URL+"/api/v1/events?workspace_id="+url.QueryEscape(ws.Id),
+		nil,
+	)
+	require.NoError(err)
+	response, err := http.DefaultClient.Do(request)
+	require.NoError(err)
+	require.Equal(http.StatusOK, response.StatusCode)
+	scanner := bufio.NewScanner(response.Body)
+	ready := readSSEFrameWithin(t, scanner, 5*time.Second, cancel)
+	for ready.Event != "workspace_diff_ready" {
+		ready = readSSEFrameWithin(t, scanner, 5*time.Second, cancel)
+	}
+	var readyData struct {
+		WorkspaceID string `json:"workspace_id"`
+		Version     string `json:"version"`
+	}
+	require.NoError(json.Unmarshal([]byte(ready.Data), &readyData))
+	assert.Equal(ws.Id, readyData.WorkspaceID)
+	assert.NotEmpty(readyData.Version)
+
+	srv.workspaceDiffCache.mu.Lock()
+	assert.Equal(1, srv.workspaceDiffCache.selected[ws.Id])
+	srv.workspaceDiffCache.mu.Unlock()
+
+	cancel()
+	require.NoError(response.Body.Close())
+	require.Eventually(func() bool {
+		srv.workspaceDiffCache.mu.Lock()
+		defer srv.workspaceDiffCache.mu.Unlock()
+		return srv.workspaceDiffCache.selected[ws.Id] == 0
+	}, time.Second, 10*time.Millisecond)
+}
+
+func TestWorkspaceDiffWatchPrewarmsAndPushesSelectedChangesE2E(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	assert := assert.New(t)
+
+	client, _, _, _, srv := setupTestServerWithWorkspacesServer(t, nil)
+	ws := createReadyWorkspace(t, context.Background(), client)
+	path := filepath.Join(ws.WorktreePath, "watched.txt")
+	require.NoError(os.WriteFile(path, []byte("a1\n"), 0o644))
+	httpServer := httptest.NewServer(srv)
+	t.Cleanup(httpServer.Close)
+
+	firstResponse, err := http.Get(
+		httpServer.URL + "/api/v1/workspaces/" + ws.Id + "/diff/watch",
+	)
+	require.NoError(err)
+	require.Equal(http.StatusOK, firstResponse.StatusCode)
+	var first struct {
+		Changed bool   `json:"changed"`
+		Version string `json:"version"`
+	}
+	require.NoError(json.NewDecoder(firstResponse.Body).Decode(&first))
+	require.NoError(firstResponse.Body.Close())
+	assert.True(first.Changed)
+	require.NotEmpty(first.Version)
+
+	pushedRequest, err := srv.workspaceDiffRequest(
+		t.Context(), ws.Id, string(workspace.WorktreeDiffBasePushed),
+	)
+	require.NoError(err)
+	pushed, _, err := srv.workspaceDiffCache.Get(
+		t.Context(), srv.workspaceDiffCacheKey(pushedRequest, false),
+	)
+	require.NoError(err)
+	require.NotEqual(first.Version, pushed.Version)
+	foreignClient := &http.Client{Timeout: time.Second}
+	foreignResponse, err := foreignClient.Get(
+		httpServer.URL + "/api/v1/workspaces/" + ws.Id +
+			"/diff/watch?version=" + url.QueryEscape(pushed.Version),
+	)
+	require.NoError(err)
+	require.Equal(http.StatusOK, foreignResponse.StatusCode)
+	var resetToHead struct {
+		Changed bool   `json:"changed"`
+		Version string `json:"version"`
+	}
+	require.NoError(json.NewDecoder(foreignResponse.Body).Decode(&resetToHead))
+	require.NoError(foreignResponse.Body.Close())
+	assert.True(resetToHead.Changed)
+	assert.Equal(first.Version, resetToHead.Version)
+
+	type watchResult struct {
+		status int
+		body   struct {
+			Changed bool   `json:"changed"`
+			Version string `json:"version"`
+		}
+		err error
+	}
+	result := make(chan watchResult, 1)
+	go func() {
+		response, requestErr := http.Get(
+			httpServer.URL + "/api/v1/workspaces/" + ws.Id +
+				"/diff/watch?version=" + url.QueryEscape(first.Version),
+		)
+		got := watchResult{err: requestErr}
+		if requestErr == nil {
+			got.status = response.StatusCode
+			got.err = json.NewDecoder(response.Body).Decode(&got.body)
+			closeErr := response.Body.Close()
+			if got.err == nil {
+				got.err = closeErr
+			}
+		}
+		result <- got
+	}()
+
+	require.Eventually(func() bool {
+		srv.workspaceDiffCache.mu.Lock()
+		defer srv.workspaceDiffCache.mu.Unlock()
+		return srv.workspaceDiffCache.selected[ws.Id] == 1
+	}, time.Second, 10*time.Millisecond)
+	srv.hub.Broadcast(Event{Type: "workspace_diff_changed", Data: workspaceDiffEventData{
+		WorkspaceID: ws.Id,
+		Revision:    pushed.Revision,
+		Version:     pushed.Version,
+	}})
+	select {
+	case got := <-result:
+		require.Fail(
+			"workspace diff watch returned an unrelated scope",
+			"version=%q error=%v", got.body.Version, got.err,
+		)
+	case <-time.After(100 * time.Millisecond):
+	}
+	require.NoError(os.WriteFile(path, []byte("b1\n"), 0o644))
+	srv.notifyWorktreeStatsChanged()
+
+	select {
+	case got := <-result:
+		require.NoError(got.err)
+		require.Equal(http.StatusOK, got.status)
+		assert.True(got.body.Changed)
+		assert.NotEqual(first.Version, got.body.Version)
+	case <-time.After(5 * time.Second):
+		require.Fail("workspace diff watch did not return the changed snapshot")
+	}
+}
+
+func TestFleetWorkspaceDiffWatchCancellationReleasesRemoteSelectionE2E(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+
+	client, _, _, _, peerServer := setupTestServerWithWorkspacesServer(t, nil)
+	ws := createReadyWorkspace(t, context.Background(), client)
+	peerHTTP := httptest.NewServer(peerServer)
+	t.Cleanup(peerHTTP.Close)
+
+	hub := &Server{cfg: &config.Config{Fleet: config.Fleet{
+		Enabled: true,
+		Key:     "hub",
+		Peers: []config.FleetPeer{
+			{Key: "member", BaseURL: peerHTTP.URL},
+		},
+	}}}
+	hubAPI := newFleetTestAPI()
+	hub.registerFleetRoutes(hubAPI)
+	hubHTTP := httptest.NewServer(hubAPI.Adapter())
+	t.Cleanup(hubHTTP.Close)
+
+	watchURL := hubHTTP.URL + "/fleet/hosts/member/workspaces/" + ws.Id + "/diff/watch"
+	firstResponse, err := http.Get(watchURL)
+	require.NoError(err)
+	require.Equal(http.StatusOK, firstResponse.StatusCode)
+	var first workspaceDiffWatchResponse
+	require.NoError(json.NewDecoder(firstResponse.Body).Decode(&first))
+	require.NoError(firstResponse.Body.Close())
+	require.NotEmpty(first.Version)
+	require.Eventually(func() bool {
+		peerServer.workspaceDiffCache.mu.Lock()
+		defer peerServer.workspaceDiffCache.mu.Unlock()
+		return peerServer.workspaceDiffCache.selected[ws.Id] == 0
+	}, time.Second, 10*time.Millisecond)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	request, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodGet,
+		watchURL+"?version="+url.QueryEscape(first.Version),
+		nil,
+	)
+	require.NoError(err)
+	requestDone := make(chan error, 1)
+	go func() {
+		response, requestErr := http.DefaultClient.Do(request)
+		if response != nil {
+			requestErr = errors.Join(requestErr, response.Body.Close())
+		}
+		requestDone <- requestErr
+	}()
+	require.Eventually(func() bool {
+		peerServer.workspaceDiffCache.mu.Lock()
+		defer peerServer.workspaceDiffCache.mu.Unlock()
+		return peerServer.workspaceDiffCache.selected[ws.Id] == 1
+	}, time.Second, 10*time.Millisecond)
+
+	cancel()
+	select {
+	case requestErr := <-requestDone:
+		require.ErrorIs(requestErr, context.Canceled)
+	case <-time.After(time.Second):
+		require.Fail("fleet diff watch cancellation did not reach the proxy client")
+	}
+	require.Eventually(func() bool {
+		peerServer.workspaceDiffCache.mu.Lock()
+		defer peerServer.workspaceDiffCache.mu.Unlock()
+		return peerServer.workspaceDiffCache.selected[ws.Id] == 0
+	}, time.Second, 10*time.Millisecond)
+}
+
+func TestFleetWorkspaceDiffWatchTransitionsFromCreatingToReadyE2E(t *testing.T) {
+	t.Parallel()
+
+	client, database, _, _, peerServer := setupTestServerWithWorkspacesServer(t, nil)
+	ws := createReadyWorkspace(t, context.Background(), client)
+	peerHTTP := httptest.NewServer(peerServer)
+	t.Cleanup(peerHTTP.Close)
+
+	hub := &Server{cfg: &config.Config{Fleet: config.Fleet{
+		Enabled: true,
+		Key:     "hub",
+		Peers: []config.FleetPeer{
+			{Key: "member", BaseURL: peerHTTP.URL},
+		},
+	}}}
+	hubAPI := newFleetTestAPI()
+	hub.registerFleetRoutes(hubAPI)
+	hubHTTP := httptest.NewServer(hubAPI.Adapter())
+	t.Cleanup(hubHTTP.Close)
+
+	watchURL := hubHTTP.URL + "/fleet/hosts/member/workspaces/" + ws.Id + "/diff/watch"
+	tests := []struct {
+		name       string
+		status     string
+		wantStatus int
+		wantReady  bool
+	}{
+		{name: "creating", status: "creating", wantStatus: http.StatusConflict},
+		{name: "ready", status: "ready", wantStatus: http.StatusOK, wantReady: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require := require.New(t)
+			assert := assert.New(t)
+			require.NoError(database.UpdateWorkspaceStatus(t.Context(), ws.Id, tt.status, nil))
+
+			response, err := http.Get(watchURL)
+			require.NoError(err)
+			require.Equal(tt.wantStatus, response.StatusCode)
+			defer response.Body.Close()
+			if !tt.wantReady {
+				return
+			}
+
+			var body workspaceDiffWatchResponse
+			require.NoError(json.NewDecoder(response.Body).Decode(&body))
+			assert.True(body.Changed)
+			assert.NotEmpty(body.Version)
+		})
+	}
+}
+
+func TestWorkspaceManualRefreshRevalidatesCachedDiffWhenProviderRefreshFailsE2E(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	assert := assert.New(t)
+
+	client, _, _, _, srv := setupTestServerWithWorkspacesServer(t, nil)
+	ws := createReadyWorkspace(t, context.Background(), client)
+	path := filepath.Join(ws.WorktreePath, "manual-refresh.txt")
+	require.NoError(os.WriteFile(path, []byte("before\n"), 0o644))
+	first := requestWorkspaceFiles(t, srv, ws.Id, "head")
+	require.NotNil(first.SnapshotVersion)
+	firstVersion := *first.SnapshotVersion
+
+	events, _ := srv.hub.Subscribe(t.Context(), false)
+	require.NoError(os.WriteFile(path, []byte("after\n"), 0o644))
+	originalPrepare := srv.workspaceDiffCache.deps.prepare
+	prepareStarted := make(chan struct{})
+	releasePrepare := make(chan struct{})
+	var signalPrepare sync.Once
+	srv.workspaceDiffCache.deps.prepare = func(
+		ctx context.Context,
+		resolved workspace.ResolvedDiffSnapshotSpec,
+	) (*gitclone.DiffResult, error) {
+		signalPrepare.Do(func() { close(prepareStarted) })
+		select {
+		case <-releasePrepare:
+			return originalPrepare(ctx, resolved)
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
+	request := newWorkspaceFixtureRequest(
+		http.MethodPost,
+		"/api/v1/workspaces/"+ws.Id+"/refresh",
+		strings.NewReader("{}"),
+	)
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	responseDone := make(chan struct{})
+	go func() {
+		srv.ServeHTTP(response, request)
+		close(responseDone)
+	}()
+	select {
+	case <-responseDone:
+		require.Equal(http.StatusBadGateway, response.Code, response.Body.String())
+	case <-time.After(5 * time.Second):
+		require.Fail("workspace refresh waited for diff preparation")
+	}
+	select {
+	case <-prepareStarted:
+	case <-time.After(5 * time.Second):
+		require.Fail("workspace refresh did not schedule diff preparation")
+	}
+	close(releasePrepare)
+
+	var changed workspaceDiffEventData
+	select {
+	case event := <-events:
+		for event.Event.Type != "workspace_diff_changed" {
+			select {
+			case event = <-events:
+			case <-time.After(5 * time.Second):
+				require.Fail("workspace diff change event not received")
+			}
+		}
+		var ok bool
+		changed, ok = event.Event.Data.(workspaceDiffEventData)
+		require.True(ok)
+	case <-time.After(5 * time.Second):
+		require.Fail("workspace diff change event not received")
+	}
+	assert.Equal(ws.Id, changed.WorkspaceID)
+	assert.NotEqual(firstVersion, changed.Version)
+
+	second := requestWorkspaceFiles(t, srv, ws.Id, "head")
+	require.NotNil(second.SnapshotVersion)
+	assert.Equal(changed.Version, *second.SnapshotVersion)
+	diff := requestWorkspaceDiffQuery(
+		t, srv, ws.Id,
+		"base=head&revision="+url.QueryEscape(changed.Version),
+	)
+	file := requireWorkspaceDiffFile(t, *diff.Files, "manual-refresh.txt")
+	assert.Contains(file.Patch, "+after\n")
+}
+
 func TestWorkspaceDiffEndpointScopesPatchByPathE2E(t *testing.T) {
 	t.Parallel()
 
@@ -26279,6 +26772,35 @@ func TestWorkspaceDiffEndpointScopesPatchByPathE2E(t *testing.T) {
 	require.NotNil(file.Hunks)
 	require.Len(*file.Hunks, 1)
 	assert.NotContains(workspaceDiffPaths(*diff.Files), "second.go")
+}
+
+func TestWorkspaceDiffPathPrefersCurrentPathOverEarlierRenameE2E(t *testing.T) {
+	t.Parallel()
+
+	require := require.New(t)
+	assert := assert.New(t)
+	client, _, _, _, srv := setupTestServerWithWorkspacesServer(t, nil)
+	ws := createReadyWorkspace(t, context.Background(), client)
+	runGit(t, ws.WorktreePath, "config", "user.email", "test@test.com")
+	runGit(t, ws.WorktreePath, "config", "user.name", "Test")
+	require.NoError(os.WriteFile(filepath.Join(ws.WorktreePath, "z.txt"), []byte("renamed content\n"), 0o644))
+	runGit(t, ws.WorktreePath, "add", "z.txt")
+	runGit(t, ws.WorktreePath, "commit", "-m", "add rename source")
+	require.NoError(os.Rename(filepath.Join(ws.WorktreePath, "z.txt"), filepath.Join(ws.WorktreePath, "a.txt")))
+	runGit(t, ws.WorktreePath, "add", "-A")
+	require.NoError(os.WriteFile(filepath.Join(ws.WorktreePath, "z.txt"), []byte("new current path\n"), 0o644))
+
+	diff := requestWorkspaceDiffForPath(t, srv, ws.Id, "head", "z.txt")
+	require.NotNil(diff.Files)
+	require.Len(*diff.Files, 1)
+	assert.Equal("z.txt", (*diff.Files)[0].Path)
+	assert.Equal("added", (*diff.Files)[0].Status)
+
+	preview := requestWorkspaceFilePreview(t, srv, ws.Id, "head", "z.txt", "new")
+	content, err := base64.StdEncoding.DecodeString(preview.Content)
+	require.NoError(err)
+	assert.Equal("z.txt", preview.Path)
+	assert.Equal("new current path\n", string(content))
 }
 
 func TestWorkspaceDiffEndpointKeepsModifiedSourcePatchSeparateFromCopyE2E(t *testing.T) {

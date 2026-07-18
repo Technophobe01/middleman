@@ -138,6 +138,7 @@ type Server struct {
 	workspaces                  *workspace.Manager
 	workspacePRMonitor          *workspace.PRMonitor
 	workspacePushedHeadObserver *workspace.PushedHeadObserver
+	workspaceDiffCache          *workspaceDiffCache
 	tmuxActivity                *tmuxActivityTracker
 	fleetTmuxMonitor            *fleetTmuxMonitor
 	fleetWorktreeDiscoverer     *fleetWorktreeDiscoverer
@@ -248,6 +249,12 @@ type Server struct {
 	// after http.Server.Shutdown so that the deferred setState in
 	// (*conn).serve finishes before tests tear down dependencies.
 	connWG sync.WaitGroup
+}
+
+type workspaceDiffEventData struct {
+	WorkspaceID string `json:"workspace_id"`
+	Revision    uint64 `json:"revision"`
+	Version     string `json:"version"`
 }
 
 // trackHTTPConn is installed as http.Server.ConnState by Serve so
@@ -730,6 +737,26 @@ func newServer(
 	}
 	s.docsRegistry = docs.NewRegistry(docFolders)
 	warnDocFolderDaemonBindings(docFolders)
+	s.workspaceDiffCache = newWorkspaceDiffCache(s.bgCtx, workspaceDiffCacheDeps{
+		onReady: func(workspaceID string, revision uint64, version string) {
+			s.hub.Broadcast(Event{Type: "workspace_diff_ready", Data: workspaceDiffEventData{
+				WorkspaceID: workspaceID,
+				Revision:    revision,
+				Version:     version,
+			}})
+		},
+		onChanged: func(workspaceID string, revision uint64, version string) {
+			s.hub.Broadcast(Event{Type: "workspace_diff_changed", Data: workspaceDiffEventData{
+				WorkspaceID: workspaceID,
+				Revision:    revision,
+				Version:     version,
+			}})
+		},
+	})
+	s.runBackground(func(ctx context.Context) {
+		<-ctx.Done()
+		s.workspaceDiffCache.Wait()
+	})
 
 	s.hostOpts.Store(&hostOpts)
 	if hostOpts.TrustReverseProxy && len(hostOpts.Allowed) == 0 {
@@ -1474,7 +1501,7 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) streamEvents(
-	_ context.Context, _ *struct{},
+	_ context.Context, input *streamEventsInput,
 ) (*huma.StreamResponse, error) {
 	return &huma.StreamResponse{
 		Body: func(ctx huma.Context) {
@@ -1486,7 +1513,24 @@ func (s *Server) streamEvents(
 			rc := http.NewResponseController(w)
 			_ = rc.SetWriteDeadline(time.Time{})
 			cursor, hasCursor := parseLastEventID(r)
-			s.serveSSE(ctx.Context(), w, rc, cursor, hasCursor)
+			ch, done := s.hub.Subscribe(ctx.Context(), !hasCursor)
+			releaseSelection := func() {}
+			if input.WorkspaceID != "" && s.workspaceDiffCache != nil {
+				releaseSelection = s.workspaceDiffCache.Select(
+					input.WorkspaceID,
+					func(resolveCtx context.Context) (workspaceDiffLogicalKey, error) {
+						req, err := s.workspaceDiffRequest(
+							resolveCtx, input.WorkspaceID, string(workspace.WorktreeDiffBaseHead),
+						)
+						if err != nil {
+							return workspaceDiffLogicalKey{}, err
+						}
+						return s.workspaceDiffCacheKey(req, false), nil
+					},
+				)
+			}
+			defer releaseSelection()
+			s.serveSSESubscribed(ctx.Context(), w, rc, cursor, hasCursor, ch, done)
 		},
 	}, nil
 }
@@ -1536,6 +1580,18 @@ func (s *Server) serveSSE(
 	// supplied the handler replays the ring directly, so cached
 	// sync_status injection by Subscribe would duplicate; pass false.
 	ch, done := s.hub.Subscribe(ctx, !hasCursor)
+	s.serveSSESubscribed(ctx, w, rc, cursor, hasCursor, ch, done)
+}
+
+func (s *Server) serveSSESubscribed(
+	ctx context.Context,
+	w io.Writer,
+	rc sseController,
+	cursor uint64,
+	hasCursor bool,
+	ch <-chan RecordedEvent,
+	done <-chan struct{},
+) {
 
 	if err := rc.Flush(); err != nil {
 		return
