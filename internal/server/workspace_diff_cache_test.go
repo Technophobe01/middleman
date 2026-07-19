@@ -373,6 +373,7 @@ func TestWorkspaceDiffCacheSelectedColdFailureWaitsForPrewarmBackoff(t *testing.
 		require.Equal(int64(2), <-attempts)
 		<-ready
 	}
+	<-ready
 	assert.Equal(int64(2), prepareCalls.Load())
 }
 

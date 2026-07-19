@@ -85,6 +85,7 @@
     Settings,
     TerminalSettings,
   } from "./api/types.js";
+  import type { RoutedItemRef } from "./routes.js";
 
   interface Props {
     client: MiddlemanClient;
@@ -97,6 +98,7 @@
     config?: UIConfig;
     sidebar?: SidebarAccessors;
     getPage?: () => string;
+    getActivitySelection?: () => RoutedItemRef | null;
     roborevBaseUrl?: string;
     onError?: (msg: string) => void;
     onNotification?: (msg: string) => void;
@@ -119,6 +121,7 @@
       toggleSidebar: () => {},
     },
     getPage = () => "",
+    getActivitySelection = () => null,
     roborevBaseUrl = undefined,
     onError = undefined,
     onNotification = undefined,
@@ -140,6 +143,7 @@
     workspaceCmd: WorkspaceCommandCallback | undefined,
     sb: SidebarAccessors,
     gp: () => string,
+    getSelectedActivity: () => RoutedItemRef | null,
     roborevBase: string | undefined,
     errorCb: ((msg: string) => void) | undefined,
     notificationCb: ((msg: string) => void) | undefined,
@@ -271,6 +275,22 @@
       ]);
     }
 
+    function refreshSelectedActivityDetail(): void {
+      if (gp() !== "activity" && gp() !== "mobile-activity") return;
+      const selection = getSelectedActivity();
+      if (selection?.itemType !== "pr") return;
+      void detailStore.refreshDetailOnly(
+        selection.owner,
+        selection.name,
+        selection.number,
+        {
+          provider: selection.provider,
+          platformHost: selection.platformHost,
+          repoPath: selection.repoPath,
+        },
+      );
+    }
+
     function refreshVisibleData(): void {
       switch (gp()) {
         case "pulls":
@@ -284,6 +304,7 @@
         case "activity":
         case "mobile-activity":
           void activityStore.loadActivity();
+          refreshSelectedActivityDetail();
           break;
         case "focus":
           void pullsStore.loadPulls();
@@ -387,6 +408,7 @@
         void pullsStore.loadPulls();
         void issuesStore.loadIssues();
         void activityStore.loadActivity();
+        refreshSelectedActivityDetail();
         void syncStore.refreshSyncStatus();
       },
     });
@@ -471,7 +493,8 @@
     client, hostState, config, actions,
     onNavigate, onEvent, prepareRoute,
     onWorkspaceCommand,
-    sidebar, getPage, roborevBaseUrl, onError, onNotification,
+    sidebar, getPage, getActivitySelection,
+    roborevBaseUrl, onError, onNotification,
   );
 
   onDestroy(() => {

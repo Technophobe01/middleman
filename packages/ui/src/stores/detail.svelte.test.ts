@@ -29,6 +29,25 @@ function pullDetail(headSHA: string): PullDetail {
   } as unknown as PullDetail;
 }
 
+function pullDetailFor(name: string, number: number, headSHA: string): PullDetail {
+  const result = pullDetail(headSHA);
+  result.repo_name = name;
+  result.repo.repo_path = `acme/${name}`;
+  result.merge_request.Number = number;
+  return result;
+}
+
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+} {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
 function conflictProblem(reason: string): ProblemBody {
   return {
     code: ProblemCodes.conflict,
@@ -88,6 +107,105 @@ describe("createDetailStore", () => {
     await store.refreshDetailOnly("acme", "widget", 7, routeIdentity);
     expect(store.getDetail()).not.toBe(displayed);
     expect(store.getDetail()?.platform_head_sha).toBe("new-head");
+  });
+
+  it("rejects an old selection refresh that resolves after the new selection", async () => {
+    const loadB = deferred<{ data: PullDetail }>();
+    const refreshA = deferred<{ data: PullDetail }>();
+    const get = vi
+      .fn()
+      .mockResolvedValueOnce({ data: pullDetailFor("widget-a", 7, "head-a") })
+      .mockReturnValueOnce(loadB.promise)
+      .mockReturnValueOnce(refreshA.promise);
+    const store = createDetailStore({ client: mockClient({ GET: get }) });
+    const identity = (name: string) => ({
+      provider: "github",
+      platformHost: "github.com",
+      repoPath: `acme/${name}`,
+      sync: false as const,
+    });
+    await store.loadDetail("acme", "widget-a", 7, identity("widget-a"));
+
+    const loadingB = store.loadDetail("acme", "widget-b", 8, identity("widget-b"));
+    const refreshingA = store.refreshDetailOnly("acme", "widget-a", 7, identity("widget-a"));
+    loadB.resolve({ data: pullDetailFor("widget-b", 8, "head-b") });
+    await loadingB;
+    refreshA.resolve({ data: pullDetailFor("widget-a", 7, "late-head-a") });
+    await refreshingA;
+
+    expect(store.getDetail()?.repo_name).toBe("widget-b");
+    expect(store.getDetail()?.merge_request.Number).toBe(8);
+    expect(store.getDetail()?.platform_head_sha).toBe("head-b");
+  });
+
+  it("rejects an initial load that resolves after a newer refresh for the same selection", async () => {
+    const initialLoad = deferred<{ data: PullDetail }>();
+    const newerRefresh = deferred<{ data: PullDetail }>();
+    const get = vi.fn().mockReturnValueOnce(initialLoad.promise).mockReturnValueOnce(newerRefresh.promise);
+    const store = createDetailStore({ client: mockClient({ GET: get }) });
+    const identity = {
+      provider: "github",
+      platformHost: "github.com",
+      repoPath: "acme/widget",
+      sync: false as const,
+    };
+
+    const loading = store.loadDetail("acme", "widget", 7, identity);
+    const refreshing = store.refreshDetailOnly("acme", "widget", 7, identity);
+    newerRefresh.resolve({ data: pullDetail("newer-head") });
+    await refreshing;
+    initialLoad.resolve({ data: pullDetail("older-head") });
+    await loading;
+
+    expect(store.getDetail()?.platform_head_sha).toBe("newer-head");
+  });
+
+  it("applies a pending initial load when a newer refresh fails for the same selection", async () => {
+    const initialLoad = deferred<{ data?: PullDetail; error?: ProblemBody }>();
+    const newerRefresh = deferred<{ data?: PullDetail; error?: ProblemBody }>();
+    const get = vi.fn().mockReturnValueOnce(initialLoad.promise).mockReturnValueOnce(newerRefresh.promise);
+    const store = createDetailStore({ client: mockClient({ GET: get }) });
+    const identity = {
+      provider: "github",
+      platformHost: "github.com",
+      repoPath: "acme/widget",
+      sync: false as const,
+    };
+
+    const loading = store.loadDetail("acme", "widget", 7, identity);
+    const refreshing = store.refreshDetailOnly("acme", "widget", 7, identity);
+    newerRefresh.resolve({ error: conflictProblem("detail_refresh_failed") });
+    await refreshing;
+    initialLoad.resolve({ data: pullDetail("loaded-head") });
+    await loading;
+
+    expect(store.getDetail()?.platform_head_sha).toBe("loaded-head");
+  });
+
+  it.each([
+    {
+      loaded: { provider: "gh", platformHost: undefined },
+      refreshed: { provider: "github", platformHost: "github.com" },
+    },
+    {
+      loaded: { provider: "github", platformHost: "github.com" },
+      refreshed: { provider: "gh", platformHost: undefined },
+    },
+  ])("treats provider aliases and omitted default hosts as the same selection", async ({ loaded, refreshed }) => {
+    const get = vi
+      .fn()
+      .mockResolvedValueOnce({ data: pullDetail("head") })
+      .mockResolvedValueOnce({ data: pullDetail("refreshed-head") });
+    const store = createDetailStore({ client: mockClient({ GET: get }) });
+    const identity = { repoPath: "acme/widget", sync: false as const };
+    await store.loadDetail("acme", "widget", 7, { ...identity, ...loaded });
+
+    await store.refreshDetailOnly("acme", "widget", 7, {
+      repoPath: identity.repoPath,
+      ...refreshed,
+    });
+
+    expect(store.getDetail()?.platform_head_sha).toBe("refreshed-head");
   });
 
   it("applies a warnings-only change since the panel renders warnings", async () => {

@@ -175,6 +175,74 @@ describe("Provider events store wiring", () => {
     expect(loadActivity).toHaveBeenCalledTimes(activity);
   });
 
+  it("refreshes the Activity drawer selection instead of stale displayed detail", () => {
+    currentDetail = {
+      repo: {
+        provider: "github",
+        platform_host: "github.com",
+        repo_path: "acme/old-widget",
+      },
+      repo_owner: "acme",
+      repo_name: "old-widget",
+      merge_request: { Number: 41 },
+    };
+    render(Provider, {
+      props: {
+        client: stubClient,
+        getPage: () => "activity",
+        getActivitySelection: () => ({
+          itemType: "pr",
+          provider: "gitlab",
+          platformHost: "gitlab.example.com",
+          repoPath: "group/widget",
+          owner: "group",
+          name: "widget",
+          number: 42,
+        }),
+      },
+    });
+
+    captured.store?.options.onDataChanged?.();
+
+    expect(loadActivity).toHaveBeenCalledTimes(1);
+    expect(refreshDetailOnly).toHaveBeenCalledTimes(1);
+    expect(refreshDetailOnly).toHaveBeenCalledWith("group", "widget", 42, {
+      provider: "gitlab",
+      platformHost: "gitlab.example.com",
+      repoPath: "group/widget",
+    });
+  });
+
+  it("refreshes the selected Activity PR after a stale reconnect", () => {
+    render(Provider, {
+      props: {
+        client: stubClient,
+        getPage: () => "activity",
+        getActivitySelection: () => ({
+          itemType: "pr",
+          provider: "github",
+          platformHost: "github.com",
+          repoPath: "acme/widget",
+          owner: "acme",
+          name: "widget",
+          number: 42,
+        }),
+      },
+    });
+
+    captured.store?.options.onReconnectStale?.();
+
+    expect(loadPulls).toHaveBeenCalledTimes(1);
+    expect(loadIssues).toHaveBeenCalledTimes(1);
+    expect(loadActivity).toHaveBeenCalledTimes(1);
+    expect(refreshDetailOnly).toHaveBeenCalledTimes(1);
+    expect(refreshDetailOnly).toHaveBeenCalledWith("acme", "widget", 42, {
+      provider: "github",
+      platformHost: "github.com",
+      repoPath: "acme/widget",
+    });
+  });
+
   it("passes onSyncStatus that pushes the received status into sync store", () => {
     render(Provider, { props: { client: stubClient } });
 

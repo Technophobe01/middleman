@@ -8,6 +8,7 @@ import {
   type ProblemBody,
 } from "../api/problems.js";
 import {
+  canonicalProvider,
   providerDefaultHost,
   providerItemPath,
   providerRouteParams,
@@ -114,6 +115,8 @@ export function createDetailStore(opts: DetailStoreOptions) {
   let detailLoaded = $state(false);
   let syncGeneration = 0;
   let selectionGeneration = 0;
+  let detailRequestSequence = 0;
+  const latestSuccessfulDetailRequestSequenceBySelection = new Map<string, number>();
   let activeSelectionKey: string | null = null;
   // Tracks the PR (if any) whose local body has been edited since
   // the last server confirmation. While set, background sync paths
@@ -192,7 +195,9 @@ export function createDetailStore(opts: DetailStoreOptions) {
   // --- internal helpers ---
 
   function prKey(ref: DetailRequestRef): string {
-    return `${ref.provider}:${ref.platformHost ?? ""}:${ref.repoPath}/${ref.number}`;
+    const provider = canonicalProvider(ref.provider);
+    const platformHost = ref.platformHost?.trim() || providerDefaultHost(provider) || "";
+    return `${provider}:${platformHost}:${ref.repoPath}/${ref.number}`;
   }
 
   function detailRequestRef(
@@ -358,6 +363,8 @@ export function createDetailStore(opts: DetailStoreOptions) {
     identity: DetailRequestRef,
   ): Promise<{ ok: boolean; error?: string; fetchedAt?: string }> {
     const ref = detailRequestRef(owner, name, number, identity);
+    const key = prKey(ref);
+    const requestSequence = ++detailRequestSequence;
     try {
       const { data, error: requestError } = await apiClient.GET(providerItemPath("pulls", ref, ""), {
         params: {
@@ -367,11 +374,18 @@ export function createDetailStore(opts: DetailStoreOptions) {
       // Re-check the generation after the awaited request: if the
       // selected PR changed mid-flight, dropping the assignment keeps
       // the new selection's data from being clobbered.
-      if (expectedGen !== syncGeneration) return { ok: false };
+      if (
+        expectedGen !== syncGeneration ||
+        activeSelectionKey !== key ||
+        requestSequence < (latestSuccessfulDetailRequestSequenceBySelection.get(key) ?? 0)
+      ) {
+        return { ok: false };
+      }
       if (requestError) {
         return { ok: false, error: apiErrorMessage(requestError, "failed to refresh pull request") };
       }
       if (data !== undefined) {
+        latestSuccessfulDetailRequestSequenceBySelection.set(key, requestSequence);
         applyRefreshedDetail(
           withPreservedLocalBody({
             ...data,
@@ -459,6 +473,7 @@ export function createDetailStore(opts: DetailStoreOptions) {
     ++selectionGeneration;
     activeSelectionKey = null;
     activeLoad = null;
+    latestSuccessfulDetailRequestSequenceBySelection.clear();
     detail = null;
     loading = false;
     syncing = false;
@@ -513,6 +528,7 @@ export function createDetailStore(opts: DetailStoreOptions) {
     syncing = false;
     storeError = null;
     detailLoaded = false;
+    const requestSequence = ++detailRequestSequence;
     const promise = (async () => {
       try {
         const { data, error: requestError } = await apiClient.GET(providerItemPath("pulls", requestRef, ""), {
@@ -523,10 +539,16 @@ export function createDetailStore(opts: DetailStoreOptions) {
             },
           },
         });
-        if (gen !== syncGeneration) return;
+        if (
+          gen !== syncGeneration ||
+          requestSequence < (latestSuccessfulDetailRequestSequenceBySelection.get(key) ?? 0)
+        ) {
+          return;
+        }
         if (requestError) {
           throw new Error(requestError.detail ?? requestError.title ?? "failed to load pull request");
         }
+        latestSuccessfulDetailRequestSequenceBySelection.set(key, requestSequence);
         detail = data
           ? withPreservedLocalBody({
               ...data,
@@ -536,7 +558,12 @@ export function createDetailStore(opts: DetailStoreOptions) {
         noteObservedFetchedAt(data?.detail_fetched_at);
         detailLoaded = data?.detail_loaded ?? false;
       } catch (err) {
-        if (gen !== syncGeneration) return;
+        if (
+          gen !== syncGeneration ||
+          requestSequence < (latestSuccessfulDetailRequestSequenceBySelection.get(key) ?? 0)
+        ) {
+          return;
+        }
         storeError = err instanceof Error ? err.message : String(err);
       } finally {
         if (gen === syncGeneration) loading = false;
