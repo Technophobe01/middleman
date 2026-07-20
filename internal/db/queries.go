@@ -1879,10 +1879,6 @@ func (d *DB) ListRepos(ctx context.Context) ([]Repo, error) {
 		        last_sync_started_at, last_sync_completed_at,
 		        last_sync_error, allow_squash_merge, allow_merge_commit,
 		        allow_rebase_merge, viewer_can_merge,
-		        backfill_pr_page, backfill_pr_complete,
-		        backfill_pr_completed_at,
-		        backfill_issue_page, backfill_issue_complete,
-		        backfill_issue_completed_at,
 		        label_catalog_synced_at, label_catalog_checked_at,
 		        label_catalog_sync_error,
 		        created_at
@@ -1905,10 +1901,6 @@ func (d *DB) ListRepos(ctx context.Context) ([]Repo, error) {
 			&r.LastSyncError,
 			&r.AllowSquashMerge, &r.AllowMergeCommit, &r.AllowRebaseMerge,
 			&r.ViewerCanMerge,
-			&r.BackfillPRPage, &r.BackfillPRComplete,
-			&r.BackfillPRCompletedAt,
-			&r.BackfillIssuePage, &r.BackfillIssueComplete,
-			&r.BackfillIssueCompletedAt,
 			&r.LabelCatalogSyncedAt, &r.LabelCatalogCheckedAt,
 			&r.LabelCatalogSyncError,
 			&r.CreatedAt,
@@ -1983,10 +1975,6 @@ func (d *DB) GetRepoByIdentity(ctx context.Context, identity RepoIdentity) (*Rep
 		        last_sync_started_at, last_sync_completed_at,
 		        last_sync_error, allow_squash_merge, allow_merge_commit,
 		        allow_rebase_merge, viewer_can_merge,
-		        backfill_pr_page, backfill_pr_complete,
-		        backfill_pr_completed_at,
-		        backfill_issue_page, backfill_issue_complete,
-		        backfill_issue_completed_at,
 		        label_catalog_synced_at, label_catalog_checked_at,
 		        label_catalog_sync_error,
 		        created_at
@@ -2004,10 +1992,6 @@ func (d *DB) GetRepoByIdentity(ctx context.Context, identity RepoIdentity) (*Rep
 		&r.LastSyncError,
 		&r.AllowSquashMerge, &r.AllowMergeCommit, &r.AllowRebaseMerge,
 		&r.ViewerCanMerge,
-		&r.BackfillPRPage, &r.BackfillPRComplete,
-		&r.BackfillPRCompletedAt,
-		&r.BackfillIssuePage, &r.BackfillIssueComplete,
-		&r.BackfillIssueCompletedAt,
 		&r.LabelCatalogSyncedAt, &r.LabelCatalogCheckedAt,
 		&r.LabelCatalogSyncError,
 		&r.CreatedAt,
@@ -2033,10 +2017,6 @@ func (d *DB) GetRepoByID(ctx context.Context, id int64) (*Repo, error) {
 		        last_sync_started_at, last_sync_completed_at,
 		        last_sync_error, allow_squash_merge, allow_merge_commit,
 		        allow_rebase_merge, viewer_can_merge,
-		        backfill_pr_page, backfill_pr_complete,
-		        backfill_pr_completed_at,
-		        backfill_issue_page, backfill_issue_complete,
-		        backfill_issue_completed_at,
 		        label_catalog_synced_at, label_catalog_checked_at,
 		        label_catalog_sync_error,
 		        created_at
@@ -2050,10 +2030,6 @@ func (d *DB) GetRepoByID(ctx context.Context, id int64) (*Repo, error) {
 		&r.LastSyncError,
 		&r.AllowSquashMerge, &r.AllowMergeCommit, &r.AllowRebaseMerge,
 		&r.ViewerCanMerge,
-		&r.BackfillPRPage, &r.BackfillPRComplete,
-		&r.BackfillPRCompletedAt,
-		&r.BackfillIssuePage, &r.BackfillIssueComplete,
-		&r.BackfillIssueCompletedAt,
 		&r.LabelCatalogSyncedAt, &r.LabelCatalogCheckedAt,
 		&r.LabelCatalogSyncError,
 		&r.CreatedAt,
@@ -2080,14 +2056,6 @@ func normalizeRepoTimestamps(r *Repo) {
 	if r.LastSyncCompletedAt != nil {
 		t := r.LastSyncCompletedAt.UTC()
 		r.LastSyncCompletedAt = &t
-	}
-	if r.BackfillPRCompletedAt != nil {
-		t := r.BackfillPRCompletedAt.UTC()
-		r.BackfillPRCompletedAt = &t
-	}
-	if r.BackfillIssueCompletedAt != nil {
-		t := r.BackfillIssueCompletedAt.UTC()
-		r.BackfillIssueCompletedAt = &t
 	}
 	if r.LabelCatalogSyncedAt != nil {
 		t := r.LabelCatalogSyncedAt.UTC()
@@ -2213,6 +2181,25 @@ func (d *DB) UpsertMergeRequest(ctx context.Context, mr *MergeRequest) (int64, e
 	return id, err
 }
 
+// UpsertMergeRequestSnapshotWithLabels atomically applies a provider merge
+// request snapshot and its labels through the shared parent upsert core.
+// Callers must skip dependent writes when the monotonic updated_at guard
+// rejects the parent.
+func (d *DB) UpsertMergeRequestSnapshotWithLabels(
+	ctx context.Context,
+	mr *MergeRequest,
+) (int64, int64, bool, error) {
+	var id int64
+	var revision int64
+	var accepted bool
+	err := d.Tx(ctx, func(tx *sql.Tx) error {
+		var err error
+		id, revision, accepted, err = commitMergeRequestParentSnapshotTx(ctx, tx, mr, mr.Labels)
+		return err
+	})
+	return id, revision, accepted, err
+}
+
 // UpsertMergeRequestSnapshot reports whether the provider snapshot was
 // accepted. A false result means a newer timestamp already owns the row, so
 // callers must skip all downstream writes derived from the rejected snapshot.
@@ -2220,8 +2207,14 @@ func (d *DB) UpsertMergeRequestSnapshot(
 	ctx context.Context,
 	mr *MergeRequest,
 ) (int64, bool, error) {
-	canonicalizeMergeRequestTimestamps(mr)
-	return upsertMergeRequestSnapshot(ctx, d.rw, mr)
+	var id int64
+	var accepted bool
+	err := d.Tx(ctx, func(tx *sql.Tx) error {
+		var err error
+		id, _, accepted, err = upsertMergeRequestParentTx(ctx, tx, mr)
+		return err
+	})
+	return id, accepted, err
 }
 
 type mergeRequestSnapshotExecutor interface {
@@ -2233,7 +2226,7 @@ func upsertMergeRequestSnapshot(
 	ctx context.Context,
 	executor mergeRequestSnapshotExecutor,
 	mr *MergeRequest,
-) (int64, bool, error) {
+) (int64, int64, bool, error) {
 	result, err := executor.ExecContext(ctx, `
 		INSERT INTO middleman_merge_requests
 		    (repo_id, platform_id, platform_external_id, number, url, title, author, author_display_name,
@@ -2244,8 +2237,8 @@ func upsertMergeRequestSnapshot(
 		     detail_fetched_at, ci_had_pending,
 		     created_at, updated_at,
 		     last_activity_at, merged_at, closed_at, mergeable_state,
-		     assignees_json, reviewers_json)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		     assignees_json, reviewers_json, snapshot_revision)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
 		ON CONFLICT(repo_id, number) DO UPDATE SET
 		    platform_id          = excluded.platform_id,
 		    platform_external_id = COALESCE(NULLIF(excluded.platform_external_id, ''), middleman_merge_requests.platform_external_id),
@@ -2261,7 +2254,9 @@ func upsertMergeRequestSnapshot(
 		    base_branch          = excluded.base_branch,
 		    platform_head_sha    = excluded.platform_head_sha,
 		    platform_base_sha    = excluded.platform_base_sha,
-		    head_repo_clone_url  = excluded.head_repo_clone_url,
+		    head_repo_clone_url  = CASE WHEN ?
+		                                THEN middleman_merge_requests.head_repo_clone_url
+		                                ELSE excluded.head_repo_clone_url END,
 		    additions            = excluded.additions,
 		    deletions            = excluded.deletions,
 		    comment_count        = excluded.comment_count,
@@ -2280,7 +2275,8 @@ func upsertMergeRequestSnapshot(
 		                                ELSE excluded.assignees_json END,
 		    reviewers_json       = CASE WHEN excluded.reviewers_json = ''
 		                                THEN middleman_merge_requests.reviewers_json
-		                                ELSE excluded.reviewers_json END
+		                                ELSE excluded.reviewers_json END,
+		    snapshot_revision    = middleman_merge_requests.snapshot_revision + 1
 		WHERE excluded.updated_at >= middleman_merge_requests.updated_at`,
 		mr.RepoID, mr.PlatformID, mr.PlatformExternalID, mr.Number, mr.URL, mr.Title,
 		mr.Author, mr.AuthorDisplayName,
@@ -2292,23 +2288,71 @@ func upsertMergeRequestSnapshot(
 		mr.CreatedAt, mr.UpdatedAt,
 		mr.LastActivityAt, mr.MergedAt, mr.ClosedAt, mr.MergeableState,
 		mr.AssigneesJSON, mr.ReviewersJSON,
+		mr.HeadRepoCloneURLUnknown,
 	)
 	if err != nil {
-		return 0, false, fmt.Errorf("upsert merge request: %w", err)
+		return 0, 0, false, fmt.Errorf("upsert merge request: %w", err)
 	}
 	rowsAffected, err := result.RowsAffected()
 	if err != nil {
-		return 0, false, fmt.Errorf("read upsert merge request result: %w", err)
+		return 0, 0, false, fmt.Errorf("read upsert merge request result: %w", err)
 	}
-	var id int64
+	var id, revision int64
 	err = executor.QueryRowContext(ctx,
-		`SELECT id FROM middleman_merge_requests WHERE repo_id = ? AND number = ?`,
+		`SELECT id, snapshot_revision FROM middleman_merge_requests WHERE repo_id = ? AND number = ?`,
 		mr.RepoID, mr.Number,
-	).Scan(&id)
+	).Scan(&id, &revision)
 	if err != nil {
-		return 0, false, fmt.Errorf("get mr id after upsert: %w", err)
+		return 0, 0, false, fmt.Errorf("get mr id after upsert: %w", err)
 	}
-	return id, rowsAffected > 0, nil
+	return id, revision, rowsAffected > 0, nil
+}
+
+// upsertMergeRequestParentTx applies a provider snapshot inside an existing
+// transaction.
+func upsertMergeRequestParentTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	mr *MergeRequest,
+) (int64, int64, bool, error) {
+	canonicalizeMergeRequestTimestamps(mr)
+	id, revision, accepted, err := upsertMergeRequestSnapshot(ctx, tx, mr)
+	return id, revision, accepted, err
+}
+
+// commitIssueParentSnapshotTx upserts the parent and replaces labels only when
+// the incoming snapshot wins the monotonic timestamp guard.
+func commitIssueParentSnapshotTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	issue *Issue,
+	labels []Label,
+) (int64, int64, bool, error) {
+	id, revision, accepted, err := upsertIssueParentTx(ctx, tx, issue)
+	if err != nil || !accepted {
+		return id, revision, accepted, err
+	}
+	if err := replaceIssueLabelsTx(ctx, tx, issue.RepoID, id, labels); err != nil {
+		return 0, 0, false, err
+	}
+	return id, revision, true, nil
+}
+
+// commitMergeRequestParentSnapshotTx is the merge-request counterpart.
+func commitMergeRequestParentSnapshotTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	mr *MergeRequest,
+	labels []Label,
+) (int64, int64, bool, error) {
+	id, revision, accepted, err := upsertMergeRequestParentTx(ctx, tx, mr)
+	if err != nil || !accepted {
+		return id, revision, accepted, err
+	}
+	if err := replaceMergeRequestLabelsTx(ctx, tx, mr.RepoID, id, labels); err != nil {
+		return 0, 0, false, err
+	}
+	return id, revision, true, nil
 }
 
 // GetMergeRequest returns a merge request by repository identity and MR number, or nil if not found.
@@ -2321,7 +2365,7 @@ func (d *DB) GetMergeRequest(
 	platformHost, owner, name = canonicalRepoLookupIdentifier(platformHost, owner, name)
 	var mr MergeRequest
 	err := d.ro.QueryRowContext(ctx, `
-		SELECT p.id, p.repo_id, p.platform_id, p.platform_external_id, p.number, p.url, p.title,
+		SELECT p.id, p.snapshot_revision, p.repo_id, p.platform_id, p.platform_external_id, p.number, p.url, p.title,
 		       p.author, p.author_display_name, p.state, p.is_draft, p.is_locked,
 		       p.body, p.head_branch, p.base_branch,
 		       p.platform_head_sha, p.platform_base_sha,
@@ -2348,7 +2392,7 @@ func (d *DB) GetMergeRequest(
 		  AND p.number = ?`,
 		platform, platformHost, owner, name, number,
 	).Scan(
-		&mr.ID, &mr.RepoID, &mr.PlatformID, &mr.PlatformExternalID, &mr.Number, &mr.URL, &mr.Title,
+		&mr.ID, &mr.SnapshotRevision, &mr.RepoID, &mr.PlatformID, &mr.PlatformExternalID, &mr.Number, &mr.URL, &mr.Title,
 		&mr.Author, &mr.AuthorDisplayName, &mr.State, &mr.IsDraft, &mr.IsLocked,
 		&mr.Body, &mr.HeadBranch, &mr.BaseBranch,
 		&mr.PlatformHeadSHA, &mr.PlatformBaseSHA,
@@ -2383,7 +2427,7 @@ func (d *DB) GetMergeRequest(
 func (d *DB) GetMergeRequestByRepoIDAndNumber(ctx context.Context, repoID int64, number int) (*MergeRequest, error) {
 	var mr MergeRequest
 	err := d.ro.QueryRowContext(ctx, `
-		SELECT p.id, p.repo_id, p.platform_id, p.platform_external_id, p.number, p.url, p.title,
+		SELECT p.id, p.snapshot_revision, p.repo_id, p.platform_id, p.platform_external_id, p.number, p.url, p.title,
 		       p.author, p.author_display_name, p.state, p.is_draft, p.is_locked,
 		       p.body, p.head_branch, p.base_branch,
 		       p.platform_head_sha, p.platform_base_sha,
@@ -2407,7 +2451,7 @@ func (d *DB) GetMergeRequestByRepoIDAndNumber(ctx context.Context, repoID int64,
 		WHERE p.repo_id = ? AND p.number = ?`,
 		repoID, number,
 	).Scan(
-		&mr.ID, &mr.RepoID, &mr.PlatformID, &mr.PlatformExternalID, &mr.Number, &mr.URL, &mr.Title,
+		&mr.ID, &mr.SnapshotRevision, &mr.RepoID, &mr.PlatformID, &mr.PlatformExternalID, &mr.Number, &mr.URL, &mr.Title,
 		&mr.Author, &mr.AuthorDisplayName, &mr.State, &mr.IsDraft, &mr.IsLocked,
 		&mr.Body, &mr.HeadBranch, &mr.BaseBranch,
 		&mr.PlatformHeadSHA, &mr.PlatformBaseSHA,
@@ -2508,7 +2552,7 @@ func (d *DB) ListMergeRequests(ctx context.Context, opts ListMergeRequestsOpts) 
 	}
 
 	query := fmt.Sprintf(`
-		SELECT p.id, p.repo_id, p.platform_id, p.platform_external_id, p.number, p.url, p.title,
+		SELECT p.id, p.snapshot_revision, p.repo_id, p.platform_id, p.platform_external_id, p.number, p.url, p.title,
 		       p.author, p.author_display_name, p.state, p.is_draft, p.is_locked,
 		       p.body, p.head_branch, p.base_branch,
 		       p.platform_head_sha, p.platform_base_sha,
@@ -2543,7 +2587,7 @@ func (d *DB) ListMergeRequests(ctx context.Context, opts ListMergeRequestsOpts) 
 	for rows.Next() {
 		var mr MergeRequest
 		if err := rows.Scan(
-			&mr.ID, &mr.RepoID, &mr.PlatformID, &mr.PlatformExternalID, &mr.Number, &mr.URL, &mr.Title,
+			&mr.ID, &mr.SnapshotRevision, &mr.RepoID, &mr.PlatformID, &mr.PlatformExternalID, &mr.Number, &mr.URL, &mr.Title,
 			&mr.Author, &mr.AuthorDisplayName, &mr.State, &mr.IsDraft, &mr.IsLocked,
 			&mr.Body, &mr.HeadBranch, &mr.BaseBranch,
 			&mr.PlatformHeadSHA, &mr.PlatformBaseSHA,
@@ -2662,28 +2706,6 @@ func (d *DB) MRCommentEventExists(
 	return exists, nil
 }
 
-// DeleteMissingMRCommentEvents removes issue_comment rows for a PR whose
-// dedupe keys are absent from the latest GitHub comment list.
-func (d *DB) DeleteMissingMRCommentEvents(
-	ctx context.Context,
-	mrID int64,
-	dedupeKeys []string,
-) error {
-	query := `DELETE FROM middleman_mr_events
-		WHERE merge_request_id = ? AND event_type = 'issue_comment'`
-	args := []any{mrID}
-	if len(dedupeKeys) > 0 {
-		query += ` AND dedupe_key NOT IN (` + sqlPlaceholders(len(dedupeKeys)) + `)`
-		for _, key := range dedupeKeys {
-			args = append(args, key)
-		}
-	}
-	if _, err := d.rw.ExecContext(ctx, query, args...); err != nil {
-		return fmt.Errorf("delete missing mr comment events: %w", err)
-	}
-	return nil
-}
-
 // ReplaceMRCommentEvents atomically replaces provider issue-comment events and
 // their parent merge request's derived comment count.
 func (d *DB) ReplaceMRCommentEvents(
@@ -2693,32 +2715,42 @@ func (d *DB) ReplaceMRCommentEvents(
 	lastActivityAt *time.Time,
 ) error {
 	return d.Tx(ctx, func(tx *sql.Tx) error {
-		query := `DELETE FROM middleman_mr_events
+		return replaceMRCommentEventsTx(ctx, tx, mrID, events, lastActivityAt)
+	})
+}
+
+func replaceMRCommentEventsTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	mrID int64,
+	events []MREvent,
+	lastActivityAt *time.Time,
+) error {
+	query := `DELETE FROM middleman_mr_events
 			WHERE merge_request_id = ? AND event_type = 'issue_comment'`
-		args := []any{mrID}
-		if len(events) > 0 {
-			query += ` AND dedupe_key NOT IN (` + sqlPlaceholders(len(events)) + `)`
-			for i := range events {
-				args = append(args, events[i].DedupeKey)
-			}
+	args := []any{mrID}
+	if len(events) > 0 {
+		query += ` AND dedupe_key NOT IN (` + sqlPlaceholders(len(events)) + `)`
+		for i := range events {
+			args = append(args, events[i].DedupeKey)
 		}
-		if _, err := tx.ExecContext(ctx, query, args...); err != nil {
-			return fmt.Errorf("delete missing mr comment events: %w", err)
-		}
-		if err := upsertMREventsTx(ctx, tx, events); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `
+	}
+	if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+		return fmt.Errorf("delete missing mr comment events: %w", err)
+	}
+	if err := upsertMREventsTx(ctx, tx, events); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
 			UPDATE middleman_merge_requests
 			SET comment_count = (
 				SELECT COUNT(*) FROM middleman_mr_events
 				WHERE merge_request_id = ? AND event_type = 'issue_comment'
 			), last_activity_at = COALESCE(?, last_activity_at)
 			WHERE id = ?`, mrID, lastActivityAt, mrID); err != nil {
-			return fmt.Errorf("update mr derived fields: %w", err)
-		}
-		return nil
-	})
+		return fmt.Errorf("update mr derived fields: %w", err)
+	}
+	return nil
 }
 
 // GetMRLatestNonCommentEventTime returns the most recent created_at across
@@ -2865,7 +2897,8 @@ func (d *DB) GetPreviouslyOpenMRNumbers(
 	stillOpen map[int]bool,
 ) ([]int, error) {
 	rows, err := d.ro.QueryContext(ctx,
-		`SELECT number FROM middleman_merge_requests WHERE repo_id = ? AND state = 'open'`,
+		`SELECT number FROM middleman_merge_requests
+		 WHERE repo_id = ? AND state = 'open'`,
 		repoID,
 	)
 	if err != nil {
@@ -3077,27 +3110,6 @@ func (d *DB) UpdateMRCIStatusForHead(
 	return nil
 }
 
-// ClearMRCI resets ci_status, ci_checks_json, and ci_had_pending for a
-// merge request. UpsertMergeRequest preserves ci_had_pending across
-// upserts, so callers that observe a head SHA change need this to drop
-// the stale pending flag along with the rest of the CI fields.
-func (d *DB) ClearMRCI(
-	ctx context.Context,
-	repoID int64,
-	number int,
-) error {
-	_, err := d.rw.ExecContext(ctx, `
-		UPDATE middleman_merge_requests
-		SET ci_status = '', ci_checks_json = '', ci_had_pending = 0
-		WHERE repo_id = ? AND number = ?`,
-		repoID, number,
-	)
-	if err != nil {
-		return fmt.Errorf("clear mr ci: %w", err)
-	}
-	return nil
-}
-
 // UpdateClosedMRState atomically updates the state, timestamps, and final
 // platform head/base SHAs for a MR that has transitioned to closed or merged.
 // updatedAt should be the MR's UpdatedAt timestamp from the platform.
@@ -3303,13 +3315,47 @@ func (d *DB) UpdateMRDraftState(ctx context.Context, repoID int64, number int, i
 // operates on a consistent storage representation.
 // On conflict (repo_id, number), stale snapshots are ignored wholesale.
 func (d *DB) UpsertIssue(ctx context.Context, issue *Issue) (int64, error) {
+	var id int64
+	err := d.Tx(ctx, func(tx *sql.Tx) error {
+		var err error
+		id, _, _, err = upsertIssueParentTx(ctx, tx, issue)
+		return err
+	})
+	return id, err
+}
+
+// UpsertIssueSnapshotWithLabels atomically applies a provider issue snapshot
+// through the shared parent upsert core in its live (progress-optional) mode
+// and reports whether it passed the monotonic updated_at guard. Callers must
+// skip child writes derived from a rejected snapshot.
+func (d *DB) UpsertIssueSnapshotWithLabels(
+	ctx context.Context,
+	issue *Issue,
+) (int64, int64, bool, error) {
+	var id int64
+	var revision int64
+	var accepted bool
+	err := d.Tx(ctx, func(tx *sql.Tx) error {
+		var err error
+		id, revision, accepted, err = commitIssueParentSnapshotTx(ctx, tx, issue, issue.Labels)
+		return err
+	})
+	return id, revision, accepted, err
+}
+
+func upsertIssueParentTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	issue *Issue,
+) (int64, int64, bool, error) {
 	canonicalizeIssueTimestamps(issue)
-	_, err := d.rw.ExecContext(ctx, `
+	var issueID, revision int64
+	err := tx.QueryRowContext(ctx, `
 		INSERT INTO middleman_issues
 		    (repo_id, platform_id, platform_external_id, number, url, title, author, state,
 		     body, comment_count, labels_json, assignees_json, detail_fetched_at,
-		     created_at, updated_at, last_activity_at, closed_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?, ''), '[]'), ?, ?, ?, ?, ?)
+		     created_at, updated_at, last_activity_at, closed_at, snapshot_revision)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?, ''), '[]'), ?, ?, ?, ?, ?, 1)
 		ON CONFLICT(repo_id, number) DO UPDATE SET
 		    platform_id       = excluded.platform_id,
 		    platform_external_id = COALESCE(NULLIF(excluded.platform_external_id, ''), middleman_issues.platform_external_id),
@@ -3324,26 +3370,30 @@ func (d *DB) UpsertIssue(ctx context.Context, issue *Issue) (int64, error) {
 		    detail_fetched_at = COALESCE(middleman_issues.detail_fetched_at, excluded.detail_fetched_at),
 		    updated_at        = excluded.updated_at,
 		    last_activity_at  = excluded.last_activity_at,
-		    closed_at         = excluded.closed_at
-		WHERE excluded.updated_at >= middleman_issues.updated_at`,
+		    closed_at         = excluded.closed_at,
+		    snapshot_revision = middleman_issues.snapshot_revision + 1
+		WHERE excluded.updated_at >= middleman_issues.updated_at
+		RETURNING id, snapshot_revision`,
 		issue.RepoID, issue.PlatformID, issue.PlatformExternalID, issue.Number, issue.URL,
 		issue.Title, issue.Author, issue.State,
 		issue.Body, issue.CommentCount, issue.LabelsJSON, issue.AssigneesJSON,
 		issue.DetailFetchedAt,
 		issue.CreatedAt, issue.UpdatedAt, issue.LastActivityAt, issue.ClosedAt,
-	)
-	if err != nil {
-		return 0, fmt.Errorf("upsert issue: %w", err)
+	).Scan(&issueID, &revision)
+	if errors.Is(err, sql.ErrNoRows) {
+		err = tx.QueryRowContext(ctx,
+			`SELECT id, snapshot_revision FROM middleman_issues WHERE repo_id = ? AND number = ?`,
+			issue.RepoID, issue.Number,
+		).Scan(&issueID, &revision)
+		if err != nil {
+			return 0, 0, false, fmt.Errorf("get issue id after stale upsert: %w", err)
+		}
+		return issueID, revision, false, nil
 	}
-	var id int64
-	err = d.ro.QueryRowContext(ctx,
-		`SELECT id FROM middleman_issues WHERE repo_id = ? AND number = ?`,
-		issue.RepoID, issue.Number,
-	).Scan(&id)
 	if err != nil {
-		return 0, fmt.Errorf("get issue id after upsert: %w", err)
+		return 0, 0, false, fmt.Errorf("upsert issue parent: %w", err)
 	}
-	return id, nil
+	return issueID, revision, true, nil
 }
 
 // GetIssue returns an issue by repository identity and issue number, or nil if not found.
@@ -3356,7 +3406,7 @@ func (d *DB) GetIssue(
 	platformHost, owner, name = canonicalRepoLookupIdentifier(platformHost, owner, name)
 	var issue Issue
 	err := d.ro.QueryRowContext(ctx, `
-		SELECT i.id, i.repo_id, i.platform_id, i.platform_external_id, i.number, i.url, i.title,
+		SELECT i.id, i.snapshot_revision, i.repo_id, i.platform_id, i.platform_external_id, i.number, i.url, i.title,
 		       i.author, i.state, i.body, i.comment_count, i.labels_json, i.assignees_json,
 		       i.detail_fetched_at,
 		       i.created_at, i.updated_at, i.last_activity_at, i.closed_at,
@@ -3373,7 +3423,7 @@ func (d *DB) GetIssue(
 		  AND i.number = ?`,
 		platform, platformHost, owner, name, number,
 	).Scan(
-		&issue.ID, &issue.RepoID, &issue.PlatformID, &issue.PlatformExternalID, &issue.Number,
+		&issue.ID, &issue.SnapshotRevision, &issue.RepoID, &issue.PlatformID, &issue.PlatformExternalID, &issue.Number,
 		&issue.URL, &issue.Title, &issue.Author, &issue.State,
 		&issue.Body, &issue.CommentCount, &issue.LabelsJSON, &issue.AssigneesJSON,
 		&issue.DetailFetchedAt,
@@ -3404,7 +3454,7 @@ func (d *DB) GetIssue(
 func (d *DB) GetIssueByRepoIDAndNumber(ctx context.Context, repoID int64, number int) (*Issue, error) {
 	var issue Issue
 	err := d.ro.QueryRowContext(ctx, `
-		SELECT i.id, i.repo_id, i.platform_id, i.platform_external_id, i.number, i.url, i.title,
+		SELECT i.id, i.snapshot_revision, i.repo_id, i.platform_id, i.platform_external_id, i.number, i.url, i.title,
 		       i.author, i.state, i.body, i.comment_count, i.labels_json, i.assignees_json,
 		       i.detail_fetched_at,
 		       i.created_at, i.updated_at, i.last_activity_at, i.closed_at,
@@ -3418,7 +3468,7 @@ func (d *DB) GetIssueByRepoIDAndNumber(ctx context.Context, repoID int64, number
 		WHERE i.repo_id = ? AND i.number = ?`,
 		repoID, number,
 	).Scan(
-		&issue.ID, &issue.RepoID, &issue.PlatformID, &issue.PlatformExternalID, &issue.Number,
+		&issue.ID, &issue.SnapshotRevision, &issue.RepoID, &issue.PlatformID, &issue.PlatformExternalID, &issue.Number,
 		&issue.URL, &issue.Title, &issue.Author, &issue.State,
 		&issue.Body, &issue.CommentCount, &issue.LabelsJSON, &issue.AssigneesJSON,
 		&issue.DetailFetchedAt,
@@ -3510,7 +3560,7 @@ func (d *DB) ListIssues(
 	}
 
 	query := fmt.Sprintf(`
-		SELECT i.id, i.repo_id, i.platform_id, i.platform_external_id, i.number, i.url, i.title,
+		SELECT i.id, i.snapshot_revision, i.repo_id, i.platform_id, i.platform_external_id, i.number, i.url, i.title,
 		       i.author, i.state, i.body, i.comment_count, i.labels_json, i.assignees_json,
 		       i.detail_fetched_at,
 		       i.created_at, i.updated_at, i.last_activity_at, i.closed_at,
@@ -3537,7 +3587,7 @@ func (d *DB) ListIssues(
 	for rows.Next() {
 		var issue Issue
 		if err := rows.Scan(
-			&issue.ID, &issue.RepoID, &issue.PlatformID, &issue.PlatformExternalID, &issue.Number,
+			&issue.ID, &issue.SnapshotRevision, &issue.RepoID, &issue.PlatformID, &issue.PlatformExternalID, &issue.Number,
 			&issue.URL, &issue.Title, &issue.Author, &issue.State,
 			&issue.Body, &issue.CommentCount, &issue.LabelsJSON, &issue.AssigneesJSON,
 			&issue.DetailFetchedAt,
@@ -3576,7 +3626,8 @@ func (d *DB) ResolveItemNumber(
 ) (itemType string, found bool, err error) {
 	var exists int
 	err = d.ro.QueryRowContext(ctx,
-		`SELECT 1 FROM middleman_merge_requests WHERE repo_id = ? AND number = ?`,
+		`SELECT 1 FROM middleman_merge_requests
+		 WHERE repo_id = ? AND number = ?`,
 		repoID, number,
 	).Scan(&exists)
 	if err == nil {
@@ -3587,7 +3638,8 @@ func (d *DB) ResolveItemNumber(
 	}
 
 	err = d.ro.QueryRowContext(ctx,
-		`SELECT 1 FROM middleman_issues WHERE repo_id = ? AND number = ?`,
+		`SELECT 1 FROM middleman_issues
+		 WHERE repo_id = ? AND number = ?`,
 		repoID, number,
 	).Scan(&exists)
 	if err == nil {
@@ -3607,9 +3659,11 @@ func (d *DB) ResolveItemNumberOfType(
 	var query string
 	switch itemType {
 	case "pr":
-		query = `SELECT 1 FROM middleman_merge_requests WHERE repo_id = ? AND number = ?`
+		query = `SELECT 1 FROM middleman_merge_requests
+		         WHERE repo_id = ? AND number = ?`
 	case "issue":
-		query = `SELECT 1 FROM middleman_issues WHERE repo_id = ? AND number = ?`
+		query = `SELECT 1 FROM middleman_issues
+		         WHERE repo_id = ? AND number = ?`
 	default:
 		return "", false, fmt.Errorf("unsupported item type %q", itemType)
 	}
@@ -3654,7 +3708,8 @@ func (d *DB) GetPreviouslyOpenIssueNumbers(
 	stillOpen map[int]bool,
 ) ([]int, error) {
 	rows, err := d.ro.QueryContext(ctx,
-		`SELECT number FROM middleman_issues WHERE repo_id = ? AND state = 'open'`,
+		`SELECT number FROM middleman_issues
+		 WHERE repo_id = ? AND state = 'open'`,
 		repoID,
 	)
 	if err != nil {
@@ -3794,25 +3849,6 @@ func (d *DB) UpdateMRDetailFetchedByRepoID(
 	return nil
 }
 
-// ClearMRDetailFetchedByRepoID marks an existing merge request as needing a
-// fresh detail fetch for an already resolved provider-qualified repo row.
-func (d *DB) ClearMRDetailFetchedByRepoID(
-	ctx context.Context,
-	repoID int64,
-	number int,
-) error {
-	_, err := d.rw.ExecContext(ctx, `
-		UPDATE middleman_merge_requests
-		SET detail_fetched_at = NULL
-		WHERE repo_id = ? AND number = ?`,
-		repoID, number,
-	)
-	if err != nil {
-		return fmt.Errorf("clear mr detail fetched by repo id: %w", err)
-	}
-	return nil
-}
-
 // UpdateMRWorkflowApproval persists the workflow-approval snapshot
 // for a merge request. The result is tied to headSHA: a later GET
 // must compare the stored head SHA to the merge request's current
@@ -3863,56 +3899,6 @@ func (d *DB) UpdateIssueDetailFetched(
 	)
 	if err != nil {
 		return fmt.Errorf("update issue detail fetched: %w", err)
-	}
-	return nil
-}
-
-// UpdateIssueDetailFetchedByRepoID marks an issue as having had its
-// detail fetched for an already resolved provider-qualified repo row.
-func (d *DB) UpdateIssueDetailFetchedByRepoID(
-	ctx context.Context,
-	repoID int64,
-	number int,
-) error {
-	_, err := d.rw.ExecContext(ctx, `
-		UPDATE middleman_issues
-		SET detail_fetched_at = datetime('now')
-		WHERE repo_id = ? AND number = ?`,
-		repoID, number,
-	)
-	if err != nil {
-		return fmt.Errorf("update issue detail fetched by repo id: %w", err)
-	}
-	return nil
-}
-
-// UpdateBackfillCursor updates the backfill pagination state for a repo.
-func (d *DB) UpdateBackfillCursor(
-	ctx context.Context, repoID int64,
-	prPage int, prComplete bool, prCompletedAt *time.Time,
-	issuePage int, issueComplete bool,
-	issueCompletedAt *time.Time,
-) error {
-	repo := &Repo{
-		BackfillPRCompletedAt:    prCompletedAt,
-		BackfillIssueCompletedAt: issueCompletedAt,
-	}
-	canonicalizeRepoTimestamps(repo)
-	_, err := d.rw.ExecContext(ctx, `
-		UPDATE middleman_repos
-		SET backfill_pr_page = ?,
-		    backfill_pr_complete = ?,
-		    backfill_pr_completed_at = ?,
-		    backfill_issue_page = ?,
-		    backfill_issue_complete = ?,
-		    backfill_issue_completed_at = ?
-		WHERE id = ?`,
-		prPage, prComplete, repo.BackfillPRCompletedAt,
-		issuePage, issueComplete, repo.BackfillIssueCompletedAt,
-		repoID,
-	)
-	if err != nil {
-		return fmt.Errorf("update backfill cursor: %w", err)
 	}
 	return nil
 }
@@ -3994,28 +3980,6 @@ func (d *DB) IssueCommentEventExists(
 	return exists, nil
 }
 
-// DeleteMissingIssueCommentEvents removes issue_comment rows for an issue whose
-// dedupe keys are absent from the latest GitHub comment list.
-func (d *DB) DeleteMissingIssueCommentEvents(
-	ctx context.Context,
-	issueID int64,
-	dedupeKeys []string,
-) error {
-	query := `DELETE FROM middleman_issue_events
-		WHERE issue_id = ? AND event_type = 'issue_comment'`
-	args := []any{issueID}
-	if len(dedupeKeys) > 0 {
-		query += ` AND dedupe_key NOT IN (` + sqlPlaceholders(len(dedupeKeys)) + `)`
-		for _, key := range dedupeKeys {
-			args = append(args, key)
-		}
-	}
-	if _, err := d.rw.ExecContext(ctx, query, args...); err != nil {
-		return fmt.Errorf("delete missing issue comment events: %w", err)
-	}
-	return nil
-}
-
 // ReplaceIssueCommentEvents atomically replaces provider issue-comment events
 // and their parent issue's derived comment count.
 func (d *DB) ReplaceIssueCommentEvents(
@@ -4025,32 +3989,42 @@ func (d *DB) ReplaceIssueCommentEvents(
 	lastActivityAt *time.Time,
 ) error {
 	return d.Tx(ctx, func(tx *sql.Tx) error {
-		query := `DELETE FROM middleman_issue_events
+		return replaceIssueCommentEventsTx(ctx, tx, issueID, events, lastActivityAt)
+	})
+}
+
+func replaceIssueCommentEventsTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	issueID int64,
+	events []IssueEvent,
+	lastActivityAt *time.Time,
+) error {
+	query := `DELETE FROM middleman_issue_events
 			WHERE issue_id = ? AND event_type = 'issue_comment'`
-		args := []any{issueID}
-		if len(events) > 0 {
-			query += ` AND dedupe_key NOT IN (` + sqlPlaceholders(len(events)) + `)`
-			for i := range events {
-				args = append(args, events[i].DedupeKey)
-			}
+	args := []any{issueID}
+	if len(events) > 0 {
+		query += ` AND dedupe_key NOT IN (` + sqlPlaceholders(len(events)) + `)`
+		for i := range events {
+			args = append(args, events[i].DedupeKey)
 		}
-		if _, err := tx.ExecContext(ctx, query, args...); err != nil {
-			return fmt.Errorf("delete missing issue comment events: %w", err)
-		}
-		if err := upsertIssueEventsTx(ctx, tx, events); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `
+	}
+	if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+		return fmt.Errorf("delete missing issue comment events: %w", err)
+	}
+	if err := upsertIssueEventsTx(ctx, tx, events); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
 			UPDATE middleman_issues
 			SET comment_count = (
 				SELECT COUNT(*) FROM middleman_issue_events
 				WHERE issue_id = ? AND event_type = 'issue_comment'
 			), last_activity_at = COALESCE(?, last_activity_at)
 			WHERE id = ?`, issueID, lastActivityAt, issueID); err != nil {
-			return fmt.Errorf("update issue derived fields: %w", err)
-		}
-		return nil
-	})
+		return fmt.Errorf("update issue derived fields: %w", err)
+	}
+	return nil
 }
 
 // ListIssueEvents returns all events for an issue ordered by created_at DESC.
@@ -4374,8 +4348,6 @@ func (d *DB) GetPlatformRateLimit(
 // --- Worktree Links ---
 
 // SetWorktreeLinks replaces all worktree links atomically.
-// The existing rows are deleted and the provided links are
-// inserted in a single transaction.
 func (d *DB) SetWorktreeLinks(
 	ctx context.Context, links []WorktreeLink,
 ) error {

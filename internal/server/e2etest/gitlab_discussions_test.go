@@ -299,7 +299,9 @@ func (p *gitLabDiscussionProvider) ListRepositories(context.Context, string, pla
 	return nil, nil
 }
 
-func (p *gitLabDiscussionProvider) ListOpenMergeRequests(context.Context, platform.RepoRef) ([]platform.MergeRequest, error) {
+func (p *gitLabDiscussionProvider) ListOpenMergeRequests(
+	context.Context, platform.RepoRef,
+) ([]platform.MergeRequest, error) {
 	return nil, nil
 }
 
@@ -308,10 +310,10 @@ func (p *gitLabDiscussionProvider) GetMergeRequest(
 	_ platform.RepoRef,
 	number int,
 ) (platform.MergeRequest, error) {
-	if p.mergeRequests != nil {
-		return p.mergeRequests[number], nil
+	if mr, ok := p.mergeRequests[number]; ok {
+		return mr, nil
 	}
-	return platform.MergeRequest{}, nil
+	return platform.MergeRequest{}, platform.ProviderContract(platform.KindGitLab, p.ref.Host, "merge_request", nil)
 }
 
 func (p *gitLabDiscussionProvider) ListMergeRequestEvents(
@@ -325,7 +327,9 @@ func (p *gitLabDiscussionProvider) ListMergeRequestEvents(
 	return nil, nil
 }
 
-func (p *gitLabDiscussionProvider) ListOpenIssues(context.Context, platform.RepoRef) ([]platform.Issue, error) {
+func (p *gitLabDiscussionProvider) ListOpenIssues(
+	context.Context, platform.RepoRef,
+) ([]platform.Issue, error) {
 	return nil, nil
 }
 
@@ -334,10 +338,10 @@ func (p *gitLabDiscussionProvider) GetIssue(
 	_ platform.RepoRef,
 	number int,
 ) (platform.Issue, error) {
-	if p.issues != nil {
-		return p.issues[number], nil
+	if issue, ok := p.issues[number]; ok {
+		return issue, nil
 	}
-	return platform.Issue{}, nil
+	return platform.Issue{}, platform.ProviderContract(platform.KindGitLab, p.ref.Host, "issue", nil)
 }
 
 func (p *gitLabDiscussionProvider) ListIssueEvents(

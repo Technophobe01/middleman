@@ -152,6 +152,22 @@ registry helpers return typed errors for missing providers or capabilities.
   only metadata writer. A branch that skips the write leaves default_branch
   empty forever, which silently degrades the worktree diff sampler to a bare
   HEAD diff (0/0 sidebar stats).
+- Child datasets and detail/CI/diff freshness writes are fenced to the parent snapshot revision. Complete comments and inline review sets replace; submitted reviews remain additive. (`internal/db/queries_snapshot_children.go::CommitMergeRequestChildSnapshot`)
+
+## Historical Archive
+
+- Archive is a scheduling and progress mode over normal sync, not a second sync engine; completeness is repository and item progress scoped by full repository identity. (`internal/db/queries_archive.go::GetArchiveProgress`)
+- Created-order inventory calls require the historical capability; updated-order maintenance traversal does not. Each returns one bounded identity page with an advancing opaque cursor or explicit exhaustion. (`internal/platform/reader_validation.go::pageReaderValidation.prepare`)
+- Hydration admits one item, invokes canonical item sync, and records only its archive outcome; do not add archive-specific lookup, normalization, dataset, parent/child writer, or revision-fencing paths. (`internal/archive/hydrate.go::hydrateItem`, `internal/db/queries_dataset_progress.go::CommitArchiveItemSync`)
+- Only parent lookups explicitly classified as removed, moved, or inaccessible are terminal. Generic and child-dataset not-found responses remain retries; non-GitHub providers probe repository accessibility before classifying a missing parent. Canonical item content stays untouched. (`internal/archive/hydrate.go::archiveTerminalSyncOutcome`, `internal/github/sync.go::classifyProviderItemLookupError`)
+- Maintenance rediscovery reopens terminal item progress for hydration; unsupported and blocked items remain excluded. (`internal/db/queries_dataset_progress.go::reopenArchiveItemProgressTx`)
+- A bare optional `DiffSyncError` does not block archive historical-activity completion; wrapped or joined hard failures still retry. (`internal/github/sync.go::SyncArchiveItem`)
+- Every configured repository starts provider-neutral discovery; do not restore provider-specific closed-item cursors or translate legacy formats. (`internal/archive/service.go::EnsureConfigured`)
+- Configuration reconciliation pauses omitted repositories with a durable `configuration_removed` reason while retaining archive content and progress. Re-adding the same full identity clears only that automatic pause; an operator pause stays paused. (`internal/db/queries_archive.go::ReconcileDiscoveryArchives`, `internal/db/queries_archive.go::EnsureDiscoveryArchives`)
+- Reconcile configured repositories only at startup or configuration reload; idle scheduler polls must remain read-only unless they claim actual work. (`internal/github/sync.go::SetReposWithContext`, `internal/archive/scheduler.go::RunEligible`)
+- Authentication and repository-blocked errors defer every archive work class, including already-pending hydration, until an explicit retry clears the repository error. (`internal/archive/scheduler.go::archiveRepoDeferred`)
+- Archive admission is provider-host scoped and request-bounded. Normal index, notification, and active-detail work outrank archive requests; live work registers first, cancels the active archive request context, and waits for that request lease to release before provider I/O. Archive leases are released before SQLite commits. Register repo index and item detail work inside their shared execution functions so periodic, watched, manual, API, and item-number entry points cannot bypass admission. (`internal/github/sync.go::beginProviderWork`, `internal/github/sync.go::tryBeginArchiveProviderRequest`, `internal/github/sync.go::Admit`, `internal/archive/scheduler.go::admit`)
+- Archive admission requires the declared minimum cost, then bounds all wire attempts to the currently available quadratic surplus above the provider live floor. Unknown reset timing or a budget that cannot cover the floor disables archive requests. (`internal/github/budget.go::ArchiveSpendAvailable`, `internal/github/sync.go::Admit`)
 
 ## Label Catalogs And Mutations
 
@@ -177,6 +193,12 @@ GitLab merge request and issue `iid` values are repo-scoped numbers. Persist
 provider object ids separately from user-visible numbers, and scope events by
 provider identity so equal GitHub/GitLab ids do not collide.
 
+GitLab archive discussions normalize as ordinary or inline comments. Do not synthesize submitted reviews from notes or current approvals; without stable historical actions, that dataset stays unsupported and coverage stays partial. (`internal/platform/gitlab/client.go::Capabilities`)
+
+GitLab historical merge-request inventory is unsupported because project merge requests expose only offset pagination and cannot guarantee completeness across equal-`created_at` ties. Coverage remains partial while supported issue history and discussion datasets continue. (`internal/platform/gitlab/client.go::Capabilities`, `internal/platform/gitlab/pages.go::ListMergeRequestsPage`)
+
+GitLab maintenance inventories walk mutable `updated_at` results newest-first. Updates then move toward the consumed prefix; rows that move ahead before consumption remain eligible under the next scan's inclusive watermark. (`internal/platform/gitlab/pages.go::listInventoryIssuesPage`, `internal/platform/gitlab/pages.go::listInventoryMergeRequestsPage`)
+
 ## Forgejo And Gitea Shape
 
 Forgejo and Gitea use owner/name repository addressing in the REST and SDK
@@ -196,6 +218,10 @@ statuses and Actions runs without duplicating a check already represented by
 the status endpoint. Neither Forgejo nor Gitea should claim workflow approval or
 ready-for-review support unless the provider interface and server/UI capability
 tests prove those exact operations.
+
+Archive access probes preserve transient and rate-limit failures for retry. Only
+authoritative repository permission or not-found responses may become permanent
+inaccessibility. (`internal/platform/gitealike/pages.go::classifyLookupOutcome`)
 
 ## Import And Routes
 

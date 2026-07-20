@@ -10,16 +10,6 @@ import (
 	"go.kenn.io/middleman/internal/platform"
 )
 
-func (c *Client) RequestChanges(
-	ctx context.Context,
-	ref platform.RepoRef,
-	number int,
-	body string,
-	expectedHeadSHA string,
-) error {
-	return c.provider.RequestChanges(ctx, ref, number, body, expectedHeadSHA)
-}
-
 func (c *Client) PublishDiffReviewDraft(
 	ctx context.Context,
 	ref platform.RepoRef,
@@ -107,7 +97,6 @@ func (t *transport) listAllPullReviews(
 	ref platform.RepoRef,
 	number int,
 ) ([]*forgejosdk.PullReview, error) {
-	t.spendSyncBudget(ctx)
 	var out []*forgejosdk.PullReview
 	page := 1
 	for {
@@ -137,7 +126,6 @@ func (t *transport) listPullReviewComments(
 	number int,
 	reviewID int64,
 ) ([]*forgejosdk.PullReviewComment, error) {
-	t.spendSyncBudget(ctx)
 	var comments []*forgejosdk.PullReviewComment
 	var resp *forgejosdk.Response
 	err := t.withRequestContext(ctx, func() error {

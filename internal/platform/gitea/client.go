@@ -24,11 +24,13 @@ type clientOptions struct {
 	skipVersionProbe  bool
 }
 
+type provider = gitealike.Provider
+
 type Client struct {
-	host              string
-	baseURL           string
-	transport         *transport
-	provider          *gitealike.Provider
+	host      string
+	baseURL   string
+	transport *transport
+	*provider
 	api               *giteasdk.Client
 	foregroundTimeout time.Duration
 }
@@ -80,6 +82,7 @@ func NewClient(host string, source tokenauth.Source, options ...ClientOption) (*
 			rateTracker: opts.rateTracker,
 		}
 	}
+	httpTransport = ghsync.WrapSyncBudgetTransport(httpTransport, opts.budget)
 	mergeability := gitealike.NewMergeableCache()
 	httpTransport = &gitealike.MergeableCaptureTransport{
 		Base:  httpTransport,
@@ -108,7 +111,6 @@ func NewClient(host string, source tokenauth.Source, options ...ClientOption) (*
 	}
 	transport := &transport{
 		api:                api,
-		budget:             opts.budget,
 		mergeability:       mergeability,
 		mergeRejections:    mergeRejections,
 		requestContextLock: make(chan struct{}, 1),
@@ -131,13 +133,8 @@ func (c *Client) Host() string {
 	return c.host
 }
 
-func (c *Client) Capabilities() platform.Capabilities {
-	return c.provider.Capabilities()
-}
-
 type transport struct {
 	api                *giteasdk.Client
-	budget             *ghsync.SyncBudget
 	mergeability       *gitealike.MergeableCache
 	mergeRejections    *gitealike.MergeRejectionCapture
 	requestContextLock chan struct{}
@@ -146,7 +143,6 @@ type transport struct {
 func (t *transport) getRepositoryRaw(
 	ctx context.Context, owner, repo string,
 ) (*giteasdk.Repository, error) {
-	t.spendSyncBudget(ctx)
 	var repository *giteasdk.Repository
 	err := t.withRequestContext(ctx, func() error {
 		var err error
@@ -173,12 +169,6 @@ func (t *transport) withRequestContext(ctx context.Context, request func() error
 	t.api.SetContext(ctx)
 	defer t.api.SetContext(context.Background())
 	return request()
-}
-
-func (t *transport) spendSyncBudget(ctx context.Context) {
-	if t.budget != nil && ghsync.IsSyncBudgetContext(ctx) {
-		t.budget.Spend(1)
-	}
 }
 
 type rateTrackingTransport struct {

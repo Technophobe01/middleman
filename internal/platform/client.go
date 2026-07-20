@@ -1,6 +1,8 @@
 package platform
 
-import "context"
+import (
+	"context"
+)
 
 type Provider interface {
 	Platform() Kind
@@ -55,6 +57,16 @@ type IssueReader interface {
 	ListOpenIssues(ctx context.Context, ref RepoRef) ([]Issue, error)
 	GetIssue(ctx context.Context, ref RepoRef, number int) (Issue, error)
 	ListIssueEvents(ctx context.Context, ref RepoRef, number int) ([]IssueEvent, error)
+}
+
+// IssuePageReader is the archive inventory surface for issues.
+type IssuePageReader interface {
+	ListIssuesPage(context.Context, RepoRef, ItemPageQuery) (Page[Issue], error)
+}
+
+// MergeRequestPageReader is the archive inventory surface for merge requests.
+type MergeRequestPageReader interface {
+	ListMergeRequestsPage(context.Context, RepoRef, ItemPageQuery) (Page[MergeRequest], error)
 }
 
 type LabelCatalog struct {

@@ -541,6 +541,17 @@ func mapPlatformError(err error) huma.StatusError {
 			"Unsupported provider capability",
 			details,
 		)
+	case platform.ErrCodeProviderContract:
+		details := platformErrorDetails(provider, host)
+		if pe.Field != "" {
+			details["field"] = pe.Field
+		}
+		return newProblem(
+			http.StatusBadGateway,
+			CodeUpstreamError,
+			err.Error(),
+			details,
+		)
 	case platform.ErrCodeRateLimited:
 		return problemRateLimited(provider, host, pe.ResetAt)
 	case platform.ErrCodePermissionDenied:
@@ -550,7 +561,19 @@ func mapPlatformError(err error) huma.StatusError {
 		}
 		return problemForbidden(err.Error(), d)
 	case platform.ErrCodeNotFound:
-		return problemNotFound(CodeNotFound, err.Error(), nil)
+		// A moved-lookup not_found carries the destination repository;
+		// surface the full provider-aware identity as stable extension
+		// members so clients can retarget the reference instead of
+		// parsing prose.
+		var details map[string]any
+		if pe.Destination != nil {
+			details = platformErrorDetails(provider, host)
+			details["destinationProvider"] = string(pe.Destination.Platform)
+			details["destinationPlatformHost"] = pe.Destination.Host
+			details["destinationOwner"] = pe.Destination.Owner
+			details["destinationName"] = pe.Destination.Name
+		}
+		return problemNotFound(CodeNotFound, err.Error(), details)
 	// Both conflict flavors share wire code `conflict` and HTTP 409;
 	// details.reason is the stable discriminator clients branch on
 	// (stale_state: reload and re-review; conflict: the provider refuses

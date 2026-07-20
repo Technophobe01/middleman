@@ -8,11 +8,13 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	ghsync "go.kenn.io/middleman/internal/github"
 	"go.kenn.io/middleman/internal/platform"
 	"go.kenn.io/middleman/internal/ratelimit"
 	"go.kenn.io/middleman/internal/testutil/dbtest"
@@ -98,7 +100,8 @@ func TestClientListOpenMergeRequestsPopulatesForkHeadRepoCloneURL(t *testing.T) 
 			writeJSON(w, `[
 				{"id": 1001, "iid": 7, "project_id": 42, "source_project_id": 77, "target_project_id": 42, "source_branch": "feature/auth", "target_branch": "main", "title": "Fork base", "state": "opened"},
 				{"id": 1002, "iid": 8, "project_id": 42, "source_project_id": 77, "target_project_id": 42, "source_branch": "feature/auth-ui", "target_branch": "feature/auth", "title": "Fork tip", "state": "opened"},
-				{"id": 1003, "iid": 9, "project_id": 42, "source_project_id": 42, "target_project_id": 42, "source_branch": "feature/local", "target_branch": "main", "title": "Local", "state": "opened"}
+				{"id": 1003, "iid": 9, "project_id": 42, "source_project_id": 42, "target_project_id": 42, "source_branch": "feature/local", "target_branch": "main", "title": "Local", "state": "opened"},
+				{"id": 1004, "iid": 10, "project_id": 42, "target_project_id": 42, "source_branch": "feature/deleted", "target_branch": "main", "title": "Deleted fork", "state": "opened"}
 			]`)
 		case "/api/v4/projects/77":
 			writeJSON(w, `{
@@ -124,10 +127,13 @@ func TestClientListOpenMergeRequestsPopulatesForkHeadRepoCloneURL(t *testing.T) 
 
 	mrs, err := client.ListOpenMergeRequests(context.Background(), ref)
 	require.NoError(err)
-	require.Len(mrs, 3)
+	require.Len(mrs, 4)
 	assert.Equal("https://gitlab.example.com/fork/project.git", mrs[0].HeadRepoCloneURL)
 	assert.Equal("https://gitlab.example.com/fork/project.git", mrs[1].HeadRepoCloneURL)
 	assert.Equal("https://gitlab.example.com/group/project.git", mrs[2].HeadRepoCloneURL)
+	assert.False(mrs[2].HeadRepoCloneURLUnknown)
+	assert.Empty(mrs[3].HeadRepoCloneURL)
+	assert.True(mrs[3].HeadRepoCloneURLUnknown)
 	assert.Equal([]string{
 		"/api/v4/projects/42/merge_requests",
 		"/api/v4/projects/77",
@@ -167,6 +173,23 @@ func TestClientListOpenMergeRequestsContinuesWhenForkHeadRepoLookupFails(t *test
 			require.Len(mrs, 1)
 			assert.Equal(7, mrs[0].Number)
 			assert.Empty(mrs[0].HeadRepoCloneURL)
+			assert.True(mrs[0].HeadRepoCloneURLUnknown,
+				"an unavailable fork project must preserve any stored clone URL")
+
+			database := dbtest.Open(t)
+			repoID, err := database.UpsertRepo(t.Context(), platform.DBRepoIdentity(ref))
+			require.NoError(err)
+			known := platform.DBMergeRequest(repoID, mrs[0])
+			known.HeadRepoCloneURL = "https://gitlab.example.com/fork/project.git"
+			known.HeadRepoCloneURLUnknown = false
+			_, err = database.UpsertMergeRequest(t.Context(), known)
+			require.NoError(err)
+			_, err = database.UpsertMergeRequest(t.Context(), platform.DBMergeRequest(repoID, mrs[0]))
+			require.NoError(err)
+			stored, err := database.GetMergeRequestByRepoIDAndNumber(t.Context(), repoID, 7)
+			require.NoError(err)
+			require.NotNil(stored)
+			assert.Equal("https://gitlab.example.com/fork/project.git", stored.HeadRepoCloneURL)
 		})
 	}
 }
@@ -243,49 +266,6 @@ func TestClientGetMergeRequestContinuesWhenForkHeadRepoLookupFails(t *testing.T)
 	assert.Equal(7, mr.Number)
 	assert.Empty(mr.HeadRepoCloneURL)
 }
-
-func TestClientGetMergeRequestPropagatesTransientForkHeadRepoLookupFailures(t *testing.T) {
-	assert := assert.New(t)
-	require := require.New(t)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.EscapedPath() {
-		case "/api/v4/projects/42/merge_requests/7":
-			writeJSON(w, `{
-				"id": 1001,
-				"iid": 7,
-				"project_id": 42,
-				"source_project_id": 77,
-				"target_project_id": 42,
-				"source_branch": "feature/auth",
-				"target_branch": "main",
-				"title": "Fork base",
-				"state": "opened"
-			}`)
-		case "/api/v4/projects/77":
-			http.Error(w, "rate limited", http.StatusTooManyRequests)
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer server.Close()
-
-	client := newTestClient(t, server.URL)
-	ref := platform.RepoRef{
-		Platform:   platform.KindGitLab,
-		Host:       "gitlab.example.com",
-		RepoPath:   "group/project",
-		PlatformID: 42,
-		CloneURL:   "https://gitlab.example.com/group/project.git",
-	}
-
-	_, err := client.GetMergeRequest(context.Background(), ref, 7)
-	require.Error(err)
-	var platformErr *platform.Error
-	require.ErrorAs(err, &platformErr)
-	assert.Equal(platform.ErrCodeRateLimited, platformErr.Code)
-	assert.Equal("get_source_project", platformErr.Capability)
-}
-
 func TestClientGetMergeRequestUsesMergedByFallback(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
@@ -359,6 +339,115 @@ func TestClientRecordsRateLimitRequests(t *testing.T) {
 	assert.Equal(599, row.RateRemaining)
 	require.NotNil(row.RateResetAt)
 	assert.Equal(resetAt, row.RateResetAt.Unix())
+}
+
+func TestClientDoesNotSynthesizeRateLimitResetWhenHeaderMissing(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	database := dbtest.Open(t)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("RateLimit-Limit", "600")
+		w.Header().Set("RateLimit-Remaining", "599")
+		// Deliberately no RateLimit-Reset header: the provider did not
+		// observe a reset time for this response.
+		writeJSON(w, `{
+			"id": 42,
+			"path": "project",
+			"path_with_namespace": "group/project",
+			"name": "Project"
+		}`)
+	}))
+	defer server.Close()
+
+	rt := ratelimit.NewPlatformRateTracker(database, "gitlab", "gitlab.example.com", "rest")
+	client := newTestClient(t, server.URL, WithRateTracker(rt))
+	_, err := client.GetRepository(context.Background(), platform.RepoRef{
+		Platform: platform.KindGitLab,
+		Host:     "gitlab.example.com",
+		RepoPath: "group/project",
+	})
+	require.NoError(err)
+
+	// A missing reset header must be recorded as unknown (nil), never as a
+	// non-nil zero timestamp. The rate tracker's nil-for-unknown contract is
+	// what keeps the archive budget ceiling at zero: any non-nil resetAt within
+	// the coming hour reads as a live provider signal to release surplus, and a
+	// fabricated or year-one reset would falsely trigger that release even
+	// though no provider ever reported it.
+	resetAt := rt.ResetAt()
+	require.Nil(resetAt)
+
+	budget := ghsync.NewSyncBudget(1000)
+	assert.False(budget.CanSpendArchive(1, time.Now(), resetAt, 100))
+}
+
+func TestClientSyncBudgetChargesOnlyMarkedRoundTrips(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		writeJSON(w, `{"id":42,"path":"project","path_with_namespace":"group/project","name":"Project"}`)
+	}))
+	defer server.Close()
+
+	budget := ghsync.NewSyncBudget(100)
+	client := newTestClient(t, server.URL, WithSyncBudget(budget))
+	ref := platform.RepoRef{
+		Platform: platform.KindGitLab, Host: "gitlab.example.com", RepoPath: "group/project",
+	}
+	_, err := client.GetRepository(t.Context(), ref)
+	require.NoError(err)
+	assert.Equal(0, budget.Spent())
+
+	_, err = client.GetRepository(ghsync.WithSyncBudget(t.Context()), ref)
+	require.NoError(err)
+	assert.Equal(1, budget.Spent())
+	assert.Zero(budget.ArchiveSpent())
+
+	_, err = client.GetRepository(ghsync.WithArchiveSyncBudget(t.Context()), ref)
+	require.NoError(err)
+	assert.Equal(2, budget.Spent())
+	assert.Equal(1, budget.ArchiveSpent())
+	assert.Equal(3, requests)
+}
+
+func TestClientArchiveAttemptAllowanceCapsProviderRetries(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	var mu sync.Mutex
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		requests++
+		mu.Unlock()
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	budget := ghsync.NewSyncBudget(100)
+	// Retries stay enabled here: the pinned GitLab SDK retries 5xx up to five
+	// times, so without a per-attempt ceiling one admitted archive request
+	// could make six wire attempts and overspend the protected live floor.
+	client, err := NewClient(
+		"gitlab.example.com", testTokenSource("token"),
+		WithBaseURLForTesting(server.URL+"/api/v4"), WithSyncBudget(budget),
+	)
+	require.NoError(err)
+	ref := platform.RepoRef{
+		Platform: platform.KindGitLab, Host: "gitlab.example.com", RepoPath: "group/project",
+	}
+	ctx := ghsync.WithArchiveAttemptAllowance(ghsync.WithArchiveSyncBudget(t.Context()), 2)
+
+	_, err = client.GetRepository(ctx, ref)
+	require.Error(err)
+	require.ErrorIs(err, platform.ErrArchiveAttemptBudget)
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(2, requests, "SDK retries must not exceed the admitted allowance")
+	assert.Equal(2, budget.ArchiveSpent())
 }
 
 func TestClientReadsTokenSourceForEachRequest(t *testing.T) {

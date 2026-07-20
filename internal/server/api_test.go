@@ -931,7 +931,7 @@ func (p *apiTestGitLabProvider) ListOpenIssues(
 	context.Context,
 	platform.RepoRef,
 ) ([]platform.Issue, error) {
-	return p.issues, nil
+	return slices.Clone(p.issues), nil
 }
 
 func (p *apiTestGitLabProvider) GetIssue(
@@ -8936,6 +8936,14 @@ func TestAPISyncIssueNilUpdatedAtFallsBackToCreatedAt(t *testing.T) {
 
 	srv, database := setupTestServerWithMock(t, mock)
 	seedIssue(t, database, "acme", "widget", 9, "open")
+	repo, err := database.GetRepoByIdentity(ctx, db.GitHubRepoIdentity("github.com", "acme", "widget"))
+	require.NoError(err)
+	_, err = database.WriteDB().ExecContext(ctx, `
+		UPDATE middleman_issues
+		SET created_at = ?, updated_at = ?, last_activity_at = ?
+		WHERE repo_id = ? AND number = 9`,
+		createdAt.Add(-time.Hour), createdAt.Add(-time.Hour), createdAt.Add(-time.Hour), repo.ID)
+	require.NoError(err)
 	client := setupTestClient(t, srv)
 
 	// Before the nil guard, refreshIssueTimeline panicked on
@@ -9137,7 +9145,7 @@ func TestAPIListItemsHonorsLimit(t *testing.T) {
 	assert.EqualValues(12, (*secondIssueResp.JSON200)[0].Number)
 }
 
-func TestAPIListPullsReportsBackfilledMergedPRFromMergedAt(t *testing.T) {
+func TestAPIListPullsReportsHistoricalMergedPRFromMergedAt(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 	ctx := t.Context()
@@ -9145,60 +9153,32 @@ func TestAPIListPullsReportsBackfilledMergedPRFromMergedAt(t *testing.T) {
 	now := time.Date(2024, 6, 7, 12, 0, 0, 0, time.UTC)
 	mergedAt := now.Add(time.Hour)
 	number := 42
-	platformID := int64(42000)
-	title := "Backfilled merged PR"
-	state := "closed"
-	url := "https://github.com/acme/widget/pull/42"
-	author := "alice"
-	headRef := "feature"
+	title := "Historical merged PR"
 	headSHA := "abc123def456"
-	baseRef := "main"
 	baseSHA := "def456abc123"
-	mock := &mockGH{
-		listPullRequestsPageFn: func(_ context.Context, owner, repo, listState string, page int) ([]*gh.PullRequest, bool, error) {
-			require.Equal("acme", owner)
-			require.Equal("widget", repo)
-			require.Equal("closed", listState)
-			require.Equal(1, page)
-			return []*gh.PullRequest{{
-				ID:        &platformID,
-				Number:    &number,
-				Title:     &title,
-				State:     &state,
-				HTMLURL:   &url,
-				User:      &gh.User{Login: &author},
-				CreatedAt: &gh.Timestamp{Time: now},
-				UpdatedAt: &gh.Timestamp{Time: now},
-				ClosedAt:  &gh.Timestamp{Time: mergedAt},
-				MergedAt:  &gh.Timestamp{Time: mergedAt},
-				Head: &gh.PullRequestBranch{
-					Ref: &headRef,
-					SHA: &headSHA,
-				},
-				Base: &gh.PullRequestBranch{
-					Ref: &baseRef,
-					SHA: &baseSHA,
-				},
-			}}, false, nil
-		},
-	}
-
 	database := dbtest.Open(t)
+	seedPR(
+		t, database, "acme", "widget", number,
+		withSeedPRTitle(title),
+		withSeedPRAuthor("alice"),
+		withSeedPRLifecycle(db.MergeRequestStateMerged, &mergedAt, &mergedAt),
+		withSeedPRTimes(now, now, mergedAt),
+		withSeedPRHeadSHA(headSHA),
+		withSeedPRBaseSHA(baseSHA),
+	)
 
 	syncer := ghclient.NewSyncer(
-		map[string]ghclient.Client{"github.com": mock},
+		map[string]ghclient.Client{"github.com": &mockGH{}},
 		database,
 		nil,
 		defaultTestRepos,
 		time.Minute,
 		nil,
-		map[string]*ghclient.SyncBudget{"github.com": ghclient.NewSyncBudget(10000)},
+		nil,
 	)
 	t.Cleanup(syncer.Stop)
 	srv := New(database, syncer, nil, "/", nil, ServerOptions{})
 	t.Cleanup(func() { gracefulShutdown(t, srv) })
-
-	srv.syncer.RunOnce(ctx)
 
 	client := setupTestClient(t, srv)
 	filterState := "closed"
@@ -12195,6 +12175,132 @@ func TestE2EPRDetailRemovesDeletedCommentOnGraphQLBulkSync(t *testing.T) {
 	require.Empty(*secondResp.JSON200.Events)
 }
 
+// TestE2EGraphQLBulkSyncAppliesAuthoritativeReviewDecisionOverIncompleteReviews
+// drives the real GraphQL bulk sync twice against a mocked GraphQL backend with
+// real SQLite. The first pass persists an APPROVED review decision; the second
+// pass reports a CHANGED authoritative reviewDecision (CHANGES_REQUESTED)
+// alongside an incomplete reviews connection (hasNextPage=true, so
+// ReviewsComplete is false). GitHub's reviewDecision scalar is authoritative
+// over the PR's whole review history, so nested-connection truncation must not
+// gate it: the changed decision must reach the HTTP API.
+func TestE2EGraphQLBulkSyncAppliesAuthoritativeReviewDecisionOverIncompleteReviews(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	ctx := t.Context()
+
+	now := time.Date(2026, 5, 2, 9, 0, 0, 0, time.UTC)
+	firstUpdatedAt := now.Format(time.RFC3339)
+	secondUpdatedAt := now.Add(time.Minute).Format(time.RFC3339)
+	currentUpdatedAt := firstUpdatedAt
+	currentReviewDecision := "APPROVED"
+	// First pass: reviews connection complete (empty). The second pass
+	// overrides these to an incomplete connection carrying a changed decision.
+	currentReviewsConn := `{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}}`
+
+	gqlSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if bytes.Contains(body, []byte("pullRequests")) {
+			resp := `{"data":{"repository":{"pullRequests":{"nodes":[{
+				"databaseId":181100,
+				"number":181,
+				"title":"Authoritative review decision PR",
+				"state":"OPEN",
+				"isDraft":false,
+				"body":"GraphQL bulk PR",
+				"url":"https://github.com/acme/widget/pull/181",
+				"author":{"login":"heidi"},
+				"createdAt":"` + firstUpdatedAt + `",
+				"updatedAt":"` + currentUpdatedAt + `",
+				"mergedAt":null,
+				"closedAt":null,
+				"additions":1,
+				"deletions":0,
+				"mergeable":"MERGEABLE",
+				"reviewDecision":"` + currentReviewDecision + `",
+				"headRefName":"feature/decision",
+				"baseRefName":"main",
+				"headRefOid":"cafebabe",
+				"baseRefOid":"feedface",
+				"headRepository":{"url":"https://github.com/acme/widget"},
+				"labels":{"nodes":[]},
+				"comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}},
+				"reviews":` + currentReviewsConn + `,
+				"allCommits":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}},
+				"lastCommit":{"nodes":[]}
+			}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}`
+			_, _ = w.Write([]byte(resp))
+			return
+		}
+		_, _ = w.Write([]byte(`{"data":{"repository":{"issues":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}`))
+	}))
+	defer gqlSrv.Close()
+
+	prID := int64(181100)
+	prNumber := 181
+	prTitle := "Authoritative review decision PR"
+	prState := "open"
+	prURL := "https://github.com/acme/widget/pull/181"
+	headRef := "feature/decision"
+	headSHA := "cafebabe"
+	baseRef := "main"
+	prCreated := gh.Timestamp{Time: now}
+	mock := &mockGH{
+		listOpenPullRequestsFn: func(_ context.Context, _, _ string) ([]*gh.PullRequest, error) {
+			updatedAt, parseErr := time.Parse(time.RFC3339, currentUpdatedAt)
+			require.NoError(parseErr)
+			updatedStamp := gh.Timestamp{Time: updatedAt}
+			return []*gh.PullRequest{{
+				ID:        &prID,
+				Number:    &prNumber,
+				Title:     &prTitle,
+				State:     &prState,
+				HTMLURL:   &prURL,
+				User:      &gh.User{Login: new("heidi")},
+				CreatedAt: &prCreated,
+				UpdatedAt: &updatedStamp,
+				Head:      &gh.PullRequestBranch{Ref: &headRef, SHA: &headSHA},
+				Base:      &gh.PullRequestBranch{Ref: &baseRef},
+			}}, nil
+		},
+		listOpenIssuesFn: func(_ context.Context, _, _ string) ([]*gh.Issue, error) {
+			return nil, &gh.ErrorResponse{
+				Response: &http.Response{StatusCode: http.StatusNotModified},
+			}
+		},
+	}
+
+	srv, _ := setupTestServerWithMock(t, mock)
+	gqlClient := githubv4.NewEnterpriseClient(gqlSrv.URL, gqlSrv.Client())
+	srv.syncer.SetFetchers(map[string]*ghclient.GraphQLFetcher{
+		"github.com": ghclient.NewGraphQLFetcherWithClient(gqlClient, nil),
+	})
+	client := setupTestClient(t, srv)
+
+	// First pass persists the APPROVED decision through the real pipeline.
+	srv.syncer.RunOnce(ctx)
+	firstResp, err := client.HTTP.GetPullWithResponse(ctx, "gh", "acme", "widget", int64(prNumber))
+	require.NoError(err)
+	require.Equal(http.StatusOK, firstResp.StatusCode())
+	require.NotNil(firstResp.JSON200)
+	require.Equal("approved", firstResp.JSON200.MergeRequest.ReviewDecision)
+
+	// Second pass: the provider reports a CHANGED authoritative decision while
+	// the reviews connection is truncated (incomplete). The authoritative
+	// scalar must still reach the API.
+	currentUpdatedAt = secondUpdatedAt
+	currentReviewDecision = "CHANGES_REQUESTED"
+	currentReviewsConn = `{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":"review-cursor"}}`
+
+	srv.syncer.RunOnce(ctx)
+	secondResp, err := client.HTTP.GetPullWithResponse(ctx, "gh", "acme", "widget", int64(prNumber))
+	require.NoError(err)
+	require.Equal(http.StatusOK, secondResp.StatusCode())
+	require.NotNil(secondResp.JSON200)
+	assert.Equal("changes_requested", secondResp.JSON200.MergeRequest.ReviewDecision)
+}
+
 // TestE2EGraphQLBulkSyncPersistsWorkflowApproval drives the periodic
 // sync through the GraphQL bulk path and verifies the persisted
 // workflow approval snapshot reaches the HTTP API. Regression test
@@ -14045,6 +14151,296 @@ func (p *issueMutatorGitLabProvider) EditMergeRequestContent(
 	return platform.MergeRequest{}, p.providerErr
 }
 
+// TestRefreshWorkspaceRepoIndexToleratesPartialSyncFailure pins the workspace
+// refresh decision point: a repo sync cycle that only failed per-item work in
+// one scope (here a seeded open issue whose closed-item refresh fails) must
+// not abort the workspace refresh — sync health already records the partial
+// failure — while a hard repository failure (the open-PR list itself failing)
+// still aborts.
+func TestRefreshWorkspaceRepoIndexToleratesPartialSyncFailure(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	ctx := t.Context()
+
+	// Partial: the default mock lists no open issues, so the seeded open
+	// issue hits closure detection and its refresh fails (nil issue).
+	partialSrv, partialDB := setupTestServerWithMock(t, &mockGH{})
+	seedIssue(t, partialDB, "acme", "widget", 7, "open")
+	err := partialSrv.refreshWorkspaceRepoIndex(
+		ctx, platform.KindGitHub, "github.com", "acme", "widget",
+	)
+	require.NoError(err,
+		"an issue-scope partial failure must not abort the workspace refresh")
+	repo, err := partialDB.GetRepoByIdentity(
+		ctx, db.GitHubRepoIdentity("github.com", "acme", "widget"),
+	)
+	require.NoError(err)
+	require.NotNil(repo)
+	assert.NotEmpty(repo.LastSyncError,
+		"the tolerated partial failure must still be recorded in sync health")
+
+	// MR-scope partial: a seeded open PR fails its closed-item refresh.
+	// The workspace flow depends on merge-request data, so the refresh
+	// must abort rather than report success over a stale association.
+	mrSrv, mrDB := setupTestServerWithMock(t, &mockGH{
+		getPullRequestFn: func(context.Context, string, string, int) (*gh.PullRequest, error) {
+			return nil, errors.New("closed PR refresh failed")
+		},
+	})
+	seedPR(t, mrDB, "acme", "widget", 1)
+	err = mrSrv.refreshWorkspaceRepoIndex(
+		ctx, platform.KindGitHub, "github.com", "acme", "widget",
+	)
+	require.Error(err,
+		"a merge-request-scope partial failure must abort the workspace refresh")
+
+	// Hard: the open-PR list itself fails; the refresh must abort.
+	hardSrv, _ := setupTestServerWithMock(t, &mockGH{
+		listOpenPullRequestsFn: func(context.Context, string, string) ([]*gh.PullRequest, error) {
+			return nil, errors.New("list open PRs down")
+		},
+	})
+	err = hardSrv.refreshWorkspaceRepoIndex(
+		ctx, platform.KindGitHub, "github.com", "acme", "widget",
+	)
+	assert.Error(err, "a hard repository failure must still abort the refresh")
+}
+
+// TestAPIResolveItemMapsLookupOutcomes drives GitHub item resolution
+// (/repo/.../resolve/{number}) through a mock client whose type-probe fetch
+// reports a removed, inaccessible, or transferred item. The problem envelope
+// must carry the classified outcome — not a raw upstream failure or a 500 —
+// and the moved outcome must include the destination extension members.
+func TestAPIResolveItemMapsLookupOutcomes(t *testing.T) {
+	const movedRepoAPIURL = "https://api.github.com/repos/newowner/newname"
+
+	statusErr := func(status int) error {
+		return &gh.ErrorResponse{
+			Response: &http.Response{StatusCode: status, Header: http.Header{}},
+		}
+	}
+
+	cases := []struct {
+		name            string
+		getIssueErr     error
+		wantStatus      int
+		wantCode        string
+		wantDestination bool
+	}{
+		{
+			name:        "removed",
+			getIssueErr: statusErr(http.StatusNotFound),
+			wantStatus:  http.StatusNotFound,
+			wantCode:    "notFound",
+		},
+		{
+			name:        "inaccessible",
+			getIssueErr: statusErr(http.StatusForbidden),
+			wantStatus:  http.StatusForbidden,
+			wantCode:    "forbidden",
+		},
+		{
+			name:            "moved",
+			wantStatus:      http.StatusNotFound,
+			wantCode:        "notFound",
+			wantDestination: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			require := require.New(t)
+			assert := assert.New(t)
+			ctx := t.Context()
+
+			mock := &mockGH{
+				getIssueFn: func(context.Context, string, string, int) (*gh.Issue, error) {
+					if tc.getIssueErr != nil {
+						return nil, tc.getIssueErr
+					}
+					return &gh.Issue{
+						Number:        new(5),
+						RepositoryURL: gh.Ptr(movedRepoAPIURL),
+					}, nil
+				},
+			}
+			srv, database := setupTestServerWithMock(t, mock)
+			_, err := database.UpsertRepo(
+				ctx, db.GitHubRepoIdentity("github.com", "acme", "widget"),
+			)
+			require.NoError(err)
+
+			rr := doJSON(t, srv, http.MethodPost, "/api/v1/repo/gh/acme/widget/resolve/5", nil)
+			require.Equal(tc.wantStatus, rr.Code, rr.Body.String())
+
+			var problem rawProblemDetail
+			require.NoError(json.NewDecoder(rr.Body).Decode(&problem))
+			assert.Equal(tc.wantCode, problem.Code)
+			if !tc.wantDestination {
+				return
+			}
+			require.NotNil(problem.Details)
+			assert.Equal("github", problem.Details["destinationProvider"])
+			assert.Equal("github.com", problem.Details["destinationPlatformHost"])
+			assert.Equal("newowner", problem.Details["destinationOwner"])
+			assert.Equal("newname", problem.Details["destinationName"])
+		})
+	}
+}
+
+// movedLookupGitLabProvider embeds apiTestGitLabProvider but reports every
+// single-item read as moved to another repository via the supplied
+// platform.Error. Used by TestAPIMovedLookupProblemCarriesDestination.
+type movedLookupGitLabProvider struct {
+	apiTestGitLabProvider
+	lookupErr error
+}
+
+func (p *movedLookupGitLabProvider) GetIssue(
+	_ context.Context,
+	_ platform.RepoRef,
+	_ int,
+) (platform.Issue, error) {
+	return platform.Issue{}, p.lookupErr
+}
+
+func (p *movedLookupGitLabProvider) GetMergeRequest(
+	_ context.Context,
+	_ platform.RepoRef,
+	_ int,
+) (platform.MergeRequest, error) {
+	return platform.MergeRequest{}, p.lookupErr
+}
+
+// TestAPIMovedLookupProblemCarriesDestination drives item sync through a
+// fake provider whose single-item read reports the item moved to another
+// repository (a not_found platform.Error carrying Destination). The 404
+// problem body must carry the full provider-aware destination identity as
+// stable extension members so clients can retarget the reference.
+func TestAPIMovedLookupProblemCarriesDestination(t *testing.T) {
+	ctx := t.Context()
+	now := time.Now().UTC().Truncate(time.Second)
+
+	database := dbtest.Open(t)
+
+	ref := platform.RepoRef{
+		Platform:           platform.KindGitLab,
+		Host:               "gitlab.example.com",
+		Owner:              "group",
+		Name:               "project",
+		RepoPath:           "group/project",
+		PlatformID:         4242,
+		PlatformExternalID: "gid://gitlab/Project/4242",
+		WebURL:             "https://gitlab.example.com/group/project",
+		CloneURL:           "https://gitlab.example.com/group/project.git",
+		DefaultBranch:      "main",
+	}
+	provider := &movedLookupGitLabProvider{
+		apiTestGitLabProvider: apiTestGitLabProvider{
+			ref: ref,
+			mergeRequests: []platform.MergeRequest{{
+				Repo:           ref,
+				PlatformID:     7001,
+				Number:         7,
+				URL:            "https://gitlab.example.com/group/project/-/merge_requests/7",
+				Title:          "Existing MR",
+				Author:         "alice",
+				State:          "open",
+				HeadBranch:     "feature",
+				BaseBranch:     "main",
+				CreatedAt:      now,
+				UpdatedAt:      now,
+				LastActivityAt: now,
+			}},
+			issues: []platform.Issue{{
+				Repo:           ref,
+				PlatformID:     8001,
+				Number:         11,
+				URL:            "https://gitlab.example.com/group/project/-/issues/11",
+				Title:          "Existing",
+				Author:         "alice",
+				State:          "open",
+				CreatedAt:      now,
+				UpdatedAt:      now,
+				LastActivityAt: now,
+			}},
+		},
+		lookupErr: &platform.Error{
+			Code:         platform.ErrCodeNotFound,
+			Provider:     platform.KindGitLab,
+			PlatformHost: "gitlab.example.com",
+			Destination: &platform.RepoRef{
+				Platform: platform.KindGitLab,
+				Host:     "gitlab.example.com",
+				Owner:    "newgroup",
+				Name:     "project",
+				RepoPath: "newgroup/project",
+			},
+			Err: errors.New("group/project item is not present (moved)"),
+		},
+	}
+	registry, err := platform.NewRegistry(provider)
+	require.NoError(t, err)
+
+	repo := ghclient.RepoRef{
+		Platform:           platform.KindGitLab,
+		Owner:              "group",
+		Name:               "project",
+		PlatformHost:       "gitlab.example.com",
+		RepoPath:           "group/project",
+		PlatformRepoID:     4242,
+		PlatformExternalID: "gid://gitlab/Project/4242",
+		WebURL:             "https://gitlab.example.com/group/project",
+		CloneURL:           "https://gitlab.example.com/group/project.git",
+		DefaultBranch:      "main",
+	}
+	syncer := ghclient.NewSyncerWithRegistry(
+		registry, database, nil, []ghclient.RepoRef{repo}, time.Minute, nil, nil,
+	)
+	t.Cleanup(syncer.Stop)
+	srv := New(database, syncer, nil, "/", nil, ServerOptions{})
+	t.Cleanup(func() { gracefulShutdown(t, srv) })
+
+	syncer.RunOnce(ctx)
+
+	tests := []struct {
+		name string
+		path string
+	}{
+		{
+			name: "issue sync",
+			path: "/api/v1/host/gitlab.example.com/issues/gl/group/project/11/sync",
+		},
+		{
+			name: "pull sync",
+			path: "/api/v1/host/gitlab.example.com/pulls/gl/group/project/7/sync",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require := require.New(t)
+			assert := assert.New(t)
+
+			rr := doJSON(t, srv, http.MethodPost, tt.path, nil)
+			require.Equal(http.StatusNotFound, rr.Code, rr.Body.String())
+
+			var problem rawProblemDetail
+			require.NoError(json.NewDecoder(rr.Body).Decode(&problem))
+			assert.Equal("notFound", problem.Code)
+			require.NotNil(problem.Details)
+			assert.Equal("gitlab", problem.Details["provider"])
+			assert.Equal("gitlab.example.com", problem.Details["platformHost"])
+			assert.Equal("gitlab", problem.Details["destinationProvider"])
+			assert.Equal(
+				"gitlab.example.com", problem.Details["destinationPlatformHost"],
+			)
+			assert.Equal("newgroup", problem.Details["destinationOwner"])
+			assert.Equal("project", problem.Details["destinationName"])
+		})
+	}
+}
+
 func TestAPIDiffReviewDraftCRUDUsesLocalStorage(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
@@ -15764,7 +16160,7 @@ func TestAPIGitLabSyncKeepsCanonicalReviewThreadWhenProviderReturnsReplies(t *te
 	assert.Equal(originalLine, detail.Events[1].DiffThread.Line)
 }
 
-func TestAPIGitLabSyncPrunesMissingReviewThreadTimelineEvents(t *testing.T) {
+func TestAPIGitLabSyncRemovesMissingReviewThreadTimelineEvents(t *testing.T) {
 	require := require.New(t)
 	caps := platform.Capabilities{
 		ReadRepositories:  true,
@@ -29881,6 +30277,196 @@ func TestKataWorkspaceManualRefreshDiscoversAndSyncsAssociatedPR(t *testing.T) {
 	assert.Equal(headSHA, pr.PlatformHeadSHA)
 }
 
+// TestWorkspaceRefreshProceedsThroughIssueScopePartialSyncFailure drives
+// POST /workspaces/{id}/refresh through the full router with real SQLite
+// while the repo's index sync has an issue-scope partial failure (a seeded
+// open issue whose closed-item refresh fails). The refresh must succeed:
+// association discovery proceeds, the targeted PR-detail update still runs,
+// and the tolerated partial failure stays recorded in repo sync health.
+func TestWorkspaceRefreshProceedsThroughIssueScopePartialSyncFailure(t *testing.T) {
+	t.Parallel()
+
+	assert := assert.New(t)
+	require := require.New(t)
+	ctx := t.Context()
+
+	now := time.Now().UTC().Truncate(time.Second)
+	str := func(v string) *string { return &v }
+	prID := int64(1001)
+	buildPR := func(number int, title string, updatedAt time.Time) *gh.PullRequest {
+		return &gh.PullRequest{
+			ID:        &prID,
+			Number:    &number,
+			Title:     &title,
+			State:     str("open"),
+			HTMLURL:   str("https://github.com/acme/widget/pull/1"),
+			User:      &gh.User{Login: str("alice")},
+			CreatedAt: &gh.Timestamp{Time: now.Add(-time.Hour)},
+			UpdatedAt: &gh.Timestamp{Time: updatedAt},
+			Head:      &gh.PullRequestBranch{Ref: str("feature")},
+			Base:      &gh.PullRequestBranch{Ref: str("main")},
+		}
+	}
+	var detailCalls atomic.Int32
+	mock := &mockGH{
+		listOpenPullRequestsFn: func(context.Context, string, string) ([]*gh.PullRequest, error) {
+			return []*gh.PullRequest{buildPR(1, "list title", now.Add(time.Minute))}, nil
+		},
+		getPullRequestFn: func(_ context.Context, _, _ string, number int) (*gh.PullRequest, error) {
+			detailCalls.Add(1)
+			return buildPR(number, "detail title", now.Add(2*time.Minute)), nil
+		},
+		// The seeded open issue leaves the (empty) open list and its
+		// closed-item refresh fails: an issue-scope partial failure on
+		// every repo index sync.
+		getIssueFn: func(context.Context, string, string, int) (*gh.Issue, error) {
+			return nil, errors.New("closed issue refresh failed")
+		},
+	}
+	fixture := setupWorkspaceServerFixtureWithMockHostAndOptions(
+		t, nil, mock, "github.com",
+		ServerOptions{
+			PtyOwnerInProcess:                  true,
+			DisableWorkspaceBackgroundMonitors: true,
+		},
+	)
+	seedIssue(t, fixture.database, "acme", "widget", 8, "open")
+
+	ws := createReadyWorkspace(t, ctx, fixture.client)
+	before := detailCalls.Load()
+
+	refreshRR := doJSON(
+		t,
+		fixture.server,
+		http.MethodPost,
+		"/api/v1/workspaces/"+ws.Id+"/refresh",
+		nil,
+	)
+	require.Equal(http.StatusOK, refreshRR.Code, refreshRR.Body.String())
+
+	var refreshed rawWorkspaceStatusResponse
+	require.NoError(json.NewDecoder(refreshRR.Body).Decode(&refreshed))
+	assert.Equal(ws.Id, refreshed.ID,
+		"the refresh must complete association discovery and return the workspace")
+
+	assert.Greater(detailCalls.Load(), before,
+		"the targeted PR-detail refresh must still run")
+
+	repo, err := fixture.database.GetRepoByIdentity(
+		ctx, db.GitHubRepoIdentity("github.com", "acme", "widget"),
+	)
+	require.NoError(err)
+	require.NotNil(repo)
+	assert.NotEmpty(repo.LastSyncError,
+		"the tolerated partial failure must stay recorded in sync health")
+
+	pr, err := fixture.database.GetMergeRequestByRepoIDAndNumber(ctx, repo.ID, 1)
+	require.NoError(err)
+	require.NotNil(pr)
+	assert.Equal("detail title", pr.Title,
+		"the targeted PR update must land after the index refresh")
+}
+
+// TestWorkspaceRefreshAbortsOnMergeRequestScopePartialSyncFailure is the
+// route-level complement of the issue-scope test above: when the repo index
+// sync has a merge-request-scope partial failure (a seeded open PR whose
+// closed-item refresh fails), POST /workspaces/{id}/refresh must return the
+// error envelope instead of success over stale association data — the
+// association/PR-detail refresh must not continue — while sync health still
+// records the failure.
+func TestWorkspaceRefreshAbortsOnMergeRequestScopePartialSyncFailure(t *testing.T) {
+	t.Parallel()
+
+	assert := assert.New(t)
+	require := require.New(t)
+	ctx := t.Context()
+
+	now := time.Now().UTC().Truncate(time.Second)
+	str := func(v string) *string { return &v }
+	prID := int64(1001)
+	buildPR := func(number int, title string, updatedAt time.Time) *gh.PullRequest {
+		return &gh.PullRequest{
+			ID:        &prID,
+			Number:    &number,
+			Title:     &title,
+			State:     str("open"),
+			HTMLURL:   str("https://github.com/acme/widget/pull/1"),
+			User:      &gh.User{Login: str("alice")},
+			CreatedAt: &gh.Timestamp{Time: now.Add(-time.Hour)},
+			UpdatedAt: &gh.Timestamp{Time: updatedAt},
+			Head:      &gh.PullRequestBranch{Ref: str("feature")},
+			Base:      &gh.PullRequestBranch{Ref: str("main")},
+		}
+	}
+	var pr1DetailCalls atomic.Int32
+	mock := &mockGH{
+		listOpenPullRequestsFn: func(context.Context, string, string) ([]*gh.PullRequest, error) {
+			return []*gh.PullRequest{buildPR(1, "list title", now.Add(3*time.Minute))}, nil
+		},
+		getPullRequestFn: func(_ context.Context, _, _ string, number int) (*gh.PullRequest, error) {
+			// Seeded PR #2 leaves the open list and its closed-item
+			// refresh fails: a merge-request-scope partial failure on
+			// every repo index sync. PR #1 detail stays healthy.
+			if number == 2 {
+				return nil, errors.New("closed PR refresh failed")
+			}
+			pr1DetailCalls.Add(1)
+			return buildPR(number, "detail title", now.Add(10*time.Minute)), nil
+		},
+	}
+	fixture := setupWorkspaceServerFixtureWithMockHostAndOptions(
+		t, nil, mock, "github.com",
+		ServerOptions{
+			PtyOwnerInProcess:                  true,
+			DisableWorkspaceBackgroundMonitors: true,
+		},
+	)
+	seedPR(t, fixture.database, "acme", "widget", 2)
+
+	ws := createReadyWorkspace(t, ctx, fixture.client)
+
+	repo, err := fixture.database.GetRepoByIdentity(
+		ctx, db.GitHubRepoIdentity("github.com", "acme", "widget"),
+	)
+	require.NoError(err)
+	require.NotNil(repo)
+	before, err := fixture.database.GetMergeRequestByRepoIDAndNumber(ctx, repo.ID, 1)
+	require.NoError(err)
+	require.NotNil(before)
+	detailCallsBefore := pr1DetailCalls.Load()
+
+	refreshRR := doJSON(
+		t,
+		fixture.server,
+		http.MethodPost,
+		"/api/v1/workspaces/"+ws.Id+"/refresh",
+		nil,
+	)
+	require.Equal(http.StatusBadGateway, refreshRR.Code, refreshRR.Body.String())
+
+	var problem rawProblemDetail
+	require.NoError(json.NewDecoder(refreshRR.Body).Decode(&problem))
+	assert.Equal("upstreamError", problem.Code)
+	assert.Contains(problem.Detail, "merge request sync items failed")
+
+	// The association/PR-detail refresh must not have continued.
+	assert.Equal(detailCallsBefore, pr1DetailCalls.Load(),
+		"the targeted PR-detail refresh must not run after the abort")
+	after, err := fixture.database.GetMergeRequestByRepoIDAndNumber(ctx, repo.ID, 1)
+	require.NoError(err)
+	require.NotNil(after)
+	assert.Equal(before.DetailFetchedAt, after.DetailFetchedAt,
+		"no detail refresh may land on the workspace PR row")
+
+	refreshedRepo, err := fixture.database.GetRepoByIdentity(
+		ctx, db.GitHubRepoIdentity("github.com", "acme", "widget"),
+	)
+	require.NoError(err)
+	require.NotNil(refreshedRepo)
+	assert.NotEmpty(refreshedRepo.LastSyncError,
+		"the aborting partial failure must be recorded in sync health")
+}
+
 func TestWorkspaceManualRefreshReturnsAssociationInspectionError(t *testing.T) {
 	t.Parallel()
 
@@ -29896,6 +30482,7 @@ func TestWorkspaceManualRefreshReturnsAssociationInspectionError(t *testing.T) {
 	issueURL := "https://github.com/acme/widget/issues/7"
 	author := "alice"
 	intPointer := func(value int) *int { return &value }
+	str := func(v string) *string { return &v }
 	mock := &mockGH{
 		getIssueFn: func(context.Context, string, string, int) (*gh.Issue, error) {
 			return &gh.Issue{
@@ -29912,6 +30499,25 @@ func TestWorkspaceManualRefreshReturnsAssociationInspectionError(t *testing.T) {
 		},
 		listOpenPullRequestsFn: func(context.Context, string, string) ([]*gh.PullRequest, error) {
 			return nil, nil
+		},
+		// The fixture seeds PR #1 as open; with the open list empty,
+		// closure detection refreshes it. Serve a valid closed PR so
+		// the repo sync cycle stays clean and the refresh reaches the
+		// association-inspection failure this test targets.
+		getPullRequestFn: func(_ context.Context, _, _ string, number int) (*gh.PullRequest, error) {
+			id := int64(9001)
+			return &gh.PullRequest{
+				ID:        &id,
+				Number:    &number,
+				Title:     str("Seeded PR"),
+				State:     str("closed"),
+				HTMLURL:   str("https://github.com/acme/widget/pull/1"),
+				User:      &gh.User{Login: &author},
+				CreatedAt: &gh.Timestamp{Time: now},
+				UpdatedAt: &gh.Timestamp{Time: now},
+				Head:      &gh.PullRequestBranch{Ref: str("feature")},
+				Base:      &gh.PullRequestBranch{Ref: str("main")},
+			}, nil
 		},
 	}
 	fixture := setupWorkspaceServerFixtureWithMockHostAndOptions(

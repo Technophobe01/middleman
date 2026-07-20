@@ -1,12 +1,16 @@
 package github
 
-import "sync"
+import (
+	"math"
+	"sync"
+	"time"
+)
 
 // PRDetailWorstCase is the maximum API calls a PR detail
 // fetch can make (detail + GetUser + comments + reviews +
-// commits + force-push events + combined status + check runs +
-// workflow runs for approval state).
-const PRDetailWorstCase = 9
+// commits + force-push events + review threads + combined status +
+// check runs + one workflow-run read).
+const PRDetailWorstCase = 10
 
 // IssueDetailWorstCase is the maximum API calls an issue
 // detail fetch can make (detail + comments).
@@ -15,9 +19,10 @@ const IssueDetailWorstCase = 2
 // SyncBudget tracks hourly API call spend for background
 // detail fetches on a single host.
 type SyncBudget struct {
-	mu    sync.Mutex
-	limit int
-	spent int
+	mu           sync.Mutex
+	limit        int
+	spent        int
+	archiveSpent int
 }
 
 func NewSyncBudget(limit int) *SyncBudget {
@@ -62,6 +67,7 @@ func (b *SyncBudget) Reset() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.spent = 0
+	b.archiveSpent = 0
 }
 
 func (b *SyncBudget) Remaining() int {
@@ -78,4 +84,54 @@ func (b *SyncBudget) Spent() int {
 
 func (b *SyncBudget) Limit() int {
 	return b.limit
+}
+
+func (b *SyncBudget) ArchiveSpendCeiling(now time.Time, resetAt *time.Time, liveFloor int) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.archiveSpendCeiling(now, resetAt, liveFloor)
+}
+
+func (b *SyncBudget) CanSpendArchive(n int, now time.Time, resetAt *time.Time, liveFloor int) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return n > 0 && n <= b.archiveSpendAvailable(now, resetAt, liveFloor)
+}
+
+func (b *SyncBudget) ArchiveSpendAvailable(now time.Time, resetAt *time.Time, liveFloor int) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.archiveSpendAvailable(now, resetAt, liveFloor)
+}
+
+func (b *SyncBudget) SpendArchive(n int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.spent += n
+	b.archiveSpent += n
+}
+
+func (b *SyncBudget) ArchiveSpent() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.archiveSpent
+}
+
+func (b *SyncBudget) archiveSpendCeiling(now time.Time, resetAt *time.Time, liveFloor int) int {
+	if resetAt == nil || liveFloor >= b.limit {
+		return 0
+	}
+	remaining := resetAt.Sub(now)
+	if remaining < 0 || remaining > time.Hour {
+		return 0
+	}
+	elapsedFraction := 1 - float64(remaining)/float64(time.Hour)
+	surplus := b.limit - max(liveFloor, 0)
+	return int(math.Floor(float64(surplus) * elapsedFraction * elapsedFraction))
+}
+
+func (b *SyncBudget) archiveSpendAvailable(now time.Time, resetAt *time.Time, liveFloor int) int {
+	ceilingRemaining := b.archiveSpendCeiling(now, resetAt, liveFloor) - b.archiveSpent
+	liveRemaining := b.limit - max(liveFloor, 0) - b.spent
+	return max(min(ceilingRemaining, liveRemaining), 0)
 }

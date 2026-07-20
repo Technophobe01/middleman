@@ -771,6 +771,7 @@ func (s *Server) registerAPI(api huma.API) {
 	s.registerDocsAPI(api)
 	s.registerMsgvaultAPI(api)
 	s.registerMessagesAPI(api)
+	s.registerArchiveAPI(api)
 	huma.Register(api, huma.Operation{
 		OperationID:   "list-notifications",
 		Method:        http.MethodGet,
@@ -2593,7 +2594,6 @@ func (s *Server) createIssue(
 	if err != nil {
 		return nil, unsupportedCapabilityProblem(*repo, capabilityIssueMutation)
 	}
-
 	platformIssue, err := mutator.CreateIssue(
 		ctx, platformRepoRefFromDB(*repo), title, input.Body.Body,
 	)
@@ -3303,7 +3303,6 @@ func (s *Server) readyForReview(ctx context.Context, input *repoNumberInput) (*a
 	if err != nil {
 		return nil, unsupportedCapabilityProblem(*repo, capabilityReadyForReview)
 	}
-
 	pr, err := mutator.MarkReadyForReview(ctx, platformRepoRefFromDB(*repo), input.Number)
 	if err != nil {
 		type readyForReviewFailure interface {
@@ -3764,7 +3763,6 @@ func (s *Server) setPRGitHubState(
 			nil,
 		)
 	}
-
 	if input.Body.State == "draft" {
 		mutator, err := s.syncer.DraftMutator(
 			repoProviderKind(*repo), repoProviderHost(*repo),
@@ -3795,10 +3793,10 @@ func (s *Server) setPRGitHubState(
 	if err != nil {
 		return nil, unsupportedCapabilityProblem(*repo, capabilityStateMutation)
 	}
-
-	if _, err := mutator.SetMergeRequestState(
+	_, err = mutator.SetMergeRequestState(
 		ctx, platformRepoRefFromDB(*repo), input.Number, input.Body.State,
-	); err != nil {
+	)
+	if err != nil {
 		var ghErr *gh.ErrorResponse
 		if errors.As(err, &ghErr) && ghErr != nil && ghErr.Response != nil &&
 			ghErr.Response.StatusCode == http.StatusUnprocessableEntity {
@@ -3909,7 +3907,6 @@ func (s *Server) setIssueGitHubState(
 	if err != nil {
 		return nil, unsupportedCapabilityProblem(*repo, capabilityStateMutation)
 	}
-
 	if _, err := mutator.SetIssueState(
 		ctx, platformRepoRefFromDB(*repo), input.Number, input.Body.State,
 	); err != nil {
@@ -4709,6 +4706,13 @@ func (s *Server) resolveItem(
 	// row state via diffWarnings.
 	var diffErr *ghclient.DiffSyncError
 	if err != nil && !errors.As(err, &diffErr) {
+		// Classified lookup outcomes (removed, inaccessible, moved with
+		// its destination) arrive as platform errors; map them to their
+		// typed problems instead of collapsing into an internal error.
+		var platformErr *platform.Error
+		if errors.As(err, &platformErr) {
+			return nil, mapPlatformError(err)
+		}
 		var ghErr *gh.ErrorResponse
 		if errors.As(err, &ghErr) {
 			if ghErr.Response != nil &&
@@ -5709,6 +5713,17 @@ func (s *Server) refreshWorkspaceRepoIndex(
 ) error {
 	err := s.syncer.SyncRepoOnProvider(ctx, kind, host, owner, name)
 	if err == nil {
+		return nil
+	}
+	// An issue-only partial failure is already recorded in repo sync
+	// health, and the workspace flow depends on merge-request data, so the
+	// refresh proceeds to association inspection and the targeted
+	// PR-detail refresh. Partial failures touching the merge-request
+	// scope (and hard failures) still abort: succeeding would return
+	// stale association data for a PR that failed to sync.
+	if partial, ok := ghclient.ExclusivePartialSyncFailure(err); ok && !partial.MergeRequests {
+		slog.Warn("workspace refresh: issue sync partially failed",
+			"owner", owner, "name", name, "err", err)
 		return nil
 	}
 	if strings.Contains(err.Error(), "is not tracked") {

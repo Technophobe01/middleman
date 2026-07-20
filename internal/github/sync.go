@@ -16,6 +16,7 @@ import (
 	"time"
 
 	gh "github.com/google/go-github/v88/github"
+	"go.kenn.io/middleman/internal/archive"
 	"go.kenn.io/middleman/internal/config"
 	"go.kenn.io/middleman/internal/db"
 	"go.kenn.io/middleman/internal/gitclone"
@@ -239,6 +240,42 @@ type RepoRef struct {
 	DefaultBranch      string
 }
 
+// PartialSyncError reports a repo sync cycle whose index scan completed but
+// failed to refresh one or more items in the listed scopes. It is recorded in
+// repo and global sync health like any other sync failure, but consumers that
+// depend only on an unaffected scope (stack detection over merge requests,
+// workspace refresh flows) should proceed instead of treating the repository
+// as failed wholesale.
+type PartialSyncError struct {
+	MergeRequests bool
+	Issues        bool
+}
+
+func (e *PartialSyncError) Error() string {
+	var failedPaths []string
+	if e.MergeRequests {
+		failedPaths = append(failedPaths, "merge request")
+	}
+	if e.Issues {
+		failedPaths = append(failedPaths, "issue")
+	}
+	return fmt.Sprintf(
+		"one or more %s sync items failed", strings.Join(failedPaths, " and "),
+	)
+}
+
+// ExclusivePartialSyncFailure returns the typed partial failure only when the
+// complete error is the partial failure itself. A partial error joined or
+// wrapped with any other failure (for example a hard post-sync bookkeeping
+// error) describes more than its scopes, so consumers must treat it as a
+// hard failure rather than proceeding on the strength of a scope report
+// that does not cover the whole error.
+func ExclusivePartialSyncFailure(err error) (*PartialSyncError, bool) {
+	//nolint:errorlint // exclusivity is deliberate: joined or wrapped errors must not be typed partial
+	partial, ok := err.(*PartialSyncError)
+	return partial, ok
+}
+
 // RepoSyncResult holds the outcome of syncing a single repo.
 type RepoSyncResult struct {
 	Platform     platform.Kind
@@ -246,6 +283,10 @@ type RepoSyncResult struct {
 	Name         string
 	PlatformHost string
 	Error        string // empty on success
+	// PartialFailure carries the failed item scopes when Error records a
+	// partial per-item failure; nil on success and on hard repository
+	// failures.
+	PartialFailure *PartialSyncError
 }
 
 // WatchedMR identifies a merge request to sync on a fast interval.
@@ -411,6 +452,11 @@ func (p *listFetchProgressLogger) log(message string) {
 type Syncer struct {
 	clients                  *platform.Registry
 	db                       *db.DB
+	archiveRunner            archiveRunner
+	archiveLifecycle         archiveRepositoryLifecycle
+	archiveWake              chan struct{}
+	archivePollInterval      time.Duration
+	now                      func() time.Time
 	clones                   *gitclone.Manager
 	rateTrackers             map[string]*RateTracker    // provider/host bucket -> tracker
 	writeRateTrackers        map[string]*RateTracker    // provider/host bucket -> mutation-credential REST tracker
@@ -431,6 +477,9 @@ type Syncer struct {
 	branchActivityMaxCommits int
 	parallelism              atomic.Int32
 	running                  atomic.Bool
+	providerWorkMu           sync.Mutex
+	providerWork             map[string]map[archive.WorkPriority]int
+	archiveProviderRequests  map[string]archiveProviderRequest
 	status                   atomic.Value // stores *SyncStatus
 	stopCh                   chan struct{}
 	notificationSyncMu       sync.RWMutex
@@ -492,6 +541,20 @@ type Syncer struct {
 	commentRefreshMu         sync.Mutex
 	pendingPRCommentSyncs    []queuedPRCommentSync
 	pendingIssueCommentSyncs []queuedIssueCommentSync
+}
+
+type archiveProviderRequest struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+type archiveRunner interface {
+	RunEligible(context.Context) error
+}
+
+type archiveRepositoryLifecycle interface {
+	EnsureConfigured(context.Context, []platform.RepoRef) error
+	RetryAuthentication(context.Context, []platform.RepoRef) error
 }
 
 type queuedPRCommentSync struct {
@@ -579,28 +642,6 @@ func repoFailKey(repo RepoRef) string {
 		strings.ToLower(repo.Owner) + "/" + strings.ToLower(repo.Name)
 }
 
-func (s *Syncer) replaceMergeRequestLabels(
-	ctx context.Context,
-	repoID, mrID int64,
-	labels []db.Label,
-) error {
-	if err := s.db.ReplaceMergeRequestLabels(ctx, repoID, mrID, labels); err != nil {
-		return fmt.Errorf("replace merge request labels: %w", err)
-	}
-	return nil
-}
-
-func (s *Syncer) replaceIssueLabels(
-	ctx context.Context,
-	repoID, issueID int64,
-	labels []db.Label,
-) error {
-	if err := s.db.ReplaceIssueLabels(ctx, repoID, issueID, labels); err != nil {
-		return fmt.Errorf("replace issue labels: %w", err)
-	}
-	return nil
-}
-
 // consumeRepoFailed returns the failScope bitmask for a previously
 // failed repo. Returns 0 if the repo had no failure. The flag remains
 // set until a subsequent successful sync explicitly clears it.
@@ -628,7 +669,7 @@ func (s *Syncer) publishStatus(status *SyncStatus) {
 // given interval. clients maps host -> Client; rateTrackers maps
 // host -> RateTracker. Both may contain nil values. clones may
 // be nil. budgets maps host -> SyncBudget; nil or empty disables
-// detail drain and backfill. Budgets are created by the caller
+// detail drain and archive collection. Budgets are created by the caller
 // (typically main.go) and wired into each Client's HTTP transport
 // at construction time so every sync-context RoundTrip is
 // automatically counted.
@@ -684,7 +725,11 @@ func NewSyncerWithRegistry(
 		branchActivityMaxCommits: defaultBranchActivityMaxCommits,
 		nextSyncAfter:            make(map[string]time.Time),
 		nextWatchSyncAfter:       make(map[string]time.Time),
+		archiveProviderRequests:  make(map[string]archiveProviderRequest),
 		stopCh:                   make(chan struct{}),
+		archiveWake:              make(chan struct{}, 1),
+		archivePollInterval:      time.Second,
+		now:                      time.Now,
 		displayNames: newDisplayNameCache(
 			displayNameCacheSize,
 			displayNameSuccessTTL,
@@ -702,6 +747,295 @@ func NewSyncerWithRegistry(
 	}
 
 	return s
+}
+
+// SetArchiveService attaches the provider-neutral archive worker before Start.
+// It also extends provider window-reset callbacks so budget resets wake queued
+// archive work immediately.
+func (s *Syncer) SetArchiveService(runner archiveRunner) {
+	s.archiveRunner = runner
+	s.archiveLifecycle, _ = runner.(archiveRepositoryLifecycle)
+	for key, tracker := range s.rateTrackers {
+		if tracker == nil {
+			continue
+		}
+		budget := s.budgets[key]
+		tracker.SetOnWindowReset(func() {
+			if budget != nil {
+				budget.Reset()
+			}
+			s.WakeArchive()
+		})
+	}
+}
+
+func (s *Syncer) WakeArchive() {
+	select {
+	case s.archiveWake <- struct{}{}:
+	default:
+	}
+}
+
+func (s *Syncer) SetArchivePollIntervalForTesting(interval time.Duration) {
+	if interval > 0 {
+		s.archivePollInterval = interval
+	}
+}
+
+func (s *Syncer) ConfiguredRepositories(context.Context) ([]platform.RepoRef, error) {
+	s.reposMu.Lock()
+	repos := slices.Clone(s.repos)
+	s.reposMu.Unlock()
+	refs := make([]platform.RepoRef, 0, len(repos))
+	for _, repo := range repos {
+		kind := repoPlatform(repo)
+		host := repoHost(repo)
+		refs = append(refs, platform.RepoRef{
+			Platform: kind, Host: host, Owner: repo.Owner, Name: repo.Name,
+			RepoPath: repo.Owner + "/" + repo.Name,
+		})
+	}
+	return refs, nil
+}
+
+func (s *Syncer) Admit(
+	ctx context.Context,
+	ref platform.RepoRef,
+	cost int,
+) (archive.AdmissionResult, error) {
+	now := s.now().UTC()
+	if s.running.Load() {
+		retryAt := now.Add(time.Second)
+		return archive.AdmissionResult{RetryAt: &retryAt, Detail: "normal sync is active"}, nil
+	}
+	key := rateBucketKeyFor(ref.Platform, ref.Host)
+	if s.higherPriorityProviderWorkActive(key, archive.PriorityFullArchive) {
+		retryAt := now.Add(time.Second)
+		return archive.AdmissionResult{RetryAt: &retryAt, Detail: "higher-priority sync work is active"}, nil
+	}
+	tracker := s.rateTrackers[key]
+	if tracker != nil && (tracker.IsPaused() ||
+		tracker.Known() && tracker.Remaining()-cost < RateReserveBuffer) {
+		retryAt := now.Add(time.Minute)
+		if reset := tracker.ResetAt(); reset != nil && reset.After(now) {
+			retryAt = reset.UTC()
+		}
+		return archive.AdmissionResult{RetryAt: &retryAt, Detail: "provider rate reserve reached"}, nil
+	}
+	budget := s.budgets[key]
+	resetAt := archiveBudgetResetAt(tracker)
+	available := 0
+	if budget != nil {
+		available = budget.ArchiveSpendAvailable(now, resetAt, archiveLiveFloor(ref.Platform))
+	}
+	if available < cost {
+		retryAt := now.Add(time.Minute)
+		if resetAt != nil && resetAt.After(now) && resetAt.Before(retryAt) {
+			retryAt = resetAt.UTC()
+		}
+		return archive.AdmissionResult{RetryAt: &retryAt, Detail: "archive surplus budget unavailable"}, nil
+	}
+	requestCtx, release, allowed := s.tryBeginArchiveProviderRequest(ctx, key)
+	if !allowed {
+		retryAt := now.Add(time.Second)
+		return archive.AdmissionResult{RetryAt: &retryAt, Detail: "higher-priority sync work is active"}, nil
+	}
+	// The declared cost is the admission minimum. Once admitted, the request may
+	// use the archive surplus currently available without crossing the live
+	// floor; provider-SDK and authentication retries share this allowance.
+	return archive.AdmissionResult{
+		Allowed: true,
+		Context: WithArchiveAttemptAllowance(WithArchiveSyncBudget(requestCtx), available),
+		Release: release,
+	}, nil
+}
+
+func (s *Syncer) tryBeginArchiveProviderRequest(
+	ctx context.Context,
+	key string,
+) (context.Context, func(), bool) {
+	s.providerWorkMu.Lock()
+	if active := s.providerWork[key]; len(active) > 0 {
+		s.providerWorkMu.Unlock()
+		return nil, nil, false
+	}
+	if s.providerWork == nil {
+		s.providerWork = make(map[string]map[archive.WorkPriority]int)
+	}
+	s.providerWork[key] = map[archive.WorkPriority]int{archive.PriorityFullArchive: 1}
+	requestCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	s.archiveProviderRequests[key] = archiveProviderRequest{cancel: cancel, done: done}
+	s.providerWorkMu.Unlock()
+
+	var once sync.Once
+	return requestCtx, func() {
+		once.Do(func() {
+			cancel()
+			s.providerWorkMu.Lock()
+			active := s.providerWork[key]
+			delete(active, archive.PriorityFullArchive)
+			if len(active) == 0 {
+				delete(s.providerWork, key)
+			}
+			delete(s.archiveProviderRequests, key)
+			close(done)
+			s.providerWorkMu.Unlock()
+		})
+	}, true
+}
+
+func archiveBudgetResetAt(tracker *RateTracker) *time.Time {
+	if tracker == nil {
+		return nil
+	}
+	return tracker.ResetAt()
+}
+
+func archiveLiveFloor(kind platform.Kind) int {
+	floor := PRDetailWorstCase + 1 // one full live detail plus one current-index page
+	if kind == platform.KindGitHub {
+		floor++ // one notification page
+	}
+	return floor
+}
+
+func (s *Syncer) beginProviderWork(key string, priority archive.WorkPriority) func() {
+	s.providerWorkMu.Lock()
+	if s.providerWork == nil {
+		s.providerWork = make(map[string]map[archive.WorkPriority]int)
+	}
+	active := s.providerWork[key]
+	if active == nil {
+		active = make(map[archive.WorkPriority]int)
+		s.providerWork[key] = active
+	}
+	active[priority]++
+	archiveRequest, waitForArchive := s.archiveProviderRequests[key]
+	if waitForArchive {
+		archiveRequest.cancel()
+	}
+	s.providerWorkMu.Unlock()
+	if waitForArchive {
+		<-archiveRequest.done
+	}
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.providerWorkMu.Lock()
+			defer s.providerWorkMu.Unlock()
+			active := s.providerWork[key]
+			active[priority]--
+			if active[priority] == 0 {
+				delete(active, priority)
+			}
+			if len(active) == 0 {
+				delete(s.providerWork, key)
+			}
+		})
+	}
+}
+
+func (s *Syncer) higherPriorityProviderWorkActive(key string, threshold archive.WorkPriority) bool {
+	s.providerWorkMu.Lock()
+	defer s.providerWorkMu.Unlock()
+	for priority, count := range s.providerWork[key] {
+		if count > 0 && priority < threshold {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Syncer) commitIssueParentSnapshot(
+	ctx context.Context,
+	_ RepoRef,
+	issue *db.Issue,
+) (int64, int64, bool, error) {
+	return s.db.UpsertIssueSnapshotWithLabels(ctx, issue)
+}
+
+func (s *Syncer) commitMergeRequestParentSnapshot(
+	ctx context.Context,
+	_ RepoRef,
+	mr *db.MergeRequest,
+) (int64, int64, bool, error) {
+	return s.db.UpsertMergeRequestSnapshotWithLabels(ctx, mr)
+}
+
+func (s *Syncer) commitIssueCommentsSnapshot(
+	ctx context.Context,
+	repo RepoRef,
+	number int,
+	expectedRevision int64,
+	events []db.IssueEvent,
+	otherEvents []db.IssueEvent,
+	derived *db.IssueDerivedFields,
+) (bool, error) {
+	parent, err := s.db.GetIssue(
+		ctx, string(repoPlatform(repo)), repoHost(repo), repo.Owner, repo.Name, number,
+	)
+	if err != nil || parent == nil {
+		if err != nil {
+			return false, err
+		}
+		return false, fmt.Errorf("issue #%d is missing before comment replacement", number)
+	}
+	for i := range events {
+		events[i].IssueID = parent.ID
+	}
+	for i := range otherEvents {
+		otherEvents[i].IssueID = parent.ID
+	}
+	applied, err := s.db.CommitIssueChildSnapshot(ctx, db.IssueChildSnapshot{
+		IssueID: parent.ID, ExpectedRevision: expectedRevision,
+		Comments: events, OtherEvents: otherEvents, DerivedFields: derived,
+	})
+	if err != nil {
+		return false, fmt.Errorf("commit child snapshot for issue #%d: %w", number, err)
+	}
+	return applied, nil
+}
+
+func (s *Syncer) commitMergeRequestDatasets(
+	ctx context.Context,
+	repo RepoRef,
+	number int,
+	expectedRevision int64,
+	comments []db.MREvent,
+	commentsComplete bool,
+	reviews []db.MREvent,
+	inline []db.MREvent,
+	threads []db.MRReviewThread,
+	inlineComplete bool,
+	otherEvents []db.MREvent,
+	derived *db.MRDerivedFields,
+) (bool, error) {
+	parent, err := s.db.GetMergeRequest(
+		ctx, string(repoPlatform(repo)), repoHost(repo), repo.Owner, repo.Name, number,
+	)
+	if err != nil || parent == nil {
+		if err != nil {
+			return false, err
+		}
+		return false, fmt.Errorf("merge request #%d is missing before dataset persistence", number)
+	}
+	for _, events := range [][]db.MREvent{comments, reviews, inline, otherEvents} {
+		for i := range events {
+			events[i].MergeRequestID = parent.ID
+		}
+	}
+	applied, err := s.db.CommitMergeRequestChildSnapshot(ctx, db.MergeRequestChildSnapshot{
+		MergeRequestID: parent.ID, ExpectedRevision: expectedRevision,
+		Comments: comments, CommentsComplete: commentsComplete, Reviews: reviews,
+		InlineComments: inline, ReviewThreads: threads, InlineCommentsComplete: inlineComplete,
+		OtherEvents: otherEvents, DerivedFields: derived,
+	})
+	if err != nil {
+		return false, fmt.Errorf("commit child snapshot for MR #%d: %w", number, err)
+	}
+	return applied, nil
 }
 
 type gitHubClientProvider struct {
@@ -722,6 +1056,8 @@ type authenticatedViewerCacheKeyClient interface {
 }
 
 const authenticatedViewerLoginTTL = time.Minute
+
+var errParentSnapshotAdvanced = errors.New("provider parent snapshot advanced during child refresh")
 
 type githubLabelClient interface {
 	ListRepoLabels(ctx context.Context, owner, repo string) ([]*gh.Label, error)
@@ -780,6 +1116,7 @@ func (p *gitHubClientProvider) Capabilities() platform.Capabilities {
 	_, labels := p.client.(githubLabelClient)
 	_, assignees := p.client.(githubAssigneeClient)
 	_, reviewers := p.client.(githubReviewerClient)
+	_, archivePages := p.client.(pageClient)
 	return platform.Capabilities{
 		ReadRepositories:            true,
 		ReadMergeRequests:           true,
@@ -807,6 +1144,13 @@ func (p *gitHubClientProvider) Capabilities() platform.Capabilities {
 		ReviewSuggestionApplication: true,
 		ReadReviewThreads:           true,
 		NativeMultilineRanges:       true,
+		Archive: platform.ArchiveCapabilities{
+			HistoricalIssues:        archivePages,
+			HistoricalMergeRequests: archivePages,
+			OrdinaryComments:        archivePages,
+			SubmittedReviews:        archivePages,
+			InlineReviewComments:    archivePages,
+		},
 		SupportedReviewActions: []platform.ReviewAction{
 			platform.ReviewActionComment,
 			platform.ReviewActionApprove,
@@ -1026,8 +1370,11 @@ func (p *gitHubClientProvider) GetGitHubPullRequest(
 	number int,
 ) (*gh.PullRequest, platform.MergeRequest, error) {
 	pr, err := p.client.GetPullRequest(ctx, ref.Owner, ref.Name, number)
-	if err != nil {
-		return nil, platform.MergeRequest{}, err
+	// The optimized detail path needs the full SDK object, so it fetches
+	// raw; the failure and transfer outcomes still route through the one
+	// canonical lookup classification.
+	if outcomeErr := p.mergeRequestLookupOutcomeError(ctx, ref, number, pr, err); outcomeErr != nil {
+		return nil, platform.MergeRequest{}, outcomeErr
 	}
 	mr, err := platformgithub.NormalizePullRequest(ref, pr)
 	if err != nil {
@@ -1106,6 +1453,98 @@ func (p *gitHubClientProvider) ListMergeRequestEvents(
 	return out, nil
 }
 
+// lookupNotPresentError renders the typed error a live caller receives when a
+// single-item lookup resolves to a non-present outcome. Live callers require
+// present; archive callers inspect the outcome instead. The outcomes must not
+// collapse: removed is not_found, inaccessible is permission_denied (the
+// behavior a raw 403 produced before lookup classification), and moved is
+// not_found carrying the destination repository so callers can retarget the
+// reference.
+func (p *gitHubClientProvider) lookupNotPresentError(
+	ref platform.RepoRef,
+	number int,
+	outcome lookupOutcome,
+	destination *platform.RepoRef,
+) error {
+	code := platform.ErrCodeNotFound
+	cause := fmt.Errorf("%s#%d is not present (%s)", ref.DisplayName(), number, outcome)
+	if outcome == lookupInaccessible {
+		code = platform.ErrCodePermissionDenied
+		cause = errors.Join(platform.ErrLookupInaccessible, cause)
+	} else {
+		cause = errors.Join(platform.ErrLookupNotPresent, cause)
+	}
+	return &platform.Error{
+		Code:         code,
+		Provider:     platform.KindGitHub,
+		PlatformHost: p.host,
+		Destination:  destination,
+		Err:          cause,
+	}
+}
+
+// issueFetchOutcomeError routes a raw single-issue fetch result through the
+// canonical lookup classification when the repo's registered reader is the
+// GitHub provider. A nil return means no outcome mapping applies (present
+// item, non-GitHub reader, or a nil conditional result).
+func (s *Syncer) issueFetchOutcomeError(
+	ctx context.Context,
+	repo RepoRef,
+	number int,
+	issue *gh.Issue,
+	err error,
+) error {
+	reader, readerErr := s.issueReaderFor(repo)
+	if readerErr != nil {
+		return nil
+	}
+	provider, ok := reader.(*gitHubClientProvider)
+	if !ok {
+		return nil
+	}
+	return provider.issueLookupOutcomeError(ctx, platformRepoRef(repo), number, issue, err)
+}
+
+// mergeRequestFetchOutcomeError is the merge-request counterpart to
+// issueFetchOutcomeError.
+func (s *Syncer) mergeRequestFetchOutcomeError(
+	ctx context.Context,
+	repo RepoRef,
+	number int,
+	pr *gh.PullRequest,
+	err error,
+) error {
+	reader, readerErr := s.mergeRequestReaderFor(repo)
+	if readerErr != nil {
+		return nil
+	}
+	provider, ok := reader.(*gitHubClientProvider)
+	if !ok {
+		return nil
+	}
+	return provider.mergeRequestLookupOutcomeError(ctx, platformRepoRef(repo), number, pr, err)
+}
+
+// ListOpenGitHubIssues is the raw ETag-gated open-issue bulk read backing both
+// the canonical listOpenIssuesPage normalization and the optimized GitHub
+// index sync consumer. Because the raw slice is consumed without passing
+// through the validating canonical reader wrapper, this method applies the
+// equivalent contract checks itself, so no caller ever observes an unvalidated
+// bulk observation.
+func (p *gitHubClientProvider) ListOpenGitHubIssues(
+	ctx context.Context,
+	ref platform.RepoRef,
+) ([]*gh.Issue, error) {
+	issues, err := p.client.ListOpenIssues(ctx, ref.Owner, ref.Name)
+	if err != nil {
+		return nil, err
+	}
+	if err := p.validateOpenIssuesContract(ref, issues); err != nil {
+		return nil, err
+	}
+	return issues, nil
+}
+
 func (p *gitHubClientProvider) ListOpenIssues(
 	ctx context.Context,
 	ref platform.RepoRef,
@@ -1125,11 +1564,51 @@ func (p *gitHubClientProvider) ListOpenIssues(
 	return out, nil
 }
 
-func (p *gitHubClientProvider) ListOpenGitHubIssues(
-	ctx context.Context,
+// validateOpenIssuesContract applies the contract checks the validating
+// canonical reader wrapper would run on a normalized open-issue page to the
+// raw bulk result: items must be non-nil, item numbers positive and unique
+// within the single exhausted open list, and every item bound to the
+// requested repository. Monotonic-order checks do not apply because the open
+// scan leaves traversal order contractually unspecified. Violations are typed
+// provider contract errors so consumers reject the whole list instead of
+// persisting from it.
+func (p *gitHubClientProvider) validateOpenIssuesContract(
 	ref platform.RepoRef,
-) ([]*gh.Issue, error) {
-	return p.client.ListOpenIssues(ctx, ref.Owner, ref.Name)
+	issues []*gh.Issue,
+) error {
+	seen := make(map[int]bool, len(issues))
+	for _, issue := range issues {
+		if issue == nil {
+			return platform.ProviderContract(
+				platform.KindGitHub, p.host, "item",
+				fmt.Errorf("provider returned a nil issue in the open list for %s", ref.DisplayName()),
+			)
+		}
+		number := issue.GetNumber()
+		if number <= 0 {
+			return platform.ProviderContract(
+				platform.KindGitHub, p.host, "item_number",
+				fmt.Errorf("provider returned nonpositive issue number %d", number),
+			)
+		}
+		if seen[number] {
+			return platform.ProviderContract(
+				platform.KindGitHub, p.host, "item_number",
+				fmt.Errorf("provider returned duplicate issue number %d in one open list", number),
+			)
+		}
+		seen[number] = true
+		if destination := githubArchiveDestination(ref, issue.GetRepositoryURL()); destination != nil {
+			return platform.ProviderContract(
+				platform.KindGitHub, p.host, "item_repo",
+				fmt.Errorf(
+					"provider returned issue %d bound to repository %s for requested %s",
+					number, destination.RepoPath, ref.RepoPath,
+				),
+			)
+		}
+	}
+	return nil
 }
 
 func (p *gitHubClientProvider) ListLabels(
@@ -1147,6 +1626,20 @@ func (p *gitHubClientProvider) ListLabels(
 	return platform.LabelCatalog{Labels: platformgithub.NormalizeLabels(ref, labels)}, nil
 }
 
+func (p *gitHubClientProvider) GetGitHubIssue(
+	ctx context.Context,
+	ref platform.RepoRef,
+	number int,
+) (*gh.Issue, error) {
+	issue, err := p.client.GetIssue(ctx, ref.Owner, ref.Name, number)
+	// Raw fetch for the optimized detail path; outcomes still route
+	// through the one canonical lookup classification.
+	if outcomeErr := p.issueLookupOutcomeError(ctx, ref, number, issue, err); outcomeErr != nil {
+		return nil, outcomeErr
+	}
+	return issue, nil
+}
+
 func (p *gitHubClientProvider) GetIssue(
 	ctx context.Context,
 	ref platform.RepoRef,
@@ -1157,14 +1650,6 @@ func (p *gitHubClientProvider) GetIssue(
 		return platform.Issue{}, err
 	}
 	return platformgithub.NormalizeIssue(ref, issue)
-}
-
-func (p *gitHubClientProvider) GetGitHubIssue(
-	ctx context.Context,
-	ref platform.RepoRef,
-	number int,
-) (*gh.Issue, error) {
-	return p.client.GetIssue(ctx, ref.Owner, ref.Name, number)
 }
 
 func (p *gitHubClientProvider) ListIssueEvents(
@@ -2537,9 +3022,38 @@ func (s *Syncer) HostForRepo(owner, name string) string {
 
 // SetRepos atomically replaces the list of repositories to sync.
 func (s *Syncer) SetRepos(repos []RepoRef) {
+	if err := s.SetReposWithContext(context.Background(), repos, false); err != nil {
+		slog.Warn("update archive repositories", "err", err)
+		s.reposMu.Lock()
+		s.repos = slices.Clone(repos)
+		s.reposMu.Unlock()
+		s.WakeArchive()
+	}
+}
+
+// SetReposWithContext prepares durable archive state before exposing a new
+// configured repository set to sync workers. Credential reloads may also make
+// authentication-blocked work eligible without resetting archive progress.
+func (s *Syncer) SetReposWithContext(ctx context.Context, repos []RepoRef, retryAuthentication bool) error {
+	refs := make([]platform.RepoRef, 0, len(repos))
+	for _, repo := range repos {
+		refs = append(refs, platformRepoRef(repo))
+	}
+	if s.archiveLifecycle != nil {
+		if err := s.archiveLifecycle.EnsureConfigured(ctx, refs); err != nil {
+			return fmt.Errorf("seed archive discovery: %w", err)
+		}
+		if retryAuthentication {
+			if err := s.archiveLifecycle.RetryAuthentication(ctx, refs); err != nil {
+				return fmt.Errorf("retry archive authentication: %w", err)
+			}
+		}
+	}
 	s.reposMu.Lock()
 	s.repos = slices.Clone(repos)
 	s.reposMu.Unlock()
+	s.WakeArchive()
+	return nil
 }
 
 // Start runs an immediate sync then launches a background ticker.
@@ -2560,12 +3074,21 @@ func (s *Syncer) Start(ctx context.Context) {
 
 	watchMerged, watchCancel := s.mergeWithRunCtx(ctx)
 	s.wg.Add(1)
+	var archiveReady chan struct{}
+	if s.archiveRunner != nil {
+		archiveReady = make(chan struct{})
+		s.wg.Add(1)
+	}
 	s.lifecycleMu.Unlock()
 
 	go func() {
 		defer s.wg.Done()
 		defer startCancel()
 		s.RunOnce(startMerged)
+		if archiveReady != nil {
+			close(archiveReady)
+			s.WakeArchive()
+		}
 		ticker := time.NewTicker(s.interval)
 		defer ticker.Stop()
 		for {
@@ -2579,6 +3102,13 @@ func (s *Syncer) Start(ctx context.Context) {
 			}
 		}
 	}()
+
+	if archiveReady != nil {
+		go func() {
+			defer s.wg.Done()
+			s.runArchiveLoop(startMerged, archiveReady)
+		}()
+	}
 
 	go func() {
 		defer s.wg.Done()
@@ -2598,6 +3128,36 @@ func (s *Syncer) Start(ctx context.Context) {
 			}
 		}
 	}()
+}
+
+func (s *Syncer) runArchiveLoop(ctx context.Context, ready <-chan struct{}) {
+	select {
+	case <-ready:
+	case <-s.stopCh:
+		return
+	case <-ctx.Done():
+		return
+	}
+	interval := s.archivePollInterval
+	if interval <= 0 {
+		interval = time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		if err := s.archiveRunner.RunEligible(ctx); err != nil &&
+			!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			slog.Warn("archive worker iteration failed", "err", err)
+		}
+		select {
+		case <-ticker.C:
+		case <-s.archiveWake:
+		case <-s.stopCh:
+			return
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 // syncWatchedMRs syncs each MR on the watch list via SyncMR.
@@ -2711,7 +3271,8 @@ func (s *Syncer) syncWatchedMRs(ctx context.Context) {
 			)
 			continue
 		}
-		if err := s.syncMRWithWatchedRef(ctx, mr); err != nil {
+		err := s.syncMRWithWatchedRef(ctx, mr)
+		if err != nil {
 			slog.Warn("fast-sync watched MR failed",
 				"owner", mr.Owner,
 				"name", mr.Name,
@@ -3165,7 +3726,8 @@ func (s *Syncer) runWorker(
 		}
 		repoName := repo.Owner + "/" + repo.Name
 		slog.Info("syncing repo", "repo", repoName)
-		if err := s.syncRepo(ctx, repo); err != nil {
+		err := s.syncRepo(ctx, repo)
+		if err != nil {
 			// Bail without counting this repo only when the
 			// *run* context itself is canceled and the error
 			// reflects that. Per-request timeouts also come
@@ -3186,8 +3748,13 @@ func (s *Syncer) runWorker(
 			state.errMu.Lock()
 			*state.lastErr = errStr
 			state.errMu.Unlock()
-			// Each index is written by exactly one worker.
+			// Each index is written by exactly one worker. The partial
+			// typing requires the whole error to be the partial failure:
+			// a partial joined with any other failure is hard.
 			state.results[item.index].Error = errStr
+			if partial, ok := ExclusivePartialSyncFailure(err); ok {
+				state.results[item.index].PartialFailure = partial
+			}
 		}
 		// Latch the canceled flag if ctx was canceled during
 		// syncRepo. A misbehaving Client implementation can
@@ -3206,7 +3773,7 @@ func (s *Syncer) runWorker(
 
 // publishMonotonicProgress publishes a progress update only if done
 // is the highest value seen so far. Skips the final "total/total"
-// because detail drain and backfill still run after index completes.
+// because detail drain still runs after index completes.
 // Both worker completions and throttled-repo skips use this to
 // guarantee SSE progress never regresses.
 func (s *Syncer) publishMonotonicProgress(
@@ -3362,16 +3929,6 @@ dispatch:
 		s.drainDetailQueue(ctx, eligibleBuckets)
 	}
 
-	// Backfill discovery: fetch closed items if budget allows.
-	if !canceled.Load() && ctx.Err() == nil {
-		for bucket, ok := range eligibleBuckets {
-			if !ok {
-				continue
-			}
-			s.runBackfillDiscovery(ctx, bucket, repos)
-		}
-	}
-
 	if !canceled.Load() && ctx.Err() == nil {
 		s.drainPendingCommentSyncs(ctx, eligibleBuckets)
 	}
@@ -3500,6 +4057,11 @@ func (s *Syncer) markClosedLinkedNotificationsDone(ctx context.Context) error {
 }
 
 func (s *Syncer) syncRepo(ctx context.Context, repo RepoRef) error {
+	releaseProviderWork := s.beginProviderWork(
+		repoRateBucketKey(repo), archive.PriorityNormalIndex,
+	)
+	defer releaseProviderWork()
+
 	repoIdentity, resolvedRepo, err := s.syncRepoIdentity(ctx, repo)
 	if err != nil {
 		return fmt.Errorf("resolve repo identity %s/%s: %w", repo.Owner, repo.Name, err)
@@ -4387,6 +4949,9 @@ func (s *Syncer) indexSyncRepo(
 		if rawIssueReader, ok := issueReader.(interface {
 			ListOpenGitHubIssues(context.Context, platform.RepoRef) ([]*gh.Issue, error)
 		}); ok && hasGitHubClient {
+			// Keep GitHub's ETag-gated bulk path so index sync retains the
+			// provider-only fields used by per-item detail refreshes. The raw
+			// reader performs the same contract checks before persistence.
 			ghIssues, issueListErr = rawIssueReader.ListOpenGitHubIssues(ctx, platformRef)
 		} else {
 			openIssues, issueListErr = issueReader.ListOpenIssues(ctx, platformRef)
@@ -4467,6 +5032,19 @@ func (s *Syncer) indexSyncRepo(
 	}
 	if caps.ReadIssues && issueListUnchanged && failedScope&failIssues == 0 {
 		s.refreshRepoIssueComments(ctx, repo)
+	}
+
+	if failedScope != 0 {
+		// Surface the partially-failed cycle to the caller so repo
+		// sync health (last_sync_error, sync status) records it;
+		// without this, per-item failures such as a transferred or
+		// inaccessible item look like a clean sync from the API. The
+		// typed partial error lets consumers that depend only on an
+		// unaffected scope proceed.
+		return &PartialSyncError{
+			MergeRequests: failedScope&failMR != 0,
+			Issues:        failedScope&failIssues != 0,
+		}
 	}
 
 	return nil
@@ -4624,7 +5202,7 @@ func (s *Syncer) indexUpsertMergeRequest(
 		}
 	}
 
-	mrID, accepted, err := s.db.UpsertMergeRequestSnapshot(ctx, normalized)
+	mrID, revision, accepted, err := s.commitMergeRequestParentSnapshot(ctx, repo, normalized)
 	if err != nil {
 		return fmt.Errorf(
 			"upsert MR #%d: %w", mr.Number, err,
@@ -4634,17 +5212,18 @@ func (s *Syncer) indexUpsertMergeRequest(
 		return nil
 	}
 	if needsCIDetailRefresh {
-		if err := s.clearMRDetailFetchedByRepoID(ctx, repoID, mr.Number); err != nil {
+		detailCleared, err := s.db.ClearMRDetailFetchedSnapshot(ctx, mrID, revision)
+		if err != nil {
 			return fmt.Errorf(
 				"clear detail fetch marker for MR #%d: %w",
 				mr.Number, err,
 			)
 		}
+		if !detailCleared {
+			return nil
+		}
 	}
-	if err := s.replaceMergeRequestLabels(ctx, repoID, mrID, normalized.Labels); err != nil {
-		return fmt.Errorf("persist labels for MR #%d: %w", mr.Number, err)
-	}
-	if _, err := s.persistMergedActorEvent(ctx, mrID, mr.MergedBy, normalized.MergedAt); err != nil {
+	if _, err := s.persistMergedActorEvent(ctx, mrID, revision, mr.MergedBy, normalized.MergedAt); err != nil {
 		return fmt.Errorf("persist merged lifecycle event for MR #%d: %w", mr.Number, err)
 	}
 
@@ -4668,7 +5247,10 @@ func (s *Syncer) indexUpsertMergeRequest(
 		existing.DiffBaseSHA == normalized.PlatformBaseSHA &&
 		existing.MergeBaseSHA != ""
 	if s.clones != nil && cloneFetchOK && !snapshotCurrent {
-		if err := s.syncProviderMRDiff(ctx, repo, repoID, mr.Number, normalized, false); err != nil {
+		if err := s.syncProviderMRDiff(ctx, repo, mrID, revision, mr.Number, normalized, false); err != nil {
+			if errors.Is(err, errParentSnapshotAdvanced) {
+				return nil
+			}
 			slog.Warn("provider diff snapshot failed",
 				"repo", repo.Owner+"/"+repo.Name,
 				"number", mr.Number, "err", err,
@@ -4737,7 +5319,7 @@ func (s *Syncer) indexUpsertMR(
 		}
 	}
 
-	mrID, accepted, err := s.db.UpsertMergeRequestSnapshot(ctx, normalized)
+	mrID, revision, accepted, err := s.commitMergeRequestParentSnapshot(ctx, repo, normalized)
 	if err != nil {
 		return fmt.Errorf(
 			"upsert MR #%d: %w", ghPR.GetNumber(), err,
@@ -4747,17 +5329,18 @@ func (s *Syncer) indexUpsertMR(
 		return nil
 	}
 	if needsCIDetailRefresh {
-		if err := s.clearMRDetailFetchedByRepoID(ctx, repoID, ghPR.GetNumber()); err != nil {
+		detailCleared, err := s.db.ClearMRDetailFetchedSnapshot(ctx, mrID, revision)
+		if err != nil {
 			return fmt.Errorf(
 				"clear detail fetch marker for MR #%d: %w",
 				ghPR.GetNumber(), err,
 			)
 		}
+		if !detailCleared {
+			return nil
+		}
 	}
-	if err := s.replaceMergeRequestLabels(ctx, repoID, mrID, normalized.Labels); err != nil {
-		return fmt.Errorf("persist labels for MR #%d: %w", ghPR.GetNumber(), err)
-	}
-	if _, err := s.persistMergedTransitionEvent(ctx, mrID, ghPR, normalized.MergedAt); err != nil {
+	if _, err := s.persistMergedTransitionEvent(ctx, mrID, revision, ghPR, normalized.MergedAt); err != nil {
 		return fmt.Errorf("persist merged lifecycle event for MR #%d: %w", ghPR.GetNumber(), err)
 	}
 
@@ -4808,7 +5391,6 @@ func (s *Syncer) refreshPRCommentsForItem(
 	if !s.canSpendCommentRefresh(repo) {
 		return
 	}
-
 	comments, err := s.listCommentsForRefresh(
 		ctx, client, repo, pr.Number, pr.CommentCount,
 	)
@@ -4823,7 +5405,7 @@ func (s *Syncer) refreshPRCommentsForItem(
 		)
 		return
 	}
-	if err := s.persistPRComments(ctx, pr, comments); err != nil {
+	if err := s.persistPRComments(ctx, repo, pr, comments); err != nil {
 		client.InvalidateListETagsForRepo(repo.Owner, repo.Name, "comments")
 		slog.Warn("comment refresh: persist PR comments failed",
 			"repo", repo.Owner+"/"+repo.Name,
@@ -4845,7 +5427,6 @@ func (s *Syncer) refreshIssueCommentsForItem(
 	if !s.canSpendCommentRefresh(repo) {
 		return
 	}
-
 	comments, err := s.listCommentsForRefresh(
 		ctx, client, repo, issue.Number, issue.CommentCount,
 	)
@@ -4860,7 +5441,7 @@ func (s *Syncer) refreshIssueCommentsForItem(
 		)
 		return
 	}
-	if err := s.persistIssueComments(ctx, issue, comments); err != nil {
+	if err := s.persistIssueComments(ctx, repo, issue, comments); err != nil {
 		client.InvalidateListETagsForRepo(repo.Owner, repo.Name, "comments")
 		slog.Warn("comment refresh: persist issue comments failed",
 			"repo", repo.Owner+"/"+repo.Name,
@@ -5140,9 +5721,12 @@ func (s *Syncer) syncOpenIssueFromBulk(
 		// adaptIssue, so trust the fresh GraphQL value.
 	}
 
-	issueID, err := s.db.UpsertIssue(ctx, normalized)
+	issueID, revision, accepted, err := s.commitIssueParentSnapshot(ctx, repo, normalized)
 	if err != nil {
 		return fmt.Errorf("upsert issue #%d: %w", number, err)
+	}
+	if !accepted {
+		return nil
 	}
 
 	// UpsertIssue uses COALESCE to preserve existing detail_fetched_at,
@@ -5150,71 +5734,69 @@ func (s *Syncer) syncOpenIssueFromBulk(
 	// explicitly clear it so the detail drain re-queues this issue
 	// if the REST fallback fails.
 	if !bulk.CommentsComplete || !bulk.TimelineComplete {
-		_, err = s.db.WriteDB().ExecContext(ctx,
-			`UPDATE middleman_issues SET detail_fetched_at = NULL WHERE id = ?`,
-			issueID,
-		)
+		var detailCleared bool
+		detailCleared, err = s.db.ClearIssueDetailFetchedSnapshot(ctx, issueID, revision)
 		if err != nil {
 			return fmt.Errorf(
 				"clear detail_fetched_at for issue #%d: %w", number, err,
 			)
 		}
-	}
-
-	if err := s.replaceIssueLabels(
-		ctx, repoID, issueID, normalized.Labels,
-	); err != nil {
-		return fmt.Errorf(
-			"persist labels for issue #%d: %w", number, err,
-		)
+		if !detailCleared {
+			return nil
+		}
 	}
 
 	if bulk.CommentsComplete && bulk.TimelineComplete {
-		if err := s.replaceIssueCommentEvents(ctx, issueID, bulk.Comments); err != nil {
+		derived := db.IssueDerivedFields{
+			CommentCount:   normalized.CommentCount,
+			LastActivityAt: computeIssueCommentLastActivity(bulk.Issue, bulk.Comments),
+		}
+		applied, err := s.replaceIssueCommentEvents(
+			ctx, repo, number, issueID, revision, bulk.Comments,
+			normalizeIssueTimelineEvents(issueID, bulk.TimelineEvents), &derived,
+		)
+		if err != nil {
 			return fmt.Errorf(
 				"replace issue comment events for #%d: %w", number, err,
 			)
 		}
-		if err := s.upsertIssueTimelineEvents(ctx, issueID, bulk.TimelineEvents); err != nil {
-			return fmt.Errorf(
-				"upsert issue timeline events for #%d: %w", number, err,
-			)
+		if !applied {
+			return nil
 		}
-		if err := s.db.UpdateIssueActivity(
-			ctx, issueID, computeIssueCommentLastActivity(bulk.Issue, bulk.Comments),
-		); err != nil {
-			return fmt.Errorf(
-				"update issue #%d derived fields: %w", number, err,
-			)
-		}
-
 		// Mark detail as fetched so the detail drain doesn't
 		// re-queue this issue for REST detail fetches.
-		if err := s.updateIssueDetailFetchedByRepoID(
-			ctx, repoID, number,
-		); err != nil {
+		detailApplied, err := s.db.MarkIssueDetailFetchedSnapshot(ctx, issueID, revision)
+		if err != nil {
 			slog.Warn("mark GraphQL issue detail fetched failed",
 				"repo", repo.Owner+"/"+repo.Name,
 				"number", number, "err", err,
 			)
 		}
+		if !detailApplied {
+			return nil
+		}
 	} else {
 		// Timeline data truncated — fall back to detail fetch.
 		if err := s.refreshIssueTimeline(
-			ctx, repo, issueID, bulk.Issue,
+			ctx, repo, issueID, revision, bulk.Issue,
 		); err != nil {
+			if errors.Is(err, errParentSnapshotAdvanced) {
+				return nil
+			}
 			return fmt.Errorf(
 				"refresh timeline for issue #%d: %w", number, err,
 			)
 		}
 		// REST fallback succeeded — mark detail as fetched.
-		if err := s.updateIssueDetailFetchedByRepoID(
-			ctx, repoID, number,
-		); err != nil {
+		detailApplied, err := s.db.MarkIssueDetailFetchedSnapshot(ctx, issueID, revision)
+		if err != nil {
 			slog.Warn("mark issue detail fetched after REST fallback failed",
 				"repo", repo.Owner+"/"+repo.Name,
 				"number", number, "err", err,
 			)
+		}
+		if !detailApplied {
+			return nil
 		}
 	}
 
@@ -5270,6 +5852,21 @@ func (s *Syncer) syncOpenMRFromBulk(
 		}
 	}
 
+	// Resolve the review decision independent of nested-connection
+	// pagination. GitHub's reviewDecision scalar is provider-authoritative:
+	// it is computed over the PR's entire review history, so a truncated
+	// reviews/comments/commits/CI page on this fetch must not gate it. Apply
+	// it to the parent snapshot whenever the provider supplies it. Only when
+	// the provider reports no decision (null/empty enum) do we fall back to
+	// deriving from this fetch's reviews, and only when that reviews
+	// connection is complete; otherwise the previously persisted decision is
+	// retained (review history is additive).
+	if decision, authoritative := mapGraphQLReviewDecision(bulk.ReviewDecision); authoritative {
+		normalized.ReviewDecision = decision
+	} else if bulk.ReviewsComplete && len(bulk.Reviews) > 0 {
+		normalized.ReviewDecision = DeriveReviewDecision(bulk.Reviews)
+	}
+
 	// Resolve display name if missing.
 	if normalized.Author != "" &&
 		normalized.AuthorDisplayName == "" {
@@ -5287,7 +5884,7 @@ func (s *Syncer) syncOpenMRFromBulk(
 		}
 	}
 
-	mrID, accepted, err := s.db.UpsertMergeRequestSnapshot(ctx, normalized)
+	mrID, revision, accepted, err := s.commitMergeRequestParentSnapshot(ctx, repo, normalized)
 	if err != nil {
 		return fmt.Errorf("upsert MR #%d: %w", number, err)
 	}
@@ -5300,24 +5897,22 @@ func (s *Syncer) syncOpenMRFromBulk(
 	// without an explicit clear. Drop the stale CI state here so it
 	// doesn't outlive the old commit.
 	if headChanged {
-		if err := s.db.ClearMRCI(ctx, repoID, number); err != nil {
+		ciCleared, err := s.db.ClearMRCISnapshot(
+			ctx, mrID, revision, normalized.PlatformHeadSHA,
+		)
+		if err != nil {
 			return fmt.Errorf(
 				"clear stale CI for MR #%d: %w", number, err,
 			)
+		}
+		if !ciCleared {
+			return nil
 		}
 	}
 
 	if err := s.db.EnsureKanbanState(ctx, mrID); err != nil {
 		return fmt.Errorf(
 			"ensure kanban state for MR #%d: %w", number, err,
-		)
-	}
-
-	if err := s.replaceMergeRequestLabels(
-		ctx, repoID, mrID, normalized.Labels,
-	); err != nil {
-		return fmt.Errorf(
-			"persist labels for MR #%d: %w", number, err,
 		)
 	}
 
@@ -5340,31 +5935,35 @@ func (s *Syncer) syncOpenMRFromBulk(
 					"number", number, "err", mbErr,
 				)
 			} else {
-				if dbErr := s.db.UpdateDiffSHAs(
-					ctx, repoID, number,
+				diffApplied, dbErr := s.db.UpdateDiffSHAsSnapshot(
+					ctx, mrID, revision, headSHA, baseSHA,
 					headSHA, baseSHA, mb,
-				); dbErr != nil {
+				)
+				if dbErr != nil {
 					slog.Warn("update diff SHAs failed",
 						"repo", repo.Owner+"/"+repo.Name,
 						"number", number, "err", dbErr,
 					)
+				} else if !diffApplied {
+					return nil
 				}
 			}
 		}
 	}
 
-	// Timeline events — comments, reviews, commits, and system events.
-	// Events use ON CONFLICT DO NOTHING, so partial data is safe.
+	// Commit complete archival families atomically under the page's epoch.
+	comments := make([]db.MREvent, 0, len(bulk.Comments))
+	reviews := make([]db.MREvent, 0, len(bulk.Reviews))
 	var events []db.MREvent
 	commitOrderer, err := s.commitOrderAssigner(ctx, mrID)
 	if err != nil {
 		return fmt.Errorf("load commit order for MR #%d: %w", number, err)
 	}
 	for _, c := range bulk.Comments {
-		events = append(events, NormalizeCommentEvent(mrID, c))
+		comments = append(comments, NormalizeCommentEvent(mrID, c))
 	}
 	for _, r := range bulk.Reviews {
-		events = append(events, NormalizeReviewEvent(mrID, r))
+		reviews = append(reviews, NormalizeReviewEvent(mrID, r))
 	}
 	for i, c := range bulk.Commits {
 		event := NormalizeCommitEvent(mrID, c)
@@ -5380,19 +5979,49 @@ func (s *Syncer) syncOpenMRFromBulk(
 	if err != nil {
 		return fmt.Errorf("dedupe merged lifecycle events for MR #%d: %w", number, err)
 	}
+	allComplete := bulk.CommentsComplete &&
+		bulk.ReviewsComplete &&
+		bulk.CommitsComplete &&
+		bulk.TimelineComplete &&
+		bulk.CIComplete
+	var derived *db.MRDerivedFields
 	if bulk.CommentsComplete {
-		if err := s.replacePRCommentEvents(ctx, mrID, bulk.Comments); err != nil {
-			return fmt.Errorf(
-				"replace comment events for MR #%d: %w", number, err,
+		fields := db.MRDerivedFields{
+			ReviewDecision: normalized.ReviewDecision,
+			CommentCount:   len(bulk.Comments),
+			LastActivityAt: computeLastActivity(bulk.PR, bulk.Comments, nil, nil, nil),
+		}
+		// ReviewDecision is already resolved on normalized (and carried into
+		// fields above) independent of nested-connection completeness.
+		if allComplete {
+			fields.LastActivityAt = computeLastActivity(
+				bulk.PR, bulk.Comments, bulk.Reviews, bulk.Commits, bulk.TimelineEvents,
 			)
+		} else if nonCommentLatest, nErr := s.db.GetMRLatestNonCommentEventTime(ctx, mrID); nErr != nil {
+			slog.Warn("latest non-comment event lookup failed",
+				"repo", repo.Owner+"/"+repo.Name,
+				"number", number, "err", nErr,
+			)
+		} else if nonCommentLatest.After(fields.LastActivityAt) {
+			fields.LastActivityAt = nonCommentLatest
+		}
+		derived = &fields
+	}
+	if bulk.CommentsComplete || bulk.ReviewsComplete || len(events) > 0 {
+		applied, err := s.commitMergeRequestDatasets(
+			ctx, repo, number, revision,
+			comments, bulk.CommentsComplete,
+			reviews,
+			nil, nil, false, events, derived,
+		)
+		if err != nil {
+			return fmt.Errorf("commit archival events for MR #%d: %w", number, err)
+		}
+		if !applied {
+			return nil
 		}
 	}
-	if err := s.db.UpsertMREvents(ctx, events); err != nil {
-		return fmt.Errorf(
-			"upsert events for MR #%d: %w", number, err,
-		)
-	}
-	if _, err := s.persistMergedTransitionEvent(ctx, mrID, bulk.PR, normalized.MergedAt); err != nil {
+	if _, err := s.persistMergedTransitionEvent(ctx, mrID, revision, bulk.PR, normalized.MergedAt); err != nil {
 		return fmt.Errorf("persist merged lifecycle event for MR #%d: %w", number, err)
 	}
 
@@ -5407,74 +6036,36 @@ func (s *Syncer) syncOpenMRFromBulk(
 		}
 		ciJSON, _ = json.Marshal(ciChecks)
 		ciStatus := deriveCIStatusFromChecks(ciChecks)
-		if err := s.db.UpdateMRCIStatus(
-			ctx, repoID, number,
-			ciStatus, string(ciJSON),
-		); err != nil {
+		ciApplied, err := s.db.UpdateMergeRequestCISnapshot(
+			ctx, mrID, revision, ciStatus, string(ciJSON),
+		)
+		if err != nil {
 			slog.Warn("update CI status failed",
 				"repo", repo.Owner+"/"+repo.Name,
 				"number", number, "err", err,
 			)
 		}
+		if !ciApplied {
+			return nil
+		}
 	}
 
-	// Mark detail as fetched and update derived fields only when
+	// Mark detail as fetched only when
 	// ALL connections are complete. Incomplete PRs leave
-	// DetailFetchedAt stale so the detail drain picks them up for
-	// a full REST fetch. Derived fields from truncated data would
-	// overwrite correct values with partial counts.
-	if bulk.CommentsComplete {
-		lastActivity := computeLastActivity(bulk.PR, bulk.Comments, nil, nil, nil)
-		// When reviews/commits are truncated this cycle, any stored
-		// review/commit/force-push event with a newer timestamp must
-		// still win so the dashboard ordering doesn't regress.
-		nonCommentLatest, nErr := s.db.GetMRLatestNonCommentEventTime(ctx, mrID)
-		if nErr != nil {
-			slog.Warn("latest non-comment event lookup failed",
-				"repo", repo.Owner+"/"+repo.Name,
-				"number", number, "err", nErr,
-			)
-		} else if nonCommentLatest.After(lastActivity) {
-			lastActivity = nonCommentLatest
-		}
-		if err := s.db.UpdateMRReviewActivity(
-			ctx, mrID, normalized.ReviewDecision, lastActivity,
-		); err != nil {
-			slog.Warn("update comment-derived fields failed",
-				"repo", repo.Owner+"/"+repo.Name,
-				"number", number, "err", err,
-			)
-		}
-	}
-
-	allComplete := bulk.CommentsComplete &&
-		bulk.ReviewsComplete &&
-		bulk.CommitsComplete &&
-		bulk.TimelineComplete &&
-		bulk.CIComplete
-	if allComplete {
-		reviewDecision := DeriveReviewDecision(bulk.Reviews)
-		lastActivity := computeLastActivity(
-			bulk.PR, bulk.Comments, bulk.Reviews, bulk.Commits, bulk.TimelineEvents,
-		)
-		if err := s.db.UpdateMRReviewActivity(
-			ctx, mrID, reviewDecision, lastActivity,
-		); err != nil {
-			slog.Warn("update derived fields failed",
-				"repo", repo.Owner+"/"+repo.Name,
-				"number", number, "err", err,
-			)
-		}
-	}
+	// DetailFetchedAt stale so the detail drain picks it up for a
+	// full REST fetch. Derived fields are committed atomically with
+	// their complete mirrored datasets above.
 	if allComplete {
 		pending := ciHasPending(string(ciJSON))
-		if err := s.updateMRDetailFetchedByRepoID(
-			ctx, repoID, number, pending,
-		); err != nil {
+		detailApplied, err := s.db.MarkMergeRequestDetailFetchedSnapshot(ctx, mrID, revision, pending)
+		if err != nil {
 			slog.Warn("mark GraphQL detail fetched failed",
 				"repo", repo.Owner+"/"+repo.Name,
 				"number", number, "err", err,
 			)
+		}
+		if !detailApplied {
+			return nil
 		}
 		// Refresh workflow approval state so the DB-only detail GET
 		// can render the Approve workflows button without a foreground
@@ -5484,10 +6075,13 @@ func (s *Syncer) syncOpenMRFromBulk(
 		// sync-budget transport spends the actual REST call; this is
 		// only the admission check.
 		if s.canSpendWorkflowApprovalRefresh(repo) {
-			s.refreshWorkflowApproval(
+			approvalApplied, _ := s.refreshWorkflowApproval(
 				ctx, repo, repoID, number,
 				normalized.PlatformHeadSHA, bulk.PR, normalized,
 			)
+			if !approvalApplied {
+				return nil
+			}
 		}
 	}
 
@@ -5586,6 +6180,16 @@ func (s *Syncer) fetchMRDetail(
 		ctx, client, repo, number,
 	)
 	calls++
+	// Route fetch failures and detected transfers through the canonical
+	// lookup classification so removed, inaccessible, and moved items
+	// surface typed outcomes instead of generic upstream failures.
+	if provider, ok := mrReader.(*gitHubClientProvider); ok {
+		if outcomeErr := provider.mergeRequestLookupOutcomeError(
+			ctx, platformRepoRef(repo), number, fullPR, err,
+		); outcomeErr != nil {
+			return calls, fmt.Errorf("get full PR #%d: %w", number, outcomeErr)
+		}
+	}
 	if err == nil && fullPR == nil {
 		if notModified && existing != nil {
 			return s.markUnchangedMRDetailFetched(
@@ -5619,7 +6223,7 @@ func (s *Syncer) fetchMRDetail(
 		calls++ // GetUser
 	}
 
-	mrID, accepted, err := s.db.UpsertMergeRequestSnapshot(ctx, normalized)
+	mrID, revision, accepted, err := s.commitMergeRequestParentSnapshot(ctx, repo, normalized)
 	if err != nil {
 		return calls, fmt.Errorf(
 			"upsert MR #%d: %w", number, err,
@@ -5627,9 +6231,6 @@ func (s *Syncer) fetchMRDetail(
 	}
 	if !accepted {
 		return calls, nil
-	}
-	if err := s.replaceMergeRequestLabels(ctx, repoID, mrID, normalized.Labels); err != nil {
-		return calls, fmt.Errorf("persist labels for MR #%d: %w", number, err)
 	}
 
 	if err := s.db.EnsureKanbanState(ctx, mrID); err != nil {
@@ -5657,29 +6258,35 @@ func (s *Syncer) fetchMRDetail(
 					"number", number, "err", mbErr,
 				)
 			} else {
-				if dbErr := s.db.UpdateDiffSHAs(
-					ctx, repoID, number,
+				diffApplied, dbErr := s.db.UpdateDiffSHAsSnapshot(
+					ctx, mrID, revision, headSHA, baseSHA,
 					headSHA, baseSHA, mb,
-				); dbErr != nil {
+				)
+				if dbErr != nil {
 					slog.Warn("update diff SHAs failed",
 						"repo", repo.Owner+"/"+repo.Name,
 						"number", number, "err", dbErr,
 					)
+				} else if !diffApplied {
+					return calls, nil
 				}
 			}
 		}
 	}
 
 	if err := s.refreshTimeline(
-		ctx, repo, repoID, mrID, fullPR,
+		ctx, repo, repoID, mrID, revision, fullPR,
 	); err != nil {
 		// Timeline = 4 base calls (comments + reviews + commits + force-push);
 		// provider review-thread sync is handled inside refreshTimeline.
 		calls += 4
+		if errors.Is(err, errParentSnapshotAdvanced) {
+			return calls, nil
+		}
 		return calls, err
 	}
 	calls += 4
-	if _, err := s.persistMergedTransitionEvent(ctx, mrID, fullPR, normalized.MergedAt); err != nil {
+	if _, err := s.persistMergedTransitionEvent(ctx, mrID, revision, fullPR, normalized.MergedAt); err != nil {
 		return calls, fmt.Errorf("persist merged lifecycle event for MR #%d: %w", number, err)
 	}
 
@@ -5687,23 +6294,30 @@ func (s *Syncer) fetchMRDetail(
 	if fullPR.GetHead() != nil {
 		ciHeadSHA = fullPR.GetHead().GetSHA()
 	}
-	if err := s.refreshCIStatus(
-		ctx, repo, repoID, number, ciHeadSHA,
-	); err != nil {
+	ciApplied, err := s.refreshCIStatusSnapshot(
+		ctx, repo, mrID, revision, number, ciHeadSHA,
+	)
+	if err != nil {
 		// CI = 2 calls (combined status + check runs).
 		calls += 2
 		return calls, err
 	}
 	calls += 2
+	if !ciApplied {
+		return calls, nil
+	}
 
 	// Refresh workflow approval state so the DB-only detail GET
 	// can render the Approve workflows button without a foreground
 	// sync. Same path as syncMRForRepo, but the budgeted detail
 	// drain needs to count this call too.
-	s.refreshWorkflowApproval(
+	approvalApplied, approvalCalls := s.refreshWorkflowApproval(
 		ctx, repo, repoID, number, ciHeadSHA, fullPR, normalized,
 	)
-	calls++
+	calls += approvalCalls
+	if !approvalApplied {
+		return calls, nil
+	}
 
 	// Determine whether CI had pending checks for scoring by
 	// reading the DB row that refreshCIStatus just wrote. Use
@@ -5718,12 +6332,14 @@ func (s *Syncer) fetchMRDetail(
 		pending = ciHasPending(freshMR.CIChecksJSON)
 	}
 
-	if err := s.updateMRDetailFetchedByRepoID(
-		ctx, repoID, number, pending,
-	); err != nil {
+	detailApplied, err := s.db.MarkMergeRequestDetailFetchedSnapshot(ctx, mrID, revision, pending)
+	if err != nil {
 		return calls, fmt.Errorf(
 			"mark detail fetched for MR #%d: %w", number, err,
 		)
+	}
+	if !detailApplied {
+		return calls, nil
 	}
 
 	// Fire onMRSynced hook.
@@ -5797,20 +6413,31 @@ func (s *Syncer) markUnchangedMRDetailFetched(
 ) (int, error) {
 	pending := existing.CIHadPending
 	if existing.CIHadPending && existing.PlatformHeadSHA != "" {
-		if err := s.refreshCIStatus(
-			ctx, repo, repoID, number, existing.PlatformHeadSHA,
-		); err != nil {
+		ciApplied, err := s.refreshCIStatusSnapshot(
+			ctx, repo, existing.ID, existing.SnapshotRevision,
+			number, existing.PlatformHeadSHA,
+		)
+		if err != nil {
 			calls += 2
 			return calls, err
 		}
 		calls += 2
+		if !ciApplied {
+			return calls, nil
+		}
 		fresh, err := s.db.GetMergeRequestByRepoIDAndNumber(ctx, repoID, number)
 		if err == nil && fresh != nil {
 			pending = ciHasPending(fresh.CIChecksJSON)
 		}
 	}
-	if err := s.updateMRDetailFetchedByRepoID(ctx, repoID, number, pending); err != nil {
+	detailApplied, err := s.db.MarkMergeRequestDetailFetchedSnapshot(
+		ctx, existing.ID, existing.SnapshotRevision, pending,
+	)
+	if err != nil {
 		return calls, fmt.Errorf("mark unchanged detail fetched for MR #%d: %w", number, err)
+	}
+	if !detailApplied {
+		return calls, nil
 	}
 	if s.onMRSynced != nil {
 		fresh, fErr := s.db.GetMergeRequestByRepoIDAndNumber(ctx, repoID, number)
@@ -5834,10 +6461,17 @@ func (s *Syncer) fetchProviderMRDetail(
 	number int,
 ) (int, error) {
 	calls := 0
-	mr, err := reader.GetMergeRequest(ctx, platformRepoRef(repo), number)
+	mrReader, err := s.mergeRequestReaderFor(repo)
+	if err != nil {
+		return calls, fmt.Errorf("resolve merge request reader for %s/%s: %w", repo.Owner, repo.Name, err)
+	}
+	mr, err := mrReader.GetMergeRequest(ctx, platformRepoRef(repo), number)
 	calls++
 	if err != nil {
-		return calls, fmt.Errorf("get full MR #%d: %w", number, err)
+		return calls, fmt.Errorf(
+			"get full MR #%d: %w", number,
+			s.classifyProviderItemLookupError(ctx, repo, err),
+		)
 	}
 
 	normalized := platform.DBMergeRequest(repoID, mr)
@@ -5851,7 +6485,7 @@ func (s *Syncer) fetchProviderMRDetail(
 	}
 	preserveMergeableStateIfOmitted(normalized, existing)
 
-	mrID, accepted, err := s.db.UpsertMergeRequestSnapshot(ctx, normalized)
+	mrID, revision, accepted, err := s.commitMergeRequestParentSnapshot(ctx, repo, normalized)
 	if err != nil {
 		return calls, fmt.Errorf(
 			"upsert MR #%d: %w", number, err,
@@ -5860,9 +6494,6 @@ func (s *Syncer) fetchProviderMRDetail(
 	if !accepted {
 		return calls, nil
 	}
-	if err := s.replaceMergeRequestLabels(ctx, repoID, mrID, normalized.Labels); err != nil {
-		return calls, fmt.Errorf("persist labels for MR #%d: %w", number, err)
-	}
 	if err := s.db.EnsureKanbanState(ctx, mrID); err != nil {
 		return calls, fmt.Errorf(
 			"ensure kanban state for MR #%d: %w", number, err,
@@ -5870,18 +6501,25 @@ func (s *Syncer) fetchProviderMRDetail(
 	}
 
 	detailCalls, pending, err := s.syncProviderMRDetailExtras(
-		ctx, reader, repo, repoID, mrID, number, normalized.PlatformHeadSHA,
+		ctx, reader, repo, repoID, mrID, number, revision, normalized.PlatformHeadSHA,
 	)
 	calls += detailCalls
 	if err != nil {
+		if errors.Is(err, errParentSnapshotAdvanced) {
+			return calls, nil
+		}
 		return calls, err
 	}
-	if _, err := s.persistMergedActorEvent(ctx, mrID, mr.MergedBy, normalized.MergedAt); err != nil {
+	if _, err := s.persistMergedActorEvent(ctx, mrID, revision, mr.MergedBy, normalized.MergedAt); err != nil {
 		return calls, fmt.Errorf("persist merged lifecycle event for MR #%d: %w", number, err)
 	}
 
-	if err := s.updateMRDetailFetchedByRepoID(ctx, repoID, number, pending); err != nil {
+	detailApplied, err := s.db.MarkMergeRequestDetailFetchedSnapshot(ctx, mrID, revision, pending)
+	if err != nil {
 		return calls, fmt.Errorf("mark detail fetched for MR #%d: %w", number, err)
+	}
+	if !detailApplied {
+		return calls, nil
 	}
 
 	if s.onMRSynced != nil {
@@ -5906,6 +6544,7 @@ func (s *Syncer) syncProviderMRDetailExtras(
 	repoID int64,
 	mrID int64,
 	number int,
+	expectedRevision int64,
 	headSHA string,
 ) (int, bool, error) {
 	calls := 0
@@ -5916,7 +6555,8 @@ func (s *Syncer) syncProviderMRDetailExtras(
 	}
 	if err == nil {
 		dbEvents := make([]db.MREvent, 0, len(events))
-		commentDedupeKeys := make([]string, 0, len(events))
+		comments := make([]db.MREvent, 0, len(events))
+		reviews := make([]db.MREvent, 0, len(events))
 		commitOrderer, orderErr := s.commitOrderAssigner(ctx, mrID)
 		if orderErr != nil {
 			return calls, false, fmt.Errorf("load commit order for MR #%d: %w", number, orderErr)
@@ -5928,24 +6568,34 @@ func (s *Syncer) syncProviderMRDetailExtras(
 				commitListOrder++
 				commitOrderer.apply(&dbEvent, commitListOrder)
 			}
-			dbEvents = append(dbEvents, dbEvent)
-			if dbEvent.EventType == "issue_comment" {
-				commentDedupeKeys = append(commentDedupeKeys, dbEvent.DedupeKey)
+			switch dbEvent.EventType {
+			case "issue_comment":
+				comments = append(comments, dbEvent)
+			case "review":
+				reviews = append(reviews, dbEvent)
+			default:
+				dbEvents = append(dbEvents, dbEvent)
 			}
-		}
-		if err := s.db.DeleteMissingMRCommentEvents(ctx, mrID, commentDedupeKeys); err != nil {
-			return calls, false, fmt.Errorf("delete missing comment events for MR #%d: %w", number, err)
 		}
 		dbEvents, err = s.filterDuplicateMergedLifecycleEvents(ctx, mrID, dbEvents)
 		if err != nil {
 			return calls, false, fmt.Errorf("dedupe merged lifecycle events for MR #%d: %w", number, err)
 		}
-		if err := s.db.UpsertMREvents(ctx, dbEvents); err != nil {
-			return calls, false, fmt.Errorf("upsert events for MR #%d: %w", number, err)
+		applied, commitErr := s.commitMergeRequestDatasets(
+			ctx, repo, number, expectedRevision,
+			comments, true,
+			reviews,
+			nil, nil, false, dbEvents, nil,
+		)
+		if commitErr != nil {
+			return calls, false, fmt.Errorf("replace provider MR events for #%d: %w", number, commitErr)
+		}
+		if !applied {
+			return calls, false, errParentSnapshotAdvanced
 		}
 	}
 
-	reviewThreadCalls, err := s.syncProviderMRReviewThreads(ctx, repo, mrID, number)
+	reviewThreadCalls, err := s.syncProviderMRReviewThreads(ctx, repo, mrID, number, expectedRevision)
 	calls += reviewThreadCalls
 	if err != nil {
 		return calls, false, fmt.Errorf("sync review threads for MR #%d: %w", number, err)
@@ -5976,8 +6626,14 @@ func (s *Syncer) syncProviderMRDetailExtras(
 	}
 	ciJSON, _ := json.Marshal(dbChecks)
 	ciStatus := deriveCIStatusFromChecks(dbChecks)
-	if err := s.db.UpdateMRCIStatus(ctx, repoID, number, ciStatus, string(ciJSON)); err != nil {
+	ciApplied, err := s.db.UpdateMergeRequestCISnapshot(
+		ctx, mrID, expectedRevision, ciStatus, string(ciJSON),
+	)
+	if err != nil {
 		return calls, false, fmt.Errorf("update CI status for MR #%d: %w", number, err)
+	}
+	if !ciApplied {
+		return calls, false, errParentSnapshotAdvanced
 	}
 	pending = ciHasPending(string(ciJSON))
 	return calls, pending, nil
@@ -5986,8 +6642,9 @@ func (s *Syncer) syncProviderMRDetailExtras(
 func (s *Syncer) syncProviderMRReviewThreads(
 	ctx context.Context,
 	repo RepoRef,
-	mrID int64,
+	_ int64,
 	number int,
+	expectedRevision int64,
 ) (int, error) {
 	caps, err := s.clients.Capabilities(repoPlatform(repo), repoHost(repo))
 	if err != nil {
@@ -6009,87 +6666,22 @@ func (s *Syncer) syncProviderMRReviewThreads(
 		return calls, err
 	}
 
-	dbThreads := make([]db.MRReviewThread, 0, len(threads))
-	events := make([]db.MREvent, 0, len(threads))
-	providerThreadIDs := make([]string, 0, len(threads))
-	reviewCommentDedupeKeys := make([]string, 0, len(threads))
-	seenProviderThreadIDs := make(map[string]struct{}, len(threads))
-	for _, thread := range threads {
-		providerThreadID := thread.ProviderThreadID
-		if providerThreadID == "" {
-			providerThreadID = thread.ProviderCommentID
+	for i := range threads {
+		if threads[i].CreatedAt.IsZero() {
+			threads[i].CreatedAt = time.Now().UTC()
 		}
-		if providerThreadID == "" {
-			continue
-		}
-		if _, ok := seenProviderThreadIDs[providerThreadID]; !ok {
-			seenProviderThreadIDs[providerThreadID] = struct{}{}
-			providerThreadIDs = append(providerThreadIDs, providerThreadID)
-			dbThreads = append(dbThreads, db.MRReviewThread{
-				ProviderThreadID:  providerThreadID,
-				ProviderReviewID:  thread.ProviderReviewID,
-				ProviderCommentID: thread.ProviderCommentID,
-				Body:              thread.Body,
-				AuthorLogin:       thread.AuthorLogin,
-				Range:             dbReviewLineRangeFromPlatform(thread.Range),
-				Resolved:          thread.Resolved,
-				CreatedAt:         thread.CreatedAt,
-				UpdatedAt:         thread.UpdatedAt,
-				ResolvedAt:        thread.ResolvedAt,
-				MetadataJSON:      thread.MetadataJSON,
-			})
-		}
-		eventExternalID := firstNonEmpty(thread.ProviderCommentID, providerThreadID)
-		if eventExternalID == "" {
-			continue
-		}
-		createdAt := thread.CreatedAt
-		if createdAt.IsZero() {
-			createdAt = time.Now().UTC()
-		}
-		dedupeKey := "review_comment:" + eventExternalID
-		reviewCommentDedupeKeys = append(reviewCommentDedupeKeys, dedupeKey)
-		threadID := providerThreadID
-		events = append(events, db.MREvent{
-			MergeRequestID:     mrID,
-			PlatformExternalID: eventExternalID,
-			EventType:          "review_comment",
-			Author:             thread.AuthorLogin,
-			Body:               thread.Body,
-			DirectURL:          thread.DirectURL,
-			CreatedAt:          createdAt,
-			DedupeKey:          dedupeKey,
-			ThreadID:           &threadID,
-		})
 	}
-	if err := s.db.DeleteMissingMRReviewThreads(ctx, mrID, providerThreadIDs, reviewCommentDedupeKeys); err != nil {
+	events, dbThreads := platform.DBReviewThreads(threads)
+	applied, err := s.commitMergeRequestDatasets(
+		ctx, repo, number, expectedRevision, nil, false, nil, events, dbThreads, true, nil, nil,
+	)
+	if err != nil {
 		return calls, err
 	}
-	if err := s.db.UpsertMRReviewThreads(ctx, mrID, dbThreads); err != nil {
-		return calls, err
-	}
-	if len(events) > 0 {
-		if err := s.db.UpsertMREvents(ctx, events); err != nil {
-			return calls, err
-		}
+	if !applied {
+		return calls, errParentSnapshotAdvanced
 	}
 	return calls, nil
-}
-
-func dbReviewLineRangeFromPlatform(input platform.DiffReviewLineRange) db.ReviewLineRange {
-	return db.ReviewLineRange{
-		Path:        input.Path,
-		OldPath:     input.OldPath,
-		Side:        input.Side,
-		StartSide:   input.StartSide,
-		StartLine:   input.StartLine,
-		Line:        input.Line,
-		OldLine:     input.OldLine,
-		NewLine:     input.NewLine,
-		LineType:    input.LineType,
-		DiffHeadSHA: input.DiffHeadSHA,
-		CommitSHA:   input.CommitSHA,
-	}
 }
 
 // fetchIssueDetail performs a full detail fetch for a single
@@ -6116,19 +6708,40 @@ func (s *Syncer) fetchIssueDetail(
 	if err != nil {
 		return calls, fmt.Errorf("resolve client for %s/%s: %w", repo.Owner, repo.Name, err)
 	}
+	existing, err := s.db.GetIssueByRepoIDAndNumber(ctx, repoID, number)
+	if err != nil {
+		return calls, fmt.Errorf("get existing issue #%d: %w", number, err)
+	}
 
 	ghIssue, newETag, notModified, err := s.getIssueForDetail(
 		ctx, client, repo, number,
 	)
 	calls++
+	// Route fetch failures and detected transfers through the canonical
+	// lookup classification so removed, inaccessible, and moved items
+	// surface typed outcomes instead of generic upstream failures.
+	if provider, ok := issueReader.(*gitHubClientProvider); ok {
+		if outcomeErr := provider.issueLookupOutcomeError(
+			ctx, platformRepoRef(repo), number, ghIssue, err,
+		); outcomeErr != nil {
+			return calls, fmt.Errorf("get issue #%d: %w", number, outcomeErr)
+		}
+	}
 	if err == nil && ghIssue == nil {
 		if notModified {
-			if err := s.updateIssueDetailFetchedByRepoID(
-				ctx, repoID, number,
-			); err != nil {
+			if existing == nil {
+				return calls, fmt.Errorf("mark unchanged detail fetched for issue #%d: issue is missing", number)
+			}
+			detailApplied, markErr := s.db.MarkIssueDetailFetchedSnapshot(
+				ctx, existing.ID, existing.SnapshotRevision,
+			)
+			if markErr != nil {
 				return calls, fmt.Errorf(
-					"mark unchanged detail fetched for issue #%d: %w", number, err,
+					"mark unchanged detail fetched for issue #%d: %w", number, markErr,
 				)
+			}
+			if !detailApplied {
+				return calls, nil
 			}
 			return calls, nil
 		}
@@ -6143,30 +6756,35 @@ func (s *Syncer) fetchIssueDetail(
 	if err != nil {
 		return calls, fmt.Errorf("normalize issue #%d: %w", number, err)
 	}
-	issueID, err := s.db.UpsertIssue(ctx, normalized)
+	issueID, revision, accepted, err := s.commitIssueParentSnapshot(ctx, repo, normalized)
 	if err != nil {
 		return calls, fmt.Errorf(
 			"upsert issue #%d: %w", number, err,
 		)
 	}
-	if err := s.replaceIssueLabels(ctx, repoID, issueID, normalized.Labels); err != nil {
-		return calls, fmt.Errorf("persist labels for issue #%d: %w", number, err)
+	if !accepted {
+		return calls, nil
 	}
 
 	if err := s.refreshIssueTimeline(
-		ctx, repo, issueID, ghIssue,
+		ctx, repo, issueID, revision, ghIssue,
 	); err != nil {
 		calls++ // comments
+		if errors.Is(err, errParentSnapshotAdvanced) {
+			return calls, nil
+		}
 		return calls, err
 	}
 	calls++ // comments
 
-	if err := s.updateIssueDetailFetchedByRepoID(
-		ctx, repoID, number,
-	); err != nil {
+	detailApplied, err := s.db.MarkIssueDetailFetchedSnapshot(ctx, issueID, revision)
+	if err != nil {
 		return calls, fmt.Errorf(
 			"mark detail fetched for issue #%d: %w", number, err,
 		)
+	}
+	if !detailApplied {
+		return calls, nil
 	}
 
 	if newETag != "" {
@@ -6223,92 +6841,90 @@ func (s *Syncer) fetchProviderIssueDetail(
 	number int,
 ) (int, error) {
 	calls := 0
-	issue, err := reader.GetIssue(ctx, platformRepoRef(repo), number)
+	issueReader, err := s.issueReaderFor(repo)
+	if err != nil {
+		return calls, fmt.Errorf("resolve issue reader for %s/%s: %w", repo.Owner, repo.Name, err)
+	}
+	issue, err := issueReader.GetIssue(ctx, platformRepoRef(repo), number)
 	calls++
 	if err != nil {
-		return calls, fmt.Errorf("get issue #%d: %w", number, err)
+		return calls, fmt.Errorf(
+			"get issue #%d: %w", number,
+			s.classifyProviderItemLookupError(ctx, repo, err),
+		)
+	}
+
+	normalized := platform.DBIssue(repoID, issue)
+	existing, err := s.db.GetIssueByRepoIDAndNumber(ctx, repoID, number)
+	if err != nil {
+		return calls, fmt.Errorf("get existing issue #%d: %w", number, err)
+	}
+	if existing != nil {
+		normalized.CommentCount = existing.CommentCount
+	}
+	issueID, revision, accepted, err := s.commitIssueParentSnapshot(ctx, repo, normalized)
+	if err != nil {
+		return calls, fmt.Errorf(
+			"upsert issue #%d: %w", number, err,
+		)
+	}
+	if !accepted {
+		return calls, nil
 	}
 	events, eventsErr := reader.ListIssueEvents(ctx, platformRepoRef(repo), number)
 	calls++
 	if eventsErr != nil && !errors.Is(eventsErr, platform.ErrUnsupportedCapability) {
 		return calls, fmt.Errorf("list issue events for #%d: %w", number, eventsErr)
 	}
-
-	normalized := platform.DBIssue(repoID, issue)
 	if eventsErr == nil {
-		existing, err := s.db.GetIssueByRepoIDAndNumber(ctx, repoID, number)
-		if err != nil {
-			return calls, fmt.Errorf("get existing issue #%d: %w", number, err)
-		}
-		if existing != nil {
-			normalized.CommentCount = existing.CommentCount
-		}
-	}
-	issueID, err := s.db.UpsertIssue(ctx, normalized)
-	if err != nil {
-		return calls, fmt.Errorf(
-			"upsert issue #%d: %w", number, err,
-		)
-	}
-	if err := s.replaceIssueLabels(ctx, repoID, issueID, normalized.Labels); err != nil {
-		return calls, fmt.Errorf("persist labels for issue #%d: %w", number, err)
-	}
-
-	if eventsErr == nil {
-		commentEvents := make([]db.IssueEvent, 0, len(events))
-		nonCommentEvents := make([]db.IssueEvent, 0, len(events))
+		comments := make([]db.IssueEvent, 0, len(events))
+		dbEvents := make([]db.IssueEvent, 0, len(events))
 		for _, event := range events {
 			dbEvent := platform.DBIssueEvent(issueID, event)
 			if dbEvent.EventType == "issue_comment" {
-				commentEvents = append(commentEvents, dbEvent)
+				comments = append(comments, dbEvent)
 			} else {
-				nonCommentEvents = append(nonCommentEvents, dbEvent)
+				dbEvents = append(dbEvents, dbEvent)
 			}
 		}
-		if err := s.db.ReplaceIssueCommentEvents(ctx, issueID, commentEvents, nil); err != nil {
-			return calls, fmt.Errorf("replace comment events for issue #%d: %w", number, err)
+		applied, commitErr := s.commitIssueCommentsSnapshot(ctx, repo, number, revision, comments, dbEvents, nil)
+		if commitErr != nil {
+			return calls, fmt.Errorf("replace provider issue comments for #%d: %w", number, commitErr)
 		}
-		if err := s.db.UpsertIssueEvents(ctx, nonCommentEvents); err != nil {
-			return calls, fmt.Errorf("upsert non-comment issue events for #%d: %w", number, err)
+		if !applied {
+			return calls, nil
 		}
 	}
 
-	if err := s.updateIssueDetailFetchedByRepoID(
-		ctx, repoID, number,
-	); err != nil {
+	detailApplied, err := s.db.MarkIssueDetailFetchedSnapshot(ctx, issueID, revision)
+	if err != nil {
 		return calls, fmt.Errorf(
 			"mark detail fetched for issue #%d: %w", number, err,
 		)
+	}
+	if !detailApplied {
+		return calls, nil
 	}
 
 	return calls, nil
 }
 
-func (s *Syncer) updateMRDetailFetchedByRepoID(
+func (s *Syncer) classifyProviderItemLookupError(
 	ctx context.Context,
-	repoID int64,
-	number int,
-	ciHadPending bool,
+	repo RepoRef,
+	err error,
 ) error {
-	return s.db.UpdateMRDetailFetchedByRepoID(
-		ctx, repoID, number, ciHadPending,
-	)
-}
-
-func (s *Syncer) clearMRDetailFetchedByRepoID(
-	ctx context.Context,
-	repoID int64,
-	number int,
-) error {
-	return s.db.ClearMRDetailFetchedByRepoID(ctx, repoID, number)
-}
-
-func (s *Syncer) updateIssueDetailFetchedByRepoID(
-	ctx context.Context,
-	repoID int64,
-	number int,
-) error {
-	return s.db.UpdateIssueDetailFetchedByRepoID(ctx, repoID, number)
+	if !errors.Is(err, platform.ErrNotFound) {
+		return err
+	}
+	repositoryReader, readerErr := s.clients.RepositoryReader(repoPlatform(repo), repoHost(repo))
+	if readerErr != nil {
+		return err
+	}
+	if _, probeErr := repositoryReader.GetRepository(ctx, platformRepoRef(repo)); probeErr != nil {
+		return errors.Join(err, fmt.Errorf("probe repository after item not found: %w", probeErr))
+	}
+	return errors.Join(platform.ErrLookupNotPresent, err)
 }
 
 // refreshTimeline fetches comments, reviews, and commits for a PR and
@@ -6318,6 +6934,7 @@ func (s *Syncer) refreshTimeline(
 	repo RepoRef,
 	repoID int64,
 	mrID int64,
+	expectedRevision int64,
 	ghPR *gh.PullRequest,
 ) error {
 	if ghPR == nil {
@@ -6356,16 +6973,18 @@ func (s *Syncer) refreshTimeline(
 		timelineEvents = nil
 	}
 
+	commentEvents := make([]db.MREvent, 0, len(comments))
+	reviewEvents := make([]db.MREvent, 0, len(reviews))
 	var events []db.MREvent
 	commitOrderer, err := s.commitOrderAssigner(ctx, mrID)
 	if err != nil {
 		return fmt.Errorf("load commit order for MR #%d: %w", number, err)
 	}
 	for _, c := range comments {
-		events = append(events, NormalizeCommentEvent(mrID, c))
+		commentEvents = append(commentEvents, NormalizeCommentEvent(mrID, c))
 	}
 	for _, r := range reviews {
-		events = append(events, NormalizeReviewEvent(mrID, r))
+		reviewEvents = append(reviewEvents, NormalizeReviewEvent(mrID, r))
 	}
 	for i, c := range commits {
 		event := NormalizeCommitEvent(mrID, c)
@@ -6384,16 +7003,6 @@ func (s *Syncer) refreshTimeline(
 		return fmt.Errorf("dedupe merged lifecycle events for MR #%d: %w", number, err)
 	}
 
-	if err := s.replacePRCommentEvents(ctx, mrID, comments); err != nil {
-		return fmt.Errorf("replace comment events for MR #%d: %w", number, err)
-	}
-	if err := s.db.UpsertMREvents(ctx, events); err != nil {
-		return fmt.Errorf("upsert events for MR #%d: %w", number, err)
-	}
-	if _, err := s.syncProviderMRReviewThreads(ctx, repo, mrID, number); err != nil {
-		return fmt.Errorf("sync review threads for MR #%d: %w", number, err)
-	}
-
 	reviewDecision := DeriveReviewDecision(reviews)
 	lastActivityAt := computeLastActivity(ghPR, comments, reviews, commits, timelineEvents)
 	if !timelineEventsFetched {
@@ -6406,7 +7015,27 @@ func (s *Syncer) refreshTimeline(
 		}
 	}
 
-	return s.db.UpdateMRReviewActivity(ctx, mrID, reviewDecision, lastActivityAt)
+	derived := db.MRDerivedFields{
+		ReviewDecision: reviewDecision,
+		CommentCount:   len(comments),
+		LastActivityAt: lastActivityAt,
+	}
+	applied, err := s.commitMergeRequestDatasets(
+		ctx, repo, number, expectedRevision,
+		commentEvents, true,
+		reviewEvents,
+		nil, nil, false, events, &derived,
+	)
+	if err != nil {
+		return fmt.Errorf("commit comments and reviews for MR #%d: %w", number, err)
+	}
+	if !applied {
+		return errParentSnapshotAdvanced
+	}
+	if _, err := s.syncProviderMRReviewThreads(ctx, repo, mrID, number, expectedRevision); err != nil {
+		return fmt.Errorf("sync review threads for MR #%d: %w", number, err)
+	}
+	return nil
 }
 
 // RefreshMRCIStatusOnProvider fetches only CI checks for a PR's head SHA and
@@ -6498,6 +7127,28 @@ func (s *Syncer) refreshCIStatus(
 	)
 }
 
+// refreshCIStatusSnapshot is the detail-sync variant of refreshCIStatus. It
+// rejects the write when another parent snapshot won while CI was in flight.
+func (s *Syncer) refreshCIStatusSnapshot(
+	ctx context.Context,
+	repo RepoRef,
+	mrID int64,
+	expectedRevision int64,
+	number int,
+	headSHA string,
+) (bool, error) {
+	result, err := s.fetchGitHubCIStatus(ctx, repo, number, headSHA)
+	if err != nil {
+		return false, err
+	}
+	if !result.Updated {
+		return true, nil
+	}
+	return s.db.UpdateMergeRequestCISnapshot(
+		ctx, mrID, expectedRevision, result.Status, result.ChecksJSON,
+	)
+}
+
 const ciRefreshWarning = "Could not refresh CI checks; showing last known status."
 
 type ciStatusFetchResult struct {
@@ -6553,9 +7204,9 @@ func (s *Syncer) fetchGitHubCIStatus(
 // refreshWorkflowApproval fetches action_required workflow runs at the
 // given head SHA and persists the result on the merge request row.
 //
-// The persisted snapshot is keyed by head SHA so that a later DB-only
-// read can ignore the snapshot once the PR's head moves (force-push),
-// preventing a stale "Approve workflows" button on a fresh commit.
+// The persisted snapshot is keyed by head SHA for reads and guarded by the
+// local parent revision so same-head workflow changes cannot race a newer
+// equal-timestamp parent snapshot.
 //
 // Failures (no client, network errors, closed PR) are intentionally
 // silent: this is a refresh, not a precondition. The previous
@@ -6568,9 +7219,9 @@ func (s *Syncer) refreshWorkflowApproval(
 	headSHA string,
 	ghPR *gh.PullRequest,
 	normalized *db.MergeRequest,
-) {
+) (bool, int) {
 	if headSHA == "" {
-		return
+		return true, 0
 	}
 	state := ""
 	switch {
@@ -6580,23 +7231,13 @@ func (s *Syncer) refreshWorkflowApproval(
 		state = string(normalized.State)
 	}
 	if state != "open" {
-		return
+		return true, 0
 	}
 
 	client, err := s.clientFor(repo)
 	if err != nil {
-		return
+		return true, 0
 	}
-	runs, err := client.ListWorkflowRunsForHeadSHA(ctx, repo.Owner, repo.Name, headSHA)
-	if err != nil {
-		slog.Warn("list workflow runs for approval refresh failed",
-			"repo", repo.Owner+"/"+repo.Name,
-			"number", number,
-			"err", err,
-		)
-		return
-	}
-
 	headRepoFullName := ""
 	headRef := ""
 	if ghPR != nil && ghPR.GetHead() != nil {
@@ -6615,6 +7256,15 @@ func (s *Syncer) refreshWorkflowApproval(
 		headRef = normalized.HeadBranch
 	}
 
+	runs, err := client.ListWorkflowRunsForHeadSHA(ctx, repo.Owner, repo.Name, headSHA)
+	if err != nil {
+		slog.Warn("list workflow runs for approval refresh failed",
+			"repo", repo.Owner+"/"+repo.Name,
+			"number", number,
+			"err", err,
+		)
+		return true, 1
+	}
 	approval := WorkflowApprovalStateFromRuns(
 		FilterWorkflowRunsAwaitingApproval(runs, PRSource{
 			Number:           number,
@@ -6624,7 +7274,8 @@ func (s *Syncer) refreshWorkflowApproval(
 		}),
 	)
 	if err := s.db.UpdateMRWorkflowApproval(
-		ctx, repoID, number, time.Now().UTC(), headSHA, approval.Required, approval.Count,
+		ctx, repoID, number, time.Now().UTC(), headSHA,
+		approval.Required, approval.Count,
 	); err != nil {
 		slog.Warn("persist workflow approval state failed",
 			"repo", repo.Owner+"/"+repo.Name,
@@ -6632,6 +7283,7 @@ func (s *Syncer) refreshWorkflowApproval(
 			"err", err,
 		)
 	}
+	return true, 1
 }
 
 // ciHasPending parses the CI checks JSON and returns true if any
@@ -6754,34 +7406,40 @@ func computeIssueCommentRefreshLastActivity(
 
 func (s *Syncer) replacePRCommentEvents(
 	ctx context.Context,
+	repo RepoRef,
+	number int,
 	mrID int64,
+	expectedRevision int64,
 	comments []*gh.IssueComment,
-) error {
-	return s.db.ReplaceMRCommentEvents(ctx, mrID, normalizePRComments(mrID, comments), nil)
+	derived *db.MRDerivedFields,
+) (bool, error) {
+	events := make([]db.MREvent, 0, len(comments))
+	for _, c := range comments {
+		event := NormalizeCommentEvent(mrID, c)
+		events = append(events, event)
+	}
+	applied, err := s.commitMergeRequestDatasets(
+		ctx, repo, number, expectedRevision, events, true, nil, nil, nil, false, nil, derived,
+	)
+	return applied, err
 }
 
 func (s *Syncer) replaceIssueCommentEvents(
 	ctx context.Context,
+	repo RepoRef,
+	number int,
 	issueID int64,
+	expectedRevision int64,
 	comments []*gh.IssueComment,
-) error {
-	return s.db.ReplaceIssueCommentEvents(ctx, issueID, normalizeIssueComments(issueID, comments), nil)
-}
-
-func normalizePRComments(mrID int64, comments []*gh.IssueComment) []db.MREvent {
-	events := make([]db.MREvent, 0, len(comments))
-	for _, comment := range comments {
-		events = append(events, NormalizeCommentEvent(mrID, comment))
-	}
-	return events
-}
-
-func normalizeIssueComments(issueID int64, comments []*gh.IssueComment) []db.IssueEvent {
+	otherEvents []db.IssueEvent,
+	derived *db.IssueDerivedFields,
+) (bool, error) {
 	events := make([]db.IssueEvent, 0, len(comments))
-	for _, comment := range comments {
-		events = append(events, NormalizeIssueCommentEvent(issueID, comment))
+	for _, c := range comments {
+		event := NormalizeIssueCommentEvent(issueID, c)
+		events = append(events, event)
 	}
-	return events
+	return s.commitIssueCommentsSnapshot(ctx, repo, number, expectedRevision, events, otherEvents, derived)
 }
 
 // resolveDisplayName returns the GitHub display name for a
@@ -6937,7 +7595,7 @@ func (s *Syncer) syncPlatformIssuesFromList(
 	}
 	for _, number := range closedNumbers {
 		if err := s.fetchAndUpdateClosedPlatformIssue(
-			ctx, reader, repo, repoID, number,
+			ctx, repo, repoID, number,
 		); err != nil {
 			slog.Error("update closed issue failed",
 				"repo", repo.Owner+"/"+repo.Name,
@@ -6977,14 +7635,14 @@ func (s *Syncer) syncOpenPlatformIssue(
 	needsTimeline := forceRefresh || existing == nil ||
 		!existing.UpdatedAt.Equal(normalized.UpdatedAt)
 
-	issueID, err := s.db.UpsertIssue(ctx, normalized)
+	issueID, revision, accepted, err := s.commitIssueParentSnapshot(ctx, repo, normalized)
 	if err != nil {
 		return fmt.Errorf(
 			"upsert issue #%d: %w", issue.Number, err,
 		)
 	}
-	if err := s.replaceIssueLabels(ctx, repoID, issueID, normalized.Labels); err != nil {
-		return fmt.Errorf("persist labels for issue #%d: %w", issue.Number, err)
+	if !accepted {
+		return nil
 	}
 
 	if !needsTimeline {
@@ -7001,12 +7659,22 @@ func (s *Syncer) syncOpenPlatformIssue(
 		}
 		return fmt.Errorf("list issue events for #%d: %w", issue.Number, err)
 	}
+	comments := make([]db.IssueEvent, 0, len(events))
 	dbEvents := make([]db.IssueEvent, 0, len(events))
 	for _, event := range events {
-		dbEvents = append(dbEvents, platform.DBIssueEvent(issueID, event))
+		dbEvent := platform.DBIssueEvent(issueID, event)
+		if dbEvent.EventType == "issue_comment" {
+			comments = append(comments, dbEvent)
+		} else {
+			dbEvents = append(dbEvents, dbEvent)
+		}
 	}
-	if err := s.db.UpsertIssueEvents(ctx, dbEvents); err != nil {
-		return fmt.Errorf("upsert issue events for #%d: %w", issue.Number, err)
+	applied, err := s.commitIssueCommentsSnapshot(ctx, repo, issue.Number, revision, comments, dbEvents, nil)
+	if err != nil {
+		return fmt.Errorf("replace issue comments for #%d: %w", issue.Number, err)
+	}
+	if !applied {
+		return nil
 	}
 	return nil
 }
@@ -7036,14 +7704,14 @@ func (s *Syncer) syncOpenIssue(
 	needsTimeline := forceRefresh || existing == nil ||
 		!existing.UpdatedAt.Equal(normalized.UpdatedAt)
 
-	issueID, err := s.db.UpsertIssue(ctx, normalized)
+	issueID, revision, accepted, err := s.commitIssueParentSnapshot(ctx, repo, normalized)
 	if err != nil {
 		return fmt.Errorf(
 			"upsert issue #%d: %w", ghIssue.GetNumber(), err,
 		)
 	}
-	if err := s.replaceIssueLabels(ctx, repoID, issueID, normalized.Labels); err != nil {
-		return fmt.Errorf("persist labels for issue #%d: %w", ghIssue.GetNumber(), err)
+	if !accepted {
+		return nil
 	}
 
 	if !needsTimeline {
@@ -7053,13 +7721,20 @@ func (s *Syncer) syncOpenIssue(
 		return nil
 	}
 
-	return s.refreshIssueTimeline(ctx, repo, issueID, ghIssue)
+	if err := s.refreshIssueTimeline(ctx, repo, issueID, revision, ghIssue); err != nil {
+		if errors.Is(err, errParentSnapshotAdvanced) {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 func (s *Syncer) refreshIssueTimeline(
 	ctx context.Context,
 	repo RepoRef,
 	issueID int64,
+	expectedRevision int64,
 	ghIssue *gh.Issue,
 ) error {
 	if ghIssue == nil {
@@ -7080,12 +7755,11 @@ func (s *Syncer) refreshIssueTimeline(
 		)
 	}
 
-	if err := s.replaceIssueCommentEvents(ctx, issueID, comments); err != nil {
-		return fmt.Errorf(
-			"replace issue events for #%d: %w", number, err,
-		)
+	derived := db.IssueDerivedFields{
+		CommentCount:   len(comments),
+		LastActivityAt: computeIssueCommentLastActivity(ghIssue, comments),
 	}
-
+	var otherEvents []db.IssueEvent
 	if timelineClient, ok := client.(issueTimelineLister); ok {
 		timelineEvents, err := timelineClient.ListIssueTimelineEvents(
 			ctx, repo.Owner, repo.Name, number,
@@ -7096,23 +7770,29 @@ func (s *Syncer) refreshIssueTimeline(
 				"number", number,
 				"err", err,
 			)
-		} else if err := s.upsertIssueTimelineEvents(ctx, issueID, timelineEvents); err != nil {
-			return fmt.Errorf(
-				"upsert issue timeline events for #%d: %w", number, err,
-			)
+		} else {
+			otherEvents = normalizeIssueTimelineEvents(issueID, timelineEvents)
 		}
 	}
+	applied, err := s.replaceIssueCommentEvents(
+		ctx, repo, number, issueID, expectedRevision, comments, otherEvents, &derived,
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"replace issue events for #%d: %w", number, err,
+		)
+	}
+	if !applied {
+		return errParentSnapshotAdvanced
+	}
 
-	lastActivity := computeIssueCommentLastActivity(ghIssue, comments)
-
-	return s.db.UpdateIssueActivity(ctx, issueID, lastActivity)
+	return nil
 }
 
-func (s *Syncer) upsertIssueTimelineEvents(
-	ctx context.Context,
+func normalizeIssueTimelineEvents(
 	issueID int64,
 	timelineEvents []PullRequestTimelineEvent,
-) error {
+) []db.IssueEvent {
 	events := make([]db.IssueEvent, 0, len(timelineEvents))
 	for _, timelineEvent := range timelineEvents {
 		event := NormalizeIssueTimelineEvent(issueID, timelineEvent)
@@ -7121,10 +7801,7 @@ func (s *Syncer) upsertIssueTimelineEvents(
 		}
 		events = append(events, *event)
 	}
-	if err := s.db.UpsertIssueEvents(ctx, events); err != nil {
-		return fmt.Errorf("upsert issue timeline events: %w", err)
-	}
-	return nil
+	return events
 }
 
 func (s *Syncer) refreshRepoPRComments(
@@ -7209,6 +7886,7 @@ func (s *Syncer) canSpendWorkflowApprovalRefresh(repo RepoRef) bool {
 
 func (s *Syncer) persistPRComments(
 	ctx context.Context,
+	repo RepoRef,
 	pr *db.MergeRequest,
 	comments []*gh.IssueComment,
 ) error {
@@ -7216,18 +7894,44 @@ func (s *Syncer) persistPRComments(
 	if err != nil {
 		return fmt.Errorf("latest non-comment event for PR #%d: %w", pr.Number, err)
 	}
-
-	lastActivityAt := computePRCommentRefreshLastActivity(pr, comments, nonCommentLatest)
-	return s.db.ReplaceMRCommentEvents(ctx, pr.ID, normalizePRComments(pr.ID, comments), &lastActivityAt)
+	derived := db.MRDerivedFields{
+		ReviewDecision: pr.ReviewDecision,
+		CommentCount:   len(comments),
+		LastActivityAt: computePRCommentRefreshLastActivity(pr, comments, nonCommentLatest),
+	}
+	applied, err := s.replacePRCommentEvents(
+		ctx, repo, pr.Number, pr.ID, pr.SnapshotRevision, comments, &derived,
+	)
+	if err != nil {
+		return fmt.Errorf("replace PR comment events: %w", err)
+	}
+	if !applied {
+		return nil
+	}
+	return nil
 }
 
 func (s *Syncer) persistIssueComments(
 	ctx context.Context,
+	repo RepoRef,
 	issue *db.Issue,
 	comments []*gh.IssueComment,
 ) error {
-	lastActivityAt := computeIssueCommentRefreshLastActivity(issue, comments)
-	return s.db.ReplaceIssueCommentEvents(ctx, issue.ID, normalizeIssueComments(issue.ID, comments), &lastActivityAt)
+	derived := db.IssueDerivedFields{
+		CommentCount:   len(comments),
+		LastActivityAt: computeIssueCommentRefreshLastActivity(issue, comments),
+	}
+	applied, err := s.replaceIssueCommentEvents(
+		ctx, repo, issue.Number, issue.ID, issue.SnapshotRevision, comments, nil, &derived,
+	)
+	if err != nil {
+		return fmt.Errorf("replace issue comment events: %w", err)
+	}
+	if !applied {
+		return nil
+	}
+
+	return nil
 }
 
 func (s *Syncer) fetchAndUpdateClosedIssue(
@@ -7240,6 +7944,12 @@ func (s *Syncer) fetchAndUpdateClosedIssue(
 	ghIssue, err := client.GetIssue(
 		ctx, repo.Owner, repo.Name, number,
 	)
+	// Route fetch failures and detected transfers through the canonical
+	// lookup classification so removed, inaccessible, and moved items
+	// surface typed outcomes instead of generic upstream failures.
+	if outcomeErr := s.issueFetchOutcomeError(ctx, repo, number, ghIssue, err); outcomeErr != nil {
+		return fmt.Errorf("get closed issue #%d: %w", number, outcomeErr)
+	}
 	if err != nil {
 		return fmt.Errorf("get closed issue #%d: %w", number, err)
 	}
@@ -7247,33 +7957,20 @@ func (s *Syncer) fetchAndUpdateClosedIssue(
 		return fmt.Errorf("get closed issue #%d: client returned nil issue", number)
 	}
 
-	var closedAt *time.Time
-	if ghIssue.ClosedAt != nil {
-		t := ghIssue.ClosedAt.Time
-		closedAt = &t
-	}
-
-	if err := s.db.UpdateIssueState(
-		ctx, repoID, number, ghIssue.GetState(), closedAt,
-	); err != nil {
-		return err
-	}
-	if err := s.markClosedLinkedNotificationsDone(ctx); err != nil {
-		return err
-	}
-
-	issue, err := s.db.GetIssueByRepoIDAndNumber(ctx, repoID, number)
+	normalized, err := NormalizeIssue(repoID, ghIssue)
 	if err != nil {
-		return fmt.Errorf("get closed issue #%d for labels: %w", number, err)
+		return fmt.Errorf("normalize closed issue #%d: %w", number, err)
 	}
-	if issue != nil {
-		normalized, err := NormalizeIssue(repoID, ghIssue)
-		if err != nil {
-			return fmt.Errorf("normalize closed issue #%d: %w", number, err)
-		}
-		if err := s.replaceIssueLabels(ctx, repoID, issue.ID, normalized.Labels); err != nil {
-			return fmt.Errorf("persist labels for closed issue #%d: %w", number, err)
-		}
+	if existing, getErr := s.db.GetIssueByRepoIDAndNumber(ctx, repoID, number); getErr != nil {
+		return fmt.Errorf("get closed issue #%d: %w", number, getErr)
+	} else if existing != nil {
+		normalized.DetailFetchedAt = existing.DetailFetchedAt
+		normalized.Starred = existing.Starred
+	}
+	if _, _, accepted, commitErr := s.commitIssueParentSnapshot(ctx, repo, normalized); commitErr != nil {
+		return fmt.Errorf("commit closed issue #%d: %w", number, commitErr)
+	} else if !accepted {
+		return nil
 	}
 
 	return s.markClosedLinkedNotificationsDone(ctx)
@@ -7281,22 +7978,25 @@ func (s *Syncer) fetchAndUpdateClosedIssue(
 
 func (s *Syncer) fetchAndUpdateClosedPlatformIssue(
 	ctx context.Context,
-	reader platform.IssueReader,
 	repo RepoRef,
 	repoID int64,
 	number int,
 ) error {
-	issue, err := reader.GetIssue(ctx, platformRepoRef(repo), number)
+	issueReader, err := s.issueReaderFor(repo)
+	if err != nil {
+		return fmt.Errorf("resolve issue reader for %s/%s: %w", repo.Owner, repo.Name, err)
+	}
+	issue, err := issueReader.GetIssue(ctx, platformRepoRef(repo), number)
 	if err != nil {
 		return fmt.Errorf("get closed issue #%d: %w", number, err)
 	}
 	normalized := platform.DBIssue(repoID, issue)
-	issueID, err := s.db.UpsertIssue(ctx, normalized)
+	_, _, accepted, err := s.commitIssueParentSnapshot(ctx, repo, normalized)
 	if err != nil {
 		return fmt.Errorf("upsert closed issue #%d: %w", number, err)
 	}
-	if err := s.replaceIssueLabels(ctx, repoID, issueID, normalized.Labels); err != nil {
-		return fmt.Errorf("persist labels for closed issue #%d: %w", number, err)
+	if !accepted {
+		return nil
 	}
 	return nil
 }
@@ -7528,224 +8228,6 @@ func (s *Syncer) buildDetailQueueItems(
 	return items
 }
 
-// --- Backfill Discovery ---
-
-// backfillMaxPagesPerRepo limits how many closed-item pages
-// we fetch per repo per cycle to stay gentle on the API.
-const backfillMaxPagesPerRepo = 2
-
-// runBackfillDiscovery fetches closed PRs/issues for repos in
-// the given provider/host bucket, advancing backfill cursors stored in the DB.
-// Only runs when >50% of the bucket's budget remains.
-func (s *Syncer) runBackfillDiscovery(
-	ctx context.Context,
-	bucket string,
-	repos []RepoRef,
-) {
-	budget := s.budgets[bucket]
-	if budget == nil {
-		return
-	}
-	if budget.Remaining() < budget.Limit()/2 {
-		return
-	}
-
-	for _, repo := range repos {
-		if ctx.Err() != nil {
-			return
-		}
-		if repoRateBucketKey(repo) != bucket {
-			continue
-		}
-
-		repoRow, err := s.db.GetRepoByIdentity(
-			ctx, platform.DBRepoIdentity(platformRepoRef(repo)),
-		)
-		if err != nil || repoRow == nil {
-			continue
-		}
-
-		s.backfillRepo(ctx, repo, repoRow, budget)
-	}
-}
-
-func (s *Syncer) backfillRepo(
-	ctx context.Context,
-	repo RepoRef,
-	repoRow *db.Repo,
-	budget *SyncBudget,
-) {
-	client, ok := s.optionalGitHubClientFor(repo)
-	if !ok {
-		return
-	}
-	repoID := repoRow.ID
-	now := time.Now()
-
-	// PR backfill.
-	prPage := repoRow.BackfillPRPage
-	prComplete := repoRow.BackfillPRComplete
-	prCompletedAt := repoRow.BackfillPRCompletedAt
-
-	if prComplete && prCompletedAt != nil &&
-		now.Sub(*prCompletedAt) < 24*time.Hour {
-		// Skip -- completed recently.
-	} else {
-		if prComplete {
-			// Reset for re-scan.
-			prPage = 0
-			prComplete = false
-			prCompletedAt = nil
-		}
-		for range backfillMaxPagesPerRepo {
-			if ctx.Err() != nil || !budget.CanSpend(1) {
-				break
-			}
-			prPage++
-			pageFailed := false
-			prs, hasMore, err := client.ListPullRequestsPage(
-				ctx, repo.Owner, repo.Name,
-				"closed", prPage,
-			)
-			if err != nil {
-				slog.Warn("backfill PRs failed",
-					"repo", repo.Owner+"/"+repo.Name,
-					"page", prPage, "err", err,
-				)
-				break
-			}
-			for _, ghPR := range prs {
-				normalized, err := NormalizePR(repoID, ghPR)
-				if err != nil {
-					slog.Warn("backfill normalize PR failed",
-						"repo", repo.Owner+"/"+repo.Name,
-						"number", ghPR.GetNumber(),
-						"err", err,
-					)
-					pageFailed = true
-					break
-				}
-				mrID, accepted, uErr := s.db.UpsertMergeRequestSnapshot(ctx, normalized)
-				if uErr != nil {
-					slog.Warn("backfill upsert PR failed",
-						"repo", repo.Owner+"/"+repo.Name,
-						"number", ghPR.GetNumber(),
-						"err", uErr,
-					)
-					pageFailed = true
-					break
-				} else if !accepted {
-					continue
-				} else if err := s.replaceMergeRequestLabels(ctx, repoID, mrID, normalized.Labels); err != nil {
-					slog.Warn("backfill replace PR labels failed",
-						"repo", repo.Owner+"/"+repo.Name,
-						"number", ghPR.GetNumber(),
-						"err", err,
-					)
-					pageFailed = true
-					break
-				}
-			}
-			if pageFailed {
-				prPage--
-				break
-			}
-			if !hasMore {
-				prComplete = true
-				t := now
-				prCompletedAt = &t
-				break
-			}
-		}
-	}
-
-	// Issue backfill.
-	issuePage := repoRow.BackfillIssuePage
-	issueComplete := repoRow.BackfillIssueComplete
-	issueCompletedAt := repoRow.BackfillIssueCompletedAt
-
-	if issueComplete && issueCompletedAt != nil &&
-		now.Sub(*issueCompletedAt) < 24*time.Hour {
-		// Skip.
-	} else {
-		if issueComplete {
-			issuePage = 0
-			issueComplete = false
-			issueCompletedAt = nil
-		}
-		for range backfillMaxPagesPerRepo {
-			if ctx.Err() != nil || !budget.CanSpend(1) {
-				break
-			}
-			issuePage++
-			pageFailed := false
-			issues, hasMore, err := client.ListIssuesPage(
-				ctx, repo.Owner, repo.Name,
-				"closed", issuePage,
-			)
-			if err != nil {
-				slog.Warn("backfill issues failed",
-					"repo", repo.Owner+"/"+repo.Name,
-					"page", issuePage, "err", err,
-				)
-				break
-			}
-			for _, ghIssue := range issues {
-				normalized, err := NormalizeIssue(repoID, ghIssue)
-				if err != nil {
-					slog.Warn("backfill normalize issue failed",
-						"repo", repo.Owner+"/"+repo.Name,
-						"number", ghIssue.GetNumber(),
-						"err", err,
-					)
-					pageFailed = true
-					break
-				}
-				if issueID, uErr := s.db.UpsertIssue(
-					ctx, normalized,
-				); uErr != nil {
-					slog.Warn("backfill upsert issue failed",
-						"repo", repo.Owner+"/"+repo.Name,
-						"number", ghIssue.GetNumber(),
-						"err", uErr,
-					)
-					pageFailed = true
-					break
-				} else if err := s.replaceIssueLabels(ctx, repoID, issueID, normalized.Labels); err != nil {
-					slog.Warn("backfill replace issue labels failed",
-						"repo", repo.Owner+"/"+repo.Name,
-						"number", ghIssue.GetNumber(),
-						"err", err,
-					)
-					pageFailed = true
-					break
-				}
-			}
-			if pageFailed {
-				issuePage--
-				break
-			}
-			if !hasMore {
-				issueComplete = true
-				t := now
-				issueCompletedAt = &t
-				break
-			}
-		}
-	}
-
-	// Persist cursor state.
-	if err := s.db.UpdateBackfillCursor(
-		ctx, repoID,
-		prPage, prComplete, prCompletedAt,
-		issuePage, issueComplete, issueCompletedAt,
-	); err != nil {
-		slog.Warn("update backfill cursor failed",
-			"repo", repo.Owner+"/"+repo.Name, "err", err,
-		)
-	}
-}
-
 // IsTrackedRepo checks whether the given repo is in the configured list.
 func (s *Syncer) IsTrackedRepo(owner, name string) bool {
 	s.reposMu.Lock()
@@ -7895,6 +8377,13 @@ func (s *Syncer) syncMRForRepo(
 	number int,
 	useConditionalPRDetail bool,
 ) error {
+	if !IsArchiveSyncBudgetContext(ctx) {
+		releaseProviderWork := s.beginProviderWork(
+			repoRateBucketKey(repo), archive.PriorityActiveDetail,
+		)
+		defer releaseProviderWork()
+	}
+
 	owner := repo.Owner
 	name := repo.Name
 	mrReader, err := s.mergeRequestReaderFor(repo)
@@ -7929,6 +8418,15 @@ func (s *Syncer) syncMRForRepo(
 			ghPR, newETag, notModified, err = s.getPullRequestForDetail(
 				ctx, client, repo, number,
 			)
+			// Same canonical lookup classification as the raw
+			// GetGitHubPullRequest branch below.
+			if provider, ok := mrReader.(*gitHubClientProvider); ok {
+				if outcomeErr := provider.mergeRequestLookupOutcomeError(
+					ctx, platformRepoRef(repo), number, ghPR, err,
+				); outcomeErr != nil {
+					err = outcomeErr
+				}
+			}
 			if err == nil && ghPR == nil {
 				if notModified && existing != nil {
 					_, err := s.markUnchangedMRDetailFetched(
@@ -7998,7 +8496,7 @@ func (s *Syncer) syncMRForRepo(
 		}
 	}
 
-	mrID, accepted, err := s.db.UpsertMergeRequestSnapshot(ctx, normalized)
+	mrID, revision, accepted, err := s.commitMergeRequestParentSnapshot(ctx, repo, normalized)
 	if err != nil {
 		return fmt.Errorf("upsert MR #%d: %w", number, err)
 	}
@@ -8012,14 +8510,16 @@ func (s *Syncer) syncMRForRepo(
 	// it here when the head SHA changed so a stale pending flag from
 	// the previous head doesn't survive across the refresh.
 	if headChanged {
-		if err := s.db.ClearMRCI(ctx, repoID, number); err != nil {
+		ciCleared, err := s.db.ClearMRCISnapshot(
+			ctx, mrID, revision, normalized.PlatformHeadSHA,
+		)
+		if err != nil {
 			return fmt.Errorf("clear stale CI for MR #%d: %w", number, err)
 		}
+		if !ciCleared {
+			return nil
+		}
 	}
-	if err := s.replaceMergeRequestLabels(ctx, repoID, mrID, normalized.Labels); err != nil {
-		return fmt.Errorf("persist labels for MR #%d: %w", number, err)
-	}
-
 	if err := s.db.EnsureKanbanState(ctx, mrID); err != nil {
 		return fmt.Errorf("ensure kanban state for MR #%d: %w", number, err)
 	}
@@ -8029,12 +8529,18 @@ func (s *Syncer) syncMRForRepo(
 		// Run the diff sync, but don't let its failure abort the rest of SyncMR:
 		// timeline and CI status are independent and the user still wants them
 		// fresh. Capture the error and surface it via DiffSyncError at the end.
-		diffErr = s.syncMRDiff(ctx, repo, repoID, number, ghPR, normalized)
+		diffErr = s.syncMRDiff(ctx, repo, repoID, mrID, revision, number, ghPR, normalized)
+		if errors.Is(diffErr, errParentSnapshotAdvanced) {
+			return nil
+		}
 
-		if err := s.refreshTimeline(ctx, repo, repoID, mrID, ghPR); err != nil {
+		if err := s.refreshTimeline(ctx, repo, repoID, mrID, revision, ghPR); err != nil {
+			if errors.Is(err, errParentSnapshotAdvanced) {
+				return nil
+			}
 			return fmt.Errorf("refresh timeline for MR #%d: %w", number, err)
 		}
-		if _, err := s.persistMergedTransitionEvent(ctx, mrID, ghPR, normalized.MergedAt); err != nil {
+		if _, err := s.persistMergedTransitionEvent(ctx, mrID, revision, ghPR, normalized.MergedAt); err != nil {
 			return fmt.Errorf("persist merged lifecycle event for MR #%d: %w", number, err)
 		}
 
@@ -8042,8 +8548,14 @@ func (s *Syncer) syncMRForRepo(
 		if ghPR.GetHead() != nil {
 			syncMRHeadSHA = ghPR.GetHead().GetSHA()
 		}
-		if err := s.refreshCIStatus(ctx, repo, repoID, number, syncMRHeadSHA); err != nil {
+		ciApplied, err := s.refreshCIStatusSnapshot(
+			ctx, repo, mrID, revision, number, syncMRHeadSHA,
+		)
+		if err != nil {
 			return err
+		}
+		if !ciApplied {
+			return nil
 		}
 
 		// Refresh workflow approval state for the current head SHA.
@@ -8052,15 +8564,26 @@ func (s *Syncer) syncMRForRepo(
 		// can show the Approve Workflows button without a foreground
 		// sync round-trip. The result is tied to syncMRHeadSHA so a
 		// later read can detect a stale snapshot after force-push.
-		s.refreshWorkflowApproval(
+		approvalApplied, _ := s.refreshWorkflowApproval(
 			ctx, repo, repoID, number, syncMRHeadSHA, ghPR, normalized,
 		)
+		if !approvalApplied {
+			return nil
+		}
 
 		// Update ci_had_pending after refreshing CI status.
 		fresh, freshErr := s.db.GetMergeRequestByRepoIDAndNumber(ctx, repoID, number)
 		if freshErr == nil && fresh != nil {
 			pending := ciHasPending(fresh.CIChecksJSON)
-			_ = s.updateMRDetailFetchedByRepoID(ctx, repoID, number, pending)
+			detailApplied, detailErr := s.db.MarkMergeRequestDetailFetchedSnapshot(
+				ctx, mrID, revision, pending,
+			)
+			if detailErr != nil {
+				return fmt.Errorf("mark detail fetched for MR #%d: %w", number, detailErr)
+			}
+			if !detailApplied {
+				return nil
+			}
 		}
 	} else {
 		// Record the reviewed diff snapshot for non-GitHub providers
@@ -8068,20 +8591,32 @@ func (s *Syncer) syncMRForRepo(
 		// DiffHeadSHA matches the platform head, so a sync that never
 		// writes it would leave head-bound actions permanently
 		// disabled with 409 head_unknown.
-		diffErr = s.syncProviderMRDiff(ctx, repo, repoID, number, normalized, true)
+		diffErr = s.syncProviderMRDiff(ctx, repo, mrID, revision, number, normalized, true)
+		if errors.Is(diffErr, errParentSnapshotAdvanced) {
+			return nil
+		}
 
 		pending := false
 		_, pending, err = s.syncProviderMRDetailExtras(
-			ctx, mrReader, repo, repoID, mrID, number, normalized.PlatformHeadSHA,
+			ctx, mrReader, repo, repoID, mrID, number, revision, normalized.PlatformHeadSHA,
 		)
 		if err != nil {
+			if errors.Is(err, errParentSnapshotAdvanced) {
+				return nil
+			}
 			return err
 		}
-		if _, err := s.persistMergedActorEvent(ctx, mrID, platformMR.MergedBy, normalized.MergedAt); err != nil {
+		if _, err := s.persistMergedActorEvent(ctx, mrID, revision, platformMR.MergedBy, normalized.MergedAt); err != nil {
 			return fmt.Errorf("persist merged lifecycle event for MR #%d: %w", number, err)
 		}
-		if err := s.updateMRDetailFetchedByRepoID(ctx, repoID, number, pending); err != nil {
+		detailApplied, err := s.db.MarkMergeRequestDetailFetchedSnapshot(
+			ctx, mrID, revision, pending,
+		)
+		if err != nil {
 			return fmt.Errorf("mark detail fetched for MR #%d: %w", number, err)
+		}
+		if !detailApplied {
+			return nil
 		}
 	}
 
@@ -8218,7 +8753,7 @@ func preserveCIStateIfOmitted(
 // clone or diff path. Callers can recover the structured categorization via
 // errors.As.
 func (s *Syncer) syncMRDiff(
-	ctx context.Context, repo RepoRef, repoID int64, number int,
+	ctx context.Context, repo RepoRef, repoID, mrID, expectedRevision int64, number int,
 	ghPR *gh.PullRequest, normalized *db.MergeRequest,
 ) error {
 	if s.clones == nil {
@@ -8235,7 +8770,11 @@ func (s *Syncer) syncMRDiff(
 	if ghPR.GetMerged() {
 		// Merged MRs need special merge-base logic via the pull ref.
 		// Force recomputation to repair any previously incorrect SHAs.
-		return s.computeMergedMRDiffSHAs(ctx, repo, repoID, number, ghPR.GetMergeCommitSHA(), true)
+		return s.computeMergedMRDiffSHAs(
+			ctx, repo, repoID, mrID, expectedRevision, number,
+			normalized.PlatformHeadSHA, normalized.PlatformBaseSHA,
+			ghPR.GetMergeCommitSHA(), true,
+		)
 	}
 
 	if normalized.PlatformHeadSHA == "" || normalized.PlatformBaseSHA == "" {
@@ -8248,11 +8787,19 @@ func (s *Syncer) syncMRDiff(
 			Err:  fmt.Errorf("merge-base for #%d: %w", number, err),
 		}
 	}
-	if err := s.db.UpdateDiffSHAs(ctx, repoID, number, normalized.PlatformHeadSHA, normalized.PlatformBaseSHA, mb); err != nil {
+	applied, err := s.db.UpdateDiffSHAsSnapshot(
+		ctx, mrID, expectedRevision,
+		normalized.PlatformHeadSHA, normalized.PlatformBaseSHA,
+		normalized.PlatformHeadSHA, normalized.PlatformBaseSHA, mb,
+	)
+	if err != nil {
 		return &DiffSyncError{
 			Code: DiffSyncCodeInternal,
 			Err:  fmt.Errorf("update diff SHAs for #%d: %w", number, err),
 		}
+	}
+	if !applied {
+		return errParentSnapshotAdvanced
 	}
 	return nil
 }
@@ -8265,7 +8812,7 @@ func (s *Syncer) syncMRDiff(
 // meaningless once merged/closed, and the merged-MR merge-base repair
 // logic is GitHub-specific.
 func (s *Syncer) syncProviderMRDiff(
-	ctx context.Context, repo RepoRef, repoID int64, number int,
+	ctx context.Context, repo RepoRef, mrID, expectedRevision int64, number int,
 	normalized *db.MergeRequest, ensureClone bool,
 ) error {
 	if s.clones == nil {
@@ -8297,11 +8844,19 @@ func (s *Syncer) syncProviderMRDiff(
 			Err:  fmt.Errorf("merge-base for #%d: %w", number, err),
 		}
 	}
-	if err := s.db.UpdateDiffSHAs(ctx, repoID, number, normalized.PlatformHeadSHA, normalized.PlatformBaseSHA, mb); err != nil {
+	applied, err := s.db.UpdateDiffSHAsSnapshot(
+		ctx, mrID, expectedRevision,
+		normalized.PlatformHeadSHA, normalized.PlatformBaseSHA,
+		normalized.PlatformHeadSHA, normalized.PlatformBaseSHA, mb,
+	)
+	if err != nil {
 		return &DiffSyncError{
 			Code: DiffSyncCodeInternal,
 			Err:  fmt.Errorf("update diff SHAs for #%d: %w", number, err),
 		}
+	}
+	if !applied {
+		return errParentSnapshotAdvanced
 	}
 	return nil
 }
@@ -8340,16 +8895,7 @@ func (s *Syncer) SyncIssueOnProvider(
 	repo.Owner = owner
 	repo.Name = name
 	repo.PlatformHost = repoHost(repo)
-
-	repoID, err := s.db.UpsertRepo(ctx, platform.DBRepoIdentity(platformRepoRef(repo)))
-	if err != nil {
-		return fmt.Errorf("upsert repo %s/%s: %w", owner, name, err)
-	}
-
-	if _, err := s.fetchIssueDetail(ctx, repo, repoID, number); err != nil {
-		return err
-	}
-	return s.markClosedLinkedNotificationsDone(ctx)
+	return s.syncIssueForRepo(ctx, repo, number)
 }
 
 func (s *Syncer) syncIssueWithHost(
@@ -8383,16 +8929,74 @@ func (s *Syncer) syncIssueWithHost(
 	repo.Owner = owner
 	repo.Name = name
 	repo.PlatformHost = repoHost(repo)
+	return s.syncIssueForRepo(ctx, repo, number)
+}
+
+func (s *Syncer) syncIssueForRepo(
+	ctx context.Context,
+	repo RepoRef,
+	number int,
+) error {
+	if !IsArchiveSyncBudgetContext(ctx) {
+		releaseProviderWork := s.beginProviderWork(
+			repoRateBucketKey(repo), archive.PriorityActiveDetail,
+		)
+		defer releaseProviderWork()
+	}
 
 	repoID, err := s.db.UpsertRepo(ctx, platform.DBRepoIdentity(platformRepoRef(repo)))
 	if err != nil {
-		return fmt.Errorf("upsert repo %s/%s: %w", owner, name, err)
+		return fmt.Errorf("upsert repo %s/%s: %w", repo.Owner, repo.Name, err)
 	}
 
 	if _, err := s.fetchIssueDetail(ctx, repo, repoID, number); err != nil {
 		return err
 	}
 	return s.markClosedLinkedNotificationsDone(ctx)
+}
+
+// ArchiveItemSyncCost returns the worst-case wire-attempt allowance for the
+// existing full item sync. One logical request may spend a second attempt
+// after authentication refresh.
+func (s *Syncer) ArchiveItemSyncCost(_ platform.Kind, itemType db.ArchiveItemType) int {
+	if itemType == db.ArchiveItemTypeMergeRequest {
+		return 2 * PRDetailWorstCase
+	}
+	return 2 * IssueDetailWorstCase
+}
+
+// SyncArchiveItem runs archive hydration through the canonical live item
+// sync. The caller has already acquired archive admission, so the archive
+// budget context also prevents the live entry point from taking a nested
+// provider-work lease.
+func (s *Syncer) SyncArchiveItem(
+	ctx context.Context,
+	ref platform.RepoRef,
+	itemType db.ArchiveItemType,
+	number int,
+) error {
+	repo, ok := s.trackedRepoByIdentity(ref.Platform, ref.Owner, ref.Name, ref.Host)
+	if !ok {
+		return fmt.Errorf(
+			"repo %s/%s on %s/%s is not tracked",
+			ref.Owner, ref.Name, ref.Platform, ref.Host,
+		)
+	}
+	repo.Owner = ref.Owner
+	repo.Name = ref.Name
+	repo.PlatformHost = repoHost(repo)
+	switch itemType {
+	case db.ArchiveItemTypeIssue:
+		return s.syncIssueForRepo(ctx, repo, number)
+	case db.ArchiveItemTypeMergeRequest:
+		err := s.syncMRForRepo(ctx, repo, number, false)
+		if _, onlyDiffFailed := err.(*DiffSyncError); onlyDiffFailed { //nolint:errorlint // joined hard failures must propagate
+			return nil
+		}
+		return err
+	default:
+		return fmt.Errorf("sync archive item: invalid item type %q", itemType)
+	}
 }
 
 // SyncItemByNumber fetches an item by number from GitHub, determines
@@ -8412,6 +9016,10 @@ func (s *Syncer) SyncItemByNumber(
 	repo.Owner = owner
 	repo.Name = name
 	repo.PlatformHost = repoHost(repo)
+	releaseProviderWork := s.beginProviderWork(
+		repoRateBucketKey(repo), archive.PriorityActiveDetail,
+	)
+	defer releaseProviderWork()
 
 	if repoPlatform(repo) != platform.KindGitHub {
 		return "", fmt.Errorf(
@@ -8427,6 +9035,14 @@ func (s *Syncer) SyncItemByNumber(
 		return "", fmt.Errorf("resolve client for %s/%s: %w", owner, name, err)
 	}
 	ghIssue, err := client.GetIssue(ctx, owner, name, number)
+	// Route fetch failures and detected transfers through the canonical
+	// lookup classification so removed, inaccessible, and moved items
+	// surface typed outcomes instead of generic upstream failures.
+	if outcomeErr := s.issueFetchOutcomeError(ctx, repo, number, ghIssue, err); outcomeErr != nil {
+		return "", fmt.Errorf(
+			"get item %s/%s#%d: %w", owner, name, number, outcomeErr,
+		)
+	}
 	if err != nil {
 		return "", fmt.Errorf(
 			"get item %s/%s#%d: %w", owner, name, number, err,
@@ -8473,6 +9089,12 @@ func (s *Syncer) fetchAndUpdateClosed(ctx context.Context, repo RepoRef, repoID 
 		return fmt.Errorf("resolve client for %s/%s: %w", repo.Owner, repo.Name, err)
 	}
 	ghPR, err := client.GetPullRequest(ctx, repo.Owner, repo.Name, number)
+	// Route fetch failures and detected transfers through the canonical
+	// lookup classification so removed, inaccessible, and moved items
+	// surface typed outcomes instead of generic upstream failures.
+	if outcomeErr := s.mergeRequestFetchOutcomeError(ctx, repo, number, ghPR, err); outcomeErr != nil {
+		return fmt.Errorf("get closed PR #%d: %w", number, outcomeErr)
+	}
 	if err != nil {
 		return fmt.Errorf("get closed PR #%d: %w", number, err)
 	}
@@ -8483,48 +9105,32 @@ func (s *Syncer) fetchAndUpdateClosed(ctx context.Context, repo RepoRef, repoID 
 		)
 	}
 
-	state := ghPR.GetState()
-	if pullRequestWasMerged(ghPR) {
-		state = "merged"
+	normalized, err := NormalizePR(repoID, ghPR)
+	if err != nil {
+		return fmt.Errorf("normalize closed PR #%d: %w", number, err)
 	}
-
-	var mergedAt, closedAt *time.Time
-	if ghPR.MergedAt != nil {
-		t := ghPR.MergedAt.Time
-		mergedAt = &t
+	if existing, getErr := s.db.GetMergeRequestByRepoIDAndNumber(ctx, repoID, number); getErr != nil {
+		return fmt.Errorf("get closed MR #%d: %w", number, getErr)
+	} else if existing != nil {
+		normalized.CommentCount = existing.CommentCount
+		normalized.ReviewDecision = existing.ReviewDecision
+		normalized.CIStatus = existing.CIStatus
+		normalized.CIChecksJSON = existing.CIChecksJSON
+		normalized.CIHadPending = existing.CIHadPending
+		normalized.DetailFetchedAt = existing.DetailFetchedAt
 	}
-	if ghPR.ClosedAt != nil {
-		t := ghPR.ClosedAt.Time
-		closedAt = &t
+	mrID, revision, accepted, err := s.commitMergeRequestParentSnapshot(ctx, repo, normalized)
+	if err != nil {
+		return fmt.Errorf("commit closed MR #%d: %w", number, err)
 	}
-
-	if err := s.db.UpdateClosedMRState(
-		ctx, repoID, number, state,
-		ghPR.GetUpdatedAt().Time,
-		mergedAt, closedAt,
-		ghPR.GetHead().GetSHA(), ghPR.GetBase().GetSHA(),
-	); err != nil {
-		return fmt.Errorf("update closed MR #%d: %w", number, err)
+	if !accepted {
+		return nil
+	}
+	if _, err := s.persistMergedTransitionEvent(ctx, mrID, revision, ghPR, normalized.MergedAt); err != nil {
+		return fmt.Errorf("persist merged lifecycle event for MR #%d: %w", number, err)
 	}
 	if err := s.markClosedLinkedNotificationsDone(ctx); err != nil {
 		return err
-	}
-
-	mr, err := s.db.GetMergeRequestByRepoIDAndNumber(ctx, repoID, number)
-	if err != nil {
-		return fmt.Errorf("get closed MR #%d for labels: %w", number, err)
-	}
-	if mr != nil {
-		if _, err := s.persistMergedTransitionEvent(ctx, mr.ID, ghPR, mergedAt); err != nil {
-			return fmt.Errorf("persist merged lifecycle event for MR #%d: %w", number, err)
-		}
-		normalized, err := NormalizePR(repoID, ghPR)
-		if err != nil {
-			return fmt.Errorf("normalize closed PR #%d: %w", number, err)
-		}
-		if err := s.replaceMergeRequestLabels(ctx, repoID, mr.ID, normalized.Labels); err != nil {
-			return fmt.Errorf("persist labels for closed MR #%d: %w", number, err)
-		}
 	}
 
 	// Compute diff SHAs so the diff endpoint works.
@@ -8543,7 +9149,14 @@ func (s *Syncer) fetchAndUpdateClosed(ctx context.Context, repo RepoRef, repoID 
 		baseSHA := ghPR.GetBase().GetSHA()
 
 		if pullRequestWasMerged(ghPR) {
-			if err := s.computeMergedMRDiffSHAs(ctx, repo, repoID, number, ghPR.GetMergeCommitSHA(), false); err != nil {
+			if err := s.computeMergedMRDiffSHAs(
+				ctx, repo, repoID, mrID, revision, number,
+				normalized.PlatformHeadSHA, normalized.PlatformBaseSHA,
+				ghPR.GetMergeCommitSHA(), false,
+			); err != nil {
+				if errors.Is(err, errParentSnapshotAdvanced) {
+					return nil
+				}
 				slog.Warn("compute merged PR diff SHAs failed",
 					"repo", repo.Owner+"/"+repo.Name,
 					"number", number, "err", err,
@@ -8557,11 +9170,17 @@ func (s *Syncer) fetchAndUpdateClosed(ctx context.Context, repo RepoRef, repoID 
 					"number", number, "err", err,
 				)
 			} else {
-				if err := s.db.UpdateDiffSHAs(ctx, repoID, number, headSHA, baseSHA, mb); err != nil {
+				diffApplied, err := s.db.UpdateDiffSHAsSnapshot(
+					ctx, mrID, revision, headSHA, baseSHA,
+					headSHA, baseSHA, mb,
+				)
+				if err != nil {
 					slog.Warn("update diff SHAs for closed PR failed",
 						"repo", repo.Owner+"/"+repo.Name,
 						"number", number, "err", err,
 					)
+				} else if !diffApplied {
+					return nil
 				}
 			}
 		}
@@ -8615,6 +9234,7 @@ func isAuthoredMergedLifecycleEvent(event db.MREvent) bool {
 func (s *Syncer) persistMergedTransitionEvent(
 	ctx context.Context,
 	mrID int64,
+	expectedRevision int64,
 	ghPR *gh.PullRequest,
 	mergedAt *time.Time,
 ) (bool, error) {
@@ -8625,12 +9245,13 @@ func (s *Syncer) persistMergedTransitionEvent(
 	if mergedBy == nil {
 		return false, nil
 	}
-	return s.persistMergedActorEvent(ctx, mrID, mergedBy.GetLogin(), mergedAt)
+	return s.persistMergedActorEvent(ctx, mrID, expectedRevision, mergedBy.GetLogin(), mergedAt)
 }
 
 func (s *Syncer) persistMergedActorEvent(
 	ctx context.Context,
 	mrID int64,
+	_ int64,
 	actor string,
 	mergedAt *time.Time,
 ) (bool, error) {
@@ -8676,22 +9297,23 @@ func (s *Syncer) fetchAndUpdateClosedMergeRequest(
 		return s.fetchAndUpdateClosed(ctx, repo, repoID, number, cloneFetchOK)
 	}
 
-	mr, err := reader.GetMergeRequest(ctx, platformRepoRef(repo), number)
+	mrReader, err := s.mergeRequestReaderFor(repo)
+	if err != nil {
+		return fmt.Errorf("resolve merge request reader for %s/%s: %w", repo.Owner, repo.Name, err)
+	}
+	mr, err := mrReader.GetMergeRequest(ctx, platformRepoRef(repo), number)
 	if err != nil {
 		return fmt.Errorf("get closed MR #%d: %w", number, err)
 	}
 	normalized := platform.DBMergeRequest(repoID, mr)
-	mrID, accepted, err := s.db.UpsertMergeRequestSnapshot(ctx, normalized)
+	mrID, revision, accepted, err := s.commitMergeRequestParentSnapshot(ctx, repo, normalized)
 	if err != nil {
 		return fmt.Errorf("upsert closed MR #%d: %w", number, err)
 	}
 	if !accepted {
 		return nil
 	}
-	if err := s.replaceMergeRequestLabels(ctx, repoID, mrID, normalized.Labels); err != nil {
-		return fmt.Errorf("persist labels for closed MR #%d: %w", number, err)
-	}
-	if _, err := s.persistMergedActorEvent(ctx, mrID, mr.MergedBy, normalized.MergedAt); err != nil {
+	if _, err := s.persistMergedActorEvent(ctx, mrID, revision, mr.MergedBy, normalized.MergedAt); err != nil {
 		return fmt.Errorf("persist merged lifecycle event for closed MR #%d: %w", number, err)
 	}
 	return nil
@@ -8714,8 +9336,8 @@ func (s *Syncer) fetchAndUpdateClosedMergeRequest(
 // any git or DB operation fails. A nil return covers both success and the
 // no-op skip cases (empty merge SHA, existing valid diff SHAs without force).
 func (s *Syncer) computeMergedMRDiffSHAs(
-	ctx context.Context, repo RepoRef, repoID int64, number int, mergeCommitSHA string,
-	force bool,
+	ctx context.Context, repo RepoRef, repoID, mrID, expectedRevision int64,
+	number int, expectedHeadSHA, expectedBaseSHA, mergeCommitSHA string, force bool,
 ) error {
 	if mergeCommitSHA == "" {
 		return nil
@@ -8773,11 +9395,18 @@ func (s *Syncer) computeMergedMRDiffSHAs(
 		return nil
 	}
 
-	if err := s.db.UpdateDiffSHAs(ctx, repoID, number, prHead, mb, mb); err != nil {
+	applied, err := s.db.UpdateDiffSHAsSnapshot(
+		ctx, mrID, expectedRevision, expectedHeadSHA, expectedBaseSHA,
+		prHead, mb, mb,
+	)
+	if err != nil {
 		return &DiffSyncError{
 			Code: DiffSyncCodeInternal,
 			Err:  fmt.Errorf("update diff SHAs for merged PR #%d: %w", number, err),
 		}
+	}
+	if !applied {
+		return errParentSnapshotAdvanced
 	}
 	return nil
 }

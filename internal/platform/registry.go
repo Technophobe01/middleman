@@ -121,6 +121,51 @@ func (r *Registry) IssueReader(kind Kind, host string) (IssueReader, error) {
 	return reader, nil
 }
 
+// IssuePageReader returns the provider's canonical issue read surface wrapped
+// in the provider-neutral contract validation, so every caller consumes
+// validated canonical pages and lookups.
+func (r *Registry) IssuePageReader(kind Kind, host string) (IssuePageReader, error) {
+	provider, err := r.Provider(kind, host)
+	if err != nil {
+		return nil, err
+	}
+
+	reader, ok := provider.(IssuePageReader)
+	caps := provider.Capabilities()
+	if !ok {
+		return nil, UnsupportedCapability(kind, host, "read_issues")
+	}
+	return &validatingIssuePageReader{
+		reader: reader,
+		pageReaderValidation: pageReaderValidation{
+			contract: readerContract{kind: kind, host: host}, caps: caps,
+		},
+	}, nil
+}
+
+// MergeRequestPageReader is the merge-request counterpart to IssuePageReader.
+func (r *Registry) MergeRequestPageReader(
+	kind Kind,
+	host string,
+) (MergeRequestPageReader, error) {
+	provider, err := r.Provider(kind, host)
+	if err != nil {
+		return nil, err
+	}
+
+	reader, ok := provider.(MergeRequestPageReader)
+	caps := provider.Capabilities()
+	if !ok {
+		return nil, UnsupportedCapability(kind, host, "read_merge_requests")
+	}
+	return &validatingMergeRequestPageReader{
+		reader: reader,
+		pageReaderValidation: pageReaderValidation{
+			contract: readerContract{kind: kind, host: host}, caps: caps,
+		},
+	}, nil
+}
+
 func (r *Registry) LabelReader(kind Kind, host string) (LabelReader, error) {
 	provider, err := r.Provider(kind, host)
 	if err != nil {

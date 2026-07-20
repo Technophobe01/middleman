@@ -2,6 +2,7 @@ package platform
 
 import (
 	"encoding/json"
+	"strings"
 	"time"
 
 	"go.kenn.io/middleman/internal/db"
@@ -17,6 +18,59 @@ func MarshalAssigneesJSON(assignees []string) string {
 		return string(b)
 	}
 	return "[]"
+}
+
+func DBReviewThreads(threads []MergeRequestReviewThread) ([]db.MREvent, []db.MRReviewThread) {
+	events := make([]db.MREvent, 0, len(threads))
+	dbThreads := make([]db.MRReviewThread, 0, len(threads))
+	seenThreads := make(map[string]struct{}, len(threads))
+	for _, thread := range threads {
+		threadID := firstNonEmptyString(thread.ProviderThreadID, thread.ProviderCommentID)
+		if threadID == "" {
+			continue
+		}
+		if _, seen := seenThreads[threadID]; !seen {
+			seenThreads[threadID] = struct{}{}
+			dbThreads = append(dbThreads, db.MRReviewThread{
+				ProviderThreadID: threadID, ProviderReviewID: thread.ProviderReviewID,
+				ProviderCommentID: thread.ProviderCommentID, Body: thread.Body,
+				AuthorLogin: thread.AuthorLogin, Range: DBReviewLineRange(thread.Range),
+				Resolved: thread.Resolved, CreatedAt: thread.CreatedAt,
+				UpdatedAt: thread.UpdatedAt, ResolvedAt: thread.ResolvedAt,
+				MetadataJSON: thread.MetadataJSON,
+			})
+		}
+		externalID := firstNonEmptyString(thread.ProviderCommentID, threadID)
+		if externalID == "" {
+			continue
+		}
+		threadIDCopy := threadID
+		events = append(events, db.MREvent{
+			PlatformExternalID: externalID, EventType: "review_comment",
+			Author: thread.AuthorLogin, Body: thread.Body, CreatedAt: thread.CreatedAt,
+			DedupeKey: "review_comment:" + externalID, DirectURL: thread.DirectURL,
+			ThreadID: &threadIDCopy,
+		})
+	}
+	return events, dbThreads
+}
+
+func DBReviewLineRange(input DiffReviewLineRange) db.ReviewLineRange {
+	return db.ReviewLineRange{
+		Path: input.Path, OldPath: input.OldPath, Side: input.Side,
+		StartSide: input.StartSide, StartLine: input.StartLine, Line: input.Line,
+		OldLine: input.OldLine, NewLine: input.NewLine, LineType: input.LineType,
+		DiffHeadSHA: input.DiffHeadSHA, CommitSHA: input.CommitSHA,
+	}
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 // MarshalUserNamesJSON converts a username list to a JSON array string,
@@ -54,36 +108,37 @@ func DBRepositoryIdentity(repo Repository) db.RepoIdentity {
 
 func DBMergeRequest(repoID int64, mr MergeRequest) *db.MergeRequest {
 	out := &db.MergeRequest{
-		RepoID:             repoID,
-		PlatformID:         mr.PlatformID,
-		PlatformExternalID: mr.PlatformExternalID,
-		Number:             mr.Number,
-		URL:                mr.URL,
-		Title:              mr.Title,
-		Author:             mr.Author,
-		AuthorDisplayName:  mr.AuthorDisplayName,
-		State:              db.MergeRequestState(mr.State),
-		IsDraft:            mr.IsDraft,
-		IsLocked:           mr.IsLocked,
-		Body:               mr.Body,
-		HeadBranch:         mr.HeadBranch,
-		BaseBranch:         mr.BaseBranch,
-		PlatformHeadSHA:    mr.HeadSHA,
-		PlatformBaseSHA:    mr.BaseSHA,
-		HeadRepoCloneURL:   mr.HeadRepoCloneURL,
-		Additions:          mr.Additions,
-		Deletions:          mr.Deletions,
-		CommentCount:       mr.CommentCount,
-		ReviewDecision:     mr.ReviewDecision,
-		CIStatus:           mr.CIStatus,
-		MergeableState:     mr.MergeableState,
-		CreatedAt:          mr.CreatedAt,
-		UpdatedAt:          mr.UpdatedAt,
-		LastActivityAt:     mr.LastActivityAt,
-		MergedAt:           mr.MergedAt,
-		ClosedAt:           mr.ClosedAt,
-		AssigneesJSON:      MarshalUserNamesJSON(mr.Assignees),
-		ReviewersJSON:      MarshalUserNamesJSON(mr.RequestedReviewers),
+		RepoID:                  repoID,
+		PlatformID:              mr.PlatformID,
+		PlatformExternalID:      mr.PlatformExternalID,
+		Number:                  mr.Number,
+		URL:                     mr.URL,
+		Title:                   mr.Title,
+		Author:                  mr.Author,
+		AuthorDisplayName:       mr.AuthorDisplayName,
+		State:                   db.MergeRequestState(mr.State),
+		IsDraft:                 mr.IsDraft,
+		IsLocked:                mr.IsLocked,
+		Body:                    mr.Body,
+		HeadBranch:              mr.HeadBranch,
+		BaseBranch:              mr.BaseBranch,
+		PlatformHeadSHA:         mr.HeadSHA,
+		PlatformBaseSHA:         mr.BaseSHA,
+		HeadRepoCloneURL:        mr.HeadRepoCloneURL,
+		HeadRepoCloneURLUnknown: mr.HeadRepoCloneURLUnknown,
+		Additions:               mr.Additions,
+		Deletions:               mr.Deletions,
+		CommentCount:            mr.CommentCount,
+		ReviewDecision:          mr.ReviewDecision,
+		CIStatus:                mr.CIStatus,
+		MergeableState:          mr.MergeableState,
+		CreatedAt:               mr.CreatedAt,
+		UpdatedAt:               mr.UpdatedAt,
+		LastActivityAt:          mr.LastActivityAt,
+		MergedAt:                mr.MergedAt,
+		ClosedAt:                mr.ClosedAt,
+		AssigneesJSON:           MarshalUserNamesJSON(mr.Assignees),
+		ReviewersJSON:           MarshalUserNamesJSON(mr.RequestedReviewers),
 	}
 	out.Labels = DBLabels(mr.Labels, itemLabelUpdatedAt(mr.UpdatedAt, mr.CreatedAt))
 	return out

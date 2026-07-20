@@ -34,6 +34,265 @@ func openTestDB(t *testing.T) *db.DB {
 	return dbtest.Open(t)
 }
 
+func mergeRequestSnapshotRevision(t *testing.T, database *db.DB, repoID int64, number int) int64 {
+	t.Helper()
+	mr, err := database.GetMergeRequestByRepoIDAndNumber(t.Context(), repoID, number)
+	require.NoError(t, err)
+	require.NotNil(t, mr)
+	return mr.SnapshotRevision
+}
+
+func TestCommitIssueParentSnapshotRejectsStaleLabels(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	database := openTestDB(t)
+	ctx := t.Context()
+	now := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
+	repoID, err := database.UpsertRepo(ctx, db.RepoIdentity{
+		Platform: "github", PlatformHost: "github.com", Owner: "acme", Name: "widget",
+	})
+	require.NoError(err)
+	newer := &db.Issue{
+		RepoID: repoID, PlatformID: 1, PlatformExternalID: "issue-1", Number: 1,
+		Title: "newer", State: "open", CreatedAt: now.Add(-time.Hour), UpdatedAt: now,
+		LastActivityAt: now,
+	}
+	issueID, err := database.UpsertIssue(ctx, newer)
+	require.NoError(err)
+	require.NoError(database.ReplaceIssueLabels(ctx, repoID, issueID, []db.Label{{
+		RepoID: repoID, PlatformID: 1, Name: "newer", Color: "ffffff", UpdatedAt: now,
+	}}))
+
+	stale := *newer
+	stale.Title = "stale"
+	stale.UpdatedAt = now.Add(-time.Minute)
+	stale.LastActivityAt = stale.UpdatedAt
+	stale.Labels = []db.Label{{
+		RepoID: repoID, PlatformID: 2, Name: "stale", Color: "000000", UpdatedAt: stale.UpdatedAt,
+	}}
+	syncer := &Syncer{db: database}
+	committedID, _, accepted, err := syncer.commitIssueParentSnapshot(ctx, RepoRef{}, &stale)
+	require.NoError(err)
+	assert.Equal(issueID, committedID)
+	assert.False(accepted)
+
+	stored, err := database.GetIssueByRepoIDAndNumber(ctx, repoID, 1)
+	require.NoError(err)
+	require.NotNil(stored)
+	assert.Equal("newer", stored.Title)
+	require.Len(stored.Labels, 1)
+	assert.Equal("newer", stored.Labels[0].Name)
+}
+
+func TestNormalSyncRejectsIssueCommentsAfterParentAdvances(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	database := openTestDB(t)
+	ctx := t.Context()
+	oldUpdatedAt := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
+	currentUpdatedAt := oldUpdatedAt.Add(time.Minute)
+	repo := RepoRef{Platform: platform.KindGitHub, PlatformHost: "github.com", Owner: "acme", Name: "widget"}
+	repoID, err := database.UpsertRepo(ctx, db.RepoIdentity{
+		Platform: "github", PlatformHost: "github.com", Owner: "acme", Name: "widget",
+	})
+	require.NoError(err)
+	issueID, err := database.UpsertIssue(ctx, &db.Issue{
+		RepoID: repoID, PlatformID: 1, PlatformExternalID: "issue-1", Number: 1,
+		Title: "old", State: "open", CreatedAt: oldUpdatedAt.Add(-time.Hour),
+		UpdatedAt: oldUpdatedAt, LastActivityAt: oldUpdatedAt,
+	})
+	require.NoError(err)
+	stale, err := database.GetIssueByRepoIDAndNumber(ctx, repoID, 1)
+	require.NoError(err)
+	require.NotNil(stale)
+	_, err = database.UpsertIssue(ctx, &db.Issue{
+		RepoID: repoID, PlatformID: 1, PlatformExternalID: "issue-1", Number: 1,
+		Title: "current", State: "open", CreatedAt: oldUpdatedAt.Add(-time.Hour),
+		UpdatedAt: currentUpdatedAt, LastActivityAt: currentUpdatedAt,
+	})
+	require.NoError(err)
+	require.NoError(database.UpsertIssueEvents(ctx, []db.IssueEvent{{
+		IssueID: issueID, EventType: "issue_comment", DedupeKey: "current-comment",
+		CreatedAt: currentUpdatedAt,
+	}}))
+
+	applied, err := (&Syncer{db: database}).commitIssueCommentsSnapshot(
+		ctx, repo, 1, stale.SnapshotRevision, []db.IssueEvent{{
+			IssueID: issueID, EventType: "issue_comment", DedupeKey: "stale-comment",
+			CreatedAt: oldUpdatedAt,
+		}}, nil, nil,
+	)
+	require.NoError(err)
+	assert.False(applied)
+	events, err := database.ListIssueEvents(ctx, issueID)
+	require.NoError(err)
+	require.Len(events, 1)
+	assert.Equal("current-comment", events[0].DedupeKey)
+}
+
+func TestNormalSyncRejectsAllMergeRequestChildrenAfterParentAdvances(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	database := openTestDB(t)
+	ctx := t.Context()
+	oldUpdatedAt := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
+	currentUpdatedAt := oldUpdatedAt.Add(time.Minute)
+	repo := RepoRef{Platform: platform.KindGitHub, PlatformHost: "github.com", Owner: "acme", Name: "widget"}
+	repoID, err := database.UpsertRepo(ctx, db.RepoIdentity{
+		Platform: "github", PlatformHost: "github.com", Owner: "acme", Name: "widget",
+	})
+	require.NoError(err)
+	mrID, err := database.UpsertMergeRequest(ctx, &db.MergeRequest{
+		RepoID: repoID, PlatformID: 1, PlatformExternalID: "mr-1", Number: 1,
+		Title: "old", State: db.MergeRequestStateOpen, CreatedAt: oldUpdatedAt.Add(-time.Hour),
+		UpdatedAt: oldUpdatedAt, LastActivityAt: oldUpdatedAt,
+	})
+	require.NoError(err)
+	staleRevision := mergeRequestSnapshotRevision(t, database, repoID, 1)
+	_, err = database.UpsertMergeRequest(ctx, &db.MergeRequest{
+		RepoID: repoID, PlatformID: 1, PlatformExternalID: "mr-1", Number: 1,
+		Title: "current", State: db.MergeRequestStateOpen, CreatedAt: oldUpdatedAt.Add(-time.Hour),
+		UpdatedAt: currentUpdatedAt, LastActivityAt: currentUpdatedAt,
+	})
+	require.NoError(err)
+	require.NoError(database.UpsertMREvents(ctx, []db.MREvent{
+		{MergeRequestID: mrID, EventType: "issue_comment", DedupeKey: "current-comment", CreatedAt: currentUpdatedAt},
+		{MergeRequestID: mrID, EventType: "review", DedupeKey: "current-review", CreatedAt: currentUpdatedAt},
+		{MergeRequestID: mrID, EventType: "review_comment", DedupeKey: "current-inline", CreatedAt: currentUpdatedAt},
+	}))
+	require.NoError(database.UpsertMRReviewThreads(ctx, mrID, []db.MRReviewThread{{
+		ProviderThreadID: "current-thread", CreatedAt: currentUpdatedAt, UpdatedAt: currentUpdatedAt,
+	}}))
+
+	applied, err := (&Syncer{db: database}).commitMergeRequestDatasets(
+		ctx, repo, 1, staleRevision,
+		[]db.MREvent{{EventType: "issue_comment", DedupeKey: "stale-comment", CreatedAt: oldUpdatedAt}}, true,
+		[]db.MREvent{{EventType: "review", DedupeKey: "stale-review", CreatedAt: oldUpdatedAt}},
+		[]db.MREvent{{EventType: "review_comment", DedupeKey: "stale-inline", CreatedAt: oldUpdatedAt}},
+		[]db.MRReviewThread{{ProviderThreadID: "stale-thread", CreatedAt: oldUpdatedAt, UpdatedAt: oldUpdatedAt}},
+		true, nil, nil,
+	)
+	require.NoError(err)
+	assert.False(applied)
+	events, err := database.ListMREvents(ctx, mrID)
+	require.NoError(err)
+	keys := make([]string, len(events))
+	for i := range events {
+		keys[i] = events[i].DedupeKey
+	}
+	assert.ElementsMatch([]string{"current-comment", "current-review", "current-inline"}, keys)
+	threads, err := database.ListMRReviewThreads(ctx, mrID)
+	require.NoError(err)
+	require.Len(threads, 1)
+	assert.Equal("current-thread", threads[0].ProviderThreadID)
+}
+
+func TestSyncArchiveItemClassifiesOnlyConfirmedParentNotFound(t *testing.T) {
+	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
+	ref := platform.RepoRef{
+		Platform: platform.KindGitLab, Host: "gitlab.example.com",
+		Owner: "group", Name: "project", RepoPath: "group/project",
+	}
+	issue := platform.Issue{
+		Repo: ref, PlatformID: 7, PlatformExternalID: "issue-7", Number: 7,
+		Title: "issue", State: "open", CreatedAt: now, UpdatedAt: now, LastActivityAt: now,
+	}
+	tests := []struct {
+		name            string
+		issues          []platform.Issue
+		getIssueErr     error
+		listEventsErr   error
+		repositoryErr   error
+		wantNotPresent  bool
+		wantRepoQueries int32
+	}{
+		{
+			name: "accessible repository confirms missing parent", getIssueErr: platform.ErrNotFound,
+			wantNotPresent: true, wantRepoQueries: 1,
+		},
+		{
+			name: "child event not found stays retryable", issues: []platform.Issue{issue},
+			listEventsErr: platform.ErrNotFound,
+		},
+		{
+			name: "missing repository does not prove missing parent", getIssueErr: platform.ErrNotFound,
+			repositoryErr: platform.ErrNotFound, wantRepoQueries: 1,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
+			database := openTestDB(t)
+			_, err := database.UpsertRepo(t.Context(), platform.DBRepoIdentity(ref))
+			require.NoError(err)
+			provider := &syncTestRepositoryReadProvider{
+				syncTestReadProvider: &syncTestReadProvider{
+					syncTestProvider: syncTestProvider{kind: ref.Platform, host: ref.Host},
+					issues:           test.issues, getIssueErr: test.getIssueErr,
+					listIssueEventsErr: test.listEventsErr,
+				},
+				repository: platform.Repository{Ref: ref}, repositoryErr: test.repositoryErr,
+			}
+			registry, err := platform.NewRegistry(provider)
+			require.NoError(err)
+			syncer := NewSyncerWithRegistry(registry, database, nil, []RepoRef{{
+				Platform: ref.Platform, PlatformHost: ref.Host,
+				Owner: ref.Owner, Name: ref.Name, RepoPath: ref.RepoPath,
+			}}, time.Minute, nil, nil)
+
+			err = syncer.SyncArchiveItem(t.Context(), ref, db.ArchiveItemTypeIssue, issue.Number)
+			require.Error(err)
+			assert.Equal(test.wantNotPresent, errors.Is(err, platform.ErrLookupNotPresent))
+			assert.Equal(test.wantRepoQueries, provider.getRepositoryCalls.Load())
+		})
+	}
+}
+
+func TestCommitMergeRequestParentSnapshotRollsBackParentWhenLabelsFail(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	database := openTestDB(t)
+	ctx := t.Context()
+	now := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
+	repoID, err := database.UpsertRepo(ctx, db.RepoIdentity{
+		Platform: "github", PlatformHost: "github.com", Owner: "acme", Name: "widget",
+	})
+	require.NoError(err)
+	stored := &db.MergeRequest{
+		RepoID: repoID, PlatformID: 1, PlatformExternalID: "mr-1", Number: 1,
+		Title: "stored", State: db.MergeRequestStateOpen, CreatedAt: now.Add(-time.Hour),
+		UpdatedAt: now, LastActivityAt: now,
+	}
+	mrID, err := database.UpsertMergeRequest(ctx, stored)
+	require.NoError(err)
+	require.NoError(database.ReplaceMergeRequestLabels(ctx, repoID, mrID, []db.Label{{
+		RepoID: repoID, PlatformID: 1, Name: "stored", Color: "ffffff", UpdatedAt: now,
+	}}))
+	_, err = database.WriteDB().ExecContext(ctx, `
+		CREATE TRIGGER reject_new_mr_label BEFORE INSERT ON middleman_merge_request_labels
+		BEGIN SELECT RAISE(ABORT, 'synthetic label failure'); END`)
+	require.NoError(err)
+
+	updated := *stored
+	updated.Title = "must roll back"
+	updated.UpdatedAt = now.Add(time.Minute)
+	updated.LastActivityAt = updated.UpdatedAt
+	updated.Labels = []db.Label{{
+		RepoID: repoID, PlatformID: 2, Name: "new", Color: "000000", UpdatedAt: updated.UpdatedAt,
+	}}
+	syncer := &Syncer{db: database}
+	_, _, _, err = syncer.commitMergeRequestParentSnapshot(ctx, RepoRef{}, &updated)
+	require.Error(err)
+
+	result, err := database.GetMergeRequestByRepoIDAndNumber(ctx, repoID, 1)
+	require.NoError(err)
+	require.NotNil(result)
+	assert.Equal("stored", result.Title)
+	require.Len(result.Labels, 1)
+	assert.Equal("stored", result.Labels[0].Name)
+}
+
 func setupBareRemoteForSyncTest(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -417,6 +676,8 @@ esac
 		ctx,
 		repo,
 		repoID,
+		0,
+		0,
 		1,
 		&gh.PullRequest{},
 		&db.MergeRequest{
@@ -518,6 +779,7 @@ type mockClient struct {
 	checkRuns                       []*gh.CheckRun
 	checkRunsErr                    error
 	workflowRuns                    []*gh.WorkflowRun
+	listWorkflowRunsFn              func(context.Context, string, string, string) ([]*gh.WorkflowRun, error)
 	approveWorkflowRunFn            func(context.Context, string, string, int64) error
 	listOpenPRsCalled               atomic.Bool
 	getUserCalls                    atomic.Int32
@@ -608,6 +870,8 @@ type syncTestReadProvider struct {
 	syncTestProvider
 	mergeRequests       []platform.MergeRequest
 	issues              []platform.Issue
+	getIssueErr         error
+	listIssueEventsErr  error
 	listMRCalls         atomic.Int32
 	listIssueCalls      atomic.Int32
 	getMRCalls          atomic.Int32
@@ -622,6 +886,7 @@ type syncTestReadProvider struct {
 type syncTestRepositoryReadProvider struct {
 	*syncTestReadProvider
 	repository         platform.Repository
+	repositoryErr      error
 	getRepositoryCalls atomic.Int32
 }
 
@@ -648,7 +913,7 @@ func (p *syncTestMergeRequestOnlyProvider) GetMergeRequest(
 	platform.RepoRef,
 	int,
 ) (platform.MergeRequest, error) {
-	return platform.MergeRequest{}, nil
+	return platform.MergeRequest{}, errors.New("missing merge request")
 }
 
 type syncTestIssueOnlyProvider struct {
@@ -711,7 +976,7 @@ func (p *syncTestRepositoryReadProvider) GetRepository(
 	platform.RepoRef,
 ) (platform.Repository, error) {
 	p.getRepositoryCalls.Add(1)
-	return p.repository, nil
+	return p.repository, p.repositoryErr
 }
 
 func (p *syncTestRepositoryReadProvider) ListRepositories(
@@ -775,6 +1040,9 @@ func (p *syncTestReadProvider) GetIssue(
 	number int,
 ) (platform.Issue, error) {
 	p.getIssueCalls.Add(1)
+	if p.getIssueErr != nil {
+		return platform.Issue{}, p.getIssueErr
+	}
 	for _, issue := range p.issues {
 		if issue.Number == number {
 			return issue, nil
@@ -788,7 +1056,7 @@ func (p *syncTestReadProvider) ListIssueEvents(
 	platform.RepoRef,
 	int,
 ) ([]platform.IssueEvent, error) {
-	return p.listIssueReadEvents, nil
+	return p.listIssueReadEvents, p.listIssueEventsErr
 }
 
 func (m *mockClient) trackCall() {
@@ -986,9 +1254,12 @@ func (m *mockClient) ListCheckRunsForRef(_ context.Context, _, _, _ string) ([]*
 }
 
 func (m *mockClient) ListWorkflowRunsForHeadSHA(
-	_ context.Context, _, _, _ string,
+	ctx context.Context, owner, repo, headSHA string,
 ) ([]*gh.WorkflowRun, error) {
 	m.trackCall()
+	if m.listWorkflowRunsFn != nil {
+		return m.listWorkflowRunsFn(ctx, owner, repo, headSHA)
+	}
 	return m.workflowRuns, nil
 }
 
@@ -1894,7 +2165,7 @@ func TestSyncMRMarksLinkedNotificationDone(t *testing.T) {
 	openNumber := 9
 	_, err = d.UpsertMergeRequest(t.Context(), &db.MergeRequest{
 		RepoID:           repoID,
-		PlatformID:       700,
+		PlatformID:       7000,
 		Number:           number,
 		URL:              "https://github.com/acme/widget/pull/7",
 		Title:            "Close me",
@@ -3699,7 +3970,8 @@ func TestRefreshTimelineUsesForcePushForLastActivity(t *testing.T) {
 	}
 
 	syncer := NewSyncer(map[string]Client{"github.com": mc}, d, nil, []RepoRef{repo}, time.Minute, nil, testBudget(500))
-	require.NoError(syncer.refreshTimeline(ctx, repo, repoID, mrID, buildOpenPR(1, now.Add(-2*time.Hour))))
+	require.NoError(syncer.refreshTimeline(ctx, repo, repoID, mrID,
+		mergeRequestSnapshotRevision(t, d, repoID, 1), buildOpenPR(1, now.Add(-2*time.Hour))))
 
 	pr, err := d.GetMergeRequestByRepoIDAndNumber(ctx, repoID, 1)
 	require.NoError(err)
@@ -3759,7 +4031,8 @@ func TestRefreshTimelineFetchFailurePreservesStoredForcePushActivity(t *testing.
 	}
 
 	syncer := NewSyncer(map[string]Client{"github.com": mc}, d, nil, []RepoRef{repo}, time.Minute, nil, testBudget(500))
-	require.NoError(syncer.refreshTimeline(ctx, repo, repoID, mrID, buildOpenPR(1, now.Add(-2*time.Hour))))
+	require.NoError(syncer.refreshTimeline(ctx, repo, repoID, mrID,
+		mergeRequestSnapshotRevision(t, d, repoID, 1), buildOpenPR(1, now.Add(-2*time.Hour))))
 
 	pr, err := d.GetMergeRequestByRepoIDAndNumber(ctx, repoID, 1)
 	require.NoError(err)
@@ -3844,7 +4117,8 @@ func TestSyncAssignsStableCommitOrderKeysAcrossForcePushReplacement(t *testing.T
 	}))
 
 	syncer := NewSyncer(map[string]Client{"github.com": mc}, d, nil, []RepoRef{repo}, time.Minute, nil, testBudget(500))
-	require.NoError(syncer.refreshTimeline(ctx, repo, repoID, mrID, buildOpenPR(1, now)))
+	require.NoError(syncer.refreshTimeline(ctx, repo, repoID, mrID,
+		mergeRequestSnapshotRevision(t, d, repoID, 1), buildOpenPR(1, now)))
 
 	events, err := d.ListMREvents(ctx, mrID)
 	require.NoError(err)
@@ -5825,6 +6099,13 @@ func TestSyncMRUsesConfiguredProviderRegistry(t *testing.T) {
 			host: "gitlab.com",
 		},
 		mergeRequests: []platform.MergeRequest{{
+			Repo: platform.RepoRef{
+				Platform: platform.KindGitLab,
+				Host:     "gitlab.com",
+				Owner:    "acme",
+				Name:     "widget",
+				RepoPath: "acme/widget",
+			},
 			PlatformID: 42,
 			Number:     10,
 			Title:      "gitlab mr",
@@ -6431,7 +6712,8 @@ func TestRefreshTimelineSkipsMergedEventWhenAuthoredMergedEventAlreadyExists(t *
 		nil,
 	)
 
-	require.NoError(syncer.refreshTimeline(ctx, repo, repoID, mrID, pr))
+	require.NoError(syncer.refreshTimeline(ctx, repo, repoID, mrID,
+		mergeRequestSnapshotRevision(t, d, repoID, 7), pr))
 
 	events, err := d.ListMREvents(ctx, mrID)
 	require.NoError(err)
@@ -6500,6 +6782,184 @@ func TestSyncOpenMRFromBulkPersistsMergedActorEventFromPullRequest(t *testing.T)
 	assert.Equal("merge-admin", events[0].Author)
 	assert.Equal("merged this", events[0].Summary)
 	assert.True(events[0].CreatedAt.Equal(mergedAt))
+}
+
+func TestSyncOpenMRFromBulkPreservesReviewDecisionWhenReviewsConnectionReturnsEmpty(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	ctx := t.Context()
+	d := openTestDB(t)
+
+	repoID, err := d.UpsertRepo(ctx, db.GitHubRepoIdentity("github.com", "owner", "repo"))
+	require.NoError(err)
+
+	now := time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC)
+	syncer := NewSyncer(
+		map[string]Client{"github.com": &mockClient{}},
+		d, nil, []RepoRef{{Owner: "owner", Name: "repo", PlatformHost: "github.com"}},
+		time.Minute, nil, nil,
+	)
+	repo := RepoRef{Owner: "owner", Name: "repo", PlatformHost: "github.com"}
+
+	reviewer := "alice"
+	approvedState := "APPROVED"
+	reviewID := int64(501)
+	err = syncer.syncOpenMRFromBulk(ctx, repo, repoID, &BulkPR{
+		PR: buildOpenPR(1, now),
+		Reviews: []*gh.PullRequestReview{{
+			ID: &reviewID, User: &gh.User{Login: &reviewer}, State: &approvedState,
+		}},
+		CommentsComplete: true, ReviewsComplete: true, CommitsComplete: true,
+		TimelineComplete: true, CIComplete: true,
+	}, false)
+	require.NoError(err)
+
+	mr, err := d.GetMergeRequest(ctx, "github", "github.com", "owner", "repo", 1)
+	require.NoError(err)
+	require.NotNil(mr)
+	assert.Equal("approved", mr.ReviewDecision)
+
+	// A later bulk fetch that legitimately completes (ReviewsComplete is
+	// true, so the connection was not truncated) but observes zero
+	// reviews must not clear the persisted decision: review history is
+	// additive, and the earlier APPROVED review is retained even though
+	// this fetch's Reviews connection came back empty.
+	err = syncer.syncOpenMRFromBulk(ctx, repo, repoID, &BulkPR{
+		PR:               buildOpenPR(1, now.Add(time.Minute)),
+		Reviews:          nil,
+		CommentsComplete: true, ReviewsComplete: true, CommitsComplete: true,
+		TimelineComplete: true, CIComplete: true,
+	}, false)
+	require.NoError(err)
+
+	mr, err = d.GetMergeRequest(ctx, "github", "github.com", "owner", "repo", 1)
+	require.NoError(err)
+	require.NotNil(mr)
+	assert.Equal("approved", mr.ReviewDecision)
+}
+
+func TestSyncOpenMRFromBulkResolvesReviewDecisionIndependentOfNestedCompleteness(t *testing.T) {
+	reviewPtr := func(id int64, login, state string) *gh.PullRequestReview {
+		return &gh.PullRequestReview{
+			ID: &id, User: &gh.User{Login: &login}, State: &state,
+		}
+	}
+
+	// Every case first establishes a persisted APPROVED decision via a fully
+	// complete sync, then applies a second fetch whose completeness/scalar
+	// combination is under test. The provider's reviewDecision scalar is
+	// authoritative over the PR's whole review history, so nested-connection
+	// truncation on the second fetch must not gate it; only a null/empty
+	// scalar falls back to deriving from a complete reviews connection, and
+	// an incomplete one preserves the additive history already persisted.
+	cases := []struct {
+		name             string
+		scalar           string
+		reviews          []*gh.PullRequestReview
+		reviewsComplete  bool
+		commitsComplete  bool
+		timelineComplete bool
+		ciComplete       bool
+		want             string
+	}{
+		{
+			name:             "authoritative scalar wins when reviews connection incomplete",
+			scalar:           "CHANGES_REQUESTED",
+			reviews:          nil,
+			reviewsComplete:  false,
+			commitsComplete:  true,
+			timelineComplete: true,
+			ciComplete:       true,
+			want:             "changes_requested",
+		},
+		{
+			name:             "authoritative scalar wins when an unrelated connection incomplete",
+			scalar:           "CHANGES_REQUESTED",
+			reviews:          []*gh.PullRequestReview{reviewPtr(710, "carol", "COMMENTED")},
+			reviewsComplete:  true,
+			commitsComplete:  false, // unrelated truncation must not gate the scalar
+			timelineComplete: true,
+			ciComplete:       true,
+			want:             "changes_requested",
+		},
+		{
+			name:             "authoritative scalar wins over a partial review page",
+			scalar:           "CHANGES_REQUESTED",
+			reviews:          []*gh.PullRequestReview{reviewPtr(711, "bob", "COMMENTED")},
+			reviewsComplete:  true,
+			commitsComplete:  true,
+			timelineComplete: true,
+			ciComplete:       true,
+			want:             "changes_requested",
+		},
+		{
+			name:             "empty scalar derives from a complete reviews connection",
+			scalar:           "",
+			reviews:          []*gh.PullRequestReview{reviewPtr(712, "alice", "CHANGES_REQUESTED")},
+			reviewsComplete:  true,
+			commitsComplete:  true,
+			timelineComplete: true,
+			ciComplete:       true,
+			want:             "changes_requested",
+		},
+		{
+			name:             "empty scalar preserves persisted history when reviews incomplete",
+			scalar:           "",
+			reviews:          nil,
+			reviewsComplete:  false,
+			commitsComplete:  true,
+			timelineComplete: true,
+			ciComplete:       true,
+			want:             "approved",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
+			ctx := t.Context()
+			d := openTestDB(t)
+
+			repoID, err := d.UpsertRepo(ctx, db.GitHubRepoIdentity("github.com", "owner", "repo"))
+			require.NoError(err)
+
+			now := time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC)
+			syncer := NewSyncer(
+				map[string]Client{"github.com": &mockClient{}},
+				d, nil, []RepoRef{{Owner: "owner", Name: "repo", PlatformHost: "github.com"}},
+				time.Minute, nil, nil,
+			)
+			repo := RepoRef{Owner: "owner", Name: "repo", PlatformHost: "github.com"}
+
+			require.NoError(syncer.syncOpenMRFromBulk(ctx, repo, repoID, &BulkPR{
+				PR:               buildOpenPR(1, now),
+				ReviewDecision:   "APPROVED",
+				CommentsComplete: true, ReviewsComplete: true, CommitsComplete: true,
+				TimelineComplete: true, CIComplete: true,
+			}, false))
+			seeded, err := d.GetMergeRequest(ctx, "github", "github.com", "owner", "repo", 1)
+			require.NoError(err)
+			require.NotNil(seeded)
+			require.Equal("approved", seeded.ReviewDecision)
+
+			require.NoError(syncer.syncOpenMRFromBulk(ctx, repo, repoID, &BulkPR{
+				PR:               buildOpenPR(1, now.Add(time.Minute)),
+				ReviewDecision:   tc.scalar,
+				Reviews:          tc.reviews,
+				CommentsComplete: true,
+				ReviewsComplete:  tc.reviewsComplete,
+				CommitsComplete:  tc.commitsComplete,
+				TimelineComplete: tc.timelineComplete,
+				CIComplete:       tc.ciComplete,
+			}, false))
+
+			mr, err := d.GetMergeRequest(ctx, "github", "github.com", "owner", "repo", 1)
+			require.NoError(err)
+			require.NotNil(mr)
+			assert.Equal(tc.want, mr.ReviewDecision)
+		})
+	}
 }
 
 func TestSyncOpenMRFromBulkSkipsMergedActorFallbackWhenAuthoredMergedEventExists(t *testing.T) {
@@ -9286,10 +9746,10 @@ func TestDetailDrainRespectsBudget(t *testing.T) {
 	}
 
 	// Index overhead: GetRepo(1) + ListPRs(1) + ListIssues(1) +
-	// GetUser(1, deduplicated by singleflight) = 4 calls. One PR
-	// detail = 9 calls. Budget of 15 covers index + 1 detail (13)
-	// with 2 remaining, which is below the 9 needed for a 2nd.
-	budget := testBudget(15)
+	// GetUser(1, deduplicated by singleflight) = 4 calls. The PR
+	// detail admission reserve is 11 calls. Budget of 16 leaves
+	// enough nominal capacity for one detail, but not a second.
+	budget := testBudget(16)
 	mc := &detailTrackingClient{}
 	mc.budget = budget["github.com"]
 	mc.openPRs = prs
@@ -10267,320 +10727,6 @@ func TestFetchAndUpdateClosedRefreshesIssueLabelsWithSameRepoOnAnotherHost(t *te
 	require.Equal("other-host", labelName)
 }
 
-func TestBackfillRepoPersistsPRLabels(t *testing.T) {
-	require := require.New(t)
-	ctx := t.Context()
-	d := openTestDB(t)
-
-	repoID, err := d.UpsertRepo(ctx, db.GitHubRepoIdentity("github.com", "owner", "repo"))
-	require.NoError(err)
-	repoRow, err := d.GetRepoByIdentity(ctx, db.GitHubRepoIdentity("github.com", "owner", "repo"))
-	require.NoError(err)
-	require.NotNil(repoRow)
-	now := time.Date(2024, 6, 7, 12, 0, 0, 0, time.UTC)
-	pr := buildOpenPR(21, now)
-	pr.State = new("closed")
-	pr.Labels = []*gh.Label{buildGitHubLabel(1101, "backfill-pr", "Backfilled PR label", "5319e7", false)}
-
-	mc := &mockClient{listPullRequestsPageFn: func(context.Context, string, string, string, int) ([]*gh.PullRequest, bool, error) {
-		return []*gh.PullRequest{pr}, false, nil
-	}}
-	syncer := NewSyncer(map[string]Client{"github.com": mc}, d, nil, []RepoRef{{Owner: "owner", Name: "repo", PlatformHost: "github.com"}}, time.Minute, nil, testBudget(10))
-
-	syncer.backfillRepo(ctx, RepoRef{Owner: "owner", Name: "repo", PlatformHost: "github.com"}, repoRow, NewSyncBudget(10))
-
-	stored, err := d.GetMergeRequest(ctx, "github", "github.com", "owner", "repo", 21)
-	require.NoError(err)
-	require.NotNil(stored)
-	require.Equal(repoID, stored.RepoID)
-	require.Len(stored.Labels, 1)
-	require.Equal("backfill-pr", stored.Labels[0].Name)
-}
-
-func TestBackfillRepoPersistsIssueLabels(t *testing.T) {
-	require := require.New(t)
-	ctx := t.Context()
-	d := openTestDB(t)
-
-	_, err := d.UpsertRepo(ctx, db.GitHubRepoIdentity("github.com", "owner", "repo"))
-	require.NoError(err)
-	repoRow, err := d.GetRepoByIdentity(ctx, db.GitHubRepoIdentity("github.com", "owner", "repo"))
-	require.NoError(err)
-	require.NotNil(repoRow)
-	now := time.Date(2024, 6, 8, 12, 0, 0, 0, time.UTC)
-	issueNumber := 22
-	issueTitle := "backfilled issue"
-	issueState := "closed"
-	issueURL := "https://github.com/owner/repo/issues/22"
-	issueBody := ""
-	issueID := int64(900022)
-	issue := &gh.Issue{ID: &issueID, Number: &issueNumber, Title: &issueTitle, State: &issueState, HTMLURL: &issueURL, Body: &issueBody, CreatedAt: makeTimestamp(now), UpdatedAt: makeTimestamp(now), Labels: []*gh.Label{buildGitHubLabel(1201, "backfill-issue", "Backfilled issue label", "0052cc", false)}}
-
-	mc := &mockClient{listIssuesPageFn: func(context.Context, string, string, string, int) ([]*gh.Issue, bool, error) {
-		return []*gh.Issue{issue}, false, nil
-	}}
-	syncer := NewSyncer(map[string]Client{"github.com": mc}, d, nil, []RepoRef{{Owner: "owner", Name: "repo", PlatformHost: "github.com"}}, time.Minute, nil, testBudget(10))
-
-	syncer.backfillRepo(ctx, RepoRef{Owner: "owner", Name: "repo", PlatformHost: "github.com"}, repoRow, NewSyncBudget(10))
-
-	stored, err := d.GetIssue(ctx, "github", "github.com", "owner", "repo", issueNumber)
-	require.NoError(err)
-	require.NotNil(stored)
-	require.Len(stored.Labels, 1)
-	require.Equal("backfill-issue", stored.Labels[0].Name)
-}
-
-func TestBackfillRepoSkipsNonGitHubProviders(t *testing.T) {
-	require := require.New(t)
-	ctx := t.Context()
-	d := openTestDB(t)
-	repo := RepoRef{
-		Platform:     platform.KindGitLab,
-		PlatformHost: "gitlab.com",
-		Owner:        "owner",
-		Name:         "repo",
-	}
-	_, err := d.UpsertRepo(ctx, platform.DBRepoIdentity(platformRepoRef(repo)))
-	require.NoError(err)
-	repoRow, err := d.GetRepoByIdentity(ctx, platform.DBRepoIdentity(platformRepoRef(repo)))
-	require.NoError(err)
-	require.NotNil(repoRow)
-
-	provider := &syncTestReadProvider{
-		syncTestProvider: syncTestProvider{
-			kind: platform.KindGitLab,
-			host: "gitlab.com",
-		},
-	}
-	registry, err := platform.NewRegistry(provider)
-	require.NoError(err)
-	syncer := NewSyncer(nil, d, nil, []RepoRef{repo}, time.Minute, nil, map[string]*SyncBudget{
-		"gitlab.com": NewSyncBudget(10),
-	})
-	syncer.clients = registry
-
-	syncer.backfillRepo(ctx, repo, repoRow, NewSyncBudget(10))
-
-	repoAfter, err := d.GetRepoByIdentity(ctx, platform.DBRepoIdentity(platformRepoRef(repo)))
-	require.NoError(err)
-	require.NotNil(repoAfter)
-	require.False(repoAfter.BackfillPRComplete)
-	require.False(repoAfter.BackfillIssueComplete)
-	require.Zero(provider.getMRCalls.Load())
-	require.Zero(provider.getIssueCalls.Load())
-}
-
-func TestRunBackfillDiscoveryUsesProviderQualifiedRepo(t *testing.T) {
-	require := require.New(t)
-	ctx := t.Context()
-	d := openTestDB(t)
-
-	gitLabRepo := RepoRef{
-		Platform:     platform.KindGitLab,
-		PlatformHost: "github.com",
-		Owner:        "owner",
-		Name:         "repo",
-	}
-	_, err := d.UpsertRepo(ctx, platform.DBRepoIdentity(platformRepoRef(gitLabRepo)))
-	require.NoError(err)
-
-	gitHubRepo := RepoRef{
-		Platform:     platform.KindGitHub,
-		PlatformHost: "github.com",
-		Owner:        "owner",
-		Name:         "repo",
-	}
-	_, err = d.UpsertRepo(ctx, platform.DBRepoIdentity(platformRepoRef(gitHubRepo)))
-	require.NoError(err)
-
-	mc := &mockClient{
-		listPullRequestsPageFn: func(context.Context, string, string, string, int) ([]*gh.PullRequest, bool, error) {
-			return nil, false, nil
-		},
-		listIssuesPageFn: func(context.Context, string, string, string, int) ([]*gh.Issue, bool, error) {
-			return nil, false, nil
-		},
-	}
-	syncer := NewSyncer(
-		map[string]Client{"github.com": mc},
-		d, nil,
-		[]RepoRef{gitHubRepo},
-		time.Minute, nil,
-		map[string]*SyncBudget{"github.com": NewSyncBudget(10)},
-	)
-
-	syncer.runBackfillDiscovery(ctx, "github.com", []RepoRef{gitHubRepo})
-
-	gitHubAfter, err := d.GetRepoByIdentity(ctx, platform.DBRepoIdentity(platformRepoRef(gitHubRepo)))
-	require.NoError(err)
-	require.NotNil(gitHubAfter)
-	require.True(gitHubAfter.BackfillPRComplete)
-	require.True(gitHubAfter.BackfillIssueComplete)
-
-	gitLabAfter, err := d.GetRepoByIdentity(ctx, platform.DBRepoIdentity(platformRepoRef(gitLabRepo)))
-	require.NoError(err)
-	require.NotNil(gitLabAfter)
-	require.False(gitLabAfter.BackfillPRComplete)
-	require.False(gitLabAfter.BackfillIssueComplete)
-}
-
-func TestBackfillRepoStoresCompletionTimestampsInUTC(t *testing.T) {
-	require := require.New(t)
-
-	ctx := t.Context()
-	d := openTestDB(t)
-
-	_, err := d.UpsertRepo(ctx, db.GitHubRepoIdentity("github.com", "owner", "repo"))
-	require.NoError(err)
-	repoRow, err := d.GetRepoByIdentity(ctx, db.GitHubRepoIdentity("github.com", "owner", "repo"))
-	require.NoError(err)
-	require.NotNil(repoRow)
-	now := time.Date(2024, 6, 8, 12, 0, 0, 0, time.UTC)
-
-	pr := buildOpenPR(41, now)
-	pr.State = new("closed")
-	issueNumber := 42
-	issueTitle := "backfilled issue"
-	issueState := "closed"
-	issueURL := "https://github.com/owner/repo/issues/42"
-	issueBody := ""
-	issueID := int64(900042)
-	issue := &gh.Issue{ID: &issueID, Number: &issueNumber, Title: &issueTitle, State: &issueState, HTMLURL: &issueURL, Body: &issueBody, CreatedAt: makeTimestamp(now), UpdatedAt: makeTimestamp(now)}
-
-	mc := &mockClient{
-		listPullRequestsPageFn: func(context.Context, string, string, string, int) ([]*gh.PullRequest, bool, error) {
-			return []*gh.PullRequest{pr}, false, nil
-		},
-		listIssuesPageFn: func(context.Context, string, string, string, int) ([]*gh.Issue, bool, error) {
-			return []*gh.Issue{issue}, false, nil
-		},
-	}
-	syncer := NewSyncer(map[string]Client{"github.com": mc}, d, nil, []RepoRef{{Owner: "owner", Name: "repo", PlatformHost: "github.com"}}, time.Minute, nil, testBudget(10))
-
-	syncer.backfillRepo(ctx, RepoRef{Owner: "owner", Name: "repo", PlatformHost: "github.com"}, repoRow, NewSyncBudget(10))
-
-	repoAfter, err := d.GetRepoByIdentity(ctx, db.GitHubRepoIdentity("github.com", "owner", "repo"))
-	require.NoError(err)
-	require.NotNil(repoAfter)
-	require.True(repoAfter.BackfillPRComplete)
-	require.True(repoAfter.BackfillIssueComplete)
-	require.NotNil(repoAfter.BackfillPRCompletedAt)
-	require.NotNil(repoAfter.BackfillIssueCompletedAt)
-	require.Equal(time.UTC, repoAfter.BackfillPRCompletedAt.Location())
-	require.Equal(time.UTC, repoAfter.BackfillIssueCompletedAt.Location())
-}
-
-func TestBackfillRepoDoesNotAdvancePRCursorWhenLabelPersistenceFails(t *testing.T) {
-	require := require.New(t)
-	ctx := t.Context()
-	d := openTestDB(t)
-
-	repoID, err := d.UpsertRepo(ctx, db.GitHubRepoIdentity("github.com", "owner", "repo"))
-	require.NoError(err)
-	repoRow, err := d.GetRepoByIdentity(ctx, db.GitHubRepoIdentity("github.com", "owner", "repo"))
-	require.NoError(err)
-	require.NotNil(repoRow)
-	now := time.Date(2024, 6, 9, 12, 0, 0, 0, time.UTC)
-
-	require.NoError(d.UpsertLabels(ctx, repoID, []db.Label{{
-		PlatformID:  100,
-		Name:        "bug",
-		Description: "name row",
-		Color:       "111111",
-		UpdatedAt:   now,
-	}}))
-	require.NoError(d.UpsertLabels(ctx, repoID, []db.Label{{
-		PlatformID:  200,
-		Name:        "renamed",
-		Description: "platform row",
-		Color:       "222222",
-		UpdatedAt:   now,
-	}}))
-
-	pr := buildOpenPR(31, now)
-	pr.State = new("closed")
-	pr.Labels = []*gh.Label{buildGitHubLabel(200, "bug", "ambiguous", "333333", false)}
-
-	mc := &mockClient{listPullRequestsPageFn: func(context.Context, string, string, string, int) ([]*gh.PullRequest, bool, error) {
-		return []*gh.PullRequest{pr}, false, nil
-	}}
-	syncer := NewSyncer(map[string]Client{"github.com": mc}, d, nil, []RepoRef{{Owner: "owner", Name: "repo", PlatformHost: "github.com"}}, time.Minute, nil, testBudget(10))
-
-	syncer.backfillRepo(ctx, RepoRef{Owner: "owner", Name: "repo", PlatformHost: "github.com"}, repoRow, NewSyncBudget(10))
-
-	repoAfter, err := d.GetRepoByIdentity(ctx, db.GitHubRepoIdentity("github.com", "owner", "repo"))
-	require.NoError(err)
-	require.NotNil(repoAfter)
-	require.Equal(0, repoAfter.BackfillPRPage)
-	require.False(repoAfter.BackfillPRComplete)
-	require.Nil(repoAfter.BackfillPRCompletedAt)
-
-	stored, err := d.GetMergeRequest(ctx, "github", "github.com", "owner", "repo", 31)
-	require.NoError(err)
-	require.NotNil(stored)
-	require.Empty(stored.Labels)
-}
-
-func TestBackfillRepoDoesNotAdvanceIssueCursorWhenLabelPersistenceFails(t *testing.T) {
-	require := require.New(t)
-	ctx := t.Context()
-	d := openTestDB(t)
-
-	repoID, err := d.UpsertRepo(ctx, db.GitHubRepoIdentity("github.com", "owner", "repo"))
-	require.NoError(err)
-	repoRow, err := d.GetRepoByIdentity(ctx, db.GitHubRepoIdentity("github.com", "owner", "repo"))
-	require.NoError(err)
-	require.NotNil(repoRow)
-	now := time.Date(2024, 6, 10, 12, 0, 0, 0, time.UTC)
-
-	require.NoError(d.UpsertLabels(ctx, repoID, []db.Label{{
-		PlatformID:  100,
-		Name:        "bug",
-		Description: "name row",
-		Color:       "111111",
-		UpdatedAt:   now,
-	}}))
-	require.NoError(d.UpsertLabels(ctx, repoID, []db.Label{{
-		PlatformID:  200,
-		Name:        "renamed",
-		Description: "platform row",
-		Color:       "222222",
-		UpdatedAt:   now,
-	}}))
-
-	issueNumber := 32
-	issueTitle := "ambiguous backfill issue"
-	issueState := "closed"
-	issueURL := "https://github.com/owner/repo/issues/32"
-	issueBody := ""
-	issueID := int64(900032)
-	issue := &gh.Issue{ID: &issueID, Number: &issueNumber, Title: &issueTitle, State: &issueState, HTMLURL: &issueURL, Body: &issueBody, CreatedAt: makeTimestamp(now), UpdatedAt: makeTimestamp(now), Labels: []*gh.Label{buildGitHubLabel(200, "bug", "ambiguous", "333333", false)}}
-
-	mc := &mockClient{listIssuesPageFn: func(context.Context, string, string, string, int) ([]*gh.Issue, bool, error) {
-		return []*gh.Issue{issue}, false, nil
-	}}
-	syncer := NewSyncer(map[string]Client{"github.com": mc}, d, nil, []RepoRef{{Owner: "owner", Name: "repo", PlatformHost: "github.com"}}, time.Minute, nil, testBudget(10))
-
-	syncer.backfillRepo(ctx, RepoRef{Owner: "owner", Name: "repo", PlatformHost: "github.com"}, repoRow, NewSyncBudget(10))
-
-	repoAfter, err := d.GetRepoByIdentity(ctx, db.GitHubRepoIdentity("github.com", "owner", "repo"))
-	require.NoError(err)
-	require.NotNil(repoAfter)
-	require.Equal(0, repoAfter.BackfillIssuePage)
-	require.False(repoAfter.BackfillIssueComplete)
-	require.Nil(repoAfter.BackfillIssueCompletedAt)
-
-	stored, err := d.GetIssue(ctx, "github", "github.com", "owner", "repo", issueNumber)
-	require.NoError(err)
-	require.NotNil(stored)
-	require.Empty(stored.Labels)
-}
-
-// partialFailureMock embeds mockClient and simulates ETag-like
-// behavior for issues: after a successful list fetch, subsequent
-// calls return 304 (not-modified) unless InvalidateListETagsForRepo
-// was called. This proves invalidation is load-bearing — without it
-// the retry never fires and stale state persists.
 type partialFailureMock struct {
 	mockClient
 	issuesCached         bool
@@ -11509,7 +11655,7 @@ func TestSyncOpenMRFromBulkPersistsWorkflowApproval(t *testing.T) {
 	headSHA := pr.GetHead().GetSHA()
 	require.NotEmpty(headSHA)
 
-	budgets := testBudget(1)
+	budgets := testBudget(2)
 	mc := &mockClient{
 		budget: budgets["github.com"],
 		workflowRuns: []*gh.WorkflowRun{{
@@ -12528,11 +12674,13 @@ func TestSyncRepoGraphQLIssuesClosureDetection(t *testing.T) {
 		getIssueFn: func(_ context.Context, _, _ string, number int) (*gh.Issue, error) {
 			if number == 30 {
 				return &gh.Issue{
-					ID:       &closedIssueID,
-					Number:   &closedNumber,
-					Title:    &closedTitle,
-					State:    &closedState,
-					ClosedAt: &closedAt,
+					ID:        &closedIssueID,
+					Number:    &closedNumber,
+					Title:     &closedTitle,
+					State:     &closedState,
+					CreatedAt: &closedAt,
+					UpdatedAt: &closedAt,
+					ClosedAt:  &closedAt,
 				}, nil
 			}
 			return nil, fmt.Errorf("unexpected issue %d", number)
@@ -12925,19 +13073,27 @@ func TestPersistGitHubCommentsRollsBackRecoveryWrites(t *testing.T) {
 		assert := assert.New(t)
 		require := require.New(t)
 		database := openTestDB(t)
+		repo := RepoRef{
+			Platform: platform.KindGitHub, PlatformHost: "github.com",
+			Owner: "owner", Name: "repo", RepoPath: "owner/repo",
+		}
 		repoID, err := database.UpsertRepo(t.Context(), db.GitHubRepoIdentity("github.com", "owner", "repo"))
 		require.NoError(err)
 		now := time.Now().UTC().Truncate(time.Second)
 		mr := &db.MergeRequest{RepoID: repoID, PlatformID: 101, Number: 1, URL: "https://github.com/owner/repo/pull/1", Title: "PR", Author: "alice", State: "open", CreatedAt: now, UpdatedAt: now, LastActivityAt: now, CommentCount: 1}
 		mr.ID, err = database.UpsertMergeRequest(t.Context(), mr)
 		require.NoError(err)
+		mr, err = database.GetMergeRequestByRepoIDAndNumber(t.Context(), repoID, 1)
+		require.NoError(err)
+		require.NotNil(mr)
 		oldID := int64(11)
 		require.NoError(database.UpsertMREvents(t.Context(), []db.MREvent{{MergeRequestID: mr.ID, PlatformID: &oldID, EventType: "issue_comment", CreatedAt: now, DedupeKey: "old"}}))
 		_, err = database.WriteDB().ExecContext(t.Context(), `CREATE TRIGGER reject_github_pr_comment_count BEFORE UPDATE OF comment_count ON middleman_merge_requests BEGIN SELECT RAISE(ABORT, 'reject count'); END`)
 		require.NoError(err)
 
 		newID, body, login := int64(12), "new", "bob"
-		err = (&Syncer{db: database}).persistPRComments(t.Context(), mr, []*gh.IssueComment{{ID: &newID, Body: &body, User: &gh.User{Login: &login}, CreatedAt: &gh.Timestamp{Time: now}}})
+		syncer := NewSyncerWithRegistry(nil, database, nil, []RepoRef{repo}, time.Minute, nil, nil)
+		err = syncer.persistPRComments(t.Context(), repo, mr, []*gh.IssueComment{{ID: &newID, Body: &body, User: &gh.User{Login: &login}, CreatedAt: &gh.Timestamp{Time: now}}})
 		require.Error(err)
 		events, err := database.ListMREvents(t.Context(), mr.ID)
 		require.NoError(err)
@@ -12953,19 +13109,27 @@ func TestPersistGitHubCommentsRollsBackRecoveryWrites(t *testing.T) {
 		assert := assert.New(t)
 		require := require.New(t)
 		database := openTestDB(t)
+		repo := RepoRef{
+			Platform: platform.KindGitHub, PlatformHost: "github.com",
+			Owner: "owner", Name: "repo", RepoPath: "owner/repo",
+		}
 		repoID, err := database.UpsertRepo(t.Context(), db.GitHubRepoIdentity("github.com", "owner", "repo"))
 		require.NoError(err)
 		now := time.Now().UTC().Truncate(time.Second)
 		issue := &db.Issue{RepoID: repoID, PlatformID: 201, Number: 2, URL: "https://github.com/owner/repo/issues/2", Title: "Issue", Author: "alice", State: "open", CreatedAt: now, UpdatedAt: now, LastActivityAt: now, CommentCount: 1}
 		issue.ID, err = database.UpsertIssue(t.Context(), issue)
 		require.NoError(err)
+		issue, err = database.GetIssueByRepoIDAndNumber(t.Context(), repoID, 2)
+		require.NoError(err)
+		require.NotNil(issue)
 		oldID := int64(21)
 		require.NoError(database.UpsertIssueEvents(t.Context(), []db.IssueEvent{{IssueID: issue.ID, PlatformID: &oldID, EventType: "issue_comment", CreatedAt: now, DedupeKey: "old"}}))
 		_, err = database.WriteDB().ExecContext(t.Context(), `CREATE TRIGGER reject_github_issue_comment_count BEFORE UPDATE OF comment_count ON middleman_issues BEGIN SELECT RAISE(ABORT, 'reject count'); END`)
 		require.NoError(err)
 
 		newID, body, login := int64(22), "new", "bob"
-		err = (&Syncer{db: database}).persistIssueComments(t.Context(), issue, []*gh.IssueComment{{ID: &newID, Body: &body, User: &gh.User{Login: &login}, CreatedAt: &gh.Timestamp{Time: now}}})
+		syncer := NewSyncerWithRegistry(nil, database, nil, []RepoRef{repo}, time.Minute, nil, nil)
+		err = syncer.persistIssueComments(t.Context(), repo, issue, []*gh.IssueComment{{ID: &newID, Body: &body, User: &gh.User{Login: &login}, CreatedAt: &gh.Timestamp{Time: now}}})
 		require.Error(err)
 		events, err := database.ListIssueEvents(t.Context(), issue.ID)
 		require.NoError(err)
@@ -13345,7 +13509,7 @@ func TestDeferredCommentRefreshYieldsBudgetToDetailDrain(t *testing.T) {
 	d := openTestDB(t)
 
 	now := time.Date(2026, 4, 20, 12, 0, 0, 0, time.UTC)
-	budget := testBudget(12)
+	budget := testBudget(14)
 	repoID, err := d.UpsertRepo(ctx, db.GitHubRepoIdentity("github.com", "owner", "repo"))
 	require.NoError(err)
 	repo := RepoRef{Owner: "owner", Name: "repo", PlatformHost: "github.com"}
@@ -13435,8 +13599,8 @@ func TestDeferredCommentRefreshYieldsBudgetToDetailDrain(t *testing.T) {
 	require.NotNil(pr)
 	assert.NotNil(pr.DetailFetchedAt,
 		"detail drain should win before unchanged large-thread refresh")
-	assert.Equal([]int{2}, commentCalls,
-		"only the detail-drain PR should spend the remaining budget")
+	assert.Equal([]int{2, 1}, commentCalls,
+		"detail drain should spend first, before the deferred large-thread refresh")
 }
 
 func TestSyncerGQLRateTrackers(t *testing.T) {

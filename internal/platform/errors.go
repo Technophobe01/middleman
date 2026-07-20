@@ -10,6 +10,7 @@ type PlatformErrorCode string
 
 const (
 	ErrCodeUnsupportedCapability PlatformErrorCode = "unsupported_capability"
+	ErrCodeProviderContract      PlatformErrorCode = "provider_contract"
 	ErrCodeProviderNotConfigured PlatformErrorCode = "provider_not_configured"
 	ErrCodeMissingToken          PlatformErrorCode = "missing_token"
 	ErrCodeInvalidRepoRef        PlatformErrorCode = "invalid_repo_ref"
@@ -25,10 +26,16 @@ const (
 	// the request was understood but the target's current state refuses
 	// it (for example merging an unmergeable MR).
 	ErrCodeConflict PlatformErrorCode = "conflict"
+	// ErrCodePageLimit marks a whole-dataset drain that exceeded the
+	// caller-side page budget. The provider did nothing wrong — the dataset
+	// is larger than a single in-memory collection supports; unbounded
+	// datasets belong on the durable-cursor archive path.
+	ErrCodePageLimit PlatformErrorCode = "page_limit"
 )
 
 var (
 	ErrUnsupportedCapability = &Error{Code: ErrCodeUnsupportedCapability}
+	ErrProviderContract      = &Error{Code: ErrCodeProviderContract}
 	ErrProviderNotConfigured = &Error{Code: ErrCodeProviderNotConfigured}
 	ErrMissingToken          = &Error{Code: ErrCodeMissingToken}
 	ErrInvalidRepoRef        = &Error{Code: ErrCodeInvalidRepoRef}
@@ -38,7 +45,26 @@ var (
 	ErrRateLimited           = &Error{Code: ErrCodeRateLimited}
 	ErrStaleState            = &Error{Code: ErrCodeStaleState}
 	ErrConflict              = &Error{Code: ErrCodeConflict}
+	ErrPageLimit             = &Error{Code: ErrCodePageLimit}
 )
+
+// ErrArchiveAttemptBudget is returned by budget-counting transports when an
+// archive request exhausts its admitted per-attempt allowance. It bounds the
+// total wire attempts for one admitted request — including provider-SDK and
+// authentication retries — to the admitted archive cost, so a single admitted
+// request can never overspend the protected live floor. Archive work treats it
+// as a transient budget deferral and must never let it surface as a
+// repository-blocking contract error.
+var ErrArchiveAttemptBudget = errors.New("archive per-attempt allowance exhausted")
+
+// ErrLookupInaccessible marks a single-item lookup that the provider has
+// explicitly classified as inaccessible rather than a generic authentication
+// or permission failure.
+var ErrLookupInaccessible = errors.New("lookup explicitly classified as inaccessible")
+
+// ErrLookupNotPresent marks a parent item lookup that the provider has
+// explicitly classified as removed or moved.
+var ErrLookupNotPresent = errors.New("parent item lookup explicitly classified as not present")
 
 type Error struct {
 	Code         PlatformErrorCode
@@ -60,7 +86,12 @@ type Error struct {
 	// without parsing Hint prose. Keys must not collide with the
 	// reserved problem members (reason, provider, platformHost).
 	Details map[string]string
-	Err     error
+	// Destination identifies where an item now lives when a not_found error
+	// stems from a moved lookup outcome (repository transfer). Callers still
+	// branch on Code; the destination is structured, actionable detail for
+	// retargeting the reference instead of parsing prose.
+	Destination *RepoRef
+	Err         error
 }
 
 func (e *Error) Error() string {
@@ -110,5 +141,27 @@ func UnsupportedCapability(kind Kind, host, capability string) error {
 		Provider:     kind,
 		PlatformHost: host,
 		Capability:   capability,
+	}
+}
+
+func PermissionDenied(kind Kind, host string, err error) error {
+	return &Error{
+		Code: ErrCodePermissionDenied, Provider: kind, PlatformHost: host, Err: err,
+	}
+}
+
+func ProviderContract(kind Kind, host, field string, err error) error {
+	// Provider response validation may itself use typed caller-side helpers.
+	// Strip those classifications here: an upstream contract failure must not
+	// also match invalid_repo_ref or another request error through Unwrap.
+	if err != nil {
+		err = errors.New(err.Error())
+	}
+	return &Error{
+		Code:         ErrCodeProviderContract,
+		Provider:     kind,
+		PlatformHost: host,
+		Field:        field,
+		Err:          err,
 	}
 }

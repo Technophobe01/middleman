@@ -10,97 +10,10 @@ import (
 	"go.kenn.io/middleman/internal/platform/gitealike"
 )
 
-func (c *Client) GetRepository(ctx context.Context, ref platform.RepoRef) (platform.Repository, error) {
-	return c.provider.GetRepository(ctx, ref)
-}
-
-func (c *Client) ListRepositories(
-	ctx context.Context,
-	owner string,
-	opts platform.RepositoryListOptions,
-) ([]platform.Repository, error) {
-	return c.provider.ListRepositories(ctx, owner, opts)
-}
-
-func (c *Client) ListOpenMergeRequests(
-	ctx context.Context,
-	ref platform.RepoRef,
-) ([]platform.MergeRequest, error) {
-	return c.provider.ListOpenMergeRequests(ctx, ref)
-}
-
-func (c *Client) GetMergeRequest(
-	ctx context.Context,
-	ref platform.RepoRef,
-	number int,
-) (platform.MergeRequest, error) {
-	return c.provider.GetMergeRequest(ctx, ref, number)
-}
-
-func (c *Client) ListMergeRequestEvents(
-	ctx context.Context,
-	ref platform.RepoRef,
-	number int,
-) ([]platform.MergeRequestEvent, error) {
-	return c.provider.ListMergeRequestEvents(ctx, ref, number)
-}
-
-func (c *Client) ListMergeRequestComments(ctx context.Context, ref platform.RepoRef, number int) ([]platform.MergeRequestEvent, error) {
-	return c.provider.ListMergeRequestComments(ctx, ref, number)
-}
-
-func (c *Client) ListOpenIssues(ctx context.Context, ref platform.RepoRef) ([]platform.Issue, error) {
-	return c.provider.ListOpenIssues(ctx, ref)
-}
-
-func (c *Client) GetIssue(
-	ctx context.Context,
-	ref platform.RepoRef,
-	number int,
-) (platform.Issue, error) {
-	return c.provider.GetIssue(ctx, ref, number)
-}
-
-func (c *Client) ListIssueEvents(
-	ctx context.Context,
-	ref platform.RepoRef,
-	number int,
-) ([]platform.IssueEvent, error) {
-	return c.provider.ListIssueEvents(ctx, ref, number)
-}
-
-func (c *Client) ListIssueComments(ctx context.Context, ref platform.RepoRef, number int) ([]platform.IssueEvent, error) {
-	return c.provider.ListIssueComments(ctx, ref, number)
-}
-
-func (c *Client) ListReleases(ctx context.Context, ref platform.RepoRef) ([]platform.Release, error) {
-	return c.provider.ListReleases(ctx, ref)
-}
-
-func (c *Client) ListTags(ctx context.Context, ref platform.RepoRef) ([]platform.Tag, error) {
-	return c.provider.ListTags(ctx, ref)
-}
-
-func (c *Client) ListCIChecks(
-	ctx context.Context,
-	ref platform.RepoRef,
-	sha string,
-) ([]platform.CICheck, error) {
-	return c.provider.ListCIChecks(ctx, ref, sha)
-}
-
-func (c *Client) ListLabels(
-	ctx context.Context,
-	ref platform.RepoRef,
-) (platform.LabelCatalog, error) {
-	return c.provider.ListLabels(ctx, ref)
-}
-
 func (t *transport) GetRepository(
 	ctx context.Context,
 	owner, repo string,
 ) (gitealike.RepositoryDTO, error) {
-	t.spendSyncBudget(ctx)
 	var repository *forgejosdk.Repository
 	var resp *forgejosdk.Response
 	err := t.withRequestContext(ctx, func() error {
@@ -119,7 +32,6 @@ func (t *transport) ListUserRepositories(
 	owner string,
 	opts gitealike.PageOptions,
 ) ([]gitealike.RepositoryDTO, gitealike.Page, error) {
-	t.spendSyncBudget(ctx)
 	var repos []*forgejosdk.Repository
 	var resp *forgejosdk.Response
 	err := t.withRequestContext(ctx, func() error {
@@ -140,7 +52,6 @@ func (t *transport) ListOrgRepositories(
 	owner string,
 	opts gitealike.PageOptions,
 ) ([]gitealike.RepositoryDTO, gitealike.Page, error) {
-	t.spendSyncBudget(ctx)
 	var repos []*forgejosdk.Repository
 	var resp *forgejosdk.Response
 	err := t.withRequestContext(ctx, func() error {
@@ -161,7 +72,6 @@ func (t *transport) ListOpenPullRequests(
 	ref platform.RepoRef,
 	opts gitealike.PageOptions,
 ) ([]gitealike.PullRequestDTO, gitealike.Page, error) {
-	t.spendSyncBudget(ctx)
 	var prs []*forgejosdk.PullRequest
 	var resp *forgejosdk.Response
 	err := t.withRequestContext(ctx, func() error {
@@ -183,7 +93,6 @@ func (t *transport) GetPullRequest(
 	ref platform.RepoRef,
 	number int,
 ) (gitealike.PullRequestDTO, error) {
-	t.spendSyncBudget(ctx)
 	var pr *forgejosdk.PullRequest
 	var resp *forgejosdk.Response
 	err := t.withRequestContext(ctx, func() error {
@@ -222,7 +131,6 @@ func (t *transport) ListPullRequestComments(
 	number int,
 	opts gitealike.PageOptions,
 ) ([]gitealike.CommentDTO, gitealike.Page, error) {
-	t.spendSyncBudget(ctx)
 	var comments []*forgejosdk.Comment
 	var resp *forgejosdk.Response
 	err := t.withRequestContext(ctx, func() error {
@@ -244,7 +152,6 @@ func (t *transport) ListPullRequestReviews(
 	number int,
 	opts gitealike.PageOptions,
 ) ([]gitealike.ReviewDTO, gitealike.Page, error) {
-	t.spendSyncBudget(ctx)
 	var reviews []*forgejosdk.PullReview
 	var resp *forgejosdk.Response
 	err := t.withRequestContext(ctx, func() error {
@@ -266,7 +173,6 @@ func (t *transport) ListPullRequestCommits(
 	number int,
 	opts gitealike.PageOptions,
 ) ([]gitealike.CommitDTO, gitealike.Page, error) {
-	t.spendSyncBudget(ctx)
 	var commits []*forgejosdk.Commit
 	var resp *forgejosdk.Response
 	err := t.withRequestContext(ctx, func() error {
@@ -287,7 +193,6 @@ func (t *transport) ListOpenIssues(
 	ref platform.RepoRef,
 	opts gitealike.PageOptions,
 ) ([]gitealike.IssueDTO, gitealike.Page, error) {
-	t.spendSyncBudget(ctx)
 	var issues []*forgejosdk.Issue
 	var resp *forgejosdk.Response
 	err := t.withRequestContext(ctx, func() error {
@@ -305,12 +210,44 @@ func (t *transport) ListOpenIssues(
 	return convertIssues(issues), forgejoPage(resp), nil
 }
 
+func (t *transport) ListIssuesPage(ctx context.Context, ref platform.RepoRef, opts gitealike.ArchiveListOptions) ([]gitealike.IssueDTO, gitealike.Page, error) {
+	var issues []*forgejosdk.Issue
+	var resp *forgejosdk.Response
+	err := t.withRequestContext(ctx, func() error {
+		var err error
+		issues, resp, err = t.api.ListRepoIssues(ref.Owner, ref.Name, forgejosdk.ListIssueOption{
+			ListOptions: forgejoListOptions(opts.PageOptions), State: forgejosdk.StateAll,
+			Type: forgejosdk.IssueTypeIssue, Since: opts.Since, Before: opts.Before,
+		})
+		return err
+	})
+	if err != nil {
+		return nil, gitealike.Page{}, forgejoHTTPError(resp, err)
+	}
+	return convertIssues(issues), forgejoPage(resp), nil
+}
+
+func (t *transport) ListPullRequestsPage(ctx context.Context, ref platform.RepoRef, opts gitealike.ArchiveListOptions) ([]gitealike.PullRequestDTO, gitealike.Page, error) {
+	var prs []*forgejosdk.PullRequest
+	var resp *forgejosdk.Response
+	err := t.withRequestContext(ctx, func() error {
+		var err error
+		prs, resp, err = t.api.ListRepoPullRequests(ref.Owner, ref.Name, forgejosdk.ListPullRequestsOptions{
+			ListOptions: forgejoListOptions(opts.PageOptions), State: forgejosdk.StateAll, Sort: opts.Sort,
+		})
+		return err
+	})
+	if err != nil {
+		return nil, gitealike.Page{}, forgejoHTTPError(resp, err)
+	}
+	return convertPullRequests(prs, t.mergeableForPullRequest), forgejoPage(resp), nil
+}
+
 func (t *transport) GetIssue(
 	ctx context.Context,
 	ref platform.RepoRef,
 	number int,
 ) (gitealike.IssueDTO, error) {
-	t.spendSyncBudget(ctx)
 	var issue *forgejosdk.Issue
 	var resp *forgejosdk.Response
 	err := t.withRequestContext(ctx, func() error {
@@ -338,7 +275,6 @@ func (t *transport) ListReleases(
 	ref platform.RepoRef,
 	opts gitealike.PageOptions,
 ) ([]gitealike.ReleaseDTO, gitealike.Page, error) {
-	t.spendSyncBudget(ctx)
 	var releases []*forgejosdk.Release
 	var resp *forgejosdk.Response
 	err := t.withRequestContext(ctx, func() error {
@@ -359,7 +295,6 @@ func (t *transport) ListTags(
 	ref platform.RepoRef,
 	opts gitealike.PageOptions,
 ) ([]gitealike.TagDTO, gitealike.Page, error) {
-	t.spendSyncBudget(ctx)
 	var tags []*forgejosdk.Tag
 	var resp *forgejosdk.Response
 	err := t.withRequestContext(ctx, func() error {
@@ -380,7 +315,6 @@ func (t *transport) ListRepoLabels(
 	ref platform.RepoRef,
 	opts gitealike.PageOptions,
 ) ([]gitealike.LabelDTO, gitealike.Page, error) {
-	t.spendSyncBudget(ctx)
 	var labels []*forgejosdk.Label
 	var resp *forgejosdk.Response
 	err := t.withRequestContext(ctx, func() error {
@@ -402,7 +336,6 @@ func (t *transport) ListStatuses(
 	sha string,
 	opts gitealike.PageOptions,
 ) ([]gitealike.StatusDTO, gitealike.Page, error) {
-	t.spendSyncBudget(ctx)
 	var statuses []*forgejosdk.Status
 	var resp *forgejosdk.Response
 	err := t.withRequestContext(ctx, func() error {
@@ -424,7 +357,6 @@ func (t *transport) ListActionRuns(
 	sha string,
 	opts gitealike.PageOptions,
 ) ([]gitealike.ActionRunDTO, gitealike.Page, error) {
-	t.spendSyncBudget(ctx)
 	var runs *forgejosdk.ListActionRunsResponse
 	var resp *forgejosdk.Response
 	err := t.withRequestContext(ctx, func() error {
@@ -469,7 +401,7 @@ func forgejoPage(resp *forgejosdk.Response) gitealike.Page {
 	if resp == nil {
 		return gitealike.Page{}
 	}
-	return gitealike.Page{Next: resp.NextPage}
+	return gitealike.Page{Next: resp.NextPage, Last: resp.LastPage}
 }
 
 func forgejoHTTPError(resp *forgejosdk.Response, err error) error {

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	gitlab "gitlab.com/gitlab-org/api/client-go/v2"
+	ghsync "go.kenn.io/middleman/internal/github"
 	"go.kenn.io/middleman/internal/platform"
 	"go.kenn.io/middleman/internal/ratelimit"
 	"go.kenn.io/middleman/internal/tokenauth"
@@ -28,6 +29,7 @@ type clientOptions struct {
 	baseURL           string
 	foregroundTimeout time.Duration
 	rateTracker       *ratelimit.RateTracker
+	budget            *ghsync.SyncBudget
 	disableRetries    bool
 }
 
@@ -85,6 +87,12 @@ func WithRateTracker(rateTracker *ratelimit.RateTracker) ClientOption {
 	}
 }
 
+func WithSyncBudget(budget *ghsync.SyncBudget) ClientOption {
+	return func(opts *clientOptions) {
+		opts.budget = budget
+	}
+}
+
 func WithoutRetriesForTesting() ClientOption {
 	return func(opts *clientOptions) {
 		opts.disableRetries = true
@@ -105,6 +113,9 @@ func NewClient(host string, source tokenauth.Source, options ...ClientOption) (*
 		clientOptions = append(clientOptions, gitlab.WithoutRetries())
 	}
 	baseTransport := http.DefaultTransport
+	if opts.budget != nil {
+		baseTransport = &syncBudgetTransport{base: baseTransport, budget: opts.budget}
+	}
 	if opts.rateTracker != nil {
 		baseTransport = &rateTrackingTransport{
 			base:        baseTransport,
@@ -136,6 +147,26 @@ func NewClient(host string, source tokenauth.Source, options ...ClientOption) (*
 	}, nil
 }
 
+type syncBudgetTransport struct {
+	base   http.RoundTripper
+	budget *ghsync.SyncBudget
+}
+
+func (t *syncBudgetTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if !ghsync.ConsumeArchiveAttemptAllowance(req.Context()) {
+		return nil, platform.ErrArchiveAttemptBudget
+	}
+	resp, err := t.base.RoundTrip(req)
+	if ghsync.IsSyncBudgetContext(req.Context()) {
+		if ghsync.IsArchiveSyncBudgetContext(req.Context()) {
+			t.budget.SpendArchive(1)
+		} else {
+			t.budget.Spend(1)
+		}
+	}
+	return resp, err
+}
+
 type rateTrackingTransport struct {
 	base        http.RoundTripper
 	rateTracker *ratelimit.RateTracker
@@ -163,7 +194,14 @@ func parseRateLimitHeaders(resp *http.Response) (ratelimit.Rate, bool) {
 		return ratelimit.Rate{}, false
 	}
 	limit, _ := parseHeaderInt(resp, "RateLimit-Limit", "X-RateLimit-Limit")
-	resetAt := time.Now().UTC().Add(time.Minute)
+	// Leave Reset at its zero value when the provider doesn't supply a
+	// reset header, matching the GitHub REST transport's behavior
+	// (parseRateLimitHeaders in graphql.go). A synthesized near-future
+	// reset here would look "plausible" to the archive budget's
+	// SyncBudget.ArchiveSpendCeiling and release archive surplus that no
+	// provider signal actually justifies; only a provider-observed reset
+	// may do that.
+	var resetAt time.Time
 	if resetUnix, ok := parseHeaderInt64(resp, "RateLimit-Reset", "X-RateLimit-Reset"); ok {
 		resetAt = time.Unix(resetUnix, 0).UTC()
 	}
@@ -234,6 +272,11 @@ func (c *Client) Capabilities() platform.Capabilities {
 		ReadReviewThreads:      true,
 		NativeMultilineRanges:  false,
 		MutationHeadBinding:    true,
+		Archive: platform.ArchiveCapabilities{
+			HistoricalIssues:     true,
+			OrdinaryComments:     true,
+			InlineReviewComments: true,
+		},
 		// GitLab has no native "request changes" review state, so
 		// request_changes is intentionally absent.
 		SupportedReviewActions: []platform.ReviewAction{
@@ -299,84 +342,26 @@ func (c *Client) PreviewNamespace(
 	return result.finish(), nil
 }
 
-func (c *Client) ListOpenMergeRequests(
-	ctx context.Context,
-	ref platform.RepoRef,
-) ([]platform.MergeRequest, error) {
-	pid, normalizedRef, err := c.projectScopedArg(ctx, ref)
-	if err != nil {
-		return nil, err
-	}
-	state := "opened"
-	recheck := true
-	opt := &gitlab.ListProjectMergeRequestsOptions{
-		State:                  &state,
-		WithMergeStatusRecheck: &recheck,
-		ListOptions: gitlab.ListOptions{
-			Page:    1,
-			PerPage: defaultPageSize,
-		},
-	}
-
-	var out []platform.MergeRequest
-	for {
-		mrs, resp, err := c.api.MergeRequests.ListProjectMergeRequests(pid, opt, gitlab.WithContext(ctx))
-		if err != nil {
-			return nil, mapGitLabError("list_merge_requests", err)
-		}
-		for _, mr := range mrs {
-			normalized := NormalizeMergeRequest(normalizedRef, mr, nil)
-			normalized.HeadRepoCloneURL, err = c.optionalHeadRepoCloneURL(ctx, normalizedRef, mr.ProjectID, mr.SourceProjectID)
-			if err != nil {
-				return nil, err
-			}
-			out = append(out, normalized)
-		}
-		if resp == nil || resp.NextPage == 0 {
-			return out, nil
-		}
-		opt.Page = resp.NextPage
-	}
-}
-
-func (c *Client) GetMergeRequest(
-	ctx context.Context,
-	ref platform.RepoRef,
-	number int,
-) (platform.MergeRequest, error) {
-	pid, normalizedRef, err := c.projectScopedArg(ctx, ref)
-	if err != nil {
-		return platform.MergeRequest{}, err
-	}
-	mr, _, err := c.api.MergeRequests.GetMergeRequest(pid, int64(number), nil, gitlab.WithContext(ctx))
-	if err != nil {
-		return platform.MergeRequest{}, mapGitLabError("get_merge_request", err)
-	}
-	normalized := NormalizeDetailedMergeRequest(normalizedRef, mr)
-	normalized.HeadRepoCloneURL, err = c.optionalHeadRepoCloneURL(ctx, normalizedRef, mr.ProjectID, mr.SourceProjectID)
-	if err != nil {
-		return platform.MergeRequest{}, err
-	}
-	return normalized, nil
-}
-
 func (c *Client) optionalHeadRepoCloneURL(
 	ctx context.Context,
 	ref platform.RepoRef,
 	targetProjectID int64,
 	sourceProjectID int64,
-) (string, error) {
+) (string, bool, error) {
+	if sourceProjectID == 0 {
+		return "", true, nil
+	}
 	cloneURL, err := c.headRepoCloneURL(ctx, ref, targetProjectID, sourceProjectID)
 	if err == nil {
-		return cloneURL, nil
+		return cloneURL, false, nil
 	}
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		return "", ctxErr
+		return "", false, ctxErr
 	}
 	if isUnavailableSourceProjectError(err) {
-		return "", nil
+		return "", true, nil
 	}
-	return "", err
+	return "", false, err
 }
 
 func (c *Client) headRepoCloneURL(
@@ -385,7 +370,7 @@ func (c *Client) headRepoCloneURL(
 	targetProjectID int64,
 	sourceProjectID int64,
 ) (string, error) {
-	if sourceProjectID == 0 || sourceProjectID == targetProjectID || sourceProjectID == ref.PlatformID {
+	if sourceProjectID == targetProjectID {
 		return ref.CloneURL, nil
 	}
 	return c.projectCloneURL(ctx, sourceProjectID)
@@ -420,6 +405,61 @@ func (c *Client) projectCloneURL(ctx context.Context, projectID int64) (string, 
 	return cloneURL, nil
 }
 
+func (c *Client) ListOpenMergeRequests(
+	ctx context.Context,
+	ref platform.RepoRef,
+) ([]platform.MergeRequest, error) {
+	pid, normalizedRef, err := c.projectScopedArg(ctx, ref)
+	if err != nil {
+		return nil, err
+	}
+	state := "opened"
+	recheck := true
+	opt := &gitlab.ListProjectMergeRequestsOptions{
+		State: &state, WithMergeStatusRecheck: &recheck,
+		ListOptions: gitlab.ListOptions{Page: 1, PerPage: defaultPageSize},
+	}
+	var out []platform.MergeRequest
+	for {
+		mrs, resp, err := c.api.MergeRequests.ListProjectMergeRequests(pid, opt, gitlab.WithContext(ctx))
+		if err != nil {
+			return nil, mapGitLabError("list_merge_requests", err)
+		}
+		for _, mr := range mrs {
+			normalized := NormalizeMergeRequest(normalizedRef, mr, nil)
+			normalized.HeadRepoCloneURL, normalized.HeadRepoCloneURLUnknown, err =
+				c.optionalHeadRepoCloneURL(ctx, normalizedRef, mr.ProjectID, mr.SourceProjectID)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, normalized)
+		}
+		if resp == nil || resp.NextPage == 0 {
+			return out, nil
+		}
+		opt.Page = resp.NextPage
+	}
+}
+
+func (c *Client) GetMergeRequest(
+	ctx context.Context,
+	ref platform.RepoRef,
+	number int,
+) (platform.MergeRequest, error) {
+	pid, normalizedRef, err := c.projectScopedArg(ctx, ref)
+	if err != nil {
+		return platform.MergeRequest{}, err
+	}
+	mr, _, err := c.api.MergeRequests.GetMergeRequest(pid, int64(number), nil, gitlab.WithContext(ctx))
+	if err != nil {
+		return platform.MergeRequest{}, mapGitLabError("get_merge_request", err)
+	}
+	normalized := NormalizeDetailedMergeRequest(normalizedRef, mr)
+	normalized.HeadRepoCloneURL, normalized.HeadRepoCloneURLUnknown, err =
+		c.optionalHeadRepoCloneURL(ctx, normalizedRef, mr.ProjectID, mr.SourceProjectID)
+	return normalized, err
+}
+
 func (c *Client) ListMergeRequestEvents(
 	ctx context.Context,
 	ref platform.RepoRef,
@@ -429,7 +469,7 @@ func (c *Client) ListMergeRequestEvents(
 	if err != nil {
 		return nil, err
 	}
-	discussions, err := c.listMergeRequestDiscussions(ctx, pid, number)
+	events, err := c.listMergeRequestDiscussionEvents(ctx, pid, normalizedRef, number)
 	if err != nil {
 		return nil, err
 	}
@@ -437,13 +477,6 @@ func (c *Client) ListMergeRequestEvents(
 	if err != nil {
 		return nil, err
 	}
-
-	events := NormalizeMergeRequestDiscussions(
-		normalizedRef,
-		number,
-		gitLabMergeRequestURL(normalizedRef, number),
-		discussions,
-	)
 	for _, commit := range commits {
 		events = append(events, NormalizeCommitEvent(normalizedRef, number, commit))
 	}
@@ -455,11 +488,39 @@ func (c *Client) ListMergeRequestComments(ctx context.Context, ref platform.Repo
 	if err != nil {
 		return nil, err
 	}
-	discussions, err := c.listMergeRequestDiscussions(ctx, pid, number)
+	return c.listMergeRequestDiscussionEvents(ctx, pid, normalizedRef, number)
+}
+
+// listMergeRequestDiscussionEvents drains the shared discussions page fetcher
+// without the canonical ordinary-comment filter: the live event surface keeps
+// system-note events (assignment and lifecycle history) and position-less
+// replies inside inline threads, which the archive comments dataset
+// deliberately excludes.
+func (c *Client) listMergeRequestDiscussionEvents(
+	ctx context.Context,
+	pid any,
+	normalizedRef platform.RepoRef,
+	number int,
+) ([]platform.MergeRequestEvent, error) {
+	discussions, err := collectGitLabPages(ctx, func(ctx context.Context, page int64) ([]*gitlab.Discussion, int64, error) {
+		discussions, nextPage, err := c.listMergeRequestDiscussionsPage(ctx, pid, number, page)
+		if err != nil {
+			return nil, 0, c.mapGitLabError("list_merge_request_discussions", err)
+		}
+		return discussions, nextPage, nil
+	})
 	if err != nil {
 		return nil, err
 	}
 	return NormalizeMergeRequestDiscussions(normalizedRef, number, gitLabMergeRequestURL(normalizedRef, number), discussions), nil
+}
+
+func (c *Client) ListIssueEvents(
+	ctx context.Context,
+	ref platform.RepoRef,
+	number int,
+) ([]platform.IssueEvent, error) {
+	return c.ListIssueComments(ctx, ref, number)
 }
 
 func (c *Client) ListOpenIssues(ctx context.Context, ref platform.RepoRef) ([]platform.Issue, error) {
@@ -469,13 +530,8 @@ func (c *Client) ListOpenIssues(ctx context.Context, ref platform.RepoRef) ([]pl
 	}
 	state := "opened"
 	opt := &gitlab.ListProjectIssuesOptions{
-		State: &state,
-		ListOptions: gitlab.ListOptions{
-			Page:    1,
-			PerPage: defaultPageSize,
-		},
+		State: &state, ListOptions: gitlab.ListOptions{Page: 1, PerPage: defaultPageSize},
 	}
-
 	var out []platform.Issue
 	for {
 		issues, resp, err := c.api.Issues.ListProjectIssues(pid, opt, gitlab.WithContext(ctx))
@@ -504,27 +560,6 @@ func (c *Client) GetIssue(ctx context.Context, ref platform.RepoRef, number int)
 	return NormalizeIssue(normalizedRef, issue), nil
 }
 
-func (c *Client) ListIssueEvents(
-	ctx context.Context,
-	ref platform.RepoRef,
-	number int,
-) ([]platform.IssueEvent, error) {
-	pid, normalizedRef, err := c.projectScopedArg(ctx, ref)
-	if err != nil {
-		return nil, err
-	}
-	discussions, err := c.listIssueDiscussions(ctx, pid, number)
-	if err != nil {
-		return nil, err
-	}
-	return NormalizeIssueDiscussions(
-		normalizedRef,
-		number,
-		gitLabIssueURL(normalizedRef, number),
-		discussions,
-	), nil
-}
-
 func (c *Client) ListIssueComments(ctx context.Context, ref platform.RepoRef, number int) ([]platform.IssueEvent, error) {
 	pid, normalizedRef, err := c.projectScopedArg(ctx, ref)
 	if err != nil {
@@ -535,6 +570,16 @@ func (c *Client) ListIssueComments(ctx context.Context, ref platform.RepoRef, nu
 		return nil, err
 	}
 	return NormalizeIssueDiscussions(normalizedRef, number, gitLabIssueURL(normalizedRef, number), discussions), nil
+}
+
+func (c *Client) listIssueDiscussions(ctx context.Context, pid any, number int) ([]*gitlab.Discussion, error) {
+	return collectGitLabPages(ctx, func(ctx context.Context, page int64) ([]*gitlab.Discussion, int64, error) {
+		discussions, nextPage, err := c.listIssueDiscussionsPage(ctx, pid, number, page)
+		if err != nil {
+			return nil, 0, c.mapGitLabError("list_issue_discussions", err)
+		}
+		return discussions, nextPage, nil
+	})
 }
 
 func (c *Client) ListReleases(ctx context.Context, ref platform.RepoRef) ([]platform.Release, error) {
@@ -622,38 +667,6 @@ func (c *Client) ListCIChecks(
 		return nil, nil
 	}
 	return []platform.CICheck{NormalizePipeline(normalizedRef, pipelines[0])}, nil
-}
-
-func (c *Client) listMergeRequestDiscussions(ctx context.Context, pid any, number int) ([]*gitlab.Discussion, error) {
-	opt := &gitlab.ListMergeRequestDiscussionsOptions{ListOptions: gitlab.ListOptions{Page: 1, PerPage: defaultPageSize}}
-	var out []*gitlab.Discussion
-	for {
-		discussions, resp, err := c.api.Discussions.ListMergeRequestDiscussions(pid, int64(number), opt, gitlab.WithContext(ctx))
-		if err != nil {
-			return nil, mapGitLabError("list_merge_request_discussions", err)
-		}
-		out = append(out, discussions...)
-		if resp == nil || resp.NextPage == 0 {
-			return out, nil
-		}
-		opt.Page = resp.NextPage
-	}
-}
-
-func (c *Client) listIssueDiscussions(ctx context.Context, pid any, number int) ([]*gitlab.Discussion, error) {
-	opt := &gitlab.ListIssueDiscussionsOptions{ListOptions: gitlab.ListOptions{Page: 1, PerPage: defaultPageSize}}
-	var out []*gitlab.Discussion
-	for {
-		discussions, resp, err := c.api.Discussions.ListIssueDiscussions(pid, int64(number), opt, gitlab.WithContext(ctx))
-		if err != nil {
-			return nil, mapGitLabError("list_issue_discussions", err)
-		}
-		out = append(out, discussions...)
-		if resp == nil || resp.NextPage == 0 {
-			return out, nil
-		}
-		opt.Page = resp.NextPage
-	}
 }
 
 func (c *Client) listMergeRequestCommits(ctx context.Context, pid any, number int) ([]*gitlab.Commit, error) {

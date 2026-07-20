@@ -18,20 +18,66 @@ import (
 )
 
 var (
-	_ gitealike.Transport         = (*transport)(nil)
-	_ gitealike.ActionsTransport  = (*transport)(nil)
-	_ platform.RepositoryReader   = (*Client)(nil)
-	_ platform.MergeRequestReader = (*Client)(nil)
-	_ platform.IssueReader        = (*Client)(nil)
-	_ platform.ReleaseReader      = (*Client)(nil)
-	_ platform.TagReader          = (*Client)(nil)
-	_ platform.CIReader           = (*Client)(nil)
-	_ platform.CommentMutator     = (*Client)(nil)
-	_ platform.StateMutator       = (*Client)(nil)
-	_ platform.MergeMutator       = (*Client)(nil)
-	_ platform.ReviewMutator      = (*Client)(nil)
-	_ platform.IssueMutator       = (*Client)(nil)
+	_ gitealike.Transport             = (*transport)(nil)
+	_ gitealike.ActionsTransport      = (*transport)(nil)
+	_ platform.RepositoryReader       = (*Client)(nil)
+	_ platform.MergeRequestReader     = (*Client)(nil)
+	_ platform.IssueReader            = (*Client)(nil)
+	_ platform.ReleaseReader          = (*Client)(nil)
+	_ platform.TagReader              = (*Client)(nil)
+	_ platform.CIReader               = (*Client)(nil)
+	_ platform.CommentMutator         = (*Client)(nil)
+	_ platform.StateMutator           = (*Client)(nil)
+	_ platform.MergeMutator           = (*Client)(nil)
+	_ platform.ReviewMutator          = (*Client)(nil)
+	_ platform.IssueMutator           = (*Client)(nil)
+	_ platform.IssuePageReader        = (*Client)(nil)
+	_ platform.MergeRequestPageReader = (*Client)(nil)
 )
+
+func TestArchiveInventoryUsesAllStateOrderingAndOneBudgetedRequestPerPage(t *testing.T) {
+	assert := assert.New(t)
+	require := Require.New(t)
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v1/repos/owner/repo/issues":
+			assert.Equal("all", r.URL.Query().Get("state"))
+			assert.Equal("issues", r.URL.Query().Get("type"))
+			assert.NotEmpty(r.URL.Query().Get("before"))
+			_, _ = w.Write([]byte(`[{"id":1,"number":1,"state":"closed","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z"}]`))
+		case "/api/v1/repos/owner/repo/pulls":
+			assert.Equal("all", r.URL.Query().Get("state"))
+			assert.Equal("oldest", r.URL.Query().Get("sort"))
+			_, _ = w.Write([]byte(`[{"id":2,"number":2,"state":"closed","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z"}]`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	budget := ghsync.NewSyncBudget(20)
+	client, err := NewClient("gitea.test", testTokenSource("token"), WithBaseURLForTesting(server.URL), WithSyncBudget(budget))
+	require.NoError(err)
+	ref := platform.RepoRef{Platform: platform.KindGitea, Host: "gitea.test", Owner: "owner", Name: "repo"}
+	ctx := ghsync.WithArchiveSyncBudget(context.Background())
+
+	issues, err := client.ListIssuesPage(ctx, ref, platform.ItemPageQuery{
+		Order: platform.ItemOrderCreated,
+	})
+	require.NoError(err)
+	pulls, err := client.ListMergeRequestsPage(ctx, ref, platform.ItemPageQuery{
+		Order: platform.ItemOrderCreated,
+	})
+	require.NoError(err)
+
+	assert.Len(issues.Items, 1)
+	assert.Len(pulls.Items, 1)
+	assert.Equal(2, requests)
+	assert.Equal(2, budget.Spent())
+	assert.Equal(2, budget.ArchiveSpent())
+}
 
 func TestClientLooksUpRepositoryAndSendsToken(t *testing.T) {
 	assert := assert.New(t)
@@ -265,6 +311,10 @@ func TestClientProviderIdentityExposesReadCapabilities(t *testing.T) {
 			platform.ReviewActionComment,
 			platform.ReviewActionApprove,
 			platform.ReviewActionRequestChanges,
+		},
+		Archive: platform.ArchiveCapabilities{
+			HistoricalIssues: true, HistoricalMergeRequests: true,
+			OrdinaryComments: true, SubmittedReviews: true,
 		},
 	}, client.Capabilities())
 }
@@ -607,9 +657,20 @@ func TestClientMapsNotFoundResponsesToPlatformError(t *testing.T) {
 	require := Require.New(t)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal("/api/v1/repos/owner/repo/pulls/99", r.URL.Path)
-		w.WriteHeader(http.StatusNotFound)
-		assert.NoError(json.NewEncoder(w).Encode(map[string]string{"message": "not found"}))
+		switch r.URL.Path {
+		case "/api/v1/repos/owner/repo/pulls/99":
+			w.WriteHeader(http.StatusNotFound)
+			assert.NoError(json.NewEncoder(w).Encode(map[string]string{"message": "not found"}))
+		case "/api/v1/repos/owner/repo":
+			// The lookup classification probes the repository to tell item
+			// removal apart from repository-level access loss.
+			assert.NoError(json.NewEncoder(w).Encode(map[string]any{
+				"id": 1, "name": "repo", "full_name": "owner/repo",
+				"owner": map[string]any{"login": "owner"},
+			}))
+		default:
+			http.NotFound(w, r)
+		}
 	}))
 	defer server.Close()
 

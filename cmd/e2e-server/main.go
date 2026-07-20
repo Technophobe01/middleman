@@ -171,17 +171,30 @@ func (p e2eStaticProvider) ListRepositories(
 	return repos, nil
 }
 
+func (p e2eStaticProvider) ListIssuesPage(
+	_ context.Context,
+	ref platform.RepoRef,
+	query platform.ItemPageQuery,
+) (platform.Page[platform.Issue], error) {
+	if err := platform.ValidateItemPageQuery(query); err != nil {
+		return platform.Page[platform.Issue]{}, err
+	}
+	if ref.RepoPath != p.issue.Repo.RepoPath {
+		return platform.Page[platform.Issue]{Exhausted: true}, nil
+	}
+	return platform.Page[platform.Issue]{
+		Items: []platform.Issue{p.issue}, Exhausted: true,
+	}, nil
+}
+
 func (p e2eStaticProvider) ListOpenIssues(
 	_ context.Context,
 	ref platform.RepoRef,
 ) ([]platform.Issue, error) {
-	if ref.RepoPath != p.issue.Repo.RepoPath {
-		return nil, nil
+	if ref.RepoPath == p.issue.Repo.RepoPath && p.issue.State == "open" {
+		return []platform.Issue{p.issue}, nil
 	}
-	if p.issue.State != "open" {
-		return nil, nil
-	}
-	return []platform.Issue{p.issue}, nil
+	return nil, nil
 }
 
 func (p e2eStaticProvider) GetIssue(
@@ -192,7 +205,7 @@ func (p e2eStaticProvider) GetIssue(
 	if ref.RepoPath == p.issue.Repo.RepoPath && number == p.issue.Number {
 		return p.issue, nil
 	}
-	return platform.Issue{}, fmt.Errorf("e2e static provider: issue %s#%d not found", ref.RepoPath, number)
+	return platform.Issue{}, platform.ErrNotFound
 }
 
 func (p e2eStaticProvider) ListIssueEvents(
@@ -1439,6 +1452,7 @@ func buildAppState(
 		srv.Hub().Broadcast(server.Event{Type: "data_changed", Data: struct{}{}})
 	})
 	var failNextRepoBrowserTree atomic.Bool
+	var failNextNotificationRead atomic.Bool
 	rootHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost && r.URL.Path == "/__e2e/activity/pr-comment" {
 			if srv.SubscriberCount() == 0 {
@@ -1478,6 +1492,38 @@ func buildAppState(
 			strings.HasSuffix(r.URL.Path, "/browser/tree") &&
 			failNextRepoBrowserTree.CompareAndSwap(true, false) {
 			http.Error(w, "tree failed", http.StatusInternalServerError)
+			return
+		}
+		if r.Method == http.MethodPost &&
+			r.URL.Path == "/__e2e/notifications/fail-next-read" {
+			failNextNotificationRead.Store(true)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if r.Method == http.MethodPost &&
+			r.URL.Path == "/api/v1/notifications/read" &&
+			failNextNotificationRead.CompareAndSwap(true, false) {
+			var input struct {
+				IDs []int64 `json:"ids"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&input); err != nil || len(input.IDs) == 0 {
+				http.Error(w, "notification ids required", http.StatusBadRequest)
+				return
+			}
+			failed := make([]map[string]any, 0, len(input.IDs))
+			for _, id := range input.IDs {
+				failed = append(failed, map[string]any{
+					"id": id, "error": "fixture notification read failure",
+				})
+			}
+			w.Header().Set("Content-Type", "application/json")
+			if err := json.NewEncoder(w).Encode(map[string]any{
+				"succeeded": []int64{},
+				"queued":    []int64{},
+				"failed":    failed,
+			}); err != nil {
+				slog.Warn("write notification read failure fixture", "err", err)
+			}
 			return
 		}
 		if r.Method == http.MethodPost && r.URL.Path == "/__e2e/review-suggestion/succeed" {

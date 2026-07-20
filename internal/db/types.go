@@ -30,36 +30,30 @@ type LabelCatalogFreshness struct {
 }
 
 type Repo struct {
-	ID                       int64
-	Platform                 string
-	PlatformHost             string
-	PlatformRepoID           string `json:"-"`
-	Owner                    string
-	Name                     string
-	RepoPath                 string `json:"-"`
-	OwnerKey                 string `json:"-"`
-	NameKey                  string `json:"-"`
-	RepoPathKey              string `json:"-"`
-	WebURL                   string `json:"-"`
-	CloneURL                 string `json:"-"`
-	DefaultBranch            string `json:"-"`
-	LastSyncStartedAt        *time.Time
-	LastSyncCompletedAt      *time.Time
-	LastSyncError            string
-	AllowSquashMerge         bool
-	AllowMergeCommit         bool
-	AllowRebaseMerge         bool
-	ViewerCanMerge           bool
-	BackfillPRPage           int
-	BackfillPRComplete       bool
-	BackfillPRCompletedAt    *time.Time
-	BackfillIssuePage        int
-	BackfillIssueComplete    bool
-	BackfillIssueCompletedAt *time.Time
-	LabelCatalogSyncedAt     *time.Time
-	LabelCatalogCheckedAt    *time.Time
-	LabelCatalogSyncError    string
-	CreatedAt                time.Time
+	ID                    int64
+	Platform              string
+	PlatformHost          string
+	PlatformRepoID        string `json:"-"`
+	Owner                 string
+	Name                  string
+	RepoPath              string `json:"-"`
+	OwnerKey              string `json:"-"`
+	NameKey               string `json:"-"`
+	RepoPathKey           string `json:"-"`
+	WebURL                string `json:"-"`
+	CloneURL              string `json:"-"`
+	DefaultBranch         string `json:"-"`
+	LastSyncStartedAt     *time.Time
+	LastSyncCompletedAt   *time.Time
+	LastSyncError         string
+	AllowSquashMerge      bool
+	AllowMergeCommit      bool
+	AllowRebaseMerge      bool
+	ViewerCanMerge        bool
+	LabelCatalogSyncedAt  *time.Time
+	LabelCatalogCheckedAt *time.Time
+	LabelCatalogSyncError string
+	CreatedAt             time.Time
 }
 
 func (r Repo) FullName() string {
@@ -83,6 +77,423 @@ type RepoProviderMetadata struct {
 	WebURL         string
 	CloneURL       string
 	DefaultBranch  string
+}
+
+type ArchiveCollectionMode string
+
+const (
+	ArchiveCollectionModeDiscovery ArchiveCollectionMode = "discovery"
+	ArchiveCollectionModeFull      ArchiveCollectionMode = "full"
+)
+
+type ArchiveOperatorState string
+
+const (
+	ArchiveOperatorStateActive ArchiveOperatorState = "active"
+	ArchiveOperatorStatePaused ArchiveOperatorState = "paused"
+)
+
+type ArchiveItemType string
+
+const (
+	ArchiveItemTypeIssue        ArchiveItemType = "issue"
+	ArchiveItemTypeMergeRequest ArchiveItemType = "merge_request"
+)
+
+type ArchiveLifecycleState string
+
+const (
+	ArchiveLifecycleStateActive          ArchiveLifecycleState = "active"
+	ArchiveLifecycleStateRemovedUpstream ArchiveLifecycleState = "removed_upstream"
+	ArchiveLifecycleStateInaccessible    ArchiveLifecycleState = "inaccessible"
+)
+
+type ArchiveDataset string
+
+const (
+	ArchiveDatasetLookup ArchiveDataset = "lookup"
+)
+
+// ArchiveScanKind names one repository-level scan with durable cursor state.
+type ArchiveScanKind string
+
+const (
+	ArchiveScanIssueInventory           ArchiveScanKind = "issue_inventory"
+	ArchiveScanMergeRequestInventory    ArchiveScanKind = "merge_request_inventory"
+	ArchiveScanMaintenanceIssues        ArchiveScanKind = "maintenance_issues"
+	ArchiveScanMaintenanceMergeRequests ArchiveScanKind = "maintenance_merge_requests"
+)
+
+// ArchiveScanStatus is the lifecycle of one repository-level scan row.
+type ArchiveScanStatus string
+
+const (
+	ArchiveScanPending  ArchiveScanStatus = "pending"
+	ArchiveScanRunning  ArchiveScanStatus = "running"
+	ArchiveScanComplete ArchiveScanStatus = "complete"
+	ArchiveScanBlocked  ArchiveScanStatus = "blocked"
+	ArchiveScanFailed   ArchiveScanStatus = "failed"
+)
+
+// ArchiveScanState is the durable progress of one repository-level scan:
+// historical inventory or maintenance, per item type. The scans table is the
+// single authority for repository cursors.
+type ArchiveScanState struct {
+	Generation      int64
+	NextCursor      *string
+	LastInputCursor *string
+	PageCount       int
+	Status          ArchiveScanStatus
+	LastErrorCode   *string
+	LastErrorDetail *string
+}
+
+// Complete reports whether the scan reached explicit end-of-pagination in its
+// current generation.
+func (s ArchiveScanState) Complete() bool { return s.Status == ArchiveScanComplete }
+
+// Blocked reports whether the scan durably stopped.
+func (s ArchiveScanState) Blocked() bool { return s.Status == ArchiveScanBlocked }
+
+// Cursor returns the durable next input cursor, empty for page one.
+func (s ArchiveScanState) Cursor() string {
+	if s.NextCursor == nil {
+		return ""
+	}
+	return *s.NextCursor
+}
+
+// StaleArchiveScanError reports an inventory or maintenance page commit whose
+// scan generation or input cursor no longer matches the durable scan row.
+type StaleArchiveScanError struct {
+	RepoID             int64
+	Scan               ArchiveScanKind
+	ExpectedGeneration int64
+	GotGeneration      int64
+	ExpectedCursor     string
+	GotCursor          string
+	// GotStatus is set when the scan's status alone rejected the commit (a
+	// completed scan accepts nothing but an exact final-page replay).
+	GotStatus ArchiveScanStatus
+}
+
+func (e *StaleArchiveScanError) Error() string {
+	return fmt.Sprintf(
+		"stale archive scan for repo %d %s: generation %d/%d, cursor %q/%q",
+		e.RepoID, e.Scan,
+		e.ExpectedGeneration, e.GotGeneration,
+		e.ExpectedCursor, e.GotCursor,
+	)
+}
+
+// ArchiveDatasetProgressStatus is the lifecycle of one dataset progress row.
+type ArchiveDatasetProgressStatus string
+
+const (
+	ArchiveDatasetProgressPending     ArchiveDatasetProgressStatus = "pending"
+	ArchiveDatasetProgressRunning     ArchiveDatasetProgressStatus = "running"
+	ArchiveDatasetProgressComplete    ArchiveDatasetProgressStatus = "complete"
+	ArchiveDatasetProgressUnsupported ArchiveDatasetProgressStatus = "unsupported"
+	ArchiveDatasetProgressBlocked     ArchiveDatasetProgressStatus = "blocked"
+	ArchiveDatasetProgressFailed      ArchiveDatasetProgressStatus = "failed"
+	ArchiveDatasetProgressTerminal    ArchiveDatasetProgressStatus = "terminal"
+)
+
+// ArchiveLookupOutcome mirrors platform.ArchiveLookupOutcome values.
+// internal/db cannot import internal/platform (platform imports db), so the
+// outcome is re-declared here with identical string values.
+type ArchiveLookupOutcome string
+
+const (
+	ArchiveLookupPresent      ArchiveLookupOutcome = "present"
+	ArchiveLookupRemoved      ArchiveLookupOutcome = "removed"
+	ArchiveLookupMoved        ArchiveLookupOutcome = "moved"
+	ArchiveLookupInaccessible ArchiveLookupOutcome = "inaccessible"
+)
+
+// ArchiveItemSyncCommit records the outcome of running the existing full item
+// sync for archive hydration. Provider content is already persisted by the
+// syncer; this commit advances only archive progress and terminal lifecycle.
+type ArchiveItemSyncCommit struct {
+	RepoID         int64
+	ItemType       ArchiveItemType
+	ItemNumber     int
+	ScanGeneration int64
+	Outcome        ArchiveLookupOutcome
+	Destination    *RepoIdentity
+	ErrorCode      string
+	ErrorDetail    string
+	Now            time.Time
+}
+
+// ArchiveDatasetProgressKey addresses one dataset progress row.
+type ArchiveDatasetProgressKey struct {
+	RepoID     int64
+	ItemType   ArchiveItemType
+	ItemNumber int
+	Dataset    ArchiveDataset
+}
+
+// ArchiveDatasetProgress is one durable dataset progress row. It carries
+// progress metadata only, never provider content.
+type ArchiveDatasetProgress struct {
+	RepoID          int64
+	ItemType        ArchiveItemType
+	ItemNumber      int
+	Dataset         ArchiveDataset
+	ParentRevision  int64
+	ScanGeneration  int64
+	NextCursor      *string
+	LastInputCursor *string
+	PageCount       int
+	Status          ArchiveDatasetProgressStatus
+	ObservedCount   int
+	AttemptCount    int
+	NextRetryAt     *time.Time
+	LastErrorCode   *string
+	LastErrorDetail *string
+	StartedAt       *time.Time
+	CompletedAt     *time.Time
+	UpdatedAt       time.Time
+}
+
+// StaleDatasetProgressError reports a page or lookup commit whose revision,
+// generation, or cursor no longer matches durable dataset progress.
+type StaleDatasetProgressError struct {
+	RepoID             int64
+	ItemType           ArchiveItemType
+	ItemNumber         int
+	Dataset            ArchiveDataset
+	ExpectedRevision   int64
+	GotRevision        int64
+	ExpectedGeneration int64
+	GotGeneration      int64
+	ExpectedCursor     string
+	GotCursor          string
+	// GotStatus is set when the row's status alone rejected the commit (a
+	// completed, unsupported, or terminal dataset accepts no page advances).
+	GotStatus ArchiveDatasetProgressStatus
+}
+
+func (e *StaleDatasetProgressError) Error() string {
+	return fmt.Sprintf(
+		"stale dataset progress for repo %d %s %d %s: revision %d/%d, generation %d/%d, cursor %q/%q",
+		e.RepoID, e.ItemType, e.ItemNumber, e.Dataset,
+		e.ExpectedRevision, e.GotRevision,
+		e.ExpectedGeneration, e.GotGeneration,
+		e.ExpectedCursor, e.GotCursor,
+	)
+}
+
+// ScanBlockedError reports a scan that stopped spending provider requests.
+type ScanBlockedError struct {
+	Scope  string
+	Reason string
+}
+
+func (e *ScanBlockedError) Error() string {
+	return fmt.Sprintf("scan blocked for %s: %s", e.Scope, e.Reason)
+}
+
+type ArchiveErrorCode string
+
+const (
+	ArchiveErrorCodeBudgetExhausted      ArchiveErrorCode = "budget_exhausted"
+	ArchiveErrorCodeAuthentication       ArchiveErrorCode = "authentication_failed"
+	ArchiveErrorCodeRepoBlocked          ArchiveErrorCode = "repository_blocked"
+	ArchiveErrorCodeTransient            ArchiveErrorCode = "transient"
+	ArchiveErrorCodeConfigurationRemoved ArchiveErrorCode = "configuration_removed"
+)
+
+type ArchiveCoverage string
+
+const (
+	ArchiveCoverageUnknown     ArchiveCoverage = "unknown"
+	ArchiveCoverageSupported   ArchiveCoverage = "supported"
+	ArchiveCoverageUnsupported ArchiveCoverage = "unsupported"
+)
+
+type ArchiveCoverageSet struct {
+	Comments       ArchiveCoverage
+	Reviews        ArchiveCoverage
+	InlineComments ArchiveCoverage
+}
+
+type ArchiveRefreshReason string
+
+const (
+	ArchiveRefreshReasonInitial ArchiveRefreshReason = "initial"
+	ArchiveRefreshReasonPrompt  ArchiveRefreshReason = "prompt"
+)
+
+type ArchiveRepoState struct {
+	RepoID                   int64
+	CollectionMode           ArchiveCollectionMode
+	OperatorState            ArchiveOperatorState
+	IssueInventory           ArchiveScanState
+	MergeRequestInventory    ArchiveScanState
+	MaintenanceIssues        ArchiveScanState
+	MaintenanceMergeRequests ArchiveScanState
+	InitialStartedAt         *time.Time
+	InitialCompletedAt       *time.Time
+	MaintenanceWatermark     *time.Time
+	MaintenanceSucceededAt   *time.Time
+	PromptScanStartedAt      *time.Time
+	PromptSince              *time.Time
+	CommentsCoverage         ArchiveCoverage
+	ReviewsCoverage          ArchiveCoverage
+	InlineCommentsCoverage   ArchiveCoverage
+	LastErrorCode            *string
+	LastErrorDetail          *string
+	NextRetryAt              *time.Time
+	CreatedAt                time.Time
+	UpdatedAt                time.Time
+}
+
+// Scan returns the durable state of one repository-level scan.
+func (s ArchiveRepoState) Scan(kind ArchiveScanKind) ArchiveScanState {
+	switch kind {
+	case ArchiveScanIssueInventory:
+		return s.IssueInventory
+	case ArchiveScanMergeRequestInventory:
+		return s.MergeRequestInventory
+	case ArchiveScanMaintenanceIssues:
+		return s.MaintenanceIssues
+	case ArchiveScanMaintenanceMergeRequests:
+		return s.MaintenanceMergeRequests
+	default:
+		return ArchiveScanState{}
+	}
+}
+
+// ArchiveRepoStateNotFoundError reports repository IDs that do not satisfy an
+// archive lifecycle operation's durable precondition.
+type ArchiveRepoStateNotFoundError struct {
+	RepoIDs []int64
+}
+
+func (e *ArchiveRepoStateNotFoundError) Error() string {
+	return fmt.Sprintf("archive repository state not found for repo IDs %v", e.RepoIDs)
+}
+
+type ArchiveItemState struct {
+	RepoID            int64
+	ItemType          ArchiveItemType
+	ItemNumber        int
+	ProviderItemID    string
+	ProviderCreatedAt time.Time
+	ProviderUpdatedAt time.Time
+	LifecycleState    ArchiveLifecycleState
+	RefreshReason     ArchiveRefreshReason
+}
+
+type ClaimArchiveItemOpts struct {
+	RepoIDs []int64
+	Now     time.Time
+}
+
+// IssueSnapshot and MergeRequestSnapshot contain provider-owned content from
+// one read. Complete flags are explicit so partial pagination can never erase
+// a previously complete family.
+type IssueSnapshot struct {
+	Issue                    Issue
+	Labels                   []Label
+	OrdinaryComments         []IssueEvent
+	OrdinaryCommentsComplete bool
+	DerivedFields            *IssueDerivedFields
+}
+
+type MergeRequestSnapshot struct {
+	MergeRequest             MergeRequest
+	Labels                   []Label
+	OrdinaryComments         []MREvent
+	OrdinaryCommentsComplete bool
+	SubmittedReviews         []MREvent
+	SubmittedReviewsComplete bool
+	InlineComments           []MREvent
+	ReviewThreads            []MRReviewThread
+	InlineCommentsComplete   bool
+	DerivedFields            *MRDerivedFields
+}
+
+type ArchiveInventoryItem struct {
+	Number            int
+	ProviderItemID    string
+	ProviderCreatedAt time.Time
+	ProviderUpdatedAt time.Time
+}
+
+type ArchiveInventoryCommit struct {
+	RepoID        int64
+	ItemType      ArchiveItemType
+	RefreshReason ArchiveRefreshReason
+	Items         []ArchiveInventoryItem
+	// ScanGeneration and InputCursor bind the page to the durable scan row
+	// with compare-and-swap semantics: a response from before an explicit
+	// reset cannot advance the new generation, and a duplicate delivery of
+	// the already-committed page is an idempotent no-op.
+	ScanGeneration int64
+	InputCursor    string
+	NextCursor     string
+	Exhausted      bool
+	Now            time.Time
+}
+
+// ArchiveItemWork is one claimable archive hydration operation.
+type ArchiveItemWork struct {
+	RepoID            int64
+	ItemType          ArchiveItemType
+	ItemNumber        int
+	ProviderCreatedAt time.Time
+	ScanGeneration    int64
+}
+
+type ArchiveStatus string
+
+const (
+	ArchiveStatusRunning          ArchiveStatus = "running"
+	ArchiveStatusWaitingForBudget ArchiveStatus = "waiting_for_budget"
+	ArchiveStatusCurrent          ArchiveStatus = "current"
+	ArchiveStatusPartial          ArchiveStatus = "partial"
+	ArchiveStatusPaused           ArchiveStatus = "paused"
+	ArchiveStatusBlocked          ArchiveStatus = "blocked"
+)
+
+type ArchivePhase string
+
+const (
+	ArchivePhaseIssueInventory        ArchivePhase = "issue_inventory"
+	ArchivePhaseMergeRequestInventory ArchivePhase = "merge_request_inventory"
+	ArchivePhaseHydration             ArchivePhase = "hydration"
+	ArchivePhasePromptMaintenance     ArchivePhase = "prompt_maintenance"
+)
+
+type ArchiveProgressOpts struct {
+	RepoIDs []int64
+	Now     time.Time
+}
+
+type ArchiveProgressCounts struct {
+	ItemCount         int
+	CompleteItemCount int
+	PendingItemCount  int
+	FailedItemCount   int
+	// UnsupportedItemCount counts items with at least one unsupported dataset.
+	UnsupportedItemCount  int
+	InaccessibleItemCount int
+	DueItemCount          int
+	// BlockedItemCount counts active items with at least one blocked dataset scan.
+	BlockedItemCount int
+}
+
+// ArchiveRepoProgress is derived from durable repository and item state. It is
+// intentionally separate from ArchiveRepoState, which represents stored data.
+type ArchiveRepoProgress struct {
+	RepoID          int64
+	Status          ArchiveStatus
+	ActivePhases    []ArchivePhase
+	Counts          ArchiveProgressCounts
+	BudgetWaitUntil *time.Time
 }
 
 type RepoSummary struct {
@@ -172,6 +583,7 @@ type RepoIssueHeadline struct {
 
 type MergeRequest struct {
 	ID                 int64
+	SnapshotRevision   int64 `json:"-"`
 	RepoID             int64
 	PlatformID         int64
 	PlatformExternalID string
@@ -194,20 +606,25 @@ type MergeRequest struct {
 	DiffBaseSHA      string `json:"-"`
 	MergeBaseSHA     string `json:"-"`
 	HeadRepoCloneURL string
-	Additions        int
-	Deletions        int
-	CommentCount     int
-	ReviewDecision   string
-	CIStatus         string
-	CIChecksJSON     string
-	CreatedAt        time.Time
-	UpdatedAt        time.Time
-	LastActivityAt   time.Time
-	MergedAt         *time.Time
-	ClosedAt         *time.Time
-	MergeableState   string
-	DetailFetchedAt  *time.Time
-	CIHadPending     bool
+	// HeadRepoCloneURLUnknown is not a column: it marks HeadRepoCloneURL as
+	// undetermined for this snapshot (a failed best-effort enrichment), so
+	// the upsert preserves the previously stored value instead of clearing
+	// it. An authoritative empty HeadRepoCloneURL leaves it false.
+	HeadRepoCloneURLUnknown bool `json:"-"`
+	Additions               int
+	Deletions               int
+	CommentCount            int
+	ReviewDecision          string
+	CIStatus                string
+	CIChecksJSON            string
+	CreatedAt               time.Time
+	UpdatedAt               time.Time
+	LastActivityAt          time.Time
+	MergedAt                *time.Time
+	ClosedAt                *time.Time
+	MergeableState          string
+	DetailFetchedAt         *time.Time
+	CIHadPending            bool
 	// WorkflowApprovalCheckedAt is when middleman last reconciled the
 	// workflow-approval state for this merge request. Nil means never
 	// checked; the GET path treats persisted state as authoritative
@@ -441,6 +858,7 @@ type RepoFilter struct {
 
 type Issue struct {
 	ID                 int64
+	SnapshotRevision   int64 `json:"-"`
 	RepoID             int64
 	PlatformID         int64
 	PlatformExternalID string
