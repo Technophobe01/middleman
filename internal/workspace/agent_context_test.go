@@ -224,31 +224,100 @@ func TestRenderAgentContextKeepsMultilineMetadataInListItems(t *testing.T) {
 	assert.NotContains(rendered, " ")
 }
 
+func TestAgentContextRelPathMatchesCaseFoldedAgentFamilyPrefixes(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		targetKey string
+		want      string
+	}{
+		{name: "codex builtin", targetKey: "codex", want: "AGENTS.override.md"},
+		{name: "codex configured suffix", targetKey: "Codex yolo", want: "AGENTS.override.md"},
+		{name: "codex surrounding whitespace", targetKey: "  CODEX proxy  ", want: "AGENTS.override.md"},
+		{name: "claude builtin", targetKey: "claude", want: "CLAUDE.local.md"},
+		{name: "claude configured suffix", targetKey: "Claude reviewer", want: "CLAUDE.local.md"},
+		{name: "unrelated agent", targetKey: "opencode"},
+		{name: "prefix must begin name", targetKey: "my-codex"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.want, agentContextRelPath(tt.targetKey))
+		})
+	}
+}
+
+func TestRenderAgentInstructionFile(t *testing.T) {
+	t.Parallel()
+	ctx := AgentContext{
+		WorkspaceID: "ws-1", SourceKind: AgentSourceKindPullRequest,
+		Provider: "github", PlatformHost: "github.com",
+		RepoOwner: "acme", RepoName: "widget", ItemNumber: 42,
+	}
+	wantContext := RenderAgentContext(ctx)
+	tests := []struct {
+		name          string
+		relPath       string
+		agentsEntry   string
+		agentsContent string
+		want          string
+	}{
+		{
+			name: "codex appends instructions verbatim", relPath: "AGENTS.override.md",
+			agentsEntry: "file", agentsContent: "# Repository Rules\nkeep trailing bytes",
+			want: wantContext + "\n# Repository Rules\nkeep trailing bytes",
+		},
+		{name: "codex missing instructions", relPath: "AGENTS.override.md", want: wantContext},
+		{name: "codex unreadable instructions", relPath: "AGENTS.override.md", agentsEntry: "directory", want: wantContext},
+		{name: "codex rejects symlinked instructions", relPath: "AGENTS.override.md", agentsEntry: "symlink", agentsContent: "host secret", want: wantContext},
+		{name: "codex rejects oversized instructions", relPath: "AGENTS.override.md", agentsEntry: "file", agentsContent: strings.Repeat("x", (1<<20)+1), want: wantContext},
+		{name: "claude remains context only", relPath: "CLAUDE.local.md", agentsEntry: "file", agentsContent: "# Repository Rules\n", want: wantContext},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			require := require.New(t)
+			dir := t.TempDir()
+			switch tt.agentsEntry {
+			case "file":
+				require.NoError(os.WriteFile(filepath.Join(dir, "AGENTS.md"), []byte(tt.agentsContent), 0o644))
+			case "directory":
+				require.NoError(os.Mkdir(filepath.Join(dir, "AGENTS.md"), 0o755))
+			case "symlink":
+				target := filepath.Join(t.TempDir(), "AGENTS.md")
+				require.NoError(os.WriteFile(target, []byte(tt.agentsContent), 0o644))
+				require.NoError(os.Symlink(target, filepath.Join(dir, "AGENTS.md")))
+			}
+			assert.Equal(t, tt.want, string(renderAgentInstructionFile(dir, tt.relPath, ctx)))
+		})
+	}
+}
+
 func TestGeneratedFileWritable(t *testing.T) {
 	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	dir := t.TempDir()
 
-	writable, err := generatedFileWritable(filepath.Join(dir, "absent.md"))
+	writable, err := generatedFileWritable(dir, "absent.md")
 	require.NoError(err)
 	assert.True(writable, "absent file is writable")
 
 	marked := filepath.Join(dir, "marked.md")
 	require.NoError(os.WriteFile(marked, []byte(generatedAgentContextMarker+"\nold\n"), 0o644))
-	writable, err = generatedFileWritable(marked)
+	writable, err = generatedFileWritable(dir, "marked.md")
 	require.NoError(err)
 	assert.True(writable, "middleman-marked file is refreshable")
 
 	user := filepath.Join(dir, "user.md")
 	require.NoError(os.WriteFile(user, []byte("# Mine\n"), 0o644))
-	writable, err = generatedFileWritable(user)
+	writable, err = generatedFileWritable(dir, "user.md")
 	require.NoError(err)
 	assert.False(writable, "unmarked user file is preserved")
 
 	legacy := filepath.Join(dir, "legacy.md")
 	require.NoError(os.WriteFile(legacy, []byte(legacyGeneratedAgentContextMarkers[0]+"\nold pointer\n"), 0o644))
-	writable, err = generatedFileWritable(legacy)
+	writable, err = generatedFileWritable(dir, "legacy.md")
 	require.NoError(err)
 	assert.True(writable, "files with the previous marker stay middleman-owned")
 
@@ -256,9 +325,22 @@ func TestGeneratedFileWritable(t *testing.T) {
 	require.NoError(os.WriteFile(linkTarget, []byte(generatedAgentContextMarker+"\n"), 0o644))
 	link := filepath.Join(dir, "link.md")
 	require.NoError(os.Symlink(linkTarget, link))
-	writable, err = generatedFileWritable(link)
+	writable, err = generatedFileWritable(dir, "link.md")
 	require.NoError(err)
 	assert.False(writable, "symlink is preserved even when its target carries the marker")
+
+	outside := t.TempDir()
+	require.NoError(os.WriteFile(filepath.Join(outside, "marked.md"), []byte(generatedAgentContextMarker+"\n"), 0o644))
+	require.NoError(os.Symlink(outside, filepath.Join(dir, "escape")))
+	writable, err = generatedFileWritable(dir, filepath.Join("escape", "marked.md"))
+	require.Error(err)
+	assert.False(writable, "intermediate symlink cannot escape the worktree")
+
+	oversized := filepath.Join(dir, "oversized.md")
+	require.NoError(os.WriteFile(oversized, []byte(generatedAgentContextMarker+strings.Repeat("x", (1<<20)+1)), 0o644))
+	writable, err = generatedFileWritable(dir, "oversized.md")
+	require.NoError(err)
+	assert.True(writable, "large middleman-owned files are recognized from a bounded prefix")
 }
 
 func TestWriteGeneratedFileAtomicRefusesSymlinkedTarget(t *testing.T) {
@@ -268,15 +350,15 @@ func TestWriteGeneratedFileAtomicRefusesSymlinkedTarget(t *testing.T) {
 	worktree := t.TempDir()
 	victim := filepath.Join(t.TempDir(), "victim.md")
 	require.NoError(os.WriteFile(victim, []byte("original\n"), 0o644))
-	require.NoError(os.Symlink(victim, filepath.Join(worktree, "AGENTS.local.md")))
+	require.NoError(os.Symlink(victim, filepath.Join(worktree, "AGENTS.override.md")))
 
-	err := writeGeneratedFileAtomic(worktree, "AGENTS.local.md", []byte("context\n"))
+	err := writeGeneratedFileAtomic(worktree, "AGENTS.override.md", []byte("context\n"))
 	require.Error(err)
 	assert.Contains(err.Error(), "non-regular file")
 	content, err := os.ReadFile(victim)
 	require.NoError(err)
 	assert.Equal("original\n", string(content))
-	info, err := os.Lstat(filepath.Join(worktree, "AGENTS.local.md"))
+	info, err := os.Lstat(filepath.Join(worktree, "AGENTS.override.md"))
 	require.NoError(err)
 	assert.NotZero(info.Mode()&os.ModeSymlink, "symlink must remain in place")
 }
@@ -299,14 +381,14 @@ func TestPrepareAgentLaunchContextSkipsSymlinkedFile(t *testing.T) {
 
 	target := filepath.Join(t.TempDir(), "user-agents.md")
 	require.NoError(os.WriteFile(target, []byte("# User context\n"), 0o644))
-	require.NoError(os.Symlink(target, filepath.Join(worktree, "AGENTS.local.md")))
+	require.NoError(os.Symlink(target, filepath.Join(worktree, "AGENTS.override.md")))
 
 	require.NoError(mgr.PrepareAgentLaunchContext(t.Context(), PrepareAgentLaunchContextOptions{
 		WorkspaceID: ws.ID,
 		TargetKey:   "codex",
 	}))
 
-	info, err := os.Lstat(filepath.Join(worktree, "AGENTS.local.md"))
+	info, err := os.Lstat(filepath.Join(worktree, "AGENTS.override.md"))
 	require.NoError(err)
 	assert.NotZero(info.Mode()&os.ModeSymlink, "existing symlink must be preserved")
 	content, err := os.ReadFile(target)
@@ -339,7 +421,7 @@ func TestPrepareAgentLaunchContextUsesSyncedHeadBranchForPushTarget(t *testing.T
 		TargetKey:   "codex",
 	}))
 
-	content, err := os.ReadFile(filepath.Join(worktree, "AGENTS.local.md"))
+	content, err := os.ReadFile(filepath.Join(worktree, "AGENTS.override.md"))
 	require.NoError(err)
 	assert.Contains(string(content), "Push branch: feature/widgets-renamed on origin (updates this PR)")
 	assert.NotContains(string(content), "Working branch")
@@ -372,7 +454,7 @@ func TestPrepareAgentLaunchContextRefreshesLegacyUnknownHeadRepo(t *testing.T) {
 		TargetKey:   "codex",
 	}))
 
-	content, err := os.ReadFile(filepath.Join(worktree, "AGENTS.local.md"))
+	content, err := os.ReadFile(filepath.Join(worktree, "AGENTS.override.md"))
 	require.NoError(err)
 	assert.Contains(
 		string(content),
@@ -409,7 +491,7 @@ func TestPrepareAgentLaunchContextPreservesUserFileAndRefreshesMarkedFile(t *tes
 	assert.Equal("# Hook context\n", string(local), "user-owned file must not be rewritten")
 
 	// A middleman-marked file from an earlier launch is refreshed in place.
-	agentsPath := filepath.Join(worktree, "AGENTS.local.md")
+	agentsPath := filepath.Join(worktree, "AGENTS.override.md")
 	require.NoError(os.WriteFile(agentsPath, []byte(generatedAgentContextMarker+"\nstale\n"), 0o644))
 	require.NoError(mgr.PrepareAgentLaunchContext(t.Context(), PrepareAgentLaunchContextOptions{
 		WorkspaceID: ws.ID,
@@ -420,5 +502,5 @@ func TestPrepareAgentLaunchContextPreservesUserFileAndRefreshesMarkedFile(t *tes
 	assert.Contains(string(refreshed), "Source kind: pull request")
 	assert.Contains(string(refreshed), "PR: #42")
 	assert.NotContains(string(refreshed), "stale")
-	assertGitIgnored(t, worktree, "AGENTS.local.md")
+	assertGitIgnored(t, worktree, "AGENTS.override.md")
 }
