@@ -476,7 +476,10 @@ type Syncer struct {
 	branchActivityRetention  time.Duration
 	branchActivityMaxCommits int
 	parallelism              atomic.Int32
+	runMu                    sync.Mutex
 	running                  atomic.Bool
+	exclusiveRun             bool // guarded by runMu
+	scheduledFullPending     bool // guarded by runMu
 	providerWorkMu           sync.Mutex
 	providerWork             map[string]map[archive.WorkPriority]int
 	archiveProviderRequests  map[string]archiveProviderRequest
@@ -2573,6 +2576,29 @@ func (s *Syncer) TriggerRunWithPriority(
 	ctx context.Context,
 	priorityRepos []RepoRef,
 ) {
+	s.triggerRun(ctx, slices.Clone(priorityRepos), nil)
+}
+
+// TriggerRunForRepos kicks off a non-blocking ad-hoc sync restricted to the
+// matching configured repositories.
+func (s *Syncer) TriggerRunForRepos(ctx context.Context, repos []RepoRef) {
+	s.triggerRun(ctx, nil, slices.Clone(repos))
+}
+
+func (s *Syncer) triggerRun(
+	ctx context.Context,
+	priorityRepos []RepoRef,
+	onlyRepos []RepoRef,
+) {
+	s.triggerRunWithCadence(ctx, true, priorityRepos, onlyRepos)
+}
+
+func (s *Syncer) triggerRunWithCadence(
+	ctx context.Context,
+	bypassNextSyncAfter bool,
+	priorityRepos []RepoRef,
+	onlyRepos []RepoRef,
+) {
 	s.lifecycleMu.Lock()
 	if s.stopped {
 		s.lifecycleMu.Unlock()
@@ -2585,7 +2611,7 @@ func (s *Syncer) TriggerRunWithPriority(
 	go func() {
 		defer s.wg.Done()
 		defer cancel()
-		s.runOnce(merged, true, priorityRepos)
+		s.runOnce(merged, bypassNextSyncAfter, priorityRepos, onlyRepos)
 	}()
 }
 
@@ -3805,18 +3831,40 @@ func (s *Syncer) publishMonotonicProgress(
 // per-host GitHub rate limit and abuse-detection thresholds happy
 // while still capturing most of the wall-clock win on network I/O.
 func (s *Syncer) RunOnce(ctx context.Context) {
-	s.runOnce(ctx, false, nil)
+	s.runOnce(ctx, false, nil, nil)
 }
 
 func (s *Syncer) runOnce(
 	ctx context.Context,
 	bypassNextSyncAfter bool,
 	priorityRepos []RepoRef,
+	onlyRepos []RepoRef,
 ) {
-	if !s.running.CompareAndSwap(false, true) {
+	s.runMu.Lock()
+	if s.running.Load() {
+		if !bypassNextSyncAfter && onlyRepos == nil && s.exclusiveRun {
+			s.scheduledFullPending = true
+		}
+		s.runMu.Unlock()
 		return
 	}
-	defer s.running.Store(false)
+	s.running.Store(true)
+	exclusive := onlyRepos != nil
+	s.exclusiveRun = exclusive
+	s.runMu.Unlock()
+	defer func() {
+		s.runMu.Lock()
+		s.running.Store(false)
+		s.exclusiveRun = false
+		retryScheduledFull := exclusive && s.scheduledFullPending
+		if retryScheduledFull {
+			s.scheduledFullPending = false
+		}
+		s.runMu.Unlock()
+		if retryScheduledFull {
+			s.triggerRunWithCadence(context.Background(), false, nil, nil)
+		}
+	}()
 
 	rateLimitSnapshotCtx := ctx
 
@@ -3828,6 +3876,9 @@ func (s *Syncer) runOnce(
 	s.reposMu.Lock()
 	repos := slices.Clone(s.repos)
 	s.reposMu.Unlock()
+	if onlyRepos != nil {
+		repos = selectRepos(repos, onlyRepos)
+	}
 	repos = prioritizeRepos(repos, priorityRepos)
 
 	total := len(repos)
@@ -3926,7 +3977,7 @@ dispatch:
 	// Detail drain: fetch full details for highest-priority items
 	// within the per-host budget. Runs after index scan completes.
 	if !canceled.Load() && ctx.Err() == nil {
-		s.drainDetailQueue(ctx, eligibleBuckets)
+		s.drainDetailQueue(ctx, eligibleBuckets, repos)
 	}
 
 	if !canceled.Load() && ctx.Err() == nil {
@@ -3959,9 +4010,11 @@ dispatch:
 	if rateLimitSnapshotCtx.Err() == nil {
 		s.RefreshRateLimitSnapshots(rateLimitSnapshotCtx)
 	}
-	s.advanceNextSync(
-		eligibleBuckets, s.nextSyncAfter, s.interval,
-	)
+	if onlyRepos == nil {
+		s.advanceNextSync(
+			eligibleBuckets, s.nextSyncAfter, s.interval,
+		)
+	}
 
 	slog.Info("sync complete", "repos", total)
 
@@ -4010,6 +4063,23 @@ func prioritizeRepos(repos, priorityRepos []RepoRef) []RepoRef {
 			return 0
 		}
 	})
+	return out
+}
+
+func selectRepos(repos, selectedRepos []RepoRef) []RepoRef {
+	selectedKeys := make(map[string]struct{}, len(selectedRepos))
+	for _, repo := range selectedRepos {
+		if key := repoPriorityKey(repo); key != "" {
+			selectedKeys[key] = struct{}{}
+		}
+	}
+
+	out := make([]RepoRef, 0, len(selectedKeys))
+	for _, repo := range repos {
+		if _, ok := selectedKeys[repoPriorityKey(repo)]; ok {
+			out = append(out, repo)
+		}
+	}
 	return out
 }
 
@@ -8008,12 +8078,13 @@ func (s *Syncer) fetchAndUpdateClosedPlatformIssue(
 func (s *Syncer) drainDetailQueue(
 	ctx context.Context,
 	eligibleBuckets map[string]bool,
+	repos []RepoRef,
 ) {
 	if len(s.budgets) == 0 {
 		return
 	}
 
-	items := s.buildDetailQueueItems(ctx)
+	items := s.buildDetailQueueItems(ctx, repos)
 	if len(items) == 0 {
 		return
 	}
@@ -8122,15 +8193,15 @@ func (s *Syncer) drainDetailQueue(
 // state to build queue items for scoring.
 func (s *Syncer) buildDetailQueueItems(
 	ctx context.Context,
+	repos []RepoRef,
 ) []QueueItem {
-	// Build set of tracked repos to filter out stale DB rows
-	// from removed repos.
-	s.reposMu.Lock()
-	trackedRepos := make(map[string]bool, len(s.repos))
-	for _, r := range s.repos {
+	// Build the set of repos selected for this run. In addition to filtering
+	// stale DB rows from removed repos, this keeps repository-scoped runs from
+	// spending their detail budget on unrelated repositories on the same host.
+	trackedRepos := make(map[string]bool, len(repos))
+	for _, r := range repos {
 		trackedRepos[detailRepoKey(repoPlatform(r), repoHost(r), r.Owner, r.Name)] = true
 	}
-	s.reposMu.Unlock()
 
 	// Gather watched MR numbers for matching.
 	s.watchMu.Lock()

@@ -6079,7 +6079,7 @@ func TestDetailDrainUsesProviderCloneURLForNestedGitLabRepo(t *testing.T) {
 		rateKey: NewSyncBudget(100),
 	})
 
-	syncer.drainDetailQueue(ctx, map[string]bool{rateKey: true})
+	syncer.drainDetailQueue(ctx, map[string]bool{rateKey: true}, syncer.TrackedRepos())
 
 	assert.Equal(int32(1), provider.getMRCalls.Load())
 	clonePath, err := clones.ClonePath("gitlab.example.com", "group/subgroup", "project")
@@ -9513,7 +9513,7 @@ func TestDetailDrainUsesProviderReadersForNonGitHub(t *testing.T) {
 	})
 	syncer.clients = registry
 
-	syncer.drainDetailQueue(ctx, map[string]bool{rateKey: true})
+	syncer.drainDetailQueue(ctx, map[string]bool{rateKey: true}, syncer.TrackedRepos())
 
 	assert.Equal(int32(1), provider.getMRCalls.Load())
 	assert.Equal(int32(1), provider.getIssueCalls.Load())
@@ -9613,7 +9613,7 @@ func TestDetailDrainDisambiguatesSameHostOwnerNameAcrossProviders(t *testing.T) 
 	})
 	syncer.clients = registry
 
-	syncer.drainDetailQueue(ctx, map[string]bool{rateKey: true})
+	syncer.drainDetailQueue(ctx, map[string]bool{rateKey: true}, syncer.TrackedRepos())
 
 	assert.Equal(int32(1), gitlabProvider.getMRCalls.Load())
 	mr, err := d.GetMergeRequestByRepoIDAndNumber(ctx, gitlabRepoID, 7)
@@ -9674,7 +9674,7 @@ func TestDetailQueueWatchedKeyIncludesProviderIdentity(t *testing.T) {
 		Number:       7,
 	}})
 
-	items := syncer.buildDetailQueueItems(ctx)
+	items := syncer.buildDetailQueueItems(ctx, syncer.TrackedRepos())
 
 	require.Len(items, 2)
 	watchedByPlatform := map[platform.Kind]bool{}
@@ -9722,7 +9722,7 @@ func TestDetailQueueDerivesPendingCIFromCachedChecks(t *testing.T) {
 
 	syncer := NewSyncer(nil, d, nil, []RepoRef{repo}, time.Minute, nil, nil)
 
-	items := syncer.buildDetailQueueItems(ctx)
+	items := syncer.buildDetailQueueItems(ctx, syncer.TrackedRepos())
 	require.Len(items, 1)
 	assert.True(items[0].CIHadPending)
 	queue := BuildQueue(items, now)
@@ -9798,6 +9798,189 @@ func TestDetailDrainRespectsBudget(t *testing.T) {
 	require.NotNil(hostBudget)
 	assert.Positive(hostBudget.Spent(),
 		"budget should have been spent")
+}
+
+func TestScopedRunDrainsDetailsOnlyForSelectedRepos(t *testing.T) {
+	require := require.New(t)
+	ctx := t.Context()
+	d := openTestDB(t)
+	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	repos := []RepoRef{
+		{Owner: "owner", Name: "selected", PlatformHost: "github.com"},
+		{Owner: "owner", Name: "unrelated", PlatformHost: "github.com"},
+	}
+	for i, repo := range repos {
+		repoID, err := d.UpsertRepo(ctx, platform.DBRepoIdentity(platformRepoRef(repo)))
+		require.NoError(err)
+		_, err = d.UpsertMergeRequest(ctx, &db.MergeRequest{
+			RepoID:          repoID,
+			PlatformID:      int64(i + 1),
+			Number:          i + 1,
+			URL:             "https://github.com/owner/" + repo.Name + "/pull/1",
+			Title:           repo.Name,
+			Author:          "ada",
+			State:           "open",
+			HeadBranch:      "feature",
+			BaseBranch:      "main",
+			PlatformHeadSHA: "head",
+			PlatformBaseSHA: "base",
+			CreatedAt:       now,
+			UpdatedAt:       now,
+			LastActivityAt:  now,
+		})
+		require.NoError(err)
+	}
+
+	var detailRepos []string
+	mc := &detailTrackingClient{}
+	mc.budget = NewSyncBudget(100)
+	mc.listOpenPRsFn = func(_ context.Context, _, repo string) ([]*gh.PullRequest, error) {
+		if repo == "selected" {
+			return []*gh.PullRequest{buildOpenPR(1, now)}, nil
+		}
+		return []*gh.PullRequest{}, nil
+	}
+	mc.getPullRequestFn = func(_ context.Context, _, repo string, number int) (*gh.PullRequest, error) {
+		detailRepos = append(detailRepos, repo)
+		return buildOpenPR(number, now), nil
+	}
+	mc.comments = []*gh.IssueComment{}
+	mc.reviews = []*gh.PullRequestReview{}
+	mc.commits = []*gh.RepositoryCommit{}
+	mc.ciStatus = &gh.CombinedStatus{State: new("success")}
+
+	syncer := NewSyncer(
+		map[string]Client{"github.com": mc}, d, nil, repos,
+		time.Minute, nil,
+		map[string]*SyncBudget{"github.com": mc.budget},
+	)
+	syncer.runOnce(ctx, true, nil, repos[:1])
+
+	assert.Equal(t, []string{"selected"}, detailRepos)
+}
+
+func TestScopedRunDoesNotDelayNextFullRunOnSameHost(t *testing.T) {
+	ctx := t.Context()
+	d := openTestDB(t)
+	repos := []RepoRef{
+		{Owner: "owner", Name: "selected", PlatformHost: "github.com"},
+		{Owner: "owner", Name: "unrelated", PlatformHost: "github.com"},
+	}
+	var mu sync.Mutex
+	var indexRepos []string
+	mc := &mockClient{
+		listOpenPRsFn: func(_ context.Context, _, repo string) ([]*gh.PullRequest, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			indexRepos = append(indexRepos, repo)
+			return []*gh.PullRequest{}, nil
+		},
+	}
+	syncer := NewSyncer(
+		map[string]Client{"github.com": mc}, d, nil, repos,
+		time.Hour,
+		map[string]*RateTracker{"github.com": NewRateTracker(d, "github.com", "rest")},
+		nil,
+	)
+	syncer.SetParallelism(1)
+
+	syncer.runOnce(ctx, true, nil, repos[:1])
+	syncer.RunOnce(ctx)
+
+	mu.Lock()
+	got := append([]string(nil), indexRepos...)
+	mu.Unlock()
+	assert.Equal(t, []string{"selected", "selected", "unrelated"}, got)
+}
+
+func TestScheduledFullRunRetriesAfterOverlappingScopedRun(t *testing.T) {
+	tests := []struct {
+		name                string
+		cadenceGated        bool
+		wantUnrelatedSynced bool
+	}{
+		{name: "runs when host is due", wantUnrelatedSynced: true},
+		{name: "honors a future host cadence gate", cadenceGated: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require := require.New(t)
+			ctx := t.Context()
+			d := openTestDB(t)
+			repos := []RepoRef{
+				{Owner: "owner", Name: "selected", PlatformHost: "github.com"},
+				{Owner: "owner", Name: "unrelated", PlatformHost: "github.com"},
+			}
+			selectedEntered := make(chan struct{}, 1)
+			releaseSelected := make(chan struct{})
+			var unrelatedSynced atomic.Bool
+			mc := &mockClient{
+				listOpenPRsFn: func(ctx context.Context, _, repo string) ([]*gh.PullRequest, error) {
+					switch repo {
+					case "selected":
+						select {
+						case selectedEntered <- struct{}{}:
+							select {
+							case <-releaseSelected:
+							case <-ctx.Done():
+								return nil, ctx.Err()
+							}
+						default:
+						}
+					case "unrelated":
+						unrelatedSynced.Store(true)
+					}
+					return []*gh.PullRequest{}, nil
+				},
+			}
+			var rateTrackers map[string]*RateTracker
+			if tt.cadenceGated {
+				rateTrackers = map[string]*RateTracker{
+					"github.com": NewRateTracker(d, "github.com", "rest"),
+				}
+			}
+			syncer := NewSyncer(
+				map[string]Client{"github.com": mc}, d, nil, repos,
+				time.Hour, rateTrackers, nil,
+			)
+			if tt.cadenceGated {
+				syncer.nextSyncAfter["github.com"] = time.Now().Add(time.Hour)
+			}
+			syncer.SetParallelism(1)
+			t.Cleanup(syncer.Stop)
+			fullRunCompleted := make(chan struct{}, 1)
+			syncer.SetOnSyncCompleted(func(results []RepoSyncResult) {
+				if len(results) == len(repos) {
+					select {
+					case fullRunCompleted <- struct{}{}:
+					default:
+					}
+				}
+			})
+
+			scopedDone := make(chan struct{})
+			go func() {
+				defer close(scopedDone)
+				syncer.runOnce(ctx, true, nil, repos[:1])
+			}()
+
+			select {
+			case <-selectedEntered:
+			case <-time.After(time.Second):
+				require.FailNow("scoped run did not start within 1s")
+			}
+			syncer.RunOnce(ctx)
+			close(releaseSelected)
+
+			select {
+			case <-fullRunCompleted:
+			case <-time.After(time.Second):
+				require.FailNow("scheduled full run was not retried after scoped run")
+			}
+			assert.Equal(t, tt.wantUnrelatedSynced, unrelatedSynced.Load())
+			<-scopedDone
+		})
+	}
 }
 
 func TestBudgetResetOnRateWindowReset(t *testing.T) {
@@ -13591,7 +13774,7 @@ func TestDeferredCommentRefreshYieldsBudgetToDetailDrain(t *testing.T) {
 
 	syncer.queuePRCommentSync(repo, 1)
 	budget["github.com"].Spend(3)
-	syncer.drainDetailQueue(ctx, map[string]bool{"github.com": true})
+	syncer.drainDetailQueue(ctx, map[string]bool{"github.com": true}, syncer.TrackedRepos())
 	syncer.drainPendingCommentSyncs(ctx, map[string]bool{"github.com": true})
 
 	pr, err := d.GetMergeRequest(ctx, "github", "github.com", "owner", "repo", 2)
