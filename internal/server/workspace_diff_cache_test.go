@@ -50,6 +50,128 @@ func TestWorkspaceDiffCacheMissThenHitPreparesOnce(t *testing.T) {
 	assert.Empty(second.Files[0].Hunks)
 }
 
+func TestWorkspaceDiffCacheWarningRequiresHeadMismatch(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name        string
+		currentHead string
+		headErr     error
+		wantStale   bool
+	}{
+		{name: "matching head", currentHead: "head"},
+		{name: "changed head", currentHead: "new-head", wantStale: true},
+		{name: "head unavailable", headErr: errors.New("head unavailable")},
+		{name: "head resolution failed", headErr: errors.New("resolve head")},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			require := require.New(t)
+			assert := assert.New(t)
+			now := time.Unix(100, 0)
+			cache := newWorkspaceDiffCache(t.Context(), workspaceDiffCacheDeps{
+				now: func() time.Time { return now },
+				resolve: func(context.Context, workspace.DiffSnapshotSpec) (workspace.ResolvedDiffSnapshotSpec, bool, error) {
+					return workspaceDiffTestResolved(), true, nil
+				},
+				resolveHead: func(context.Context, workspace.DiffSnapshotSpec) (string, error) {
+					return tt.currentHead, tt.headErr
+				},
+				fingerprint: func(context.Context, workspace.ResolvedDiffSnapshotSpec) (workspace.DiffFingerprint, error) {
+					return "v1", nil
+				},
+				prepare: func(context.Context, workspace.ResolvedDiffSnapshotSpec) (*gitclone.DiffResult, error) {
+					return workspaceDiffTestResult("one.txt"), nil
+				},
+			})
+
+			_, _, err := cache.Get(t.Context(), workspaceDiffTestKey())
+			require.NoError(err)
+			now = now.Add(workspaceDiffCacheFreshFor + time.Second)
+			cache.mu.Lock()
+			cache.peekEntryLocked(workspaceDiffTestKey()).retryAfter = now.Add(time.Hour)
+			cache.mu.Unlock()
+			got, state, err := cache.Get(t.Context(), workspaceDiffTestKey())
+			require.NoError(err)
+			require.NotNil(got)
+			assert.Equal(workspaceDiffCacheStale, state)
+			assert.Equal(tt.wantStale, got.Diff.Stale)
+		})
+	}
+}
+
+func TestWorkspaceDiffCacheHitDoesNotRepeatFullSnapshotResolution(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	assert := assert.New(t)
+	resolveCalls := 0
+	cache := newWorkspaceDiffCache(t.Context(), workspaceDiffCacheDeps{
+		resolve: func(context.Context, workspace.DiffSnapshotSpec) (workspace.ResolvedDiffSnapshotSpec, bool, error) {
+			resolveCalls++
+			return workspaceDiffTestResolved(), true, nil
+		},
+		resolveHead: func(context.Context, workspace.DiffSnapshotSpec) (string, error) {
+			return "head", nil
+		},
+		fingerprint: func(context.Context, workspace.ResolvedDiffSnapshotSpec) (workspace.DiffFingerprint, error) {
+			return "v1", nil
+		},
+		prepare: func(context.Context, workspace.ResolvedDiffSnapshotSpec) (*gitclone.DiffResult, error) {
+			return workspaceDiffTestResult("one.txt"), nil
+		},
+	})
+
+	_, _, err := cache.Get(t.Context(), workspaceDiffTestKey())
+	require.NoError(err)
+	_, state, err := cache.Get(t.Context(), workspaceDiffTestKey())
+	require.NoError(err)
+
+	assert.Equal(workspaceDiffCacheHit, state)
+	assert.Equal(2, resolveCalls)
+}
+
+func TestWorkspaceDiffCacheHeadMismatchQueuesImmediateValidation(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	assert := assert.New(t)
+	now := time.Unix(100, 0)
+	resolved := workspaceDiffTestResolved()
+	key := workspaceDiffTestKey()
+	cache := newWorkspaceDiffCache(t.Context(), workspaceDiffCacheDeps{
+		now: func() time.Time { return now },
+		after: func(time.Duration) <-chan time.Time {
+			return make(chan time.Time)
+		},
+		resolve: func(context.Context, workspace.DiffSnapshotSpec) (workspace.ResolvedDiffSnapshotSpec, bool, error) {
+			return resolved, true, nil
+		},
+		resolveHead: func(context.Context, workspace.DiffSnapshotSpec) (string, error) {
+			return resolved.HeadOID, nil
+		},
+		fingerprint: func(context.Context, workspace.ResolvedDiffSnapshotSpec) (workspace.DiffFingerprint, error) {
+			return workspace.DiffFingerprint(resolved.HeadOID), nil
+		},
+		prepare: func(context.Context, workspace.ResolvedDiffSnapshotSpec) (*gitclone.DiffResult, error) {
+			return workspaceDiffTestResult(resolved.HeadOID + ".txt"), nil
+		},
+	})
+
+	_, _, err := cache.Get(t.Context(), key)
+	require.NoError(err)
+	resolved.HeadOID = "new-head"
+
+	got, state, err := cache.Get(t.Context(), key)
+	require.NoError(err)
+	require.NotNil(got)
+	assert.Equal(workspaceDiffCacheHit, state)
+	assert.True(got.Diff.Stale)
+	assert.Eventually(func() bool {
+		entry := cache.peekEntry(key)
+		return entry != nil && entry.snapshot.Resolved.HeadOID == "new-head"
+	}, time.Second, time.Millisecond)
+}
+
 func TestWorkspaceDiffCacheProtectedEntriesDoNotConsumeCostBudget(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
