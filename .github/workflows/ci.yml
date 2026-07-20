@@ -20,7 +20,7 @@ concurrency:
 jobs:
   detect_changes:
     name: Detect changed paths
-    runs-on: ubuntu-latest
+    runs-on: kenn-linux-x64
     outputs:
       backend: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.backend == 'true' || steps.filter.outputs.ci == 'true' }}
       frontend: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.frontend == 'true' || steps.filter.outputs.ci == 'true' }}
@@ -68,7 +68,7 @@ jobs:
               - Makefile
 
   lint:
-    runs-on: ubuntu-latest
+    runs-on: kenn-linux-x64
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -78,6 +78,7 @@ jobs:
       - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
         with:
           go-version-file: go.mod
+          cache: false
 
       - name: Setup Vite+
         uses: voidzero-dev/setup-vp@2dec1e33f4ab2c6d5bce1b0c4607961bb1a3f7a1 # v1
@@ -113,7 +114,13 @@ jobs:
 
   test_go:
     name: Go tests
-    runs-on: ubuntu-latest
+    runs-on: kenn-linux-x64
+    # Bound package fan-out on high-core runners so concurrent test binaries
+    # and in-package parallel tests stay within the job's memory budget.
+    env:
+      GOMAXPROCS: "4"
+      GOMEMLIMIT: "4GiB"
+      GOFLAGS: "-p=1"
     needs: detect_changes
     if: needs.detect_changes.outputs.backend == 'true'
     steps:
@@ -124,6 +131,7 @@ jobs:
       - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
         with:
           go-version-file: go.mod
+          cache: false
 
       - name: Stub frontend embed dir
         run: |
@@ -133,7 +141,7 @@ jobs:
       - name: Run tests
         run: |
           mkdir -p tmp
-          go tool gotestsum --format pkgname-and-test-fails --jsonfile=tmp/test-output.json -- ./... -shuffle=on
+          go tool gotestsum --format pkgname-and-test-fails --jsonfile=tmp/test-output.json -- ./... -shuffle=on -parallel=2
 
       - name: Publish unit test report
         if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
@@ -165,7 +173,7 @@ jobs:
       - name: Run integration tests (git-dependent)
         run: |
           mkdir -p tmp
-          go tool gotestsum --format pkgname-and-test-fails --jsonfile=tmp/test-integration-output.json -- -tags integration ./... -shuffle=on
+          go tool gotestsum --format pkgname-and-test-fails --jsonfile=tmp/test-integration-output.json -- -tags integration ./... -shuffle=on -parallel=2
 
       - name: Publish integration test report
         if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
@@ -178,7 +186,7 @@ jobs:
 
   test_frontend:
     name: Frontend unit tests
-    runs-on: ubuntu-latest
+    runs-on: kenn-linux-x64
     needs: detect_changes
     if: needs.detect_changes.outputs.backend == 'true' || needs.detect_changes.outputs.frontend == 'true'
     steps:
@@ -209,6 +217,7 @@ jobs:
       - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
         with:
           go-version-file: go.mod
+          cache: false
 
       - name: Stub frontend embed dir
         shell: pwsh
@@ -230,7 +239,12 @@ jobs:
 
   race:
     name: go test -race
-    runs-on: ubuntu-latest
+    runs-on: kenn-linux-x64
+    # Race-instrumented packages are especially memory-intensive.
+    env:
+      GOMAXPROCS: "4"
+      GOMEMLIMIT: "4GiB"
+      GOFLAGS: "-p=1"
     needs: detect_changes
     if: needs.detect_changes.outputs.backend == 'true'
     steps:
@@ -241,6 +255,7 @@ jobs:
       - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
         with:
           go-version-file: go.mod
+          cache: false
 
       - name: Stub frontend embed dir
         run: |
@@ -300,7 +315,7 @@ jobs:
           retention-days: 7
 
   build:
-    runs-on: ubuntu-latest
+    runs-on: kenn-linux-x64
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -309,6 +324,7 @@ jobs:
       - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
         with:
           go-version-file: go.mod
+          cache: false
 
       - name: Setup Vite+
         uses: voidzero-dev/setup-vp@2dec1e33f4ab2c6d5bce1b0c4607961bb1a3f7a1 # v1
@@ -329,7 +345,7 @@ jobs:
         run: go build -o middleman ./cmd/middleman
 
   e2e-mock:
-    runs-on: ubuntu-latest
+    runs-on: kenn-linux-x64
     needs: detect_changes
     if: needs.detect_changes.outputs.frontend == 'true' || needs.detect_changes.outputs.e2e == 'true'
     container: mcr.microsoft.com/playwright@sha256:5b8f294aff9041b7191c34a4bab3ac270157a28774d4b0660e9743297b697e48 # v1.61.1-noble
@@ -366,7 +382,7 @@ jobs:
           retention-days: 7
 
   e2e:
-    runs-on: ubuntu-latest
+    runs-on: kenn-linux-x64
     needs: detect_changes
     if: needs.detect_changes.outputs.backend == 'true' || needs.detect_changes.outputs.frontend == 'true' || needs.detect_changes.outputs.e2e == 'true'
     # Run inside the official Playwright image: browsers and their OS deps are
@@ -389,6 +405,7 @@ jobs:
       - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
         with:
           go-version-file: go.mod
+          cache: false
 
       - name: Setup Vite+
         uses: voidzero-dev/setup-vp@2dec1e33f4ab2c6d5bce1b0c4607961bb1a3f7a1 # v1
@@ -457,7 +474,7 @@ jobs:
           retention-days: 7
 
   e2e-roborev:
-    runs-on: ubuntu-latest
+    runs-on: kenn-linux-x64
     needs: detect_changes
     if: needs.detect_changes.outputs.backend == 'true' || needs.detect_changes.outputs.frontend == 'true' || needs.detect_changes.outputs.e2e == 'true'
     env:
@@ -479,6 +496,7 @@ jobs:
       - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
         with:
           go-version-file: go.mod
+          cache: false
 
       - name: Setup Vite+
         uses: voidzero-dev/setup-vp@2dec1e33f4ab2c6d5bce1b0c4607961bb1a3f7a1 # v1
@@ -502,7 +520,7 @@ jobs:
 
   test_browser:
     name: frontend browser tests
-    runs-on: ubuntu-latest
+    runs-on: kenn-linux-x64
     timeout-minutes: 15
     needs: detect_changes
     if: needs.detect_changes.outputs.backend == 'true' || needs.detect_changes.outputs.frontend == 'true'

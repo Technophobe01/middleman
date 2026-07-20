@@ -139,6 +139,14 @@ export function webSocketDebugEnabled(env: Record<string, string | undefined> = 
   }
 }
 
+export function resolveBrowserTestWorkers(env: Record<string, string | undefined> = process.env): number | undefined {
+  return env.CI ? 2 : undefined;
+}
+
+export function resolveUnitTestWorkers(env: Record<string, string | undefined> = process.env): number | undefined {
+  return env.CI ? 2 : undefined;
+}
+
 function terminalWebSocketProxy(url: string): ProxyOptions {
   const proxy: ProxyOptions = {
     target: url,
@@ -154,10 +162,12 @@ function terminalWebSocketProxy(url: string): ProxyOptions {
 // The "unit" project preserves the prior flat test config: jsdom plus the
 // localStorage/elementFromPoint shims in setup.ts. The browser glob exclude
 // keeps *.browser.svelte.ts files off this project so they never double-run.
+const unitTestMaxWorkers = resolveUnitTestWorkers();
 const unitTestProject = {
   extends: true,
   test: {
     name: "unit",
+    ...(unitTestMaxWorkers ? { maxWorkers: unitTestMaxWorkers } : {}),
     environment: "jsdom",
     setupFiles: ["./src/test/setup.ts"],
     include: ["src/**/*.{test,spec}.?(c|m)[jt]s?(x)", "../packages/ui/src/**/*.{test,spec}.?(c|m)[jt]s?(x)"],
@@ -188,6 +198,7 @@ const unitTestProject = {
 // keeps the standard "module"/"development|production" placeholders intact.
 const browserTestProject = defineProject(async () => {
   const { playwright } = await import("vite-plus/test/browser-playwright");
+  const maxWorkers = resolveBrowserTestWorkers();
   return {
     extends: true,
     resolve: {
@@ -196,6 +207,7 @@ const browserTestProject = defineProject(async () => {
     test: {
       name: "browser",
       include: ["src/**/*.browser.svelte.ts"],
+      ...(maxWorkers ? { maxWorkers } : {}),
       browser: {
         enabled: true,
         provider: playwright() as never,
