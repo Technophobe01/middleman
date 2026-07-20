@@ -1386,20 +1386,24 @@ function diffResponseFromFixture(fixture: DiffResult | DiffFixture): DiffResult 
   };
 }
 
-async function mockDiffApi(page: Page, fixture: DiffResult | DiffFixture): Promise<void> {
-  const responseFixture = diffResponseFromFixture(fixture);
+async function mockDiffApi(
+  page: Page,
+  fixture: DiffResult | DiffFixture | (() => DiffResult | DiffFixture),
+): Promise<void> {
+  const currentFixture = (): DiffResult => diffResponseFromFixture(typeof fixture === "function" ? fixture() : fixture);
+
   await page.route("**/api/v1/pulls/github/acme/widgets/1/files", async (route) => {
     await route.fulfill({
       status: 200,
       contentType: "application/json",
-      body: JSON.stringify(filesFromDiff(responseFixture)),
+      body: JSON.stringify(filesFromDiff(currentFixture())),
     });
   });
   await page.route("**/api/v1/pulls/github/acme/widgets/1/diff*", async (route) => {
     await route.fulfill({
       status: 200,
       contentType: "application/json",
-      body: JSON.stringify(responseFixture),
+      body: JSON.stringify(currentFixture()),
     });
   });
 }
@@ -2903,13 +2907,64 @@ test.describe("diff view", () => {
     await expect.poll(() => renderedDiffFilePaths(page)).toEqual(expectedFileOrder);
   });
 
-  test("stale diff banner is shown when diff is stale", async ({ page }) => {
-    await mockDiffApi(page, staleDiff);
+  test("stale diff warning stays clear of file controls without shifting diff content", async ({ page }) => {
+    let fixture = staleDiff;
+    await mockDiffApi(page, () => fixture);
     await navigateToDiff(page);
     await waitForDiffLoaded(page);
 
+    const banner = page.locator(".stale-banner");
+    const diffBody = page.locator(".diff-body");
+    const firstFile = page.locator(".diff-file").first();
+    const firstHeader = firstFile.locator(".file-header");
+    const firstContent = firstFile.locator(".file-content");
+    await expect(banner).toBeVisible();
+    await expect(banner).toContainText("outdated");
+    const staleBounds = await diffBody.boundingBox();
+    expect(staleBounds).not.toBeNull();
+
+    const bannerBounds = await visibleBoundingBox(banner);
+    const headerBounds = await visibleBoundingBox(firstHeader);
+    expect(headerBounds.y).toBeGreaterThanOrEqual(bannerBounds.y + bannerBounds.height);
+
+    await expect(firstContent).toBeAttached();
+    await firstHeader.click();
+    await expect(firstContent).not.toBeAttached();
+
+    fixture = smallDiff;
+    await openDiffFilterMenu(page);
+    await page.getByRole("switch", { name: "Hide whitespace changes" }).click();
+    await expect(banner).not.toBeVisible();
+    await expect(banner).toHaveAttribute("aria-hidden", "true");
+
+    expect(await diffBody.boundingBox()).toEqual(staleBounds);
+  });
+
+  test("stale diff warning does not shift content when the initial diff loads", async ({ page }) => {
+    let releaseDiffResponse: () => void = () => {};
+    const diffResponseReleased = new Promise<void>((resolve) => {
+      releaseDiffResponse = resolve;
+    });
+    await mockDiffApi(page, staleDiff);
+    await page.route("**/api/v1/pulls/github/acme/widgets/1/diff*", async (route) => {
+      await diffResponseReleased;
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(diffResponseFromFixture(staleDiff)),
+      });
+    });
+    await navigateToDiff(page);
+
+    const diffBody = page.locator(".diff-body");
+    await expect(page.locator(".diff-state-msg")).toHaveText("Loading diff");
+    const loadingBounds = await diffBody.boundingBox();
+    expect(loadingBounds).not.toBeNull();
+
+    releaseDiffResponse();
+    await waitForDiffLoaded(page);
     await expect(page.locator(".stale-banner")).toBeVisible();
-    await expect(page.locator(".stale-banner")).toContainText("outdated");
+    expect(await diffBody.boundingBox()).toEqual(loadingBounds);
   });
 
   test("error state shown when diff API fails", async ({ page }) => {
@@ -3975,7 +4030,9 @@ test.describe("diff view (git-backed)", () => {
     await page.goto("/pulls/github/acme/widgets/1/files");
     await page.locator(".diff-file").first().waitFor({ state: "visible", timeout: 10_000 });
 
-    await expect(page.locator(".stale-banner")).not.toBeAttached();
+    const banner = page.locator(".stale-banner");
+    await expect(banner).not.toBeVisible();
+    await expect(banner).toHaveAttribute("aria-hidden", "true");
   });
 
   test("real diff loads and renders all changed files", async ({ page }) => {

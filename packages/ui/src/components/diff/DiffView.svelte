@@ -581,11 +581,9 @@
 </script>
 
 <div class="diff-view">
-  {#if diff?.stale}
-    <div class="stale-banner">
-      Diff may be outdated -- showing changes as of an earlier version of this PR.
-    </div>
-  {/if}
+  <div class={["stale-banner", { "stale-banner--hidden": !diff?.stale }]} aria-hidden={!diff?.stale}>
+    Diff may be outdated -- showing changes as of an earlier version of this PR.
+  </div>
 
   <div class="diff-body">
     {#if loading && !diff}
@@ -657,12 +655,16 @@
   }
 
   .stale-banner {
+    flex-shrink: 0;
     padding: 6px 16px;
     background: var(--diff-stale-bg);
     color: var(--diff-stale-text);
     border-bottom: 1px solid var(--diff-stale-border);
     font-size: var(--font-size-sm);
-    flex-shrink: 0;
+  }
+
+  .stale-banner--hidden {
+    visibility: hidden;
   }
 
   .review-warning {

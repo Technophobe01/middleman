@@ -217,6 +217,25 @@ test.describe("PR list view", () => {
       expect(headerBox.width).toBeLessThanOrEqual(800);
     }
   });
+
+  test("PR detail stale refresh uses the standard syncing indicator", async ({ page }) => {
+    await page.route("**/api/v1/pulls/github/acme/widgets/1", async (route) => {
+      const response = await route.fetch();
+      const detail = (await response.json()) as {
+        detail_fetched_at: string;
+        merge_request: { UpdatedAt: string };
+      };
+      detail.detail_fetched_at = "2020-01-01T00:00:00Z";
+      detail.merge_request.UpdatedAt = "2026-01-01T00:00:00Z";
+      await route.fulfill({ response, json: detail });
+    });
+
+    await page.goto("/pulls/github/acme/widgets/1");
+
+    await expect(page.locator(".pull-detail .sync-indicator")).toBeVisible();
+    await expect(page.locator(".pull-detail .refresh-banner")).toHaveCount(0);
+    await expect(page.getByText("Refreshing...", { exact: true })).toHaveCount(0);
+  });
 });
 
 test.describe("PR list sidebar", () => {
