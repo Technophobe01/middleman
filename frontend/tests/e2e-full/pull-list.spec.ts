@@ -1,4 +1,4 @@
-import { expect, test, type Browser, type Page } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 import { startIsolatedE2EServer, type IsolatedE2EServer } from "./support/e2eServer";
 
 // Seeded data summary:
@@ -81,46 +81,33 @@ async function mockLongPullRepoSlug(page: Page): Promise<void> {
   );
 }
 
-async function expectRepoChipToClipSafely(
+async function expectRepoNameToClipSafely(
   item: ReturnType<Page["locator"]>,
-  repoChip: ReturnType<Page["locator"]>,
+  repoName: ReturnType<Page["locator"]>,
   expectedRepoPath: string,
 ): Promise<void> {
   await item.evaluate((node) => {
     (node as HTMLElement).style.width = "180px";
   });
 
-  await expect(repoChip.locator(".kit-chip__label")).toHaveText(expectedRepoPath);
-  await expect(repoChip.locator(".kit-chip__label")).toHaveCSS("overflow", "hidden");
-  await expect(repoChip.locator(".kit-chip__label")).toHaveCSS("text-overflow", "ellipsis");
-  await expect(repoChip).toHaveAttribute("title", expectedRepoPath);
-  await expect(repoChip).toHaveCSS("justify-content", "flex-start");
+  await expect(repoName).toHaveText(expectedRepoPath);
+  await expect(repoName).toHaveCSS("overflow", "hidden");
+  await expect(repoName).toHaveCSS("text-overflow", "ellipsis");
+  await expect(repoName).toHaveAttribute("title", expectedRepoPath);
 
-  const chipBox = await repoChip.boundingBox();
+  const nameBox = await repoName.boundingBox();
   const itemBox = await item.boundingBox();
-  expect(chipBox).not.toBeNull();
+  expect(nameBox).not.toBeNull();
   expect(itemBox).not.toBeNull();
-  if (chipBox !== null && itemBox !== null) {
-    expect(chipBox.x + chipBox.width).toBeLessThanOrEqual(itemBox.x + itemBox.width + 1);
+  if (nameBox !== null && itemBox !== null) {
+    expect(nameBox.x + nameBox.width).toBeLessThanOrEqual(itemBox.x + itemBox.width + 1);
   }
 
-  const labelOverflow = await repoChip.locator(".kit-chip__label").evaluate((node) => ({
+  const labelOverflow = await repoName.evaluate((node) => ({
     clientWidth: (node as HTMLElement).clientWidth,
     scrollWidth: (node as HTMLElement).scrollWidth,
   }));
   expect(labelOverflow.scrollWidth).toBeGreaterThanOrEqual(labelOverflow.clientWidth);
-}
-
-async function primeKanbanStateRows(browser: Browser, baseURL: string): Promise<void> {
-  const page = await browser.newPage({ baseURL });
-  try {
-    await page.goto("/pulls");
-    await waitForPullList(page);
-    await page.locator(".pull-item").first().click();
-    await page.locator(".pull-detail").waitFor({ state: "visible", timeout: 5_000 });
-  } finally {
-    await page.close();
-  }
 }
 
 async function expectPullReviewIndicator(page: Page, title: string, label: string): Promise<void> {
@@ -241,16 +228,15 @@ test.describe("PR list view", () => {
 test.describe("PR list sidebar", () => {
   let server: IsolatedE2EServer | undefined;
 
-  test.beforeAll(async ({ browser }) => {
+  test.beforeAll(async () => {
     server = await startIsolatedE2EServer();
-    await primeKanbanStateRows(browser, server.info.base_url);
   });
 
   test.afterAll(async () => {
     await server?.stop();
   });
 
-  test("sidebar status pills use the shared chip component", async ({ page }) => {
+  test("sidebar rows show review indicators, clip long repo names, and never show a status chip", async ({ page }) => {
     if (!server) {
       throw new Error("PR list sidebar e2e server was not started");
     }
@@ -264,9 +250,27 @@ test.describe("PR list sidebar", () => {
     await expectPullReviewIndicator(page, "Fix race condition in event loop", "Changes requested");
 
     const firstItem = page.locator(".pull-item").first();
-    const repoChip = firstItem.locator(".repo-chip");
-    await expect(repoChip).toBeVisible();
-    await expectRepoChipToClipSafely(firstItem, repoChip, longRepoPath);
-    await expect(firstItem.locator(".status-chip")).toBeVisible();
+    const repoName = firstItem.locator(".repo-name");
+    await expect(repoName).toBeVisible();
+    await expectRepoNameToClipSafely(firstItem, repoName, longRepoPath);
+
+    // The kanban status chip was removed from the sidebar entirely (the
+    // kanban feature itself may go away); no row shows one regardless of
+    // its workflow state.
+    await expect(page.locator(".pull-item .status-chip")).toHaveCount(0);
+
+    // Compact layout: repo name lives in the meta row, no standalone repo
+    // row, and rows keep a uniform two-line height regardless of labels.
+    await expect(firstItem.locator(".meta-row .repo-name")).toBeVisible();
+    await expect(page.locator(".pull-item .repo-row")).toHaveCount(0);
+    await expect(page.locator(".pull-item:has(.kit-color-label)").first()).toBeVisible();
+    const rowHeights = await page
+      .locator(".pull-item")
+      .evaluateAll((nodes) => nodes.slice(0, 6).map((node) => node.getBoundingClientRect().height));
+    expect(rowHeights.length).toBeGreaterThan(1);
+    for (const height of rowHeights) {
+      expect(height).toBeLessThanOrEqual(60);
+      expect(Math.abs(height - (rowHeights[0] ?? 0))).toBeLessThanOrEqual(1);
+    }
   });
 });

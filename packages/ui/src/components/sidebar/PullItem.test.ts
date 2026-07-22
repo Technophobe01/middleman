@@ -215,7 +215,7 @@ describe("PullItem CI cluster", () => {
 });
 
 describe("PullItem repository label", () => {
-  it("keeps chip color tied to repository identity when the display label changes", () => {
+  it("keeps repo name color tied to repository identity when the display label changes", () => {
     const pr = mkPR({
       repo: {
         provider: "github",
@@ -239,7 +239,7 @@ describe("PullItem repository label", () => {
       ]),
     });
 
-    expect(document.querySelector(".kit-chip.repo-chip")?.getAttribute("style")).toContain(
+    expect(document.querySelector(".meta-left .repo-name")?.getAttribute("style")).toContain(
       hashColor("github|github.com|acme/widgets"),
     );
   });
@@ -295,49 +295,95 @@ describe("PullItem kanban status", () => {
     expect(screen.queryByLabelText("Changes requested")).toBeNull();
   });
 
-  it("shows the kanban status for open PRs", () => {
-    renderItem(
-      mkPR({
-        Title: "Cache widget details",
-        Author: "alice",
-        KanbanStatus: "reviewing",
-        LastActivityAt: "2026-05-01T12:00:00Z",
-        repo_owner: "acme",
-        repo_name: "widgets",
-      }),
-    );
+  it("never renders a status chip, regardless of kanban status or PR state", () => {
+    const cases = [
+      { State: "open", KanbanStatus: "new" },
+      { State: "open", KanbanStatus: "reviewing" },
+      { State: "closed", KanbanStatus: "reviewing" },
+      { State: "merged", KanbanStatus: "awaiting_merge" },
+    ];
 
-    expect(screen.getByText("Reviewing")).toBeTruthy();
+    for (const overrides of cases) {
+      renderItem(
+        mkPR({
+          Title: "Cache widget details",
+          Author: "alice",
+          LastActivityAt: "2026-05-01T12:00:00Z",
+          repo_owner: "acme",
+          repo_name: "widgets",
+          ...overrides,
+        }),
+      );
+
+      expect(document.querySelector(".status-chip")).toBeNull();
+      cleanup();
+    }
+  });
+});
+
+describe("PullItem compact layout", () => {
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
   });
 
-  it("hides the kanban status for closed and merged PRs", () => {
+  it("renders the repo name inside the meta row with no separate repo row", () => {
+    render(PullItem, {
+      props: {
+        pr: mkPR({}),
+        selected: false,
+        showRepo: true,
+        repoLabel: "o/n",
+        onclick: () => {},
+      },
+      context: new Map<symbol, unknown>([
+        [STORES_KEY, { pulls: { togglePRStar: vi.fn() } }],
+        [HOST_STATE_KEY, {}],
+      ]),
+    });
+
+    expect(document.querySelector(".meta-row .meta-left .repo-name")).not.toBeNull();
+    expect(document.querySelector(".kit-chip.repo-chip")).toBeNull();
+    expect(document.querySelector(".repo-row")).toBeNull();
+  });
+
+  it("renders label pills on the title line", () => {
     renderItem(
       mkPR({
-        Title: "Cache widget details",
-        Author: "alice",
-        State: "closed",
-        KanbanStatus: "reviewing",
-        LastActivityAt: "2026-05-01T12:00:00Z",
-        repo_owner: "acme",
-        repo_name: "widgets",
+        labels: [
+          { name: "bug", color: "d73a4a" },
+          { name: "sync", color: "0075ca" },
+        ],
       }),
     );
 
-    expect(screen.queryByText("Reviewing")).toBeNull();
-    cleanup();
+    expect(document.querySelectorAll(".title .kit-color-label")).toHaveLength(2);
+    expect(screen.getByText("bug")).toBeTruthy();
+    expect(screen.getByText("sync")).toBeTruthy();
+    expect(document.querySelector(".label-dots")).toBeNull();
+  });
 
+  it("caps label pills at two plus an overflow count on the title line", () => {
     renderItem(
       mkPR({
-        Title: "Cache widget details",
-        Author: "alice",
-        State: "merged",
-        KanbanStatus: "awaiting_merge",
-        LastActivityAt: "2026-05-01T12:00:00Z",
-        repo_owner: "acme",
-        repo_name: "widgets",
+        labels: [
+          { name: "bug", color: "d73a4a" },
+          { name: "sync", color: "0075ca" },
+          { name: "docs", color: "008672" },
+        ],
       }),
     );
 
-    expect(screen.queryByText("Ready")).toBeNull();
+    expect(document.querySelectorAll(".title .kit-color-label")).toHaveLength(2);
+    expect(screen.getByText("+1")).toBeTruthy();
+    expect(document.querySelector(".label-dots")).toBeNull();
+  });
+
+  it("keeps title text, top-right number, and plain author in the two-line structure", () => {
+    renderItem(mkPR({ Title: "Cache widget details", Author: "alice", Number: 7 }));
+
+    expect(document.querySelector(".title .title-text")?.textContent).toBe("Cache widget details");
+    expect(document.querySelector(".title .item-number")?.textContent).toBe("#7");
+    expect(document.querySelector(".meta-left .meta-text")?.textContent).toBe("alice");
   });
 });

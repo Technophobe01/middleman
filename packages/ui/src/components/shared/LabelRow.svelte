@@ -42,10 +42,15 @@
   .label-row--compact {
     flex-wrap: nowrap;
     overflow: hidden;
+    /* Yields space to the title before the title itself has to shrink:
+     * a higher shrink factor than .title-text's default 1 (mirrors the
+     * author-vs-repo idiom on the meta line). */
+    flex: 0 4 auto;
+    min-width: 0;
   }
 
   .label-row--compact :global(.kit-color-label) {
-    max-width: 120px;
+    max-width: 90px;
   }
 
   .label-more {

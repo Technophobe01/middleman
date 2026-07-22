@@ -319,7 +319,7 @@ describe("grouping toggle", () => {
   it("PR list defaults to grouped with repo headers and no badges", async () => {
     await mountPulls();
     await vi.waitFor(() => expect(document.querySelector(".sidebar-group-header")).not.toBeNull(), WAIT);
-    expect(count(".repo-chip")).toBe(0);
+    expect(count(".pull-item .repo-name")).toBe(0);
   });
 
   it("PR list ungrouped shows a repo badge per item and no headers", async () => {
@@ -327,7 +327,7 @@ describe("grouping toggle", () => {
     await selectPullGrouping("All");
 
     await vi.waitFor(() => expect(count(".sidebar-group-header")).toBe(0), WAIT);
-    await vi.waitFor(() => expect(count(".repo-chip")).toBe(count(".pull-item")), WAIT);
+    await vi.waitFor(() => expect(count(".pull-item .repo-name")).toBe(count(".pull-item")), WAIT);
     expect(count(".pull-item")).toBe(pulls.length);
   });
 
@@ -346,7 +346,7 @@ describe("grouping toggle", () => {
     mounted = await mountBrowserApp("/pulls", { overrides: overrides() });
     await vi.waitFor(() => expect(document.querySelector(".pull-item")).not.toBeNull(), WAIT);
     expect(count(".sidebar-group-header")).toBe(0);
-    expect(document.querySelector(".repo-chip")).not.toBeNull();
+    expect(document.querySelector(".pull-item .repo-name")).not.toBeNull();
   });
 
   it("toggle syncs from PRs to the issue list", async () => {
@@ -358,7 +358,7 @@ describe("grouping toggle", () => {
     mounted = await mountBrowserApp("/issues", { overrides: overrides() });
     await vi.waitFor(() => expect(document.querySelector(".issue-item")).not.toBeNull(), WAIT);
     expect(count(".sidebar-group-header")).toBe(0);
-    expect(document.querySelector(".repo-chip")).not.toBeNull();
+    expect(document.querySelector(".issue-item .repo-name")).not.toBeNull();
   });
 
   it("hides bot-authored issues and restores the saved preference after reload", async () => {
@@ -383,22 +383,25 @@ describe("grouping toggle", () => {
     await mountPulls();
     await selectPullGrouping("All");
     await vi.waitFor(
-      () => expect(document.querySelector(".repo-chip")?.textContent?.trim()).toBe("acme/widgets"),
+      () => expect(document.querySelector(".pull-item .repo-name")?.textContent?.trim()).toBe("acme/widgets"),
       WAIT,
     );
 
     await selectCompactFilterItem("Hide org name");
-    await vi.waitFor(() => expect(document.querySelector(".repo-chip")?.textContent?.trim()).toBe("widgets"), WAIT);
+    await vi.waitFor(
+      () => expect(document.querySelector(".pull-item .repo-name")?.textContent?.trim()).toBe("widgets"),
+      WAIT,
+    );
     expect(localStorage.getItem("middleman:hideOrgName")).toBe("1");
 
     mounted?.unmount();
     mounted = await mountBrowserApp("/issues", { overrides: overrides() });
     await vi.waitFor(() => expect(document.querySelector(".issue-item")).not.toBeNull(), WAIT);
-    expect(document.querySelector(".repo-chip")?.textContent?.trim()).toBe("widgets");
+    expect(document.querySelector(".issue-item .repo-name")?.textContent?.trim()).toBe("widgets");
 
     await selectCompactFilterItem("Hide org name");
     await vi.waitFor(
-      () => expect(document.querySelector(".repo-chip")?.textContent?.trim()).toBe("acme/widgets"),
+      () => expect(document.querySelector(".issue-item .repo-name")?.textContent?.trim()).toBe("acme/widgets"),
       WAIT,
     );
   });

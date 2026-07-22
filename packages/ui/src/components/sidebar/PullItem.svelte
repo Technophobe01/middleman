@@ -13,7 +13,6 @@
   import CircleAlertIcon from "@lucide/svelte/icons/circle-alert";
   import CircleCheckBigIcon from "@lucide/svelte/icons/circle-check-big";
   import OctagonXIcon from "@lucide/svelte/icons/octagon-x";
-  import { Chip } from "@kenn-io/kit-ui";
   import LabelRow from "../shared/LabelRow.svelte";
   import WorkspaceIndicator from "../shared/WorkspaceIndicator.svelte";
   import { repoIdentityKey } from "../../utils/repo-label.js";
@@ -62,16 +61,6 @@
     }
   });
 
-  const kanbanLabels: Record<string, string> = {
-    new: "New",
-    reviewing: "Reviewing",
-    waiting: "Waiting",
-    awaiting_merge: "Ready",
-  };
-
-  const statusLabel = $derived(kanbanLabels[pr.KanbanStatus] ?? pr.KanbanStatus);
-  const statusClass = $derived(`status-chip--${pr.KanbanStatus.replace("_", "-")}`);
-  const showStatus = $derived(pr.State !== "closed" && pr.State !== "merged");
   const ago = $derived(formatRelativeTime(pr.LastActivityAt));
   const hasWorktree = $derived(
     (pr.worktree_links?.length ?? 0) > 0,
@@ -174,23 +163,17 @@
 >
   <p class="title">
     <span class="state-dot" style="background: {stateColors[prState]}"></span>
-    {pr.Title}
+    <span class="title-text">{pr.Title}</span>
+    <LabelRow {labels} compact />
+    <span class="item-number">#{pr.Number}</span>
   </p>
-  <LabelRow {labels} compact />
-  {#if showRepo}
-    <div class="repo-row">
-      <Chip
-        size="xs"
-        uppercase={false}
-        title={repoLabel}
-        tone="muted" class="repo-chip"
-        style={`color: ${hashColor(repoColorKey)}; background: color-mix(in srgb, ${hashColor(repoColorKey)} 15%, transparent);`}
-      >{repoLabel}</Chip>
-    </div>
-  {/if}
   <div class="meta-row">
     <span class="meta-left">
-      #{pr.Number} · {pr.Author}
+      {#if showRepo}
+        <span class="repo-name" style={`color: ${hashColor(repoColorKey)}`} title={repoLabel}>{repoLabel}</span>
+        <span class="meta-sep">·</span>
+      {/if}
+      <span class="meta-text">{pr.Author}</span>
     </span>
     <span class="meta-right">
       {#if showImport}
@@ -278,9 +261,6 @@
           </svg>
         {/if}
       </span>
-      {#if showStatus && statusLabel}
-        <Chip size="xs" class={`status-chip ${statusClass}`}>{statusLabel}</Chip>
-      {/if}
       <span class="time">{ago}</span>
     </span>
   </div>
@@ -291,7 +271,7 @@
     display: block;
     width: 100%;
     text-align: left;
-    padding: var(--sidebar-row-padding, 10px 12px);
+    padding: 6px 10px;
     border-bottom: 1px solid var(--sidebar-list-border-muted, var(--border-muted));
     background: var(--sidebar-row-bg, var(--bg-surface));
     cursor: pointer;
@@ -332,10 +312,16 @@
     font-size: var(--font-size-md);
     font-weight: 500;
     color: var(--text-primary);
+    overflow: hidden;
+    margin-bottom: 2px;
+  }
+
+  .title-text {
+    flex: 0 1 auto;
+    min-width: 0;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    margin-bottom: 4px;
   }
 
   .state-dot {
@@ -343,6 +329,13 @@
     height: 8px;
     border-radius: 50%;
     flex-shrink: 0;
+  }
+
+  .item-number {
+    margin-left: auto;
+    flex-shrink: 0;
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
   }
 
   .meta-row {
@@ -353,26 +346,36 @@
   }
 
   .meta-left {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+
+  .meta-text {
     font-size: var(--font-size-xs);
     color: var(--text-muted);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+    flex: 0 4 auto;
     min-width: 0;
   }
 
-  .repo-row {
-    display: flex;
-    min-width: 0;
-    margin-bottom: 4px;
-  }
-
-  :global(.kit-chip.repo-chip) {
-    flex: 0 1 auto;
-    justify-content: flex-start;
-    min-width: 0;
-    max-width: 100%;
+  .repo-name {
+    font-size: var(--font-size-xs);
+    font-weight: 500;
+    white-space: nowrap;
     overflow: hidden;
+    text-overflow: ellipsis;
+    flex: 0 1 auto;
+    min-width: 0;
+  }
+
+  .meta-sep {
+    color: var(--text-muted);
+    flex-shrink: 0;
   }
 
   .meta-right {
@@ -385,30 +388,6 @@
   .time {
     font-size: var(--font-size-xs);
     color: var(--text-muted);
-  }
-
-  :global(.status-chip) {
-    flex-shrink: 0;
-  }
-
-  :global(.status-chip--new) {
-    background: color-mix(in srgb, var(--kanban-new) 18%, transparent);
-    color: var(--kanban-new);
-  }
-
-  :global(.status-chip--reviewing) {
-    background: color-mix(in srgb, var(--accent-amber) 18%, transparent);
-    color: var(--accent-amber);
-  }
-
-  :global(.status-chip--waiting) {
-    background: color-mix(in srgb, var(--accent-purple) 18%, transparent);
-    color: var(--accent-purple);
-  }
-
-  :global(.status-chip--awaiting-merge) {
-    background: color-mix(in srgb, var(--accent-green) 18%, transparent);
-    color: var(--accent-green);
   }
 
   .worktree-badge {
@@ -524,7 +503,7 @@
   }
 
   :global(.mobile-main) .pull-item {
-    min-height: calc(var(--focus-mobile-hit-target, 37px) * 1.65);
+    min-height: calc(var(--focus-mobile-hit-target, 37px) * 1.95);
     font-size: var(--font-size-md);
     padding: var(--focus-mobile-space-sm, 10px) var(--focus-mobile-space-md, 13px);
     border-bottom: thin solid var(--border-muted);
@@ -536,6 +515,9 @@
     margin-bottom: var(--focus-mobile-space-xs, 6.5px);
     font-size: var(--font-size-xl);
     line-height: 1.3;
+  }
+
+  :global(.mobile-main) .title-text {
     white-space: normal;
     display: -webkit-box;
     -webkit-box-orient: vertical;
@@ -548,17 +530,15 @@
     height: 10px;
   }
 
-  :global(.mobile-main) .repo-row {
-    margin-bottom: var(--focus-mobile-space-xs, 6.5px);
-  }
-
   :global(.mobile-main) .meta-row {
     gap: var(--focus-mobile-space-sm, 8px);
   }
 
-  :global(.mobile-main) .meta-left,
+  :global(.mobile-main) .meta-text,
   :global(.mobile-main) .time,
-  :global(.mobile-main) .worktree-name {
+  :global(.mobile-main) .worktree-name,
+  :global(.mobile-main) .item-number,
+  :global(.mobile-main) .repo-name {
     font-size: var(--font-size-sm);
     line-height: 1.35;
   }
@@ -568,8 +548,7 @@
   }
 
   :global(.mobile-main) :global(.kit-chip),
-  :global(.mobile-main) :global(.state-chip),
-  :global(.mobile-main) :global(.status-chip) {
+  :global(.mobile-main) :global(.state-chip) {
     min-height: calc(var(--focus-mobile-hit-target, 37px) * 0.65);
     padding: 2.5px var(--focus-mobile-space-xs, 6.5px);
     border-radius: 999px;
