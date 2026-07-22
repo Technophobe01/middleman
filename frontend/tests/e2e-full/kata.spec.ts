@@ -100,6 +100,51 @@ async function selectGraphFilterItem(graph: Locator, id: string): Promise<void> 
   await expect(item).toHaveClass(/(^|\s)active(\s|$)/);
 }
 
+type ElementBox = { x: number; y: number; width: number; height: number };
+
+function expectFloatingPanelAnchored(trigger: ElementBox, panel: ElementBox): void {
+  expect(Math.abs(panel.x + panel.width - (trigger.x + trigger.width))).toBeLessThanOrEqual(2);
+  const belowGap = Math.abs(panel.y - (trigger.y + trigger.height + 4));
+  const aboveGap = Math.abs(trigger.y - (panel.y + panel.height + 4));
+  expect(Math.min(belowGap, aboveGap)).toBeLessThanOrEqual(2);
+}
+
+async function expectTaskColumnsAligned(page: Page, columns: readonly string[]): Promise<void> {
+  for (const column of columns) {
+    await expect(page.locator(`.table-header .col-${column}`)).toBeVisible();
+    await expect(page.locator(`.issue-row .cell-${column}`).first()).toHaveCount(1);
+  }
+
+  const header = page.locator(".table-header");
+  const row = page.locator(".issue-row").first();
+  const headerGrid = await header.evaluate((element) => {
+    const style = getComputedStyle(element);
+    return {
+      columns: style.gridTemplateColumns,
+      gap: style.columnGap,
+      paddingLeft: style.paddingLeft,
+      paddingRight: style.paddingRight,
+    };
+  });
+  const rowGrid = await row.evaluate((element) => {
+    const style = getComputedStyle(element);
+    return {
+      columns: style.gridTemplateColumns,
+      gap: style.columnGap,
+      paddingLeft: style.paddingLeft,
+      paddingRight: style.paddingRight,
+    };
+  });
+  expect(rowGrid).toEqual(headerGrid);
+
+  const headerBox = await header.boundingBox();
+  const rowBox = await row.boundingBox();
+  expect(headerBox).not.toBeNull();
+  expect(rowBox).not.toBeNull();
+  expect(Math.abs(headerBox!.x - rowBox!.x)).toBeLessThanOrEqual(1);
+  expect(Math.abs(headerBox!.width - rowBox!.width)).toBeLessThanOrEqual(1);
+}
+
 type BackendState = {
   commentsByUID: Map<string, CommentRow[]>;
   duplicateIssueListResponses: DuplicateIssueListResponse[];
@@ -3156,6 +3201,102 @@ test("kata task list sorting preserves visible groups", async ({ page }) => {
     await expect(todayGroup).toContainText("Today low priority");
     await expect(overdueGroup.locator(".issue-row").first()).toContainText("Overdue high priority");
     await expect(todayGroup.locator(".issue-row").first()).toContainText("Today low priority");
+  } finally {
+    await server.stop();
+    kataHome.restore();
+    await backend.close();
+  }
+});
+
+test("kata task columns float and preserve responsive grid alignment", async ({ page }) => {
+  await page.setViewportSize({ width: 1180, height: 760 });
+  const backend = await startKataBackend();
+  const kataHome = await configureKataHome(backend.url);
+  const server = await startIsolatedE2EServer();
+
+  try {
+    await page.goto(`${server.info.base_url}/kata`);
+    await expectKataDaemonSwitcherReady(page);
+    const list = page.locator(".issue-list");
+    await list.evaluate((element) => {
+      element.style.width = "940px";
+      element.style.flex = "none";
+    });
+
+    const titleCell = page.locator(".issue-row .cell-title").first();
+    const titleWidthBefore = await titleCell.evaluate((element) => element.getBoundingClientRect().width);
+    await expectTaskColumnsAligned(page, ["id", "title", "updated", "priority", "due", "owner", "tags"]);
+
+    const trigger = page.getByRole("button", { name: "Columns" });
+    await trigger.click();
+    const panel = page.locator(".column-picker__panel");
+    await expect(panel).toBeVisible();
+    expect(await panel.evaluate((element) => getComputedStyle(element).position)).toBe("fixed");
+    expect(Number(await panel.evaluate((element) => getComputedStyle(element).zIndex))).toBeGreaterThan(0);
+    const triggerBox = await trigger.boundingBox();
+    const panelBox = await panel.boundingBox();
+    expect(triggerBox).not.toBeNull();
+    expect(panelBox).not.toBeNull();
+    expectFloatingPanelAnchored(triggerBox!, panelBox!);
+    expect(panelBox!.x).toBeGreaterThanOrEqual(0);
+    expect(panelBox!.y).toBeGreaterThanOrEqual(0);
+    expect(panelBox!.x + panelBox!.width).toBeLessThanOrEqual(1181);
+    expect(panelBox!.y + panelBox!.height).toBeLessThanOrEqual(761);
+
+    await page.getByRole("checkbox", { name: "Tags" }).click();
+    await expect(page.locator(".table-header .col-tags")).toHaveCount(0);
+    await expect(page.locator(".issue-row .cell-tags")).toHaveCount(0);
+    const titleWidthAfter = await titleCell.evaluate((element) => element.getBoundingClientRect().width);
+    expect(titleWidthAfter).toBeGreaterThan(titleWidthBefore);
+    await page.keyboard.press("Escape");
+
+    await list.evaluate((element) => {
+      element.style.width = "640px";
+    });
+    await expect(trigger.locator(".action-label")).toBeHidden();
+    await expect(page.locator(".table-header .col-owner")).toBeHidden();
+    await expectTaskColumnsAligned(page, ["id", "title", "updated", "priority", "due"]);
+    await list.evaluate((element) => {
+      element.style.width = "940px";
+    });
+    await expect(page.locator(".table-header .col-owner")).toBeVisible();
+    await expect(page.locator(".table-header .col-tags")).toHaveCount(0);
+
+    await page.getByRole("button", { name: /Sort by Owner/ }).click();
+    await list.evaluate((element) => {
+      element.style.width = "640px";
+    });
+    await expect(page.getByRole("button", { name: "Sort by Owner, currently ascending" })).toBeVisible();
+    await expectTaskColumnsAligned(page, ["id", "title", "updated", "priority", "due", "owner"]);
+    await trigger.click();
+
+    await page.keyboard.press("Escape");
+    await page.setViewportSize({ width: 720, height: 540 });
+    expect(await page.evaluate(() => ({ width: window.innerWidth, height: window.innerHeight }))).toEqual({
+      width: 720,
+      height: 540,
+    });
+    await trigger.scrollIntoViewIfNeeded();
+    await trigger.click();
+    await expect
+      .poll(async () => {
+        const box = await panel.boundingBox();
+        return box ? box.x + box.width : Number.POSITIVE_INFINITY;
+      })
+      .toBeLessThanOrEqual(721);
+    await expect
+      .poll(async () => {
+        const box = await panel.boundingBox();
+        return box ? box.y + box.height : Number.POSITIVE_INFINITY;
+      })
+      .toBeLessThanOrEqual(541);
+    const constrainedPanelBox = await panel.boundingBox();
+    const constrainedTriggerBox = await trigger.boundingBox();
+    expect(constrainedPanelBox).not.toBeNull();
+    expect(constrainedTriggerBox).not.toBeNull();
+    expect(constrainedPanelBox!.x).toBeGreaterThanOrEqual(0);
+    expect(constrainedPanelBox!.y).toBeGreaterThanOrEqual(0);
+    expectFloatingPanelAnchored(constrainedTriggerBox!, constrainedPanelBox!);
   } finally {
     await server.stop();
     kataHome.restore();
@@ -6413,8 +6554,25 @@ test("kata task links render, navigate, and add related links through the config
     body: "Parent budgeting task.",
     labels: ["home"],
   });
+  const closedPeer = {
+    ...issueSummary({
+      id: 34,
+      uid: "issue-closed-link",
+      project_id: 1,
+      project_uid: "project-finance",
+      project_name: "Finances",
+      short_id: "closed-link",
+      qualified_id: "Finances#closed-link",
+      title: "Completed linked task",
+      body: "Closed peer body.",
+      labels: ["home"],
+    }),
+    status: "closed" as const,
+    closed_reason: "done" as const,
+    closed_at: now,
+  };
   const backend = await startKataBackend({
-    issues: [...issues, budget],
+    issues: [...issues, budget, closedPeer],
     links: [
       linkRow({
         id: 1,
@@ -6423,19 +6581,105 @@ test("kata task links render, navigate, and add related links through the config
         to: issues[0]!,
         type: "parent",
       }),
+      linkRow({
+        id: 2,
+        project_id: 1,
+        from: issues[0]!,
+        to: closedPeer,
+        type: "related",
+      }),
     ],
   });
   const kataHome = await configureKataHome(backend.url);
   const server = await startIsolatedE2EServer();
 
   try {
+    await page.setViewportSize({ width: 720, height: 540 });
     await page.goto(`${server.info.base_url}/kata?issue=issue-rent`);
+    await page.getByRole("button", { name: "Switch to side-by-side layout" }).click();
 
     const detail = page.getByRole("region", { name: "Task detail" });
     const links = detail.getByRole("region", { name: "Links" });
     await expect(links.getByRole("heading", { name: "Links" })).toBeVisible();
     await expect(links).toContainText("Quarterly budget review with a long title");
-    await expect.poll(() => backend.state.seenPaths).toContain("GET /api/v1/issues/issue-budget");
+    await expect(links).not.toContainText("Completed linked task");
+    await expect(links).toContainText("1 / 2");
+    expect(backend.state.seenPaths).not.toContain("GET /api/v1/issues/issue-budget");
+    await expect.poll(() => backend.state.seenPaths).toContain("GET /api/v1/issues/issue-closed-link");
+
+    const filterTrigger = links.getByRole("button", { name: "Filter links" });
+    await filterTrigger.click();
+    const filterPanel = page.locator(".link-filter-panel");
+    await expect(filterPanel).toBeVisible();
+    expect(await filterPanel.evaluate((element) => getComputedStyle(element).position)).toBe("fixed");
+    expect(Number(await filterPanel.evaluate((element) => getComputedStyle(element).zIndex))).toBeGreaterThan(0);
+    const filterTriggerBox = await filterTrigger.boundingBox();
+    const filterPanelBox = await filterPanel.boundingBox();
+    expect(filterTriggerBox).not.toBeNull();
+    expect(filterPanelBox).not.toBeNull();
+    expectFloatingPanelAnchored(filterTriggerBox!, filterPanelBox!);
+    expect(filterPanelBox!.x).toBeGreaterThanOrEqual(0);
+    expect(filterPanelBox!.y).toBeGreaterThanOrEqual(0);
+    expect(filterPanelBox!.x + filterPanelBox!.width).toBeLessThanOrEqual(721);
+    expect(filterPanelBox!.y + filterPanelBox!.height).toBeLessThanOrEqual(541);
+
+    await page.keyboard.press("Escape");
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await filterTrigger.focus();
+    await page.keyboard.press("Enter");
+    await expect(filterPanel).toBeVisible();
+    await expect
+      .poll(async () => {
+        const box = await filterPanel.boundingBox();
+        return box ? box.x + box.width : Number.POSITIVE_INFINITY;
+      })
+      .toBeLessThanOrEqual(1281);
+    await expect
+      .poll(async () => {
+        const box = await filterPanel.boundingBox();
+        return box ? box.y + box.height : Number.POSITIVE_INFINITY;
+      })
+      .toBeLessThanOrEqual(721);
+    const wideFilterPanelBox = await filterPanel.boundingBox();
+    const wideFilterTriggerBox = await filterTrigger.boundingBox();
+    expect(wideFilterPanelBox).not.toBeNull();
+    expect(wideFilterTriggerBox).not.toBeNull();
+    expect(wideFilterPanelBox!.x).toBeGreaterThanOrEqual(0);
+    expect(wideFilterPanelBox!.y).toBeGreaterThanOrEqual(0);
+    expect(wideFilterPanelBox!.x + wideFilterPanelBox!.width).toBeLessThanOrEqual(1281);
+    expect(wideFilterPanelBox!.y + wideFilterPanelBox!.height).toBeLessThanOrEqual(721);
+    expectFloatingPanelAnchored(wideFilterTriggerBox!, wideFilterPanelBox!);
+    await filterPanel.getByRole("checkbox", { name: "Closed" }).click();
+
+    await expect(links).toContainText("Completed linked task");
+    const linkList = links.locator(".link-list");
+    await expect(linkList.getByText("Open", { exact: true })).toBeVisible();
+    await expect(linkList.getByText("Closed", { exact: true })).toBeVisible();
+    const linkTextGaps = await linkList.getByRole("button", { name: /parent\s+budget/ }).evaluate((row) => {
+      const textBox = (selector: string): DOMRect => {
+        const element = row.querySelector(selector);
+        if (!element) throw new Error(`Missing ${selector}`);
+        const range = document.createRange();
+        range.selectNodeContents(element);
+        return range.getBoundingClientRect();
+      };
+      const kind = textBox(".link-kind");
+      const peer = textBox(".link-peer");
+      const title = textBox(".link-title");
+      return {
+        kindToPeer: peer.x - kind.right,
+        peerToTitle: title.x - peer.right,
+      };
+    });
+    expect(linkTextGaps.kindToPeer).toBeLessThanOrEqual(16);
+    expect(linkTextGaps.peerToTitle).toBeLessThanOrEqual(16);
+
+    await filterPanel.getByRole("checkbox", { name: "Parent" }).click();
+    await expect(links).not.toContainText("Quarterly budget review with a long title");
+    await expect(links).toContainText("1 / 2");
+    await filterPanel.getByRole("checkbox", { name: "Parent" }).click();
+    await filterPanel.getByRole("checkbox", { name: "Related" }).click();
+    await page.keyboard.press("Escape");
 
     await links.getByRole("button", { name: /parent\s+budget/ }).click();
     await expect(detail.getByRole("heading", { name: "Quarterly budget review with a long title" })).toBeVisible();
@@ -6445,8 +6689,13 @@ test("kata task links render, navigate, and add related links through the config
       .locator(".kata-list")
       .getByRole("button", { name: /Pay rent/ })
       .click();
+    await filterTrigger.focus();
+    await page.keyboard.press("Enter");
+    await expect(filterPanel.getByRole("checkbox", { name: "Related" })).not.toBeChecked();
+    await filterPanel.getByRole("checkbox", { name: "Related" }).click();
+    await page.keyboard.press("Escape");
     await links.getByLabel("Related issue", { exact: true }).fill("kat-7");
-    await links.getByRole("button", { name: "Link" }).click();
+    await links.getByRole("button", { name: "Link", exact: true }).click();
 
     await expect(links.getByRole("button", { name: /related\s+kat-7/ })).toBeVisible();
     await expect.poll(() => backend.state.seenPaths).toContain("PATCH /api/v1/projects/1/issues/issue-rent");
