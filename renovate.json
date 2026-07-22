@@ -43,6 +43,12 @@
       "groupSlug": "docker-images"
     },
     {
+      "matchManagers": ["dockerfile"],
+      "matchDepNames": ["mcr.microsoft.com/playwright", "oven/bun"],
+      "groupName": "JavaScript dependencies",
+      "groupSlug": "javascript-dependencies"
+    },
+    {
       "matchManagers": ["mise"],
       "groupName": "Developer tools",
       "groupSlug": "dev-tools"
@@ -68,13 +74,11 @@
     },
     {
       "customType": "regex",
-      "managerFilePatterns": ["/(^|/)\\.github/workflows/.+\\.ya?ml$/"],
-      "matchStrings": [
-        "mcr\\.microsoft\\.com/playwright@(?<currentDigest>sha256:[a-f0-9]{64})\\s*#\\s*(?<currentValue>v\\d+\\.\\d+\\.\\d+-noble)"
-      ],
-      "datasourceTemplate": "docker",
-      "depNameTemplate": "mcr.microsoft.com/playwright",
-      "versioningTemplate": "regex:^v(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)-noble$"
+      "managerFilePatterns": ["/(^|/)\\.github/docker/playwright/Dockerfile$/"],
+      "matchStrings": ["ARG VITE_PLUS_VERSION=(?<currentValue>\\d+\\.\\d+\\.\\d+)"],
+      "datasourceTemplate": "npm",
+      "depNameTemplate": "vite-plus",
+      "versioningTemplate": "semver"
     }
   ]
 }

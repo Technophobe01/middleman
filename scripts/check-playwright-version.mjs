@@ -1,25 +1,23 @@
 #!/usr/bin/env node
 
-// Guard that the CI Playwright container image tag stays in lockstep with the
-// pinned @playwright/test version. The e2e job runs inside the
-// mcr.microsoft.com/playwright image, whose browsers are pre-baked and keyed to
-// the image's Playwright version. If the image tag drifts from the npm pin,
-// Playwright silently re-downloads browsers (losing the container's whole
-// benefit) or runs mismatched binaries. This check fails the commit when they
-// disagree, so the version coupling can never rot unnoticed.
+// Guard that the browser CI image stays in lockstep with the repository's
+// Playwright, Bun, and Vite+ pins. The browser jobs run inside a
+// repository-owned image derived from mcr.microsoft.com/playwright.
 
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // package.json files that pin @playwright/test. All must agree, and the CI
-// container image version must match them.
+// image recipe's base Playwright version must match them.
 const PIN_FILES = ["package.json", "frontend/package.json", "packages/github-app-ui/package.json"];
-const WORKFLOW_FILE = ".github/workflows/ci.yml";
+const IMAGE_FILE = ".github/docker/playwright/Dockerfile";
 // A line that references the Playwright container image, by tag or by digest:
 //   mcr.microsoft.com/playwright:v1.60.0-noble
 //   mcr.microsoft.com/playwright@sha256:...  # v1.60.0-noble
 const IMAGE_REF_RE = /mcr\.microsoft\.com\/playwright[:@]/;
+const BUN_IMAGE_REF_RE = /^ARG BUN_IMAGE=oven\/bun:(\d+\.\d+\.\d+)@sha256:[a-f0-9]{64}$/;
+const VITE_PLUS_VERSION_RE = /^ARG VITE_PLUS_VERSION=(\d+\.\d+\.\d+)$/;
 // The version lives either in the tag (:v1.60.0-noble) or, for a digest pin, in
 // the trailing "# v1.60.0-noble" comment. Either way it is the v<semver> token;
 // a 64-hex sha256 digest carries no such token, so it cannot match by accident.
@@ -29,9 +27,31 @@ function pinnedPlaywright(pkg) {
   return pkg.devDependencies?.["@playwright/test"] ?? pkg.dependencies?.["@playwright/test"];
 }
 
+function requiredArgMatch(lines, name, pattern, invalidMessage, findings) {
+  const declarations = lines
+    .map((line, index) => ({ line, lineNumber: index + 1 }))
+    .filter(({ line }) => line.startsWith(`ARG ${name}=`));
+  if (declarations.length !== 1) {
+    findings.push({
+      file: IMAGE_FILE,
+      message: `Dockerfile must define exactly one ARG ${name} declaration.`,
+    });
+    return null;
+  }
+
+  const declaration = declarations[0];
+  const match = declaration.line.match(pattern);
+  if (!match) {
+    findings.push({ file: IMAGE_FILE, line: declaration.lineNumber, message: invalidMessage });
+    return null;
+  }
+  return { match, lineNumber: declaration.lineNumber };
+}
+
 export async function checkPlaywrightVersion({ root = process.cwd() } = {}) {
   const rootPath = resolve(root);
   const findings = [];
+  let rootPackage;
 
   // Collect the pinned @playwright/test version from each package.json.
   const pins = new Map();
@@ -45,6 +65,7 @@ export async function checkPlaywrightVersion({ root = process.cwd() } = {}) {
     }
     const version = pinnedPlaywright(pkg);
     if (version) pins.set(rel, version);
+    if (rel === "package.json") rootPackage = pkg;
   }
 
   // Every package.json must pin the same version.
@@ -59,44 +80,94 @@ export async function checkPlaywrightVersion({ root = process.cwd() } = {}) {
 
   const expected = pins.size > 0 ? [...pins.values()][0] : null;
 
-  // Compare every Playwright container image reference in the workflow against
-  // the pin. The image is digest-pinned, so the version is carried by the
-  // trailing "# v<version>" comment, which must be present and must match.
-  let workflow;
+  // Compare every Playwright base image reference in the image recipe against
+  // the pin. A tag plus digest keeps the human-readable version and immutable
+  // content identity in one reference.
+  let imageFile;
   try {
-    workflow = await readFile(resolve(rootPath, WORKFLOW_FILE), "utf8");
+    imageFile = await readFile(resolve(rootPath, IMAGE_FILE), "utf8");
   } catch (error) {
-    findings.push({ file: WORKFLOW_FILE, message: `Unable to read ${WORKFLOW_FILE}: ${error.message}` });
+    findings.push({ file: IMAGE_FILE, message: `Unable to read ${IMAGE_FILE}: ${error.message}` });
     return findings;
   }
 
-  workflow.split(/\r?\n/).forEach((line, index) => {
-    if (!IMAGE_REF_RE.test(line)) return;
-
-    const versionMatch = line.match(VERSION_RE);
-    if (!versionMatch) {
-      findings.push({
-        file: WORKFLOW_FILE,
-        line: index + 1,
-        message:
-          "Playwright container image has no v<version> tag or comment to verify. Add a " +
-          "trailing '# v<version>' comment next to the digest so the pin stays traceable " +
-          "and checkable against the @playwright/test pin.",
-      });
-      return;
-    }
-
-    const imageVersion = versionMatch[1];
-    if (expected && imageVersion !== expected) {
-      findings.push({
-        file: WORKFLOW_FILE,
-        line: index + 1,
-        message:
-          `Playwright container image is v${imageVersion} but @playwright/test is ${expected}. ` +
-          `Update the digest pin and its '# v${expected}' comment so the pre-baked browsers match.`,
-      });
+  const imageLines = imageFile.split(/\r?\n/);
+  imageLines.forEach((line, index) => {
+    if (IMAGE_REF_RE.test(line)) {
+      const versionMatch = line.match(VERSION_RE);
+      if (!versionMatch) {
+        findings.push({
+          file: IMAGE_FILE,
+          line: index + 1,
+          message:
+            "Playwright base image has no v<version> tag to verify. Keep the readable tag " +
+            "alongside the digest so the pin remains checkable against @playwright/test.",
+        });
+      } else {
+        const imageVersion = versionMatch[1];
+        if (expected && imageVersion !== expected) {
+          findings.push({
+            file: IMAGE_FILE,
+            line: index + 1,
+            message:
+              `Playwright base image is v${imageVersion} but @playwright/test is ${expected}. ` +
+              `Update its tag and digest so the pre-baked browsers match.`,
+          });
+        }
+      }
     }
   });
+
+  const packageManagerMatch = rootPackage?.packageManager?.match(/^bun@(\d+\.\d+\.\d+)$/);
+  if (!packageManagerMatch) {
+    findings.push({
+      file: "package.json",
+      message: "packageManager must pin Bun as bun@<version>.",
+    });
+  }
+
+  const bunImageMatch = requiredArgMatch(
+    imageLines,
+    "BUN_IMAGE",
+    BUN_IMAGE_REF_RE,
+    "BUN_IMAGE must pin oven/bun as <version>@sha256:<digest>.",
+    findings,
+  );
+  if (bunImageMatch && packageManagerMatch && bunImageMatch.match[1] !== packageManagerMatch[1]) {
+    findings.push({
+      file: IMAGE_FILE,
+      line: bunImageMatch.lineNumber,
+      message:
+        `Bun image is ${bunImageMatch.match[1]} but packageManager is bun@${packageManagerMatch[1]}. ` +
+        "Update its tag and digest together.",
+    });
+  }
+
+  const vitePlusPin = rootPackage?.devDependencies?.["vite-plus"];
+  const vitePlusPinMatch = vitePlusPin?.match(/^(\d+\.\d+\.\d+)$/);
+  if (!vitePlusPinMatch) {
+    findings.push({
+      file: "package.json",
+      message: "devDependencies.vite-plus must use an exact version.",
+    });
+  }
+
+  const vitePlusImageMatch = requiredArgMatch(
+    imageLines,
+    "VITE_PLUS_VERSION",
+    VITE_PLUS_VERSION_RE,
+    "VITE_PLUS_VERSION must use an exact version.",
+    findings,
+  );
+  if (vitePlusImageMatch && vitePlusPinMatch && vitePlusImageMatch.match[1] !== vitePlusPinMatch[1]) {
+    findings.push({
+      file: IMAGE_FILE,
+      line: vitePlusImageMatch.lineNumber,
+      message:
+        `Baked Vite+ is ${vitePlusImageMatch.match[1]} but package.json pins vite-plus ${vitePlusPinMatch[1]}. ` +
+        "Update them together.",
+    });
+  }
 
   return findings;
 }

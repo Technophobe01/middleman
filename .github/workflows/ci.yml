@@ -65,7 +65,85 @@ jobs:
               - tests/integration/**
             ci:
               - .github/workflows/ci.yml
+              - .github/docker/**
               - Makefile
+
+  ensure_playwright_image:
+    name: Ensure Playwright CI image
+    runs-on: kenn-linux-x64
+    needs: detect_changes
+    if: needs.detect_changes.outputs.backend == 'true' || needs.detect_changes.outputs.frontend == 'true' || needs.detect_changes.outputs.e2e == 'true'
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.resolve.outputs.image }}
+    env:
+      PLAYWRIGHT_CI_IMAGE: ghcr.io/kenn-io/middleman-playwright
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: echo "$GHCR_TOKEN" | docker login ghcr.io --username "${{ github.actor }}" --password-stdin
+
+      - name: Resolve Playwright CI image
+        id: resolve
+        shell: bash
+        env:
+          PR_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          set -euo pipefail
+
+          dockerfile=.github/docker/playwright/Dockerfile
+          image_export=zstd-3-oci-force
+          playwright_base_image="$(sed -n 's/^ARG PLAYWRIGHT_BASE_IMAGE=//p' "$dockerfile" | head -n 1)"
+          base_digest="${playwright_base_image##*@sha256:}"
+          if [[ ! "$base_digest" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::$dockerfile must define PLAYWRIGHT_BASE_IMAGE with a sha256 digest"
+            exit 1
+          fi
+
+          recipe_digest="$(
+            {
+              sha256sum "$dockerfile"
+              printf '%s\n' "$image_export"
+            } | sha256sum | cut -d' ' -f1
+          )"
+          image_tag="${PLAYWRIGHT_CI_IMAGE}:playwright-${base_digest}-recipe-${recipe_digest:0:16}"
+
+          inspect_output=""
+          if inspect_output="$(docker buildx imagetools inspect "$image_tag" 2>&1)"; then
+            echo "Reusing $image_tag"
+          elif grep -Eqi 'manifest unknown|not found|no such manifest' <<<"$inspect_output"; then
+            if [[ "$GITHUB_EVENT_NAME" == "pull_request" && "$PR_HEAD_REPOSITORY" != "$GITHUB_REPOSITORY" ]]; then
+              echo "::error::The Playwright CI image is missing and fork pull requests cannot publish private packages. Run this workflow from a trusted branch first."
+              exit 1
+            fi
+
+            docker buildx build \
+              --build-arg "PLAYWRIGHT_BASE_IMAGE=$playwright_base_image" \
+              --file "$dockerfile" \
+              --output "type=registry,compression=zstd,compression-level=3,force-compression=true,oci-mediatypes=true" \
+              --platform linux/amd64 \
+              --provenance=false \
+              --tag "$image_tag" \
+              .github/docker/playwright
+          else
+            echo "$inspect_output" >&2
+            exit 1
+          fi
+
+          manifest_digest="$(docker buildx imagetools inspect "$image_tag" --format '{{.Manifest.Digest}}')"
+          if [[ ! "$manifest_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Unable to resolve an immutable digest for $image_tag"
+            exit 1
+          fi
+
+          echo "image=${PLAYWRIGHT_CI_IMAGE}@${manifest_digest}" >> "$GITHUB_OUTPUT"
 
   lint:
     runs-on: kenn-linux-x64
@@ -346,9 +424,16 @@ jobs:
 
   e2e-mock:
     runs-on: kenn-linux-x64
-    needs: detect_changes
+    needs: [detect_changes, ensure_playwright_image]
     if: needs.detect_changes.outputs.frontend == 'true' || needs.detect_changes.outputs.e2e == 'true'
-    container: mcr.microsoft.com/playwright@sha256:5b8f294aff9041b7191c34a4bab3ac270157a28774d4b0660e9743297b697e48 # v1.61.1-noble
+    permissions:
+      contents: read
+      packages: read
+    container:
+      image: ${{ needs.ensure_playwright_image.outputs.image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
     strategy:
       fail-fast: false
       matrix:
@@ -359,12 +444,16 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Setup Vite+
-        uses: voidzero-dev/setup-vp@2dec1e33f4ab2c6d5bce1b0c4607961bb1a3f7a1 # v1
+      - name: Restore Bun package cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          node-version-file: package.json
-          cache: true
-          run-install: true
+          path: /usr/local/install/cache
+          key: browser-bun-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/docker/playwright/Dockerfile', 'bun.lock') }}
+          restore-keys: |
+            browser-bun-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Install frontend dependencies
+        run: bun install --frozen-lockfile
 
       - name: Make $HOME owned by the current user for Firefox
         if: matrix.browser == 'firefox'
@@ -383,15 +472,19 @@ jobs:
 
   e2e:
     runs-on: kenn-linux-x64
-    needs: detect_changes
+    needs: [detect_changes, ensure_playwright_image]
     if: needs.detect_changes.outputs.backend == 'true' || needs.detect_changes.outputs.frontend == 'true' || needs.detect_changes.outputs.e2e == 'true'
-    # Run inside the official Playwright image: browsers and their OS deps are
-    # pre-baked at $PLAYWRIGHT_BROWSERS_PATH, so there is no apt download to
-    # time out on (the firefox `--with-deps` install repeatedly flirted with the
-    # old 10m cap off a slow mirror). Pinned by digest like the actions above so
-    # a bot can bump it; the trailing comment records the version, which
-    # `make playwright-version-check` keeps locked to the @playwright/test pin.
-    container: mcr.microsoft.com/playwright@sha256:5b8f294aff9041b7191c34a4bab3ac270157a28774d4b0660e9743297b697e48 # v1.61.1-noble
+    permissions:
+      contents: read
+      packages: read
+    # The prerequisite job resolves a private, digest-pinned Playwright image
+    # with Bun, Vite+, and tmux preinstalled, so browser jobs skip repeated
+    # toolchain bootstrap downloads and never depend on Ubuntu mirrors.
+    container:
+      image: ${{ needs.ensure_playwright_image.outputs.image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
     strategy:
       fail-fast: false
       matrix:
@@ -407,25 +500,18 @@ jobs:
           go-version-file: go.mod
           cache: false
 
-      - name: Setup Vite+
-        uses: voidzero-dev/setup-vp@2dec1e33f4ab2c6d5bce1b0c4607961bb1a3f7a1 # v1
+      - name: Restore Bun package cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          node-version-file: package.json
-          # The Playwright container must install its own dependency tree.
-          # Restoring the host cache can leave Vite's CSS pipeline with stale
-          # virtual modules, producing intermittent invalid-selector builds.
-          cache: false
-          run-install: true
+          path: /usr/local/install/cache
+          key: browser-bun-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/docker/playwright/Dockerfile', 'bun.lock') }}
+          restore-keys: |
+            browser-bun-${{ runner.os }}-${{ runner.arch }}-
 
-      - name: Install tmux for workspace PTY sessions
-        # The minimal Playwright image ships browsers but not tmux, which the
-        # full-stack workspace e2e specs need to start real PTY sessions
-        # (ubuntu-latest had it pre-installed). This is one small package, not
-        # the 48MB firefox browser-deps download the container already removed.
-        timeout-minutes: 5
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends tmux
+      - name: Install frontend dependencies
+        # Restore only Bun's package cache; materialize node_modules from the
+        # checked-out lockfile inside this job container.
+        run: bun install --frozen-lockfile
 
       - name: Make $HOME owned by the current user for Firefox
         # GitHub mounts the container $HOME (/github/home) owned by the runner
@@ -433,7 +519,7 @@ jobs:
         # not owned by the current user (Chromium does not check), so the
         # firefox leg fails every test at browser launch. Re-own the directory
         # itself (not its contents) so the launch check passes; HOME stays
-        # /github/home, leaving the setup-go/setup-vp caches untouched.
+        # /github/home, leaving the setup-go cache untouched.
         run: chown "$(id -u):$(id -g)" "$HOME"
 
       - name: Build frontend
@@ -525,26 +611,34 @@ jobs:
     name: frontend browser tests
     runs-on: kenn-linux-x64
     timeout-minutes: 15
-    needs: detect_changes
+    needs: [detect_changes, ensure_playwright_image]
     if: needs.detect_changes.outputs.backend == 'true' || needs.detect_changes.outputs.frontend == 'true'
+    permissions:
+      contents: read
+      packages: read
     # Keep browser-component tests on the same Playwright image as the full e2e
     # suite so Chromium and its OS dependencies are preinstalled instead of
     # depending on apt during the workflow.
-    container: mcr.microsoft.com/playwright@sha256:5b8f294aff9041b7191c34a4bab3ac270157a28774d4b0660e9743297b697e48 # v1.61.1-noble
+    container:
+      image: ${{ needs.ensure_playwright_image.outputs.image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
 
-      - name: Setup Vite+
-        uses: voidzero-dev/setup-vp@2dec1e33f4ab2c6d5bce1b0c4607961bb1a3f7a1 # v1
+      - name: Restore Bun package cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          node-version-file: package.json
-          # The Playwright container already consumes most of the hosted
-          # runner's disk. Restoring the dependency cache as well can exhaust
-          # the workspace while Vitest browser mode is still running.
-          cache: false
-          run-install: true
+          path: /usr/local/install/cache
+          key: browser-bun-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/docker/playwright/Dockerfile', 'bun.lock') }}
+          restore-keys: |
+            browser-bun-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Install frontend dependencies
+        run: bun install --frozen-lockfile
 
       - name: Run frontend browser tests
         run: cd frontend && vp test run --project browser
