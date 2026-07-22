@@ -1,4 +1,4 @@
-import type { Issue, IssueDetail, IssuesParams, Label } from "../api/types.js";
+import type { Issue, IssueDetail, IssuesParams, IssueSettings, Label } from "../api/types.js";
 import {
   providerDefaultHost,
   providerItemPath,
@@ -63,6 +63,16 @@ function strongerSyncMode(a: IssueDetailSyncMode, b: IssueDetailSyncMode): Issue
   return syncIntentRank(b) > syncIntentRank(a) ? b : a;
 }
 
+const GITLAB_RESOURCE_BOT_USERNAME = /^(?:project|group)_\d+_bot_[a-z0-9]+$/;
+
+function isBotAuthor(issue: Issue): boolean {
+  const author = issue.Author.toLowerCase();
+  if (author.endsWith("-bot")) return true;
+  if (issue.repo.provider === "github") return author.endsWith("[bot]");
+  if (issue.repo.provider === "gitlab") return GITLAB_RESOURCE_BOT_USERNAME.test(author);
+  return false;
+}
+
 export function createIssuesStore(opts: IssuesStoreOptions) {
   const apiClient = opts.client;
   const getGlobalRepo = opts.getGlobalRepo ?? (() => undefined);
@@ -79,6 +89,10 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
   // --- list state ---
 
   let issues = $state<Issue[]>([]);
+  let hideBots = $state(false);
+  let confirmedHideBots = false;
+  let hideBotsMutationGeneration = 0;
+  let hideBotsSave: Promise<void> | null = null;
   let loading = $state(false);
   let storeError = $state<string | null>(null);
   let filterStarred = $state(false);
@@ -120,7 +134,12 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
   // --- list reads ---
 
   function getIssues(): Issue[] {
-    return issues;
+    if (!hideBots) return issues;
+    return issues.filter((issue) => !isBotAuthor(issue));
+  }
+
+  function getHideBots(): boolean {
+    return hideBots;
   }
   function isIssuesLoading(): boolean {
     return loading;
@@ -140,7 +159,7 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
 
   function issuesByRepo(): Map<string, Issue[]> {
     const map = new Map<string, Issue[]>();
-    for (const issue of issues) {
+    for (const issue of getIssues()) {
       const key = issueIdentityKey(issueRef(issue));
       const existing = map.get(key);
       if (existing) existing.push(issue);
@@ -222,6 +241,44 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
   }
   function setIssueFilterState(s: string): void {
     filterState = s;
+  }
+
+  function hydrateDefaults(settings: IssueSettings): void {
+    hideBots = settings.hide_bots;
+    confirmedHideBots = settings.hide_bots;
+  }
+
+  async function persistHideBots(): Promise<void> {
+    for (;;) {
+      const generation = hideBotsMutationGeneration;
+      const value = hideBots;
+      try {
+        const { data, error: requestError } = await apiClient.PUT("/settings", {
+          body: { issues: { hide_bots: value } },
+        });
+        if (!data) {
+          throw new Error(apiErrorMessage(requestError ?? {}, "failed to save issue visibility"));
+        }
+        confirmedHideBots = data.issues.hide_bots;
+        if (generation !== hideBotsMutationGeneration) continue;
+        hideBots = confirmedHideBots;
+        return;
+      } catch (err) {
+        if (generation !== hideBotsMutationGeneration) continue;
+        hideBots = confirmedHideBots;
+        showFlash(err instanceof Error ? err.message : "failed to save issue visibility", { tone: "danger" });
+        return;
+      }
+    }
+  }
+
+  async function setHideBots(value: boolean): Promise<void> {
+    hideBots = value;
+    hideBotsMutationGeneration += 1;
+    hideBotsSave ??= persistHideBots().finally(() => {
+      hideBotsSave = null;
+    });
+    await hideBotsSave;
   }
 
   function selectIssue(
@@ -977,7 +1034,7 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
       }
       return ordered;
     }
-    return issues;
+    return getIssues();
   }
 
   function selectNextIssue(): void {
@@ -1048,6 +1105,7 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
 
   return {
     getIssues,
+    getHideBots,
     isIssuesLoading,
     getIssuesError,
     getSelectedIssue,
@@ -1057,6 +1115,8 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
     setIssueSearchQuery,
     getIssueFilterState,
     setIssueFilterState,
+    hydrateDefaults,
+    setHideBots,
     issuesByRepo,
     selectIssue,
     clearIssueSelection,
