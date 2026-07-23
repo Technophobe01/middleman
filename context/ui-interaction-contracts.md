@@ -162,6 +162,24 @@ Persisted controls must state their scope clearly.
   navigation is part of the feature contract.
 - Server-backed settings belong in the API only when the preference should
   follow the user/config rather than one browser session.
+- Concurrent controls for one server-backed settings object must share a
+  serialized mutation path and reconcile only fields still owned by the settling
+  mutation generation; value equality alone is ABA-prone, while stale full-object
+  saves can erase unrelated preferences
+  (`packages/ui/src/stores/terminal-settings-persistence.ts::saveTerminalSettings`).
+- A settings form that snapshots its baseline must either merge sibling mutations
+  or keep the form and those controls mutually gated while either save settles
+  (`frontend/src/lib/components/terminal/WorkspaceTerminalView.svelte::terminalZoomSaving`).
+- An idle settings queue must rebase from authoritative store values, excluding
+  fields still owned by live preview; otherwise reloads are erased or drafts leak
+  into unrelated saves (`packages/ui/src/stores/terminal-settings-persistence.ts::settingsWithoutPreview`).
+- Settings hydration must share the mutation coordinator; a stale read must
+  preserve pending or newly confirmed fields and rebase active previews while
+  retaining only generation-owned drafts
+  (`packages/ui/src/stores/terminal-settings-persistence.ts::hydrateTerminalSettings`).
+- Settings that select a runtime must hydrate before that runtime starts, but
+  the gate must abort timed-out or superseded reads and expose retry rather than strand the surface
+  (`frontend/src/lib/components/terminal/WorkspaceEmbedShell.svelte::loadTerminalSettings`).
 
 Whenever a control persists, document and test:
 

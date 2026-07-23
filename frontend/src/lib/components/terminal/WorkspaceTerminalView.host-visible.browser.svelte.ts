@@ -97,6 +97,7 @@ describe("WorkspaceTerminalView hostVisible", () => {
     // reads settingsStore.getTerminalSettings() at initialization, so the
     // main subtree cannot mount without a settings store on STORES_KEY.
     const settingsStore = {
+      getTerminalFontSize: () => DEFAULT_TERMINAL_SETTINGS.font_size,
       getTerminalSettings: () => DEFAULT_TERMINAL_SETTINGS,
     };
 
@@ -166,6 +167,7 @@ describe("WorkspaceTerminalView hostVisible", () => {
     globalThis.EventSource = NoopEventSource as unknown as typeof EventSource;
 
     const settingsStore = {
+      getTerminalFontSize: () => DEFAULT_TERMINAL_SETTINGS.font_size,
       getTerminalSettings: () => DEFAULT_TERMINAL_SETTINGS,
     };
     // Opening the right sidebar mounts the diff panel, which reads the
@@ -259,6 +261,7 @@ describe("WorkspaceTerminalView hostVisible", () => {
     // (inside the options popover) with livePreview, which writes settings
     // back through the store — so the stub needs a setter too.
     const settingsStore = {
+      getTerminalFontSize: () => DEFAULT_TERMINAL_SETTINGS.font_size,
       getTerminalSettings: () => DEFAULT_TERMINAL_SETTINGS,
       setTerminalSettings: () => {},
     };
@@ -319,6 +322,139 @@ describe("WorkspaceTerminalView hostVisible", () => {
     }
   });
 
+  it("disables terminal zoom while an options save is in flight", async () => {
+    const api = createMockApiFetch([workspaceRoutes()]);
+    const originalFetch = globalThis.fetch;
+    const originalEventSource = globalThis.EventSource;
+    let resolveSettingsSave: (() => void) | undefined;
+    let terminalSettings = $state({ ...DEFAULT_TERMINAL_SETTINGS });
+
+    globalThis.fetch = async (input, init) => {
+      const request =
+        input instanceof Request ? input : new Request(new URL(String(input), window.location.href), init);
+      const url = new URL(request.url);
+      if (request.method === "PUT" && url.pathname === "/api/v1/settings") {
+        const body = JSON.parse(await request.clone().text()) as {
+          terminal: typeof DEFAULT_TERMINAL_SETTINGS;
+        };
+        return new Promise<Response>((resolve) => {
+          resolveSettingsSave = () => {
+            resolve(jsonResponse({ terminal: body.terminal }));
+          };
+        });
+      }
+      return api.fetch(request);
+    };
+    globalThis.EventSource = NoopEventSource as unknown as typeof EventSource;
+
+    const settingsStore = {
+      getTerminalFontSize: () => terminalSettings.font_size,
+      getTerminalSettings: () => terminalSettings,
+      setTerminalSettings: (settings: typeof DEFAULT_TERMINAL_SETTINGS) => {
+        terminalSettings = settings;
+      },
+    };
+    const target = document.createElement("div");
+    document.body.appendChild(target);
+    const instance = mount(WorkspaceTerminalView, {
+      target,
+      props: {
+        workspaceId: "ws-1",
+        hideWorkspaceList: true,
+        hideRightSidebar: true,
+      },
+      context: new Map([[STORES_KEY, { settings: settingsStore }]]),
+    });
+
+    try {
+      await vi.waitFor(() => {
+        expect(document.querySelector(".header-btn.danger")).not.toBeNull();
+      }, WAIT);
+
+      await page.getByRole("button", { name: "Terminal options" }).click();
+      await page.getByRole("textbox", { name: "Monospace font family" }).fill("Iosevka Term");
+      await page.getByRole("button", { name: "Save" }).click();
+      await expect.element(page.getByRole("button", { name: "Saving..." })).toBeVisible();
+
+      await expect.element(page.getByRole("button", { name: "Increase terminal font size" })).toBeDisabled();
+
+      await vi.waitFor(() => expect(resolveSettingsSave).toBeTypeOf("function"), WAIT);
+      resolveSettingsSave!();
+      await expect.element(page.getByRole("button", { name: "Save" })).toBeVisible();
+      await expect.element(page.getByRole("button", { name: "Increase terminal font size" })).toBeEnabled();
+    } finally {
+      flushSync(() => unmount(instance));
+      target.remove();
+      globalThis.fetch = originalFetch;
+      globalThis.EventSource = originalEventSource;
+    }
+  });
+
+  it("keeps terminal options disabled until a rejected zoom rolls back", async () => {
+    const api = createMockApiFetch([workspaceRoutes()]);
+    const originalFetch = globalThis.fetch;
+    const originalEventSource = globalThis.EventSource;
+    let rejectZoomSave: (() => void) | undefined;
+    let terminalSettings = $state({ ...DEFAULT_TERMINAL_SETTINGS });
+
+    globalThis.fetch = async (input, init) => {
+      const request =
+        input instanceof Request ? input : new Request(new URL(String(input), window.location.href), init);
+      const url = new URL(request.url);
+      if (request.method === "PUT" && url.pathname === "/api/v1/settings") {
+        return new Promise<Response>((resolve) => {
+          rejectZoomSave = () => {
+            resolve(jsonResponse({ title: "Settings unavailable" }, 503));
+          };
+        });
+      }
+      return api.fetch(request);
+    };
+    globalThis.EventSource = NoopEventSource as unknown as typeof EventSource;
+
+    const settingsStore = {
+      getTerminalFontSize: () => terminalSettings.font_size,
+      getTerminalSettings: () => terminalSettings,
+      setTerminalSettings: (settings: typeof DEFAULT_TERMINAL_SETTINGS) => {
+        terminalSettings = settings;
+      },
+    };
+    const target = document.createElement("div");
+    document.body.appendChild(target);
+    const instance = mount(WorkspaceTerminalView, {
+      target,
+      props: {
+        workspaceId: "ws-1",
+        hideWorkspaceList: true,
+        hideRightSidebar: true,
+      },
+      context: new Map([[STORES_KEY, { settings: settingsStore }]]),
+    });
+
+    try {
+      await vi.waitFor(() => {
+        expect(document.querySelector(".header-btn.danger")).not.toBeNull();
+      }, WAIT);
+
+      const optionsButton = page.getByRole("button", { name: "Terminal options" });
+      await page.getByRole("button", { name: "Increase terminal font size" }).click();
+      await vi.waitFor(() => expect(rejectZoomSave).toBeTypeOf("function"), WAIT);
+
+      await expect.element(optionsButton).toBeDisabled();
+
+      rejectZoomSave!();
+      await expect.element(optionsButton).toBeEnabled();
+      await optionsButton.click();
+      await expect.element(page.getByRole("dialog", { name: "Terminal options" })).toBeVisible();
+      expect(document.querySelector<HTMLInputElement>("#terminal-font-size")?.value).toBe("12");
+    } finally {
+      flushSync(() => unmount(instance));
+      target.remove();
+      globalThis.fetch = originalFetch;
+      globalThis.EventSource = originalEventSource;
+    }
+  });
+
   it("unmounts the workspace list's own delete dialog while hidden and restores it when visible", async () => {
     const api = createMockApiFetch([workspaceRoutes()]);
     const originalFetch = globalThis.fetch;
@@ -327,6 +463,7 @@ describe("WorkspaceTerminalView hostVisible", () => {
     globalThis.EventSource = NoopEventSource as unknown as typeof EventSource;
 
     const settingsStore = {
+      getTerminalFontSize: () => DEFAULT_TERMINAL_SETTINGS.font_size,
       getTerminalSettings: () => DEFAULT_TERMINAL_SETTINGS,
     };
 

@@ -14,6 +14,10 @@
   import FleetSettings from "./FleetSettings.svelte";
   import KataProjectMappingsSettings from "./KataProjectMappingsSettings.svelte";
   import PullRequestSettings from "./PullRequestSettings.svelte";
+  import {
+    beginTerminalSettingsHydration,
+    hydrateTerminalSettings,
+  } from "@middleman/ui/stores/terminal-settings-persistence";
   import { SETTINGS_PANELS, settingsPanelsForModes } from "./settingsPanels.js";
 
   // Switched-panel model on kit SettingsLayout: this list is the single
@@ -52,13 +56,14 @@
   });
 
   async function loadSettings(): Promise<void> {
+    const terminalHydration = beginTerminalSettingsHydration(settingsStore);
     loading = true;
     error = null;
     try {
       settings = await getSettings();
       settingsStore.setConfiguredRepos(settings.repos);
       settingsStore.setModeVisibility(settings.modes);
-      settingsStore.setTerminalSettings(settings.terminal);
+      hydrateTerminalSettings(terminalHydration, settings.terminal);
       settingsStore.setPullRequestSettings(settings.pull_requests);
     } catch (err) {
       error = err instanceof Error ? err.message : String(err);
@@ -139,7 +144,6 @@
               terminal={loaded.terminal}
               onUpdate={(terminal) => {
                 settings = { ...settings!, terminal };
-                settingsStore.setTerminalSettings(terminal);
               }}
             />
           {:else if meta.id === "settings-kata-projects"}

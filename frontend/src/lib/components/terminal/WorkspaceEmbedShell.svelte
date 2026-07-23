@@ -1,10 +1,16 @@
 <script lang="ts">
-  import { onDestroy, onMount } from "svelte";
-  import { FlashBanner } from "@kenn-io/kit-ui";
+  import { onDestroy, onMount, untrack } from "svelte";
+  import {
+    Button,
+    EmptyState,
+    FlashBanner,
+    Spinner,
+  } from "@kenn-io/kit-ui";
   import { Provider, WorkspaceRightSidebar } from "@middleman/ui";
   import type { StoreInstances } from "@middleman/ui";
 
   import { client } from "../../api/runtime.js";
+  import { getSettings } from "../../api/settings.js";
   import {
     getBasePath,
     getPage,
@@ -32,9 +38,18 @@
   import WorkspaceEmbedEmptyState from "./WorkspaceEmbedEmptyState.svelte";
   import WorkspaceFirstRunPanel from "./WorkspaceFirstRunPanel.svelte";
   import WorkspaceProjectCard from "./WorkspaceProjectCard.svelte";
+  import {
+    beginTerminalSettingsHydration,
+    hydrateTerminalSettings,
+  } from "@middleman/ui/stores/terminal-settings-persistence";
   import { showFlash } from "@middleman/ui/stores/flash";
 
   let stores = $state<StoreInstances | undefined>();
+  let terminalSettingsReady = $state(false);
+  let terminalSettingsError = $state<string | null>(null);
+  let settingsLoadSequence = 0;
+  let settingsLoadController: AbortController | undefined;
+  const terminalSettingsTimeoutMs = 8_000;
 
   onMount(() => {
     initTheme();
@@ -51,6 +66,71 @@
   $effect(() => {
     reapplyTheme();
   });
+
+  $effect(() => {
+    const activeStores = stores;
+    if (!activeStores) return;
+
+    void loadTerminalSettings(activeStores);
+    return () => {
+      settingsLoadSequence += 1;
+      settingsLoadController?.abort();
+      settingsLoadController = undefined;
+    };
+  });
+
+  async function getSettingsWithTimeout(controller: AbortController) {
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        getSettings({ signal: controller.signal }),
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(() => {
+            const error = new Error("Timed out loading terminal settings");
+            controller.abort(error);
+            reject(error);
+          }, terminalSettingsTimeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timeout !== undefined) clearTimeout(timeout);
+    }
+  }
+
+  async function loadTerminalSettings(activeStores: StoreInstances): Promise<void> {
+    settingsLoadController?.abort();
+    const controller = new AbortController();
+    settingsLoadController = controller;
+    const sequence = ++settingsLoadSequence;
+    const terminalHydration = untrack(() =>
+      beginTerminalSettingsHydration(activeStores.settings)
+    );
+    terminalSettingsReady = false;
+    terminalSettingsError = null;
+    try {
+      const settings = await getSettingsWithTimeout(controller);
+      if (sequence !== settingsLoadSequence) return;
+      hydrateTerminalSettings(terminalHydration, settings.terminal);
+      terminalSettingsReady = true;
+    } catch (error) {
+      if (sequence !== settingsLoadSequence) return;
+      const detail = error instanceof Error ? error.message : "Unknown error";
+      terminalSettingsError = detail;
+      showFlash(`Couldn't load terminal settings: ${detail}`, {
+        tone: "danger",
+      });
+    } finally {
+      if (settingsLoadController === controller) {
+        settingsLoadController = undefined;
+      }
+    }
+  }
+
+  function retryTerminalSettings(): void {
+    const activeStores = stores;
+    if (!activeStores) return;
+    void loadTerminalSettings(activeStores);
+  }
 </script>
 
 <Provider
@@ -112,11 +192,31 @@
     {#if r.page === "embed-workspace-list"}
       <WorkspaceListSidebar selectedId="" />
     {:else if r.page === "embed-workspace-terminal"}
-      <WorkspaceTerminalView
-        workspaceId={r.workspaceId}
-        hideWorkspaceList={true}
-        hideRightSidebar={true}
-      />
+      {#if terminalSettingsReady}
+        <WorkspaceTerminalView
+          workspaceId={r.workspaceId}
+          hideWorkspaceList={true}
+          hideRightSidebar={true}
+          {terminalSettingsReady}
+        />
+      {:else if terminalSettingsError}
+        <EmptyState
+          title="Couldn't load terminal settings"
+          description={terminalSettingsError}
+        >
+          <Button
+            label="Retry"
+            ariaLabel="Retry terminal settings"
+            onclick={retryTerminalSettings}
+          />
+        </EmptyState>
+      {:else}
+        <EmptyState title="Loading terminal settings">
+          {#snippet icon()}
+            <Spinner size={18} label="Loading terminal settings" />
+          {/snippet}
+        </EmptyState>
+      {/if}
     {:else if r.page === "embed-workspace-detail"}
       <WorkspaceRightSidebar
         activeTab={r.tab ??

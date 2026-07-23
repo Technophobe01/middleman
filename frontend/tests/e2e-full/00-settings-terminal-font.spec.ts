@@ -73,7 +73,7 @@ test("settings saves and reloads workspace terminal options", async ({ page }) =
   await openSettingsPanel(page, "Terminal");
 
   const input = page.getByLabel("Monospace font family");
-  const fontSize = page.getByLabel("Font size");
+  const fontSize = page.getByRole("spinbutton", { name: "Font size", exact: true });
   const scrollback = page.getByLabel("Scrollback");
   const lineHeight = page.getByLabel("Line height");
   const letterSpacing = page.getByLabel("Letter spacing");
@@ -86,7 +86,7 @@ test("settings saves and reloads workspace terminal options", async ({ page }) =
     exact: true,
   });
   await expect(input).toHaveValue("");
-  await expect(fontSize).toHaveValue("14");
+  await expect(fontSize).toHaveValue("12");
   await expect(scrollback).toHaveValue("1000");
   await expect(lineHeight).toHaveValue("1");
   await expect(letterSpacing).toHaveValue("0");
@@ -148,7 +148,7 @@ test("settings saves and reloads workspace terminal options", async ({ page }) =
   await page.reload();
   await openSettingsPanel(page, "Terminal");
   await expect(page.getByLabel("Monospace font family")).toHaveValue('"Iosevka Term", monospace');
-  await expect(page.getByLabel("Font size")).toHaveValue("18");
+  await expect(page.getByRole("spinbutton", { name: "Font size", exact: true })).toHaveValue("18");
   await expect(page.getByLabel("Scrollback")).toHaveValue("5000");
   await expect(page.getByLabel("Line height")).toHaveValue("1.15");
   await expect(page.getByLabel("Letter spacing")).toHaveValue("1");
@@ -206,6 +206,90 @@ test("settings saves visible modes and hides disabled nav entries", async ({ pag
 test.describe("terminal options popover", () => {
   test.describe.configure({ timeout: lockedWorkspaceTestTimeoutMs });
 
+  test("hydrates embedded terminal settings before zoom can persist them", async ({ page }) => {
+    test.skip(
+      !hasCommand("git") || !hasCommand("tmux", ["-V"]),
+      "git and tmux are required for the real workspace flow",
+    );
+
+    let workspaceServer: IsolatedE2EServer | null = null;
+    let workspaceApi: APIRequestContext | null = null;
+    let settingsDelayed = false;
+    let releaseSettings: (() => void) | undefined;
+    try {
+      workspaceServer = await startIsolatedWorkspaceE2EServer();
+      workspaceApi = await playwrightRequest.newContext({
+        baseURL: workspaceServer.info.base_url,
+      });
+      const configuredTerminal = {
+        font_family: '"Iosevka Term", monospace',
+        font_size: 17,
+        scrollback: 4200,
+        line_height: 1.2,
+        letter_spacing: 1,
+        cursor_blink: false,
+        font_ligatures: true,
+        renderer: "ghostty-web",
+        hide_tmux_status: true,
+      };
+      const settingsResponse = await workspaceApi.put("/api/v1/settings", {
+        data: { terminal: configuredTerminal },
+      });
+      expect(settingsResponse.ok()).toBe(true);
+
+      const createResponse = await workspaceApi.post("/api/v1/issues/github/acme/widgets/10/workspace", {
+        data: {},
+      });
+      expect(createResponse.status()).toBe(202);
+      const workspace = (await createResponse.json()) as WorkspaceStatusResponse;
+      await waitForWorkspaceReady(workspaceApi, workspace.id);
+
+      let settingsRequestStarted: (() => void) | undefined;
+      const settingsRequest = new Promise<void>((resolve) => {
+        settingsRequestStarted = resolve;
+      });
+      await page.route("**/api/v1/settings", async (route) => {
+        if (route.request().method() === "GET" && !settingsDelayed) {
+          settingsDelayed = true;
+          settingsRequestStarted?.();
+          await new Promise<void>((resolve) => {
+            releaseSettings = resolve;
+          });
+        }
+        await route.continue();
+      });
+
+      await page.goto(`${workspaceServer.info.base_url}/workspaces/embed/terminal/${workspace.id}`);
+      await settingsRequest;
+      await expect(page.locator(".terminal-view")).toHaveCount(0);
+
+      const retrySettings = page.getByRole("button", {
+        name: "Retry terminal settings",
+      });
+      await expect(retrySettings).toBeVisible({ timeout: 10_000 });
+      await retrySettings.click();
+      const resetZoom = page.getByRole("button", { name: "Reset terminal font size" });
+      await expect(resetZoom).toHaveText("17px");
+      await page.getByRole("button", { name: "Open terminal panel" }).click();
+      await expect(page.locator(".terminal-container canvas")).toBeVisible();
+      await page.getByRole("button", { name: "Increase terminal font size" }).click();
+
+      await expect
+        .poll(async () => {
+          const response = await workspaceApi!.get("/api/v1/settings");
+          const settings = (await response.json()) as {
+            terminal: typeof configuredTerminal;
+          };
+          return settings.terminal;
+        })
+        .toEqual({ ...configuredTerminal, font_size: 18 });
+    } finally {
+      releaseSettings?.();
+      await workspaceApi?.dispose();
+      await workspaceServer?.stop();
+    }
+  });
+
   test("live previews, reverts unsaved changes, and saves from the toolbar", async ({ page }) => {
     test.skip(
       !hasCommand("git") || !hasCommand("tmux", ["-V"]),
@@ -238,7 +322,8 @@ test.describe("terminal options popover", () => {
       await expect(terminalOptionsDialog).toBeVisible();
       await expect(terminalOptionsDialog.getByText("Visible modes")).toHaveCount(0);
       await expect(terminalOptionsDialog.getByRole("button", { name: "Save visible modes" })).toHaveCount(0);
-      await page.getByLabel("Font size").fill("20");
+      await terminalOptionsDialog.getByRole("spinbutton", { name: "Font size", exact: true }).fill("20");
+      await expect(page.getByRole("button", { name: "Reset terminal font size" })).toHaveText("20px");
       await expect.poll(() => terminalScreenSizeKey(page)).not.toBe(initialScreenSize);
 
       await page.keyboard.press("Escape");
@@ -246,7 +331,7 @@ test.describe("terminal options popover", () => {
       await expect.poll(() => terminalScreenSizeKey(page)).toBe(initialScreenSize);
 
       await page.getByRole("button", { name: "Terminal options" }).click();
-      await page.getByLabel("Font size").fill("18");
+      await terminalOptionsDialog.getByRole("spinbutton", { name: "Font size", exact: true }).fill("18");
       await expect.poll(() => terminalScreenSizeKey(page)).not.toBe(initialScreenSize);
       let releaseSettingsSave: (() => void) | undefined;
       await page.route("**/api/v1/settings", async (route) => {
