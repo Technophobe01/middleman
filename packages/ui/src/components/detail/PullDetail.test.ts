@@ -4,7 +4,22 @@ import type { DiffResult, PullDetail } from "../../api/types.js";
 import { ACTIONS_KEY, API_CLIENT_KEY, NAVIGATE_KEY, STORES_KEY, UI_CONFIG_KEY } from "../../context.js";
 import { createDetailActivityViewStore } from "../../stores/detail-activity-view.svelte.js";
 import { createDetailStore } from "../../stores/detail.svelte.js";
+import { dismissFlash, getFlashes } from "../../stores/flash.svelte.js";
+import {
+  markWorkspaceIdDeleted,
+  nextWorkspaceLifecycleTick,
+  recordWorkspaceCreated,
+  resetWorkspaceCreatePendingForTest,
+} from "../../stores/workspace-create-pending.svelte.js";
 import type { MiddlemanClient } from "../../types.js";
+import type { InlineWorkspaceController, WorkspaceItemIdentity } from "../../workspace-inline.js";
+import { openLabelPickerFor } from "./labelPickerCommand.js";
+import { createTestController } from "../workspace/WorkspaceDockPanelTestController.svelte.js";
+
+// The pending-create store is module-scoped so it can survive component
+// remounts; tests that leave a deferred create unresolved must not leak
+// that pending identity into later tests.
+afterEach(resetWorkspaceCreatePendingForTest);
 
 const markdownMockState = vi.hoisted(() => ({
   pending: false,
@@ -178,14 +193,17 @@ function renderPullDetail(
     hideWorkspaceAction?: boolean;
     actions?: { pull: unknown[] };
     detailSyncing?: boolean;
+    inlineWorkspace?: InlineWorkspaceController | null;
   } = {},
 ) {
   const actions = options.actions ?? { pull: [] };
+  let envelopeTick = 0;
   const detailStore = {
     loadDetail: vi.fn(async () => undefined),
     startDetailPolling: vi.fn(),
     stopDetailPolling: vi.fn(),
     getDetail: () => detail,
+    getDetailEnvelopeTick: () => envelopeTick,
     isDetailLoading: () => false,
     getDetailError: () => null,
     isDetailSyncing: () => options.detailSyncing ?? false,
@@ -195,9 +213,11 @@ function renderPullDetail(
     updatePRContent: vi.fn(),
     refreshPendingCI: vi.fn(async () => undefined),
     syncDetailNow: vi.fn(async () => true),
+    refreshDetailOnly: vi.fn(async () => undefined),
     editComment: vi.fn(),
     applyReviewSuggestions: vi.fn(async () => true),
   };
+  const navigate = vi.fn();
 
   const rendered = render(PullDetailComponent, {
     props: {
@@ -208,6 +228,7 @@ function renderPullDetail(
       platformHost: "github.com",
       repoPath: "acme/widget",
       hideWorkspaceAction: options.hideWorkspaceAction ?? true,
+      inlineWorkspace: options.inlineWorkspace ?? null,
     },
     context: new Map<symbol, unknown>([
       [API_CLIENT_KEY, apiClient],
@@ -222,10 +243,17 @@ function renderPullDetail(
       ],
       [ACTIONS_KEY, actions],
       [UI_CONFIG_KEY, { hideStar: true }],
-      [NAVIGATE_KEY, vi.fn()],
+      [NAVIGATE_KEY, navigate],
     ]),
   });
-  return { ...rendered, detailStore };
+  return {
+    ...rendered,
+    detailStore,
+    navigate,
+    setEnvelopeTick: (tick: number) => {
+      envelopeTick = tick;
+    },
+  };
 }
 
 function addReviewSuggestionToDetail(detail: PullDetail): void {
@@ -1402,6 +1430,530 @@ describe("PullDetail approvals", () => {
     await vi.waitFor(() => expect(apiClient.POST).toHaveBeenCalledTimes(1));
     expect(detailStore.syncDetailNow).not.toHaveBeenCalled();
     expect(screen.queryByText(/head commit changed since/i)).toBeNull();
+  });
+});
+
+describe("PullDetail inline workspace handoff", () => {
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  afterEach(() => {
+    cleanup();
+    for (const item of getFlashes()) dismissFlash(item.id);
+  });
+
+  const identity: WorkspaceItemIdentity = {
+    provider: "github",
+    platformHost: "github.com",
+    owner: "acme",
+    name: "widget",
+    repoPath: "acme/widget",
+    number: 1,
+    itemType: "pull",
+  };
+
+  function deferredWorkspaceApiClient() {
+    let resolvePost!: (value: { data?: { id: string; status: string } }) => void;
+    const postPromise = new Promise<{ data?: { id: string; status: string } }>((resolve) => {
+      resolvePost = resolve;
+    });
+    const apiClient = {
+      GET: vi.fn(async () => ({ data: {} })),
+      POST: vi.fn(async () => postPromise),
+    };
+    return { apiClient, resolvePost };
+  }
+
+  it("create with inline controller records the override and does not navigate", async () => {
+    const controller = createTestController("split");
+    const { apiClient, resolvePost } = deferredWorkspaceApiClient();
+    const { detailStore, navigate } = renderPullDetail(pullDetail(), undefined, apiClient, {
+      hideWorkspaceAction: false,
+      inlineWorkspace: controller,
+    });
+
+    await fireEvent.click(screen.getAllByRole("button", { name: "Create Workspace" })[0]!);
+    resolvePost({ data: { id: "ws-new", status: "provisioning" } });
+
+    await vi.waitFor(() => {
+      expect(controller.recordCreated).toHaveBeenCalledWith(identity, { id: "ws-new", status: "provisioning" });
+    });
+    expect(navigate).not.toHaveBeenCalled();
+    await vi.waitFor(() => {
+      expect(detailStore.refreshDetailOnly).toHaveBeenCalledWith("acme", "widget", 1, {
+        provider: "github",
+        platformHost: "github.com",
+        repoPath: "acme/widget",
+      });
+    });
+  });
+
+  it("records the override when a layout change unmounts the detail mid-create", async () => {
+    // Tab switches, split-view toggles, and breakpoint crossings unmount
+    // PullDetail with the same PR still selected; the successful response
+    // must still land its store-level override instead of orphaning the
+    // created workspace.
+    const controller = createTestController("split");
+    const { apiClient, resolvePost } = deferredWorkspaceApiClient();
+    const { detailStore, navigate, unmount } = renderPullDetail(pullDetail(), undefined, apiClient, {
+      hideWorkspaceAction: false,
+      inlineWorkspace: controller,
+    });
+
+    await fireEvent.click(screen.getAllByRole("button", { name: "Create Workspace" })[0]!);
+    unmount();
+    resolvePost({ data: { id: "ws-new", status: "provisioning" } });
+
+    await vi.waitFor(() => {
+      expect(controller.recordCreated).toHaveBeenCalledWith(identity, { id: "ws-new", status: "provisioning" });
+    });
+    expect(navigate).not.toHaveBeenCalled();
+    // No refetch from a destroyed component: its frozen identity cannot
+    // see that the shared detail store may belong to a new selection.
+    expect(detailStore.refreshDetailOnly).not.toHaveBeenCalled();
+  });
+
+  it("an alias-only route re-expression does not discard an in-flight create", async () => {
+    // gh vs github and omitted vs concrete default host describe the same
+    // PR; such a prop change mid-create must not bump the request
+    // generation, or the success would be discarded and the button
+    // re-enabled for a duplicate request.
+    const controller = createTestController("split");
+    const { apiClient, resolvePost } = deferredWorkspaceApiClient();
+    const { rerender } = renderPullDetail(pullDetail(), undefined, apiClient, {
+      hideWorkspaceAction: false,
+      inlineWorkspace: controller,
+    });
+
+    await fireEvent.click(screen.getAllByRole("button", { name: "Create Workspace" })[0]!);
+    await rerender({ provider: "gh", platformHost: undefined });
+    resolvePost({ data: { id: "ws-new", status: "provisioning" } });
+
+    await vi.waitFor(() => {
+      expect(controller.recordCreated).toHaveBeenCalledWith(identity, { id: "ws-new", status: "provisioning" });
+    });
+  });
+
+  it("keeps mutation actions live when the identity omits the host or aliases the provider", async () => {
+    // Activity URLs may omit platform_host and route segments may carry
+    // gh/gl aliases while the payload is canonical and concrete; the
+    // stale guard must not block mutations on a detail that is current.
+    const controller = createTestController("split");
+    const { apiClient } = deferredWorkspaceApiClient();
+    const { rerender } = renderPullDetail(pullDetail(), undefined, apiClient, {
+      hideWorkspaceAction: false,
+      inlineWorkspace: controller,
+    });
+
+    await rerender({ provider: "gh", platformHost: undefined });
+    await fireEvent.click(screen.getAllByRole("button", { name: "Create Workspace" })[0]!);
+
+    expect(apiClient.POST).toHaveBeenCalled();
+  });
+
+  it("publishes a confirmed creation even after the selection changed", async () => {
+    // The workspace exists server-side the moment the response confirms
+    // it. Discarding it because the selection moved on would leave the
+    // next visit to this PR offering "Create Workspace" again — a
+    // duplicate submission. Only presentation (refetch, navigation)
+    // stays tied to the live selection.
+    const controller = createTestController("split");
+    const { apiClient, resolvePost } = deferredWorkspaceApiClient();
+    const { detailStore, navigate, rerender } = renderPullDetail(pullDetail(), undefined, apiClient, {
+      hideWorkspaceAction: false,
+      inlineWorkspace: controller,
+    });
+
+    await fireEvent.click(screen.getAllByRole("button", { name: "Create Workspace" })[0]!);
+    // Navigate to a different PR while the create request is in flight.
+    await rerender({ number: 2 });
+    resolvePost({ data: { id: "ws-new", status: "provisioning" } });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(controller.recordCreated).toHaveBeenCalledWith(identity, { id: "ws-new", status: "provisioning" });
+    expect(detailStore.refreshDetailOnly).not.toHaveBeenCalled();
+    expect(navigate).not.toHaveBeenCalled();
+  });
+
+  it("keeps Create Workspace disabled across a selection round-trip while a create is pending", async () => {
+    // The local creating flag is cleared by the route-reset effect on
+    // A→B and again on B→A; only the shared identity-keyed pending
+    // store can keep the button disabled, or the second click sends a
+    // duplicate create and earns a misleading "already exists" conflict.
+    const controller = createTestController("split");
+    const { apiClient, resolvePost } = deferredWorkspaceApiClient();
+    const { rerender } = renderPullDetail(pullDetail(), undefined, apiClient, {
+      hideWorkspaceAction: false,
+      inlineWorkspace: controller,
+    });
+
+    await fireEvent.click(screen.getAllByRole("button", { name: "Create Workspace" })[0]!);
+    await rerender({ number: 2 });
+    await rerender({ number: 1 });
+
+    const button = screen.getAllByRole("button", { name: "Creating..." })[0]!;
+    expect(button.hasAttribute("disabled")).toBe(true);
+    await fireEvent.click(button);
+    expect(apiClient.POST).toHaveBeenCalledTimes(1);
+
+    resolvePost({ data: { id: "ws-new", status: "provisioning" } });
+    await vi.waitFor(() => {
+      expect(controller.recordCreated).toHaveBeenCalledWith(identity, { id: "ws-new", status: "provisioning" });
+    });
+    expect(controller.recordCreated).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps Create Workspace disabled across a remount while a create is pending", async () => {
+    const controller = createTestController("split");
+    const { apiClient } = deferredWorkspaceApiClient();
+    renderPullDetail(pullDetail(), undefined, apiClient, {
+      hideWorkspaceAction: false,
+      inlineWorkspace: controller,
+    });
+
+    await fireEvent.click(screen.getAllByRole("button", { name: "Create Workspace" })[0]!);
+    cleanup();
+
+    const second = deferredWorkspaceApiClient();
+    renderPullDetail(pullDetail(), undefined, second.apiClient, {
+      hideWorkspaceAction: false,
+      inlineWorkspace: createTestController("split"),
+    });
+
+    const button = screen.getAllByRole("button", { name: "Creating..." })[0]!;
+    expect(button.hasAttribute("disabled")).toBe(true);
+    await fireEvent.click(button);
+    expect(second.apiClient.POST).not.toHaveBeenCalled();
+  });
+
+  it("a confirmed creation without a controller survives a selection round-trip", async () => {
+    // Focus/mobile views and DetailDrawer mount PullDetail without an
+    // inline controller, so there is no override store: the shared
+    // created-record is the only way a replacement view learns the
+    // workspace exists when the response lands after a round-trip, and
+    // without it the button re-offers a duplicate create.
+    const { apiClient, resolvePost } = deferredWorkspaceApiClient();
+    const { navigate, rerender } = renderPullDetail(pullDetail(), undefined, apiClient, {
+      hideWorkspaceAction: false,
+    });
+
+    await fireEvent.click(screen.getAllByRole("button", { name: "Create Workspace" })[0]!);
+    await rerender({ number: 2 });
+    await rerender({ number: 1 });
+    resolvePost({ data: { id: "ws-new", status: "provisioning" } });
+
+    await vi.waitFor(() => {
+      expect(screen.getAllByRole("button", { name: "Open Workspace" }).length).toBeGreaterThan(0);
+    });
+    expect(screen.queryByRole("button", { name: "Create Workspace" })).toBeNull();
+    expect(navigate).not.toHaveBeenCalled();
+    expect(apiClient.POST).toHaveBeenCalledTimes(1);
+  });
+
+  it("a post-creation refetch reporting no workspace clears the stale created record", async () => {
+    // Another client deleted the workspace: a detail load whose request
+    // started AFTER the creation confirmed returns workspace: null, which
+    // is authoritative absence. Without clearing, the button would offer
+    // "Open Workspace" against a dead ID forever. The pre-clear state is
+    // proven first: the confirmation's own envelope (older tick) must not
+    // clear the record.
+    const { apiClient, resolvePost } = deferredWorkspaceApiClient();
+    const { rerender, setEnvelopeTick } = renderPullDetail(pullDetail(), undefined, apiClient, {
+      hideWorkspaceAction: false,
+    });
+
+    await fireEvent.click(screen.getAllByRole("button", { name: "Create Workspace" })[0]!);
+    resolvePost({ data: { id: "ws-new", status: "provisioning" } });
+    await vi.waitFor(() => {
+      expect(screen.getAllByRole("button", { name: "Open Workspace" }).length).toBeGreaterThan(0);
+    });
+
+    // A refetch initiated after the confirmation observes no workspace.
+    setEnvelopeTick(nextWorkspaceLifecycleTick());
+    await rerender({ number: 2 });
+    await rerender({ number: 1 });
+
+    await vi.waitFor(() => {
+      expect(screen.getAllByRole("button", { name: "Create Workspace" }).length).toBeGreaterThan(0);
+    });
+    expect(screen.queryByRole("button", { name: "Open Workspace" })).toBeNull();
+  });
+
+  it("publishes a confirmed creation across a selection round-trip", async () => {
+    // A→B→A: returning to the original PR restores an identity that
+    // matches the request, but the round-trip bumped the request
+    // generation. The confirmed creation must still land its override,
+    // or the re-rendered detail shows "Create Workspace" until an
+    // unrelated refetch.
+    const controller = createTestController("split");
+    const { apiClient, resolvePost } = deferredWorkspaceApiClient();
+    const { rerender } = renderPullDetail(pullDetail(), undefined, apiClient, {
+      hideWorkspaceAction: false,
+      inlineWorkspace: controller,
+    });
+
+    await fireEvent.click(screen.getAllByRole("button", { name: "Create Workspace" })[0]!);
+    await rerender({ number: 2 });
+    await rerender({ number: 1 });
+    resolvePost({ data: { id: "ws-new", status: "provisioning" } });
+
+    await vi.waitFor(() => {
+      expect(controller.recordCreated).toHaveBeenCalledWith(identity, { id: "ws-new", status: "provisioning" });
+    });
+  });
+
+  it("discards a create failure that lands after the selection changed (no flash)", async () => {
+    const controller = createTestController("split");
+    let resolvePost!: (value: { error?: { detail?: string } }) => void;
+    const postPromise = new Promise<{ error?: { detail?: string } }>((resolve) => {
+      resolvePost = resolve;
+    });
+    const apiClient = {
+      GET: vi.fn(async () => ({ data: {} })),
+      POST: vi.fn(async () => postPromise),
+    };
+    const { rerender } = renderPullDetail(pullDetail(), undefined, apiClient, {
+      hideWorkspaceAction: false,
+      inlineWorkspace: controller,
+    });
+
+    await fireEvent.click(screen.getAllByRole("button", { name: "Create Workspace" })[0]!);
+    // Navigate to a different PR while the create request is in flight.
+    await rerender({ number: 2 });
+    resolvePost({ error: { detail: "boom" } });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    // A failure toast about a PR the user already left is noise: without
+    // the identity guard this would show "boom".
+    expect(getFlashes()).toHaveLength(0);
+  });
+
+  it("without a controller create navigates to the terminal (today's behavior)", async () => {
+    const apiClient = {
+      GET: vi.fn(async () => ({ data: {} })),
+      POST: vi.fn(async () => ({ data: { id: "ws-new", status: "provisioning" } })),
+    };
+    const { navigate } = renderPullDetail(pullDetail(), undefined, apiClient, {
+      hideWorkspaceAction: false,
+    });
+
+    await fireEvent.click(screen.getAllByRole("button", { name: "Create Workspace" })[0]!);
+
+    await vi.waitFor(() => expect(navigate).toHaveBeenCalledWith("/terminal/ws-new"));
+  });
+
+  it("a late create response cannot navigate after unmount (no controller)", async () => {
+    const { apiClient, resolvePost } = deferredWorkspaceApiClient();
+    const { navigate } = renderPullDetail(pullDetail(), undefined, apiClient, {
+      hideWorkspaceAction: false,
+    });
+
+    await fireEvent.click(screen.getAllByRole("button", { name: "Create Workspace" })[0]!);
+    cleanup();
+    resolvePost({ data: { id: "ws-new", status: "provisioning" } });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(navigate).not.toHaveBeenCalled();
+  });
+
+  it("open action becomes focus-terminal with a secondary open-in-workspaces", async () => {
+    const detail = pullDetail();
+    detail.workspace = { id: "ws-1", status: "ready" };
+    const controller = createTestController("split");
+    // No override recorded: the controller passes the envelope ref through.
+    controller.effectiveWorkspaceRef = vi.fn((_identity, envelopeRef) => envelopeRef ?? null);
+
+    const { navigate } = renderPullDetail(detail, undefined, undefined, {
+      hideWorkspaceAction: false,
+      inlineWorkspace: controller,
+    });
+
+    await fireEvent.click(screen.getAllByRole("button", { name: "Focus Terminal" })[0]!);
+    expect(controller.focusTerminal).toHaveBeenCalled();
+
+    await fireEvent.click(screen.getAllByRole("button", { name: "Open in Workspaces" })[0]!);
+    expect(controller.openInWorkspaces).toHaveBeenCalledWith({ id: "ws-1", status: "ready" });
+    expect(navigate).not.toHaveBeenCalled();
+  });
+
+  it("without a controller open renders a single Open Workspace button that navigates", async () => {
+    const detail = pullDetail();
+    detail.workspace = { id: "ws-1", status: "ready" };
+
+    const { navigate } = renderPullDetail(detail, undefined, undefined, {
+      hideWorkspaceAction: false,
+    });
+
+    expect(screen.queryByRole("button", { name: "Focus Terminal" })).toBeNull();
+    await fireEvent.click(screen.getAllByRole("button", { name: "Open Workspace" })[0]!);
+    expect(navigate).toHaveBeenCalledWith("/terminal/ws-1");
+  });
+
+  it("without a controller a session-deleted envelope workspace is masked", async () => {
+    // Controller-less views subscribe to no invalidation: after a deletion
+    // from another surface their cached envelope still carries the dead
+    // workspace until the next fetch, and following it would offer "Open
+    // Workspace" against a 404.
+    const detail = pullDetail();
+    detail.workspace = { id: "ws-1", status: "ready" };
+
+    renderPullDetail(detail, undefined, undefined, { hideWorkspaceAction: false });
+    expect(screen.getAllByRole("button", { name: "Open Workspace" }).length).toBeGreaterThan(0);
+
+    markWorkspaceIdDeleted("ws-1");
+    await vi.waitFor(() => {
+      expect(screen.getAllByRole("button", { name: "Create Workspace" }).length).toBeGreaterThan(0);
+    });
+    expect(screen.queryByRole("button", { name: "Open Workspace" })).toBeNull();
+  });
+
+  it("without a controller the created record wins over a stale envelope", async () => {
+    // The confirmed creation is fresher than any cached envelope: a
+    // pre-create envelope still carrying the previously deleted workspace
+    // must not shadow the recreation.
+    markWorkspaceIdDeleted("ws-old");
+    const detail = pullDetail();
+    detail.workspace = { id: "ws-old", status: "ready" };
+    recordWorkspaceCreated(identity, { id: "ws-new", status: "ready" });
+
+    const { navigate } = renderPullDetail(detail, undefined, undefined, { hideWorkspaceAction: false });
+
+    await fireEvent.click(screen.getAllByRole("button", { name: "Open Workspace" })[0]!);
+    expect(navigate).toHaveBeenCalledWith("/terminal/ws-new");
+  });
+
+  it("consults the override layer for button state", () => {
+    const detail = pullDetail();
+    detail.workspace = undefined;
+    const controller = createTestController("split");
+    controller.effectiveWorkspaceRef = vi.fn(() => ({ id: "ws-o", status: "ready" }));
+
+    renderPullDetail(detail, undefined, undefined, {
+      hideWorkspaceAction: false,
+      inlineWorkspace: controller,
+    });
+
+    expect(screen.queryByRole("button", { name: "Create Workspace" })).toBeNull();
+    expect(screen.getAllByRole("button", { name: "Focus Terminal" }).length).toBeGreaterThan(0);
+  });
+
+  it("consults the override layer for button state (tombstone hides an envelope workspace)", () => {
+    const detail = pullDetail();
+    detail.workspace = { id: "ws-1", status: "ready" };
+    const controller = createTestController("split");
+    controller.effectiveWorkspaceRef = vi.fn(() => null);
+
+    renderPullDetail(detail, undefined, undefined, {
+      hideWorkspaceAction: false,
+      inlineWorkspace: controller,
+    });
+
+    expect(screen.queryByRole("button", { name: "Focus Terminal" })).toBeNull();
+    expect(screen.getAllByRole("button", { name: "Create Workspace" }).length).toBeGreaterThan(0);
+  });
+
+  it("reconciles the override on identity-matched detail load", () => {
+    const detail = pullDetail();
+    detail.workspace = { id: "ws-1", status: "ready" };
+    const controller = createTestController("split");
+
+    renderPullDetail(detail, undefined, undefined, {
+      hideWorkspaceAction: false,
+      inlineWorkspace: controller,
+    });
+
+    expect(controller.reconcile).toHaveBeenCalledWith(identity, { id: "ws-1", status: "ready" }, 0);
+  });
+
+  it("reconciles when the identity omits the host and the detail carries the provider default", async () => {
+    // Activity URLs may omit platform_host; the loaded detail always
+    // carries the concrete default host. The identity-match guard must
+    // treat them as one item or the override never reconciles.
+    const detail = pullDetail();
+    detail.workspace = { id: "ws-1", status: "ready" };
+    const controller = createTestController("split");
+
+    const { rerender } = renderPullDetail(detail, undefined, undefined, {
+      hideWorkspaceAction: false,
+      inlineWorkspace: controller,
+    });
+    controller.reconcile.mockClear();
+
+    await rerender({ platformHost: undefined });
+
+    expect(controller.reconcile).toHaveBeenCalledWith(
+      { ...identity, platformHost: undefined },
+      { id: "ws-1", status: "ready" },
+      0,
+    );
+  });
+
+  it("does not reconcile the override for a detail belonging to a different identity", async () => {
+    const detail = pullDetail();
+    detail.workspace = { id: "ws-1", status: "ready" };
+    const controller = createTestController("split");
+
+    const { rerender } = renderPullDetail(detail, undefined, undefined, {
+      hideWorkspaceAction: false,
+      inlineWorkspace: controller,
+    });
+    controller.reconcile.mockClear();
+
+    // Same detail object (still describes PR #1), but props move to a
+    // different number: detailMatchesIdentity must now return false so a
+    // load for the stale identity can't reconcile an override recorded for
+    // the newly-selected PR. Without the guard this would call reconcile
+    // with the mismatched identity.
+    await rerender({ number: 999 });
+
+    expect(controller.reconcile).not.toHaveBeenCalled();
+  });
+
+  it("restores split before opening the label picker while the dock is expanded", async () => {
+    // Expanded dock hides this detail (mounted, hidden+inert) but its
+    // window-level command listener stays live; without the split reset the
+    // picker would open invisibly and pop up on the next collapse.
+    const controller = { ...createTestController("expanded"), isClaimedFor: () => true };
+    const detail = pullDetail();
+    detail.repo.capabilities = { ...capabilities, read_labels: true, label_mutation: true };
+    renderPullDetail(detail, undefined, undefined, { inlineWorkspace: controller });
+
+    openLabelPickerFor({
+      itemType: "pull",
+      provider: "github",
+      platformHost: "github.com",
+      owner: "acme",
+      name: "widget",
+      repoPath: "acme/widget",
+      number: 1,
+    });
+
+    expect(await screen.findByRole("dialog", { name: "Edit labels" })).toBeTruthy();
+    expect(controller.setDockMode).toHaveBeenCalledWith("split");
+  });
+
+  it("label picker command leaves the dock mode alone when this detail is not claimed", async () => {
+    // getDockMode() can read "expanded" from a surface whose claim belongs
+    // to nothing (panel inactive -> detail fully visible): the command must
+    // not collapse a dock it is not hidden behind.
+    const controller = createTestController("expanded");
+    const detail = pullDetail();
+    detail.repo.capabilities = { ...capabilities, read_labels: true, label_mutation: true };
+    renderPullDetail(detail, undefined, undefined, { inlineWorkspace: controller });
+
+    openLabelPickerFor({
+      itemType: "pull",
+      provider: "github",
+      platformHost: "github.com",
+      owner: "acme",
+      name: "widget",
+      repoPath: "acme/widget",
+      number: 1,
+    });
+
+    expect(await screen.findByRole("dialog", { name: "Edit labels" })).toBeTruthy();
+    expect(controller.setDockMode).not.toHaveBeenCalled();
   });
 });
 

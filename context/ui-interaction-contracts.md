@@ -18,13 +18,96 @@ Interactive surfaces must agree on which item is selected.
 
 - Treat `platform_host` as part of PR and issue identity in route state, drawer
   state, and stale-detail guards.
-- When host is omitted for the default GitHub host, normalize comparisons so
-  `github.com` and an omitted host do not look like different items.
+- When host is omitted for a provider's default host (Activity URLs,
+  provider-default routes), normalize comparisons and cache keys with
+  `packages/ui/src/api/provider-routes.ts::resolvedPlatformHost` so the
+  concrete default host and an omitted host do not look like different items.
+- Route segments and item references may carry provider aliases (gh/gl/fj)
+  while store data uses canonical names: every identity comparison or cache
+  key derived from `provider` must canonicalize it first
+  (`packages/ui/src/workspace-inline.ts::identityEquals`). This includes
+  route-reset/generation effects that detect item changes — tracking raw
+  props treats an alias-only re-expression of the same item as a new item
+  and discards in-flight work.
+- Workspace item identity includes the item type, canonicalized across caller
+  vocabularies ("pull"/"pr"/"pull_request") by
+  `packages/ui/src/workspace-inline.ts::canonicalItemType`: a PR and an issue
+  can share a repo and number, so repo+number alone must never key claims,
+  overrides, or deletion tombstones.
 - Use shared named route/item reference types from
   `frontend/src/lib/stores/router.svelte.ts` instead of repeating anonymous
   `{ owner, name, number }`-style shapes.
 - When a view changes from item A to item B, reset transient action state that
   could otherwise submit or render against the wrong item.
+- A response confirming a server-side outcome (a completed delete or create)
+  must publish to identity-scoped global state — claims, tombstones, creation
+  overrides, route memory — before any liveness guard: neither unmount nor a
+  selection that moved on (an A→B→A round-trip bumps the request generation)
+  may discard it, or the replacement UI re-offers the action for a duplicate
+  submission. Gate only presentation — refetches, prompts, flashes,
+  navigation — on the live component and current selection
+  (`frontend/src/lib/components/terminal/WorkspaceTerminalView.svelte::handleDelete`,
+  `packages/ui/src/components/detail/PullDetail.svelte::createWorkspace`).
+  The pending request is identity-scoped shared state too: component-local
+  creating flags reset on route changes and remounts while the request is
+  still in flight, re-enabling the action for a duplicate submission
+  (`packages/ui/src/stores/workspace-create-pending.svelte.ts`). The same
+  store records confirmed creations for detail instances WITHOUT an inline
+  controller (focus/mobile views, DetailDrawer), which otherwise only see
+  the detail envelope; records reconcile away when an identity-matched
+  envelope carries a workspace and clear on deletion by workspace ID. A
+  workspace-absent envelope clears a created record or override only when
+  its request STARTED after the confirmation (shared lifecycle tick,
+  `nextWorkspaceLifecycleTick`): a stale pre-create fetch must not wipe a
+  creation, but a post-create fetch reporting absence or a replacement
+  workspace ID — or a 404 on the workspace itself, which also drops the
+  cached envelope so liveness rendering shows the error state — means
+  another client deleted it and the record must drop. Detail stores apply
+  envelope payload and tick atomically (last-started-wins) so a stale
+  response cannot pair with a newer tick, and tombstones mask only their
+  own deleted ID — a fresh-ID created record supersedes them. Deleted
+  workspace IDs persist for the session (`markWorkspaceIdDeleted`) and
+  creation publications for a deleted ID are refused in both stores: a
+  delayed create response that lost the race with its own deletion must
+  not overwrite the tombstone or republish the record (IDs are never
+  reused, so fresh-ID recreations pass the guard). The shared created
+  record reconciles under the same rule as the host store's positive
+  override — same-ID envelope or newer-tick request only; a stale
+  different-ID envelope must not erase a recreation
+  (`packages/ui/src/stores/workspace-create-pending.svelte.ts::reconcileWorkspaceCreated`).
+  Controller-less detail views (focus/mobile, DetailDrawer) AND the host
+  store's `effectiveRef` (both its tombstone and no-override branches)
+  resolve under one rule — `resolveControllerlessWorkspaceRef`, never
+  bare `envelope ?? createdWorkspaceRef`: the created record wins over a
+  different-ID envelope until reconciled (a stale pre-confirmation
+  envelope must not shadow, or let the dock claim over, a confirmed
+  recreation), a same-ID envelope wins for its fresher status, and
+  session-deleted envelope IDs are masked — globally across identities
+  and past tombstone reconciliation, since IDs are never reused. E2e mocks
+  of the create POST must keep the detail envelope consistent (the real
+  server inserts the row before returning 202). The
+  host store's `effectiveRef` falls back to that record too — a create
+  begun controller-less must surface on an inline surface after a layout
+  switch, where no recordCreated override ever ran
+  (`frontend/src/lib/stores/workspace-host.svelte.ts::effectiveRef`).
+- Inline surface claims come only from live selection effects (the list
+  views' claim effects, which react to recorded overrides); async responses
+  record overrides and tombstones but never claim a surface themselves, and
+  the hosted workspace key follows the visible surface's claim
+  (`frontend/src/lib/stores/workspace-host.svelte.ts::desiredKey`), falling
+  back to the sticky key only while parked — otherwise a late response could
+  expose the wrong terminal beneath another surface's detail.
+- Deletion invalidation must not require a live inline claim: views release
+  claims on unmount, so the workspace-host store keeps workspace-id → identity
+  metadata past release and tombstones by remembered identity — and deletion
+  callbacks carry the provider-aware identity themselves so workspaces never
+  claimed inline (tab-only, sidebar deletes) still tombstone
+  (`frontend/src/lib/stores/workspace-host.svelte.ts::notifyWorkspaceDeleted`).
+  Tombstones carry the deleted workspace ID and suppress only envelopes still
+  carrying that ID: an envelope with a different ID is a recreation that must
+  surface immediately and reconcile the tombstone away — an ID-less tombstone
+  would mask it forever, because the workspace-absent envelope it waits for
+  never arrives once the item has a new workspace.
 - Catalog-backed routes must normalize missing selections even when the catalog
   is empty: select the first available item or `null`, and clear dependent route
   identity (`frontend/src/lib/components/docs/DocsWorkspace.svelte::loadFolders`).
@@ -106,6 +189,48 @@ Keyboard handlers must have one clear owner for each key press.
 - Async shortcut handlers should report failures through the same user-visible
   error path as pointer-triggered actions, and must not leave the action marked
   in-flight forever.
+- Components that stay mounted while hidden (anything reparented under the
+  workspace host, which parks on every page) must gate window-level listeners
+  and geometry persistence on `hostVisible`: a parked view must not consume
+  shortcuts on unrelated pages or clamp and persist layout measured from
+  `display:none` geometry
+  (`frontend/src/lib/components/terminal/WorkspaceTerminalView.svelte::toggleRightSidebar`).
+  Transient popovers (and any dialog nested inside them) close when
+  `hostVisible` goes false; only dialog open-state designed to restore on
+  reveal may persist the hidden window
+  (`frontend/src/lib/components/terminal/TerminalOptionsMenu.svelte`).
+- Detail views hidden behind an expanded inline dock stay mounted with live
+  window-level command listeners: a command that opens detail UI must restore
+  the dock to split first so it cannot build an invisible overlay
+  (`packages/ui/src/components/detail/PullDetail.svelte::onOpenLabelPickerCommand`).
+- Focus Terminal reveals, it never maximizes: a collapsed inline dock reopens
+  in split — the layout the workspace first appeared in — and a visible dock
+  keeps its mode; expanding over the detail is only ever the terminal
+  toolbar's explicit action. A collapsed dock also keeps its own reopen
+  affordance at the bottom of the pane
+  (`frontend/src/lib/stores/workspace-host.svelte.ts::focusTerminal`).
+- An expanded dock mode must not outlive its claim: WorkspaceDockPanel resets
+  on inactive and on teardown, and the store resets `expanded` itself both
+  when a claim is directly replaced by a different identity (`setClaim`) and
+  synchronously on release (`clearClaim`) — a release-and-reclaim within one
+  update leaves no observable inactive gap for the panel and no previous
+  claim for setClaim's replacement check
+  (`frontend/src/lib/stores/workspace-host.svelte.ts::clearClaim`).
+- A collapse control must be reachable in every inline workspace state, not
+  only from the ready toolbar: WorkspaceDockPanel's BottomDock is not
+  closable, so the creating, fetch-failure, and setup-error branches render
+  their own collapse button or the dock cannot be closed short of deleting
+  the workspace
+  (`frontend/src/lib/components/terminal/WorkspaceTerminalView.svelte::inlineCollapseControl`).
+  Dock mode changes are pure local UI — never disable them behind mutation
+  guards like `actionsBlocked`; only the modal-stack guard applies, and only
+  to the expand direction.
+- The workspace view renders by liveness, not cached presence: the previous
+  workspace stays cached across an in-place A→B switch, and branching on
+  `workspace` alone shows A's stale ready toolbar (with action guards
+  engaged) while B is slow or failing. Gate the ready branch on
+  `workspaceLive` so the loading/error states own the switch window
+  (`frontend/src/lib/components/terminal/WorkspaceTerminalView.svelte::workspaceLive`).
 
 ## Modal Ownership
 
@@ -117,6 +242,12 @@ shortcuts while it is open.
 - Close behavior must be local to the active surface. Escape should not also
   close a parent drawer or trigger route navigation unless the child declined
   the key.
+- Unmounting a subtree that holds focus (dock close, claim release) must
+  reclaim focus for a deliberate target after the DOM update — and only when
+  focus fell to `<body>` or was still inside the closing subtree, so a
+  transition triggered in the background (e.g. a selection change resetting
+  an expanded dock) never steals focus from a control the user moved to
+  (`packages/ui/src/components/workspace/WorkspaceDockPanel.svelte::shouldReclaimFocus`).
 - Background actions that are still visible should be disabled or skipped when
   their `when` predicate no longer matches the active modal state.
 - Outside-click, focus-leave, and Escape close paths should converge on the same

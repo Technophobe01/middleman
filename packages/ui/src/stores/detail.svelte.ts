@@ -13,10 +13,12 @@ import {
   providerDefaultHost,
   providerItemPath,
   providerRouteParams,
+  resolvedPlatformHost,
   type ProviderRouteRef,
 } from "../api/provider-routes.js";
 import type { MiddlemanClient } from "../types.js";
 import { showFlash } from "./flash.svelte.js";
+import { nextWorkspaceLifecycleTick } from "./workspace-create-pending.svelte.js";
 
 export type DetailSyncMode = boolean | "background";
 
@@ -121,6 +123,13 @@ export function createDetailStore(opts: DetailStoreOptions) {
   // --- state ---
 
   let detail = $state<PullDetail | null>(null);
+  // Lifecycle tick captured when the request that produced the current
+  // envelope STARTED (not when it landed). Workspace-create reconciliation
+  // compares it against a creation confirmation's tick to tell a stale
+  // pre-create "no workspace" apart from an authoritative post-create one.
+  // Reactive so reconcile effects rerun even when a refreshed envelope's
+  // content is identical and `detail` itself is not reassigned.
+  let detailEnvelopeTick = $state(0);
   let loading = $state(false);
   let syncing = $state(false);
   let storeError = $state<string | null>(null);
@@ -178,6 +187,10 @@ export function createDetailStore(opts: DetailStoreOptions) {
     return detail;
   }
 
+  function getDetailEnvelopeTick(): number {
+    return detailEnvelopeTick;
+  }
+
   function isDetailLoading(): boolean {
     return loading;
   }
@@ -229,8 +242,12 @@ export function createDetailStore(opts: DetailStoreOptions) {
     if (!unsavedLocalBody) return next;
     if (!detail) return next;
     if (
-      unsavedLocalBody.provider !== next.repo?.provider ||
-      unsavedLocalBody.platformHost !== next.repo?.platform_host ||
+      !sameBodyTarget(
+        unsavedLocalBody.provider,
+        unsavedLocalBody.platformHost,
+        next.repo?.provider,
+        next.repo?.platform_host,
+      ) ||
       unsavedLocalBody.owner !== next.repo_owner ||
       unsavedLocalBody.name !== next.repo_name ||
       unsavedLocalBody.number !== next.merge_request?.Number
@@ -293,14 +310,28 @@ export function createDetailStore(opts: DetailStoreOptions) {
     return unsavedLocalBody !== null;
   }
 
+  // Callers pass route vocabulary (gh, omitted default host) while
+  // payloads carry canonical values; every provider/host comparison
+  // between the two must normalize both sides or a mutation on an
+  // aliased route silently no-ops against its own current detail.
+  function sameBodyTarget(
+    aProvider: string | undefined,
+    aHost: string | undefined,
+    bProvider: string | undefined,
+    bHost: string | undefined,
+  ): boolean {
+    const a = canonicalProvider(aProvider ?? "");
+    const b = canonicalProvider(bProvider ?? "");
+    return a === b && resolvedPlatformHost(a, aHost) === resolvedPlatformHost(b, bHost);
+  }
+
   function isDetailShowingRef(ref: DetailRequestRef): boolean {
     return (
       detail !== null &&
       detail.repo_owner === ref.owner &&
       detail.repo_name === ref.name &&
       detail.merge_request.Number === ref.number &&
-      detail.repo?.provider === ref.provider &&
-      detail.repo?.platform_host === ref.platformHost &&
+      sameBodyTarget(detail.repo?.provider, detail.repo?.platform_host, ref.provider, ref.platformHost) &&
       detail.repo?.repo_path === ref.repoPath
     );
   }
@@ -349,6 +380,19 @@ export function createDetailStore(opts: DetailStoreOptions) {
     detail = next;
   }
 
+  // Applies an envelope payload and its request-start tick atomically. A
+  // response whose request started before the currently applied envelope's
+  // request is stale: applying its payload while the newer tick stands
+  // would let pre-creation "no workspace" data masquerade as authoritative.
+  // Rejecting it keeps last-started-wins consistent across every
+  // detail-producing path, including sync and PATCH responses that lack
+  // the GET paths' per-selection sequence guards.
+  function applyEnvelopeAt(envelopeTick: number, assign: () => void): void {
+    if (envelopeTick < detailEnvelopeTick) return;
+    assign();
+    detailEnvelopeTick = envelopeTick;
+  }
+
   function noteObservedFetchedAt(fetchedAt: string | null | undefined): void {
     if (fetchedAt != null) lastObservedFetchedAt = fetchedAt;
   }
@@ -367,6 +411,7 @@ export function createDetailStore(opts: DetailStoreOptions) {
     const ref = detailRequestRef(owner, name, number, identity);
     const key = prKey(ref);
     const requestSequence = ++detailRequestSequence;
+    const envelopeTick = nextWorkspaceLifecycleTick();
     try {
       const { data, error: requestError } = await apiClient.GET(providerItemPath("pulls", ref, ""), {
         params: {
@@ -388,14 +433,16 @@ export function createDetailStore(opts: DetailStoreOptions) {
       }
       if (data !== undefined) {
         latestSuccessfulDetailRequestSequenceBySelection.set(key, requestSequence);
-        applyRefreshedDetail(
-          withPreservedLocalBody({
-            ...data,
-            events: data.events ?? [],
-          } as PullDetail),
-        );
+        applyEnvelopeAt(envelopeTick, () => {
+          applyRefreshedDetail(
+            withPreservedLocalBody({
+              ...data,
+              events: data.events ?? [],
+            } as PullDetail),
+          );
+          detailLoaded = data.detail_loaded ?? detailLoaded;
+        });
         noteObservedFetchedAt(data.detail_fetched_at);
-        detailLoaded = data.detail_loaded ?? detailLoaded;
         return { ok: true, ...(data.detail_fetched_at != null && { fetchedAt: data.detail_fetched_at }) };
       }
       return { ok: false, error: "Pull request refresh returned no detail" };
@@ -414,6 +461,7 @@ export function createDetailStore(opts: DetailStoreOptions) {
     const ref = detailRequestRef(owner, name, number, identity);
     syncing = true;
     let refreshed = false;
+    const envelopeTick = nextWorkspaceLifecycleTick();
     try {
       const { data, error: requestError } = await apiClient.POST(providerItemPath("pulls", ref, "/sync"), {
         params: {
@@ -426,15 +474,17 @@ export function createDetailStore(opts: DetailStoreOptions) {
       }
       if (data) {
         storeError = null;
-        applyRefreshedDetail(
-          withPreservedLocalBody({
-            ...data,
-            events: data.events ?? [],
-          } as PullDetail),
-        );
+        applyEnvelopeAt(envelopeTick, () => {
+          applyRefreshedDetail(
+            withPreservedLocalBody({
+              ...data,
+              events: data.events ?? [],
+            } as PullDetail),
+          );
+          detailLoaded = data.detail_loaded ?? detailLoaded;
+          refreshed = true;
+        });
         noteObservedFetchedAt(data.detail_fetched_at);
-        detailLoaded = data.detail_loaded ?? detailLoaded;
-        refreshed = true;
       }
     } catch {
       // Sync failure is non-fatal.
@@ -531,6 +581,7 @@ export function createDetailStore(opts: DetailStoreOptions) {
     storeError = null;
     detailLoaded = false;
     const requestSequence = ++detailRequestSequence;
+    const envelopeTick = nextWorkspaceLifecycleTick();
     const promise = (async () => {
       try {
         const { data, error: requestError } = await apiClient.GET(providerItemPath("pulls", requestRef, ""), {
@@ -551,14 +602,16 @@ export function createDetailStore(opts: DetailStoreOptions) {
           throw new Error(requestError.detail ?? requestError.title ?? "failed to load pull request");
         }
         latestSuccessfulDetailRequestSequenceBySelection.set(key, requestSequence);
-        detail = data
-          ? withPreservedLocalBody({
-              ...data,
-              events: data.events ?? [],
-            } as PullDetail)
-          : null;
+        applyEnvelopeAt(envelopeTick, () => {
+          detail = data
+            ? withPreservedLocalBody({
+                ...data,
+                events: data.events ?? [],
+              } as PullDetail)
+            : null;
+          detailLoaded = data?.detail_loaded ?? false;
+        });
         noteObservedFetchedAt(data?.detail_fetched_at);
-        detailLoaded = data?.detail_loaded ?? false;
       } catch (err) {
         if (
           gen !== syncGeneration ||
@@ -671,6 +724,7 @@ export function createDetailStore(opts: DetailStoreOptions) {
       return activeCIRefresh.promise;
     }
     const gen = syncGeneration;
+    const envelopeTick = nextWorkspaceLifecycleTick();
     const promise = (async () => {
       syncing = true;
       try {
@@ -686,14 +740,16 @@ export function createDetailStore(opts: DetailStoreOptions) {
         }
         if (data) {
           storeError = null;
-          applyRefreshedDetail(
-            withPreservedLocalBody({
-              ...data,
-              events: data.events ?? [],
-            } as PullDetail),
-          );
+          applyEnvelopeAt(envelopeTick, () => {
+            applyRefreshedDetail(
+              withPreservedLocalBody({
+                ...data,
+                events: data.events ?? [],
+              } as PullDetail),
+            );
+            detailLoaded = data.detail_loaded ?? detailLoaded;
+          });
           noteObservedFetchedAt(data.detail_fetched_at);
-          detailLoaded = data.detail_loaded ?? detailLoaded;
           const warning = data.warnings?.[0];
           if (warning) {
             showFlash(warning, { tone: "warning" });
@@ -889,6 +945,7 @@ export function createDetailStore(opts: DetailStoreOptions) {
       },
     };
 
+    const envelopeTick = nextWorkspaceLifecycleTick();
     try {
       const { data, error: requestError } = await apiClient.PATCH(providerItemPath("pulls", ref, ""), {
         params: {
@@ -901,11 +958,12 @@ export function createDetailStore(opts: DetailStoreOptions) {
       }
       // Apply server-canonical response.
       if (data && isDetailShowingRef(ref)) {
-        detail = data as PullDetail;
+        applyEnvelopeAt(envelopeTick, () => {
+          detail = data as PullDetail;
+        });
         if (
           unsavedLocalBody &&
-          unsavedLocalBody.provider === ref.provider &&
-          unsavedLocalBody.platformHost === ref.platformHost &&
+          sameBodyTarget(unsavedLocalBody.provider, unsavedLocalBody.platformHost, ref.provider, ref.platformHost) &&
           unsavedLocalBody.owner === owner &&
           unsavedLocalBody.name === name &&
           unsavedLocalBody.number === number
@@ -949,8 +1007,7 @@ export function createDetailStore(opts: DetailStoreOptions) {
   ): void {
     if (
       !detail ||
-      detail.repo?.provider !== provider ||
-      detail.repo?.platform_host !== platformHost ||
+      !sameBodyTarget(detail.repo?.provider, detail.repo?.platform_host, provider, platformHost) ||
       detail.repo_owner !== owner ||
       detail.repo_name !== name ||
       detail.merge_request.Number !== number
@@ -992,8 +1049,11 @@ export function createDetailStore(opts: DetailStoreOptions) {
     // an owner or name that contains a delimiter character can't
     // forge a collision with a different target. provider and
     // platformHost are part of the key so the same owner/name/number
-    // on different hosts or providers can't share a queue slot.
-    return JSON.stringify([provider, platformHost ?? "", owner, name, number]);
+    // on different hosts or providers can't share a queue slot —
+    // canonicalized, so an aliased route re-expression of the same PR
+    // can't hold two queue slots with out-of-order saves.
+    const canonical = canonicalProvider(provider);
+    return JSON.stringify([canonical, resolvedPlatformHost(canonical, platformHost), owner, name, number]);
   }
 
   async function runPRBodyPatch(
@@ -1014,6 +1074,7 @@ export function createDetailStore(opts: DetailStoreOptions) {
     // the user navigated to the same owner/name/number on another
     // host doesn't replace the new repo's detail.
     let localBodyMatchesSent = false;
+    const envelopeTick = nextWorkspaceLifecycleTick();
     try {
       const { data, error: requestError } = await apiClient.PATCH(providerItemPath("pulls", ref, ""), {
         params: {
@@ -1030,11 +1091,12 @@ export function createDetailStore(opts: DetailStoreOptions) {
         detail.repo_owner === owner &&
         detail.repo_name === name &&
         detail.merge_request.Number === number &&
-        detail.repo?.provider === routeRef.provider &&
-        detail.repo?.platform_host === routeRef.platformHost &&
+        sameBodyTarget(detail.repo?.provider, detail.repo?.platform_host, routeRef.provider, routeRef.platformHost) &&
         detail.merge_request.Body === body;
       if (data && localBodyMatchesSent) {
-        detail = data as PullDetail;
+        applyEnvelopeAt(envelopeTick, () => {
+          detail = data as PullDetail;
+        });
       }
     } catch (err) {
       showFlash(err instanceof Error ? err.message : String(err), { tone: "danger" });
@@ -1048,8 +1110,12 @@ export function createDetailStore(opts: DetailStoreOptions) {
       succeeded &&
       localBodyMatchesSent &&
       unsavedLocalBody &&
-      unsavedLocalBody.provider === routeRef.provider &&
-      unsavedLocalBody.platformHost === routeRef.platformHost &&
+      sameBodyTarget(
+        unsavedLocalBody.provider,
+        unsavedLocalBody.platformHost,
+        routeRef.provider,
+        routeRef.platformHost,
+      ) &&
       unsavedLocalBody.owner === owner &&
       unsavedLocalBody.name === name &&
       unsavedLocalBody.number === number
@@ -1385,6 +1451,7 @@ export function createDetailStore(opts: DetailStoreOptions) {
 
   return {
     getDetail,
+    getDetailEnvelopeTick,
     isDetailLoading,
     isDetailSyncing,
     getDetailError,

@@ -154,7 +154,13 @@ browser workflows using intercepted API responses belong in
 `frontend/tests/e2e/` (`frontend/playwright.config.ts`); workflows that must
 cross the built SPA, Go server, middleware, persistence, or provider fixture
 boundaries belong in `frontend/tests/e2e-full/`
-(`frontend/playwright-e2e.config.ts`).
+(`frontend/playwright-e2e.config.ts`). When a component change alters a
+rendering contract, sweep both lanes for specs asserting the old contract
+and run them locally — the mock lane can encode a contract without any of
+its files appearing in the diff. Terminal-readiness assertions must be
+renderer-agnostic (`canvas, .xterm-screen`): without WebGL — headless
+Firefox — xterm.js silently falls back to its DOM renderer, which never
+creates a canvas (`frontend/tests/e2e-full/00-inline-workspace-continuity.spec.ts:80`).
 
 A full-stack test claiming a user-triggered mutation works must drive the actual
 control and observe its request or visible result; `page.request` proves only the

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
-import type { Issue } from "../api/types.js";
+import type { Issue, IssueDetail } from "../api/types.js";
 import type { MiddlemanClient } from "../types.js";
 import { dismissFlash, getFlash, getFlashes } from "./flash.svelte.js";
 import { createIssuesStore } from "./issues.svelte.js";
@@ -143,5 +143,107 @@ describe("issues store bot visibility", () => {
 
     expect(store.getHideBots()).toBe(false);
     expect(getFlash()).toMatchObject({ message: "network unavailable", tone: "danger" });
+  });
+});
+
+function issueDetail(): IssueDetail {
+  return {
+    issue: {
+      Number: 7,
+      State: "open",
+      Body: "- [ ] done",
+    },
+    repo: {
+      provider: "github",
+      platform_host: "github.com",
+      repo_path: "acme/widget",
+    },
+    events: [],
+    detail_loaded: true,
+    repo_owner: "acme",
+    repo_name: "widget",
+  } as unknown as IssueDetail;
+}
+
+function mockClient(overrides: Partial<MiddlemanClient> = {}): MiddlemanClient {
+  return {
+    GET: vi.fn(),
+    POST: vi.fn(),
+    PUT: vi.fn(),
+    PATCH: vi.fn(),
+    DELETE: vi.fn(),
+    OPTIONS: vi.fn(),
+    HEAD: vi.fn(),
+    TRACE: vi.fn(),
+    ...overrides,
+  } as unknown as MiddlemanClient;
+}
+
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+} {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+describe("createIssuesStore", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("applies a local body edit addressed through a provider alias and omitted host", async () => {
+    const get = vi.fn().mockResolvedValueOnce({ data: issueDetail() });
+    const store = createIssuesStore({ client: mockClient({ GET: get }) });
+    await store.loadIssueDetail("acme", "widget", 7, {
+      provider: "github",
+      platformHost: "github.com",
+      repoPath: "acme/widget",
+      sync: false,
+    });
+
+    store.setLocalIssueBody("gh", undefined, "acme", "widget", 7, "- [x] done");
+
+    expect(store.getIssueDetail()?.issue.Body).toBe("- [x] done");
+    expect(store.hasUnsavedLocalBody()).toBe(true);
+  });
+
+  it("an older-started refresh cannot overwrite a newer envelope", async () => {
+    // Polling refreshes have no in-flight dedup: two can overlap, and the
+    // older-started one may land last. Without atomic payload+tick
+    // application its stale response would replace newer detail while the
+    // newer tick stands — letting pre-creation "no workspace" data
+    // masquerade as an authoritative post-create absence.
+    vi.useFakeTimers();
+    const identity = {
+      provider: "github",
+      platformHost: "github.com",
+      repoPath: "acme/widget",
+    };
+    const withWorkspace = { ...issueDetail(), workspace: { id: "ws-1", status: "ready" } };
+    const olderPoll = deferred<{ data: IssueDetail }>();
+    const get = vi
+      .fn()
+      .mockResolvedValueOnce({ data: issueDetail() })
+      .mockReturnValueOnce(olderPoll.promise)
+      .mockResolvedValueOnce({ data: withWorkspace });
+    const store = createIssuesStore({ client: mockClient({ GET: get }) });
+    await store.loadIssueDetail("acme", "widget", 7, { ...identity, sync: false });
+    store.startIssueDetailPolling("acme", "widget", 7, identity);
+
+    await vi.advanceTimersByTimeAsync(60_000); // older poll fires, held
+    await vi.advanceTimersByTimeAsync(60_000); // newer poll fires and applies
+    expect(store.getIssueDetail()?.workspace?.id).toBe("ws-1");
+    const newerTick = store.getIssueDetailEnvelopeTick();
+
+    olderPoll.resolve({ data: issueDetail() });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(store.getIssueDetail()?.workspace?.id).toBe("ws-1");
+    expect(store.getIssueDetailEnvelopeTick()).toBe(newerTick);
+    store.stopIssueDetailPolling();
   });
 });

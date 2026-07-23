@@ -161,6 +161,40 @@ describe("createDetailStore", () => {
     expect(store.getDetail()?.platform_head_sha).toBe("newer-head");
   });
 
+  it("an older-started sync response cannot overwrite a newer envelope", async () => {
+    // The sync path has no per-selection sequence guard; without atomic
+    // payload+tick application its stale response would replace newer
+    // detail while the newer tick stands — letting pre-creation "no
+    // workspace" data masquerade as an authoritative post-create absence.
+    const routeIdentity = {
+      provider: "github",
+      platformHost: "github.com",
+      repoPath: "acme/widget",
+    };
+    const withWorkspace = { ...pullDetail("head"), workspace: { id: "ws-1", status: "ready" } };
+    const get = vi
+      .fn()
+      .mockResolvedValueOnce({ data: pullDetail("head") })
+      .mockResolvedValueOnce({ data: withWorkspace });
+    const syncPost = deferred<{ data: PullDetail }>();
+    const post = vi.fn().mockReturnValueOnce(syncPost.promise);
+    const store = createDetailStore({ client: mockClient({ GET: get, POST: post }) });
+    await store.loadDetail("acme", "widget", 7, { ...routeIdentity, sync: false });
+
+    // The sync's request starts before the refresh below applies a newer
+    // envelope carrying the workspace.
+    const syncing = store.syncDetailNow("acme", "widget", 7, routeIdentity);
+    await store.refreshDetailOnly("acme", "widget", 7, routeIdentity);
+    expect(store.getDetail()?.workspace?.id).toBe("ws-1");
+    const newerTick = store.getDetailEnvelopeTick();
+
+    syncPost.resolve({ data: pullDetail("head") });
+    await syncing;
+
+    expect(store.getDetail()?.workspace?.id).toBe("ws-1");
+    expect(store.getDetailEnvelopeTick()).toBe(newerTick);
+  });
+
   it("applies a pending initial load when a newer refresh fails for the same selection", async () => {
     const initialLoad = deferred<{ data?: PullDetail; error?: ProblemBody }>();
     const newerRefresh = deferred<{ data?: PullDetail; error?: ProblemBody }>();
@@ -748,5 +782,24 @@ describe("createDetailStore", () => {
       expect(store.getDetailError()).toBe("pull request state changed");
       tt.assertDetail(store.getDetail());
     }
+  });
+
+  it("applies a local body edit addressed through a provider alias and omitted host", async () => {
+    // Task-list checkbox clicks pass the caller's route vocabulary; the
+    // loaded payload is canonical ("github"/"github.com"). An exact
+    // comparison would silently drop the optimistic toggle.
+    const get = vi.fn().mockResolvedValueOnce({ data: pullDetail("head") });
+    const store = createDetailStore({ client: mockClient({ GET: get }) });
+    await store.loadDetail("acme", "widget", 7, {
+      provider: "github",
+      platformHost: "github.com",
+      repoPath: "acme/widget",
+      sync: false,
+    });
+
+    store.setLocalPRBody("gh", undefined, "acme", "widget", 7, "- [x] done");
+
+    expect(store.getDetail()?.merge_request.Body).toBe("- [x] done");
+    expect(store.hasUnsavedLocalBody()).toBe(true);
   });
 });

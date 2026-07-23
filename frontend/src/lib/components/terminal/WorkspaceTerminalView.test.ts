@@ -1059,7 +1059,10 @@ describe("WorkspaceTerminalView", () => {
 
     await rerender({ workspaceId: "ws-2" });
 
-    expect(await screen.findByText("Loading workspace details...")).toBeTruthy();
+    // Liveness gating unmounts the stale ws-1 view entirely while ws-2
+    // loads: the old toolbar and sidebar are gone, not lingering behind
+    // action guards.
+    expect(await screen.findByText("Setting up workspace...")).toBeTruthy();
     expect(screen.queryByRole("region", { name: "Workspace Diff" })).toBeNull();
     expect(loadWorkspaceDiff).toHaveBeenCalledTimes(1);
 
@@ -1069,7 +1072,11 @@ describe("WorkspaceTerminalView", () => {
       }),
     );
     workspaceBGate.resolve(workspaceB);
-    await Promise.resolve();
+    // ws-2's payload landed but its runtime is still pending: the ready
+    // view mounts with the details-loading sub-state and the diff still
+    // waits for the matching runtime.
+    expect(await screen.findByText("Loading workspace details...")).toBeTruthy();
+    expect(screen.queryByRole("region", { name: "Workspace Diff" })).toBeNull();
     expect(loadWorkspaceDiff).toHaveBeenCalledTimes(1);
 
     runtimeBGate.resolve(runtimeWithStaleSession());
@@ -1892,6 +1899,158 @@ describe("WorkspaceTerminalView", () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(mocks.showFlash).not.toHaveBeenCalled();
+  });
+
+  it("reports a successful delete even after switching to another workspace", async () => {
+    localStorage.setItem("middleman-workspace-active-tab:ws-1", "home");
+    const deleteRequest = deferred<Response>();
+    const otherWorkspaceResponse = {
+      ...workspaceResponse,
+      id: "ws-2",
+      item_number: 8,
+      worktree_path: "/tmp/worktree-2",
+    };
+    const fetchMock = vi.fn().mockImplementation((input: Request | URL | string, init?: RequestInit) => {
+      const url = input instanceof Request ? input.url : String(input);
+      const method = init?.method ?? (input instanceof Request ? input.method : "GET");
+      const { pathname } = new URL(url, "http://localhost");
+      if (method === "DELETE" && pathname.endsWith("/workspaces/ws-1")) {
+        return deleteRequest.promise;
+      }
+      if (pathname.endsWith("/workspaces/ws-1")) {
+        return Promise.resolve(Response.json(workspaceResponse));
+      }
+      if (pathname.endsWith("/workspaces/ws-2")) {
+        return Promise.resolve(Response.json(otherWorkspaceResponse));
+      }
+      if (pathname.endsWith("/api/v1/workspaces")) {
+        return Promise.resolve(Response.json({ workspaces: [workspaceResponse, otherWorkspaceResponse] }));
+      }
+      return Promise.resolve(Response.json({}));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.pushState({}, "", "/terminal/ws-1");
+
+    const onWorkspaceDeleted = vi.fn();
+    const view = render(WorkspaceTerminalView, {
+      props: {
+        workspaceId: "ws-1",
+        onWorkspaceDeleted,
+      },
+    });
+
+    await screen.findByRole("button", { name: "Delete" });
+    await fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    await waitFor(() => {
+      expect(
+        fetchMock.mock.calls.some(([input]) => {
+          if (!(input instanceof Request)) return false;
+          const { pathname } = new URL(input.url);
+          return input.method === "DELETE" && pathname === "/api/v1/workspaces/ws-1";
+        }),
+      ).toBe(true);
+    });
+
+    // Switch to another workspace while the delete is still in flight.
+    window.history.pushState({}, "", "/terminal/ws-2");
+    await view.rerender({ workspaceId: "ws-2" });
+
+    deleteRequest.resolve(new Response(null, { status: 204 }));
+
+    // The server destroyed ws-1 regardless of the current selection:
+    // inline claimants, tombstones, and route memory must still hear
+    // about it, while navigation stays put on ws-2.
+    await waitFor(() =>
+      expect(onWorkspaceDeleted).toHaveBeenCalledWith("ws-1", undefined, {
+        provider: "github",
+        platformHost: "github.com",
+        owner: "acme",
+        name: "widget",
+        repoPath: "acme/widget",
+        number: 7,
+        itemType: "pull_request",
+      }),
+    );
+    expect(window.location.pathname).toBe("/terminal/ws-2");
+  });
+
+  it("reports a successful force delete even after switching to another workspace", async () => {
+    localStorage.setItem("middleman-workspace-active-tab:ws-1", "home");
+    const forceDeleteRequest = deferred<Response>();
+    const otherWorkspaceResponse = {
+      ...workspaceResponse,
+      id: "ws-2",
+      item_number: 8,
+      worktree_path: "/tmp/worktree-2",
+    };
+    const fetchMock = vi.fn().mockImplementation((input: Request | URL | string, init?: RequestInit) => {
+      const url = input instanceof Request ? input.url : String(input);
+      const method = init?.method ?? (input instanceof Request ? input.method : "GET");
+      const { pathname, searchParams } = new URL(url, "http://localhost");
+      if (method === "DELETE" && pathname.endsWith("/workspaces/ws-1")) {
+        if (searchParams.get("force") === "true") {
+          return forceDeleteRequest.promise;
+        }
+        return Promise.resolve(Response.json({ detail: "Workspace has uncommitted changes." }, { status: 409 }));
+      }
+      if (pathname.endsWith("/workspaces/ws-1")) {
+        return Promise.resolve(Response.json(workspaceResponse));
+      }
+      if (pathname.endsWith("/workspaces/ws-2")) {
+        return Promise.resolve(Response.json(otherWorkspaceResponse));
+      }
+      if (pathname.endsWith("/api/v1/workspaces")) {
+        return Promise.resolve(Response.json({ workspaces: [workspaceResponse, otherWorkspaceResponse] }));
+      }
+      return Promise.resolve(Response.json({}));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.pushState({}, "", "/terminal/ws-1");
+
+    const onWorkspaceDeleted = vi.fn();
+    const view = render(WorkspaceTerminalView, {
+      props: {
+        workspaceId: "ws-1",
+        onWorkspaceDeleted,
+      },
+    });
+
+    await screen.findByRole("button", { name: "Delete" });
+    await fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+
+    // The 409 opens the force-delete confirmation; confirming issues the
+    // forced DELETE that stays in flight while the user switches away.
+    const forceButton = await screen.findByRole("button", { name: "Force delete" });
+    await fireEvent.click(forceButton);
+    await waitFor(() => {
+      expect(
+        fetchMock.mock.calls.some(([input]) => {
+          if (!(input instanceof Request)) return false;
+          const { pathname, searchParams } = new URL(input.url);
+          return (
+            input.method === "DELETE" && pathname === "/api/v1/workspaces/ws-1" && searchParams.get("force") === "true"
+          );
+        }),
+      ).toBe(true);
+    });
+
+    window.history.pushState({}, "", "/terminal/ws-2");
+    await view.rerender({ workspaceId: "ws-2" });
+
+    forceDeleteRequest.resolve(new Response(null, { status: 204 }));
+
+    await waitFor(() =>
+      expect(onWorkspaceDeleted).toHaveBeenCalledWith("ws-1", undefined, {
+        provider: "github",
+        platformHost: "github.com",
+        owner: "acme",
+        name: "widget",
+        repoPath: "acme/widget",
+        number: 7,
+        itemType: "pull_request",
+      }),
+    );
+    expect(window.location.pathname).toBe("/terminal/ws-2");
   });
 
   it("disables active workflow terminal input while the selected workspace is deleting", async () => {

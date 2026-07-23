@@ -1,12 +1,15 @@
 import type { Issue, IssueDetail, IssuesParams, IssueSettings, Label } from "../api/types.js";
 import {
+  canonicalProvider,
   providerDefaultHost,
   providerItemPath,
   providerRouteParams,
+  resolvedPlatformHost,
   type ProviderRouteRef,
 } from "../api/provider-routes.js";
 import type { MiddlemanClient } from "../types.js";
 import { showFlash } from "./flash.svelte.js";
+import { nextWorkspaceLifecycleTick } from "./workspace-create-pending.svelte.js";
 
 export type IssueDetailSyncMode = boolean | "background";
 
@@ -103,6 +106,11 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
   // --- detail state ---
 
   let issueDetail = $state<IssueDetail | null>(null);
+  // Lifecycle tick captured when the request that produced the current
+  // envelope STARTED (not when it landed). Workspace-create reconciliation
+  // compares it against a creation confirmation's tick to tell a stale
+  // pre-create "no workspace" apart from an authoritative post-create one.
+  let issueDetailEnvelopeTick = $state(0);
   let detailLoading = $state(false);
   let detailSyncing = $state(false);
   let detailError = $state<string | null>(null);
@@ -203,6 +211,21 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
 
   function getIssueDetail(): IssueDetail | null {
     return issueDetail;
+  }
+  function getIssueDetailEnvelopeTick(): number {
+    return issueDetailEnvelopeTick;
+  }
+
+  // Applies an envelope payload and its request-start tick atomically. A
+  // response whose request started before the currently applied envelope's
+  // request is stale: applying its payload while the newer tick stands
+  // would let pre-creation "no workspace" data masquerade as authoritative.
+  // Rejecting it keeps last-started-wins consistent across every
+  // detail-producing path, including sync and PATCH responses.
+  function applyEnvelopeAt(envelopeTick: number, assign: () => void): void {
+    if (envelopeTick < issueDetailEnvelopeTick) return;
+    assign();
+    issueDetailEnvelopeTick = envelopeTick;
   }
   function isIssueDetailLoading(): boolean {
     return detailLoading;
@@ -346,8 +369,12 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
     if (!unsavedLocalBody) return next;
     if (!issueDetail) return next;
     if (
-      unsavedLocalBody.provider !== next.repo?.provider ||
-      unsavedLocalBody.platformHost !== next.repo?.platform_host ||
+      !sameBodyTarget(
+        unsavedLocalBody.provider,
+        unsavedLocalBody.platformHost,
+        next.repo?.provider,
+        next.repo?.platform_host,
+      ) ||
       unsavedLocalBody.owner !== next.repo_owner ||
       unsavedLocalBody.name !== next.repo_name ||
       unsavedLocalBody.number !== next.issue?.Number
@@ -407,14 +434,28 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
     return unsavedLocalBody !== null;
   }
 
+  // Callers pass route vocabulary (gh, omitted default host) while
+  // payloads carry canonical values; every provider/host comparison
+  // between the two must normalize both sides or a mutation on an
+  // aliased route silently no-ops against its own current detail.
+  function sameBodyTarget(
+    aProvider: string | undefined,
+    aHost: string | undefined,
+    bProvider: string | undefined,
+    bHost: string | undefined,
+  ): boolean {
+    const a = canonicalProvider(aProvider ?? "");
+    const b = canonicalProvider(bProvider ?? "");
+    return a === b && resolvedPlatformHost(a, aHost) === resolvedPlatformHost(b, bHost);
+  }
+
   function isIssueDetailShowingRef(ref: IssueDetailRequestRef): boolean {
     return (
       issueDetail !== null &&
       issueDetail.repo_owner === ref.owner &&
       issueDetail.repo_name === ref.name &&
       issueDetail.issue.Number === ref.number &&
-      issueDetail.repo?.provider === ref.provider &&
-      issueDetail.repo?.platform_host === ref.platformHost &&
+      sameBodyTarget(issueDetail.repo?.provider, issueDetail.repo?.platform_host, ref.provider, ref.platformHost) &&
       issueDetail.repo?.repo_path === ref.repoPath
     );
   }
@@ -476,6 +517,7 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
     detailLoading = true;
     detailSyncing = false;
     detailError = null;
+    const envelopeTick = nextWorkspaceLifecycleTick();
     const promise = (async () => {
       try {
         const { data, error: requestError } = await apiClient.GET(providerItemPath("issues", requestRef, ""), {
@@ -490,13 +532,15 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
         if (requestError) {
           throw new Error(apiErrorMessage(requestError, "failed to load issue"));
         }
-        issueDetail = data
-          ? withPreservedLocalBody({
-              ...data,
-              events: data.events ?? [],
-            } as IssueDetail)
-          : null;
-        issueDetailLoaded = data?.detail_loaded ?? false;
+        applyEnvelopeAt(envelopeTick, () => {
+          issueDetail = data
+            ? withPreservedLocalBody({
+                ...data,
+                events: data.events ?? [],
+              } as IssueDetail)
+            : null;
+          issueDetailLoaded = data?.detail_loaded ?? false;
+        });
       } catch (err) {
         if (gen !== issueSyncGeneration) return;
         detailError = err instanceof Error ? err.message : String(err);
@@ -572,6 +616,7 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
     ref: IssueDetailRequestRef,
   ): Promise<void> {
     detailSyncing = true;
+    const envelopeTick = nextWorkspaceLifecycleTick();
     try {
       const { data, error: requestError } = await apiClient.POST(providerItemPath("issues", ref, "/sync"), {
         params: {
@@ -584,11 +629,13 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
       }
       if (data) {
         detailError = null;
-        issueDetail = withPreservedLocalBody({
-          ...data,
-          events: data.events ?? [],
-        } as IssueDetail);
-        issueDetailLoaded = data.detail_loaded ?? issueDetailLoaded;
+        applyEnvelopeAt(envelopeTick, () => {
+          issueDetail = withPreservedLocalBody({
+            ...data,
+            events: data.events ?? [],
+          } as IssueDetail);
+          issueDetailLoaded = data.detail_loaded ?? issueDetailLoaded;
+        });
       }
     } catch {
       // Sync failure is non-fatal.
@@ -610,6 +657,7 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
     ref: IssueDetailRequestRef,
     expectedGen: number = issueSyncGeneration,
   ): Promise<{ ok: boolean; error?: string }> {
+    const envelopeTick = nextWorkspaceLifecycleTick();
     try {
       const { data, error: requestError } = await apiClient.GET(providerItemPath("issues", ref, ""), {
         params: {
@@ -624,11 +672,13 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
         return { ok: false, error: apiErrorMessage(requestError, "failed to refresh issue") };
       }
       if (data !== undefined) {
-        issueDetail = withPreservedLocalBody({
-          ...data,
-          events: data.events ?? [],
-        } as IssueDetail);
-        issueDetailLoaded = data.detail_loaded ?? issueDetailLoaded;
+        applyEnvelopeAt(envelopeTick, () => {
+          issueDetail = withPreservedLocalBody({
+            ...data,
+            events: data.events ?? [],
+          } as IssueDetail);
+          issueDetailLoaded = data.detail_loaded ?? issueDetailLoaded;
+        });
         return { ok: true };
       }
       return { ok: false, error: "Issue refresh returned no detail" };
@@ -836,8 +886,7 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
   ): void {
     if (!issueDetail) return;
     if (
-      issueDetail.repo?.provider !== provider ||
-      issueDetail.repo?.platform_host !== platformHost ||
+      !sameBodyTarget(issueDetail.repo?.provider, issueDetail.repo?.platform_host, provider, platformHost) ||
       issueDetail.repo_owner !== owner ||
       issueDetail.repo_name !== name ||
       issueDetail.issue.Number !== number
@@ -877,8 +926,11 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
     // an owner or name that contains a delimiter character can't
     // forge a collision with a different target. provider and
     // platformHost are part of the key so the same owner/name/number
-    // on different hosts or providers can't share a queue slot.
-    return JSON.stringify([provider, platformHost ?? "", owner, name, number]);
+    // on different hosts or providers can't share a queue slot —
+    // canonicalized, so an aliased route re-expression of the same
+    // issue can't hold two queue slots with out-of-order saves.
+    const canonical = canonicalProvider(provider);
+    return JSON.stringify([canonical, resolvedPlatformHost(canonical, platformHost), owner, name, number]);
   }
 
   async function runIssueBodyPatch(
@@ -899,6 +951,7 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
     // host can't replace the now-displayed issue from another host
     // that happens to share owner/name/number.
     let localBodyMatchesSent = false;
+    const envelopeTick = nextWorkspaceLifecycleTick();
     try {
       const { data, error: requestError } = await apiClient.PATCH(providerItemPath("issues", ref, ""), {
         params: {
@@ -915,14 +968,20 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
       succeeded = true;
       localBodyMatchesSent =
         issueDetail !== null &&
-        issueDetail.repo?.provider === routeRef.provider &&
-        issueDetail.repo?.platform_host === routeRef.platformHost &&
+        sameBodyTarget(
+          issueDetail.repo?.provider,
+          issueDetail.repo?.platform_host,
+          routeRef.provider,
+          routeRef.platformHost,
+        ) &&
         issueDetail.repo_owner === owner &&
         issueDetail.repo_name === name &&
         issueDetail.issue.Number === number &&
         issueDetail.issue.Body === body;
       if (data && localBodyMatchesSent) {
-        issueDetail = data as IssueDetail;
+        applyEnvelopeAt(envelopeTick, () => {
+          issueDetail = data as IssueDetail;
+        });
       }
     } catch (err) {
       showFlash(err instanceof Error ? err.message : String(err), { tone: "danger" });
@@ -931,8 +990,12 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
       succeeded &&
       localBodyMatchesSent &&
       unsavedLocalBody &&
-      unsavedLocalBody.provider === routeRef.provider &&
-      unsavedLocalBody.platformHost === routeRef.platformHost &&
+      sameBodyTarget(
+        unsavedLocalBody.provider,
+        unsavedLocalBody.platformHost,
+        routeRef.provider,
+        routeRef.platformHost,
+      ) &&
       unsavedLocalBody.owner === owner &&
       unsavedLocalBody.name === name &&
       unsavedLocalBody.number === number
@@ -1122,6 +1185,7 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
     clearIssueSelection,
     loadIssues,
     getIssueDetail,
+    getIssueDetailEnvelopeTick,
     isIssueDetailLoading,
     isIssueDetailSyncing,
     getIssueDetailError,

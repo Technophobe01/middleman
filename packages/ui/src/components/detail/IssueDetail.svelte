@@ -1,7 +1,7 @@
 <script lang="ts">
-  import { tick, untrack } from "svelte";
-  import { canonicalProvider, providerItemPath, providerRepoPath, providerRouteParams } from "../../api/provider-routes.js";
-  import type { Label, ProviderCapabilities } from "../../api/types.js";
+  import { onDestroy, tick, untrack } from "svelte";
+  import { canonicalProvider, providerItemPath, providerRepoPath, providerRouteParams, resolvedPlatformHost } from "../../api/provider-routes.js";
+  import type { IssueDetail, Label, ProviderCapabilities } from "../../api/types.js";
   import {
     getStores, getClient, getActions,
     getUIConfig, getNavigate,
@@ -37,12 +37,22 @@
   import { nextCatalogLabelNames } from "./labelSelection.js";
   import { floatingPopoverStyle } from "@kenn-io/kit-ui";
   import CopyItemNumber from "./CopyItemNumber.svelte";
+  import ExternalLinkIcon from "@lucide/svelte/icons/external-link";
   import MonitorUpIcon from "@lucide/svelte/icons/monitor-up";
   import PackagePlusIcon from "@lucide/svelte/icons/package-plus";
   import RefreshCwIcon from "@lucide/svelte/icons/refresh-cw";
   import TagsIcon from "@lucide/svelte/icons/tags";
   import UsersIcon from "@lucide/svelte/icons/users";
   import XIcon from "@lucide/svelte/icons/x";
+  import { identityEquals, type InlineWorkspaceController, type WorkspaceItemIdentity } from "../../workspace-inline.js";
+  import {
+    beginWorkspaceCreate,
+    endWorkspaceCreate,
+    isWorkspaceCreatePending,
+    reconcileWorkspaceCreated,
+    recordWorkspaceCreated,
+    resolveControllerlessWorkspaceRef,
+  } from "../../stores/workspace-create-pending.svelte.js";
 
   const CLEAR_LABELS_PENDING = "__clear-label-selection__";
 
@@ -96,6 +106,7 @@
     repoPath: string;
     hideStaleWhileLoading?: boolean;
     autoSync?: IssueDetailSyncMode;
+    inlineWorkspace?: InlineWorkspaceController | null;
   }
 
   const {
@@ -107,6 +118,7 @@
     repoPath,
     hideStaleWhileLoading = false,
     autoSync = "background",
+    inlineWorkspace = null,
   }: Props = $props();
 
   const routeRef = $derived({
@@ -125,6 +137,15 @@
     repoPath,
     number,
   });
+  const itemIdentity = $derived<WorkspaceItemIdentity>({
+    provider,
+    platformHost,
+    owner,
+    name,
+    repoPath,
+    number,
+    itemType: "issue",
+  });
 
   // See PullDetail.svelte: while a route change is in flight, the
   // displayed issue may briefly belong to the previous route. Mutating
@@ -141,10 +162,35 @@
     ) {
       return true;
     }
-    return d.repo?.provider !== provider
+    // Props may carry provider aliases (gh) or omit the default host
+    // (Activity URLs) while the payload is canonical and concrete;
+    // treating those as stale would disable every mutation action on a
+    // detail that is in fact current.
+    return canonicalProvider(d.repo?.provider ?? "") !== canonicalProvider(provider)
       || d.repo?.repo_path !== repoPath
-      || d.repo?.platform_host !== platformHost;
+      || resolvedPlatformHost(provider, d.repo?.platform_host)
+        !== resolvedPlatformHost(provider, platformHost);
   });
+
+  // Same comparison shape as PRListView's detailMatchesSelected, but
+  // against the inline workspace identity rather than a route ref: the
+  // reconcile effect below must not fire the override reconciliation for
+  // a detail payload that belongs to a different issue (e.g. one still
+  // in-flight from a prior route).
+  function detailMatchesIdentity(
+    detail: IssueDetail,
+    identity: WorkspaceItemIdentity,
+  ): boolean {
+    return (
+      detail.repo_owner === identity.owner &&
+      detail.repo_name === identity.name &&
+      detail.issue.Number === identity.number &&
+      canonicalProvider(detail.repo?.provider ?? "") === canonicalProvider(identity.provider) &&
+      resolvedPlatformHost(identity.provider, detail.repo?.platform_host) ===
+        resolvedPlatformHost(identity.provider, identity.platformHost) &&
+      detail.repo?.repo_path === identity.repoPath
+    );
+  }
 
   async function editTimelineComment(
     event: { PlatformID: number | null },
@@ -203,11 +249,21 @@
   });
 
   // Clear conflict/error state on route change so issue A's
-  // dialogs can't bleed into issue B's view.
+  // dialogs can't bleed into issue B's view. Keyed on the full
+  // provider-aware identity: the same owner/name/number can exist
+  // on another provider or host.
+  //
+  // Tracks the last identity this effect reset for: a route transition can
+  // re-express the same item (gh vs github, omitted vs concrete default
+  // host), and an alias-only change must not bump the generation — that
+  // would discard an in-flight create's success and re-enable the button
+  // for a duplicate request.
+  let lastResetIdentity: WorkspaceItemIdentity | null = null;
   $effect(() => {
-    void owner;
-    void name;
-    void number;
+    const current = $state.snapshot(itemIdentity);
+    if (lastResetIdentity !== null && identityEquals(lastResetIdentity, current)) return;
+    lastResetIdentity = current;
+    workspaceRequestGen += 1;
     branchConflict = null;
     workspaceCreating = false;
     labelPickerOpen = false;
@@ -249,9 +305,15 @@
 
   function onOpenLabelPickerCommand(event: Event): void {
     const detail = (event as CustomEvent<OpenLabelPickerDetail>).detail;
-    if (labelPickerCommandMatches(labelPickerCommandRef, detail)) {
-      void openLabelPicker();
+    if (!labelPickerCommandMatches(labelPickerCommandRef, detail)) return;
+    // While the inline dock is expanded this detail stays mounted but
+    // hidden/inert, so opening the picker here would build an invisible
+    // overlay that pops up on the next collapse. The command is an explicit
+    // detail operation: restore split first so the picker lands visibly.
+    if (inlineWorkspace?.isClaimedFor(itemIdentity) && inlineWorkspace.getDockMode() === "expanded") {
+      inlineWorkspace.setDockMode("split");
     }
+    void openLabelPicker();
   }
 
   async function openLabelPicker(event?: MouseEvent): Promise<void> {
@@ -450,6 +512,23 @@
   }
 
   let workspaceCreating = $state(false);
+  // The shared pending store outlives this component and its local flag:
+  // route resets and remounts clear workspaceCreating while the POST is
+  // still in flight, and a round-trip back to this issue must keep the
+  // button disabled or a second click sends a duplicate create.
+  const workspaceCreateBlocked = $derived(workspaceCreating || isWorkspaceCreatePending(itemIdentity));
+  // Bumped per create request and on identity change (route-reset
+  // effect): a workspace-create response whose generation no longer
+  // matches arrived for an item this component stopped showing and must
+  // not touch any state. Destroy alone is weaker — the same issue can
+  // still be selected (drawer tab/layout change), so a success still
+  // records its store-level override; only local state, the conflict
+  // dialog, flash, and navigation are skipped.
+  let workspaceRequestGen = 0;
+  let componentDestroyed = false;
+  onDestroy(() => {
+    componentDestroyed = true;
+  });
   const createWorkspaceTitle =
     "Create an issue worktree, then open Workspaces to launch agents or shells on that branch.";
   const createWorkspaceDescriptionId =
@@ -485,8 +564,37 @@
     return untrack(() => pushModalFrame("issue-detail-confirm", []));
   });
   const workspace = $derived(
-    issues.getIssueDetail()?.workspace,
+    inlineWorkspace
+      ? inlineWorkspace.effectiveWorkspaceRef(itemIdentity, issues.getIssueDetail()?.workspace ?? null)
+      : // Without a controller there is no override store: the shared
+        // resolver stands in — the confirmed created record wins over a
+        // stale cached envelope, and an envelope still carrying a
+        // session-deleted workspace ID is masked instead of re-offering
+        // "Open Workspace" for a workspace that no longer exists.
+        resolveControllerlessWorkspaceRef(itemIdentity, issues.getIssueDetail()?.workspace ?? null),
   );
+
+  // Once a detail load lands for the identity this component is currently
+  // showing, let the inline controller drop its override if the envelope
+  // now agrees (or update its bookkeeping if the envelope disagrees). A
+  // load for a stale/mismatched identity must not reconcile — that would
+  // let a slow response for issue A clear an override this component
+  // just recorded for issue B.
+  $effect(() => {
+    const detail = issues.getIssueDetail();
+    if (!detail) return;
+    if (!detailMatchesIdentity(detail, itemIdentity)) return;
+    // The shared created-record reconciles the same way, controller or
+    // not: an identity-matched envelope that carries the workspace is
+    // authoritative, and a null envelope whose request started after the
+    // creation was recorded (the tick comparison) is authoritative for
+    // absence — another client deleted the workspace. Reading the tick
+    // here also reruns this effect when a refreshed envelope's content
+    // is identical and the detail object itself is not reassigned.
+    const envelopeTick = issues.getIssueDetailEnvelopeTick();
+    reconcileWorkspaceCreated(itemIdentity, detail.workspace ?? null, envelopeTick);
+    if (inlineWorkspace) inlineWorkspace.reconcile(itemIdentity, detail.workspace ?? null, envelopeTick);
+  });
 
   function issueWorkspaceBranch(): string {
     return `middleman/issue-${number}`;
@@ -548,12 +656,25 @@
     fromConflictDialog?: boolean;
   };
 
+  // Re-checks the identity at call time (not just at the caller's check)
+  // before refetching: refetchDetailForIdentity is fired without an
+  // await on its result, so the selection can move on in the interim.
+  async function refetchDetailForIdentity(identity: WorkspaceItemIdentity): Promise<void> {
+    if (!identityEquals(identity, $state.snapshot(itemIdentity))) return;
+    await issues.loadIssueDetail(owner, name, number, {
+      provider,
+      platformHost,
+      repoPath,
+    });
+  }
+
   async function createWorkspace(
     options: CreateWorkspaceOptions = {},
   ): Promise<void> {
     if (staleIssue) return;
     const detail = issues.getIssueDetail();
     if (!detail) return;
+    const requestIdentity = $state.snapshot(itemIdentity);
 
     if (!options.fromConflictDialog) {
       branchConflict = null;
@@ -566,7 +687,22 @@
       return;
     }
 
+    // A create for this item is already in flight somewhere (this
+    // instance before a round-trip, or a predecessor before a remount).
+    // Checked after the conflict-dialog handling above: a conflict
+    // response settles the first request before the dialog can resubmit.
+    if (isWorkspaceCreatePending(requestIdentity)) return;
+    const requestGen = ++workspaceRequestGen;
+    // The identity comparison also covers the microtask gap where props
+    // already moved to a new item but the route-reset effect (which bumps
+    // the generation) hasn't flushed yet.
+    const identityLeft = () =>
+      requestGen !== workspaceRequestGen ||
+      !identityEquals(requestIdentity, $state.snapshot(itemIdentity));
+    const responseIsStale = () => componentDestroyed || identityLeft();
+
     workspaceCreating = true;
+    beginWorkspaceCreate(requestIdentity);
     if (branchConflict) {
       branchConflict.error = null;
     }
@@ -596,6 +732,9 @@
         },
       );
       if (requestError) {
+        // Superseded or unmounted: an error about an item the user
+        // already left is noise.
+        if (responseIsStale()) return;
         const conflict = parseBranchConflict(
           requestError as APIError,
         );
@@ -613,12 +752,51 @@
         );
       }
       if (data?.id) {
-        navigate(`/terminal/${data.id}`);
+        // Publish the confirmed creation to identity-scoped shared state
+        // BEFORE any liveness guard: the workspace exists server-side
+        // even when the selection moved on (an A→B→A round-trip bumps
+        // the request generation) or a layout change replaced this
+        // component, and dropping the response leaves the replacement
+        // UI offering "Create Workspace" for a duplicate submission.
+        // The created-record covers every consumer — focus/mobile views
+        // and DetailDrawer run without an inline controller; the
+        // controller's recordCreated is claim-guarded, so a late
+        // publication only parks the ref under its identity — it can't
+        // activate an inactive surface.
+        const createdRef = {
+          id: data.id,
+          status: data.status ?? "provisioning",
+        };
+        recordWorkspaceCreated(requestIdentity, createdRef);
+        inlineWorkspace?.recordCreated(requestIdentity, createdRef);
+      }
+      // Everything below is presentation owned by this live component
+      // and its current selection. A destroyed component must not
+      // refetch: its frozen identity still matches its own props, but
+      // the shared issue store may already belong to a different
+      // selection, and loading the old item would replace it. The
+      // override above is enough — a replacement component loads its
+      // own detail on mount.
+      if (responseIsStale()) return;
+      if (data?.id) {
+        if (inlineWorkspace) {
+          void refetchDetailForIdentity(requestIdentity);
+        } else {
+          navigate(`/terminal/${data.id}`);
+        }
       }
     } catch (err) {
+      if (responseIsStale()) return;
       showFlash(err instanceof Error ? err.message : String(err), { tone: "danger" });
     } finally {
-      workspaceCreating = false;
+      // The request settled either way: release the identity-scoped
+      // pending entry so the button re-enables everywhere at once.
+      endWorkspaceCreate(requestIdentity);
+      // A stale request must not clobber the creating flag a newer
+      // request (or a fresh selection) owns.
+      if (!responseIsStale()) {
+        workspaceCreating = false;
+      }
     }
   }
 
@@ -1070,25 +1248,58 @@
       <!-- Actions -->
       <div class="actions-row">
         {#if workspace}
-          <Button
-            class="btn--workspace"
-            disabled={staleIssue}
-            onclick={() => {
-              if (staleIssue) return;
-              navigate(`/terminal/${workspace.id}`);
-            }}
-            tone="info"
-            surface="soft"
-            size="sm"
-            label="Open Workspace"
-            shortLabel="Workspace"
-          >
-            <MonitorUpIcon size="14" strokeWidth="2.2" aria-hidden="true" />
-          </Button>
+          {#if inlineWorkspace}
+            <Button
+              class="btn--workspace"
+              disabled={staleIssue}
+              onclick={() => {
+                if (staleIssue) return;
+                inlineWorkspace.focusTerminal();
+              }}
+              tone="info"
+              surface="soft"
+              size="sm"
+              label="Focus Terminal"
+              shortLabel="Terminal"
+            >
+              <MonitorUpIcon size="14" strokeWidth="2.2" aria-hidden="true" />
+            </Button>
+            <Button
+              class="btn--workspace-secondary"
+              disabled={staleIssue}
+              onclick={() => {
+                if (staleIssue) return;
+                inlineWorkspace.openInWorkspaces(workspace);
+              }}
+              tone="neutral"
+              surface="soft"
+              size="sm"
+              label="Open in Workspaces"
+              shortLabel="Workspaces"
+            >
+              <ExternalLinkIcon size="14" strokeWidth="2.2" aria-hidden="true" />
+            </Button>
+          {:else}
+            <Button
+              class="btn--workspace"
+              disabled={staleIssue}
+              onclick={() => {
+                if (staleIssue) return;
+                navigate(`/terminal/${workspace.id}`);
+              }}
+              tone="info"
+              surface="soft"
+              size="sm"
+              label="Open Workspace"
+              shortLabel="Workspace"
+            >
+              <MonitorUpIcon size="14" strokeWidth="2.2" aria-hidden="true" />
+            </Button>
+          {/if}
         {:else}
           <Button
             class="btn--workspace"
-            disabled={workspaceCreating || staleIssue}
+            disabled={workspaceCreateBlocked || staleIssue}
             onclick={() => void createWorkspace()}
             tone="info"
             surface="soft"
@@ -1097,8 +1308,8 @@
               ? "Refresh details before creating a workspace."
               : createWorkspaceTitle}
             ariaDescribedby={createWorkspaceDescriptionId}
-            label={workspaceCreating ? "Creating..." : "Create Workspace"}
-            shortLabel={workspaceCreating ? "Creating..." : "Create Workspace"}
+            label={workspaceCreateBlocked ? "Creating..." : "Create Workspace"}
+            shortLabel={workspaceCreateBlocked ? "Creating..." : "Create Workspace"}
           >
             <PackagePlusIcon size="14" strokeWidth="2.2" aria-hidden="true" />
           </Button>
