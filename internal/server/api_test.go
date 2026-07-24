@@ -52,6 +52,10 @@ import (
 	platformgitlab "go.kenn.io/middleman/internal/platform/gitlab"
 	"go.kenn.io/middleman/internal/procutil"
 	"go.kenn.io/middleman/internal/ptyowner"
+	"go.kenn.io/middleman/internal/server/httpapi"
+	"go.kenn.io/middleman/internal/server/issueapi"
+	"go.kenn.io/middleman/internal/server/pullapi"
+	"go.kenn.io/middleman/internal/server/workspaceapi"
 	"go.kenn.io/middleman/internal/stacks"
 	"go.kenn.io/middleman/internal/testutil"
 	"go.kenn.io/middleman/internal/testutil/dbtest"
@@ -64,7 +68,13 @@ import (
 
 const serverRuntimeHelperMarker = "middleman-runtime-helper"
 
-var ptyE2ESemaphore = semaphore.NewWeighted(1)
+var (
+	ptyE2ESemaphore = semaphore.NewWeighted(1)
+	// Root keeps only Workspace tests that cross provider, config, Kata,
+	// runtime, terminal, Fleet, or agent-context composition boundaries.
+	// Bound their Git setup independently from the workspacetest binary.
+	rootWorkspaceGitSemaphore = semaphore.NewWeighted(2)
+)
 
 func TestMain(m *testing.M) {
 	if isServerHelperProcess() {
@@ -115,6 +125,12 @@ func acquirePTYE2ESlot(t *testing.T) func() {
 	return func() {
 		ptyE2ESemaphore.Release(1)
 	}
+}
+
+func acquireRootWorkspaceGitSlot(t *testing.T) {
+	t.Helper()
+	require.NoError(t, rootWorkspaceGitSemaphore.Acquire(t.Context(), 1))
+	t.Cleanup(func() { rootWorkspaceGitSemaphore.Release(1) })
 }
 
 func requirePTYAvailable(t *testing.T) {
@@ -1026,6 +1042,12 @@ var defaultTestRepos = []ghclient.RepoRef{
 func setupTestServerWithRepos(
 	t *testing.T, mock *mockGH, repos []ghclient.RepoRef,
 ) (*Server, *db.DB) {
+	return setupTestServerWithReposAndOptions(t, mock, repos, ServerOptions{})
+}
+
+func setupTestServerWithReposAndOptions(
+	t *testing.T, mock *mockGH, repos []ghclient.RepoRef, options ServerOptions,
+) (*Server, *db.DB) {
 	t.Helper()
 
 	database := dbtest.Open(t)
@@ -1038,7 +1060,7 @@ func setupTestServerWithRepos(
 	t.Cleanup(syncer.Stop)
 	srv := New(
 		database, syncer, nil, "/",
-		nil, ServerOptions{},
+		nil, options,
 	)
 	// Registered after the DB cleanup so LIFO ordering runs Shutdown
 	// first and lets background goroutines finish before DB close.
@@ -1700,7 +1722,7 @@ func TestAPIListPulls(t *testing.T) {
 	raw := doJSON(t, srv, http.MethodGet, "/api/v1/pulls", nil)
 	require.Equal(http.StatusOK, raw.Code)
 	var body []struct {
-		Repo repoRefResponse `json:"repo"`
+		Repo httpapi.RepoRefResponse `json:"repo"`
 	}
 	require.NoError(json.Unmarshal(raw.Body.Bytes(), &body))
 	require.Len(body, 1)
@@ -1739,21 +1761,21 @@ func TestAPIPullResponsesNormalizeMissingKanbanStateToNew(t *testing.T) {
 
 	rawList := doJSON(t, srv, http.MethodGet, "/api/v1/pulls", nil)
 	require.Equal(http.StatusOK, rawList.Code)
-	var list []mergeRequestResponse
+	var list []pullapi.MergeRequestResponse
 	require.NoError(json.Unmarshal(rawList.Body.Bytes(), &list))
 	require.Len(list, 1)
 	assert.Equal(db.KanbanStatusNew, list[0].KanbanStatus)
 
 	rawNewList := doJSON(t, srv, http.MethodGet, "/api/v1/pulls?kanban=new", nil)
 	require.Equal(http.StatusOK, rawNewList.Code)
-	var newList []mergeRequestResponse
+	var newList []pullapi.MergeRequestResponse
 	require.NoError(json.Unmarshal(rawNewList.Body.Bytes(), &newList))
 	require.Len(newList, 1)
 	assert.Equal(db.KanbanStatusNew, newList[0].KanbanStatus)
 
 	rawDetail := doJSON(t, srv, http.MethodGet, "/api/v1/pulls/gh/acme/widget/7", nil)
 	require.Equal(http.StatusOK, rawDetail.Code)
-	var detail mergeRequestDetailResponse
+	var detail pullapi.MergeRequestDetailResponse
 	require.NoError(json.Unmarshal(rawDetail.Body.Bytes(), &detail))
 	require.NotNil(detail.MergeRequest)
 	assert.Equal(db.KanbanStatusNew, detail.MergeRequest.KanbanStatus)
@@ -1792,7 +1814,7 @@ func TestAPIGetPullIncludesCIChecks(t *testing.T) {
 
 	rawDetail := doJSON(t, srv, http.MethodGet, "/api/v1/pulls/gh/acme/widget/7", nil)
 	require.Equal(http.StatusOK, rawDetail.Code)
-	var detail mergeRequestDetailResponse
+	var detail pullapi.MergeRequestDetailResponse
 	require.NoError(json.Unmarshal(rawDetail.Body.Bytes(), &detail))
 	require.Len(detail.Checks, 2)
 	assert.Equal("build", detail.Checks[0].Name)
@@ -1832,7 +1854,7 @@ func TestAPIGetPullToleratesMalformedCIChecks(t *testing.T) {
 
 	rawDetail := doJSON(t, srv, http.MethodGet, "/api/v1/pulls/gh/acme/widget/7", nil)
 	require.Equal(http.StatusOK, rawDetail.Code)
-	var detail mergeRequestDetailResponse
+	var detail pullapi.MergeRequestDetailResponse
 	require.NoError(json.Unmarshal(rawDetail.Body.Bytes(), &detail))
 	require.Empty(detail.Checks, "malformed checks cache yields no checks, not an error")
 }
@@ -2217,7 +2239,7 @@ func TestAPIRepoFilterAcceptsMultipleRepos(t *testing.T) {
 
 	rawPulls := doJSON(t, srv, http.MethodGet, "/api/v1/pulls?repo="+filter, nil)
 	require.Equal(http.StatusOK, rawPulls.Code)
-	var pulls []mergeRequestResponse
+	var pulls []pullapi.MergeRequestResponse
 	require.NoError(json.Unmarshal(rawPulls.Body.Bytes(), &pulls))
 	require.Len(pulls, 2)
 	assert.ElementsMatch([]string{"widget", "worker"}, []string{
@@ -2227,7 +2249,7 @@ func TestAPIRepoFilterAcceptsMultipleRepos(t *testing.T) {
 
 	rawIssues := doJSON(t, srv, http.MethodGet, "/api/v1/issues?repo="+filter, nil)
 	require.Equal(http.StatusOK, rawIssues.Code)
-	var issues []issueResponse
+	var issues []issueapi.IssueResponse
 	require.NoError(json.Unmarshal(rawIssues.Body.Bytes(), &issues))
 	require.Len(issues, 2)
 	assert.ElementsMatch([]string{"widget", "worker"}, []string{
@@ -4291,7 +4313,10 @@ func TestAPIGitLabClosedSyncPersistsMergedActorForImmediateDetail(t *testing.T) 
 		registry, database, nil, []ghclient.RepoRef{repo}, time.Minute, nil, nil,
 	)
 	t.Cleanup(syncer.Stop)
-	srv := New(database, syncer, nil, "/", nil, ServerOptions{})
+	srv := New(database, syncer, nil, "/", nil, ServerOptions{
+		WorktreeDir:                        t.TempDir(),
+		DisableWorkspaceBackgroundMonitors: true,
+	})
 	t.Cleanup(func() { gracefulShutdown(t, srv) })
 	client := setupTestClient(t, srv)
 
@@ -7140,7 +7165,7 @@ func TestAPIDeleteIssueCommentLeavesLocalStateForSync(t *testing.T) {
 	detailRec := httptest.NewRecorder()
 	srv.ServeHTTP(detailRec, detailReq)
 	require.Equal(http.StatusOK, detailRec.Code, detailRec.Body.String())
-	var detail issueDetailResponse
+	var detail issueapi.IssueDetailResponse
 	require.NoError(json.NewDecoder(detailRec.Body).Decode(&detail))
 	require.Len(detail.Events, 1)
 	assert.Equal("remove from issue detail", detail.Events[0].Body)
@@ -7636,9 +7661,9 @@ func TestAPITriggerSyncRejectsUnknownOnlyRepo(t *testing.T) {
 	)
 	require.Equal(http.StatusBadRequest, rr.Code, rr.Body.String())
 
-	var problem ProblemError
+	var problem httpapi.ProblemError
 	require.NoError(json.NewDecoder(rr.Body).Decode(&problem))
-	assert.Equal(CodeValidationError, problem.Code)
+	assert.Equal(httpapi.CodeValidationError, problem.Code)
 	assert.Equal("query.only_repo", problem.Details["field"])
 }
 
@@ -9639,8 +9664,10 @@ func TestAPIGetIssueWorkspaceUsesProviderScopedLookup(t *testing.T) {
 
 	syncer := ghclient.NewSyncer(nil, database, nil, nil, time.Minute, nil, nil)
 	t.Cleanup(syncer.Stop)
-	srv := New(database, syncer, nil, "/", nil, ServerOptions{})
-	srv.workspaces = workspace.NewManager(database, t.TempDir())
+	srv := New(database, syncer, nil, "/", nil, ServerOptions{
+		WorktreeDir:                        t.TempDir(),
+		DisableWorkspaceBackgroundMonitors: true,
+	})
 	t.Cleanup(func() { gracefulShutdown(t, srv) })
 
 	req := httptest.NewRequest(
@@ -9723,8 +9750,10 @@ func TestAPIGetPRWorkspaceUsesProviderScopedLookup(t *testing.T) {
 
 	syncer := ghclient.NewSyncer(nil, database, nil, nil, time.Minute, nil, nil)
 	t.Cleanup(syncer.Stop)
-	srv := New(database, syncer, nil, "/", nil, ServerOptions{})
-	srv.workspaces = workspace.NewManager(database, t.TempDir())
+	srv := New(database, syncer, nil, "/", nil, ServerOptions{
+		WorktreeDir:                        t.TempDir(),
+		DisableWorkspaceBackgroundMonitors: true,
+	})
 	t.Cleanup(func() { gracefulShutdown(t, srv) })
 
 	req := httptest.NewRequest(
@@ -9736,7 +9765,7 @@ func TestAPIGetPRWorkspaceUsesProviderScopedLookup(t *testing.T) {
 	srv.ServeHTTP(rr, req)
 
 	require.Equal(http.StatusOK, rr.Code, rr.Body.String())
-	var body mergeRequestDetailResponse
+	var body pullapi.MergeRequestDetailResponse
 	require.NoError(json.Unmarshal(rr.Body.Bytes(), &body))
 	if assert.NotNil(body.Workspace) {
 		assert.Equal("gitlab-pr-workspace", body.Workspace.ID)
@@ -9751,8 +9780,13 @@ func TestAPICreateWorkspaceRejectsEmptyProviderForAmbiguousRepo(t *testing.T) {
 	assert := assert.New(t)
 	ctx := t.Context()
 
-	srv, database := setupTestServer(t)
-	srv.workspaces = workspace.NewManager(database, t.TempDir())
+	srv, database := setupTestServerWithReposAndOptions(
+		t, &mockGH{}, defaultTestRepos,
+		ServerOptions{
+			WorktreeDir:                        t.TempDir(),
+			DisableWorkspaceBackgroundMonitors: true,
+		},
+	)
 	for _, provider := range []string{"github", "gitlab"} {
 		repoID, err := database.UpsertRepo(ctx, db.RepoIdentity{
 			Platform:     provider,
@@ -9803,8 +9837,13 @@ func TestAPICreateWorkspaceRejectsOmittedProviderForUnambiguousRepo(t *testing.T
 	require := require.New(t)
 	ctx := t.Context()
 
-	srv, database := setupTestServer(t)
-	srv.workspaces = workspace.NewManager(database, t.TempDir())
+	srv, database := setupTestServerWithReposAndOptions(
+		t, &mockGH{}, defaultTestRepos,
+		ServerOptions{
+			WorktreeDir:                        t.TempDir(),
+			DisableWorkspaceBackgroundMonitors: true,
+		},
+	)
 	repoID, err := database.UpsertRepo(ctx, db.RepoIdentity{
 		Platform:     "github",
 		PlatformHost: "github.com",
@@ -9946,7 +9985,7 @@ func TestAPISyncIssueUsesPlatformHostQuery(t *testing.T) {
 	// clear after a sync.
 	var withOps struct {
 		Repo struct {
-			Operations *RepoOperations `json:"operations"`
+			Operations *httpapi.RepoOperations `json:"operations"`
 		} `json:"repo"`
 	}
 	require.NoError(json.Unmarshal(rr.Body.Bytes(), &withOps))
@@ -10424,7 +10463,7 @@ func TestE2ELargeRepoSkipsGraphQLAndUsesConditionalPRDetail(t *testing.T) {
 	srv.ServeHTTP(rr, req)
 	require.Equal(http.StatusOK, rr.Code)
 
-	var detailResp mergeRequestDetailResponse
+	var detailResp pullapi.MergeRequestDetailResponse
 	require.NoError(json.Unmarshal(rr.Body.Bytes(), &detailResp))
 	require.NotNil(detailResp.MergeRequest)
 	assert.Equal("changed PR detail", detailResp.MergeRequest.Title)
@@ -10585,7 +10624,7 @@ func TestE2ELargeRepoSkipsGraphQLAndUsesConditionalIssueDetail(t *testing.T) {
 	srv.ServeHTTP(rr, req)
 	require.Equal(http.StatusOK, rr.Code)
 
-	var detailResp issueDetailResponse
+	var detailResp issueapi.IssueDetailResponse
 	require.NoError(json.Unmarshal(rr.Body.Bytes(), &detailResp))
 	require.NotNil(detailResp.Issue)
 	assert.Equal("changed issue detail", detailResp.Issue.Title)
@@ -13480,7 +13519,7 @@ func TestMRListIncludesWorktreeLinks(t *testing.T) {
 	require.Equal(http.StatusOK, rr.Code)
 	body := rr.Body.String()
 	require.Contains(body, `"worktree_links"`)
-	require.Contains(body, `"host_key":"`+srv.fleetSelfKey("")+`"`)
+	require.Contains(body, `"host_key":"`+srv.fleetAPI.SelfKey("")+`"`)
 	require.Contains(body, `"worktree_key":"wt-abc"`)
 	require.Contains(body, `"worktree_path":"/tmp/wt"`)
 	require.Contains(body, `"worktree_branch":"feature"`)
@@ -13511,7 +13550,7 @@ func TestMRDetailIncludesWorktreeLinks(t *testing.T) {
 	require.Equal(http.StatusOK, rr.Code)
 	body := rr.Body.String()
 	require.Contains(body, `"worktree_links"`)
-	require.Contains(body, `"host_key":"`+srv.fleetSelfKey("")+`"`)
+	require.Contains(body, `"host_key":"`+srv.fleetAPI.SelfKey("")+`"`)
 	require.Contains(body, `"worktree_key":"wt-detail"`)
 }
 
@@ -13660,10 +13699,6 @@ func TestAPIGitLabProviderCapabilitiesExposeOnResponses(t *testing.T) {
 	assert.Equal(true, activityCaps["read_merge_requests"])
 	assert.Equal(false, activityCaps["comment_mutation"])
 
-	srv.workspaces = workspace.NewManager(
-		database, filepath.Join(t.TempDir(), "worktrees"),
-	)
-	srv.workspaces.SetTmuxCommand([]string{"sh", "-c", "exit 0"})
 	require.NoError(database.InsertWorkspace(ctx, &db.Workspace{
 		ID:           "gitlabcap0000001",
 		Platform:     "gitlab",
@@ -14241,61 +14276,6 @@ func (p *issueMutatorGitLabProvider) EditMergeRequestContent(
 	return platform.MergeRequest{}, p.providerErr
 }
 
-// TestRefreshWorkspaceRepoIndexToleratesPartialSyncFailure pins the workspace
-// refresh decision point: a repo sync cycle that only failed per-item work in
-// one scope (here a seeded open issue whose closed-item refresh fails) must
-// not abort the workspace refresh — sync health already records the partial
-// failure — while a hard repository failure (the open-PR list itself failing)
-// still aborts.
-func TestRefreshWorkspaceRepoIndexToleratesPartialSyncFailure(t *testing.T) {
-	assert := assert.New(t)
-	require := require.New(t)
-	ctx := t.Context()
-
-	// Partial: the default mock lists no open issues, so the seeded open
-	// issue hits closure detection and its refresh fails (nil issue).
-	partialSrv, partialDB := setupTestServerWithMock(t, &mockGH{})
-	seedIssue(t, partialDB, "acme", "widget", 7, "open")
-	err := partialSrv.refreshWorkspaceRepoIndex(
-		ctx, platform.KindGitHub, "github.com", "acme", "widget",
-	)
-	require.NoError(err,
-		"an issue-scope partial failure must not abort the workspace refresh")
-	repo, err := partialDB.GetRepoByIdentity(
-		ctx, db.GitHubRepoIdentity("github.com", "acme", "widget"),
-	)
-	require.NoError(err)
-	require.NotNil(repo)
-	assert.NotEmpty(repo.LastSyncError,
-		"the tolerated partial failure must still be recorded in sync health")
-
-	// MR-scope partial: a seeded open PR fails its closed-item refresh.
-	// The workspace flow depends on merge-request data, so the refresh
-	// must abort rather than report success over a stale association.
-	mrSrv, mrDB := setupTestServerWithMock(t, &mockGH{
-		getPullRequestFn: func(context.Context, string, string, int) (*gh.PullRequest, error) {
-			return nil, errors.New("closed PR refresh failed")
-		},
-	})
-	seedPR(t, mrDB, "acme", "widget", 1)
-	err = mrSrv.refreshWorkspaceRepoIndex(
-		ctx, platform.KindGitHub, "github.com", "acme", "widget",
-	)
-	require.Error(err,
-		"a merge-request-scope partial failure must abort the workspace refresh")
-
-	// Hard: the open-PR list itself fails; the refresh must abort.
-	hardSrv, _ := setupTestServerWithMock(t, &mockGH{
-		listOpenPullRequestsFn: func(context.Context, string, string) ([]*gh.PullRequest, error) {
-			return nil, errors.New("list open PRs down")
-		},
-	})
-	err = hardSrv.refreshWorkspaceRepoIndex(
-		ctx, platform.KindGitHub, "github.com", "acme", "widget",
-	)
-	assert.Error(err, "a hard repository failure must still abort the refresh")
-}
-
 // TestAPIResolveItemMapsLookupOutcomes drives GitHub item resolution
 // (/repo/.../resolve/{number}) through a mock client whose type-probe fetch
 // reports a removed, inaccessible, or transferred item. The problem envelope
@@ -14827,7 +14807,7 @@ func TestAPIGitHubPublishReviewDraftSendsCommentsThroughServer(t *testing.T) {
 		"body":   " Needs changes. ",
 	})
 	require.Equal(http.StatusOK, publishRR.Code, publishRR.Body.String())
-	var publishStatus actionStatusBody
+	var publishStatus pullapi.ActionStatusBody
 	require.NoError(json.NewDecoder(publishRR.Body).Decode(&publishStatus))
 	assert.Equal("published", publishStatus.Status)
 
@@ -15488,7 +15468,7 @@ func TestAPIPublishReviewDraftPreservesDraftWhenPartialStatusIsUnknown(t *testin
 		map[string]string{"action": "comment"},
 	)
 	require.Equal(http.StatusOK, publishRR.Code, publishRR.Body.String())
-	var publishStatus actionStatusBody
+	var publishStatus pullapi.ActionStatusBody
 	require.NoError(json.NewDecoder(publishRR.Body).Decode(&publishStatus))
 	require.Equal("partially_published", publishStatus.Status)
 	require.Len(provider.publishedReviews, 1)
@@ -15663,7 +15643,7 @@ func TestAPIGitLabPublishReviewDraftSurfacesCleanupFailureAsPartial(t *testing.T
 		"action": "comment",
 	})
 	require.Equal(http.StatusOK, publishRR.Code, publishRR.Body.String())
-	var publishStatus actionStatusBody
+	var publishStatus pullapi.ActionStatusBody
 	require.NoError(json.NewDecoder(publishRR.Body).Decode(&publishStatus))
 	assert.Equal("partially_published", publishStatus.Status)
 	assert.Equal(int32(2), createAttempts.Load())
@@ -15774,7 +15754,7 @@ func TestAPIGitLabPublishReviewDraftSendsSummaryThroughServer(t *testing.T) {
 		"body":   " review summary from ui ",
 	})
 	require.Equal(http.StatusOK, publishRR.Code, publishRR.Body.String())
-	var publishStatus actionStatusBody
+	var publishStatus pullapi.ActionStatusBody
 	require.NoError(json.NewDecoder(publishRR.Body).Decode(&publishStatus))
 	assert.Equal("partially_published", publishStatus.Status)
 	assert.Equal([]string{"create-draft", "publish-draft", "summary-note", "approve"}, order)
@@ -16082,7 +16062,7 @@ func TestAPIForgejoPublishReviewDraftIngestsTimelineThread(t *testing.T) {
 
 	detailRR := doJSON(t, srv, http.MethodGet, "/api/v1/pulls/forgejo/acme/widgets/42", nil)
 	require.Equal(http.StatusOK, detailRR.Code, detailRR.Body.String())
-	var detail mergeRequestDetailResponse
+	var detail pullapi.MergeRequestDetailResponse
 	require.NoError(json.NewDecoder(detailRR.Body).Decode(&detail))
 	require.Len(detail.Events, 1)
 	require.NotNil(detail.Events[0].DiffThread)
@@ -16146,7 +16126,7 @@ func TestAPIForgejoSyncRecoversReviewThreadTimelineMetadata(t *testing.T) {
 
 	detailRR := doJSON(t, srv, http.MethodGet, "/api/v1/pulls/forgejo/acme/widgets/42", nil)
 	require.Equal(http.StatusOK, detailRR.Code, detailRR.Body.String())
-	var detail mergeRequestDetailResponse
+	var detail pullapi.MergeRequestDetailResponse
 	require.NoError(json.NewDecoder(detailRR.Body).Decode(&detail))
 	require.Len(detail.Events, 1)
 	require.NotNil(detail.Events[0].DiffThread)
@@ -16231,7 +16211,7 @@ func TestAPIGitLabSyncKeepsCanonicalReviewThreadWhenProviderReturnsReplies(t *te
 
 	detailRR := doJSON(t, srv, http.MethodGet, "/api/v1/host/gitlab.example.com/pulls/gl/group/project/7", nil)
 	require.Equal(http.StatusOK, detailRR.Code, detailRR.Body.String())
-	var detail mergeRequestDetailResponse
+	var detail pullapi.MergeRequestDetailResponse
 	require.NoError(json.NewDecoder(detailRR.Body).Decode(&detail))
 	require.Len(detail.Events, 2)
 	require.NotNil(detail.Events[0].DiffThread)
@@ -16310,7 +16290,7 @@ func TestAPIGitLabSyncRemovesMissingReviewThreadTimelineEvents(t *testing.T) {
 	require.Empty(threads)
 	detailRR := doJSON(t, srv, http.MethodGet, "/api/v1/host/gitlab.example.com/pulls/gl/group/project/7", nil)
 	require.Equal(http.StatusOK, detailRR.Code, detailRR.Body.String())
-	var detail mergeRequestDetailResponse
+	var detail pullapi.MergeRequestDetailResponse
 	require.NoError(json.NewDecoder(detailRR.Body).Decode(&detail))
 	require.Empty(detail.Events)
 }
@@ -16372,7 +16352,7 @@ func TestAPIGitLabSyncPrunesLegacyPositionedNoteCommentEvents(t *testing.T) {
 
 	detailRR := doJSON(t, srv, http.MethodGet, "/api/v1/host/gitlab.example.com/pulls/gl/group/project/7", nil)
 	require.Equal(http.StatusOK, detailRR.Code, detailRR.Body.String())
-	var detail mergeRequestDetailResponse
+	var detail pullapi.MergeRequestDetailResponse
 	require.NoError(json.NewDecoder(detailRR.Body).Decode(&detail))
 	require.Len(detail.Events, 1)
 	assert.Equal("review_comment", detail.Events[0].EventType)
@@ -16731,7 +16711,7 @@ func TestAPIApplyReviewSuggestionPassesStoredThreadRangeToProvider(t *testing.T)
 		},
 	)
 	require.Equal(http.StatusOK, rr.Code, rr.Body.String())
-	var response applyReviewSuggestionResponse
+	var response pullapi.ApplyReviewSuggestionResponse
 	require.NoError(json.NewDecoder(rr.Body).Decode(&response))
 	assert.Equal("applied", response.Status)
 	assert.Equal("suggestion-commit-sha", response.CommitSHA)
@@ -16793,7 +16773,7 @@ func TestAPIApplyReviewSuggestionRejectsNonOpenPullRequest(t *testing.T) {
 	require.Equal(http.StatusConflict, rr.Code, rr.Body.String())
 	var problem rawProblemDetail
 	require.NoError(json.NewDecoder(rr.Body).Decode(&problem))
-	assert.Equal(string(CodeConflict), problem.Code)
+	assert.Equal(string(httpapi.CodeConflict), problem.Code)
 	assert.Equal("pull request is not open", problem.Detail)
 	require.NotNil(problem.Details)
 	assert.Equal("not_open", problem.Details["reason"])
@@ -16840,7 +16820,7 @@ func TestAPIApplyReviewSuggestionRejectsUnknownHeadRepoOnGitHub(t *testing.T) {
 			require.Equal(http.StatusConflict, rr.Code, rr.Body.String())
 			var problem rawProblemDetail
 			require.NoError(json.NewDecoder(rr.Body).Decode(&problem))
-			assert.Equal(string(CodeConflict), problem.Code)
+			assert.Equal(string(httpapi.CodeConflict), problem.Code)
 			assert.Equal("pull request head repository is unknown", problem.Detail)
 			require.NotNil(problem.Details)
 			assert.Equal("head_repo_unknown", problem.Details["reason"])
@@ -16962,7 +16942,7 @@ func TestAPIApplyReviewSuggestionMapsProviderConflictReason(t *testing.T) {
 			require.Equal(http.StatusConflict, rr.Code, rr.Body.String())
 			var problem rawProblemDetail
 			require.NoError(json.NewDecoder(rr.Body).Decode(&problem))
-			assert.Equal(string(CodeConflict), problem.Code)
+			assert.Equal(string(httpapi.CodeConflict), problem.Code)
 			require.NotNil(problem.Details)
 			assert.Equal(tt.reason, problem.Details["reason"])
 		})
@@ -17022,7 +17002,7 @@ func TestAPIApplyReviewSuggestionMapsProviderStaleStateAndRefreshesDetail(t *tes
 	require.Equal(http.StatusConflict, rr.Code, rr.Body.String())
 	var problem rawProblemDetail
 	require.NoError(json.NewDecoder(rr.Body).Decode(&problem))
-	assert.Equal(string(CodeConflict), problem.Code)
+	assert.Equal(string(httpapi.CodeConflict), problem.Code)
 	assert.Equal("target changed since it was reviewed; refresh and retry", problem.Detail)
 	require.NotNil(problem.Details)
 	assert.Equal("stale_state", problem.Details["reason"])
@@ -17076,7 +17056,7 @@ func TestAPIApplyReviewSuggestionReturnsAppliedWithoutCommitMetadata(t *testing.
 	)
 
 	require.Equal(http.StatusOK, rr.Code, rr.Body.String())
-	var response applyReviewSuggestionResponse
+	var response pullapi.ApplyReviewSuggestionResponse
 	require.NoError(json.NewDecoder(rr.Body).Decode(&response))
 	assert.Equal("applied", response.Status)
 	assert.Empty(response.CommitSHA)
@@ -17126,7 +17106,7 @@ func TestAPIApplyReviewSuggestionReturnsAppliedForNilProviderResult(t *testing.T
 	)
 
 	require.Equal(http.StatusOK, rr.Code, rr.Body.String())
-	var response applyReviewSuggestionResponse
+	var response pullapi.ApplyReviewSuggestionResponse
 	require.NoError(json.NewDecoder(rr.Body).Decode(&response))
 	assert.Equal("applied", response.Status)
 	assert.Empty(response.CommitSHA)
@@ -19350,7 +19330,10 @@ func setupGitLabCapabilityServerWithProvider(
 		registry, database, nil, []ghclient.RepoRef{repo}, time.Minute, nil, nil,
 	)
 	t.Cleanup(syncer.Stop)
-	srv := New(database, syncer, nil, "/", nil, ServerOptions{})
+	srv := New(database, syncer, nil, "/", nil, ServerOptions{
+		WorktreeDir:                        t.TempDir(),
+		DisableWorkspaceBackgroundMonitors: true,
+	})
 	t.Cleanup(func() { gracefulShutdown(t, srv) })
 
 	syncer.RunOnce(ctx)
@@ -22922,6 +22905,17 @@ func setupTestServerWithWorkspacesServer(
 	return fixture.client, fixture.database, fixture.bare, fixture.remote, fixture.server
 }
 
+func setupTestServerWithWorkspacesServerAndEnrichment(
+	t *testing.T,
+	cfg *config.Config,
+) (*apiclient.Client, *db.DB, string, string, *Server) {
+	t.Helper()
+	fixture := setupWorkspaceServerFixtureWithOptions(
+		t, cfg, ServerOptions{PtyOwnerInProcess: true}, true,
+	)
+	return fixture.client, fixture.database, fixture.bare, fixture.remote, fixture.server
+}
+
 type workspaceServerFixture struct {
 	server    *Server
 	client    *apiclient.Client
@@ -22945,10 +22939,11 @@ func setupWorkspaceServerFixtureWithOptions(
 	t *testing.T,
 	cfg *config.Config,
 	options ServerOptions,
+	enableEnrichment ...bool,
 ) workspaceServerFixture {
 	t.Helper()
 	return setupWorkspaceServerFixtureWithHostAndOptions(
-		t, cfg, "github.com", options,
+		t, cfg, "github.com", options, enableEnrichment...,
 	)
 }
 
@@ -22968,9 +22963,10 @@ func setupWorkspaceServerFixtureWithHostAndOptions(
 	cfg *config.Config,
 	platformHost string,
 	options ServerOptions,
+	enableEnrichment ...bool,
 ) workspaceServerFixture {
 	return setupWorkspaceServerFixtureWithMockHostAndOptions(
-		t, cfg, &mockGH{}, platformHost, options,
+		t, cfg, &mockGH{}, platformHost, options, enableEnrichment...,
 	)
 }
 
@@ -22980,6 +22976,7 @@ func setupWorkspaceServerFixtureWithMockHostAndOptions(
 	mock *mockGH,
 	platformHost string,
 	options ServerOptions,
+	enableEnrichment ...bool,
 ) workspaceServerFixture {
 	t.Helper()
 
@@ -23054,6 +23051,7 @@ func setupWorkspaceServerFixtureWithMockHostAndOptions(
 	}
 	options.Clones = clones
 	options.WorktreeDir = worktreeDir
+	options.DisableWorkspaceEnrichment = len(enableEnrichment) == 0 || !enableEnrichment[0]
 	options.HostCheckAllowLoopbackAnyPort = true
 	if !options.HostCheck.Valid() {
 		options.HostCheck = HostCheckOptions{
@@ -23062,7 +23060,6 @@ func setupWorkspaceServerFixtureWithMockHostAndOptions(
 		}
 	}
 	srv := New(database, syncer, nil, basePath, cfg, options)
-	srv.workspaceEnrichmentDisabled = true
 	t.Cleanup(func() { cleanupWorkspaceServerFixtureTmuxSessions(t, dir) })
 	// Cleanup callbacks run LIFO. Drain the server first so async
 	// workspace setup cannot create a tmux session after fixture
@@ -23687,6 +23684,7 @@ func TestMiddlemanTmuxSessionsTreatsMissingTmuxSocketAsEmpty(t *testing.T) {
 
 func TestWorkspaceRuntimeTargetsRefreshAfterSettingsUpdateE2E(t *testing.T) {
 	t.Parallel()
+	acquireRootWorkspaceGitSlot(t)
 
 	require := require.New(t)
 	assert := assert.New(t)
@@ -23847,8 +23845,7 @@ func TestWorkspacePtyOwnerTitleMarksWorkspaceWorkingE2E(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
 
-	fixture, _, ptyOwnerDir := setupPtyOwnerWorkspaceFixture(t)
-	fixture.server.workspaceEnrichmentDisabled = false
+	fixture, _, ptyOwnerDir := setupPtyOwnerWorkspaceFixture(t, true)
 	ctx := context.Background()
 	ws := createReadyWorkspace(t, ctx, fixture.client)
 	cleanupPtyOwnerWorkspace(t, ptyOwnerDir, ws.TmuxSession)
@@ -23883,12 +23880,12 @@ func TestWorkspacePtyOwnerTitleMarksWorkspaceWorkingE2E(t *testing.T) {
 		}
 		got = resp.JSON200
 		return got.TmuxWorking &&
-			got.TmuxActivitySource == tmuxActivitySourceTitle &&
+			got.TmuxActivitySource == workspaceapi.TmuxActivitySourceTitle &&
 			got.TmuxPaneTitle != nil
 	}, 6*time.Second, 50*time.Millisecond)
 	require.NotNil(got)
 	assert.True(got.TmuxWorking)
-	assert.Equal(tmuxActivitySourceTitle, got.TmuxActivitySource)
+	assert.Equal(workspaceapi.TmuxActivitySourceTitle, got.TmuxActivitySource)
 	require.NotNil(got.TmuxPaneTitle)
 	assert.Equal("⠴ t3code-b5014b03", *got.TmuxPaneTitle)
 }
@@ -24514,6 +24511,7 @@ func TestWorkspacePtyOwnerTerminalFlushesFinalOutputOnExitE2E(t *testing.T) {
 
 func setupPtyOwnerWorkspaceFixture(
 	t *testing.T,
+	enableEnrichment ...bool,
 ) (workspaceServerFixture, string, string) {
 	t.Helper()
 
@@ -24523,7 +24521,7 @@ func setupPtyOwnerWorkspaceFixture(
 		Command: []string{filepath.Join(dir, "missing-tmux")},
 	}}
 	return setupWorkspaceServerFixtureWithOptions(
-		t, cfg, ptyOwnerServerOptions(ptyOwnerDir),
+		t, cfg, ptyOwnerServerOptions(ptyOwnerDir), enableEnrichment...,
 	), dir, ptyOwnerDir
 }
 
@@ -24620,6 +24618,7 @@ func cleanupPtyOwnerWorkspace(
 
 func TestWorkspaceRuntimeLaunchUnavailableTargetE2E(t *testing.T) {
 	t.Parallel()
+	acquireRootWorkspaceGitSlot(t)
 
 	disabled := false
 	cfg := &config.Config{Agents: []config.Agent{{
@@ -24645,6 +24644,7 @@ func TestWorkspaceRuntimeLaunchUnavailableTargetE2E(t *testing.T) {
 
 func TestWorkspaceRuntimeLaunchPlainShellCreatesRuntimeSessionE2E(t *testing.T) {
 	t.Parallel()
+	acquireRootWorkspaceGitSlot(t)
 
 	require := require.New(t)
 	assert := assert.New(t)
@@ -24681,6 +24681,7 @@ func TestWorkspaceRuntimeLaunchPlainShellCreatesRuntimeSessionE2E(t *testing.T) 
 
 func TestWorkspaceRuntimeExistingSessionsAvailableWhenWorkspaceErroredE2E(t *testing.T) {
 	t.Parallel()
+	acquireRootWorkspaceGitSlot(t)
 
 	require := require.New(t)
 	assert := assert.New(t)
@@ -25118,8 +25119,7 @@ exit 0
 		}},
 		Tmux: config.Tmux{Command: []string{tmuxPath}},
 	}
-	client, database, _, _, srv := setupTestServerWithWorkspacesServer(t, cfg)
-	srv.workspaceEnrichmentDisabled = false
+	client, database, _, _, srv := setupTestServerWithWorkspacesServerAndEnrichment(t, cfg)
 	ctx := context.Background()
 	ws := createReadyWorkspace(t, ctx, client)
 
@@ -25178,12 +25178,12 @@ exit 0
 			}
 		}
 		return listed != nil && listed.TmuxWorking &&
-			listed.TmuxActivitySource == tmuxActivitySourceTitle &&
+			listed.TmuxActivitySource == workspaceapi.TmuxActivitySourceTitle &&
 			listed.TmuxPaneTitle != nil
 	}, 2*time.Second, 10*time.Millisecond)
 	require.NotNil(listed)
 	assert.True(listed.TmuxWorking)
-	assert.Equal(tmuxActivitySourceTitle, listed.TmuxActivitySource)
+	assert.Equal(workspaceapi.TmuxActivitySourceTitle, listed.TmuxActivitySource)
 	require.NotNil(listed.TmuxPaneTitle)
 	assert.Equal("⠴ t3code-b5014b03", *listed.TmuxPaneTitle)
 	assert.Contains(readTmuxRecord(t, record), []string{
@@ -25373,12 +25373,12 @@ exit 0
 		}
 		got = resp.JSON200
 		return got.TmuxWorking &&
-			got.TmuxActivitySource == tmuxActivitySourceTitle &&
+			got.TmuxActivitySource == workspaceapi.TmuxActivitySourceTitle &&
 			got.TmuxPaneTitle != nil
 	}, 2*time.Second, 10*time.Millisecond)
 	require.NotNil(got)
 	assert.True(got.TmuxWorking)
-	assert.Equal(tmuxActivitySourceTitle, got.TmuxActivitySource)
+	assert.Equal(workspaceapi.TmuxActivitySourceTitle, got.TmuxActivitySource)
 	require.NotNil(got.TmuxPaneTitle)
 	assert.Equal("⠴ t3code-b5014b03", *got.TmuxPaneTitle)
 	assert.Contains(readTmuxRecord(t, record), []string{
@@ -25860,8 +25860,7 @@ fi
 exit 0
 `), 0o755))
 	cfg := &config.Config{Tmux: config.Tmux{Command: []string{tmuxPath}}}
-	client, database, _, _, srv := setupTestServerWithWorkspacesServer(t, cfg)
-	srv.workspaceEnrichmentDisabled = false
+	client, database, _, _, _ := setupTestServerWithWorkspacesServerAndEnrichment(t, cfg)
 	ctx := context.Background()
 	ws := createReadyWorkspace(t, ctx, client)
 	require.NotEmpty(ws.TmuxSession)
@@ -25896,12 +25895,12 @@ exit 0
 			}
 		}
 		return listed != nil && listed.TmuxWorking &&
-			listed.TmuxActivitySource == tmuxActivitySourceTitle &&
+			listed.TmuxActivitySource == workspaceapi.TmuxActivitySourceTitle &&
 			listed.TmuxPaneTitle != nil
 	}, 6*time.Second, 10*time.Millisecond)
 	require.NotNil(listed)
 	assert.True(listed.TmuxWorking)
-	assert.Equal(tmuxActivitySourceTitle, listed.TmuxActivitySource)
+	assert.Equal(workspaceapi.TmuxActivitySourceTitle, listed.TmuxActivitySource)
 	require.NotNil(listed.TmuxPaneTitle)
 	assert.Equal("⠴ claude-activity", *listed.TmuxPaneTitle)
 }
@@ -25946,92 +25945,6 @@ func TestWorkspaceDeleteStopsRuntimeSessionsE2E(t *testing.T) {
 	assert.Empty(srv.runtime.ListSessions(ws.Id))
 }
 
-// TestWorkspaceForceDeleteToleratesCorruptWorktreeGitfileE2E verifies a
-// workspace whose worktree .git gitfile was left empty by an
-// interrupted "git worktree add" (the daemon canceling background
-// setup at shutdown) can still be force-deleted through the API. Git
-// rejects such a worktree with "invalid gitfile format", which the
-// delete path's worktree-ownership probe surfaced as a 500 before the
-// fix — leaving the workspace permanently undeletable.
-func TestWorkspaceForceDeleteToleratesCorruptWorktreeGitfileE2E(t *testing.T) {
-	t.Parallel()
-
-	require := require.New(t)
-	assert := assert.New(t)
-
-	client, database, _, _ := setupTestServerWithWorkspaces(t)
-	ctx := context.Background()
-	ws := createReadyWorkspace(t, ctx, client)
-
-	gitfile := filepath.Join(ws.WorktreePath, ".git")
-	require.FileExists(gitfile)
-	// Truncate the worktree's .git gitfile to reproduce the corrupt
-	// state an interrupted "git worktree add" leaves behind.
-	require.NoError(os.Truncate(gitfile, 0))
-
-	force := true
-	delResp, err := client.HTTP.DeleteWorkspaceWithResponse(
-		ctx, ws.Id, &generated.DeleteWorkspaceParams{Force: &force},
-	)
-	require.NoError(err)
-	require.Equal(
-		http.StatusNoContent, delResp.StatusCode(), string(delResp.Body),
-	)
-
-	got, err := database.GetWorkspace(ctx, ws.Id)
-	require.NoError(err)
-	assert.Nil(got)
-}
-
-func TestWorkspaceForceDeleteToleratesMissingWorktreeCommonDirE2E(
-	t *testing.T,
-) {
-	require := require.New(t)
-	assert := assert.New(t)
-
-	client, database, _, _ := setupTestServerWithWorkspaces(t)
-	ctx := context.Background()
-	ws := createReadyWorkspace(t, ctx, client)
-	installGitCommonDirReadFailure(t)
-
-	force := true
-	delResp, err := client.HTTP.DeleteWorkspaceWithResponse(
-		ctx, ws.Id, &generated.DeleteWorkspaceParams{Force: &force},
-	)
-	require.NoError(err)
-	require.Equal(
-		http.StatusNoContent, delResp.StatusCode(), string(delResp.Body),
-	)
-
-	got, err := database.GetWorkspace(ctx, ws.Id)
-	require.NoError(err)
-	assert.Nil(got)
-}
-
-func installGitCommonDirReadFailure(t *testing.T) {
-	t.Helper()
-
-	realGit, err := exec.LookPath("git")
-	require.NoError(t, err)
-	wrapperDir := t.TempDir()
-	require.NoError(t, os.WriteFile(filepath.Join(wrapperDir, "git"), []byte(`#!/bin/sh
-set -eu
-case " $* " in
-	*" rev-parse --path-format=absolute --git-common-dir "*)
-		echo "fatal: failed to read worktrees/pr-1/commondir: Success" >&2
-		exit 128
-		;;
-esac
-exec "$MIDDLEMAN_TEST_REAL_GIT" "$@"
-`), 0o755))
-	t.Setenv("PATH", wrapperDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	t.Setenv("MIDDLEMAN_TEST_REAL_GIT", realGit)
-}
-
-// TestWorkspaceDeleteDirtyKeepsRuntimeSessionsE2E covers the case where the
-// workspace is dirty and delete is rejected with 409. Runtime sessions must
-// survive — killing them on a delete that didn't actually happen would leave
-// the user with a workspace whose agent and shell were silently terminated.
 func TestWorkspaceDeleteDirtyKeepsRuntimeSessionsE2E(t *testing.T) {
 	runParallelPTYE2E(t)
 
@@ -26094,356 +26007,6 @@ func TestWorkspaceDeleteDirtyKeepsRuntimeSessionsE2E(t *testing.T) {
 // `@{upstream}` tracking branch. The sidebar's push-state pills depend
 // on these fields, so a regression here would silently turn the pills
 // off without any test failure at the unit-test layer.
-func TestWorkspaceListReportsCommitsAheadBehindE2E(t *testing.T) {
-	t.Parallel()
-
-	require := require.New(t)
-	assert := assert.New(t)
-
-	client, _, _, _, srv := setupTestServerWithWorkspacesServer(t, nil)
-	srv.workspaceEnrichmentDisabled = false
-	now := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
-	var clockNow atomic.Int64
-	clockNow.Store(now.UnixNano())
-	srv.now = func() time.Time {
-		return time.Unix(0, clockNow.Load()).UTC()
-	}
-	ctx := context.Background()
-	ws := createReadyWorkspace(t, ctx, client)
-	require.Eventually(func() bool {
-		srv.workspaceEnrichmentMu.Lock()
-		_, cached := srv.workspaceEnrichmentCache[ws.Id]
-		_, inFlight := srv.workspaceEnrichmentInFlight[ws.Id]
-		srv.workspaceEnrichmentMu.Unlock()
-		return cached && !inFlight
-	}, 2*time.Second, 10*time.Millisecond)
-
-	// runGit strips global/system git config, so the workspace's
-	// worktree has no committer identity. Set one locally so the
-	// commits below succeed in CI as well as on developer machines.
-	runGit(t, ws.WorktreePath, "config", "user.email", "test@test.com")
-	runGit(t, ws.WorktreePath, "config", "user.name", "Test")
-
-	// Add two local commits in the worktree so HEAD is ahead of
-	// origin/feature by 2.
-	require.NoError(os.WriteFile(
-		filepath.Join(ws.WorktreePath, "ahead-1.txt"),
-		[]byte("a1\n"), 0o644,
-	))
-	runGit(t, ws.WorktreePath, "add", ".")
-	runGit(t, ws.WorktreePath, "commit", "-m", "ahead 1")
-	require.NoError(os.WriteFile(
-		filepath.Join(ws.WorktreePath, "ahead-2.txt"),
-		[]byte("a2\n"), 0o644,
-	))
-	runGit(t, ws.WorktreePath, "add", ".")
-	runGit(t, ws.WorktreePath, "commit", "-m", "ahead 2")
-	clockNow.Store(now.Add(workspaceEnrichmentTTL + time.Second).UnixNano())
-
-	var found *generated.WorkspaceResponse
-	require.Eventually(func() bool {
-		listResp, err := client.HTTP.ListWorkspacesWithResponse(ctx)
-		require.NoError(err)
-		if listResp.StatusCode() != http.StatusOK ||
-			listResp.JSON200 == nil || listResp.JSON200.Workspaces == nil {
-			return false
-		}
-		found = nil
-		for i := range *listResp.JSON200.Workspaces {
-			entry := &(*listResp.JSON200.Workspaces)[i]
-			if entry.Id == ws.Id {
-				found = entry
-				break
-			}
-		}
-		return found != nil && found.CommitsAhead != nil &&
-			found.CommitsBehind != nil &&
-			*found.CommitsAhead == 2 && *found.CommitsBehind == 0
-	}, 2*time.Second, 10*time.Millisecond)
-	require.NotNil(found, "workspace %s missing from list", ws.Id)
-	require.NotNil(
-		found.CommitsAhead,
-		"commits_ahead must be populated for a ready workspace",
-	)
-	require.NotNil(
-		found.CommitsBehind,
-		"commits_behind must be populated for a ready workspace",
-	)
-	assert.Equal(int64(2), *found.CommitsAhead)
-	assert.Equal(int64(0), *found.CommitsBehind)
-}
-
-// TestWorkspaceListRestoresAheadBehindAfterUpstreamHealE2E covers the repair
-// path for workspaces whose branch lost (or never received) an upstream —
-// the state every synthetic middleman/pr-N fallback branch was created in
-// before upstreams were configured at worktree add. The list must omit the
-// counts while the upstream is missing, and a pushed-head observer pass must
-// rewire the branch to the PR head branch so the counts come back without
-// recreating the workspace.
-func TestWorkspaceListRestoresAheadBehindAfterUpstreamHealE2E(t *testing.T) {
-	t.Parallel()
-
-	require := require.New(t)
-	assert := assert.New(t)
-
-	client, database, _, _, srv := setupTestServerWithWorkspacesServer(t, nil)
-	srv.workspaceEnrichmentDisabled = false
-	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
-	var clockNow atomic.Int64
-	clockNow.Store(now.UnixNano())
-	srv.now = func() time.Time {
-		return time.Unix(0, clockNow.Load()).UTC()
-	}
-	ctx := context.Background()
-	ws := createReadyWorkspace(t, ctx, client)
-
-	// Keep the missing-upstream state stable until the explicit observer pass.
-	seedPR(t, database, "acme", "widget", 1,
-		withSeedPRHeadRepoCloneURL("https://github.com/contributor/widget.git"))
-
-	runGit(t, ws.WorktreePath, "config", "user.email", "test@test.com")
-	runGit(t, ws.WorktreePath, "config", "user.name", "Test")
-	require.NoError(os.WriteFile(
-		filepath.Join(ws.WorktreePath, "ahead-1.txt"),
-		[]byte("a1\n"), 0o644,
-	))
-	runGit(t, ws.WorktreePath, "add", ".")
-	runGit(t, ws.WorktreePath, "commit", "-m", "ahead 1")
-
-	// Strip the branch's upstream configuration to reproduce a workspace
-	// created by the fallback path.
-	branch := ws.GitHeadRef
-	runGit(t, ws.WorktreePath, "config", "--unset", "branch."+branch+".remote")
-	runGit(t, ws.WorktreePath, "config", "--unset", "branch."+branch+".merge")
-	clockNow.Store(now.Add(workspaceEnrichmentTTL + time.Second).UnixNano())
-
-	findWorkspace := func() *generated.WorkspaceResponse {
-		listResp, err := client.HTTP.ListWorkspacesWithResponse(ctx)
-		require.NoError(err)
-		require.Equal(http.StatusOK, listResp.StatusCode())
-		require.NotNil(listResp.JSON200)
-		require.NotNil(listResp.JSON200.Workspaces)
-		for i := range *listResp.JSON200.Workspaces {
-			entry := &(*listResp.JSON200.Workspaces)[i]
-			if entry.Id == ws.Id {
-				return entry
-			}
-		}
-		require.Fail("workspace missing from list", ws.Id)
-		return nil
-	}
-
-	var broken *generated.WorkspaceResponse
-	require.Eventually(func() bool {
-		broken = findWorkspace()
-		return broken.CommitsAhead == nil &&
-			broken.CommitsBehind == nil &&
-			string(broken.EnrichmentStatus) == workspaceEnrichmentFresh
-	}, 2*time.Second, 10*time.Millisecond,
-		"counts must be omitted while the branch has no upstream")
-
-	// The observer only rewires an upstream when the merge-request row
-	// positively places the head branch in the base repository.
-	seedPR(t, database, "acme", "widget", 1,
-		withSeedPRHeadRepoCloneURL("https://github.com/acme/widget.git"))
-	srv.runWorkspacePushedHeadObserverPass(ctx)
-	clockNow.Store(now.Add(2 * (workspaceEnrichmentTTL + time.Second)).UnixNano())
-	var healed *generated.WorkspaceResponse
-	require.Eventually(func() bool {
-		healed = findWorkspace()
-		return healed.CommitsAhead != nil &&
-			healed.CommitsBehind != nil &&
-			*healed.CommitsAhead == 1 &&
-			*healed.CommitsBehind == 0 &&
-			string(healed.EnrichmentStatus) == workspaceEnrichmentFresh
-	}, 2*time.Second, 10*time.Millisecond)
-	require.NotNil(healed.CommitsAhead,
-		"observer pass must restore the branch upstream")
-	require.NotNil(healed.CommitsBehind)
-	assert.Equal(int64(1), *healed.CommitsAhead)
-	assert.Equal(int64(0), *healed.CommitsBehind)
-}
-
-func TestWorkspaceDiffEndpointsReportHeadAndPushedE2E(t *testing.T) {
-	t.Parallel()
-
-	require := require.New(t)
-	assert := assert.New(t)
-
-	client, _, _, _, srv := setupTestServerWithWorkspacesServer(t, nil)
-	ctx := context.Background()
-	ws := createReadyWorkspace(t, ctx, client)
-
-	runGit(t, ws.WorktreePath, "config", "user.email", "test@test.com")
-	runGit(t, ws.WorktreePath, "config", "user.name", "Test")
-
-	require.NoError(os.WriteFile(
-		filepath.Join(ws.WorktreePath, "committed.go"),
-		[]byte("package committed\n"), 0o644,
-	))
-	runGit(t, ws.WorktreePath, "add", ".")
-	runGit(t, ws.WorktreePath, "commit", "-m", "local workspace commit")
-	require.NoError(os.WriteFile(
-		filepath.Join(ws.WorktreePath, "dirty.go"),
-		[]byte("package dirty\n"), 0o644,
-	))
-	require.NoError(os.WriteFile(
-		filepath.Join(ws.WorktreePath, ".workspace-state.json"),
-		[]byte("{}\n"), 0o644,
-	))
-	require.NoError(os.WriteFile(
-		filepath.Join(ws.WorktreePath, "z-blank.txt"),
-		[]byte(" \t\n"), 0o644,
-	))
-	require.NoError(os.WriteFile(
-		filepath.Join(ws.WorktreePath, "z-empty.txt"),
-		nil,
-		0o644,
-	))
-	require.NoError(os.WriteFile(
-		filepath.Join(ws.WorktreePath, "base.txt"),
-		[]byte("base  \n"), 0o644,
-	))
-
-	headFiles := requestWorkspaceFiles(t, srv, ws.Id, "head")
-	require.NotNil(headFiles.Files)
-	assertWorkspaceDiffPaths(
-		t,
-		*headFiles.Files,
-		[]string{
-			".workspace-state.json",
-			"base.txt",
-			"dirty.go",
-			"z-blank.txt",
-			"z-empty.txt",
-		},
-	)
-
-	headFilesHideWhitespace := requestWorkspaceFiles(
-		t, srv, ws.Id, "head", "hide",
-	)
-	require.NotNil(headFilesHideWhitespace.Files)
-	assertWorkspaceDiffPaths(
-		t,
-		*headFilesHideWhitespace.Files,
-		[]string{".workspace-state.json", "dirty.go", "z-empty.txt"},
-	)
-
-	headDiffHideWhitespace := requestWorkspaceDiff(
-		t, srv, ws.Id, "head", "hide",
-	)
-	require.NotNil(headDiffHideWhitespace.Files)
-	assertWorkspaceDiffPaths(
-		t,
-		*headDiffHideWhitespace.Files,
-		[]string{".workspace-state.json", "dirty.go", "z-empty.txt"},
-	)
-
-	pushedDiff := requestWorkspaceDiff(t, srv, ws.Id, "pushed")
-	require.NotNil(pushedDiff.Files)
-	assertWorkspaceDiffPaths(
-		t,
-		*pushedDiff.Files,
-		[]string{
-			".workspace-state.json",
-			"base.txt",
-			"committed.go",
-			"dirty.go",
-			"z-blank.txt",
-			"z-empty.txt",
-		},
-	)
-	assert.Equal(int64(1), pushedDiff.WhitespaceOnlyCount)
-}
-
-func TestWorkspaceDiffEndpointRefreshesAfterGitHeadMovesE2E(t *testing.T) {
-	t.Parallel()
-
-	require := require.New(t)
-	assert := assert.New(t)
-
-	client, _, _, _, srv := setupTestServerWithWorkspacesServer(t, nil)
-	ws := createReadyWorkspace(t, context.Background(), client)
-	runGit(t, ws.WorktreePath, "config", "user.email", "test@test.com")
-	runGit(t, ws.WorktreePath, "config", "user.name", "Test")
-
-	initial := requestWorkspaceDiff(t, srv, ws.Id, "head")
-	assert.False(initial.Stale)
-	require.NotNil(initial.SnapshotVersion)
-	initialVersion := *initial.SnapshotVersion
-	key := workspaceDiffLogicalKey{
-		WorkspaceID: ws.Id,
-		Spec: workspace.DiffSnapshotSpec{
-			WorktreePath: ws.WorktreePath,
-			Base:         workspace.WorktreeDiffBaseHead,
-		},
-	}
-	srv.workspaceDiffCache.mu.Lock()
-	entry := srv.workspaceDiffCache.peekEntryLocked(key)
-	if entry != nil {
-		entry.validatedAt = time.Now().Add(-workspaceDiffCacheFreshFor - time.Second)
-		entry.retryAfter = time.Now().Add(time.Hour)
-	}
-	srv.workspaceDiffCache.mu.Unlock()
-	require.NotNil(entry)
-
-	unchanged := requestWorkspaceDiff(t, srv, ws.Id, "head")
-	assert.False(unchanged.Stale)
-	srv.workspaceDiffCache.mu.Lock()
-	entry = srv.workspaceDiffCache.peekEntryLocked(key)
-	if entry != nil {
-		entry.retryAfter = time.Time{}
-	}
-	srv.workspaceDiffCache.mu.Unlock()
-	require.NotNil(entry)
-	require.NoError(srv.workspaceDiffCache.validate(t.Context(), key))
-	require.NoError(os.WriteFile(
-		filepath.Join(ws.WorktreePath, "head-moved.txt"),
-		[]byte("committed\n"),
-		0o644,
-	))
-	runGit(t, ws.WorktreePath, "add", "head-moved.txt")
-	runGit(t, ws.WorktreePath, "commit", "-m", "move workspace head")
-	require.NoError(os.WriteFile(
-		filepath.Join(ws.WorktreePath, "head-moved.txt"),
-		[]byte("worktree change\n"),
-		0o644,
-	))
-
-	moved := requestWorkspaceDiff(t, srv, ws.Id, "head")
-	require.NotNil(moved.SnapshotVersion)
-
-	var refreshed generated.DiffResponse
-	if !moved.Stale && *moved.SnapshotVersion != initialVersion {
-		refreshed = moved
-	} else {
-		if moved.Stale {
-			assert.Equal(initialVersion, *moved.SnapshotVersion)
-		}
-		require.Eventually(func() bool {
-			req := newWorkspaceFixtureRequest(
-				http.MethodGet,
-				"/api/v1/workspaces/"+ws.Id+"/diff?base=head",
-				nil,
-			)
-			rr := httptest.NewRecorder()
-			srv.ServeHTTP(rr, req)
-			if rr.Code != http.StatusOK {
-				return false
-			}
-			var candidate generated.DiffResponse
-			if err := json.Unmarshal(rr.Body.Bytes(), &candidate); err != nil ||
-				candidate.Stale || candidate.SnapshotVersion == nil ||
-				*candidate.SnapshotVersion == initialVersion {
-				return false
-			}
-			refreshed = candidate
-			return true
-		}, 5*time.Second, 10*time.Millisecond)
-	}
-	require.NotNil(refreshed.Files)
-	assert.Contains(workspaceDiffPaths(*refreshed.Files), "head-moved.txt")
-}
 
 func TestWorkspaceDiffCacheHitReturnsWhileGitCapacityIsHeldE2E(t *testing.T) {
 	require := require.New(t)
@@ -26471,945 +26034,6 @@ func TestWorkspaceDiffCacheHitReturnsWhileGitCapacityIsHeldE2E(t *testing.T) {
 
 	assert.False(cached.Stale)
 	assert.Less(elapsed, 200*time.Millisecond)
-}
-
-func TestWorkspaceFilePreviewEndpointReturnsRequestedDiffSideContentE2E(t *testing.T) {
-	t.Parallel()
-
-	require := require.New(t)
-	assert := assert.New(t)
-
-	client, _, _, _, srv := setupTestServerWithWorkspacesServer(t, nil)
-	ctx := context.Background()
-	ws := createReadyWorkspace(t, ctx, client)
-
-	runGit(t, ws.WorktreePath, "config", "user.email", "test@test.com")
-	runGit(t, ws.WorktreePath, "config", "user.name", "Test")
-
-	path := "preview.go"
-	require.NoError(os.WriteFile(
-		filepath.Join(ws.WorktreePath, path),
-		[]byte("package preview\n\nfunc value() string {\n\treturn \"base\"\n}\n"),
-		0o644,
-	))
-	runGit(t, ws.WorktreePath, "add", ".")
-	runGit(t, ws.WorktreePath, "commit", "-m", "add preview fixture")
-	require.NoError(os.WriteFile(
-		filepath.Join(ws.WorktreePath, path),
-		[]byte("package preview\n\nfunc value() string {\n\treturn \"worktree\"\n}\n"),
-		0o644,
-	))
-
-	oldPreview := requestWorkspaceFilePreview(t, srv, ws.Id, "head", path, "old")
-	oldDecoded, err := base64.StdEncoding.DecodeString(oldPreview.Content)
-	require.NoError(err)
-	newPreview := requestWorkspaceFilePreview(t, srv, ws.Id, "head", path, "new")
-	newDecoded, err := base64.StdEncoding.DecodeString(newPreview.Content)
-	require.NoError(err)
-
-	assert.Equal(path, oldPreview.Path)
-	assert.Equal(path, newPreview.Path)
-	assert.Contains(string(oldDecoded), `return "base"`)
-	assert.NotContains(string(oldDecoded), `return "worktree"`)
-	assert.Contains(string(newDecoded), `return "worktree"`)
-	assert.NotContains(string(newDecoded), `return "base"`)
-}
-
-func TestWorkspaceDiffEndpointsReturnPierreTreeOrderE2E(t *testing.T) {
-	t.Parallel()
-
-	require := require.New(t)
-
-	dir := t.TempDir()
-	worktreePath := filepath.Join(dir, "worktree")
-	runGit(t, dir, "init", "--initial-branch=main", worktreePath)
-	runGit(t, worktreePath, "config", "user.email", "test@test.com")
-	runGit(t, worktreePath, "config", "user.name", "Test")
-	require.NoError(os.WriteFile(
-		filepath.Join(worktreePath, "base.txt"),
-		[]byte("base\n"),
-		0o644,
-	))
-	runGit(t, worktreePath, "add", ".")
-	runGit(t, worktreePath, "commit", "-m", "base commit")
-
-	database := dbtest.Open(t)
-	srv := New(database, nil, nil, "/", nil, ServerOptions{
-		WorktreeDir: filepath.Join(dir, "managed-worktrees"),
-	})
-	t.Cleanup(func() { gracefulShutdown(t, srv) })
-
-	ctx := context.Background()
-	require.NoError(database.InsertWorkspace(ctx, &workspace.Workspace{
-		ID:              "ws-file-order",
-		PlatformHost:    "github.com",
-		RepoOwner:       "acme",
-		RepoName:        "widget",
-		ItemType:        db.WorkspaceItemTypePullRequest,
-		ItemNumber:      1,
-		GitHeadRef:      "feature/file-order",
-		WorkspaceBranch: "middleman/pr-1",
-		WorktreePath:    worktreePath,
-		TmuxSession:     "middleman-file-order",
-		Status:          "ready",
-	}))
-
-	serverDir := filepath.Join(worktreePath, "internal", "server")
-	require.NoError(os.MkdirAll(
-		filepath.Join(serverDir, "e2etest"),
-		0o755,
-	))
-	for _, path := range []string{
-		filepath.Join(serverDir, "config_reload_test.go"),
-		filepath.Join(serverDir, "e2etest", "settings_test.go"),
-		filepath.Join(serverDir, "config_reload.go"),
-		filepath.Join(serverDir, "api_types.go"),
-	} {
-		require.NoError(os.WriteFile(path, []byte("package server\n"), 0o644))
-	}
-
-	want := []string{
-		"internal/server/e2etest/settings_test.go",
-		"internal/server/api_types.go",
-		"internal/server/config_reload.go",
-		"internal/server/config_reload_test.go",
-	}
-
-	files := requestWorkspaceFiles(t, srv, "ws-file-order", "head")
-	require.NotNil(files.Files)
-	assertWorkspaceDiffPaths(t, *files.Files, want)
-
-	diff := requestWorkspaceDiff(t, srv, "ws-file-order", "head")
-	require.NotNil(diff.Files)
-	assertWorkspaceDiffPaths(t, *diff.Files, want)
-}
-
-func TestWorkspaceCommitsEndpointListsBranchCommitsE2E(t *testing.T) {
-	t.Parallel()
-
-	require := require.New(t)
-	assert := assert.New(t)
-
-	client, _, _, _, srv := setupTestServerWithWorkspacesServer(t, nil)
-	ctx := context.Background()
-	ws := createReadyWorkspace(t, ctx, client)
-
-	runGit(t, ws.WorktreePath, "config", "user.email", "test@test.com")
-	runGit(t, ws.WorktreePath, "config", "user.name", "Test")
-
-	require.NoError(os.WriteFile(
-		filepath.Join(ws.WorktreePath, "local-one.go"),
-		[]byte("package one\n"), 0o644,
-	))
-	runGit(t, ws.WorktreePath, "add", ".")
-	runGit(t, ws.WorktreePath, "commit", "-m", "local one")
-	require.NoError(os.WriteFile(
-		filepath.Join(ws.WorktreePath, "local-two.go"),
-		[]byte("package two\n"), 0o644,
-	))
-	runGit(t, ws.WorktreePath, "add", ".")
-	runGit(t, ws.WorktreePath, "commit", "-m", "local two")
-
-	commits := requestWorkspaceCommits(t, srv, ws.Id)
-	require.Len(commits.Commits, 3)
-	assert.Equal("local two", commits.Commits[0].Message)
-	assert.Equal("local one", commits.Commits[1].Message)
-	assert.Equal("feature commit", commits.Commits[2].Message)
-}
-
-func TestWorkspaceDiffEndpointsAcceptCommitAndRangeScopesE2E(t *testing.T) {
-	t.Parallel()
-
-	require := require.New(t)
-
-	client, _, _, _, srv := setupTestServerWithWorkspacesServer(t, nil)
-	ctx := context.Background()
-	ws := createReadyWorkspace(t, ctx, client)
-
-	runGit(t, ws.WorktreePath, "config", "user.email", "test@test.com")
-	runGit(t, ws.WorktreePath, "config", "user.name", "Test")
-
-	require.NoError(os.WriteFile(
-		filepath.Join(ws.WorktreePath, "local-one.go"),
-		[]byte("package one\n"), 0o644,
-	))
-	runGit(t, ws.WorktreePath, "add", ".")
-	runGit(t, ws.WorktreePath, "commit", "-m", "local one")
-	require.NoError(os.WriteFile(
-		filepath.Join(ws.WorktreePath, "local-two.go"),
-		[]byte("package two\n"), 0o644,
-	))
-	runGit(t, ws.WorktreePath, "add", ".")
-	runGit(t, ws.WorktreePath, "commit", "-m", "local two")
-	require.NoError(os.WriteFile(
-		filepath.Join(ws.WorktreePath, "dirty.go"),
-		[]byte("package dirty\n"), 0o644,
-	))
-
-	commits := requestWorkspaceCommits(t, srv, ws.Id)
-	require.Len(commits.Commits, 3)
-	newest := commits.Commits[0].SHA
-	older := commits.Commits[1].SHA
-
-	singleFiles := requestWorkspaceFilesQuery(
-		t, srv, ws.Id, "base=head&commit="+url.QueryEscape(newest),
-	)
-	require.NotNil(singleFiles.Files)
-	assertWorkspaceDiffPaths(t, *singleFiles.Files, []string{"local-two.go"})
-
-	singleDiff := requestWorkspaceDiffQuery(
-		t, srv, ws.Id, "base=head&commit="+url.QueryEscape(newest),
-	)
-	require.NotNil(singleDiff.Files)
-	assertWorkspaceDiffPaths(t, *singleDiff.Files, []string{"local-two.go"})
-
-	rangeFiles := requestWorkspaceFilesQuery(
-		t,
-		srv,
-		ws.Id,
-		"base=head&from="+url.QueryEscape(older)+"&to="+url.QueryEscape(newest),
-	)
-	require.NotNil(rangeFiles.Files)
-	assertWorkspaceDiffPaths(
-		t,
-		*rangeFiles.Files,
-		[]string{"local-one.go", "local-two.go"},
-	)
-
-	rangeDiff := requestWorkspaceDiffQuery(
-		t,
-		srv,
-		ws.Id,
-		"base=head&from="+url.QueryEscape(older)+"&to="+url.QueryEscape(newest),
-	)
-	require.NotNil(rangeDiff.Files)
-	assertWorkspaceDiffPaths(
-		t,
-		*rangeDiff.Files,
-		[]string{"local-one.go", "local-two.go"},
-	)
-}
-
-func TestWorkspaceDiffEndpointReportsMergeTargetE2E(t *testing.T) {
-	t.Parallel()
-
-	require := require.New(t)
-	assert := assert.New(t)
-
-	client, _, _, remote, srv := setupTestServerWithWorkspacesServer(t, nil)
-	ctx := context.Background()
-	ws := createReadyWorkspace(t, ctx, client)
-
-	targetWork := filepath.Join(t.TempDir(), "target")
-	runGit(t, filepath.Dir(targetWork), "clone", remote, targetWork)
-	runGit(t, targetWork, "config", "user.email", "test@test.com")
-	runGit(t, targetWork, "config", "user.name", "Test")
-	require.NoError(os.WriteFile(
-		filepath.Join(targetWork, "target-only.txt"),
-		[]byte("target\n"), 0o644,
-	))
-	runGit(t, targetWork, "add", ".")
-	runGit(t, targetWork, "commit", "-m", "advance main")
-	runGit(t, targetWork, "push", "origin", "main")
-	runGit(t, ws.WorktreePath, "fetch", "origin", "main")
-
-	runGit(t, ws.WorktreePath, "config", "user.email", "test@test.com")
-	runGit(t, ws.WorktreePath, "config", "user.name", "Test")
-	require.NoError(os.WriteFile(
-		filepath.Join(ws.WorktreePath, "committed.go"),
-		[]byte("package committed\n"), 0o644,
-	))
-	runGit(t, ws.WorktreePath, "add", ".")
-	runGit(t, ws.WorktreePath, "commit", "-m", "local workspace commit")
-	require.NoError(os.WriteFile(
-		filepath.Join(ws.WorktreePath, "dirty.go"),
-		[]byte("package dirty\n"), 0o644,
-	))
-
-	mergeTargetFiles := requestWorkspaceFiles(t, srv, ws.Id, "merge-target")
-	require.NotNil(mergeTargetFiles.Files)
-	filePaths := workspaceDiffPaths(*mergeTargetFiles.Files)
-	assert.Contains(filePaths, "new.txt")
-	assert.Contains(filePaths, "committed.go")
-	assert.Contains(filePaths, "dirty.go")
-	assert.NotContains(filePaths, "target-only.txt")
-
-	mergeTargetDiff := requestWorkspaceDiff(t, srv, ws.Id, "merge-target")
-	require.NotNil(mergeTargetDiff.Files)
-	diffPaths := workspaceDiffPaths(*mergeTargetDiff.Files)
-	assert.Contains(diffPaths, "new.txt")
-	assert.Contains(diffPaths, "committed.go")
-	assert.Contains(diffPaths, "dirty.go")
-	assert.NotContains(diffPaths, "target-only.txt")
-}
-
-func TestWorkspaceDiffEndpointReportsMergeTargetForAssociatedKataWorkspaceE2E(t *testing.T) {
-	t.Parallel()
-
-	require := require.New(t)
-	assert := assert.New(t)
-
-	client, database, _, remote, srv := setupTestServerWithWorkspacesServer(t, nil)
-	ctx := context.Background()
-	ws := createReadyWorkspace(t, ctx, client)
-
-	targetWork := filepath.Join(t.TempDir(), "target")
-	runGit(t, filepath.Dir(targetWork), "clone", remote, targetWork)
-	runGit(t, targetWork, "config", "user.email", "test@test.com")
-	runGit(t, targetWork, "config", "user.name", "Test")
-	require.NoError(os.WriteFile(
-		filepath.Join(targetWork, "target-only.txt"),
-		[]byte("target\n"), 0o644,
-	))
-	runGit(t, targetWork, "add", ".")
-	runGit(t, targetWork, "commit", "-m", "advance main")
-	runGit(t, targetWork, "push", "origin", "main")
-	runGit(t, ws.WorktreePath, "fetch", "origin", "main")
-
-	runGit(t, ws.WorktreePath, "config", "user.email", "test@test.com")
-	runGit(t, ws.WorktreePath, "config", "user.name", "Test")
-	require.NoError(os.WriteFile(
-		filepath.Join(ws.WorktreePath, "kata-local.go"),
-		[]byte("package kata\n"), 0o644,
-	))
-	runGit(t, ws.WorktreePath, "add", ".")
-	runGit(t, ws.WorktreePath, "commit", "-m", "kata workspace commit")
-
-	associatedPRNumber := 1
-	require.NoError(database.InsertWorkspace(ctx, &db.Workspace{
-		ID:                 "ws-kata-merge-target",
-		Platform:           "github",
-		PlatformHost:       "github.com",
-		RepoOwner:          "acme",
-		RepoName:           "widget",
-		ItemType:           db.WorkspaceItemTypeKataTask,
-		ItemKey:            "kata:desktop:project-kata:issue-kata-1",
-		AssociatedPRNumber: &associatedPRNumber,
-		GitHeadRef:         ws.GitHeadRef,
-		WorkspaceBranch:    ws.GitHeadRef,
-		WorktreePath:       ws.WorktreePath,
-		TmuxSession:        "middleman-ws-kata-merge-target",
-		Status:             "ready",
-		KataMetadata: &db.WorkspaceKataMetadata{
-			DaemonID:   "desktop",
-			ProjectUID: "project-kata",
-			IssueUID:   "issue-kata-1",
-			ShortID:    "task-123",
-			Title:      "Fix widget",
-		},
-	}))
-
-	mergeTargetFiles := requestWorkspaceFiles(t, srv, "ws-kata-merge-target", "merge-target")
-	require.NotNil(mergeTargetFiles.Files)
-	filePaths := workspaceDiffPaths(*mergeTargetFiles.Files)
-	assert.Contains(filePaths, "kata-local.go")
-	assert.NotContains(filePaths, "target-only.txt")
-}
-
-func TestWorkspaceDiffEndpointRejectsOriginBaseE2E(t *testing.T) {
-	t.Parallel()
-
-	require := require.New(t)
-
-	client, _, _, _, srv := setupTestServerWithWorkspacesServer(t, nil)
-	ctx := context.Background()
-	ws := createReadyWorkspace(t, ctx, client)
-
-	req := newWorkspaceFixtureRequest(
-		http.MethodGet,
-		"/api/v1/workspaces/"+ws.Id+"/diff?base=origin",
-		nil,
-	)
-	rr := httptest.NewRecorder()
-	srv.ServeHTTP(rr, req)
-	resp := rr.Result()
-	defer resp.Body.Close()
-
-	require.Equal(http.StatusBadRequest, resp.StatusCode)
-
-	var body rawProblemDetail
-	require.NoError(json.NewDecoder(resp.Body).Decode(&body))
-	require.Contains(body.Detail, "base must be head, pushed, or merge-target")
-}
-
-func TestWorkspaceDiffEndpointHandlesUntrackedSymlinkAndLargeFileE2E(t *testing.T) {
-	t.Parallel()
-
-	require := require.New(t)
-	assert := assert.New(t)
-
-	client, _, _, _, srv := setupTestServerWithWorkspacesServer(t, nil)
-	ctx := context.Background()
-	ws := createReadyWorkspace(t, ctx, client)
-
-	secretDir := t.TempDir()
-	secretPath := filepath.Join(secretDir, "secret.txt")
-	require.NoError(os.WriteFile(secretPath, []byte("do not expose\n"), 0o644))
-	require.NoError(os.Symlink(
-		secretPath,
-		filepath.Join(ws.WorktreePath, "secret-link"),
-	))
-	require.NoError(os.WriteFile(
-		filepath.Join(ws.WorktreePath, "large.txt"),
-		bytes.Repeat([]byte("x"), 2<<20),
-		0o644,
-	))
-
-	diff := requestWorkspaceDiff(t, srv, ws.Id, "head")
-	require.NotNil(diff.Files)
-
-	symlink := requireWorkspaceDiffFile(t, *diff.Files, "secret-link")
-	assert.Equal("added", symlink.Status)
-	assert.False(symlink.IsBinary)
-	assert.Equal(int64(1), symlink.Additions)
-	require.NotNil(symlink.Hunks)
-	require.Len(*symlink.Hunks, 1)
-	require.NotNil((*symlink.Hunks)[0].Lines)
-	require.Len(*(*symlink.Hunks)[0].Lines, 1)
-	line := (*(*symlink.Hunks)[0].Lines)[0]
-	assert.Equal(secretPath, line.Content)
-	assert.NotContains(line.Content, "do not expose")
-
-	large := requireWorkspaceDiffFile(t, *diff.Files, "large.txt")
-	assert.Equal("added", large.Status)
-	assert.True(large.IsBinary)
-	assert.Zero(large.Additions)
-	require.NotNil(large.Hunks)
-	assert.Empty(*large.Hunks)
-}
-
-func TestWorkspaceDiffEndpointMarksGeneratedFilesE2E(t *testing.T) {
-	t.Parallel()
-
-	require := require.New(t)
-	assert := assert.New(t)
-
-	client, _, _, _, srv := setupTestServerWithWorkspacesServer(t, nil)
-	ctx := context.Background()
-	ws := createReadyWorkspace(t, ctx, client)
-
-	require.NoError(os.WriteFile(
-		filepath.Join(ws.WorktreePath, ".gitattributes"),
-		[]byte("dist/** linguist-generated\nbun.lock -linguist-generated\n"), 0o644,
-	))
-	require.NoError(os.MkdirAll(filepath.Join(ws.WorktreePath, "dist"), 0o755))
-	require.NoError(os.WriteFile(
-		filepath.Join(ws.WorktreePath, "dist", "api.ts"),
-		[]byte("export const generated = true;\n"), 0o644,
-	))
-	require.NoError(os.WriteFile(
-		filepath.Join(ws.WorktreePath, "bun.lock"),
-		[]byte("# lock\n"), 0o644,
-	))
-	require.NoError(os.WriteFile(
-		filepath.Join(ws.WorktreePath, "src.ts"),
-		[]byte("export const source = true;\n"), 0o644,
-	))
-
-	files := requestWorkspaceFiles(t, srv, ws.Id, "head")
-	require.NotNil(files.Files)
-	assert.True(requireWorkspaceDiffFile(t, *files.Files, "dist/api.ts").IsGenerated)
-	assert.False(requireWorkspaceDiffFile(t, *files.Files, "bun.lock").IsGenerated)
-	assert.False(requireWorkspaceDiffFile(t, *files.Files, "src.ts").IsGenerated)
-
-	diff := requestWorkspaceDiff(t, srv, ws.Id, "head")
-	require.NotNil(diff.Files)
-	assert.True(requireWorkspaceDiffFile(t, *diff.Files, "dist/api.ts").IsGenerated)
-	assert.False(requireWorkspaceDiffFile(t, *diff.Files, "bun.lock").IsGenerated)
-	assert.False(requireWorkspaceDiffFile(t, *diff.Files, "src.ts").IsGenerated)
-}
-
-func TestWorkspaceDiffSnapshotRefreshesSameSizeEditAndPinsRevisionE2E(t *testing.T) {
-	t.Parallel()
-	require := require.New(t)
-	assert := assert.New(t)
-
-	client, _, _, _, srv := setupTestServerWithWorkspacesServer(t, nil)
-	ws := createReadyWorkspace(t, context.Background(), client)
-	path := filepath.Join(ws.WorktreePath, "same-size.txt")
-	require.NoError(os.WriteFile(path, []byte("a1\n"), 0o644))
-
-	firstFiles := requestWorkspaceFiles(t, srv, ws.Id, "head")
-	require.NotNil(firstFiles.SnapshotVersion)
-	firstVersion := *firstFiles.SnapshotVersion
-	firstDiff := requestWorkspaceDiffQuery(
-		t, srv, ws.Id,
-		"base=head&revision="+url.QueryEscape(firstVersion),
-	)
-	require.NotNil(firstDiff.SnapshotVersion)
-	assert.Equal(firstVersion, *firstDiff.SnapshotVersion)
-
-	events, _ := srv.hub.Subscribe(t.Context(), false)
-	require.NoError(os.WriteFile(path, []byte("b1\n"), 0o644))
-	key := workspaceDiffLogicalKey{
-		WorkspaceID: ws.Id,
-		Spec: workspace.DiffSnapshotSpec{
-			WorktreePath: ws.WorktreePath,
-			Base:         workspace.WorktreeDiffBaseHead,
-		},
-	}
-	require.NoError(srv.workspaceDiffCache.validate(t.Context(), key))
-
-	select {
-	case event := <-events:
-		assert.Equal("workspace_diff_changed", event.Event.Type)
-	case <-time.After(time.Second):
-		require.Fail("workspace diff change event not received")
-	}
-
-	staleReq := newWorkspaceFixtureRequest(
-		http.MethodGet,
-		"/api/v1/workspaces/"+ws.Id+"/diff?base=head&revision="+url.QueryEscape(firstVersion),
-		nil,
-	)
-	staleRR := httptest.NewRecorder()
-	srv.ServeHTTP(staleRR, staleReq)
-	assert.Equal(http.StatusConflict, staleRR.Code)
-	var staleProblem rawProblemDetail
-	require.NoError(json.Unmarshal(staleRR.Body.Bytes(), &staleProblem))
-	assert.Equal("conflict", staleProblem.Code)
-	assert.Equal("snapshot_changed", staleProblem.Details["reason"])
-	stalePreviewReq := newWorkspaceFixtureRequest(
-		http.MethodGet,
-		"/api/v1/workspaces/"+ws.Id+"/file-preview?base=head&path=same-size.txt&revision="+url.QueryEscape(firstVersion),
-		nil,
-	)
-	stalePreviewRR := httptest.NewRecorder()
-	srv.ServeHTTP(stalePreviewRR, stalePreviewReq)
-	assert.Equal(http.StatusConflict, stalePreviewRR.Code)
-	var stalePreviewProblem rawProblemDetail
-	require.NoError(json.Unmarshal(stalePreviewRR.Body.Bytes(), &stalePreviewProblem))
-	assert.Equal("snapshot_changed", stalePreviewProblem.Details["reason"])
-
-	secondFiles := requestWorkspaceFiles(t, srv, ws.Id, "head")
-	require.NotNil(secondFiles.SnapshotVersion)
-	assert.NotEqual(firstVersion, *secondFiles.SnapshotVersion)
-	secondDiff := requestWorkspaceDiffQuery(
-		t, srv, ws.Id,
-		"base=head&revision="+url.QueryEscape(*secondFiles.SnapshotVersion),
-	)
-	file := requireWorkspaceDiffFile(t, *secondDiff.Files, "same-size.txt")
-	assert.Contains(file.Patch, "+b1\n")
-}
-
-func TestWorkspaceDiffPairLeaseSurvivesCostPressureE2E(t *testing.T) {
-	t.Parallel()
-	require := require.New(t)
-
-	client, _, _, _, srv := setupTestServerWithWorkspacesServer(t, nil)
-	ws := createReadyWorkspace(t, context.Background(), client)
-	require.NoError(os.WriteFile(filepath.Join(ws.WorktreePath, "pair.txt"), []byte("pair\n"), 0o644))
-	files := requestWorkspaceFiles(t, srv, ws.Id, "head")
-	require.NotNil(files.SnapshotVersion)
-
-	now := time.Now()
-	entry := func() *workspaceDiffCacheEntry {
-		return &workspaceDiffCacheEntry{
-			snapshot:   &workspaceDiffSnapshot{SizeBytes: workspaceDiffCacheMaxBytes},
-			lastAccess: now,
-		}
-	}
-	first := workspaceDiffLogicalKey{WorkspaceID: "pressure-1"}
-	second := workspaceDiffLogicalKey{WorkspaceID: "pressure-2"}
-	srv.workspaceDiffCache.mu.Lock()
-	storedFirst := srv.workspaceDiffCache.storeEntryLocked(first, entry(), now)
-	storedSecond := srv.workspaceDiffCache.storeEntryLocked(second, entry(), now)
-	srv.workspaceDiffCache.mu.Unlock()
-	require.True(storedFirst)
-	require.True(storedSecond)
-
-	diff := requestWorkspaceDiffQuery(
-		t, srv, ws.Id,
-		"base=head&revision="+url.QueryEscape(*files.SnapshotVersion),
-	)
-	require.NotNil(diff.SnapshotVersion)
-	require.Equal(*files.SnapshotVersion, *diff.SnapshotVersion)
-}
-
-func TestWorkspaceDiffSelectionLeaseFollowsScopedEventStreamE2E(t *testing.T) {
-	t.Parallel()
-	require := require.New(t)
-	assert := assert.New(t)
-
-	client, _, _, _, srv := setupTestServerWithWorkspacesServer(t, nil)
-	ws := createReadyWorkspace(t, context.Background(), client)
-	srv.workspaceDiffCache.deps.resolve = func(
-		_ context.Context, spec workspace.DiffSnapshotSpec,
-	) (workspace.ResolvedDiffSnapshotSpec, bool, error) {
-		return workspace.ResolvedDiffSnapshotSpec{
-			DiffSnapshotSpec: spec,
-			BaseRef:          "HEAD",
-			BaseOID:          "base",
-			HeadOID:          "head",
-		}, true, nil
-	}
-	srv.workspaceDiffCache.deps.fingerprint = func(
-		context.Context, workspace.ResolvedDiffSnapshotSpec,
-	) (workspace.DiffFingerprint, error) {
-		return "ready", nil
-	}
-	srv.workspaceDiffCache.deps.prepare = func(
-		context.Context, workspace.ResolvedDiffSnapshotSpec,
-	) (*gitclone.DiffResult, error) {
-		return workspaceDiffTestResult("ready.txt"), nil
-	}
-	httpServer := httptest.NewServer(srv)
-	t.Cleanup(httpServer.Close)
-
-	ctx, cancel := context.WithCancel(t.Context())
-	request, err := http.NewRequestWithContext(
-		ctx,
-		http.MethodGet,
-		httpServer.URL+"/api/v1/events?workspace_id="+url.QueryEscape(ws.Id),
-		nil,
-	)
-	require.NoError(err)
-	response, err := http.DefaultClient.Do(request)
-	require.NoError(err)
-	require.Equal(http.StatusOK, response.StatusCode)
-	scanner := bufio.NewScanner(response.Body)
-	ready := readSSEFrameWithin(t, scanner, 5*time.Second, cancel)
-	for ready.Event != "workspace_diff_ready" {
-		ready = readSSEFrameWithin(t, scanner, 5*time.Second, cancel)
-	}
-	var readyData struct {
-		WorkspaceID string `json:"workspace_id"`
-		Version     string `json:"version"`
-	}
-	require.NoError(json.Unmarshal([]byte(ready.Data), &readyData))
-	assert.Equal(ws.Id, readyData.WorkspaceID)
-	assert.NotEmpty(readyData.Version)
-
-	srv.workspaceDiffCache.mu.Lock()
-	assert.Equal(1, srv.workspaceDiffCache.selected[ws.Id])
-	srv.workspaceDiffCache.mu.Unlock()
-
-	cancel()
-	require.NoError(response.Body.Close())
-	require.Eventually(func() bool {
-		srv.workspaceDiffCache.mu.Lock()
-		defer srv.workspaceDiffCache.mu.Unlock()
-		return srv.workspaceDiffCache.selected[ws.Id] == 0
-	}, time.Second, 10*time.Millisecond)
-}
-
-func TestWorkspaceDiffWatchPrewarmsAndPushesSelectedChangesE2E(t *testing.T) {
-	t.Parallel()
-	require := require.New(t)
-	assert := assert.New(t)
-
-	client, _, _, _, srv := setupTestServerWithWorkspacesServer(t, nil)
-	ws := createReadyWorkspace(t, context.Background(), client)
-	path := filepath.Join(ws.WorktreePath, "watched.txt")
-	require.NoError(os.WriteFile(path, []byte("a1\n"), 0o644))
-	httpServer := httptest.NewServer(srv)
-	t.Cleanup(httpServer.Close)
-
-	firstResponse, err := http.Get(
-		httpServer.URL + "/api/v1/workspaces/" + ws.Id + "/diff/watch",
-	)
-	require.NoError(err)
-	require.Equal(http.StatusOK, firstResponse.StatusCode)
-	var first struct {
-		Changed bool   `json:"changed"`
-		Version string `json:"version"`
-	}
-	require.NoError(json.NewDecoder(firstResponse.Body).Decode(&first))
-	require.NoError(firstResponse.Body.Close())
-	assert.True(first.Changed)
-	require.NotEmpty(first.Version)
-
-	pushedRequest, err := srv.workspaceDiffRequest(
-		t.Context(), ws.Id, string(workspace.WorktreeDiffBasePushed),
-	)
-	require.NoError(err)
-	pushed, _, err := srv.workspaceDiffCache.Get(
-		t.Context(), srv.workspaceDiffCacheKey(pushedRequest, false),
-	)
-	require.NoError(err)
-	require.NotEqual(first.Version, pushed.Version)
-	foreignClient := &http.Client{Timeout: time.Second}
-	foreignResponse, err := foreignClient.Get(
-		httpServer.URL + "/api/v1/workspaces/" + ws.Id +
-			"/diff/watch?version=" + url.QueryEscape(pushed.Version),
-	)
-	require.NoError(err)
-	require.Equal(http.StatusOK, foreignResponse.StatusCode)
-	var resetToHead struct {
-		Changed bool   `json:"changed"`
-		Version string `json:"version"`
-	}
-	require.NoError(json.NewDecoder(foreignResponse.Body).Decode(&resetToHead))
-	require.NoError(foreignResponse.Body.Close())
-	assert.True(resetToHead.Changed)
-	assert.Equal(first.Version, resetToHead.Version)
-
-	type watchResult struct {
-		status int
-		body   struct {
-			Changed bool   `json:"changed"`
-			Version string `json:"version"`
-		}
-		err error
-	}
-	result := make(chan watchResult, 1)
-	go func() {
-		response, requestErr := http.Get(
-			httpServer.URL + "/api/v1/workspaces/" + ws.Id +
-				"/diff/watch?version=" + url.QueryEscape(first.Version),
-		)
-		got := watchResult{err: requestErr}
-		if requestErr == nil {
-			got.status = response.StatusCode
-			got.err = json.NewDecoder(response.Body).Decode(&got.body)
-			closeErr := response.Body.Close()
-			if got.err == nil {
-				got.err = closeErr
-			}
-		}
-		result <- got
-	}()
-
-	require.Eventually(func() bool {
-		srv.workspaceDiffCache.mu.Lock()
-		defer srv.workspaceDiffCache.mu.Unlock()
-		return srv.workspaceDiffCache.selected[ws.Id] == 1
-	}, time.Second, 10*time.Millisecond)
-	srv.hub.Broadcast(Event{Type: "workspace_diff_changed", Data: workspaceDiffEventData{
-		WorkspaceID: ws.Id,
-		Revision:    pushed.Revision,
-		Version:     pushed.Version,
-	}})
-	select {
-	case got := <-result:
-		require.Fail(
-			"workspace diff watch returned an unrelated scope",
-			"version=%q error=%v", got.body.Version, got.err,
-		)
-	case <-time.After(100 * time.Millisecond):
-	}
-	require.NoError(os.WriteFile(path, []byte("b1\n"), 0o644))
-	srv.notifyWorktreeStatsChanged()
-
-	select {
-	case got := <-result:
-		require.NoError(got.err)
-		require.Equal(http.StatusOK, got.status)
-		assert.True(got.body.Changed)
-		assert.NotEqual(first.Version, got.body.Version)
-	case <-time.After(5 * time.Second):
-		require.Fail("workspace diff watch did not return the changed snapshot")
-	}
-}
-
-func TestFleetWorkspaceDiffWatchCancellationReleasesRemoteSelectionE2E(t *testing.T) {
-	t.Parallel()
-	require := require.New(t)
-
-	client, _, _, _, peerServer := setupTestServerWithWorkspacesServer(t, nil)
-	ws := createReadyWorkspace(t, context.Background(), client)
-	peerHTTP := httptest.NewServer(peerServer)
-	t.Cleanup(peerHTTP.Close)
-
-	hub := &Server{cfg: &config.Config{Fleet: config.Fleet{
-		Enabled: true,
-		Key:     "hub",
-		Peers: []config.FleetPeer{
-			{Key: "member", BaseURL: peerHTTP.URL},
-		},
-	}}}
-	hubAPI := newFleetTestAPI()
-	hub.registerFleetRoutes(hubAPI)
-	hubHTTP := httptest.NewServer(hubAPI.Adapter())
-	t.Cleanup(hubHTTP.Close)
-
-	watchURL := hubHTTP.URL + "/fleet/hosts/member/workspaces/" + ws.Id + "/diff/watch"
-	firstResponse, err := http.Get(watchURL)
-	require.NoError(err)
-	require.Equal(http.StatusOK, firstResponse.StatusCode)
-	var first workspaceDiffWatchResponse
-	require.NoError(json.NewDecoder(firstResponse.Body).Decode(&first))
-	require.NoError(firstResponse.Body.Close())
-	require.NotEmpty(first.Version)
-	require.Eventually(func() bool {
-		peerServer.workspaceDiffCache.mu.Lock()
-		defer peerServer.workspaceDiffCache.mu.Unlock()
-		return peerServer.workspaceDiffCache.selected[ws.Id] == 0
-	}, time.Second, 10*time.Millisecond)
-
-	ctx, cancel := context.WithCancel(t.Context())
-	request, err := http.NewRequestWithContext(
-		ctx,
-		http.MethodGet,
-		watchURL+"?version="+url.QueryEscape(first.Version),
-		nil,
-	)
-	require.NoError(err)
-	requestDone := make(chan error, 1)
-	go func() {
-		response, requestErr := http.DefaultClient.Do(request)
-		if response != nil {
-			requestErr = errors.Join(requestErr, response.Body.Close())
-		}
-		requestDone <- requestErr
-	}()
-	require.Eventually(func() bool {
-		peerServer.workspaceDiffCache.mu.Lock()
-		defer peerServer.workspaceDiffCache.mu.Unlock()
-		return peerServer.workspaceDiffCache.selected[ws.Id] == 1
-	}, time.Second, 10*time.Millisecond)
-
-	cancel()
-	select {
-	case requestErr := <-requestDone:
-		require.ErrorIs(requestErr, context.Canceled)
-	case <-time.After(time.Second):
-		require.Fail("fleet diff watch cancellation did not reach the proxy client")
-	}
-	require.Eventually(func() bool {
-		peerServer.workspaceDiffCache.mu.Lock()
-		defer peerServer.workspaceDiffCache.mu.Unlock()
-		return peerServer.workspaceDiffCache.selected[ws.Id] == 0
-	}, time.Second, 10*time.Millisecond)
-}
-
-func TestFleetWorkspaceDiffWatchTransitionsFromCreatingToReadyE2E(t *testing.T) {
-	t.Parallel()
-
-	client, database, _, _, peerServer := setupTestServerWithWorkspacesServer(t, nil)
-	ws := createReadyWorkspace(t, context.Background(), client)
-	peerHTTP := httptest.NewServer(peerServer)
-	t.Cleanup(peerHTTP.Close)
-
-	hub := &Server{cfg: &config.Config{Fleet: config.Fleet{
-		Enabled: true,
-		Key:     "hub",
-		Peers: []config.FleetPeer{
-			{Key: "member", BaseURL: peerHTTP.URL},
-		},
-	}}}
-	hubAPI := newFleetTestAPI()
-	hub.registerFleetRoutes(hubAPI)
-	hubHTTP := httptest.NewServer(hubAPI.Adapter())
-	t.Cleanup(hubHTTP.Close)
-
-	watchURL := hubHTTP.URL + "/fleet/hosts/member/workspaces/" + ws.Id + "/diff/watch"
-	tests := []struct {
-		name       string
-		status     string
-		wantStatus int
-		wantReady  bool
-	}{
-		{name: "creating", status: "creating", wantStatus: http.StatusConflict},
-		{name: "ready", status: "ready", wantStatus: http.StatusOK, wantReady: true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			require := require.New(t)
-			assert := assert.New(t)
-			require.NoError(database.UpdateWorkspaceStatus(t.Context(), ws.Id, tt.status, nil))
-
-			response, err := http.Get(watchURL)
-			require.NoError(err)
-			require.Equal(tt.wantStatus, response.StatusCode)
-			defer response.Body.Close()
-			if !tt.wantReady {
-				return
-			}
-
-			var body workspaceDiffWatchResponse
-			require.NoError(json.NewDecoder(response.Body).Decode(&body))
-			assert.True(body.Changed)
-			assert.NotEmpty(body.Version)
-		})
-	}
-}
-
-func TestWorkspaceManualRefreshRevalidatesCachedDiffWhenProviderRefreshFailsE2E(t *testing.T) {
-	t.Parallel()
-	require := require.New(t)
-	assert := assert.New(t)
-
-	client, _, _, _, srv := setupTestServerWithWorkspacesServer(t, nil)
-	ws := createReadyWorkspace(t, context.Background(), client)
-	path := filepath.Join(ws.WorktreePath, "manual-refresh.txt")
-	require.NoError(os.WriteFile(path, []byte("before\n"), 0o644))
-	first := requestWorkspaceFiles(t, srv, ws.Id, "head")
-	require.NotNil(first.SnapshotVersion)
-	firstVersion := *first.SnapshotVersion
-
-	events, _ := srv.hub.Subscribe(t.Context(), false)
-	require.NoError(os.WriteFile(path, []byte("after\n"), 0o644))
-	originalPrepare := srv.workspaceDiffCache.deps.prepare
-	prepareStarted := make(chan struct{})
-	releasePrepare := make(chan struct{})
-	var signalPrepare sync.Once
-	srv.workspaceDiffCache.deps.prepare = func(
-		ctx context.Context,
-		resolved workspace.ResolvedDiffSnapshotSpec,
-	) (*gitclone.DiffResult, error) {
-		signalPrepare.Do(func() { close(prepareStarted) })
-		select {
-		case <-releasePrepare:
-			return originalPrepare(ctx, resolved)
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
-
-	request := newWorkspaceFixtureRequest(
-		http.MethodPost,
-		"/api/v1/workspaces/"+ws.Id+"/refresh",
-		strings.NewReader("{}"),
-	)
-	request.Header.Set("Content-Type", "application/json")
-	response := httptest.NewRecorder()
-	responseDone := make(chan struct{})
-	go func() {
-		srv.ServeHTTP(response, request)
-		close(responseDone)
-	}()
-	select {
-	case <-responseDone:
-		require.Equal(http.StatusBadGateway, response.Code, response.Body.String())
-	case <-time.After(5 * time.Second):
-		require.Fail("workspace refresh waited for diff preparation")
-	}
-	select {
-	case <-prepareStarted:
-	case <-time.After(5 * time.Second):
-		require.Fail("workspace refresh did not schedule diff preparation")
-	}
-	close(releasePrepare)
-
-	var changed workspaceDiffEventData
-	select {
-	case event := <-events:
-		for event.Event.Type != "workspace_diff_changed" {
-			select {
-			case event = <-events:
-			case <-time.After(5 * time.Second):
-				require.Fail("workspace diff change event not received")
-			}
-		}
-		var ok bool
-		changed, ok = event.Event.Data.(workspaceDiffEventData)
-		require.True(ok)
-	case <-time.After(5 * time.Second):
-		require.Fail("workspace diff change event not received")
-	}
-	assert.Equal(ws.Id, changed.WorkspaceID)
-	assert.NotEqual(firstVersion, changed.Version)
-
-	second := requestWorkspaceFiles(t, srv, ws.Id, "head")
-	require.NotNil(second.SnapshotVersion)
-	assert.Equal(changed.Version, *second.SnapshotVersion)
-	diff := requestWorkspaceDiffQuery(
-		t, srv, ws.Id,
-		"base=head&revision="+url.QueryEscape(changed.Version),
-	)
-	file := requireWorkspaceDiffFile(t, *diff.Files, "manual-refresh.txt")
-	assert.Contains(file.Patch, "+after\n")
 }
 
 func TestWorkspaceDiffEndpointScopesPatchByPathE2E(t *testing.T) {
@@ -27612,77 +26236,6 @@ func TestWorkspaceDiffEndpointQuotesDangerousPathsE2E(t *testing.T) {
 	assert.NotContains(unicodeFile.Patch, "\u2029")
 }
 
-func requestWorkspaceFiles(
-	t *testing.T,
-	srv *Server,
-	workspaceID string,
-	base string,
-	whitespace ...string,
-) generated.FilesResponse {
-	t.Helper()
-
-	query := "/api/v1/workspaces/" + workspaceID + "/files?base=" + base
-	if len(whitespace) > 0 {
-		query += "&whitespace=" + whitespace[0]
-	}
-	return requestWorkspaceFilesPath(t, srv, query)
-}
-
-func requestWorkspaceFilesQuery(
-	t *testing.T,
-	srv *Server,
-	workspaceID string,
-	query string,
-) generated.FilesResponse {
-	t.Helper()
-
-	return requestWorkspaceFilesPath(
-		t, srv, "/api/v1/workspaces/"+workspaceID+"/files?"+query,
-	)
-}
-
-func requestWorkspaceFilesPath(
-	t *testing.T,
-	srv *Server,
-	query string,
-) generated.FilesResponse {
-	t.Helper()
-
-	req := newWorkspaceFixtureRequest(http.MethodGet, query, nil)
-	rr := httptest.NewRecorder()
-	srv.ServeHTTP(rr, req)
-	resp := rr.Result()
-	defer resp.Body.Close()
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-
-	var body generated.FilesResponse
-	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
-	return body
-}
-
-func requestWorkspaceCommits(
-	t *testing.T,
-	srv *Server,
-	workspaceID string,
-) commitsResponse {
-	t.Helper()
-
-	req := newWorkspaceFixtureRequest(
-		http.MethodGet,
-		"/api/v1/workspaces/"+workspaceID+"/commits",
-		nil,
-	)
-	rr := httptest.NewRecorder()
-	srv.ServeHTTP(rr, req)
-	resp := rr.Result()
-	defer resp.Body.Close()
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-
-	var body commitsResponse
-	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
-	return body
-}
-
 func requestWorkspaceDiff(
 	t *testing.T,
 	srv *Server,
@@ -27697,19 +26250,6 @@ func requestWorkspaceDiff(
 		query += "&whitespace=" + whitespace[0]
 	}
 	return requestWorkspaceDiffPath(t, srv, query)
-}
-
-func requestWorkspaceDiffQuery(
-	t *testing.T,
-	srv *Server,
-	workspaceID string,
-	query string,
-) generated.DiffResponse {
-	t.Helper()
-
-	return requestWorkspaceDiffPath(
-		t, srv, "/api/v1/workspaces/"+workspaceID+"/diff?"+query,
-	)
 }
 
 func requestWorkspaceDiffPath(
@@ -27731,6 +26271,14 @@ func requestWorkspaceDiffPath(
 	return body
 }
 
+func workspaceDiffPaths(files []generated.DiffFile) []string {
+	paths := make([]string, 0, len(files))
+	for _, file := range files {
+		paths = append(paths, file.Path)
+	}
+	return paths
+}
+
 func requestWorkspaceFilePreview(
 	t *testing.T,
 	srv *Server,
@@ -27738,7 +26286,7 @@ func requestWorkspaceFilePreview(
 	base string,
 	path string,
 	side string,
-) filePreviewResponse {
+) httpapi.FilePreviewResponse {
 	t.Helper()
 
 	query := "/api/v1/workspaces/" + workspaceID +
@@ -27754,7 +26302,7 @@ func requestWorkspaceFilePreview(
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
-	var body filePreviewResponse
+	var body httpapi.FilePreviewResponse
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
 	return body
 }
@@ -27812,24 +26360,6 @@ func requireWorkspaceDiffFile(
 	return generated.DiffFile{}
 }
 
-func assertWorkspaceDiffPaths(
-	t *testing.T,
-	files []generated.DiffFile,
-	want []string,
-) {
-	t.Helper()
-
-	assert.Equal(t, want, workspaceDiffPaths(files))
-}
-
-func workspaceDiffPaths(files []generated.DiffFile) []string {
-	paths := make([]string, 0, len(files))
-	for _, file := range files {
-		paths = append(paths, file.Path)
-	}
-	return paths
-}
-
 func TestWorkspaceListPrunesMissingTmuxSessionsE2E(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
@@ -27851,8 +26381,7 @@ func TestWorkspaceListPrunesMissingTmuxSessionsE2E(t *testing.T) {
 	cfg := &config.Config{
 		Tmux: config.Tmux{Command: []string{script}},
 	}
-	client, database, _, _, srv := setupTestServerWithWorkspacesServer(t, cfg)
-	srv.workspaceEnrichmentDisabled = false
+	client, database, _, _, _ := setupTestServerWithWorkspacesServerAndEnrichment(t, cfg)
 	ctx := context.Background()
 
 	require.NoError(database.InsertWorkspace(ctx, &db.Workspace{
@@ -28313,7 +26842,7 @@ func TestBridgeRuntimeAttachmentOutputClosedEmitsExitFrameBeforeDone(t *testing.
 				acceptErr <- err
 				return
 			}
-			exited := bridgeRuntimeAttachment(r.Context(), conn, attach)
+			exited := workspaceapi.BridgeRuntimeAttachment(r.Context(), conn, attach)
 			bridgeReturn <- exited
 			conn.Close(websocket.StatusNormalClosure, "test done")
 		},
@@ -28461,7 +26990,7 @@ func TestBridgeRuntimeAttachmentSubscriberDropDoesNotEmitExitFrame(t *testing.T)
 				acceptErr <- err
 				return
 			}
-			exited := bridgeRuntimeAttachment(r.Context(), conn, attach)
+			exited := workspaceapi.BridgeRuntimeAttachment(r.Context(), conn, attach)
 			bridgeReturn <- exited
 			conn.Close(websocket.StatusNormalClosure, "test done")
 		},
@@ -29335,906 +27864,9 @@ type rawProblemDetail struct {
 	} `json:"errors"`
 }
 
-func TestWorkspaceCRUDE2E(t *testing.T) {
-	t.Parallel()
-
-	require := require.New(t)
-	assert := assert.New(t)
-
-	client, _, _, _ := setupTestServerWithWorkspaces(t)
-	ctx := t.Context()
-
-	// 1. List workspaces -- initially empty.
-	listResp, err := client.HTTP.ListWorkspacesWithResponse(ctx)
-	require.NoError(err)
-	require.Equal(http.StatusOK, listResp.StatusCode())
-	require.NotNil(listResp.JSON200)
-	require.NotNil(listResp.JSON200.Workspaces)
-	assert.Empty(*listResp.JSON200.Workspaces)
-
-	// 2. Create workspace.
-	createResp, err := client.HTTP.CreateWorkspaceWithResponse(
-		ctx,
-		generated.CreateWorkspaceInputBody{
-			Provider:     "github",
-			PlatformHost: "github.com",
-			Owner:        "acme",
-			Name:         "widget",
-			MrNumber:     1,
-		},
-	)
-	require.NoError(err)
-	require.Equal(http.StatusAccepted, createResp.StatusCode())
-	require.NotNil(createResp.JSON202)
-	wsID := createResp.JSON202.Id
-	assert.NotEmpty(wsID)
-	assert.Equal("github.com", createResp.JSON202.PlatformHost)
-	assert.Equal("acme", createResp.JSON202.RepoOwner)
-	assert.Equal("widget", createResp.JSON202.RepoName)
-	assert.Equal(db.WorkspaceItemTypePullRequest, createResp.JSON202.ItemType)
-	assert.Equal(int64(1), createResp.JSON202.ItemNumber)
-
-	// Wait for the async clone to finish before exercising the rest of the
-	// flow. Deleting (or letting the test end) while the clone subprocess is
-	// still writing into the workspace's TempDir races t.TempDir cleanup,
-	// which then fails with "directory not empty".
-	waitForWorkspaceReady(t, ctx, client, wsID)
-
-	// 3. Get workspace by ID.
-	getResp, err := client.HTTP.GetWorkspaceWithResponse(
-		ctx, wsID,
-	)
-	require.NoError(err)
-	require.Equal(http.StatusOK, getResp.StatusCode())
-	require.NotNil(getResp.JSON200)
-	assert.Equal(wsID, getResp.JSON200.Id)
-
-	// 4. List workspaces -- now has one.
-	listResp2, err := client.HTTP.ListWorkspacesWithResponse(ctx)
-	require.NoError(err)
-	require.Equal(http.StatusOK, listResp2.StatusCode())
-	require.NotNil(listResp2.JSON200)
-	require.NotNil(listResp2.JSON200.Workspaces)
-	assert.Len(*listResp2.JSON200.Workspaces, 1)
-
-	// 5. Delete workspace (force).
-	force := true
-	delResp, err := client.HTTP.DeleteWorkspaceWithResponse(
-		ctx, wsID, &generated.DeleteWorkspaceParams{Force: &force},
-	)
-	require.NoError(err)
-	require.Equal(http.StatusNoContent, delResp.StatusCode())
-
-	// 6. Verify deleted -- GET returns 404.
-	getResp2, err := client.HTTP.GetWorkspaceWithResponse(
-		ctx, wsID,
-	)
-	require.NoError(err)
-	require.Equal(http.StatusNotFound, getResp2.StatusCode())
-
-	// 7. List workspaces -- deleted workspace is absent from the public list.
-	listResp3, err := client.HTTP.ListWorkspacesWithResponse(ctx)
-	require.NoError(err)
-	require.Equal(http.StatusOK, listResp3.StatusCode())
-	require.NotNil(listResp3.JSON200)
-	require.NotNil(listResp3.JSON200.Workspaces)
-	assert.Empty(*listResp3.JSON200.Workspaces)
-}
-
-func TestWorkspaceRetryErroredWorkspaceE2E(t *testing.T) {
-	t.Parallel()
-
-	require := require.New(t)
-	assert := assert.New(t)
-
-	client, database, _, _ := setupTestServerWithWorkspaces(t)
-	ctx := context.Background()
-
-	createResp, err := client.HTTP.CreateWorkspaceWithResponse(
-		ctx,
-		generated.CreateWorkspaceInputBody{
-			Provider:     "github",
-			PlatformHost: "github.com",
-			Owner:        "acme",
-			Name:         "widget",
-			MrNumber:     1,
-		},
-	)
-	require.NoError(err)
-	require.Equal(http.StatusAccepted, createResp.StatusCode())
-	require.NotNil(createResp.JSON202)
-	wsID := createResp.JSON202.Id
-	waitForWorkspaceReady(t, ctx, client, wsID)
-
-	msg := "ensure clone: git fetch: fork/exec /opt/homebrew/bin/git: resource temporarily unavailable"
-	err = database.UpdateWorkspaceStatus(ctx, wsID, "error", &msg)
-	require.NoError(err)
-
-	retryResp, err := client.HTTP.RetryWorkspaceWithResponse(ctx, wsID)
-	require.NoError(err)
-	require.Equal(http.StatusAccepted, retryResp.StatusCode())
-	require.NotNil(retryResp.JSON202)
-	retryBody := retryResp.JSON202
-	assert.Equal(wsID, retryBody.Id)
-	assert.Equal("creating", retryBody.Status)
-	assert.Nil(retryBody.ErrorMessage)
-
-	ready := waitForWorkspaceReady(t, ctx, client, wsID)
-	assert.Equal(wsID, ready.Id)
-	assert.Nil(ready.ErrorMessage)
-}
-
-func TestWorkspaceRetryReadyWorkspaceConflictE2E(t *testing.T) {
-	t.Parallel()
-
-	require := require.New(t)
-	assert := assert.New(t)
-
-	client, database, _, _ := setupTestServerWithWorkspaces(t)
-	ctx := context.Background()
-
-	createResp, err := client.HTTP.CreateWorkspaceWithResponse(
-		ctx,
-		generated.CreateWorkspaceInputBody{
-			Provider:     "github",
-			PlatformHost: "github.com",
-			Owner:        "acme",
-			Name:         "widget",
-			MrNumber:     1,
-		},
-	)
-	require.NoError(err)
-	require.Equal(http.StatusAccepted, createResp.StatusCode())
-	require.NotNil(createResp.JSON202)
-	wsID := createResp.JSON202.Id
-
-	waitForWorkspaceReady(t, ctx, client, wsID)
-	before, err := database.GetWorkspace(ctx, wsID)
-	require.NoError(err)
-	require.NotNil(before)
-	require.Equal("ready", before.Status)
-	require.Nil(before.ErrorMessage)
-	require.NotEmpty(before.WorktreePath)
-	beforeEvents, err := database.ListWorkspaceSetupEvents(ctx, wsID)
-	require.NoError(err)
-
-	retryResp, err := client.HTTP.RetryWorkspaceWithResponse(ctx, wsID)
-	require.NoError(err)
-	require.Equal(http.StatusConflict, retryResp.StatusCode())
-
-	after, err := database.GetWorkspace(ctx, wsID)
-	require.NoError(err)
-	require.NotNil(after)
-	assert.Equal("ready", after.Status)
-	assert.Nil(after.ErrorMessage)
-	assert.Equal(before.WorktreePath, after.WorktreePath)
-	assert.Equal(before.WorkspaceBranch, after.WorkspaceBranch)
-
-	afterEvents, err := database.ListWorkspaceSetupEvents(ctx, wsID)
-	require.NoError(err)
-	assert.Len(afterEvents, len(beforeEvents))
-}
-
-// TestWorkspaceReadyStatusImpliesReadySetupEventE2E pins the write order
-// in Manager.Setup: the final "setup ready" event must be recorded before
-// status flips to "ready". When the order was reversed, pollers that
-// reacted to status=ready could read a setup-event list still missing its
-// last row, which made retry-conflict event-count assertions flake on CI.
-func TestWorkspaceReadyStatusImpliesReadySetupEventE2E(t *testing.T) {
-	t.Parallel()
-
-	require := require.New(t)
-
-	client, database, _, _ := setupTestServerWithWorkspaces(t)
-	ctx := context.Background()
-
-	createResp, err := client.HTTP.CreateWorkspaceWithResponse(
-		ctx,
-		generated.CreateWorkspaceInputBody{
-			Provider:     "github",
-			PlatformHost: "github.com",
-			Owner:        "acme",
-			Name:         "widget",
-			MrNumber:     1,
-		},
-	)
-	require.NoError(err)
-	require.Equal(http.StatusAccepted, createResp.StatusCode())
-	require.NotNil(createResp.JSON202)
-	wsID := createResp.JSON202.Id
-
-	// Read the event log immediately after the first observation of
-	// status=ready: the ready event must already be there.
-	waitForWorkspaceReady(t, ctx, client, wsID)
-	events, err := database.ListWorkspaceSetupEvents(ctx, wsID)
-	require.NoError(err)
-	sawReadyEvent := false
-	for _, event := range events {
-		if event.Stage == "setup" && event.Outcome == "ready" {
-			sawReadyEvent = true
-		}
-	}
-	require.True(
-		sawReadyEvent,
-		"workspace reported status=ready before the setup ready "+
-			"event was recorded; events: %d", len(events),
-	)
-}
-
-func TestWorkspaceCreateNotFound(t *testing.T) {
-	t.Parallel()
-
-	require := require.New(t)
-
-	client, _, _, _ := setupTestServerWithWorkspaces(t)
-	ctx := t.Context()
-
-	// Non-existent repo.
-	resp, err := client.HTTP.CreateWorkspaceWithResponse(
-		ctx,
-		generated.CreateWorkspaceInputBody{
-			Provider:     "github",
-			PlatformHost: "github.com",
-			Owner:        "nope",
-			Name:         "missing",
-			MrNumber:     1,
-		},
-	)
-	require.NoError(err)
-	require.Equal(http.StatusNotFound, resp.StatusCode())
-
-	// Existing repo, non-existent MR.
-	resp2, err := client.HTTP.CreateWorkspaceWithResponse(
-		ctx,
-		generated.CreateWorkspaceInputBody{
-			Provider:     "github",
-			PlatformHost: "github.com",
-			Owner:        "acme",
-			Name:         "widget",
-			MrNumber:     999,
-		},
-	)
-	require.NoError(err)
-	require.Equal(http.StatusNotFound, resp2.StatusCode())
-}
-
-func TestWorkspaceMRDetailHasWorkspace(t *testing.T) {
-	t.Parallel()
-
-	require := require.New(t)
-	assert := assert.New(t)
-
-	client, _, _, _ := setupTestServerWithWorkspaces(t)
-	ctx := t.Context()
-
-	// Create a workspace for PR #1.
-	createResp, err := client.HTTP.CreateWorkspaceWithResponse(
-		ctx,
-		generated.CreateWorkspaceInputBody{
-			Provider:     "github",
-			PlatformHost: "github.com",
-			Owner:        "acme",
-			Name:         "widget",
-			MrNumber:     1,
-		},
-	)
-	require.NoError(err)
-	require.Equal(http.StatusAccepted, createResp.StatusCode())
-	require.NotNil(createResp.JSON202)
-	wsID := createResp.JSON202.Id
-
-	// MR detail should include the workspace reference.
-	mrResp, err := client.HTTP.GetPullWithResponse(
-		ctx, "gh", "acme", "widget", 1,
-	)
-	require.NoError(err)
-	require.Equal(http.StatusOK, mrResp.StatusCode())
-	require.NotNil(mrResp.JSON200)
-	require.NotNil(mrResp.JSON200.Workspace)
-	assert.Equal(wsID, mrResp.JSON200.Workspace.Id)
-	assert.NotEmpty(mrResp.JSON200.Workspace.Status)
-
-	waitForWorkspaceReady(t, ctx, client, wsID)
-
-	// Clean up: delete the workspace.
-	force := true
-	delResp, err := client.HTTP.DeleteWorkspaceWithResponse(
-		ctx, wsID,
-		&generated.DeleteWorkspaceParams{Force: &force},
-	)
-	require.NoError(err)
-	require.Equal(http.StatusNoContent, delResp.StatusCode())
-}
-
-func TestWorkspaceCreateDuplicate(t *testing.T) {
-	t.Parallel()
-
-	require := require.New(t)
-
-	client, _, _, _ := setupTestServerWithWorkspaces(t)
-	ctx := t.Context()
-
-	body := generated.CreateWorkspaceInputBody{
-		Provider:     "github",
-		PlatformHost: "github.com",
-		Owner:        "acme",
-		Name:         "widget",
-		MrNumber:     1,
-	}
-
-	// First create succeeds.
-	resp1, err := client.HTTP.CreateWorkspaceWithResponse(ctx, body)
-	require.NoError(err)
-	require.Equal(http.StatusAccepted, resp1.StatusCode())
-	require.NotNil(resp1.JSON202)
-
-	// Duplicate create returns 409.
-	resp2, err := client.HTTP.CreateWorkspaceWithResponse(ctx, body)
-	require.NoError(err)
-	require.Equal(http.StatusConflict, resp2.StatusCode())
-
-	// Drain the first create's async setup before the test returns. Otherwise
-	// the background clone can keep writing into the bare-clone temp dir and
-	// race t.TempDir cleanup, which fails RemoveAll with "directory not empty".
-	waitForWorkspaceReady(t, ctx, client, resp1.JSON202.Id)
-}
-
-func TestWorkspaceCreateFetchesCloneThroughAPI(t *testing.T) {
-	t.Parallel()
-
-	require := require.New(t)
-	assert := assert.New(t)
-
-	fixture := setupWorkspaceServerFixture(t, nil)
-	ctx := t.Context()
-
-	remoteWork := filepath.Join(t.TempDir(), "remote-work")
-	runGit(t, t.TempDir(), "clone", fixture.remote, remoteWork)
-	runGit(t, remoteWork, "config", "user.email", "test@test.com")
-	runGit(t, remoteWork, "config", "user.name", "Test")
-	runGit(t, remoteWork, "checkout", "feature")
-	require.NoError(os.WriteFile(
-		filepath.Join(remoteWork, "after-fetch.txt"),
-		[]byte("fetched through workspace API\n"),
-		0o644,
-	))
-	runGit(t, remoteWork, "add", ".")
-	runGit(t, remoteWork, "commit", "-m", "feature after fixture clone")
-	runGit(t, remoteWork, "push", "origin", "feature")
-	featureSHA := gitOutput(t, remoteWork, "rev-parse", "HEAD")
-	runGit(t, fixture.remote, "update-ref", "refs/pull/1/head", featureSHA)
-
-	createResp, err := fixture.client.HTTP.CreateWorkspaceWithResponse(
-		ctx,
-		generated.CreateWorkspaceInputBody{
-			Provider:     "github",
-			PlatformHost: "github.com",
-			Owner:        "acme",
-			Name:         "widget",
-			MrNumber:     1,
-		},
-	)
-	require.NoError(err)
-	require.Equal(http.StatusAccepted, createResp.StatusCode())
-	require.NotNil(createResp.JSON202)
-
-	ready := waitForWorkspaceReady(t, ctx, fixture.client, createResp.JSON202.Id)
-	assert.Equal("ready", ready.Status)
-	assert.FileExists(filepath.Join(ready.WorktreePath, "after-fetch.txt"))
-}
-
-func TestWorkspaceCreateIssueE2E(t *testing.T) {
-	t.Parallel()
-
-	assert := assert.New(t)
-	require := require.New(t)
-
-	fixture := setupWorkspaceServerFixture(t, nil)
-	ctx := context.Background()
-
-	seedIssue(t, fixture.database, "acme", "widget", 7, "open")
-
-	createRR := doJSON(
-		t,
-		fixture.server,
-		http.MethodPost,
-		"/api/v1/issues/gh/acme/widget/7/workspace",
-		map[string]string{},
-	)
-	require.Equal(http.StatusAccepted, createRR.Code, createRR.Body.String())
-
-	var created rawWorkspaceStatusResponse
-	require.NoError(json.NewDecoder(createRR.Body).Decode(&created))
-	require.NotEmpty(created.ID)
-	assert.Equal("issue", created.ItemType)
-	assert.Equal(7, created.ItemNumber)
-	// seedIssue uses title "Test Issue" → slug style appends "-test-issue".
-	assert.Equal("middleman/issue-7-test-issue", created.GitHeadRef)
-
-	ready := waitForWorkspaceReady(t, ctx, fixture.client, created.ID)
-	assert.Equal(
-		"middleman/issue-7-test-issue",
-		gitOutput(t, ready.WorktreePath, "branch", "--show-current"),
-	)
-	assert.Equal(
-		testGitSHA(t, fixture.remote, "refs/heads/main"),
-		testGitSHA(t, ready.WorktreePath, "HEAD"),
-	)
-
-	getIssueRR := doJSON(
-		t,
-		fixture.server,
-		http.MethodGet,
-		"/api/v1/issues/gh/acme/widget/7",
-		nil,
-	)
-	require.Equal(http.StatusOK, getIssueRR.Code, getIssueRR.Body.String())
-
-	var issueDetail rawIssueDetailResponse
-	require.NoError(json.NewDecoder(getIssueRR.Body).Decode(&issueDetail))
-	require.NotNil(issueDetail.Workspace)
-	assert.Equal(created.ID, issueDetail.Workspace.ID)
-	assert.NotEmpty(issueDetail.Workspace.Status)
-}
-
-func TestWorkspaceCreateIssueUsesTitleSlugInBranch(t *testing.T) {
-	t.Parallel()
-
-	assert := assert.New(t)
-	require := require.New(t)
-
-	fixture := setupWorkspaceServerFixture(t, nil)
-	ctx := context.Background()
-
-	// Replace the seed title with a multi-word issue title to make
-	// sure the slug appears in the issue-workspace branch name.
-	seedIssueOnHost(
-		t, fixture.database, "github.com", "acme", "widget", 8,
-		"open", "Add foo to bar",
-	)
-
-	createRR := doJSON(
-		t,
-		fixture.server,
-		http.MethodPost,
-		"/api/v1/issues/gh/acme/widget/8/workspace",
-		map[string]string{},
-	)
-	require.Equal(http.StatusAccepted, createRR.Code, createRR.Body.String())
-
-	var created rawWorkspaceStatusResponse
-	require.NoError(json.NewDecoder(createRR.Body).Decode(&created))
-	assert.Equal("middleman/issue-8-add-foo-to-bar", created.GitHeadRef)
-
-	ready := waitForWorkspaceReady(t, ctx, fixture.client, created.ID)
-	assert.Equal(
-		"middleman/issue-8-add-foo-to-bar",
-		gitOutput(t, ready.WorktreePath, "branch", "--show-current"),
-	)
-}
-
-func TestWorkspaceCreateIssueBareStyleConfigOptOut(t *testing.T) {
-	t.Parallel()
-
-	assert := assert.New(t)
-	require := require.New(t)
-
-	cfg := &config.Config{
-		IssueWorkspaceBranchStyle: config.IssueWorkspaceBranchStyleBare,
-	}
-	fixture := setupWorkspaceServerFixture(t, cfg)
-	ctx := context.Background()
-
-	seedIssueOnHost(
-		t, fixture.database, "github.com", "acme", "widget", 9,
-		"open", "Add foo to bar",
-	)
-
-	createRR := doJSON(
-		t,
-		fixture.server,
-		http.MethodPost,
-		"/api/v1/issues/gh/acme/widget/9/workspace",
-		map[string]string{},
-	)
-	require.Equal(http.StatusAccepted, createRR.Code, createRR.Body.String())
-
-	var created rawWorkspaceStatusResponse
-	require.NoError(json.NewDecoder(createRR.Body).Decode(&created))
-	assert.Equal("middleman/issue-9", created.GitHeadRef)
-
-	ready := waitForWorkspaceReady(t, ctx, fixture.client, created.ID)
-	assert.Equal(
-		"middleman/issue-9",
-		gitOutput(t, ready.WorktreePath, "branch", "--show-current"),
-	)
-}
-
-func TestWorkspaceCreateIssueIsIdempotent(t *testing.T) {
-	t.Parallel()
-
-	assert := assert.New(t)
-	require := require.New(t)
-
-	fixture := setupWorkspaceServerFixture(t, nil)
-	ctx := context.Background()
-	seedIssue(t, fixture.database, "acme", "widget", 7, "open")
-
-	path := "/api/v1/issues/gh/acme/widget/7/workspace"
-
-	firstRR := doJSON(
-		t, fixture.server, http.MethodPost, path, map[string]string{},
-	)
-	require.Equal(http.StatusAccepted, firstRR.Code, firstRR.Body.String())
-
-	var first rawWorkspaceStatusResponse
-	require.NoError(json.NewDecoder(firstRR.Body).Decode(&first))
-	require.NotEmpty(first.ID)
-
-	secondRR := doJSON(
-		t, fixture.server, http.MethodPost, path, map[string]string{},
-	)
-	require.Equal(http.StatusAccepted, secondRR.Code, secondRR.Body.String())
-
-	var second rawWorkspaceStatusResponse
-	require.NoError(json.NewDecoder(secondRR.Body).Decode(&second))
-	assert.Equal(first.ID, second.ID)
-	assert.Equal("issue", second.ItemType)
-	assert.Equal(7, second.ItemNumber)
-
-	waitForWorkspaceReady(t, ctx, fixture.client, second.ID)
-}
-
-func TestWorkspaceCreateIssueAfterDeleteRecreatesBranch(t *testing.T) {
-	t.Parallel()
-
-	assert := assert.New(t)
-	require := require.New(t)
-
-	fixture := setupWorkspaceServerFixture(t, nil)
-	ctx := context.Background()
-
-	seedIssue(t, fixture.database, "acme", "widget", 7, "open")
-
-	createRR := doJSON(
-		t,
-		fixture.server,
-		http.MethodPost,
-		"/api/v1/issues/gh/acme/widget/7/workspace",
-		map[string]string{},
-	)
-	require.Equal(http.StatusAccepted, createRR.Code, createRR.Body.String())
-
-	var created rawWorkspaceStatusResponse
-	require.NoError(json.NewDecoder(createRR.Body).Decode(&created))
-	ready := waitForWorkspaceReady(t, ctx, fixture.client, created.ID)
-	assert.Equal(
-		"middleman/issue-7-test-issue",
-		gitOutput(t, ready.WorktreePath, "branch", "--show-current"),
-	)
-
-	force := true
-	deleteResp, err := fixture.client.HTTP.DeleteWorkspaceWithResponse(
-		ctx,
-		created.ID,
-		&generated.DeleteWorkspaceParams{Force: &force},
-	)
-	require.NoError(err)
-	require.Equal(http.StatusNoContent, deleteResp.StatusCode())
-
-	recreateRR := doJSON(
-		t,
-		fixture.server,
-		http.MethodPost,
-		"/api/v1/issues/gh/acme/widget/7/workspace",
-		map[string]string{},
-	)
-	require.Equal(http.StatusAccepted, recreateRR.Code, recreateRR.Body.String())
-
-	var recreated rawWorkspaceStatusResponse
-	require.NoError(json.NewDecoder(recreateRR.Body).Decode(&recreated))
-	recreatedReady := waitForWorkspaceReady(t, ctx, fixture.client, recreated.ID)
-	assert.Equal(
-		"middleman/issue-7-test-issue",
-		gitOutput(t, recreatedReady.WorktreePath, "branch", "--show-current"),
-	)
-}
-
-func TestWorkspaceCreatePRAndIssueCanCoexistForSameRepoNumber(t *testing.T) {
-	t.Parallel()
-
-	assert := assert.New(t)
-	require := require.New(t)
-
-	fixture := setupWorkspaceServerFixture(t, nil)
-	ctx := context.Background()
-
-	seedIssue(t, fixture.database, "acme", "widget", 1, "open")
-
-	prResp, err := fixture.client.HTTP.CreateWorkspaceWithResponse(
-		ctx,
-		generated.CreateWorkspaceInputBody{
-			Provider:     "github",
-			PlatformHost: "github.com",
-			Owner:        "acme",
-			Name:         "widget",
-			MrNumber:     1,
-		},
-	)
-	require.NoError(err)
-	require.Equal(http.StatusAccepted, prResp.StatusCode())
-	require.NotNil(prResp.JSON202)
-	assert.Equal("pull_request", prResp.JSON202.ItemType)
-	assert.Equal(int64(1), prResp.JSON202.ItemNumber)
-
-	issueResp, err := fixture.client.HTTP.CreateIssueWorkspaceWithResponse(
-		ctx,
-		"gh",
-		"acme",
-		"widget",
-		1,
-		generated.CreateIssueWorkspaceInputBody{},
-	)
-	require.NoError(err)
-	require.Equal(http.StatusAccepted, issueResp.StatusCode())
-	require.NotNil(issueResp.JSON202)
-	assert.Equal("issue", issueResp.JSON202.ItemType)
-	assert.Equal(int64(1), issueResp.JSON202.ItemNumber)
-	assert.NotEqual(prResp.JSON202.Id, issueResp.JSON202.Id)
-
-	listResp, err := fixture.client.HTTP.ListWorkspacesWithResponse(ctx)
-	require.NoError(err)
-	require.Equal(http.StatusOK, listResp.StatusCode())
-	require.NotNil(listResp.JSON200)
-	require.NotNil(listResp.JSON200.Workspaces)
-	require.Len(*listResp.JSON200.Workspaces, 2)
-}
-
-func TestWorkspaceCreateIssueBranchConflictReturnsTyped409(t *testing.T) {
-	t.Parallel()
-
-	assert := assert.New(t)
-	require := require.New(t)
-
-	fixture := setupWorkspaceServerFixture(t, nil)
-	ctx := context.Background()
-
-	seedIssue(t, fixture.database, "acme", "widget", 7, "open")
-
-	// seedIssue uses the title "Test Issue", which the slug style
-	// turns into "middleman/issue-7-test-issue". Pre-create that
-	// branch so CreateIssue surfaces a branch conflict.
-	const slugBranch = "middleman/issue-7-test-issue"
-	mainSHA := testGitSHA(t, fixture.remote, "refs/heads/main")
-	runGit(
-		t,
-		fixture.bare,
-		"update-ref",
-		"refs/heads/"+slugBranch,
-		mainSHA,
-	)
-
-	conflictRR := doJSON(
-		t,
-		fixture.server,
-		http.MethodPost,
-		"/api/v1/issues/gh/acme/widget/7/workspace",
-		map[string]string{},
-	)
-	require.Equal(http.StatusConflict, conflictRR.Code, conflictRR.Body.String())
-
-	var problem rawProblemDetail
-	require.NoError(json.NewDecoder(conflictRR.Body).Decode(&problem))
-	assert.Equal(
-		"urn:middleman:error:issue-workspace-branch-conflict",
-		problem.Type,
-	)
-	assert.Equal(http.StatusConflict, problem.Status)
-	assert.NotEmpty(problem.Detail)
-	// Wire-typed envelope: code branchConflict, details carry the
-	// conflicting branch and a suggested alternative so the UI can
-	// branch on code rather than message text.
-	assert.Equal("branchConflict", problem.Code)
-	require.NotNil(problem.Details)
-	assert.Equal(slugBranch, problem.Details["branch"])
-	assert.Equal(slugBranch+"-2", problem.Details["suggestedBranch"])
-
-	// The legacy Errors[] entries stay populated for clients that still
-	// introspect per-field huma details.
-	locations := map[string]any{}
-	for _, errDetail := range problem.Errors {
-		locations[errDetail.Location] = errDetail.Value
-	}
-	assert.Equal(slugBranch, locations["body.git_head_ref"])
-	assert.Equal(
-		slugBranch+"-2",
-		locations["body.suggested_git_head_ref"],
-	)
-
-	reuseRR := doJSON(
-		t,
-		fixture.server,
-		http.MethodPost,
-		"/api/v1/issues/gh/acme/widget/7/workspace",
-		map[string]any{
-			"git_head_ref":          slugBranch,
-			"reuse_existing_branch": true,
-		},
-	)
-	require.Equal(http.StatusAccepted, reuseRR.Code, reuseRR.Body.String())
-
-	var reused rawWorkspaceStatusResponse
-	require.NoError(json.NewDecoder(reuseRR.Body).Decode(&reused))
-	reusedReady := waitForWorkspaceReady(t, ctx, fixture.client, reused.ID)
-	assert.Equal(
-		slugBranch,
-		gitOutput(t, reusedReady.WorktreePath, "branch", "--show-current"),
-	)
-
-	stored, err := fixture.database.GetWorkspace(ctx, reused.ID)
-	require.NoError(err)
-	require.NotNil(stored)
-	assert.Empty(stored.WorkspaceBranch)
-}
-
-func prepareIssueWorkspaceAssociationFixture(
-	t *testing.T,
-) (workspaceServerFixture, rawWorkspaceStatusResponse) {
-	t.Helper()
-	require := require.New(t)
-
-	fixture := setupWorkspaceServerFixtureWithOptions(t, nil, ServerOptions{
-		DisableWorkspaceBackgroundMonitors: true,
-	})
-	ctx := context.Background()
-
-	seedIssue(t, fixture.database, "acme", "widget", 7, "open")
-	repo, err := fixture.database.GetRepoByIdentity(ctx, db.GitHubRepoIdentity("github.com", "acme", "widget"))
-	require.NoError(err)
-	require.NotNil(repo)
-
-	createRR := doJSON(
-		t,
-		fixture.server,
-		http.MethodPost,
-		"/api/v1/issues/gh/acme/widget/7/workspace",
-		map[string]string{},
-	)
-	require.Equal(http.StatusAccepted, createRR.Code, createRR.Body.String())
-
-	var created rawWorkspaceStatusResponse
-	require.NoError(json.NewDecoder(createRR.Body).Decode(&created))
-	require.NotEmpty(created.ID)
-
-	ready := waitForWorkspaceReady(t, ctx, fixture.client, created.ID)
-	require.NoError(os.WriteFile(
-		filepath.Join(ready.WorktreePath, "feature.txt"),
-		[]byte("feature\n"),
-		0o644,
-	))
-	runGit(t, ready.WorktreePath, "config", "user.email", "test@test.com")
-	runGit(t, ready.WorktreePath, "config", "user.name", "Test")
-	runGit(t, ready.WorktreePath, "add", ".")
-	runGit(t, ready.WorktreePath, "commit", "-m", "feature commit")
-	runGit(t, ready.WorktreePath, "push", "-u", "origin", ready.GitHeadRef)
-	runGit(
-		t, ready.WorktreePath,
-		"remote", "set-url", "origin", "git@github.com:acme/widget.git",
-	)
-
-	now := time.Now().UTC().Truncate(time.Second)
-	headSHA := testGitSHA(t, ready.WorktreePath, "HEAD")
-	mr := &db.MergeRequest{
-		RepoID:           repo.ID,
-		PlatformID:       7000,
-		Number:           42,
-		URL:              "https://github.com/acme/widget/pull/42",
-		Title:            "Workspace monitor association",
-		Author:           "alice",
-		State:            "open",
-		HeadBranch:       ready.GitHeadRef,
-		HeadRepoCloneURL: "https://github.com/acme/widget.git",
-		PlatformHeadSHA:  headSHA,
-		BaseBranch:       "main",
-		CIStatus:         "success",
-		ReviewDecision:   "APPROVED",
-		CreatedAt:        now,
-		UpdatedAt:        now,
-		LastActivityAt:   now,
-	}
-	_, err = fixture.database.UpsertMergeRequest(ctx, mr)
-	require.NoError(err)
-
-	return fixture, created
-}
-
-func TestWorkspaceIssueMonitorAssociatesPRAndKeepsIssueOwnership(t *testing.T) {
-	t.Parallel()
-
-	assert := assert.New(t)
-	require := require.New(t)
-	ctx := context.Background()
-
-	fixture, created := prepareIssueWorkspaceAssociationFixture(t)
-
-	var updates []workspace.PRAssociationUpdate
-	var sawUpdate bool
-	require.Eventually(func() bool {
-		var runErr error
-		updates, runErr = fixture.server.workspacePRMonitor.RunOnce(ctx)
-		require.NoError(runErr)
-		if len(updates) == 1 {
-			sawUpdate = true
-			return true
-		}
-		stored, getErr := fixture.database.GetWorkspace(ctx, created.ID)
-		require.NoError(getErr)
-		return stored != nil &&
-			stored.AssociatedPRNumber != nil &&
-			*stored.AssociatedPRNumber == 42
-	}, 30*time.Second, 100*time.Millisecond)
-	if sawUpdate {
-		assert.Equal(created.ID, updates[0].WorkspaceID)
-		assert.Equal(42, updates[0].PRNumber)
-	}
-
-	getRR := doJSON(
-		t,
-		fixture.server,
-		http.MethodGet,
-		"/api/v1/workspaces/"+created.ID,
-		nil,
-	)
-	require.Equal(http.StatusOK, getRR.Code, getRR.Body.String())
-
-	var got rawWorkspaceStatusResponse
-	require.NoError(json.NewDecoder(getRR.Body).Decode(&got))
-	assert.Equal("issue", got.ItemType)
-	assert.Equal(7, got.ItemNumber)
-	require.NotNil(got.AssociatedPRNumber)
-	assert.Equal(42, *got.AssociatedPRNumber)
-
-	getIssueRR := doJSON(
-		t,
-		fixture.server,
-		http.MethodGet,
-		"/api/v1/issues/gh/acme/widget/7",
-		nil,
-	)
-	require.Equal(http.StatusOK, getIssueRR.Code, getIssueRR.Body.String())
-
-	var issueDetail rawIssueDetailResponse
-	require.NoError(json.NewDecoder(getIssueRR.Body).Decode(&issueDetail))
-	require.NotNil(issueDetail.Workspace)
-	assert.Equal(created.ID, issueDetail.Workspace.ID)
-}
-
-func TestWorkspaceMonitorPassBroadcastsInvalidationEvents(t *testing.T) {
-	t.Parallel()
-
-	assert := assert.New(t)
-	ctx := t.Context()
-
-	fixture, created := prepareIssueWorkspaceAssociationFixture(t)
-	ch, _ := fixture.server.Hub().Subscribe(ctx, true)
-
-	fixture.server.runWorkspacePRMonitorPass(ctx)
-
-	status := readEventMatching(t, ch, func(ev Event) bool {
-		data, ok := ev.Data.(map[string]string)
-		return ev.Type == "workspace_status" && ok && data["id"] == created.ID
-	})
-	changed := readEventMatching(t, ch, func(ev Event) bool {
-		return ev.Type == "data_changed"
-	})
-
-	assert.Equal("workspace_status", status.Type)
-	assert.Equal(map[string]string{"id": created.ID}, status.Data)
-	assert.Equal("data_changed", changed.Type)
-}
-
 func TestWorkspaceManualRefreshDiscoversAndSyncsAssociatedPR(t *testing.T) {
 	t.Parallel()
+	acquireRootWorkspaceGitSlot(t)
 
 	assert := assert.New(t)
 	require := require.New(t)
@@ -30381,6 +28013,7 @@ func TestWorkspaceManualRefreshDiscoversAndSyncsAssociatedPR(t *testing.T) {
 
 func TestKataWorkspaceManualRefreshDiscoversAndSyncsAssociatedPR(t *testing.T) {
 	t.Parallel()
+	acquireRootWorkspaceGitSlot(t)
 
 	assert := assert.New(t)
 	require := require.New(t)
@@ -30537,6 +28170,7 @@ func TestKataWorkspaceManualRefreshDiscoversAndSyncsAssociatedPR(t *testing.T) {
 // and the tolerated partial failure stays recorded in repo sync health.
 func TestWorkspaceRefreshProceedsThroughIssueScopePartialSyncFailure(t *testing.T) {
 	t.Parallel()
+	acquireRootWorkspaceGitSlot(t)
 
 	assert := assert.New(t)
 	require := require.New(t)
@@ -30628,6 +28262,7 @@ func TestWorkspaceRefreshProceedsThroughIssueScopePartialSyncFailure(t *testing.
 // records the failure.
 func TestWorkspaceRefreshAbortsOnMergeRequestScopePartialSyncFailure(t *testing.T) {
 	t.Parallel()
+	acquireRootWorkspaceGitSlot(t)
 
 	assert := assert.New(t)
 	require := require.New(t)
@@ -30721,6 +28356,7 @@ func TestWorkspaceRefreshAbortsOnMergeRequestScopePartialSyncFailure(t *testing.
 
 func TestWorkspaceManualRefreshReturnsAssociationInspectionError(t *testing.T) {
 	t.Parallel()
+	acquireRootWorkspaceGitSlot(t)
 
 	assert := assert.New(t)
 	require := require.New(t)
@@ -30831,81 +28467,11 @@ func readEventMatching(
 	}
 }
 
-func TestWorkspaceCreateUsesPRBranchAndFallbackBranch(t *testing.T) {
-	t.Parallel()
-
-	assert := assert.New(t)
-	require := require.New(t)
-
-	client, database, clonePath, _ := setupTestServerWithWorkspaces(t)
-	ctx := t.Context()
-
-	seedPR(t, database, "acme", "widget", 2)
-
-	createResp1, err := client.HTTP.CreateWorkspaceWithResponse(
-		ctx,
-		generated.CreateWorkspaceInputBody{
-			Provider:     "github",
-			PlatformHost: "github.com",
-			Owner:        "acme",
-			Name:         "widget",
-			MrNumber:     1,
-		},
-	)
-	require.NoError(err)
-	require.Equal(http.StatusAccepted, createResp1.StatusCode())
-	require.NotNil(createResp1.JSON202)
-
-	ws1 := waitForWorkspaceReady(t, ctx, client, createResp1.JSON202.Id)
-	assert.Equal(
-		"feature",
-		gitOutput(t, ws1.WorktreePath, "branch", "--show-current"),
-	)
-	assert.Equal(
-		"origin",
-		gitOutput(
-			t, ws1.WorktreePath,
-			"config", "--get", "branch.feature.remote",
-		),
-	)
-	assert.Equal(
-		"refs/heads/feature",
-		gitOutput(
-			t, ws1.WorktreePath,
-			"config", "--get", "branch.feature.merge",
-		),
-	)
-	runGit(t, clonePath, "fetch", "--prune", "origin")
-
-	createResp2, err := client.HTTP.CreateWorkspaceWithResponse(
-		ctx,
-		generated.CreateWorkspaceInputBody{
-			Provider:     "github",
-			PlatformHost: "github.com",
-			Owner:        "acme",
-			Name:         "widget",
-			MrNumber:     2,
-		},
-	)
-	require.NoError(err)
-	require.Equal(http.StatusAccepted, createResp2.StatusCode())
-	require.NotNil(createResp2.JSON202)
-
-	ws2 := waitForWorkspaceReady(t, ctx, client, createResp2.JSON202.Id)
-	assert.Equal(
-		"middleman/pr-2",
-		gitOutput(t, ws2.WorktreePath, "branch", "--show-current"),
-	)
-	assert.Equal(
-		testGitSHA(t, ws1.WorktreePath, "HEAD"),
-		testGitSHA(t, ws2.WorktreePath, "HEAD"),
-	)
-}
-
 func TestWorkspaceCreateWithLocalBaseUsesPullRefWhenHeadBranchDeleted(
 	t *testing.T,
 ) {
 	t.Parallel()
+	acquireRootWorkspaceGitSlot(t)
 
 	assert := assert.New(t)
 	require := require.New(t)
@@ -30969,6 +28535,7 @@ func TestWorkspaceCreateGitLabUsesSpecificMergeRequestHeadRefE2E(
 	t *testing.T,
 ) {
 	t.Parallel()
+	acquireRootWorkspaceGitSlot(t)
 
 	assert := assert.New(t)
 	require := require.New(t)
@@ -31040,6 +28607,7 @@ func TestWorkspaceCreateGitLabUsesSpecificMergeRequestHeadRefE2E(
 
 func TestWorkspaceCreateReusesExistingWorktreeThroughAPI(t *testing.T) {
 	t.Parallel()
+	acquireRootWorkspaceGitSlot(t)
 
 	assert := assert.New(t)
 	require := require.New(t)
@@ -31101,6 +28669,7 @@ func TestWorkspaceCreateReusesExistingWorktreeThroughAPI(t *testing.T) {
 
 func TestWorkspaceRetryReusesExistingLocalHeadBranchThroughAPI(t *testing.T) {
 	t.Parallel()
+	acquireRootWorkspaceGitSlot(t)
 
 	assert := assert.New(t)
 	require := require.New(t)
@@ -31227,120 +28796,9 @@ func setupHTTPWorktreeBaseForServerTest(
 	return repo, remote, platformHost
 }
 
-func TestWorkspaceCreateSameRepoHeadCloneURLTracksOriginBranchE2E(t *testing.T) {
-	t.Parallel()
-
-	require := require.New(t)
-	assert := assert.New(t)
-
-	client, database, clonePath, remotePath := setupTestServerWithWorkspaces(t)
-	ctx := t.Context()
-
-	headSHA := testGitSHA(t, remotePath, "refs/heads/feature")
-	runGit(t, remotePath, "update-ref", "refs/pull/2/head", headSHA)
-	runGit(t, clonePath, "update-ref", "refs/pull/2/head", headSHA)
-	seedPR(
-		t,
-		database,
-		"acme", "widget", 2,
-		withSeedPRHeadRepoCloneURL("https://github.com/acme/widget.git"),
-	)
-
-	createResp, err := client.HTTP.CreateWorkspaceWithResponse(
-		ctx,
-		generated.CreateWorkspaceInputBody{
-			Provider:     "github",
-			PlatformHost: "github.com",
-			Owner:        "acme",
-			Name:         "widget",
-			MrNumber:     2,
-		},
-	)
-	require.NoError(err)
-	require.Equal(http.StatusAccepted, createResp.StatusCode())
-	require.NotNil(createResp.JSON202)
-
-	ws := waitForWorkspaceReady(t, ctx, client, createResp.JSON202.Id)
-	stored, err := database.GetWorkspace(ctx, ws.Id)
-	require.NoError(err)
-	require.NotNil(stored)
-	assert.Nil(stored.MRHeadRepo)
-	assert.Empty(stored.WorkspaceBranch)
-	assert.Equal("feature", gitOutput(t, ws.WorktreePath, "branch", "--show-current"))
-	assert.Equal(headSHA, testGitSHA(t, ws.WorktreePath, "HEAD"))
-	assert.Equal(
-		"origin/feature",
-		gitOutput(
-			t, ws.WorktreePath,
-			"rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}",
-		),
-	)
-	assert.Equal(
-		"refs/heads/feature",
-		gitOutput(
-			t, ws.WorktreePath,
-			"config", "--get", "branch.feature.merge",
-		),
-	)
-}
-
-func TestWorkspaceRetryLegacyUnknownHeadRepoLeavesBranchUntrackedE2E(t *testing.T) {
-	t.Parallel()
-
-	assert := assert.New(t)
-	require := require.New(t)
-	fixture := setupWorkspaceServerFixture(t, nil)
-	ctx := t.Context()
-
-	headSHA := testGitSHA(t, fixture.remote, "refs/heads/feature")
-	runGit(t, fixture.remote, "update-ref", "refs/pull/2/head", headSHA)
-	seedPR(
-		t, fixture.database, "acme", "widget", 2,
-		withSeedPRHeadRepoCloneURL(""),
-	)
-	errMessage := "retry legacy workspace"
-	const workspaceID = "legacy-unknown-head-repo"
-	require.NoError(fixture.database.InsertWorkspace(ctx, &db.Workspace{
-		ID:              workspaceID,
-		Platform:        "github",
-		PlatformHost:    "github.com",
-		RepoOwner:       "acme",
-		RepoName:        "widget",
-		ItemType:        db.WorkspaceItemTypePullRequest,
-		ItemNumber:      2,
-		GitHeadRef:      "feature",
-		MRHeadRepo:      nil,
-		WorkspaceBranch: "__middleman_unknown__",
-		WorktreePath:    filepath.Join(fixture.worktrees, workspaceID),
-		TmuxSession:     "middleman-" + workspaceID,
-		Status:          "error",
-		ErrorMessage:    &errMessage,
-	}))
-
-	retryResp, err := fixture.client.HTTP.RetryWorkspaceWithResponse(ctx, workspaceID)
-	require.NoError(err)
-	require.Equal(http.StatusAccepted, retryResp.StatusCode())
-
-	ready := waitForWorkspaceReady(t, ctx, fixture.client, workspaceID)
-	assert.Equal(headSHA, testGitSHA(t, ready.WorktreePath, "HEAD"))
-	branch := gitOutput(t, ready.WorktreePath, "branch", "--show-current")
-	remoteOut, remoteErrOut, upstreamErr := gitcmd.New().Run(
-		ctx, ready.WorktreePath, nil,
-		"config", "--get", "branch."+branch+".remote",
-	)
-	mergeOut, _, _ := gitcmd.New().Run(
-		ctx, ready.WorktreePath, nil,
-		"config", "--get", "branch."+branch+".merge",
-	)
-	assert.Error(
-		upstreamErr,
-		"legacy unknown workspace must remain untracked after retry; branch=%q remote=%q merge=%q stderr=%q",
-		branch, strings.TrimSpace(string(remoteOut)), strings.TrimSpace(string(mergeOut)), strings.TrimSpace(string(remoteErrOut)),
-	)
-}
-
 func TestWorkspaceCreatePortQualifiedHostTracksOriginBranchE2E(t *testing.T) {
 	t.Parallel()
+	acquireRootWorkspaceGitSlot(t)
 
 	require := require.New(t)
 	assert := assert.New(t)
@@ -31390,186 +28848,9 @@ func TestWorkspaceCreatePortQualifiedHostTracksOriginBranchE2E(t *testing.T) {
 	)
 }
 
-func TestWorkspaceDeleteRecreatesForkBranchName(t *testing.T) {
-	t.Parallel()
-
-	assert := assert.New(t)
-	require := require.New(t)
-
-	client, database, _, remotePath := setupTestServerWithWorkspaces(t)
-	ctx := t.Context()
-
-	repo, err := database.GetRepoByIdentity(ctx, db.GitHubRepoIdentity("github.com", "acme", "widget"))
-	require.NoError(err)
-	require.NotNil(repo)
-
-	headSHA := testGitSHA(t, remotePath, "feature")
-	runGit(t, remotePath, "update-ref", "refs/pull/2/head", headSHA)
-
-	now := time.Now().UTC().Truncate(time.Second)
-	forkPR := &db.MergeRequest{
-		RepoID:           repo.ID,
-		PlatformID:       2000,
-		Number:           2,
-		URL:              "https://github.com/acme/widget/pull/2",
-		Title:            "Fork PR #2",
-		Author:           "fork-user",
-		State:            "open",
-		Body:             "fork test body",
-		HeadBranch:       "fork-feature",
-		BaseBranch:       "main",
-		HeadRepoCloneURL: "https://github.com/fork/widget.git",
-		CreatedAt:        now,
-		UpdatedAt:        now,
-		LastActivityAt:   now,
-	}
-	prID, err := database.UpsertMergeRequest(ctx, forkPR)
-	require.NoError(err)
-	require.NoError(database.EnsureKanbanState(ctx, prID))
-
-	create1, err := client.HTTP.CreateWorkspaceWithResponse(
-		ctx,
-		generated.CreateWorkspaceInputBody{
-			Provider:     "github",
-			PlatformHost: "github.com",
-			Owner:        "acme",
-			Name:         "widget",
-			MrNumber:     2,
-		},
-	)
-	require.NoError(err)
-	require.Equal(http.StatusAccepted, create1.StatusCode())
-	require.NotNil(create1.JSON202)
-
-	ws1 := waitForWorkspaceReady(t, ctx, client, create1.JSON202.Id)
-	assert.Equal(
-		"fork-feature",
-		gitOutput(t, ws1.WorktreePath, "branch", "--show-current"),
-	)
-
-	force := true
-	delete1, err := client.HTTP.DeleteWorkspaceWithResponse(
-		ctx, create1.JSON202.Id,
-		&generated.DeleteWorkspaceParams{Force: &force},
-	)
-	require.NoError(err)
-	require.Equal(http.StatusNoContent, delete1.StatusCode())
-
-	create2, err := client.HTTP.CreateWorkspaceWithResponse(
-		ctx,
-		generated.CreateWorkspaceInputBody{
-			Provider:     "github",
-			PlatformHost: "github.com",
-			Owner:        "acme",
-			Name:         "widget",
-			MrNumber:     2,
-		},
-	)
-	require.NoError(err)
-	require.Equal(http.StatusAccepted, create2.StatusCode())
-	require.NotNil(create2.JSON202)
-
-	ws2 := waitForWorkspaceReady(t, ctx, client, create2.JSON202.Id)
-	assert.Equal(
-		"fork-feature",
-		gitOutput(t, ws2.WorktreePath, "branch", "--show-current"),
-	)
-	assert.Equal(
-		headSHA,
-		testGitSHA(t, ws2.WorktreePath, "HEAD"),
-	)
-}
-
-func TestWorkspaceDeletePreservesUserCreatedBranch(t *testing.T) {
-	t.Parallel()
-
-	assert := assert.New(t)
-	require := require.New(t)
-
-	client, _, clonePath, _ := setupTestServerWithWorkspaces(t)
-	ctx := t.Context()
-
-	createResp, err := client.HTTP.CreateWorkspaceWithResponse(
-		ctx,
-		generated.CreateWorkspaceInputBody{
-			Provider:     "github",
-			PlatformHost: "github.com",
-			Owner:        "acme",
-			Name:         "widget",
-			MrNumber:     1,
-		},
-	)
-	require.NoError(err)
-	require.Equal(http.StatusAccepted, createResp.StatusCode())
-	require.NotNil(createResp.JSON202)
-
-	ws := waitForWorkspaceReady(t, ctx, client, createResp.JSON202.Id)
-	runGit(t, ws.WorktreePath, "checkout", "-b", "user-scratch")
-	scratchSHA := testGitSHA(t, ws.WorktreePath, "HEAD")
-
-	force := true
-	deleteResp, err := client.HTTP.DeleteWorkspaceWithResponse(
-		ctx, createResp.JSON202.Id,
-		&generated.DeleteWorkspaceParams{Force: &force},
-	)
-	require.NoError(err)
-	require.Equal(http.StatusNoContent, deleteResp.StatusCode())
-
-	assert.Equal(
-		scratchSHA,
-		testGitSHA(t, clonePath, "refs/heads/user-scratch"),
-	)
-}
-
-func TestWorkspaceDeleteDoesNotCleanupReplacementCloneE2E(t *testing.T) {
-	t.Parallel()
-
-	assert := assert.New(t)
-	require := require.New(t)
-
-	client, database, _, remotePath := setupTestServerWithWorkspaces(t)
-	ctx := t.Context()
-	const branch = "middleman/pr-42"
-	replacementClone := filepath.Join(t.TempDir(), "replacement-clone")
-	runGit(t, filepath.Dir(replacementClone), "clone", remotePath, replacementClone)
-	runGit(
-		t, replacementClone, "remote", "set-url", "origin",
-		"https://github.com/acme/widget.git",
-	)
-	runGit(t, replacementClone, "branch", branch, "HEAD")
-	branchSHA := testGitSHA(t, replacementClone, "refs/heads/"+branch)
-	wsID := "ws-replacement-clone"
-	require.NoError(database.InsertWorkspace(ctx, &workspace.Workspace{
-		ID:              wsID,
-		Platform:        "github",
-		PlatformHost:    "github.com",
-		RepoOwner:       "acme",
-		RepoName:        "widget",
-		ItemType:        db.WorkspaceItemTypePullRequest,
-		ItemNumber:      42,
-		GitHeadRef:      "feature",
-		WorkspaceBranch: branch,
-		WorktreePath:    replacementClone,
-		TerminalBackend: workspace.TerminalBackendTmux,
-		Status:          "ready",
-	}))
-
-	force := true
-	deleteResp, err := client.HTTP.DeleteWorkspaceWithResponse(
-		ctx, wsID, &generated.DeleteWorkspaceParams{Force: &force},
-	)
-
-	require.NoError(err)
-	require.Equal(http.StatusNoContent, deleteResp.StatusCode())
-	assert.DirExists(replacementClone)
-	assert.Equal(branchSHA, testGitSHA(t, replacementClone, "refs/heads/"+branch))
-	got, err := database.GetWorkspace(ctx, wsID)
-	require.NoError(err)
-	assert.Nil(got)
-}
-
 func TestWorkspaceDeleteDoesNotCleanupReplacementCloneFromStaleLocalBaseE2E(t *testing.T) {
 	t.Parallel()
+	acquireRootWorkspaceGitSlot(t)
 
 	assert := assert.New(t)
 	require := require.New(t)
@@ -31632,152 +28913,6 @@ func TestWorkspaceDeleteDoesNotCleanupReplacementCloneFromStaleLocalBaseE2E(t *t
 	got, err := database.GetWorkspace(ctx, wsID)
 	require.NoError(err)
 	assert.Nil(got)
-}
-
-func TestWorkspaceCreatePreservesExistingLocalPreferredBranch(t *testing.T) {
-	t.Parallel()
-
-	assert := assert.New(t)
-	require := require.New(t)
-
-	client, _, clonePath, remotePath := setupTestServerWithWorkspaces(t)
-	ctx := t.Context()
-
-	privateClone := filepath.Join(t.TempDir(), "private-clone")
-	runGit(t, filepath.Dir(privateClone), "clone", clonePath, privateClone)
-	runGit(t, privateClone, "config", "user.email", "test@test.com")
-	runGit(t, privateClone, "config", "user.name", "Test")
-	runGit(t, privateClone, "checkout", "feature")
-
-	require.NoError(os.WriteFile(
-		filepath.Join(privateClone, "private.txt"),
-		[]byte("private\n"), 0o644,
-	))
-	runGit(t, privateClone, "add", "private.txt")
-	runGit(t, privateClone, "commit", "-m", "private commit")
-	privateSHA := testGitSHA(t, privateClone, "HEAD")
-	runGit(t, privateClone, "push", clonePath, "HEAD:feature")
-
-	originSHA := testGitSHA(t, remotePath, "refs/heads/feature")
-	assert.NotEqual(originSHA, privateSHA)
-	assert.Equal(privateSHA, testGitSHA(t, clonePath, "refs/heads/feature"))
-
-	createResp, err := client.HTTP.CreateWorkspaceWithResponse(
-		ctx,
-		generated.CreateWorkspaceInputBody{
-			Provider:     "github",
-			PlatformHost: "github.com",
-			Owner:        "acme",
-			Name:         "widget",
-			MrNumber:     1,
-		},
-	)
-	require.NoError(err)
-	require.Equal(http.StatusAccepted, createResp.StatusCode())
-	require.NotNil(createResp.JSON202)
-
-	ws := waitForWorkspaceReady(t, ctx, client, createResp.JSON202.Id)
-	assert.Equal(
-		"middleman/pr-1",
-		gitOutput(t, ws.WorktreePath, "branch", "--show-current"),
-	)
-	assert.Equal(originSHA, testGitSHA(t, ws.WorktreePath, "HEAD"))
-	assert.Equal(privateSHA, testGitSHA(t, clonePath, "refs/heads/feature"))
-
-	force := true
-	deleteResp, err := client.HTTP.DeleteWorkspaceWithResponse(
-		ctx, createResp.JSON202.Id,
-		&generated.DeleteWorkspaceParams{Force: &force},
-	)
-	require.NoError(err)
-	require.Equal(http.StatusNoContent, deleteResp.StatusCode())
-
-	assert.Equal(privateSHA, testGitSHA(t, clonePath, "refs/heads/feature"))
-}
-
-func TestWorkspaceDeleteLegacySyntheticBranchAllowsRecreate(t *testing.T) {
-	t.Parallel()
-
-	assert := assert.New(t)
-	require := require.New(t)
-
-	client, database, clonePath, remotePath := setupTestServerWithWorkspaces(t)
-	ctx := t.Context()
-
-	privateClone := filepath.Join(t.TempDir(), "legacy-private-clone")
-	runGit(t, filepath.Dir(privateClone), "clone", clonePath, privateClone)
-	runGit(t, privateClone, "config", "user.email", "test@test.com")
-	runGit(t, privateClone, "config", "user.name", "Test")
-	runGit(t, privateClone, "checkout", "feature")
-	require.NoError(os.WriteFile(
-		filepath.Join(privateClone, "legacy-private.txt"),
-		[]byte("legacy private\n"), 0o644,
-	))
-	runGit(t, privateClone, "add", "legacy-private.txt")
-	runGit(t, privateClone, "commit", "-m", "legacy private commit")
-	privateSHA := testGitSHA(t, privateClone, "HEAD")
-	runGit(t, privateClone, "push", clonePath, "HEAD:feature")
-	originSHA := testGitSHA(t, remotePath, "refs/heads/feature")
-	assert.NotEqual(originSHA, privateSHA)
-
-	createResp, err := client.HTTP.CreateWorkspaceWithResponse(
-		ctx,
-		generated.CreateWorkspaceInputBody{
-			Provider:     "github",
-			PlatformHost: "github.com",
-			Owner:        "acme",
-			Name:         "widget",
-			MrNumber:     1,
-		},
-	)
-	require.NoError(err)
-	require.Equal(http.StatusAccepted, createResp.StatusCode())
-	require.NotNil(createResp.JSON202)
-
-	ws := waitForWorkspaceReady(t, ctx, client, createResp.JSON202.Id)
-	assert.Equal(
-		"middleman/pr-1",
-		gitOutput(t, ws.WorktreePath, "branch", "--show-current"),
-	)
-
-	_, err = database.WriteDB().ExecContext(ctx, `
-		UPDATE middleman_workspaces
-		SET workspace_branch = '__middleman_unknown__'
-		WHERE id = ?`,
-		createResp.JSON202.Id,
-	)
-	require.NoError(err)
-
-	force := true
-	deleteResp, err := client.HTTP.DeleteWorkspaceWithResponse(
-		ctx, createResp.JSON202.Id,
-		&generated.DeleteWorkspaceParams{Force: &force},
-	)
-	require.NoError(err)
-	require.Equal(http.StatusNoContent, deleteResp.StatusCode())
-
-	runGit(t, clonePath, "fetch", "--prune", "origin")
-
-	recreateResp, err := client.HTTP.CreateWorkspaceWithResponse(
-		ctx,
-		generated.CreateWorkspaceInputBody{
-			Provider:     "github",
-			PlatformHost: "github.com",
-			Owner:        "acme",
-			Name:         "widget",
-			MrNumber:     1,
-		},
-	)
-	require.NoError(err)
-	require.Equal(http.StatusAccepted, recreateResp.StatusCode())
-	require.NotNil(recreateResp.JSON202)
-
-	recreated := waitForWorkspaceReady(t, ctx, client, recreateResp.JSON202.Id)
-	assert.Equal(
-		"middleman/pr-1",
-		gitOutput(t, recreated.WorktreePath, "branch", "--show-current"),
-	)
-	assert.Equal(originSHA, testGitSHA(t, recreated.WorktreePath, "HEAD"))
 }
 
 func TestWorkspacePRDetailPlatformHost(t *testing.T) {
@@ -31897,109 +29032,6 @@ func seedPRForRepo(
 
 	return prID
 }
-
-func TestWorkspaceDeleteDirty(t *testing.T) {
-	t.Parallel()
-
-	require := require.New(t)
-	assert := assert.New(t)
-
-	client, database, _, _ := setupTestServerWithWorkspaces(t)
-	ctx := t.Context()
-
-	// Create workspace.
-	createResp, err := client.HTTP.CreateWorkspaceWithResponse(
-		ctx,
-		generated.CreateWorkspaceInputBody{
-			Provider:     "github",
-			PlatformHost: "github.com",
-			Owner:        "acme",
-			Name:         "widget",
-			MrNumber:     1,
-		},
-	)
-	require.NoError(err)
-	require.Equal(http.StatusAccepted, createResp.StatusCode())
-	require.NotNil(createResp.JSON202)
-	wsID := createResp.JSON202.Id
-
-	ready := waitForWorkspaceReady(t, ctx, client, wsID)
-	wsPath := ready.WorktreePath
-
-	// Write a dirty file into the worktree.
-	require.NoError(os.WriteFile(
-		filepath.Join(wsPath, "dirty.txt"),
-		[]byte("uncommitted\n"), 0o644,
-	))
-
-	// DELETE without force -> 409.
-	delResp, err := client.HTTP.DeleteWorkspaceWithResponse(
-		ctx, wsID, &generated.DeleteWorkspaceParams{},
-	)
-	require.NoError(err)
-	assert.Equal(http.StatusConflict, delResp.StatusCode())
-
-	// DELETE with force -> 204.
-	force := true
-	delResp2, err := client.HTTP.DeleteWorkspaceWithResponse(
-		ctx, wsID,
-		&generated.DeleteWorkspaceParams{Force: &force},
-	)
-	require.NoError(err)
-	assert.Equal(http.StatusNoContent, delResp2.StatusCode())
-
-	// Verify deleted.
-	getResp, err := client.HTTP.GetWorkspaceWithResponse(
-		ctx, wsID,
-	)
-	require.NoError(err)
-	assert.Equal(http.StatusNotFound, getResp.StatusCode())
-
-	// --- Second scenario: corrupt/missing worktree ---
-	// Seed a second PR and create a workspace for it.
-	seedPR(t, database, "acme", "widget", 2)
-	create2, err := client.HTTP.CreateWorkspaceWithResponse(
-		ctx,
-		generated.CreateWorkspaceInputBody{
-			Provider:     "github",
-			PlatformHost: "github.com",
-			Owner:        "acme",
-			Name:         "widget",
-			MrNumber:     2,
-		},
-	)
-	require.NoError(err)
-	require.Equal(http.StatusAccepted, create2.StatusCode())
-	ws2ID := create2.JSON202.Id
-
-	ready2 := waitForWorkspaceReady(t, ctx, client, ws2ID)
-	ws2Path := ready2.WorktreePath
-
-	// Nuke the worktree directory to simulate corruption.
-	require.NoError(os.RemoveAll(ws2Path))
-
-	// DELETE without force → 409 (dirty check fails on missing dir).
-	del3, err := client.HTTP.DeleteWorkspaceWithResponse(
-		ctx, ws2ID, &generated.DeleteWorkspaceParams{},
-	)
-	require.NoError(err)
-	assert.Equal(http.StatusConflict, del3.StatusCode())
-
-	// DELETE with force → 204.
-	del4, err := client.HTTP.DeleteWorkspaceWithResponse(
-		ctx, ws2ID,
-		&generated.DeleteWorkspaceParams{Force: &force},
-	)
-	require.NoError(err)
-	assert.Equal(http.StatusNoContent, del4.StatusCode())
-
-	// Verify deleted.
-	get2, err := client.HTTP.GetWorkspaceWithResponse(ctx, ws2ID)
-	require.NoError(err)
-	assert.Equal(http.StatusNotFound, get2.StatusCode())
-}
-
-// --- edit-pr-content (PATCH) tests ---
 
 func TestAPIEditPRTitleAndBody(t *testing.T) {
 	require := require.New(t)

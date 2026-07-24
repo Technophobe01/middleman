@@ -4,46 +4,9 @@ import (
 	"time"
 
 	"go.kenn.io/middleman/internal/db"
-	"go.kenn.io/middleman/internal/gitclone"
-	"go.kenn.io/middleman/internal/workspace/localruntime"
+	"go.kenn.io/middleman/internal/server/httpapi"
+	"go.kenn.io/middleman/internal/server/workspaceapi"
 )
-
-type worktreeLinkResponse struct {
-	HostKey        string `json:"host_key,omitempty"`
-	WorktreeKey    string `json:"worktree_key"`
-	WorktreePath   string `json:"worktree_path,omitempty"`
-	WorktreeBranch string `json:"worktree_branch,omitempty"`
-}
-
-type providerCapabilitiesResponse struct {
-	ReadRepositories            bool     `json:"read_repositories"`
-	ReadMergeRequests           bool     `json:"read_merge_requests"`
-	ReadIssues                  bool     `json:"read_issues"`
-	ReadComments                bool     `json:"read_comments"`
-	ReadReleases                bool     `json:"read_releases"`
-	ReadCI                      bool     `json:"read_ci"`
-	ReadLabels                  bool     `json:"read_labels"`
-	CommentMutation             bool     `json:"comment_mutation"`
-	StateMutation               bool     `json:"state_mutation"`
-	MergeMutation               bool     `json:"merge_mutation"`
-	ReviewMutation              bool     `json:"review_mutation"`
-	WorkflowApproval            bool     `json:"workflow_approval"`
-	ReadyForReview              bool     `json:"ready_for_review"`
-	DraftMutation               bool     `json:"draft_mutation"`
-	IssueMutation               bool     `json:"issue_mutation"`
-	LabelMutation               bool     `json:"label_mutation"`
-	AssigneeMutation            bool     `json:"assignee_mutation"`
-	ReviewerMutation            bool     `json:"reviewer_mutation"`
-	ThreadReply                 bool     `json:"thread_reply"`
-	ThreadResolve               bool     `json:"thread_resolve"`
-	ReviewDraftMutation         bool     `json:"review_draft_mutation"`
-	ReviewThreadResolution      bool     `json:"review_thread_resolution"`
-	ReviewSuggestionApplication bool     `json:"review_suggestion_application"`
-	ReadReviewThreads           bool     `json:"read_review_threads"`
-	NativeMultilineRanges       bool     `json:"native_multiline_ranges"`
-	MutationHeadBinding         bool     `json:"mutation_head_binding"`
-	SupportedReviewActions      []string `json:"supported_review_actions"`
-}
 
 type repoResponse struct {
 	ID                  int64
@@ -59,114 +22,8 @@ type repoResponse struct {
 	AllowRebaseMerge    bool
 	ViewerCanMerge      bool
 	CreatedAt           time.Time
-	Capabilities        providerCapabilitiesResponse `json:"capabilities"`
-	Operations          RepoOperations               `json:"operations"`
-}
-
-// mergeRequestResponse extends db.MergeRequest with resolved repo owner/name fields.
-type mergeRequestResponse struct {
-	db.MergeRequest
-	Repo            repoRefResponse        `json:"repo"`
-	RepoOwner       string                 `json:"repo_owner"`
-	RepoName        string                 `json:"repo_name"`
-	PlatformHost    string                 `json:"platform_host"`
-	WorktreeLinks   []worktreeLinkResponse `json:"worktree_links"`
-	Workspace       *workspaceRef          `json:"workspace,omitempty"`
-	DetailLoaded    bool                   `json:"detail_loaded"`
-	DetailFetchedAt string                 `json:"detail_fetched_at,omitempty"`
-}
-
-type mergeRequestEventResponse struct {
-	ID                 int64
-	MergeRequestID     int64
-	PlatformID         *int64
-	PlatformExternalID string
-	EventType          string
-	Author             string
-	Summary            string
-	Body               string
-	MetadataJSON       string
-	CreatedAt          time.Time
-	DedupeKey          string
-	DirectURL          string
-	ThreadID           *string
-	Resolvable         bool
-	Resolved           bool
-	DiffThread         *diffReviewThreadResponse `json:"diff_thread,omitempty"`
-}
-
-type workflowApprovalResponse struct {
-	Checked  bool `json:"checked"`
-	Required bool `json:"required"`
-	Count    int  `json:"count"`
-}
-
-type mergeRequestDetailResponse struct {
-	MergeRequest     *db.MergeRequest            `json:"merge_request"`
-	Events           []mergeRequestEventResponse `json:"events"`
-	Repo             repoRefResponse             `json:"repo"`
-	RepoOwner        string                      `json:"repo_owner"`
-	RepoName         string                      `json:"repo_name"`
-	PlatformHost     string                      `json:"platform_host"`
-	PlatformHeadSHA  string                      `json:"platform_head_sha"`
-	PlatformBaseSHA  string                      `json:"platform_base_sha"`
-	ReviewedHeadSHA  string                      `json:"reviewed_head_sha"`
-	DiffHeadSHA      string                      `json:"diff_head_sha"`
-	MergeBaseSHA     string                      `json:"merge_base_sha"`
-	WorktreeLinks    []worktreeLinkResponse      `json:"worktree_links"`
-	WorkflowApproval workflowApprovalResponse    `json:"workflow_approval"`
-	Warnings         []string                    `json:"warnings,omitempty"`
-	DetailLoaded     bool                        `json:"detail_loaded"`
-	// DeferredMergePending reports whether a background "merge after CI"
-	// worker is currently waiting on this pull request in this server
-	// process, so the UI can show the queued state instead of a merge
-	// action.
-	DeferredMergePending bool                  `json:"deferred_merge_pending"`
-	DetailFetchedAt      string                `json:"detail_fetched_at,omitempty"`
-	Workspace            *workspaceRef         `json:"workspace,omitempty"`
-	Stack                *stackContextResponse `json:"stack,omitempty"`
-	// Checks is the merge request's CI checks decoded from its cached
-	// ci_checks_json. Omitted when the merge request has no cached checks.
-	Checks []db.CICheck `json:"checks,omitempty"`
-}
-
-var validKanbanStates = map[string]bool{
-	"new":            true,
-	"reviewing":      true,
-	"waiting":        true,
-	"awaiting_merge": true,
-}
-
-type workflowStateMetaResponse struct {
-	Status        db.KanbanStatus `json:"status" enum:"new,reviewing,waiting,awaiting_merge"`
-	UpdatedAt     string          `json:"updated_at,omitempty" format:"date-time"`
-	UpdatedSource string          `json:"updated_source,omitempty"`
-	UpdatedActor  string          `json:"updated_actor,omitempty"`
-	UpdatedReason string          `json:"updated_reason,omitempty"`
-}
-
-type issueResponse struct {
-	db.Issue
-	Repo            repoRefResponse `json:"repo"`
-	PlatformHost    string          `json:"platform_host"`
-	RepoOwner       string          `json:"repo_owner"`
-	RepoName        string          `json:"repo_name"`
-	Workspace       *workspaceRef   `json:"workspace,omitempty"`
-	DetailLoaded    bool            `json:"detail_loaded"`
-	DetailFetchedAt string          `json:"detail_fetched_at,omitempty"`
-}
-
-type issueDetailResponse struct {
-	Issue           *db.Issue                  `json:"issue"`
-	Events          []db.IssueEvent            `json:"events"`
-	Repo            repoRefResponse            `json:"repo"`
-	PlatformHost    string                     `json:"platform_host"`
-	RepoOwner       string                     `json:"repo_owner"`
-	RepoName        string                     `json:"repo_name"`
-	DetailLoaded    bool                       `json:"detail_loaded"`
-	DetailFetchedAt string                     `json:"detail_fetched_at,omitempty"`
-	Workspace       *workspaceRef              `json:"workspace,omitempty"`
-	Workflow        *workflowStateMetaResponse `json:"workflow,omitempty"`
+	Capabilities        httpapi.ProviderCapabilitiesResponse `json:"capabilities"`
+	Operations          httpapi.RepoOperations               `json:"operations"`
 }
 
 type repoSummaryAuthorResponse struct {
@@ -199,7 +56,7 @@ type repoSummaryCommitPointResponse struct {
 }
 
 type repoSummaryResponse struct {
-	Repo                 repoRefResponse                  `json:"repo"`
+	Repo                 httpapi.RepoRefResponse          `json:"repo"`
 	PlatformHost         string                           `json:"platform_host"`
 	DefaultPlatformHost  string                           `json:"default_platform_host"`
 	Owner                string                           `json:"owner"`
@@ -220,47 +77,7 @@ type repoSummaryResponse struct {
 	TimelineUpdatedAt    string                           `json:"timeline_updated_at,omitempty"`
 	ActiveAuthors        []repoSummaryAuthorResponse      `json:"active_authors"`
 	RecentIssues         []repoSummaryIssueResponse       `json:"recent_issues"`
-	Operations           RepoOperations                   `json:"operations"`
-}
-
-type repoBrowserRefsResponse struct {
-	Repo       repoRefResponse           `json:"repo"`
-	Refs       []gitclone.RepoBrowserRef `json:"refs"`
-	DefaultRef gitclone.RepoBrowserRef   `json:"default_ref"`
-	Truncated  bool                      `json:"truncated"`
-}
-
-type repoBrowserTreeResponse struct {
-	Repo      repoRefResponse                 `json:"repo"`
-	Ref       gitclone.RepoBrowserRef         `json:"ref"`
-	Entries   []gitclone.RepoBrowserTreeEntry `json:"entries"`
-	Truncated bool                            `json:"truncated"`
-}
-
-type repoBrowserBlobResponse struct {
-	Repo repoRefResponse          `json:"repo"`
-	Ref  gitclone.RepoBrowserRef  `json:"ref"`
-	Blob gitclone.RepoBrowserBlob `json:"blob"`
-}
-
-type repoBrowserLastChangedResponse struct {
-	Repo    repoRefResponse                       `json:"repo"`
-	Ref     gitclone.RepoBrowserRef               `json:"ref"`
-	Commits map[string]gitclone.RepoBrowserCommit `json:"commits"`
-}
-
-type repoBrowserHistoryResponse struct {
-	Repo    repoRefResponse              `json:"repo"`
-	Ref     gitclone.RepoBrowserRef      `json:"ref"`
-	Path    string                       `json:"path"`
-	Commits []gitclone.RepoBrowserCommit `json:"commits"`
-}
-
-type repoBrowserCommitResponse struct {
-	Repo   repoRefResponse            `json:"repo"`
-	Ref    gitclone.RepoBrowserRef    `json:"ref"`
-	Path   string                     `json:"path"`
-	Commit gitclone.RepoBrowserCommit `json:"commit"`
+	Operations           httpapi.RepoOperations           `json:"operations"`
 }
 
 type commentAutocompleteResponse struct {
@@ -337,108 +154,7 @@ type resolveItemResponse struct {
 	RepoTracked bool   `json:"repo_tracked"`
 }
 
-type diffResponse struct {
-	Stale               bool                `json:"stale"`
-	WhitespaceOnlyCount int                 `json:"whitespace_only_count"`
-	Files               []gitclone.DiffFile `json:"files"`
-	SnapshotVersion     string              `json:"snapshot_version,omitempty" doc:"Opaque workspace diff snapshot version used to keep files and patches coherent."`
-	// DiffHeadSHA is the synced PR diff snapshot head this diff was
-	// computed from; clients compare it against platform_head_sha to
-	// detect stale cached diff context. Empty for non-PR diffs.
-	DiffHeadSHA string `json:"diff_head_sha,omitempty" doc:"Synced PR diff snapshot head this diff was computed from. Always set for pull request diffs (the endpoint fails when no snapshot head is synced); empty for commit and workspace diffs. Compare with the pull detail's platform_head_sha to detect stale cached diff context; unrelated to 'stale', which reports clone-refresh staleness."`
-}
-
-type filesResponse struct {
-	Stale               bool                `json:"stale"`
-	WhitespaceOnlyCount int                 `json:"whitespace_only_count"`
-	Files               []gitclone.DiffFile `json:"files"`
-	SnapshotVersion     string              `json:"snapshot_version,omitempty" doc:"Opaque workspace diff snapshot version to pin on the following workspace diff request."`
-}
-
-type workspaceDiffWatchResponse struct {
-	Changed bool   `json:"changed" doc:"True when the caller must reload the watched default-HEAD snapshot."`
-	Version string `json:"version" doc:"Opaque version of the current default-HEAD snapshot; never a version from another diff scope."`
-}
-
-type diffReviewLineRange struct {
-	Path        string `json:"path"`
-	OldPath     string `json:"old_path,omitempty"`
-	Side        string `json:"side"`
-	StartSide   string `json:"start_side,omitempty"`
-	StartLine   *int   `json:"start_line,omitempty"`
-	Line        int    `json:"line"`
-	OldLine     *int   `json:"old_line,omitempty"`
-	NewLine     *int   `json:"new_line,omitempty"`
-	LineType    string `json:"line_type"`
-	DiffHeadSHA string `json:"diff_head_sha,omitempty"`
-	CommitSHA   string `json:"commit_sha,omitempty"`
-}
-
-type diffReviewDraftComment struct {
-	ID          string `json:"id"`
-	Body        string `json:"body"`
-	Path        string `json:"path"`
-	OldPath     string `json:"old_path,omitempty"`
-	Side        string `json:"side"`
-	StartSide   string `json:"start_side,omitempty"`
-	StartLine   *int   `json:"start_line,omitempty"`
-	Line        int    `json:"line"`
-	OldLine     *int   `json:"old_line,omitempty"`
-	NewLine     *int   `json:"new_line,omitempty"`
-	LineType    string `json:"line_type"`
-	DiffHeadSHA string `json:"diff_head_sha,omitempty"`
-	CommitSHA   string `json:"commit_sha,omitempty"`
-	CreatedAt   string `json:"created_at"`
-	UpdatedAt   string `json:"updated_at"`
-}
-
-type diffReviewDraftResponse struct {
-	DraftID               string                   `json:"draft_id,omitempty"`
-	Comments              []diffReviewDraftComment `json:"comments"`
-	SupportedActions      []string                 `json:"supported_actions"`
-	NativeMultilineRanges bool                     `json:"native_multiline_ranges"`
-}
-
-type diffReviewThreadResponse struct {
-	ID                string `json:"id"`
-	ProviderCommentID string `json:"provider_comment_id,omitempty"`
-	Path              string `json:"path"`
-	OldPath           string `json:"old_path,omitempty"`
-	Side              string `json:"side"`
-	StartSide         string `json:"start_side,omitempty"`
-	StartLine         *int   `json:"start_line,omitempty"`
-	Line              int    `json:"line"`
-	OldLine           *int   `json:"old_line,omitempty"`
-	NewLine           *int   `json:"new_line,omitempty"`
-	LineType          string `json:"line_type"`
-	DiffHeadSHA       string `json:"diff_head_sha,omitempty"`
-	CommitSHA         string `json:"commit_sha,omitempty"`
-	Body              string `json:"body"`
-	AuthorLogin       string `json:"author_login,omitempty"`
-	Resolved          bool   `json:"resolved"`
-	CanResolve        bool   `json:"can_resolve"`
-	CreatedAt         string `json:"created_at"`
-	UpdatedAt         string `json:"updated_at"`
-}
-
-type filePreviewResponse struct {
-	Path      string `json:"path"`
-	MediaType string `json:"media_type"`
-	Encoding  string `json:"encoding"`
-	Content   string `json:"content"`
-	Size      int64  `json:"size"`
-}
-
-type mrImportMetadataResponse struct {
-	Number           int    `json:"number"`
-	HeadBranch       string `json:"head_branch"`
-	PlatformHeadSHA  string `json:"platform_head_sha"`
-	HeadRepoCloneURL string `json:"head_repo_clone_url"`
-	State            string `json:"state"`
-	IsDraft          bool   `json:"is_draft"`
-	Title            string `json:"title"`
-}
-
+type diffResponse = httpapi.DiffResponse
 type rateLimitHostStatus struct {
 	Provider           string `json:"provider"`
 	PlatformHost       string `json:"platform_host"`
@@ -464,124 +180,6 @@ type rateLimitsResponse struct {
 	Hosts map[string]rateLimitHostStatus `json:"hosts"`
 }
 
-type commitResponse struct {
-	SHA        string    `json:"sha"         doc:"Full commit SHA"`
-	Message    string    `json:"message"     doc:"First line of commit message"`
-	AuthorName string    `json:"author_name" doc:"Commit author display name"`
-	AuthoredAt time.Time `json:"authored_at" doc:"Commit author date (RFC3339)"`
-	Pushed     *bool     `json:"pushed,omitempty" doc:"Whether the commit is reachable from the workspace branch's upstream tracking ref; false means it has not been pushed. Omitted when push status is unknown, such as pull request commits."`
-}
-
-type commitsResponse struct {
-	Commits []commitResponse `json:"commits" doc:"Commits in newest-first order"`
-}
-
-// workspaceResponse describes one middleman-managed workspace.
-//
-// This payload exists so the UI can reopen a durable local workspace and render
-// the correct item-specific presentation around it. It represents middleman's
-// own persisted workspace model, not an arbitrary host worktree inventory.
-type workspaceResponse struct {
-	ID                    string                    `json:"id"`
-	Repo                  repoRefResponse           `json:"repo"`
-	PlatformHost          string                    `json:"platform_host"`
-	RepoOwner             string                    `json:"repo_owner"`
-	RepoName              string                    `json:"repo_name"`
-	ItemType              string                    `json:"item_type"`
-	ItemNumber            int                       `json:"item_number"`
-	ItemKey               string                    `json:"item_key"`
-	GitHeadRef            string                    `json:"git_head_ref"`
-	WorktreePath          string                    `json:"worktree_path"`
-	TmuxSession           string                    `json:"tmux_session"`
-	TmuxPaneTitle         *string                   `json:"tmux_pane_title,omitempty"`
-	TmuxWorking           bool                      `json:"tmux_working"`
-	TmuxActivitySource    string                    `json:"tmux_activity_source"`
-	TmuxLastOutputAt      *string                   `json:"tmux_last_output_at"`
-	Status                string                    `json:"status"`
-	ErrorMessage          *string                   `json:"error_message,omitempty"`
-	CreatedAt             string                    `json:"created_at"`
-	ItemLastActivityAt    *string                   `json:"item_last_activity_at,omitempty"`
-	MRTitle               *string                   `json:"mr_title,omitempty"`
-	MRState               *string                   `json:"mr_state,omitempty"`
-	MRIsDraft             *bool                     `json:"mr_is_draft,omitempty"`
-	MRCIStatus            *string                   `json:"mr_ci_status,omitempty"`
-	MRReviewDecision      *string                   `json:"mr_review_decision,omitempty"`
-	MRAdditions           *int                      `json:"mr_additions,omitempty"`
-	MRDeletions           *int                      `json:"mr_deletions,omitempty"`
-	CommitsAhead          *int                      `json:"commits_ahead,omitempty"`
-	CommitsBehind         *int                      `json:"commits_behind,omitempty"`
-	EnrichmentStatus      string                    `json:"enrichment_status" enum:"not_applicable,pending,fresh,stale,failed" doc:"Aggregate git-divergence and tmux-activity reconciliation status. Failed responses retain last-known-good component fields when available."`
-	EnrichmentRefreshedAt *string                   `json:"enrichment_refreshed_at,omitempty" doc:"Oldest successful refresh time across the populated enrichment components."`
-	EnrichmentError       *string                   `json:"enrichment_error,omitempty" doc:"Combined error from the most recent reconciliation attempt; populated component fields may still contain last-known-good values."`
-	AssociatedPRNumber    *int                      `json:"associated_pr_number,omitempty"`
-	Kata                  *db.WorkspaceKataMetadata `json:"kata,omitempty"`
-}
-
-type workspaceRuntimeResponse struct {
-	LaunchTargets []localruntime.LaunchTarget `json:"launch_targets"`
-	Sessions      []localruntime.SessionInfo  `json:"sessions"`
-}
-
-type runtimeAttachSpecResponse struct {
-	Version           int      `json:"version"`
-	Kind              string   `json:"kind"`
-	SessionKey        string   `json:"session_key"`
-	TargetKey         string   `json:"target_key"`
-	TmuxSession       string   `json:"tmux_session"`
-	Command           []string `json:"command"`
-	RequiresLocalHost bool     `json:"requires_local_host"`
-}
-
-// workspaceRef is the lightweight link from item detail APIs back to an
-// existing middleman workspace.
-//
-// Its purpose is to let PR and issue detail screens switch from "create
-// workspace" to "open workspace" without embedding the full workspace payload.
-type workspaceRef struct {
-	ID     string `json:"id"`
-	Status string `json:"status"`
-}
-
-// toWorkspaceResponse maps the DB workspace summary into the API shape used by
-// the workspaces page and terminal view.
-func toWorkspaceResponse(
-	s *db.WorkspaceSummary,
-) workspaceResponse {
-	var itemLastActivityAt *string
-	if s.ItemLastActivityAt != nil {
-		formatted := s.ItemLastActivityAt.UTC().Format(time.RFC3339)
-		itemLastActivityAt = &formatted
-	}
-	return workspaceResponse{
-		ID:                 s.ID,
-		Repo:               repoRefFromParts(s.Platform, s.PlatformHost, s.RepoOwner, s.RepoName),
-		PlatformHost:       s.PlatformHost,
-		RepoOwner:          s.RepoOwner,
-		RepoName:           s.RepoName,
-		ItemType:           s.ItemType,
-		ItemNumber:         s.ItemNumber,
-		ItemKey:            s.ItemKey,
-		GitHeadRef:         s.GitHeadRef,
-		WorktreePath:       s.WorktreePath,
-		TmuxSession:        s.TmuxSession,
-		Status:             s.Status,
-		EnrichmentStatus:   workspaceEnrichmentNotApplicable,
-		TmuxActivitySource: tmuxActivitySourceUnknown,
-		ErrorMessage:       s.ErrorMessage,
-		CreatedAt:          s.CreatedAt.UTC().Format(time.RFC3339),
-		ItemLastActivityAt: itemLastActivityAt,
-		MRTitle:            s.MRTitle,
-		MRState:            s.MRState,
-		MRIsDraft:          s.MRIsDraft,
-		MRCIStatus:         s.MRCIStatus,
-		MRReviewDecision:   s.MRReviewDecision,
-		MRAdditions:        s.MRAdditions,
-		MRDeletions:        s.MRDeletions,
-		AssociatedPRNumber: s.AssociatedPRNumber,
-		Kata:               s.KataMetadata,
-	}
-}
-
 const activitySafetyCap = 5000
 
 type activityResponse struct {
@@ -589,65 +187,34 @@ type activityResponse struct {
 	Capped bool                   `json:"capped"`
 }
 
-type stackMemberResponse struct {
-	Number         int    `json:"number"`
-	Title          string `json:"title"`
-	State          string `json:"state"`
-	CIStatus       string `json:"ci_status"`
-	ReviewDecision string `json:"review_decision"`
-	MergeableState string `json:"mergeable_state"`
-	Position       int    `json:"position"`
-	IsDraft        bool   `json:"is_draft"`
-	BaseBranch     string `json:"base_branch"`
-	BlockedBy      *int   `json:"blocked_by"`
-}
-
-type stackResponse struct {
-	ID        int64                 `json:"id"`
-	Name      string                `json:"name"`
-	RepoOwner string                `json:"repo_owner"`
-	RepoName  string                `json:"repo_name"`
-	Health    string                `json:"health"`
-	Members   []stackMemberResponse `json:"members"`
-}
-
-type stackContextResponse struct {
-	StackID   int64                 `json:"stack_id"`
-	StackName string                `json:"stack_name"`
-	Position  int                   `json:"position"`
-	Size      int                   `json:"size"`
-	Health    string                `json:"health"`
-	Members   []stackMemberResponse `json:"members"`
-}
-
 type activityItemResponse struct {
-	ID             string          `json:"id"`
-	Cursor         string          `json:"cursor"`
-	ActivityType   string          `json:"activity_type"`
-	Repo           repoRefResponse `json:"repo"`
-	PlatformHost   string          `json:"platform_host"`
-	RepoOwner      string          `json:"repo_owner"`
-	RepoName       string          `json:"repo_name"`
-	ItemType       string          `json:"item_type"`
-	ItemNumber     int             `json:"item_number"`
-	ItemTitle      string          `json:"item_title"`
-	ItemURL        string          `json:"item_url"`
-	ItemState      string          `json:"item_state"`
-	Workspace      *workspaceRef   `json:"workspace,omitempty"`
-	Author         string          `json:"author"`
-	ItemAuthor     string          `json:"item_author,omitempty"`
-	CreatedAt      string          `json:"created_at"`
-	BodyPreview    string          `json:"body_preview"`
-	BranchName     string          `json:"branch_name,omitempty"`
-	CommitSHA      string          `json:"commit_sha,omitempty"`
-	BeforeSHA      string          `json:"before_sha,omitempty"`
-	AfterSHA       string          `json:"after_sha,omitempty"`
-	AuthorName     string          `json:"author_name,omitempty"`
-	AuthorEmail    string          `json:"author_email,omitempty"`
-	CommitterName  string          `json:"committer_name,omitempty"`
-	CommitterEmail string          `json:"committer_email,omitempty"`
-	AuthoredAt     string          `json:"authored_at,omitempty"`
-	CommittedAt    string          `json:"committed_at,omitempty"`
-	ActivityURL    string          `json:"activity_url,omitempty"`
-	SubjectState   string          `json:"subject_state,omitempty"`
+	ID             string                     `json:"id"`
+	Cursor         string                     `json:"cursor"`
+	ActivityType   string                     `json:"activity_type"`
+	Repo           httpapi.RepoRefResponse    `json:"repo"`
+	PlatformHost   string                     `json:"platform_host"`
+	RepoOwner      string                     `json:"repo_owner"`
+	RepoName       string                     `json:"repo_name"`
+	ItemType       string                     `json:"item_type"`
+	ItemNumber     int                        `json:"item_number"`
+	ItemTitle      string                     `json:"item_title"`
+	ItemURL        string                     `json:"item_url"`
+	ItemState      string                     `json:"item_state"`
+	Workspace      *workspaceapi.WorkspaceRef `json:"workspace,omitempty"`
+	Author         string                     `json:"author"`
+	ItemAuthor     string                     `json:"item_author,omitempty"`
+	CreatedAt      string                     `json:"created_at"`
+	BodyPreview    string                     `json:"body_preview"`
+	BranchName     string                     `json:"branch_name,omitempty"`
+	CommitSHA      string                     `json:"commit_sha,omitempty"`
+	BeforeSHA      string                     `json:"before_sha,omitempty"`
+	AfterSHA       string                     `json:"after_sha,omitempty"`
+	AuthorName     string                     `json:"author_name,omitempty"`
+	AuthorEmail    string                     `json:"author_email,omitempty"`
+	CommitterName  string                     `json:"committer_name,omitempty"`
+	CommitterEmail string                     `json:"committer_email,omitempty"`
+	AuthoredAt     string                     `json:"authored_at,omitempty"`
+	CommittedAt    string                     `json:"committed_at,omitempty"`
+	ActivityURL    string                     `json:"activity_url,omitempty"`
+	SubjectState   string                     `json:"subject_state,omitempty"`
 }

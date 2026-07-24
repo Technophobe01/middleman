@@ -6,6 +6,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -153,20 +154,31 @@ func collectConvenienceRouteMetadataFailures(path string, source []byte) []strin
 			if !ok {
 				continue
 			}
-			ident, ok := argCall.Fun.(*ast.Ident)
-			if ok && ident.Name == "documentOperation" {
+			if isDocumentOperationCall(argCall.Fun) {
 				return true
 			}
 		}
 		pos := fset.Position(call.Pos())
 		failures = append(failures, fmt.Sprintf(
-			"%s:%d: huma.%s must use documentOperation for OpenAPI metadata",
+			"%s:%d: huma.%s must use httpapi.DocumentOperation for OpenAPI metadata",
 			path, pos.Line, selector.Sel.Name,
 		))
 		return true
 	})
 	sort.Strings(failures)
 	return failures
+}
+
+func isDocumentOperationCall(expr ast.Expr) bool {
+	switch typed := expr.(type) {
+	case *ast.Ident:
+		return typed.Name == "documentOperation"
+	case *ast.SelectorExpr:
+		pkg, ok := typed.X.(*ast.Ident)
+		return ok && pkg.Name == "httpapi" && typed.Sel.Name == "DocumentOperation"
+	default:
+		return false
+	}
 }
 
 func isHumaConvenienceMethod(name string) bool {
@@ -194,12 +206,24 @@ func TestHumaContractMetadata(t *testing.T) {
 func TestHumaConvenienceRoutesUseDocumentOperation(t *testing.T) {
 	require := require.New(t)
 
-	paths, err := filepath.Glob("*.go")
+	var paths []string
+	err := filepath.WalkDir(".", func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		if filepath.Ext(path) == ".go" {
+			paths = append(paths, path)
+		}
+		return nil
+	})
 	require.NoError(err)
 
 	var failures []string
 	for _, path := range paths {
-		if strings.HasSuffix(path, "_test.go") || path == "health_routes.go" {
+		if strings.HasSuffix(path, "_test.go") || filepath.Base(path) == "health_routes.go" {
 			continue
 		}
 		source, err := os.ReadFile(path)
@@ -271,5 +295,5 @@ func (s *Server) register(api huma.API) {
 
 	failures := collectConvenienceRouteMetadataFailures("sample.go", source)
 	require.Contains(failures,
-		"sample.go:3: huma.Get must use documentOperation for OpenAPI metadata")
+		"sample.go:3: huma.Get must use httpapi.DocumentOperation for OpenAPI metadata")
 }

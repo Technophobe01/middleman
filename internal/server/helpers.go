@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -10,15 +9,9 @@ import (
 	"go.kenn.io/middleman/internal/db"
 	ghclient "go.kenn.io/middleman/internal/github"
 	"go.kenn.io/middleman/internal/platform"
+	"go.kenn.io/middleman/internal/server/httpapi"
+	"go.kenn.io/middleman/internal/server/workspaceapi"
 )
-
-type repoNumberPathRef struct {
-	repoID       int64
-	owner        string
-	name         string
-	number       int
-	platformHost string
-}
 
 type starredRequest struct {
 	ItemType     string `json:"item_type"`
@@ -27,18 +20,6 @@ type starredRequest struct {
 	Name         string `json:"name"`
 	Number       int    `json:"number"`
 	PlatformHost string `json:"platform_host"`
-}
-
-var errRepoNotFound = errors.New("repo not found")
-
-// buildRepoLookup materializes a repo-id keyed map used to annotate list
-// responses with owner/name information.
-func buildRepoLookup(repos []db.Repo) map[int64]db.Repo {
-	lookup := make(map[int64]db.Repo, len(repos))
-	for _, repo := range repos {
-		lookup[repo.ID] = repo
-	}
-	return lookup
 }
 
 func workspaceLookupKey(
@@ -63,12 +44,12 @@ func workspaceLookupKey(
 
 func (s *Server) buildWorkspaceRefLookup(
 	ctx context.Context,
-) (map[string]workspaceRef, error) {
+) (map[string]workspaceapi.WorkspaceRef, error) {
 	workspaces, err := s.db.ListWorkspaces(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("list workspaces: %w", err)
 	}
-	lookup := make(map[string]workspaceRef, len(workspaces))
+	lookup := make(map[string]workspaceapi.WorkspaceRef, len(workspaces))
 	for _, ws := range workspaces {
 		key := workspaceLookupKey(
 			ws.Platform, ws.PlatformHost, ws.RepoOwner, ws.RepoName,
@@ -77,25 +58,9 @@ func (s *Server) buildWorkspaceRefLookup(
 		if _, exists := lookup[key]; exists {
 			continue
 		}
-		lookup[key] = workspaceRef{ID: ws.ID, Status: ws.Status}
+		lookup[key] = workspaceapi.WorkspaceRef{ID: ws.ID, Status: ws.Status}
 	}
 	return lookup, nil
-}
-
-func workspaceRefForRepoItem(
-	lookup map[string]workspaceRef,
-	repo db.Repo,
-	itemType string,
-	number int,
-) *workspaceRef {
-	ref, ok := lookup[workspaceLookupKey(
-		repo.Platform, repoProviderHost(repo), repo.Owner, repo.Name,
-		itemType, number,
-	)]
-	if !ok {
-		return nil
-	}
-	return &ref
 }
 
 func workspaceItemTypeFromActivity(itemType string) string {
@@ -110,9 +75,9 @@ func workspaceItemTypeFromActivity(itemType string) string {
 }
 
 func workspaceRefForActivityItem(
-	lookup map[string]workspaceRef,
+	lookup map[string]workspaceapi.WorkspaceRef,
 	item db.ActivityItem,
-) *workspaceRef {
+) *workspaceapi.WorkspaceRef {
 	workspaceItemType := workspaceItemTypeFromActivity(item.ItemType)
 	if workspaceItemType == "" {
 		return nil
@@ -125,20 +90,6 @@ func workspaceRefForActivityItem(
 		return nil
 	}
 	return &ref
-}
-
-// lookupRepoMap fetches repos and returns an ID-keyed map. When config is
-// available, only currently tracked repos are included so that removed repos
-// are filtered out of list responses.
-func (s *Server) lookupRepoMap(ctx context.Context) (map[int64]db.Repo, error) {
-	repos, err := s.db.ListRepos(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("list repos: %w", err)
-	}
-	if s.cfg != nil {
-		repos = s.filterConfiguredRepos(repos)
-	}
-	return buildRepoLookup(repos), nil
 }
 
 // filterConfiguredRepos returns only repos that are currently tracked.
@@ -178,50 +129,37 @@ func (s *Server) trackedConfiguredRepoSet() map[string]struct{} {
 
 func configuredDBRepoKey(repo db.Repo) string {
 	return trackedRepoKey(ghclient.RepoRef{
-		Platform:     repoProviderKind(repo),
-		PlatformHost: repoProviderHost(repo),
+		Platform:     httpapi.ProviderKind(repo),
+		PlatformHost: httpapi.ProviderHost(repo),
 		Owner:        repo.Owner,
 		Name:         repo.Name,
 		RepoPath:     repo.RepoPath,
 	})
 }
 
+func (s *Server) repoResponse(repo db.Repo) repoResponse {
+	return repoResponse{
+		ID:                  repo.ID,
+		Platform:            repo.Platform,
+		PlatformHost:        repo.PlatformHost,
+		Owner:               repo.Owner,
+		Name:                repo.Name,
+		LastSyncStartedAt:   repo.LastSyncStartedAt,
+		LastSyncCompletedAt: repo.LastSyncCompletedAt,
+		LastSyncError:       repo.LastSyncError,
+		AllowSquashMerge:    repo.AllowSquashMerge,
+		AllowMergeCommit:    repo.AllowMergeCommit,
+		AllowRebaseMerge:    repo.AllowRebaseMerge,
+		ViewerCanMerge:      repo.ViewerCanMerge,
+		CreatedAt:           repo.CreatedAt,
+		Capabilities:        s.repoResolver.CapabilitiesForRepo(repo),
+		Operations:          s.repoOperations(repo),
+	}
+}
+
 func (s *Server) isConfiguredRepoTracked(repo db.Repo) bool {
 	_, ok := s.trackedConfiguredRepoSet()[configuredDBRepoKey(repo)]
 	return ok
-}
-
-// lookupMRID resolves the internal MR id from the common route tuple.
-func (s *Server) lookupMRID(ctx context.Context, ref repoNumberPathRef) (int64, error) {
-	mr, err := s.db.GetMergeRequestByRepoIDAndNumber(
-		ctx, ref.repoID, ref.number,
-	)
-	if err != nil {
-		return 0, err
-	}
-	if mr == nil {
-		return 0, fmt.Errorf(
-			"pull request %s/%s#%d on %s not found",
-			ref.owner, ref.name, ref.number, ref.platformHost,
-		)
-	}
-	return mr.ID, nil
-}
-
-// lookupIssueID resolves the internal issue id from the common route tuple.
-func (s *Server) lookupIssueID(ctx context.Context, ref repoNumberPathRef) (int64, error) {
-	issue, err := s.db.GetIssueByRepoIDAndNumber(
-		ctx, ref.repoID, ref.number,
-	)
-	if err != nil {
-		return 0, err
-	}
-	if issue == nil {
-		return 0, fmt.Errorf(
-			"issue %s/%s#%d on %s not found", ref.owner, ref.name, ref.number, ref.platformHost,
-		)
-	}
-	return issue.ID, nil
 }
 
 // parseRepoFilter splits the shared repo query parameter used by pull, issue,
@@ -298,7 +236,7 @@ func (s *Server) toRepoSummaryResponse(
 	defaultPlatformHost string,
 ) repoSummaryResponse {
 	resp := repoSummaryResponse{
-		Repo:                s.repoRefFromRepo(summary.Repo),
+		Repo:                s.repoResolver.Ref(summary.Repo),
 		PlatformHost:        summary.Repo.PlatformHost,
 		DefaultPlatformHost: defaultPlatformHost,
 		Owner:               summary.Repo.Owner,
@@ -386,39 +324,3 @@ func (s *Server) toRepoSummaryResponse(
 
 // toWorktreeLinkResponses converts DB links to API responses.
 // Returns an empty non-nil slice when input is nil.
-func toWorktreeLinkResponses(
-	links []db.WorktreeLink,
-	hostKey string,
-) []worktreeLinkResponse {
-	out := make([]worktreeLinkResponse, len(links))
-	for i, l := range links {
-		out[i] = worktreeLinkResponse{
-			HostKey:        hostKey,
-			WorktreeKey:    l.WorktreeKey,
-			WorktreePath:   l.WorktreePath,
-			WorktreeBranch: l.WorktreeBranch,
-		}
-	}
-	return out
-}
-
-// indexWorktreeLinksByMR groups worktree link responses by
-// merge request ID.
-func indexWorktreeLinksByMR(
-	links []db.WorktreeLink,
-	hostKey string,
-) map[int64][]worktreeLinkResponse {
-	m := make(map[int64][]worktreeLinkResponse)
-	for _, l := range links {
-		m[l.MergeRequestID] = append(
-			m[l.MergeRequestID],
-			worktreeLinkResponse{
-				HostKey:        hostKey,
-				WorktreeKey:    l.WorktreeKey,
-				WorktreePath:   l.WorktreePath,
-				WorktreeBranch: l.WorktreeBranch,
-			},
-		)
-	}
-	return m
-}

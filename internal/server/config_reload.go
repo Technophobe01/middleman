@@ -13,6 +13,8 @@ import (
 	"go.kenn.io/middleman/internal/configwatch"
 	ghclient "go.kenn.io/middleman/internal/github"
 	"go.kenn.io/middleman/internal/platform"
+	"go.kenn.io/middleman/internal/server/docsapi"
+	"go.kenn.io/middleman/internal/server/messagesapi"
 	"go.kenn.io/middleman/internal/tokenauth"
 )
 
@@ -354,7 +356,7 @@ func (s *Server) applyConfigChange(ctx context.Context) configChangedEvent {
 	if s.reloadCredentialNeedsClientRebuild(ctx, newCfg) {
 		restartRequired = true
 	}
-	warnDocFolderDaemonBindings(newCfg.DocFolders)
+	docsapi.WarnDaemonBindings(newCfg.DocFolders)
 
 	// Resolve the new repo set against the boot-time registry. Repos
 	// whose (platform, host) the registry never learned about cannot
@@ -388,14 +390,16 @@ func (s *Server) applyConfigChange(ctx context.Context) configChangedEvent {
 	}
 
 	s.cfgMu.Lock()
-	defer s.cfgMu.Unlock()
 	*s.cfg = cloneReloadedConfig(newCfg)
-	if s.docsRegistry != nil {
-		s.docsRegistry.Replace(newCfg.DocFolders)
+	s.refreshRuntimeTargetsLocked()
+	if s.runtime != nil {
+		s.runtime.UpdateStripEnvVars(s.updateRuntimeStripEnvVarsLocked(newCfg))
 	}
-	if s.msgvault != nil {
-		s.msgvault.applyConfig(newCfg)
-	}
+	s.applyWorkspaceConfigLocked()
+	s.applyFleetConfigLocked()
+	s.applyKataConfigLocked()
+	s.applyPullConfigLocked()
+	s.cfgMu.Unlock()
 
 	if s.syncer != nil {
 		s.syncer.SetBranchActivityLimits(
@@ -406,9 +410,11 @@ func (s *Server) applyConfigChange(ctx context.Context) configChangedEvent {
 		s.syncer.SetActiveMRWindow(newCfg.ActivePRWindowDuration())
 	}
 
-	s.refreshRuntimeTargetsLocked()
-	if s.runtime != nil {
-		s.runtime.UpdateStripEnvVars(s.updateRuntimeStripEnvVarsLocked(newCfg))
+	if s.docsAPI != nil {
+		s.docsAPI.ReplaceFolders(newCfg.DocFolders)
+	}
+	if s.messagesAPI != nil {
+		s.messagesAPI.ApplyConfig(newCfg)
 	}
 
 	slog.Info(
@@ -591,14 +597,6 @@ func validateReloadCloneTokenSources(cfg *config.Config) error {
 	return nil
 }
 
-func cloneMsgvault(in *config.Msgvault) *config.Msgvault {
-	if in == nil {
-		return nil
-	}
-	out := *in
-	return &out
-}
-
 func cloneReloadedConfig(in *config.Config) config.Config {
 	if in == nil {
 		return config.Config{}
@@ -616,7 +614,7 @@ func cloneReloadedConfig(in *config.Config) config.Config {
 	out.Modes = cloneModeVisibility(in.Modes)
 	out.Agents = cloneConfigAgents(in.Agents)
 	out.DocFolders = slices.Clone(in.DocFolders)
-	out.Msgvault = cloneMsgvault(in.Msgvault)
+	out.Msgvault = messagesapi.CloneConfig(in.Msgvault)
 	out.Tmux.Command = slices.Clone(in.Tmux.Command)
 	if in.Tmux.AgentSessions != nil {
 		v := *in.Tmux.AgentSessions

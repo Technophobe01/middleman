@@ -14,10 +14,11 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.kenn.io/kit/git/env"
+	gitenv "go.kenn.io/kit/git/env"
 	"go.kenn.io/middleman/internal/config"
 	"go.kenn.io/middleman/internal/docs"
 	"go.kenn.io/middleman/internal/procutil"
+	"go.kenn.io/middleman/internal/server/httpapi"
 )
 
 type docsGitRepo struct {
@@ -170,9 +171,9 @@ func TestDocsGitStatusAndChangesEndpointsRejectUnsafeAttributes(t *testing.T) {
 			rr := doDocsJSON(t, srv, http.MethodGet, path, nil)
 
 			require.Equal(http.StatusBadRequest, rr.Code, rr.Body.String())
-			var problem ProblemError
+			var problem httpapi.ProblemError
 			require.NoError(json.NewDecoder(rr.Body).Decode(&problem))
-			assert.Equal(CodeBadRequest, problem.Code)
+			assert.Equal(httpapi.CodeBadRequest, problem.Code)
 			assert.Equal("unsafeGitConfig", problem.Details["reason"])
 		})
 	}
@@ -192,9 +193,9 @@ func TestDocsGitChangesEndpointRejectsUnsafeLocalConfig(t *testing.T) {
 	rr := doDocsJSON(t, srv, http.MethodGet, "/api/v1/docs/folders/f/git/changes", nil)
 
 	require.Equal(http.StatusBadRequest, rr.Code, rr.Body.String())
-	var problem ProblemError
+	var problem httpapi.ProblemError
 	require.NoError(json.NewDecoder(rr.Body).Decode(&problem))
-	assert.Equal(CodeBadRequest, problem.Code)
+	assert.Equal(httpapi.CodeBadRequest, problem.Code)
 	assert.Equal("unsafeGitConfig", problem.Details["reason"])
 }
 
@@ -214,9 +215,9 @@ func TestDocsGitReadEndpointsRejectNonLoopback(t *testing.T) {
 		srv.ServeHTTP(rr, req)
 
 		require.Equal(http.StatusForbidden, rr.Code, rr.Body.String())
-		var problem ProblemError
+		var problem httpapi.ProblemError
 		require.NoError(json.NewDecoder(rr.Body).Decode(&problem))
-		assert.Equal(CodeForbidden, problem.Code)
+		assert.Equal(httpapi.CodeForbidden, problem.Code)
 		assert.Equal("loopbackOnly", problem.Details["reason"])
 	}
 }
@@ -302,9 +303,9 @@ func TestDocsGitPublishEndpointRejectsNonLoopback(t *testing.T) {
 	srv.ServeHTTP(rr, req)
 
 	require.Equal(http.StatusForbidden, rr.Code, rr.Body.String())
-	var problem ProblemError
+	var problem httpapi.ProblemError
 	require.NoError(json.NewDecoder(rr.Body).Decode(&problem))
-	assert.Equal(CodeForbidden, problem.Code)
+	assert.Equal(httpapi.CodeForbidden, problem.Code)
 	assert.Equal("loopbackOnly", problem.Details["reason"])
 }
 
@@ -340,7 +341,7 @@ func TestDocsGitPublishEndpointErrors(t *testing.T) {
 		"message": "   \n\t",
 	})
 	require.Equal(http.StatusBadRequest, emptyRR.Code, emptyRR.Body.String())
-	var empty ProblemError
+	var empty httpapi.ProblemError
 	require.NoError(json.NewDecoder(emptyRR.Body).Decode(&empty))
 	assert.Equal("emptyMessage", empty.Details["reason"])
 
@@ -361,7 +362,7 @@ func TestDocsGitPublishEndpointNoUpstreamAndCommitFailure(t *testing.T) {
 		"message": "docs: x",
 	})
 	require.Equal(http.StatusBadRequest, noUpstreamRR.Code, noUpstreamRR.Body.String())
-	var noUpstreamProblem ProblemError
+	var noUpstreamProblem httpapi.ProblemError
 	require.NoError(json.NewDecoder(noUpstreamRR.Body).Decode(&noUpstreamProblem))
 	assert.Equal("noUpstream", noUpstreamProblem.Details["reason"])
 	assert.Contains(noUpstreamProblem.Detail, "git push -u origin main")
@@ -380,7 +381,7 @@ func TestDocsGitPublishEndpointNoUpstreamAndCommitFailure(t *testing.T) {
 		"message": "docs: x",
 	})
 	require.Equal(http.StatusInternalServerError, commitFailRR.Code, commitFailRR.Body.String())
-	var commitFailProblem ProblemError
+	var commitFailProblem httpapi.ProblemError
 	require.NoError(json.NewDecoder(commitFailRR.Body).Decode(&commitFailProblem))
 	assert.Equal("commitFailed", commitFailProblem.Details["reason"])
 	assert.Contains(strings.ToLower(commitFailProblem.Detail), "lock")
@@ -400,7 +401,7 @@ func TestDocsGitPublishEndpointRejectsUnsafeGitConfig(t *testing.T) {
 	})
 
 	require.Equal(http.StatusBadRequest, rr.Code, rr.Body.String())
-	var problem ProblemError
+	var problem httpapi.ProblemError
 	require.NoError(json.NewDecoder(rr.Body).Decode(&problem))
 	assert.Equal("unsafeGitConfig", problem.Details["reason"])
 }
@@ -517,7 +518,7 @@ func TestDocsGitPublishEndpointProblemMappings(t *testing.T) {
 			})
 
 			require.Equal(tc.wantStatus, rr.Code, rr.Body.String())
-			var problem ProblemError
+			var problem httpapi.ProblemError
 			require.NoError(json.NewDecoder(rr.Body).Decode(&problem))
 			assert.Equal(tc.wantReason, problem.Details["reason"])
 			if tc.wantReason == "pushFailedAfterCommit" {
@@ -528,47 +529,18 @@ func TestDocsGitPublishEndpointProblemMappings(t *testing.T) {
 	}
 }
 
-func TestDocsPublishLockSetReleasesAndScopesPerFolder(t *testing.T) {
-	assert := assert.New(t)
-	locks := newDocsPublishLockSet()
-
-	assert.True(locks.tryAcquire("a"))
-	assert.False(locks.tryAcquire("a"))
-	assert.True(locks.tryAcquire("b"))
-	locks.release("a")
-	assert.True(locks.tryAcquire("a"))
-	locks.release("a")
-	locks.release("b")
-}
-
-func TestDocsGitPublishEndpointLockHeldReturnsConflict(t *testing.T) {
-	assert := assert.New(t)
-	require := require.New(t)
-	repo := newDocsGitRepo(t, true)
-	repo.write(t, "new.md", "# new\n")
-	srv := setupDocsGitRouteServer(t, repo.dir)
-	folder, lookupErr := srv.docsRegistry.Lookup("f")
-	require.NoError(lookupErr)
-	require.True(srv.docsPublishLocks.tryAcquire(folder.Path))
-	defer srv.docsPublishLocks.release(folder.Path)
-
-	rr := doDocsJSON(t, srv, http.MethodPost, "/api/v1/docs/folders/f/git/publish", map[string]string{
-		"message": "docs: x",
-	})
-
-	require.Equal(http.StatusConflict, rr.Code, rr.Body.String())
-	var problem ProblemError
-	require.NoError(json.NewDecoder(rr.Body).Decode(&problem))
-	assert.Equal(CodeConflict, problem.Code)
-	assert.Equal("publishInProgress", problem.Details["reason"])
-}
-
 func TestDocsGitPublishEndpointRejectsConcurrentInFlightPublish(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 	repo := newDocsGitRepo(t, true)
 	repo.write(t, "blocked.md", "# blocked\n")
-	srv := setupDocsGitRouteServer(t, repo.dir)
+	srv := New(openTestDB(t), nil, nil, "/", &config.Config{
+		DocFolders: []config.DocFolder{
+			{ID: "f", Name: "F", Path: repo.dir},
+			{ID: "alias", Name: "Alias", Path: repo.dir},
+		},
+	}, ServerOptions{})
+	t.Cleanup(func() { gracefulShutdown(t, srv) })
 
 	// The publish safety gate forbids command-bearing config, so hold the
 	// publish in-flight by hanging its push: point origin at an HTTP server
@@ -635,10 +607,17 @@ func TestDocsGitPublishEndpointRejectsConcurrentInFlightPublish(t *testing.T) {
 	}
 
 	require.Equal(http.StatusConflict, conflictRR.Code, conflictRR.Body.String())
-	var problem ProblemError
+	var problem httpapi.ProblemError
 	require.NoError(json.NewDecoder(conflictRR.Body).Decode(&problem))
-	assert.Equal(CodeConflict, problem.Code)
+	assert.Equal(httpapi.CodeConflict, problem.Code)
 	assert.Equal("publishInProgress", problem.Details["reason"])
+
+	aliasPull := doDocsJSON(t, srv, http.MethodPost, "/api/v1/docs/folders/alias/git/pull", nil)
+	require.Equal(http.StatusConflict, aliasPull.Code, aliasPull.Body.String())
+	var aliasProblem httpapi.ProblemError
+	require.NoError(json.NewDecoder(aliasPull.Body).Decode(&aliasProblem))
+	assert.Equal(httpapi.CodeConflict, aliasProblem.Code)
+	assert.Equal("gitOperationInProgress", aliasProblem.Details["reason"])
 
 	// Release the hung push; the first publish commits but fails to push.
 	doRelease()
@@ -650,7 +629,7 @@ func TestDocsGitPublishEndpointRejectsConcurrentInFlightPublish(t *testing.T) {
 		require.Fail("timed out waiting for first publish")
 	}
 	require.Equal(http.StatusBadGateway, firstRR.Code, firstRR.Body.String())
-	var firstProblem ProblemError
+	var firstProblem httpapi.ProblemError
 	require.NoError(json.NewDecoder(firstRR.Body).Decode(&firstProblem))
 	assert.Equal("pushFailedAfterCommit", firstProblem.Details["reason"])
 
@@ -730,7 +709,7 @@ func TestDocsGitPullEndpointDivergedIs409(t *testing.T) {
 	rr := doDocsJSON(t, srv, http.MethodPost, "/api/v1/docs/folders/f/git/pull", nil)
 
 	require.Equal(http.StatusConflict, rr.Code, rr.Body.String())
-	var problem ProblemError
+	var problem httpapi.ProblemError
 	require.NoError(json.NewDecoder(rr.Body).Decode(&problem))
 	assert.Equal("diverged", problem.Details["reason"])
 }
@@ -744,55 +723,8 @@ func TestDocsGitPullEndpointNoUpstreamIs400(t *testing.T) {
 	rr := doDocsJSON(t, srv, http.MethodPost, "/api/v1/docs/folders/f/git/pull", nil)
 
 	require.Equal(http.StatusBadRequest, rr.Code, rr.Body.String())
-	var problem ProblemError
+	var problem httpapi.ProblemError
 	require.NoError(json.NewDecoder(rr.Body).Decode(&problem))
 	assert.Equal("noUpstream", problem.Details["reason"])
 	assert.Contains(problem.Details["suggested_command"], "--set-upstream-to")
-}
-
-func TestDocsGitPullEndpointHeldLockIs409(t *testing.T) {
-	assert := assert.New(t)
-	require := require.New(t)
-	repo := newDocsGitRepo(t, true)
-	srv := setupDocsGitRouteServer(t, repo.dir)
-	folder, lookupErr := srv.docsRegistry.Lookup("f")
-	require.NoError(lookupErr)
-	require.True(srv.docsPublishLocks.tryAcquire(folder.Path))
-	defer srv.docsPublishLocks.release(folder.Path)
-
-	rr := doDocsJSON(t, srv, http.MethodPost, "/api/v1/docs/folders/f/git/pull", nil)
-
-	require.Equal(http.StatusConflict, rr.Code, rr.Body.String())
-	var problem ProblemError
-	require.NoError(json.NewDecoder(rr.Body).Decode(&problem))
-	assert.Equal("gitOperationInProgress", problem.Details["reason"])
-}
-
-// Two folder IDs registered over one path must contend for the same lock:
-// git operations are per-repository, and FETCH_HEAD is repo-global state.
-func TestDocsGitPullEndpointAliasedFoldersShareLock(t *testing.T) {
-	assert := assert.New(t)
-	require := require.New(t)
-	repo := newDocsGitRepo(t, true)
-	cfg := &config.Config{
-		DocFolders: []config.DocFolder{
-			{ID: "f", Name: "F", Path: repo.dir},
-			{ID: "alias", Name: "Alias", Path: repo.dir},
-		},
-	}
-	srv := New(openTestDB(t), nil, nil, "/", cfg, ServerOptions{})
-	t.Cleanup(func() { gracefulShutdown(t, srv) })
-	// Acquire through the primary ID's canonical path; the aliased ID must
-	// contend for the same key.
-	folder, lookupErr := srv.docsRegistry.Lookup("f")
-	require.NoError(lookupErr)
-	require.True(srv.docsPublishLocks.tryAcquire(folder.Path))
-	defer srv.docsPublishLocks.release(folder.Path)
-
-	rr := doDocsJSON(t, srv, http.MethodPost, "/api/v1/docs/folders/alias/git/pull", nil)
-
-	require.Equal(http.StatusConflict, rr.Code, rr.Body.String())
-	var problem ProblemError
-	require.NoError(json.NewDecoder(rr.Body).Decode(&problem))
-	assert.Equal("gitOperationInProgress", problem.Details["reason"])
 }

@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"go.kenn.io/middleman/internal/db"
+	"go.kenn.io/middleman/internal/server/httpapi"
+	"go.kenn.io/middleman/internal/server/workspaceapi"
 	"go.kenn.io/middleman/internal/workspace/localruntime"
 )
 
@@ -86,23 +88,23 @@ func (s *Server) launchHostRuntimeSession(
 	input *launchHostRuntimeSessionInput,
 ) (*hostRuntimeSessionOutput, error) {
 	if s.runtime == nil {
-		return nil, problemServiceUnavailable("host runtime not configured")
+		return nil, httpapi.ServiceUnavailable("host runtime not configured")
 	}
 	if len(input.Body.Command) == 0 {
-		return nil, problemValidation("body.command", "command is required")
+		return nil, httpapi.Validation("body.command", "command is required")
 	}
 	if strings.TrimSpace(input.Body.Command[0]) == "" {
-		return nil, problemValidation(
+		return nil, httpapi.Validation(
 			"body.command", "command executable must not be empty",
 		)
 	}
 	cwd := expandHomeCWD(strings.TrimSpace(input.Body.CWD))
 	if cwd == "" {
-		return nil, problemValidation("body.cwd", "cwd is required")
+		return nil, httpapi.Validation("body.cwd", "cwd is required")
 	}
 	for key := range input.Body.Env {
 		if !localruntime.IsShellIdentifier(key) {
-			return nil, problemValidation(
+			return nil, httpapi.Validation(
 				"body.env",
 				"env var "+strconv.Quote(key)+" is not a valid shell identifier",
 			)
@@ -120,7 +122,7 @@ func (s *Server) launchHostRuntimeSession(
 		},
 	)
 	if err != nil {
-		return nil, projectWorktreeRuntimeLaunchError(err)
+		return nil, workspaceapi.RuntimeLaunchError(err)
 	}
 	// Always upsert with the returned session's generation: ensure semantics
 	// can return a live reused session or a brand-new one, and the stored
@@ -142,7 +144,7 @@ func (s *Server) launchHostRuntimeSession(
 			if !session.Reused {
 				_ = s.runtime.Stop(ctx, hostRuntimeScope, session.Key)
 			}
-			return nil, problemInternal(
+			return nil, httpapi.Internal(
 				"record host runtime tmux session: " + err.Error(),
 			)
 		}
@@ -157,7 +159,7 @@ func (s *Server) listHostRuntimeSessions(
 	_ *struct{},
 ) (*listHostRuntimeSessionsOutput, error) {
 	if s.runtime == nil {
-		return nil, problemServiceUnavailable("host runtime not configured")
+		return nil, httpapi.ServiceUnavailable("host runtime not configured")
 	}
 	runtimeSessions := s.runtime.ListSessions(hostRuntimeScope)
 	runtimeByKey := make(
@@ -168,7 +170,7 @@ func (s *Server) listHostRuntimeSessions(
 	}
 	stored, err := s.db.ListHostRuntimeTmuxSessions(ctx)
 	if err != nil {
-		return nil, problemInternal(
+		return nil, httpapi.Internal(
 			"list host runtime tmux sessions: " + err.Error(),
 		)
 	}
@@ -207,7 +209,7 @@ func (s *Server) stopHostRuntimeSession(
 	input *hostRuntimeSessionKeyInput,
 ) (*struct{}, error) {
 	if s.runtime == nil {
-		return nil, problemServiceUnavailable("host runtime not configured")
+		return nil, httpapi.ServiceUnavailable("host runtime not configured")
 	}
 	if err := s.runtime.Stop(
 		ctx, hostRuntimeScope, input.SessionKey,
@@ -217,23 +219,23 @@ func (s *Server) stopHostRuntimeSession(
 				ctx, input.SessionKey,
 			)
 			if stopErr != nil {
-				return nil, problemInternal(
+				return nil, httpapi.Internal(
 					"stop stored host runtime session: " + stopErr.Error(),
 				)
 			}
 			if stopped {
 				return nil, nil
 			}
-			return nil, problemNotFound(CodeNotFound, err.Error(), nil)
+			return nil, httpapi.NotFound(httpapi.CodeNotFound, err.Error(), nil)
 		}
-		return nil, problemInternal(
+		return nil, httpapi.Internal(
 			"stop host runtime session: " + err.Error(),
 		)
 	}
 	if err := s.db.DeleteHostRuntimeTmuxSession(
 		ctx, input.SessionKey,
 	); err != nil {
-		return nil, problemInternal(
+		return nil, httpapi.Internal(
 			"forget host runtime tmux session: " + err.Error(),
 		)
 	}
@@ -252,7 +254,7 @@ func (s *Server) stopStoredHostRuntimeTmuxSession(
 		if row.SessionKey != sessionKey {
 			continue
 		}
-		if err := killProjectRuntimeTmuxSession(
+		if err := workspaceapi.KillRuntimeTmuxSession(
 			ctx, s.cfg.TmuxCommand(), row.SessionName,
 		); err != nil {
 			return true, err
@@ -270,10 +272,10 @@ func (s *Server) stopStoredHostRuntimeTmuxSession(
 func (s *Server) getHostRuntimeSessionAttachSpec(
 	ctx context.Context,
 	input *hostRuntimeSessionKeyInput,
-) (*runtimeAttachSpecOutput, error) {
+) (*workspaceapi.RuntimeAttachSpecOutput, error) {
 	rows, err := s.db.ListHostRuntimeTmuxSessions(ctx)
 	if err != nil {
-		return nil, problemInternal(
+		return nil, httpapi.Internal(
 			"list host runtime tmux sessions: " + err.Error(),
 		)
 	}
@@ -281,16 +283,16 @@ func (s *Server) getHostRuntimeSessionAttachSpec(
 		if row.SessionKey != input.SessionKey {
 			continue
 		}
-		spec, err := runtimeAttachSpec(
+		spec, err := workspaceapi.RuntimeAttachSpec(
 			ctx, s.cfg.TmuxCommand(), input.SessionKey, "",
 			row.SessionName,
 		)
 		if err != nil {
 			return nil, err
 		}
-		return &runtimeAttachSpecOutput{Body: spec}, nil
+		return &workspaceapi.RuntimeAttachSpecOutput{Body: spec}, nil
 	}
-	return nil, problemNotFound(CodeNotFound, "runtime session not found", nil)
+	return nil, httpapi.NotFound(httpapi.CodeNotFound, "runtime session not found", nil)
 }
 
 func hostRuntimeSessionFromRuntime(

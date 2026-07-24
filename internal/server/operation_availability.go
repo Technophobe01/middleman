@@ -6,15 +6,37 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/danielgtaylor/huma/v2"
 	"go.kenn.io/middleman/internal/db"
 	"go.kenn.io/middleman/internal/platform"
 	"go.kenn.io/middleman/internal/ratelimit"
+	"go.kenn.io/middleman/internal/server/httpapi"
 	"go.kenn.io/middleman/internal/tokenauth"
 )
 
+const (
+	capabilityCommentMutation             = "comment_mutation"
+	capabilityStateMutation               = "state_mutation"
+	capabilityMergeMutation               = "merge_mutation"
+	capabilityReviewMutation              = "review_mutation"
+	capabilityWorkflowApproval            = "workflow_approval"
+	capabilityReadyForReview              = "ready_for_review"
+	capabilityDraftMutation               = "draft_mutation"
+	capabilityIssueMutation               = "issue_mutation"
+	capabilityReadLabels                  = "read_labels"
+	capabilityLabelMutation               = "label_mutation"
+	capabilityAssigneeMutation            = "assignee_mutation"
+	capabilityReviewerMutation            = "reviewer_mutation"
+	capabilityThreadReply                 = "thread_reply"
+	capabilityThreadResolve               = "thread_resolve"
+	capabilityReviewDraftMutation         = "review_draft_mutation"
+	capabilityReviewThreadResolution      = "review_thread_resolution"
+	capabilityReviewSuggestionApplication = "review_suggestion_application"
+	capabilityReadReviewThreads           = "read_review_threads"
+	capabilityMutationHeadBinding         = "mutation_head_binding"
+)
+
 // Operation names. These string literals are the JSON field names
-// of RepoOperations and are part of the wire contract; renaming one
+// of httpapi.RepoOperations and are part of the wire contract; renaming one
 // is a breaking change for clients pinned to an older schema.
 const (
 	operationMergePR               = "merge_pr"
@@ -61,20 +83,12 @@ const (
 	apiBucketGraphQL
 )
 
-// OperationAvailability is the wire-level shape describing whether
+// httpapi.OperationAvailability is the wire-level shape describing whether
 // a write operation can be invoked against a repository right now.
 // It collapses the inputs the UI would otherwise have to mirror
 // piecemeal: provider capability flags, per-repo viewer permissions,
 // and host-wide rate-limit state.
-type OperationAvailability struct {
-	Available          bool   `json:"available"`
-	Code               string `json:"code,omitempty"`
-	UnavailableReason  string `json:"unavailable_reason,omitempty"`
-	RequiredCapability string `json:"required_capability,omitempty"`
-	RetryAt            string `json:"retry_at,omitempty"`
-}
-
-// RepoOperations carries the availability of every supported write
+// httpapi.RepoOperations carries the availability of every supported write
 // operation for a repository. Naming each operation as a struct
 // field (rather than a free-form string-keyed map) makes the set of
 // operations part of the OpenAPI contract: clients get typed access
@@ -88,31 +102,6 @@ type OperationAvailability struct {
 // gating (the pre-operations behavior) rather than disabling. The
 // frontend helper packages/ui/.../operation-gates.ts implements this
 // side of the contract.
-type RepoOperations struct {
-	MergePR               OperationAvailability `json:"merge_pr"`
-	ClosePR               OperationAvailability `json:"close_pr"`
-	ReopenPR              OperationAvailability `json:"reopen_pr"`
-	MarkReadyForReview    OperationAvailability `json:"mark_ready_for_review"`
-	MarkDraft             OperationAvailability `json:"mark_draft"`
-	SubmitReview          OperationAvailability `json:"submit_review"`
-	ReviewDraft           OperationAvailability `json:"review_draft"`
-	AddComment            OperationAvailability `json:"add_comment"`
-	EditComment           OperationAvailability `json:"edit_comment"`
-	DeleteComment         OperationAvailability `json:"delete_comment"`
-	AddLabel              OperationAvailability `json:"add_label"`
-	RemoveLabel           OperationAvailability `json:"remove_label"`
-	SetAssignees          OperationAvailability `json:"set_assignees"`
-	SetReviewers          OperationAvailability `json:"set_reviewers"`
-	CreateIssue           OperationAvailability `json:"create_issue"`
-	CloseIssue            OperationAvailability `json:"close_issue"`
-	ReopenIssue           OperationAvailability `json:"reopen_issue"`
-	ApproveWorkflow       OperationAvailability `json:"approve_workflow"`
-	UpdateContent         OperationAvailability `json:"update_content"`
-	ReplyReviewThread     OperationAvailability `json:"reply_review_thread"`
-	ResolveReviewThread   OperationAvailability `json:"resolve_review_thread"`
-	ApplyReviewSuggestion OperationAvailability `json:"apply_review_suggestion"`
-}
-
 // operationDescriptor lists the capabilities an operation needs and
 // the API bucket or buckets it consumes. requiredCapabilities is checked in
 // declaration order so the first missing capability becomes
@@ -181,22 +170,22 @@ var (
 // buckets. Each operation consults only the bucket it consumes, so
 // a paused GraphQL tracker does not block REST-backed operations
 // and vice versa.
-func (s *Server) repoOperations(repo db.Repo) RepoOperations {
+func (s *Server) repoOperations(repo db.Repo) httpapi.RepoOperations {
 	return s.repoOperationsWithContext(repo, operationAvailabilityContext{})
 }
 
 func (s *Server) repoOperationsWithContext(
 	repo db.Repo,
 	opContext operationAvailabilityContext,
-) RepoOperations {
-	caps := s.capabilitiesForRepo(repo)
+) httpapi.RepoOperations {
+	caps := s.repoResolver.CapabilitiesForRepo(repo)
 	writeCred := s.writeCredentialGateForRepo(repo)
-	derive := func(op operationDescriptor) OperationAvailability {
+	derive := func(op operationDescriptor) httpapi.OperationAvailability {
 		return deriveOperationAvailabilityWithContext(
 			op, caps, repo, s.mutationOperationRateLimit(repo, op), writeCred, opContext,
 		)
 	}
-	return RepoOperations{
+	return httpapi.RepoOperations{
 		MergePR:               derive(descMergePR),
 		ClosePR:               derive(descClosePR),
 		ReopenPR:              derive(descReopenPR),
@@ -233,7 +222,7 @@ func (s *Server) repoOperationsForMergeRequest(
 	ctx context.Context,
 	repo db.Repo,
 	mr db.MergeRequest,
-) RepoOperations {
+) httpapi.RepoOperations {
 	ops := s.repoOperationsWithContext(repo, operationAvailabilityContext{})
 	if !ops.SubmitReview.Available {
 		return ops
@@ -247,15 +236,15 @@ func (s *Server) repoOperationsForMergeRequest(
 
 func deriveOperationAvailabilityWithContext(
 	op operationDescriptor,
-	caps providerCapabilitiesResponse,
+	caps httpapi.ProviderCapabilitiesResponse,
 	repo db.Repo,
 	rate rateLimitAvailability,
 	writeCred writeCredentialGate,
 	opContext operationAvailabilityContext,
-) OperationAvailability {
+) httpapi.OperationAvailability {
 	for _, capability := range op.requiredCapabilities {
-		if !capabilityEnabled(caps, capability) {
-			return OperationAvailability{
+		if !httpapi.CapabilityEnabled(caps, capability) {
+			return httpapi.OperationAvailability{
 				Code:               availabilityCodeUnsupportedCapability,
 				UnavailableReason:  fmt.Sprintf("Provider does not support %s", capability),
 				RequiredCapability: capability,
@@ -263,13 +252,13 @@ func deriveOperationAvailabilityWithContext(
 		}
 	}
 	if writeCred.code != "" {
-		return OperationAvailability{
+		return httpapi.OperationAvailability{
 			Code:              writeCred.code,
 			UnavailableReason: writeCred.reason,
 		}
 	}
 	if op.name == operationMergePR && !repo.ViewerCanMerge {
-		return OperationAvailability{
+		return httpapi.OperationAvailability{
 			Code:              availabilityCodeViewerCannotMerge,
 			UnavailableReason: "You do not have permission to merge in this repository",
 		}
@@ -278,31 +267,20 @@ func deriveOperationAvailabilityWithContext(
 		return selfApprovalUnavailable()
 	}
 	if rate.limited {
-		return OperationAvailability{
+		return httpapi.OperationAvailability{
 			Code:              availabilityCodeRateLimited,
 			UnavailableReason: rate.reason,
 			RetryAt:           rate.retryAt,
 		}
 	}
-	return OperationAvailability{Available: true}
+	return httpapi.OperationAvailability{Available: true}
 }
 
-func selfApprovalUnavailable() OperationAvailability {
-	return OperationAvailability{
+func selfApprovalUnavailable() httpapi.OperationAvailability {
+	return httpapi.OperationAvailability{
 		Code:              availabilityCodeSelfApproval,
 		UnavailableReason: "You cannot approve your own pull request",
 	}
-}
-
-func selfApprovalProblem(repo db.Repo) huma.StatusError {
-	return problemForbidden(
-		"You cannot approve your own pull request",
-		map[string]any{
-			"reason":       availabilityCodeSelfApproval,
-			"provider":     string(repoProviderKind(repo)),
-			"platformHost": repoProviderHost(repo),
-		},
-	)
 }
 
 func (s *Server) mergeRequestAuthoredByViewer(
@@ -314,13 +292,13 @@ func (s *Server) mergeRequestAuthoredByViewer(
 		return false
 	}
 	resolver, err := s.syncer.Registry().MergeRequestViewerResolver(
-		repoProviderKind(repo), repoProviderHost(repo),
+		httpapi.ProviderKind(repo), httpapi.ProviderHost(repo),
 	)
 	if err != nil {
 		return false
 	}
 	authored, err := resolver.ViewerAuthoredMergeRequest(ctx, platform.MergeRequest{
-		Repo:   platformRepoRefFromDB(repo),
+		Repo:   httpapi.PlatformRepoRef(repo),
 		Number: mr.Number,
 		Author: mr.Author,
 	})
@@ -344,7 +322,7 @@ func (s *Server) operationRateLimit(
 
 func (s *Server) operationRateLimitBuckets(repo db.Repo, op operationDescriptor) ([]apiBucket, bool) {
 	if s != nil && s.syncer != nil && s.syncer.Registry() != nil {
-		provider, err := s.syncer.Registry().Provider(repoProviderKind(repo), repoProviderHost(repo))
+		provider, err := s.syncer.Registry().Provider(httpapi.ProviderKind(repo), httpapi.ProviderHost(repo))
 		if err == nil {
 			if reporter, ok := provider.(platform.OperationRateLimitReporter); ok {
 				if buckets, ok := reporter.OperationRateLimitBuckets(platform.OperationName(op.name)); ok {
@@ -412,7 +390,7 @@ type rateLimitAvailability struct {
 }
 
 // mutationRateLimitedReason resolves the rate state gating a write
-// operation. Every operation in RepoOperations is a mutation, and
+// operation. Every operation in httpapi.RepoOperations is a mutation, and
 // mutations authenticate with the host's write credential (the user's
 // PAT when a GitHub App handles sync reads). When the host has a
 // dedicated write tracker for the bucket the operation consumes, that
@@ -426,8 +404,8 @@ func (s *Server) mutationRateLimitedReason(
 	if s == nil || s.syncer == nil {
 		return rateLimitAvailability{}
 	}
-	host := repoProviderHost(repo)
-	key := ratelimit.RateBucketKey(string(repoProviderKind(repo)), host)
+	host := httpapi.ProviderHost(repo)
+	key := ratelimit.RateBucketKey(string(httpapi.ProviderKind(repo)), host)
 	var writeTrackers map[string]*ratelimit.RateTracker
 	switch bucket {
 	case apiBucketREST:
@@ -450,8 +428,8 @@ func (s *Server) rateLimitedReason(repo db.Repo, bucket apiBucket) rateLimitAvai
 	if s == nil || s.syncer == nil {
 		return rateLimitAvailability{}
 	}
-	host := repoProviderHost(repo)
-	providerName := string(repoProviderKind(repo))
+	host := httpapi.ProviderHost(repo)
+	providerName := string(httpapi.ProviderKind(repo))
 	key := ratelimit.RateBucketKey(providerName, host)
 
 	var trackers map[string]*ratelimit.RateTracker
@@ -528,8 +506,8 @@ func (s *Server) writeCredentialGateForRepo(repo db.Repo) writeCredentialGate {
 		return writeCredentialGate{}
 	}
 	key := tokenauth.Key{
-		Platform: string(repoProviderKind(repo)),
-		Host:     repoProviderHost(repo),
+		Platform: string(httpapi.ProviderKind(repo)),
+		Host:     httpapi.ProviderHost(repo),
 	}
 	src, ok := s.tokenSources.Get(key)
 	if !ok || src == nil {

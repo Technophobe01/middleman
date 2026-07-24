@@ -46,6 +46,17 @@ func setupTestServerWithConfigContent(
 	cfgContent string,
 	mock *mockGH,
 ) (*Server, *db.DB, string) {
+	return setupTestServerWithConfigContentAndOptions(
+		t, cfgContent, mock, ServerOptions{HostCheckAllowLoopbackAnyPort: true},
+	)
+}
+
+func setupTestServerWithConfigContentAndOptions(
+	t *testing.T,
+	cfgContent string,
+	mock *mockGH,
+	options ServerOptions,
+) (*Server, *db.DB, string) {
 	t.Helper()
 
 	dir := t.TempDir()
@@ -68,7 +79,7 @@ func setupTestServerWithConfigContent(
 	t.Cleanup(syncer.Stop)
 	srv := NewWithConfig(
 		database, syncer, nil, nil, cfg, cfgPath,
-		ServerOptions{HostCheckAllowLoopbackAnyPort: true},
+		options,
 	)
 	return srv, database, cfgPath
 }
@@ -426,6 +437,30 @@ func TestHandleUpdateSettingsPersistsModes(t *testing.T) {
 	assert.True(*cfg2.Modes.Issues)
 	assert.True(*cfg2.Modes.Board)
 	assert.True(*cfg2.Modes.Reviews)
+}
+
+func TestHandleUpdateSettingsPublishesPullConfigOnlyAfterPersistence(t *testing.T) {
+	require := require.New(t)
+	srv, _, _ := setupTestServerWithConfig(t)
+	require.False(srv.pullAPI.ConfigSnapshot().AllowMidStackMerges)
+
+	enabled := config.PullRequests{AllowMidStackMerges: true}
+	rr := doJSON(t, srv, http.MethodPut, "/api/v1/settings", updateSettingsRequest{
+		PullRequests: &enabled,
+	})
+	require.Equal(http.StatusOK, rr.Code, rr.Body.String())
+	require.True(srv.pullAPI.ConfigSnapshot().AllowMidStackMerges)
+
+	srv.cfgPath = t.TempDir()
+	disabled := config.PullRequests{AllowMidStackMerges: false}
+	rr = doJSON(t, srv, http.MethodPut, "/api/v1/settings", updateSettingsRequest{
+		PullRequests: &disabled,
+	})
+	require.Equal(http.StatusInternalServerError, rr.Code, rr.Body.String())
+	require.True(
+		srv.pullAPI.ConfigSnapshot().AllowMidStackMerges,
+		"failed persistence published an uncommitted Pull config",
+	)
 }
 
 func TestHandleUpdateSettingsPersistsKataProjectMappings(t *testing.T) {

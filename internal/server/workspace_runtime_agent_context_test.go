@@ -19,6 +19,7 @@ import (
 	"go.kenn.io/middleman/internal/config"
 	"go.kenn.io/middleman/internal/db"
 	ghclient "go.kenn.io/middleman/internal/github"
+	"go.kenn.io/middleman/internal/server/workspaceapi"
 	"go.kenn.io/middleman/internal/testutil/dbtest"
 	"go.kenn.io/middleman/internal/workspace"
 	"go.kenn.io/middleman/internal/workspace/localruntime"
@@ -26,6 +27,7 @@ import (
 
 func TestLaunchWorkspaceRuntimeSessionPreparesAgentContext(t *testing.T) {
 	t.Parallel()
+	acquireRootWorkspaceGitSlot(t)
 	assert := assert.New(t)
 	require := require.New(t)
 	d := dbtest.Open(t)
@@ -79,15 +81,15 @@ func TestLaunchWorkspaceRuntimeSessionPreparesAgentContext(t *testing.T) {
 		TmuxCommand:             []string{tmuxPath},
 		WrapAgentSessionsInTmux: true,
 	})
-	server := &Server{
-		db:         d,
-		workspaces: workspace.NewManager(d, t.TempDir()),
-		runtime:    runtime,
-	}
-	input := &launchWorkspaceRuntimeSessionInput{ID: ws.ID}
+	handler := workspaceapi.New(workspaceapi.Deps{
+		DB:         d,
+		Workspaces: workspace.NewManager(d, t.TempDir()),
+		Runtime:    runtime,
+	})
+	input := &workspaceapi.LaunchWorkspaceRuntimeSessionInput{ID: ws.ID}
 	input.Body.TargetKey = "Codex yolo"
 
-	_, err := server.launchWorkspaceRuntimeSession(t.Context(), input)
+	_, err := handler.LaunchWorkspaceRuntimeSession(t.Context(), input)
 	require.NoError(err)
 
 	override, err := os.ReadFile(filepath.Join(worktree, "AGENTS.override.md"))
@@ -202,35 +204,23 @@ func TestWorkspaceRuntimeLaunchWritesIssueAndKataAgentContextE2E(t *testing.T) {
 	database := dbtest.Open(t)
 	syncer := ghclient.NewSyncer(nil, database, nil, nil, time.Minute, nil, nil)
 	t.Cleanup(syncer.Stop)
+	tmuxPath := writeRuntimeTmuxLifecycleRecorder(t, dir, filepath.Join(dir, "tmux-record"))
+	cfg := &config.Config{
+		Tmux: config.Tmux{Command: []string{tmuxPath}},
+		Agents: []config.Agent{{
+			Key:     "codex",
+			Label:   "Codex",
+			Command: []string{"/bin/sh", "-c", "exit 0"},
+		}},
+	}
 	srv := New(
-		database, syncer, nil, "/", nil,
+		database, syncer, nil, "/", cfg,
 		ServerOptions{
 			WorktreeDir:                        filepath.Join(dir, "worktrees"),
 			DisableWorkspaceBackgroundMonitors: true,
 		},
 	)
 	t.Cleanup(func() { gracefulShutdown(t, srv) })
-	tmuxPath := writeRuntimeTmuxLifecycleRecorder(t, dir, filepath.Join(dir, "tmux-record"))
-	srv.runtime = localruntime.NewManager(localruntime.Options{
-		Targets: []localruntime.LaunchTarget{
-			{
-				Key:       "codex",
-				Label:     "Codex",
-				Kind:      localruntime.LaunchTargetAgent,
-				Command:   []string{"/bin/sh", "-c", "exit 0"},
-				Available: true,
-			},
-			{
-				Key:       string(localruntime.LaunchTargetShell),
-				Label:     "tmux",
-				Kind:      localruntime.LaunchTargetShell,
-				Command:   []string{tmuxPath},
-				Available: true,
-			},
-		},
-		TmuxCommand:             []string{tmuxPath},
-		WrapAgentSessionsInTmux: true,
-	})
 
 	issueWorktree := initServerWorkspaceGitRepo(t)
 	seedIssue(t, database, "acme", "widget", 7, "open")

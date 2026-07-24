@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -20,7 +21,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/middleman/internal/config"
-	"go.kenn.io/middleman/internal/docs"
+	"go.kenn.io/middleman/internal/db"
 	ghclient "go.kenn.io/middleman/internal/github"
 	"go.kenn.io/middleman/internal/platform"
 	"go.kenn.io/middleman/internal/testutil/dbtest"
@@ -382,6 +383,32 @@ func TestConfigReload_WatcherFiresOnInPlaceEdit(t *testing.T) {
 	assert.Equal("30d", gotActivity.TimeRange)
 }
 
+func TestConfigReloadPublishesPullConfigOnlyAfterSuccessfulReload(t *testing.T) {
+	require := require.New(t)
+	srv, _, _ := setupTestServerWithConfigContent(
+		t, validReloadConfig, &mockGH{},
+	)
+	require.False(srv.pullAPI.ConfigSnapshot().AllowMidStackMerges)
+
+	reloadPath := filepath.Join(t.TempDir(), "reload.toml")
+	srv.cfgPath = reloadPath
+	writeConfigToml(t, reloadPath, validReloadConfig+`
+[pull_requests]
+allow_mid_stack_merges = true
+`)
+	event := srv.applyConfigChange(t.Context())
+	require.True(event.Valid, event.Error)
+	require.True(srv.pullAPI.ConfigSnapshot().AllowMidStackMerges)
+
+	writeConfigToml(t, reloadPath, malformedTomlConfig)
+	event = srv.applyConfigChange(t.Context())
+	require.False(event.Valid)
+	require.True(
+		srv.pullAPI.ConfigSnapshot().AllowMidStackMerges,
+		"failed reload published an invalid Pull config",
+	)
+}
+
 // A server constructed without a syncer (Server.New permits nil; embedded
 // and docs/msgvault-only setups use it) must hot-reload non-sync surfaces
 // instead of panicking in the watcher goroutine. Regression test for a nil
@@ -503,16 +530,13 @@ func TestConfigReload_UpdatesDocFoldersAndRegistry(t *testing.T) {
 	assert.Equal("Handbook", gotCfgFolders[0].Name)
 	assert.Equal(updatedRoot, gotCfgFolders[0].Path)
 
-	gotRegistryFolders := srv.docsRegistry.Folders()
+	gotRegistryFolders := srv.docsAPI.Folders()
 	require.Len(gotRegistryFolders, 1)
 	assert.Equal("handbook", gotRegistryFolders[0].ID)
 	assert.Equal("Handbook", gotRegistryFolders[0].Name)
 	wantRegistryRoot, err := filepath.EvalSymlinks(updatedRoot)
 	require.NoError(err)
 	assert.Equal(wantRegistryRoot, gotRegistryFolders[0].Path)
-	_, err = srv.docsRegistry.Lookup("notes")
-	require.ErrorIs(err, docs.ErrFolderNotFound)
-
 	listRR := doDocsJSON(t, srv, http.MethodGet, "/api/v1/docs/folders", nil)
 	require.Equal(http.StatusOK, listRR.Code, listRR.Body.String())
 	var listBody docsFolderListWire
@@ -531,6 +555,120 @@ func TestConfigReload_UpdatesDocFoldersAndRegistry(t *testing.T) {
 
 	oldReadRR := doDocsJSON(t, srv, http.MethodGet, "/api/v1/docs/folders/notes/file?path=old.md", nil)
 	assert.Equal(http.StatusNotFound, oldReadRR.Code, oldReadRR.Body.String())
+}
+
+func TestConfigReloadThenMsgvaultConfigurePreservesReloadedState(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	t.Setenv("MSGVAULT_API_KEY_TEST", "secret-key")
+	upstream := msgvaultOKUpstream(t)
+	defer upstream.Close()
+
+	srv, _, cfgPath := setupTestServerWithConfigContent(
+		t, validReloadConfig, &mockGH{},
+	)
+	waitForConfigWatcher(t, srv, 2*time.Second)
+	stream := streamConfigEvents(t, srv)
+	defer stream.Close()
+	writeConfigToml(t, cfgPath, validReloadConfigRepoTokenEnv)
+	ev := waitForConfigEvent(t, stream, 2*time.Second)
+	require.True(ev.Valid)
+
+	owner := &msgvaultRuntimeOwner{}
+	srv.runtime = localruntime.NewManager(localruntime.Options{
+		Targets: []localruntime.LaunchTarget{{
+			Key:       "helper",
+			Label:     "Helper",
+			Kind:      localruntime.LaunchTargetAgent,
+			Source:    "test",
+			Command:   []string{"/bin/echo"},
+			Available: true,
+		}},
+		PtyOwnerRuntime: owner,
+	})
+	t.Cleanup(srv.runtime.Shutdown)
+
+	rr := doMsgvaultJSON(t, srv, http.MethodPost, "/api/v1/msgvault/configure", map[string]any{
+		"url":         upstream.URL,
+		"api_key_env": "MSGVAULT_API_KEY_TEST",
+	})
+	require.Equal(http.StatusOK, rr.Code, rr.Body.String())
+	assert.Equal(upstream.URL, decodeMsgvaultHealth(t, rr).URL)
+
+	reloaded, err := config.Load(cfgPath)
+	require.NoError(err)
+	require.Len(reloaded.Repos, 1)
+	assert.Equal("MIDDLEMAN_REPO_TOKEN", reloaded.Repos[0].TokenEnv)
+	require.NotNil(reloaded.Msgvault)
+	assert.Equal(upstream.URL, reloaded.Msgvault.URL)
+
+	srv.cfgMu.Lock()
+	inMemory := cloneReloadedConfig(srv.cfg)
+	srv.cfgMu.Unlock()
+	require.Len(inMemory.Repos, 1)
+	assert.Equal("MIDDLEMAN_REPO_TOKEN", inMemory.Repos[0].TokenEnv)
+	require.NotNil(inMemory.Msgvault)
+	assert.Equal(upstream.URL, inMemory.Msgvault.URL)
+
+	health := doMsgvaultJSON(t, srv, http.MethodGet, "/api/v1/msgvault/health", nil)
+	require.Equal(http.StatusOK, health.Code, health.Body.String())
+	assert.Equal(upstream.URL, decodeMsgvaultHealth(t, health).URL)
+
+	_, err = srv.runtime.Launch(context.Background(), "ws-1", t.TempDir(), "helper")
+	require.NoError(err)
+	assert.Contains(owner.startedStripEnvVars, "MIDDLEMAN_REPO_TOKEN")
+	assert.Contains(owner.startedStripEnvVars, "MSGVAULT_API_KEY_TEST")
+}
+
+func TestConfigReloadSerializesDocsFolderMutation(t *testing.T) {
+	require := require.New(t)
+	initialRoot := t.TempDir()
+	reloadedRoot := t.TempDir()
+	createdRoot := t.TempDir()
+	srv, _, cfgPath := setupTestServerWithConfigContent(
+		t,
+		validReloadConfigWithDocFolder("initial", "Initial", initialRoot),
+		&mockGH{},
+	)
+	writeConfigToml(t, cfgPath, validReloadConfigWithDocFolder("reloaded", "Reloaded", reloadedRoot))
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	var mutation *httptest.ResponseRecorder
+	mutationBody := strings.NewReader(fmt.Sprintf(
+		`{"id":"created","name":"Created","path":%q}`,
+		createdRoot,
+	))
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		srv.handleConfigFileChanged()
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/docs/folders", mutationBody)
+		setAcceptedHostForServerTest(req, srv)
+		req.RemoteAddr = "127.0.0.1:12345"
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(middlemanCSRFHeaderName, "1")
+		mutation = httptest.NewRecorder()
+		srv.ServeHTTP(mutation, req)
+	}()
+	close(start)
+	wg.Wait()
+	require.NotNil(mutation)
+	require.Equal(http.StatusCreated, mutation.Code, mutation.Body.String())
+
+	disk, err := config.Load(cfgPath)
+	require.NoError(err)
+	srv.cfgMu.Lock()
+	inMemory := slices.Clone(srv.cfg.DocFolders)
+	srv.cfgMu.Unlock()
+	registry := srv.docsAPI.Folders()
+	assert.Equal(t, disk.DocFolders, inMemory)
+	assert.Equal(t, disk.DocFolders, registry)
 }
 
 func TestConfigReload_UpdatesMsgvaultHealthHandler(t *testing.T) {
@@ -792,6 +930,53 @@ func TestConfigReload_GitHubTokenEnvChangeUpdatesConfigSnapshot(t *testing.T) {
 	saved, err := config.Load(savePath)
 	require.NoError(err)
 	assert.Equal("MIDDLEMAN_NEW_GITHUB_TOKEN", saved.GitHubTokenEnv)
+}
+
+func TestConfigReloadPublishesCommittedWorkspaceSnapshot(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	srv, database, cfgPath := setupTestServerWithConfigContent(t, `
+host = "127.0.0.1"
+port = 8091
+
+[[agents]]
+key = "before"
+command = ["sh"]
+`, &mockGH{})
+	project, err := database.CreateProject(t.Context(), db.CreateProjectInput{
+		DisplayName: "Workspace config snapshot",
+		LocalPath:   t.TempDir(),
+	})
+	require.NoError(err)
+
+	require.NoError(os.WriteFile(cfgPath, []byte(`
+host = "127.0.0.1"
+port = 8091
+
+[[agents]]
+key = "after"
+command = ["sh"]
+`), 0o644))
+	event := srv.applyConfigChange(t.Context())
+	require.True(event.Valid, event.Error)
+
+	rr := doJSON(
+		t, srv, http.MethodGet,
+		"/api/v1/projects/"+project.ID+"/launch-targets", nil,
+	)
+	require.Equal(http.StatusOK, rr.Code, rr.Body.String())
+	var body struct {
+		LaunchTargets []struct {
+			Key string `json:"key"`
+		} `json:"launch_targets"`
+	}
+	require.NoError(json.NewDecoder(rr.Body).Decode(&body))
+	keys := make([]string, 0, len(body.LaunchTargets))
+	for _, target := range body.LaunchTargets {
+		keys = append(keys, target.Key)
+	}
+	assert.Contains(keys, "after")
+	assert.NotContains(keys, "before")
 }
 
 func TestConfigReload_InvalidTokenSourceKeepsLastKnownGoodSource(t *testing.T) {

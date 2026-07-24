@@ -5,11 +5,12 @@ import (
 	"net/http"
 
 	"go.kenn.io/middleman/internal/config"
+	"go.kenn.io/middleman/internal/server/httpapi"
 
 	"github.com/danielgtaylor/huma/v2"
 )
 
-type getSettingsOutput = bodyOutput[settingsResponse]
+type getSettingsOutput = httpapi.BodyOutput[settingsResponse]
 
 type updateSettingsInput struct {
 	Body updateSettingsRequest
@@ -59,7 +60,7 @@ type repoWorktreeBaseHostInput struct {
 	Body         repoWorktreeBaseRequest
 }
 
-type settingsOutput = bodyOutput[settingsResponse]
+type settingsOutput = httpapi.BodyOutput[settingsResponse]
 
 type setActiveWorktreeInput struct {
 	Body struct {
@@ -89,7 +90,7 @@ type fleetSSHPeersBody struct {
 	RestartRequired bool `json:"restart_required"`
 }
 
-type fleetSSHPeersOutput = bodyOutput[fleetSSHPeersBody]
+type fleetSSHPeersOutput = httpapi.BodyOutput[fleetSSHPeersBody]
 
 type fleetSettingsResponse struct {
 	Enabled         bool                  `json:"enabled"`
@@ -101,7 +102,7 @@ type fleetSettingsResponse struct {
 	RestartRequired bool                  `json:"restart_required"`
 }
 
-type getFleetSettingsOutput = bodyOutput[fleetSettingsResponse]
+type getFleetSettingsOutput = httpapi.BodyOutput[fleetSettingsResponse]
 
 type updateFleetSettingsInput struct {
 	Body struct {
@@ -143,8 +144,8 @@ func (s *Server) getFleetSettings(
 	_ context.Context, _ *struct{},
 ) (*getFleetSettingsOutput, error) {
 	if s.cfgPath == "" {
-		return nil, problemNotFound(
-			CodeSettingsUnavailable, "settings not available", nil,
+		return nil, httpapi.NotFound(
+			httpapi.CodeSettingsUnavailable, "settings not available", nil,
 		)
 	}
 	s.cfgMu.Lock()
@@ -160,10 +161,12 @@ func (s *Server) updateFleetSettings(
 	_ context.Context, input *updateFleetSettingsInput,
 ) (*getFleetSettingsOutput, error) {
 	if s.cfgPath == "" {
-		return nil, problemNotFound(
-			CodeSettingsUnavailable, "settings not available", nil,
+		return nil, httpapi.NotFound(
+			httpapi.CodeSettingsUnavailable, "settings not available", nil,
 		)
 	}
+	s.configReloadMu.Lock()
+	defer s.configReloadMu.Unlock()
 
 	next := config.Fleet{
 		Enabled:     input.Body.Enabled,
@@ -179,13 +182,14 @@ func (s *Server) updateFleetSettings(
 	candidate.Fleet = next
 	if err := candidate.Validate(); err != nil {
 		s.cfgMu.Unlock()
-		return nil, problemBadRequest(CodeBadRequest, err.Error(), nil)
+		return nil, httpapi.BadRequest(httpapi.CodeBadRequest, err.Error(), nil)
 	}
 	if err := candidate.Save(s.cfgPath); err != nil {
 		s.cfgMu.Unlock()
-		return nil, problemInternal("save config: " + err.Error())
+		return nil, httpapi.Internal("save config: " + err.Error())
 	}
 	s.cfg.Fleet = candidate.Fleet
+	s.applyFleetConfigLocked()
 	out := s.buildFleetSettingsResponseLocked()
 	s.cfgMu.Unlock()
 	return &getFleetSettingsOutput{Body: out}, nil
@@ -196,8 +200,8 @@ func (s *Server) getFleetSSHPeers(
 	_ context.Context, _ *struct{},
 ) (*fleetSSHPeersOutput, error) {
 	if s.cfgPath == "" {
-		return nil, problemNotFound(
-			CodeSettingsUnavailable, "settings not available", nil,
+		return nil, httpapi.NotFound(
+			httpapi.CodeSettingsUnavailable, "settings not available", nil,
 		)
 	}
 	s.cfgMu.Lock()
@@ -217,10 +221,12 @@ func (s *Server) updateFleetSSHPeers(
 	_ context.Context, input *updateFleetSSHPeersInput,
 ) (*fleetSSHPeersOutput, error) {
 	if s.cfgPath == "" {
-		return nil, problemNotFound(
-			CodeSettingsUnavailable, "settings not available", nil,
+		return nil, httpapi.NotFound(
+			httpapi.CodeSettingsUnavailable, "settings not available", nil,
 		)
 	}
+	s.configReloadMu.Lock()
+	defer s.configReloadMu.Unlock()
 	next := append(
 		[]config.FleetSSHPeer(nil), input.Body.SSHPeers...,
 	)
@@ -229,11 +235,11 @@ func (s *Server) updateFleetSSHPeers(
 	candidate.Fleet.SSHPeers = next
 	if err := candidate.Validate(); err != nil {
 		s.cfgMu.Unlock()
-		return nil, problemBadRequest(CodeBadRequest, err.Error(), nil)
+		return nil, httpapi.BadRequest(httpapi.CodeBadRequest, err.Error(), nil)
 	}
 	if err := candidate.Save(s.cfgPath); err != nil {
 		s.cfgMu.Unlock()
-		return nil, problemInternal("save config: " + err.Error())
+		return nil, httpapi.Internal("save config: " + err.Error())
 	}
 	s.cfg.Fleet.SSHPeers = candidate.Fleet.SSHPeers
 	persisted := append([]config.FleetSSHPeer(nil), candidate.Fleet.SSHPeers...)
@@ -249,10 +255,7 @@ func (s *Server) updateFleetSSHPeers(
 func (s *Server) fleetSSHPeersRestartRequired(
 	persisted []config.FleetSSHPeer,
 ) bool {
-	var running []config.FleetSSHPeer
-	if s.sshFleet != nil {
-		running = s.sshFleet.snapshotPeers()
-	}
+	running := s.fleetAPI.SSHPeers()
 	if len(persisted) != len(running) {
 		return len(persisted) != 0 || len(running) != 0
 	}

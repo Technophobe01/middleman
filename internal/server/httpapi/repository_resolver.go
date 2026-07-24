@@ -1,0 +1,316 @@
+package httpapi
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+
+	"go.kenn.io/middleman/internal/db"
+	"go.kenn.io/middleman/internal/platform"
+)
+
+var ErrRepoPathRequired = errors.New("repo_path is required")
+var ErrRepoNotFound = errors.New("repo not found")
+var ErrRepositoryStoreUnavailable = errors.New("repository store unavailable")
+
+type RepositoryResolver struct {
+	db                   *db.DB
+	providerCapabilities func(platform.Kind, string) (platform.Capabilities, error)
+}
+
+// LookupRoute resolves the provider-aware route tuple through the canonical
+// repository identity path.
+func (r *RepositoryResolver) LookupRoute(
+	ctx context.Context,
+	provider, platformHost, owner, name string,
+) (*db.Repo, error) {
+	owner = strings.Trim(owner, "/ ")
+	name = strings.Trim(name, "/ ")
+	if owner == "" || name == "" {
+		return nil, ErrRepoPathRequired
+	}
+	return r.Lookup(ctx, provider, platformHost, owner+"/"+name)
+}
+
+// RequireRouteCapability combines canonical route lookup with the shared
+// provider-capability fallback policy.
+func (r *RepositoryResolver) RequireRouteCapability(
+	ctx context.Context,
+	provider, platformHost, owner, name, capability string,
+) (*db.Repo, error) {
+	repo, err := r.LookupRoute(ctx, provider, platformHost, owner, name)
+	if err != nil {
+		return nil, ProviderRouteLookupError(err)
+	}
+	if !CapabilityEnabled(r.Ref(*repo).Capabilities, capability) {
+		return nil, UnsupportedCapability(*repo, capability)
+	}
+	return repo, nil
+}
+
+func ProviderRouteLookupError(err error) error {
+	if errors.Is(err, ErrRepoPathRequired) {
+		return BadRequest(CodeBadRequest, err.Error(), nil)
+	}
+	if errors.Is(err, ErrRepoNotFound) {
+		return NotFound(CodeRepoNotFound, "repo not found", nil)
+	}
+	if strings.Contains(err.Error(), "platform_host is required") ||
+		strings.Contains(err.Error(), "unsupported platform") {
+		return BadRequest(CodeBadRequest, err.Error(), nil)
+	}
+	return Internal("get repo failed")
+}
+
+func ProviderKind(repo db.Repo) platform.Kind {
+	if strings.TrimSpace(repo.Platform) == "" {
+		return platform.KindGitHub
+	}
+	return platform.Kind(repo.Platform)
+}
+
+func ProviderHost(repo db.Repo) string {
+	if strings.TrimSpace(repo.PlatformHost) != "" {
+		return repo.PlatformHost
+	}
+	if host, ok := platform.DefaultHost(ProviderKind(repo)); ok {
+		return host
+	}
+	return platform.DefaultGitHubHost
+}
+
+func PlatformRepoRef(repo db.Repo) platform.RepoRef {
+	repoPath := strings.TrimSpace(repo.RepoPath)
+	if repoPath == "" {
+		repoPath = repo.Owner + "/" + repo.Name
+	}
+	numericID, err := strconv.ParseInt(strings.TrimSpace(repo.PlatformRepoID), 10, 64)
+	if err != nil || numericID <= 0 {
+		numericID = 0
+	}
+	return platform.RepoRef{
+		Platform:           ProviderKind(repo),
+		Host:               ProviderHost(repo),
+		Owner:              repo.Owner,
+		Name:               repo.Name,
+		RepoPath:           repoPath,
+		PlatformID:         numericID,
+		PlatformExternalID: repo.PlatformRepoID,
+		WebURL:             repo.WebURL,
+		CloneURL:           repo.CloneURL,
+		DefaultBranch:      repo.DefaultBranch,
+	}
+}
+
+func CapabilityEnabled(caps ProviderCapabilitiesResponse, capability string) bool {
+	switch capability {
+	case "comment_mutation":
+		return caps.CommentMutation
+	case "state_mutation":
+		return caps.StateMutation
+	case "merge_mutation":
+		return caps.MergeMutation
+	case "review_mutation":
+		return caps.ReviewMutation
+	case "workflow_approval":
+		return caps.WorkflowApproval
+	case "ready_for_review":
+		return caps.ReadyForReview
+	case "draft_mutation":
+		return caps.DraftMutation
+	case "issue_mutation":
+		return caps.IssueMutation
+	case "read_labels":
+		return caps.ReadLabels
+	case "label_mutation":
+		return caps.LabelMutation
+	case "assignee_mutation":
+		return caps.AssigneeMutation
+	case "reviewer_mutation":
+		return caps.ReviewerMutation
+	case "thread_reply":
+		return caps.ThreadReply
+	case "thread_resolve":
+		return caps.ThreadResolve
+	case "review_draft_mutation":
+		return caps.ReviewDraftMutation
+	case "review_thread_resolution":
+		return caps.ReviewThreadResolution
+	case "review_suggestion_application":
+		return caps.ReviewSuggestionApplication
+	case "read_review_threads":
+		return caps.ReadReviewThreads
+	case "mutation_head_binding":
+		return caps.MutationHeadBinding
+	default:
+		return false
+	}
+}
+
+type RepositoryResolverDeps struct {
+	DB                   *db.DB
+	ProviderCapabilities func(platform.Kind, string) (platform.Capabilities, error)
+}
+
+func NewRepositoryResolver(deps RepositoryResolverDeps) *RepositoryResolver {
+	return &RepositoryResolver{
+		db:                   deps.DB,
+		providerCapabilities: deps.ProviderCapabilities,
+	}
+}
+
+func (r *RepositoryResolver) Lookup(
+	ctx context.Context,
+	provider, platformHost, repoPath string,
+) (*db.Repo, error) {
+	if r == nil || r.db == nil {
+		return nil, ErrRepositoryStoreUnavailable
+	}
+	provider = strings.TrimSpace(provider)
+	platformHost = strings.TrimSpace(platformHost)
+	repoPath = strings.Trim(repoPath, "/ ")
+	kind, err := platform.NormalizeKind(provider)
+	if err != nil {
+		return nil, err
+	}
+	provider = string(kind)
+	if platformHost == "" {
+		var ok bool
+		platformHost, ok = platform.DefaultHost(kind)
+		if !ok {
+			return nil, fmt.Errorf("platform_host is required for provider %q", kind)
+		}
+	}
+	if repoPath == "" {
+		return nil, ErrRepoPathRequired
+	}
+	repo, err := r.db.GetRepoByIdentity(ctx, db.RepoIdentity{
+		Platform:     provider,
+		PlatformHost: platformHost,
+		RepoPath:     repoPath,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("lookup repo: %w", err)
+	}
+	if repo == nil {
+		return nil, ErrRepoNotFound
+	}
+	return repo, nil
+}
+
+func (r *RepositoryResolver) List(ctx context.Context) ([]db.Repo, error) {
+	if r == nil || r.db == nil {
+		return nil, ErrRepositoryStoreUnavailable
+	}
+	return r.db.ListRepos(ctx)
+}
+
+func (r *RepositoryResolver) Ref(repo db.Repo) RepoRefResponse {
+	provider := strings.TrimSpace(repo.Platform)
+	if provider == "" {
+		provider = string(platform.KindGitHub)
+	}
+	host := strings.TrimSpace(repo.PlatformHost)
+	if host == "" {
+		host, _ = platform.DefaultHost(platform.Kind(provider))
+	}
+	repoPath := strings.TrimSpace(repo.RepoPath)
+	if repoPath == "" {
+		repoPath = repo.Owner + "/" + repo.Name
+	}
+	return RepoRefResponse{
+		Provider:     provider,
+		PlatformHost: host,
+		RepoPath:     repoPath,
+		Owner:        repo.Owner,
+		Name:         repo.Name,
+		Capabilities: r.Capabilities(platform.Kind(provider), host),
+	}
+}
+
+func (r *RepositoryResolver) RefFromParts(
+	provider, host, owner, name string,
+) RepoRefResponse {
+	return r.Ref(db.Repo{
+		Platform:     provider,
+		PlatformHost: host,
+		Owner:        owner,
+		Name:         name,
+		RepoPath:     owner + "/" + name,
+	})
+}
+
+func (r *RepositoryResolver) CapabilitiesForRepo(repo db.Repo) ProviderCapabilitiesResponse {
+	return r.Capabilities(ProviderKind(repo), ProviderHost(repo))
+}
+
+// Capabilities preserves the server's established fallback policy: a missing
+// live registry still exposes the baseline GitHub feature set, while unknown
+// non-GitHub providers report no capabilities. Every HTTP domain uses this
+// method so lookup failures cannot drift between route packages.
+func (r *RepositoryResolver) Capabilities(kind platform.Kind, host string) ProviderCapabilitiesResponse {
+	if r != nil && r.providerCapabilities != nil {
+		caps, err := r.providerCapabilities(kind, host)
+		if err == nil {
+			return ProviderCapabilitiesFromPlatform(caps)
+		}
+	}
+	if kind == platform.KindGitHub {
+		return ProviderCapabilitiesFromPlatform(platform.Capabilities{
+			ReadRepositories:            true,
+			ReadMergeRequests:           true,
+			ReadIssues:                  true,
+			ReadComments:                true,
+			ReadReleases:                true,
+			ReadCI:                      true,
+			CommentMutation:             true,
+			StateMutation:               true,
+			MergeMutation:               true,
+			ReviewMutation:              true,
+			WorkflowApproval:            true,
+			ReadyForReview:              true,
+			DraftMutation:               true,
+			IssueMutation:               true,
+			ReviewSuggestionApplication: true,
+		})
+	}
+	return ProviderCapabilitiesResponse{}
+}
+
+func ProviderCapabilitiesFromPlatform(caps platform.Capabilities) ProviderCapabilitiesResponse {
+	reviewActions := make([]string, 0, len(caps.SupportedReviewActions))
+	for _, action := range caps.SupportedReviewActions {
+		reviewActions = append(reviewActions, string(action))
+	}
+	return ProviderCapabilitiesResponse{
+		ReadRepositories:            caps.ReadRepositories,
+		ReadMergeRequests:           caps.ReadMergeRequests,
+		ReadIssues:                  caps.ReadIssues,
+		ReadComments:                caps.ReadComments,
+		ReadReleases:                caps.ReadReleases,
+		ReadCI:                      caps.ReadCI,
+		ReadLabels:                  caps.ReadLabels,
+		CommentMutation:             caps.CommentMutation,
+		StateMutation:               caps.StateMutation,
+		MergeMutation:               caps.MergeMutation,
+		ReviewMutation:              caps.ReviewMutation,
+		WorkflowApproval:            caps.WorkflowApproval,
+		ReadyForReview:              caps.ReadyForReview,
+		DraftMutation:               caps.DraftMutation,
+		IssueMutation:               caps.IssueMutation,
+		LabelMutation:               caps.LabelMutation,
+		AssigneeMutation:            caps.AssigneeMutation,
+		ReviewerMutation:            caps.ReviewerMutation,
+		ThreadReply:                 caps.ThreadReply,
+		ThreadResolve:               caps.ThreadResolve,
+		ReviewDraftMutation:         caps.ReviewDraftMutation,
+		ReviewThreadResolution:      caps.ReviewThreadResolution,
+		ReviewSuggestionApplication: caps.ReviewSuggestionApplication,
+		ReadReviewThreads:           caps.ReadReviewThreads,
+		NativeMultilineRanges:       caps.NativeMultilineRanges,
+		MutationHeadBinding:         caps.MutationHeadBinding,
+		SupportedReviewActions:      reviewActions,
+	}
+}

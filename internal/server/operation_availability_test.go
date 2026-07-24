@@ -15,12 +15,14 @@ import (
 	ghclient "go.kenn.io/middleman/internal/github"
 	"go.kenn.io/middleman/internal/platform"
 	"go.kenn.io/middleman/internal/ratelimit"
+	"go.kenn.io/middleman/internal/server/httpapi"
+	"go.kenn.io/middleman/internal/server/pullapi"
 	"go.kenn.io/middleman/internal/testutil/dbtest"
 	"go.kenn.io/middleman/internal/tokenauth"
 )
 
 func TestDeriveOperationAvailability(t *testing.T) {
-	allCaps := providerCapabilitiesResponse{
+	allCaps := httpapi.ProviderCapabilitiesResponse{
 		ReadRepositories:            true,
 		ReadMergeRequests:           true,
 		ReadIssues:                  true,
@@ -66,30 +68,30 @@ func TestDeriveOperationAvailability(t *testing.T) {
 	tests := []struct {
 		name      string
 		op        operationDescriptor
-		caps      providerCapabilitiesResponse
+		caps      httpapi.ProviderCapabilitiesResponse
 		repo      db.Repo
 		rate      rateLimitAvailability
 		writeCred writeCredentialGate
 		opContext operationAvailabilityContext
-		expected  OperationAvailability
+		expected  httpapi.OperationAvailability
 	}{
 		{
 			name:     "healthy merge_pr is available",
 			op:       mergePR,
 			caps:     allCaps,
 			repo:     repoCanMerge,
-			expected: OperationAvailability{Available: true},
+			expected: httpapi.OperationAvailability{Available: true},
 		},
 		{
 			name: "missing required capability surfaces unsupported_capability",
 			op:   mergePR,
-			caps: func() providerCapabilitiesResponse {
+			caps: func() httpapi.ProviderCapabilitiesResponse {
 				c := allCaps
 				c.MergeMutation = false
 				return c
 			}(),
 			repo: repoCanMerge,
-			expected: OperationAvailability{
+			expected: httpapi.OperationAvailability{
 				Code:               availabilityCodeUnsupportedCapability,
 				UnavailableReason:  "Provider does not support merge_mutation",
 				RequiredCapability: capabilityMergeMutation,
@@ -98,14 +100,14 @@ func TestDeriveOperationAvailability(t *testing.T) {
 		{
 			name: "first missing capability wins for multi-cap operations",
 			op:   addLabel,
-			caps: func() providerCapabilitiesResponse {
+			caps: func() httpapi.ProviderCapabilitiesResponse {
 				c := allCaps
 				c.ReadLabels = false
 				c.LabelMutation = false
 				return c
 			}(),
 			repo: repoCanMerge,
-			expected: OperationAvailability{
+			expected: httpapi.OperationAvailability{
 				Code:               availabilityCodeUnsupportedCapability,
 				UnavailableReason:  "Provider does not support read_labels",
 				RequiredCapability: capabilityReadLabels,
@@ -116,7 +118,7 @@ func TestDeriveOperationAvailability(t *testing.T) {
 			op:   mergePR,
 			caps: allCaps,
 			repo: repoCannotMerge,
-			expected: OperationAvailability{
+			expected: httpapi.OperationAvailability{
 				Code:              availabilityCodeViewerCannotMerge,
 				UnavailableReason: "You do not have permission to merge in this repository",
 			},
@@ -126,7 +128,7 @@ func TestDeriveOperationAvailability(t *testing.T) {
 			op:       operationDescriptor{name: operationClosePR, requiredCapabilities: []string{capabilityStateMutation}},
 			caps:     allCaps,
 			repo:     repoCannotMerge,
-			expected: OperationAvailability{Available: true},
+			expected: httpapi.OperationAvailability{Available: true},
 		},
 		{
 			name:      "viewer cannot approve own pull request",
@@ -134,7 +136,7 @@ func TestDeriveOperationAvailability(t *testing.T) {
 			caps:      allCaps,
 			repo:      repoCanMerge,
 			opContext: operationAvailabilityContext{selfApproval: true},
-			expected: OperationAvailability{
+			expected: httpapi.OperationAvailability{
 				Code:              availabilityCodeSelfApproval,
 				UnavailableReason: "You cannot approve your own pull request",
 			},
@@ -142,33 +144,33 @@ func TestDeriveOperationAvailability(t *testing.T) {
 		{
 			name: "review draft operation uses draft capability without requiring submitted reviews",
 			op:   descReviewDraft,
-			caps: func() providerCapabilitiesResponse {
+			caps: func() httpapi.ProviderCapabilitiesResponse {
 				c := allCaps
 				c.ReviewMutation = false
 				c.ReviewDraftMutation = true
 				return c
 			}(),
 			repo:     repoCanMerge,
-			expected: OperationAvailability{Available: true},
+			expected: httpapi.OperationAvailability{Available: true},
 		},
 		{
 			name:     "review suggestion operation requires stored thread and head binding prerequisites",
 			op:       descApplyReviewSuggestion,
 			caps:     allCaps,
 			repo:     repoCanMerge,
-			expected: OperationAvailability{Available: true},
+			expected: httpapi.OperationAvailability{Available: true},
 		},
 		{
 			name: "first missing review suggestion prerequisite wins",
 			op:   descApplyReviewSuggestion,
-			caps: func() providerCapabilitiesResponse {
+			caps: func() httpapi.ProviderCapabilitiesResponse {
 				c := allCaps
 				c.MutationHeadBinding = false
 				c.ReadReviewThreads = false
 				return c
 			}(),
 			repo: repoCanMerge,
-			expected: OperationAvailability{
+			expected: httpapi.OperationAvailability{
 				Code:               availabilityCodeUnsupportedCapability,
 				UnavailableReason:  "Provider does not support mutation_head_binding",
 				RequiredCapability: capabilityMutationHeadBinding,
@@ -180,7 +182,7 @@ func TestDeriveOperationAvailability(t *testing.T) {
 			caps: allCaps,
 			repo: repoCanMerge,
 			rate: limitedRate,
-			expected: OperationAvailability{
+			expected: httpapi.OperationAvailability{
 				Code:              availabilityCodeRateLimited,
 				UnavailableReason: "github.com rate-limited",
 				RetryAt:           resetAt.UTC().Format(time.RFC3339),
@@ -189,14 +191,14 @@ func TestDeriveOperationAvailability(t *testing.T) {
 		{
 			name: "unsupported capability takes precedence over rate limit",
 			op:   mergePR,
-			caps: func() providerCapabilitiesResponse {
+			caps: func() httpapi.ProviderCapabilitiesResponse {
 				c := allCaps
 				c.MergeMutation = false
 				return c
 			}(),
 			repo: repoCanMerge,
 			rate: limitedRate,
-			expected: OperationAvailability{
+			expected: httpapi.OperationAvailability{
 				Code:               availabilityCodeUnsupportedCapability,
 				UnavailableReason:  "Provider does not support merge_mutation",
 				RequiredCapability: capabilityMergeMutation,
@@ -211,7 +213,7 @@ func TestDeriveOperationAvailability(t *testing.T) {
 				code:   availabilityCodeMissingWriteCredential,
 				reason: "No user credential for writes on github.com",
 			},
-			expected: OperationAvailability{
+			expected: httpapi.OperationAvailability{
 				Code:              availabilityCodeMissingWriteCredential,
 				UnavailableReason: "No user credential for writes on github.com",
 			},
@@ -226,7 +228,7 @@ func TestDeriveOperationAvailability(t *testing.T) {
 				code:   availabilityCodeWriteCredentialError,
 				reason: "Resolving the write credential for github.com failed",
 			},
-			expected: OperationAvailability{
+			expected: httpapi.OperationAvailability{
 				Code:              availabilityCodeWriteCredentialError,
 				UnavailableReason: "Resolving the write credential for github.com failed",
 			},
@@ -286,12 +288,12 @@ func TestFormatRateLimit(t *testing.T) {
 }
 
 func TestRepoOperationsWireShape(t *testing.T) {
-	// The set of operation field names on RepoOperations is a wire
+	// The set of operation field names on httpapi.RepoOperations is a wire
 	// contract. Renaming a json tag here breaks any frontend pinned
 	// to an older schema, so the test enumerates the full set as a
 	// guard against accidental renames.
 	require := require.New(t)
-	fields := reflect.VisibleFields(reflect.TypeFor[RepoOperations]())
+	fields := reflect.VisibleFields(reflect.TypeFor[httpapi.RepoOperations]())
 	tags := make([]string, 0, len(fields))
 	for _, f := range fields {
 		tag := f.Tag.Get("json")
@@ -867,7 +869,7 @@ func TestAPIPullDetailOperationsDisableSelfApproval(t *testing.T) {
 	rr := doJSON(t, srv, http.MethodGet, "/api/v1/pulls/github/acme/widget/1", nil)
 	require.Equal(http.StatusOK, rr.Code)
 
-	var resp mergeRequestDetailResponse
+	var resp pullapi.MergeRequestDetailResponse
 	require.NoError(json.NewDecoder(rr.Body).Decode(&resp))
 	require.NotNil(resp.Repo.Operations)
 
@@ -897,7 +899,7 @@ func TestAPIPullDetailOperationsSkipViewerLookupWhenSubmitReviewUnavailable(t *t
 	rr := doJSON(t, srv, http.MethodGet, "/api/v1/pulls/github/acme/widget/1", nil)
 	require.Equal(http.StatusOK, rr.Code, rr.Body.String())
 
-	var resp mergeRequestDetailResponse
+	var resp pullapi.MergeRequestDetailResponse
 	require.NoError(json.NewDecoder(rr.Body).Decode(&resp))
 	require.NotNil(resp.Repo.Operations)
 	assert.Equal(availabilityCodeMissingWriteCredential, resp.Repo.Operations.SubmitReview.Code)

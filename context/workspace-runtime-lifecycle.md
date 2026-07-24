@@ -61,6 +61,17 @@ Workspace deletion is intentionally conservative.
 This ordering prevents a rejected delete from silently killing the user's live
 workspace sessions.
 
+## Server Shutdown Ordering
+
+Workspace and Fleet own independent idempotent, context-bounded lifecycles;
+Fleet starts after Workspace and shuts down its workers and SSH transport before
+Workspace stops (`internal/server/fleetapi/handler.go::Handler.Shutdown`). Root closes
+Pull admission and cancels its workers before HTTP drain, then waits for Pull before
+Fleet in the post-drain dependency stage (`internal/server/server.go::Server.Shutdown`,
+`internal/server/pullapi/handler.go::Handler.Stop`).
+If any stage times out, shutdown must not advance; a later call resumes at the
+blocked stage (`internal/server/workspace_dependency_shutdown.go::workspaceDependencyShutdown`).
+
 ## Tmux Persistence Rules
 
 Persisted tmux-backed runtime rows are only valid while the backing tmux session
@@ -163,7 +174,7 @@ via `OTEL_TRACES_EXPORTER`.
   (`internal/server/otel_middleware.go::otelTraceable`).
 - Fleet proxy and SSH terminal WebSockets need their own bounded attach span,
   ending after setup and before the long-lived bridge
-  (`internal/server/fleet_proxy.go::startFleetAttachSpan`).
+  (`internal/server/fleetapi/fleet_proxy.go::startFleetAttachSpan`).
 
 ## Testing Expectations
 
@@ -172,6 +183,12 @@ behavior.
 
 - Use real SQLite-backed server tests for delete ordering, tmux cleanup, and
   runtime-session API behavior.
+- Workspace/Projects handler and Git-heavy wire tests belong to
+  `internal/server/workspaceapi` or `internal/server/workspacetest`; Git and
+  worktree cases in the public wire lane must acquire its weighted semaphore.
+- Root-retained Git tests must cross a root composition boundary and acquire
+  the root Git semaphore before expensive setup; `t.Parallel` alone is never
+  a Git-work concurrency bound (`internal/server/api_test.go::acquireRootWorkspaceGitSlot`).
 - A server test that creates a workspace must wait for setup to reach a terminal
   state (`waitForWorkspaceReady`) before it returns. The `202 Accepted` create
   runs clone/setup in a background goroutine; if the test returns first, that

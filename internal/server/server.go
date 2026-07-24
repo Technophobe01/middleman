@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,11 +26,21 @@ import (
 	"go.kenn.io/middleman/internal/config"
 	"go.kenn.io/middleman/internal/configwatch"
 	"go.kenn.io/middleman/internal/db"
-	"go.kenn.io/middleman/internal/docs"
 	"go.kenn.io/middleman/internal/gitclone"
 	ghclient "go.kenn.io/middleman/internal/github"
+	"go.kenn.io/middleman/internal/platform"
+	"go.kenn.io/middleman/internal/projects"
 	"go.kenn.io/middleman/internal/ptyowner"
 	ptyownerruntime "go.kenn.io/middleman/internal/ptyowner/runtime"
+	"go.kenn.io/middleman/internal/server/docsapi"
+	"go.kenn.io/middleman/internal/server/fleetapi"
+	"go.kenn.io/middleman/internal/server/httpapi"
+	"go.kenn.io/middleman/internal/server/issueapi"
+	"go.kenn.io/middleman/internal/server/kataapi"
+	"go.kenn.io/middleman/internal/server/messagesapi"
+	"go.kenn.io/middleman/internal/server/pullapi"
+	"go.kenn.io/middleman/internal/server/repobrowserapi"
+	"go.kenn.io/middleman/internal/server/workspaceapi"
 	"go.kenn.io/middleman/internal/telemetry"
 	"go.kenn.io/middleman/internal/tokenauth"
 	"go.kenn.io/middleman/internal/workspace"
@@ -47,7 +58,7 @@ type BuildInfo struct {
 }
 
 type versionOutputBody BuildInfo
-type versionOutput = bodyOutput[versionOutputBody]
+type versionOutput = httpapi.BodyOutput[versionOutputBody]
 
 type ServerOptions struct {
 	// APIAuthToken, when non-empty, gates /api routes behind bearer
@@ -58,6 +69,8 @@ type ServerOptions struct {
 	Clones                             *gitclone.Manager // optional clone manager for diff view
 	WorktreeDir                        string            // base dir for workspace worktrees
 	DisableWorkspaceBackgroundMonitors bool
+	DisableWorkspaceEnrichment         bool
+	WorkspaceNow                       func() time.Time
 	PtyOwnerDir                        string
 	PtyOwnerExePath                    string
 	PtyOwnerExeArgs                    []string
@@ -77,7 +90,7 @@ type ServerOptions struct {
 	// port matching after HostCheck/cfg options have been selected.
 	// Use this for httptest-style listeners on ephemeral ports.
 	HostCheckAllowLoopbackAnyPort bool
-	msgvaultRemoteImageDeps       *msgvaultRemoteImageDeps
+	msgvaultRemoteImageDeps       *messagesapi.RemoteImageDeps
 	deferredMergeMaxWait          time.Duration
 }
 
@@ -136,30 +149,28 @@ func (c shutdownAwareContext) Value(key any) any {
 	return c.parent.Value(key)
 }
 
+type pullLifecycle interface {
+	Stop()
+	Shutdown(context.Context) error
+}
+
 // Server holds the HTTP mux and its dependencies.
 type Server struct {
-	db                          *db.DB
-	syncer                      *ghclient.Syncer
-	archive                     archive.Controller
-	clones                      *gitclone.Manager
-	workspaces                  *workspace.Manager
-	workspacePRMonitor          *workspace.PRMonitor
-	workspacePushedHeadObserver *workspace.PushedHeadObserver
-	workspaceDiffCache          *workspaceDiffCache
-	tmuxActivity                *tmuxActivityTracker
-	fleetTmuxMonitor            *fleetTmuxMonitor
-	fleetWorktreeDiscoverer     *fleetWorktreeDiscoverer
-	fleetWorktreeStatsSampler   *fleetWorktreeStatsSampler
-	fleetPlatformAuthMonitor    *fleetPlatformAuthMonitor
-	runtime                     *localruntime.Manager
-	tmuxCmd                     []string
-	telemetry                   telemetry.Client
-	cfg                         *config.Config
-	cfgPath                     string
-	tokenSources                *tokenauth.SourceSet
-	repoBrowserRefreshEvery     time.Duration
-	cfgMu                       sync.Mutex
-	configReloadMu              sync.Mutex
+	db             *db.DB
+	repoResolver   *httpapi.RepositoryResolver
+	syncer         *ghclient.Syncer
+	archive        archive.Controller
+	clones         *gitclone.Manager
+	workspaces     *workspace.Manager
+	fleetAPI       *fleetapi.Handler
+	runtime        *localruntime.Manager
+	tmuxCmd        []string
+	telemetry      telemetry.Client
+	cfg            *config.Config
+	cfgPath        string
+	tokenSources   *tokenauth.SourceSet
+	cfgMu          sync.Mutex
+	configReloadMu sync.Mutex
 	// bootCfgSnapshot freezes the subset of config fields that are
 	// bound at startup (registry, listeners, clone manager, etc.) so a
 	// config-file watcher reload can detect when those changed and
@@ -174,50 +185,33 @@ type Server struct {
 	// hostOpts is atomic: Serve repoints an ephemeral (port-0) bind
 	// at the kernel-assigned port while requests may already be
 	// reading the options.
-	hostOpts                       atomic.Pointer[HostCheckOptions]
-	buildInfo                      BuildInfo
-	now                            func() time.Time
-	handler                        http.Handler
-	hub                            *EventHub
-	activeWorktreeMu               sync.Mutex
-	activeWorktreeKey              string
-	activeWorktreeSet              bool
-	labelCatalogRefreshMu          sync.Mutex
-	labelCatalogRefreshIDs         map[int64]struct{}
-	detailSyncMu                   sync.Mutex
-	detailSyncInFlight             map[string]struct{}
-	detailSyncPending              map[string]detailSyncJob
-	workspaceEnrichmentMu          sync.Mutex
-	workspaceEnrichmentCache       map[string]workspaceEnrichmentCacheEntry
-	workspaceEnrichmentInFlight    map[string]uint64
-	workspaceEnrichmentGenerations map[string]uint64
-	workspaceEnrichmentPending     map[string]workspaceEnrichmentJob
-	workspaceEnrichmentWorkers     int
-	workspaceEnrichmentSlots       chan struct{}
-	// workspaceEnrichmentDisabled keeps the shared heavyweight test fixture
-	// from starting reconciliation unrelated to the behavior under test.
-	// Production constructors leave it false.
-	workspaceEnrichmentDisabled bool
-	workspaceTmuxPrunedAt       time.Time
-	workspaceTmuxPrunePending   bool
-	workspaceTmuxPruneInFlight  bool
-	deferredMergeMu             sync.Mutex
-	deferredMergeInFlight       map[string]*deferredMergeHandle
-	deferredMergeMaxWait        time.Duration
-	writeCredProbeMu            sync.Mutex
-	writeCredProbes             map[string]writeCredentialProbe
-	writeCredProbeInFlight      map[string]chan struct{}
-	kataHealthMu                sync.Mutex
-	kataHealthCache             map[string]kataDaemonHealthCacheEntry
-	kataHealthInFlight          map[string]*kataDaemonInflightProbe
-	kataProxyMu                 sync.Mutex
-	kataProxyCache              map[kataProxyCacheKey]kataProxyCacheEntry
-	kataProxyIdleCloseOnce      sync.Once
-	kataSnapshots               *kataSnapshotCoordinator
-	kataEvents                  *kataFrontendEventRegistry
-	docsRegistry                *docs.Registry
-	docsPublishLocks            *docsPublishLockSet
-	msgvault                    *msgvaultHandler
+	hostOpts               atomic.Pointer[HostCheckOptions]
+	buildInfo              BuildInfo
+	now                    func() time.Time
+	handler                http.Handler
+	hub                    *EventHub
+	activeWorktreeMu       sync.Mutex
+	activeWorktreeKey      string
+	activeWorktreeSet      bool
+	labelCatalogRefreshMu  sync.Mutex
+	labelCatalogRefreshIDs map[int64]struct{}
+	detailSyncMu           sync.Mutex
+	detailSyncInFlight     map[string]struct{}
+	detailSyncPending      map[string]detailSyncJob
+	writeCredProbeMu       sync.Mutex
+	writeCredProbes        map[string]writeCredentialProbe
+	writeCredProbeInFlight map[string]chan struct{}
+	kataSnapshots          *kataSnapshotCoordinator
+	kataEvents             *kataFrontendEventRegistry
+	docsAPI                *docsapi.Handler
+	kataAPI                *kataapi.Handler
+	shutdownKata           func(context.Context) error
+	messagesAPI            *messagesapi.Handler
+	repoBrowserAPI         *repobrowserapi.Handler
+	pullAPI                *pullapi.Handler
+	issueAPI               *issueapi.Handler
+	pullLifecycle          pullLifecycle
+	workspaceAPI           *workspaceapi.Handler
 
 	// toolingStatus caches the assembled CLI tooling probe;
 	// toolingRun overrides the probe subprocess runner in tests.
@@ -226,10 +220,6 @@ type Server struct {
 
 	// apiAuthToken gates /api routes when non-empty (api_auth.go).
 	apiAuthToken string
-
-	// sshFleet relays API exchanges to fleet peers reached over
-	// ssh(1); nil when no ssh peers are configured (fleet_ssh.go).
-	sshFleet *sshFleetTransport
 
 	// bg tracks short-lived goroutines that HTTP handlers spawn
 	// outside of the Syncer's own wait group (e.g. mergePR's
@@ -258,12 +248,20 @@ type Server struct {
 	// after http.Server.Shutdown so that the deferred setState in
 	// (*conn).serve finishes before tests tear down dependencies.
 	connWG sync.WaitGroup
-}
 
-type workspaceDiffEventData struct {
-	WorkspaceID string `json:"workspace_id"`
-	Revision    uint64 `json:"revision"`
-	Version     string `json:"version"`
+	// workspaceDependents tracks Fleet and repository-browser loops started
+	// after Workspace. Root shutdown drains this group before stopping the
+	// Workspace domain they consume.
+	workspaceDependentsCtx    context.Context
+	workspaceDependentsCancel context.CancelFunc
+	workspaceDependentsWG     sync.WaitGroup
+	workspaceDependentsDone   chan struct{}
+	workspaceDependentsOnce   sync.Once
+	workspaceLifecycleCtx     context.Context
+	workspaceLifecycleCancel  context.CancelFunc
+	kataLifecycleCtx          context.Context
+	kataLifecycleCancel       context.CancelFunc
+	workspaceDependencyStop   *workspaceDependencyShutdown
 }
 
 // trackHTTPConn is installed as http.Server.ConnState by Serve so
@@ -281,11 +279,38 @@ func (s *Server) trackHTTPConn(_ net.Conn, state http.ConnState) {
 // retain the returned pointer beyond the server's lifetime.
 func (s *Server) Hub() *EventHub { return s.hub }
 
+// Fleet returns the composed Fleet service boundary.
+func (s *Server) Fleet() *fleetapi.Handler { return s.fleetAPI }
+
 // SubscriberCount returns the number of live SSE subscribers. Intended
 // for tests that need to wait for a connection to register before
 // broadcasting (broadcasts issued before subscription would otherwise
 // race against the handler's Subscribe call).
 func (s *Server) SubscriberCount() int { return s.hub.SubscriberCount() }
+
+func (s *Server) subscribeWorkspaceEvents(
+	ctx context.Context, injectCached bool,
+) (<-chan workspaceapi.RecordedEvent, <-chan struct{}) {
+	source, done := s.hub.Subscribe(ctx, injectCached)
+	events := make(chan workspaceapi.RecordedEvent, cap(source))
+	go func() {
+		defer close(events)
+		for event := range source {
+			select {
+			case events <- workspaceapi.RecordedEvent{
+				ID: event.ID,
+				Event: workspaceapi.Event{
+					Type: event.Event.Type,
+					Data: event.Event.Data,
+				},
+			}:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return events, done
+}
 
 // SetBuildInfo sets the metadata returned by GET /api/v1/version.
 func (s *Server) SetBuildInfo(info BuildInfo) { s.buildInfo = info }
@@ -309,131 +334,40 @@ func (s *Server) runBackground(fn func(ctx context.Context)) bool {
 	return true
 }
 
-func (s *Server) runWorkspacePRMonitorLoop(ctx context.Context) {
-	if s.workspacePRMonitor == nil {
+func (s *Server) runWorkspaceDependent(fn func(context.Context)) {
+	if fn == nil {
 		return
 	}
-
-	s.runWorkspacePRMonitorPass(ctx)
-
-	ticker := time.NewTicker(time.Minute)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			s.runWorkspacePRMonitorPass(ctx)
-		}
-	}
-}
-
-func (s *Server) runWorkspacePRMonitorPass(ctx context.Context) {
-	if s.workspacePRMonitor == nil {
-		return
-	}
-
-	updates, err := s.workspacePRMonitor.RunOnce(ctx)
-	if err != nil {
-		slog.Warn("workspace PR monitor pass failed", "err", err)
-		return
-	}
-	for i := range updates {
-		update := updates[i]
-		s.broadcastWorkspaceStatus(update.WorkspaceID)
-		s.hub.Broadcast(Event{Type: "data_changed", Data: struct{}{}})
-	}
-}
-
-func (s *Server) runWorkspacePushedHeadObserverLoop(ctx context.Context) {
-	if s.workspacePushedHeadObserver == nil {
-		return
-	}
-
-	s.runWorkspacePushedHeadObserverPass(ctx)
-
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			s.runWorkspacePushedHeadObserverPass(ctx)
-		}
-	}
-}
-
-func (s *Server) runWorkspacePushedHeadObserverPass(ctx context.Context) {
-	if s.workspacePushedHeadObserver == nil {
-		return
-	}
-
-	result, err := s.workspacePushedHeadObserver.RunOnce(ctx)
-	if err != nil {
-		slog.Warn("workspace pushed-head observer pass failed", "err", err)
-		return
-	}
-	for i := range result.Associations {
-		association := result.Associations[i]
-		s.hub.Broadcast(Event{
-			Type: "workspace_pr_associated",
-			Data: workspacePRAssociatedPayload{
-				WorkspaceID:  association.WorkspaceID,
-				Provider:     string(association.Provider),
-				PlatformHost: association.PlatformHost,
-				RepoPath:     association.RepoPath,
-				Owner:        association.Owner,
-				Name:         association.Name,
-				IssueNumber:  association.IssueNumber,
-				PRNumber:     association.PRNumber,
-				AssociatedAt: formatUTCRFC3339(association.AssociatedAt),
-			},
-		})
-		s.broadcastWorkspaceStatus(association.WorkspaceID)
-		s.hub.Broadcast(Event{Type: "data_changed", Data: struct{}{}})
-	}
-	for i := range result.HeadChanges {
-		change := result.HeadChanges[i]
-		s.hub.Broadcast(Event{
-			Type: "workspace_pushed_head_changed",
-			Data: workspacePushedHeadChangedPayload{
-				WorkspaceID:  change.WorkspaceID,
-				Provider:     string(change.Provider),
-				PlatformHost: change.PlatformHost,
-				RepoPath:     change.RepoPath,
-				Owner:        change.Owner,
-				Name:         change.Name,
-				Number:       change.Number,
-				OldSHA:       change.OldSHA,
-				NewSHA:       change.NewSHA,
-				Remote:       change.RemoteName,
-				Branch:       change.BranchName,
-				TrackingRef:  change.TrackingRef,
-				ObservedAt:   formatUTCRFC3339(change.ObservedAt),
-			},
-		})
-		s.enqueueWorkspacePushedHeadRefresh(change)
-	}
-}
-
-func (s *Server) broadcastWorkspaceStatus(workspaceID string) {
-	s.hub.Broadcast(Event{
-		Type: "workspace_status",
-		Data: map[string]string{"id": workspaceID},
+	s.workspaceDependentsWG.Go(func() {
+		fn(s.workspaceDependentsCtx)
 	})
+}
+
+func (s *Server) stopWorkspaceDependents() <-chan struct{} {
+	s.workspaceDependentsOnce.Do(func() {
+		s.workspaceDependentsCancel()
+		go func() {
+			s.workspaceDependentsWG.Wait()
+			close(s.workspaceDependentsDone)
+		}()
+	})
+	return s.workspaceDependentsDone
 }
 
 // Shutdown stops the HTTP listener (if started via ListenAndServe
 // or Serve), closes the SSE event hub so streaming handlers exit,
-// cancels background goroutines' context, and blocks until they
-// finish or ctx expires. Safe to call concurrently and repeatedly.
+// drains later-started Workspace consumers, shuts Workspace down before its
+// runtime dependency, cancels remaining background goroutines, and blocks
+// until they finish or ctx expires. Safe to call concurrently and repeatedly.
 // Every caller drives http.Server.Shutdown with its own ctx
 // (stdlib polls idle-conn closure per call) and waits on a shared
 // drain channel, so a retry with a longer deadline observes true
 // drain for both HTTP handlers and the bg group. Only the first
 // caller closes the hub and cancels bgCtx.
 func (s *Server) Shutdown(ctx context.Context) error {
+	if s.pullLifecycle != nil {
+		s.pullLifecycle.Stop()
+	}
 	s.bgMu.Lock()
 	first := !s.shuttingDown
 	if first {
@@ -457,13 +391,6 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	if first && s.kataEvents != nil {
 		s.kataEvents.Close()
 	}
-	if first && s.runtime != nil {
-		s.runtime.Shutdown()
-	}
-	if first {
-		s.sshFleet.shutdown()
-	}
-
 	var httpErr error
 	httpDrained := httpSrv == nil
 	if httpSrv != nil {
@@ -489,27 +416,18 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		httpDrained = httpErr == nil
 	}
 
-	if httpDrained {
-		s.kataProxyIdleCloseOnce.Do(s.closeKataProxyIdleConnections)
-	}
-
 	if first {
+		s.stopWorkspaceDependents()
 		s.bgCancel()
 		go func() {
 			s.bg.Wait()
 			close(drainDone)
 		}()
 	}
-
-	select {
-	case <-drainDone:
+	if !httpDrained {
 		return httpErr
-	case <-ctx.Done():
-		if httpErr != nil {
-			return errors.Join(httpErr, ctx.Err())
-		}
-		return ctx.Err()
 	}
+	return s.workspaceDependencyStop.Shutdown(ctx)
 }
 
 // SetActiveWorktreeKey sets the key of the currently
@@ -686,6 +604,102 @@ func fallbackHostCheckOptions() HostCheckOptions {
 	}
 }
 
+func workspaceConfigSnapshot(
+	cfg *config.Config, tmuxCommand []string,
+) workspaceapi.ConfigSnapshot {
+	snapshot := workspaceapi.ConfigSnapshot{TmuxCommand: slices.Clone(tmuxCommand)}
+	if cfg == nil {
+		return snapshot
+	}
+	snapshot.Agents = cloneConfigAgents(cfg.Agents)
+	snapshot.KnownPlatformHosts = make(
+		[]projects.KnownPlatformHost, 0, len(cfg.Platforms)+len(cfg.Repos)+1,
+	)
+	snapshot.KnownPlatformHosts = append(snapshot.KnownPlatformHosts, projects.KnownPlatformHost{
+		Platform: string(platform.KindGitHub),
+		Host:     cfg.DefaultPlatformHost,
+	})
+	for _, configured := range cfg.Platforms {
+		snapshot.KnownPlatformHosts = append(snapshot.KnownPlatformHosts, projects.KnownPlatformHost{
+			Platform: configured.Type,
+			Host:     configured.Host,
+		})
+	}
+	for _, repo := range cfg.Repos {
+		snapshot.KnownPlatformHosts = append(snapshot.KnownPlatformHosts, projects.KnownPlatformHost{
+			Platform: repo.PlatformOrDefault(),
+			Host:     repo.PlatformHostOrDefault(),
+		})
+	}
+	return snapshot
+}
+
+func kataConfigSnapshot(cfg *config.Config) kataapi.ConfigSnapshot {
+	if cfg == nil {
+		return kataapi.ConfigSnapshot{}
+	}
+	return kataapi.ConfigSnapshot{
+		Repos:        slices.Clone(cfg.Repos),
+		KataProjects: slices.Clone(cfg.KataProjects),
+	}
+}
+
+func pullConfigSnapshot(cfg *config.Config) pullapi.ConfigSnapshot {
+	if cfg == nil {
+		return pullapi.ConfigSnapshot{}
+	}
+	return pullapi.ConfigSnapshot{
+		AllowMidStackMerges: cfg.PullRequests.AllowMidStackMerges,
+	}
+}
+
+func fleetConfigSnapshot(cfg *config.Config, tmuxCommand []string) fleetapi.ConfigSnapshot {
+	if cfg == nil {
+		return fleetapi.ConfigSnapshot{TmuxCommand: slices.Clone(tmuxCommand)}
+	}
+	platformAuth := config.Config{
+		GitHubTokenEnv:      cfg.GitHubTokenEnv,
+		DefaultPlatformHost: cfg.DefaultPlatformHost,
+		Repos:               slices.Clone(cfg.Repos),
+		Platforms:           slices.Clone(cfg.Platforms),
+	}
+	sshSocketDir := ""
+	if cfg.DataDir != "" {
+		sshSocketDir = filepath.Join(cfg.DataDir, "ssh-sockets")
+	}
+	return fleetapi.ConfigSnapshot{
+		Fleet:               cfg.Fleet,
+		PlatformAuthConfig:  platformAuth,
+		PlatformAuthEnabled: true,
+		TmuxCommand:         slices.Clone(tmuxCommand),
+		SSHSocketDir:        sshSocketDir,
+	}
+}
+
+func (s *Server) applyWorkspaceConfigLocked() {
+	if s.workspaceAPI != nil {
+		s.workspaceAPI.ApplyConfig(workspaceConfigSnapshot(s.cfg, s.tmuxCmd))
+	}
+}
+
+func (s *Server) applyFleetConfigLocked() {
+	if s.fleetAPI != nil {
+		s.fleetAPI.ApplyConfig(fleetConfigSnapshot(s.cfg, s.tmuxCmd))
+	}
+}
+
+func (s *Server) applyKataConfigLocked() {
+	if s.kataAPI != nil {
+		s.kataAPI.ApplyConfig(kataConfigSnapshot(s.cfg))
+	}
+}
+
+func (s *Server) applyPullConfigLocked() {
+	if s.pullAPI != nil {
+		s.pullAPI.ApplyConfig(pullConfigSnapshot(s.cfg))
+	}
+}
+
 func newServer(
 	database *db.DB,
 	syncer *ghclient.Syncer,
@@ -706,69 +720,109 @@ func newServer(
 		options.HostCheckAllowLoopbackAnyPort,
 	)
 	deferredMergeMaxWait := options.deferredMergeMaxWait
-	if deferredMergeMaxWait <= 0 {
-		deferredMergeMaxWait = defaultDeferredMergeMaxWait
-	}
+	repoResolver := httpapi.NewRepositoryResolver(httpapi.RepositoryResolverDeps{
+		DB: database,
+		ProviderCapabilities: func(kind platform.Kind, host string) (platform.Capabilities, error) {
+			if syncer == nil {
+				return platform.Capabilities{}, errors.New("provider registry unavailable")
+			}
+			return syncer.ProviderCapabilities(kind, host)
+		},
+	})
 
 	s := &Server{
-		db:                             database,
-		basePath:                       basePath,
-		syncer:                         syncer,
-		archive:                        options.Archive,
-		clones:                         clones,
-		telemetry:                      options.Telemetry,
-		cfg:                            cfg,
-		cfgPath:                        cfgPath,
-		tokenSources:                   options.TokenSources,
-		repoBrowserRefreshEvery:        repoBrowserRefreshIntervalForConfig(cfg),
-		bootCfgSnapshot:                snapshotStartupConfig(cfg),
-		runtimeStripEnvVars:            initialRuntimeStripEnvNames(cfg),
-		options:                        options,
-		apiAuthToken:                   options.APIAuthToken,
-		now:                            time.Now,
-		hub:                            NewEventHubWithCapacity(cfg.SSEBufferSizeOrDefault()),
-		tmuxActivity:                   newTmuxActivityTracker(nil),
-		labelCatalogRefreshIDs:         make(map[int64]struct{}),
-		workspaceEnrichmentCache:       make(map[string]workspaceEnrichmentCacheEntry),
-		workspaceEnrichmentInFlight:    make(map[string]uint64),
-		workspaceEnrichmentGenerations: make(map[string]uint64),
-		workspaceEnrichmentPending:     make(map[string]workspaceEnrichmentJob),
-		workspaceEnrichmentSlots:       make(chan struct{}, tmuxProbeMaxConcurrency),
-		deferredMergeMaxWait:           deferredMergeMaxWait,
-		docsPublishLocks:               newDocsPublishLockSet(),
-		msgvault:                       newMsgvaultHandler(cfg, basePath, options.msgvaultRemoteImageDeps),
+		db:                     database,
+		repoResolver:           repoResolver,
+		basePath:               basePath,
+		syncer:                 syncer,
+		archive:                options.Archive,
+		clones:                 clones,
+		telemetry:              options.Telemetry,
+		cfg:                    cfg,
+		cfgPath:                cfgPath,
+		tokenSources:           options.TokenSources,
+		bootCfgSnapshot:        snapshotStartupConfig(cfg),
+		runtimeStripEnvVars:    initialRuntimeStripEnvNames(cfg),
+		options:                options,
+		apiAuthToken:           options.APIAuthToken,
+		now:                    time.Now,
+		hub:                    NewEventHubWithCapacity(cfg.SSEBufferSizeOrDefault()),
+		labelCatalogRefreshIDs: make(map[int64]struct{}),
 		bgCtx: shutdownAwareContext{
 			parent:   bgBaseCtx,
 			deadline: bgDeadline,
 		},
-		bgCancel:   bgCancel,
-		bgDeadline: bgDeadline,
+		bgCancel:                bgCancel,
+		bgDeadline:              bgDeadline,
+		workspaceDependentsDone: make(chan struct{}),
 	}
-	var docFolders []config.DocFolder
-	if cfg != nil {
-		docFolders = cfg.DocFolders
+	s.workspaceDependentsCtx, s.workspaceDependentsCancel = context.WithCancel(s.bgCtx)
+	s.workspaceLifecycleCtx, s.workspaceLifecycleCancel = context.WithCancel(context.Background())
+	s.kataLifecycleCtx, s.kataLifecycleCancel = context.WithCancel(context.Background())
+	workspaceNow := s.now
+	if options.WorkspaceNow != nil {
+		workspaceNow = options.WorkspaceNow
 	}
-	s.docsRegistry = docs.NewRegistry(docFolders)
-	warnDocFolderDaemonBindings(docFolders)
-	s.workspaceDiffCache = newWorkspaceDiffCache(s.bgCtx, workspaceDiffCacheDeps{
-		onReady: func(workspaceID string, revision uint64, version string) {
-			s.hub.Broadcast(Event{Type: "workspace_diff_ready", Data: workspaceDiffEventData{
-				WorkspaceID: workspaceID,
-				Revision:    revision,
-				Version:     version,
-			}})
+	s.docsAPI = docsapi.New(docsapi.Deps{
+		Config: cfg,
+		BeginConfigMutation: func() func() {
+			s.configReloadMu.Lock()
+			return s.configReloadMu.Unlock
 		},
-		onChanged: func(workspaceID string, revision uint64, version string) {
-			s.hub.Broadcast(Event{Type: "workspace_diff_changed", Data: workspaceDiffEventData{
-				WorkspaceID: workspaceID,
-				Revision:    revision,
-				Version:     version,
-			}})
+		SaveFolders: func(folders []config.DocFolder) error {
+			if s.cfgPath == "" || s.cfg == nil {
+				return docsapi.ErrSettingsUnavailable
+			}
+			s.cfgMu.Lock()
+			defer s.cfgMu.Unlock()
+			previous := slices.Clone(s.cfg.DocFolders)
+			s.cfg.DocFolders = slices.Clone(folders)
+			if err := s.cfg.Save(s.cfgPath); err != nil {
+				s.cfg.DocFolders = previous
+				return err
+			}
+			return nil
 		},
 	})
-	s.runBackground(func(ctx context.Context) {
-		<-ctx.Done()
-		s.workspaceDiffCache.Wait()
+	if cfg != nil {
+		docsapi.WarnDaemonBindings(cfg.DocFolders)
+	}
+	s.messagesAPI = messagesapi.New(messagesapi.Deps{
+		Config:      cfg,
+		BasePath:    basePath,
+		RemoteImage: options.msgvaultRemoteImageDeps,
+		BeginConfigMutation: func() func() {
+			s.configReloadMu.Lock()
+			return s.configReloadMu.Unlock
+		},
+		SaveConfig: func(next *config.Msgvault) (*config.Config, error) {
+			if s.cfgPath == "" || s.cfg == nil {
+				return nil, messagesapi.ErrSettingsUnavailable
+			}
+			s.cfgMu.Lock()
+			defer s.cfgMu.Unlock()
+			previous := messagesapi.CloneConfig(s.cfg.Msgvault)
+			s.cfg.Msgvault = messagesapi.CloneConfig(next)
+			if err := s.cfg.Save(s.cfgPath); err != nil {
+				s.cfg.Msgvault = previous
+				return nil, err
+			}
+			snapshot := cloneReloadedConfig(s.cfg)
+			return &snapshot, nil
+		},
+		UpdateRuntimeStripEnv: func(cfg *config.Config) {
+			if s.runtime != nil {
+				s.cfgMu.Lock()
+				stripEnvVars := s.updateRuntimeStripEnvVarsLocked(cfg)
+				s.cfgMu.Unlock()
+				s.runtime.UpdateStripEnvVars(stripEnvVars)
+			}
+		},
+	})
+	s.repoBrowserAPI = repobrowserapi.New(repobrowserapi.Deps{
+		Resolver: repoResolver,
+		Clones:   clones,
+		Config:   cfg,
 	})
 	s.kataSnapshots = newKataSnapshotCoordinator(s.bgCtx, kataSnapshotCoordinatorDeps{})
 	s.runBackground(s.kataSnapshots.run)
@@ -781,7 +835,6 @@ func newServer(
 		<-ctx.Done()
 		s.kataEvents.Close()
 	})
-
 	s.hostOpts.Store(&hostOpts)
 	if hostOpts.TrustReverseProxy && len(hostOpts.Allowed) == 0 {
 		slog.Warn(
@@ -800,31 +853,42 @@ func newServer(
 		hideTmuxStatus = cfg.Terminal.HideTmuxStatus
 	}
 	tmuxAvailable := tmuxCommandAvailable(tmuxCmd)
-	includeUnmanagedTmuxDetails := false
-	if cfg != nil {
-		includeUnmanagedTmuxDetails = cfg.Fleet.Sessions.IncludeUnmanagedDetails
-	}
-	s.fleetTmuxMonitor = newFleetTmuxMonitor(
-		tmuxCmd, includeUnmanagedTmuxDetails, nil,
-	)
-	s.fleetWorktreeDiscoverer = newFleetWorktreeDiscoverer(database)
-	s.fleetWorktreeStatsSampler = newFleetWorktreeStatsSampler(
-		database, s.notifyWorktreeStatsChanged,
-	)
-	s.fleetPlatformAuthMonitor = newFleetPlatformAuthMonitor(
-		s.snapshotPlatformAuthConfig,
-	)
-	if cfg != nil && len(cfg.Fleet.SSHPeers) > 0 && cfg.DataDir != "" {
-		s.sshFleet = newSSHFleetTransport(
-			filepath.Join(cfg.DataDir, "ssh-sockets"),
-			cfg.Fleet.SSHPeers,
-			s.hub,
-		)
-	}
+	s.fleetAPI = fleetapi.New(fleetapi.Deps{
+		DB:       database,
+		Syncer:   syncer,
+		Config:   fleetConfigSnapshot(cfg, tmuxCmd),
+		BasePath: basePath,
+		BuildVersion: func() string {
+			return s.buildInfo.Version
+		},
+		Now: workspaceNow,
+		LocalHandler: func() http.Handler {
+			return s.handler
+		},
+		Broadcast: func(event fleetapi.Event) uint64 {
+			return s.hub.Broadcast(Event{Type: event.Type, Data: event.Data})
+		},
+		Generation: s.hub.Generation,
+		WorkspaceSnapshot: func(ctx context.Context) (workspaceapi.FleetSnapshot, error) {
+			if s.workspaceAPI == nil {
+				return workspaceapi.FleetSnapshot{}, nil
+			}
+			return s.workspaceAPI.FleetSnapshot(ctx)
+		},
+		RuntimeSnapshot: func(scope string) workspaceapi.RuntimeSnapshot {
+			if s.workspaceAPI == nil {
+				return nil
+			}
+			return s.workspaceAPI.RuntimeSnapshot(scope)
+		},
+		RevalidateDiffs: func() {
+			if s.workspaceAPI != nil {
+				s.workspaceAPI.RevalidateSelectedDiffs()
+			}
+		},
+	})
 	if options.WorktreeDir != "" {
 		s.workspaces = workspace.NewManager(database, options.WorktreeDir)
-		s.workspacePRMonitor = workspace.NewPRMonitor(database)
-		s.workspacePushedHeadObserver = workspace.NewPushedHeadObserver(database)
 		s.workspaces.SetTmuxCommand(tmuxCmd)
 		s.workspaces.SetHideTmuxStatus(hideTmuxStatus)
 		s.workspaces.SetIssueBranchSlugEnabled(
@@ -888,30 +952,128 @@ func newServer(
 			PtyOwnerRuntime:          runtimePtyOwner,
 			KnownPtyOwnerSessionKeys: s.workspaces.RuntimeSessionKeysForWorkspace,
 		})
-		if err := s.restoreRuntimeSessions(context.Background()); err != nil {
-			slog.Warn("restore runtime tmux sessions", "err", err)
-		}
 	}
-
-	if s.workspaces != nil && !options.DisableWorkspaceBackgroundMonitors {
-		s.runBackground(s.runWorkspacePRMonitorLoop)
-		s.runBackground(s.runWorkspacePushedHeadObserverLoop)
+	s.workspaceAPI = workspaceapi.New(workspaceapi.Deps{
+		DB:                 database,
+		Resolver:           repoResolver,
+		Syncer:             syncer,
+		Config:             workspaceConfigSnapshot(cfg, tmuxCmd),
+		Workspaces:         s.workspaces,
+		Runtime:            s.runtime,
+		TmuxCommand:        tmuxCmd,
+		Now:                workspaceNow,
+		EnrichmentDisabled: options.DisableWorkspaceEnrichment,
+		Broadcast: func(event workspaceapi.Event) uint64 {
+			return s.hub.Broadcast(Event{Type: event.Type, Data: event.Data})
+		},
+		Subscribe:               s.subscribeWorkspaceEvents,
+		Generation:              s.hub.Generation,
+		RecomputeWorktreeLinks:  s.fleetAPI.RecomputeWorktreeLinks,
+		RefreshWorktreeStats:    s.fleetAPI.RefreshWorktreeStats,
+		RefreshProjectInventory: s.fleetAPI.RefreshProjectInventory,
+		LookupRepo:              repoResolver.LookupRoute,
+		EnqueueDetailSync:       s.enqueueDetailSyncWithCompletion,
+	})
+	s.kataAPI = kataapi.New(kataapi.Deps{
+		DB:               database,
+		Resolver:         repoResolver,
+		Config:           kataConfigSnapshot(cfg),
+		Workspaces:       s.workspaces,
+		WorkspaceAPI:     s.workspaceAPI.Workspaces(),
+		SamePlatformHost: samePlatformHost,
+		ConfigRepoPath:   configRepoPath,
+		InvalidateDaemon: func(id string) {
+			s.kataSnapshots.invalidateDaemon(id)
+		},
+	})
+	s.pullAPI = pullapi.New(pullapi.Deps{
+		DB:                   database,
+		Resolver:             repoResolver,
+		Syncer:               syncer,
+		Clones:               clones,
+		Workspaces:           s.workspaces,
+		Config:               pullConfigSnapshot(cfg),
+		Now:                  func() time.Time { return s.now() },
+		DeferredMergeMaxWait: deferredMergeMaxWait,
+		FleetSelfKey:         s.fleetAPI.SelfKey,
+		FilterRepos: func(repos []db.Repo) []db.Repo {
+			if s.cfg == nil {
+				return repos
+			}
+			return s.filterConfiguredRepos(repos)
+		},
+		RepoOperations:                s.repoOperations,
+		RepoOperationsForMergeRequest: s.repoOperationsForMergeRequest,
+		EnqueueDetailSyncOrRerun:      s.enqueueDetailSyncOrRerun,
+		Broadcast: func(event pullapi.Event) uint64 {
+			return s.hub.Broadcast(Event{Type: event.Type, Data: event.Data})
+		},
+		MarkClosedLinkedNotificationsDone: s.markClosedLinkedNotificationsDone,
+	})
+	s.issueAPI = issueapi.New(issueapi.Deps{
+		DB:         database,
+		Resolver:   repoResolver,
+		Syncer:     syncer,
+		Workspaces: s.workspaces,
+		Now:        func() time.Time { return s.now() },
+		FilterRepos: func(repos []db.Repo) []db.Repo {
+			if s.cfg == nil {
+				return repos
+			}
+			return s.filterConfiguredRepos(repos)
+		},
+		RepoOperations:                    s.repoOperations,
+		MarkClosedLinkedNotificationsDone: s.markClosedLinkedNotificationsDone,
+	})
+	s.pullLifecycle = s.pullAPI
+	s.shutdownKata = s.kataAPI.Shutdown
+	s.workspaceDependencyStop = newWorkspaceDependencyShutdown(
+		func(ctx context.Context) error {
+			for _, done := range []<-chan struct{}{
+				s.workspaceDependentsDone,
+				s.drainDone,
+			} {
+				select {
+				case <-done:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+			return nil
+		},
+		func(ctx context.Context) error {
+			if err := s.pullLifecycle.Shutdown(ctx); err != nil {
+				return err
+			}
+			if err := s.fleetAPI.Shutdown(ctx); err != nil {
+				return err
+			}
+			s.kataLifecycleCancel()
+			if err := s.shutdownKata(ctx); err != nil {
+				return err
+			}
+			s.workspaceLifecycleCancel()
+			return s.workspaceAPI.Shutdown(ctx)
+		},
+		func() {
+			if s.runtime != nil {
+				s.runtime.Shutdown()
+			}
+		},
+	)
+	if err := s.workspaceAPI.RestoreRuntimeSessions(context.Background()); err != nil {
+		slog.Warn("restore runtime tmux sessions", "err", err)
 	}
-	if s.workspaces != nil && tmuxAvailable && s.fleetTmuxMonitor != nil {
-		s.runBackground(s.fleetTmuxMonitor.run)
-	}
-	if s.fleetWorktreeDiscoverer != nil && !options.DisableWorkspaceBackgroundMonitors {
-		s.runBackground(s.fleetWorktreeDiscoverer.run)
-	}
-	if s.fleetWorktreeStatsSampler != nil && !options.DisableWorkspaceBackgroundMonitors {
-		s.runBackground(s.fleetWorktreeStatsSampler.run)
-	}
-	if s.fleetPlatformAuthMonitor != nil && !options.DisableWorkspaceBackgroundMonitors {
-		s.runBackground(s.fleetPlatformAuthMonitor.run)
-	}
+	s.workspaceAPI.Start(s.workspaceLifecycleCtx, options.DisableWorkspaceBackgroundMonitors)
+	s.kataAPI.Start(s.kataLifecycleCtx)
+	s.fleetAPI.Start(
+		s.workspaceLifecycleCtx,
+		tmuxAvailable && s.workspaces != nil,
+		options.DisableWorkspaceBackgroundMonitors,
+	)
 	if clones != nil && !options.DisableWorkspaceBackgroundMonitors {
-		s.seedRepoBrowserRefreshRepos(context.Background())
-		s.runBackground(s.runRepoBrowserRefreshLoop)
+		s.repoBrowserAPI.SeedRefreshRepos(context.Background())
+		s.runWorkspaceDependent(s.repoBrowserAPI.RunRefreshLoop)
 	}
 
 	// Watch the config file so an external edit (vim, dotfiles deploy,
@@ -968,64 +1130,6 @@ func newServer(
 	return s
 }
 
-func (s *Server) restoreRuntimeSessions(ctx context.Context) error {
-	if s.db == nil || s.runtime == nil || s.workspaces == nil {
-		return nil
-	}
-	stored, err := s.db.ListAllWorkspaceRuntimeSessions(ctx)
-	if err != nil {
-		return err
-	}
-	for _, session := range stored {
-		summary, err := s.workspaces.GetSummary(ctx, session.WorkspaceID)
-		if err != nil {
-			return err
-		}
-		if summary == nil {
-			continue
-		}
-		restored := localruntime.RestoredRuntimeSession{
-			WorkspaceID: session.WorkspaceID,
-			SessionKey:  session.SessionKey,
-			TargetKey:   session.TargetKey,
-			Label:       session.Label,
-			Kind:        localruntime.LaunchTargetKind(session.Kind),
-			TmuxSession: session.TmuxSession,
-			CWD:         summary.WorktreePath,
-			CreatedAt:   session.CreatedAt,
-		}
-		err = s.runtime.RestoreRuntimeSessions(
-			ctx, []localruntime.RestoredRuntimeSession{restored},
-		)
-		if err == nil {
-			continue
-		}
-		if errors.Is(err, localruntime.ErrSessionNotFound) {
-			if _, forgetErr := s.workspaces.ForgetRuntimeSessionCreatedAt(
-				ctx, session.WorkspaceID, session.SessionKey, session.CreatedAt,
-			); forgetErr != nil {
-				return forgetErr
-			}
-			continue
-		}
-		if errors.Is(err, localruntime.ErrSessionUnavailable) {
-			slog.Warn(
-				"runtime session unavailable after restore",
-				"workspace_id", session.WorkspaceID,
-				"session_key", session.SessionKey,
-				"target_key", session.TargetKey,
-				"tmux_session", session.TmuxSession,
-				"err", err,
-			)
-			continue
-		}
-		return err
-	}
-
-	slog.Debug("restored runtime sessions", "count", len(stored))
-	return nil
-}
-
 func (s *Server) handleRuntimeSessionExit(info localruntime.SessionInfo) {
 	if info.WorkspaceID == hostRuntimeScope {
 		if s.db == nil || info.TmuxSession == "" {
@@ -1078,27 +1182,9 @@ func (s *Server) handleRuntimeSessionExit(info localruntime.SessionInfo) {
 		})
 		return
 	}
-	if s.workspaces == nil {
-		return
+	if s.workspaceAPI != nil {
+		s.workspaceAPI.HandleRuntimeSessionExit(info)
 	}
-	s.invalidateWorkspaceEnrichment(info.WorkspaceID)
-	s.runBackground(func(ctx context.Context) {
-		cleanupCtx, cancel := context.WithTimeout(
-			ctx, runtimeSessionCleanupTimeout,
-		)
-		defer cancel()
-		if _, err := s.workspaces.ForgetRuntimeSessionAfterExit(
-			cleanupCtx, info.WorkspaceID, info.Key, info.CreatedAt,
-			info.TmuxSession,
-		); err != nil {
-			slog.Warn(
-				"forget exited runtime session",
-				"workspace_id", info.WorkspaceID,
-				"session_key", info.Key,
-				"err", err,
-			)
-		}
-	})
 }
 
 func preferPtyOwnerForWorkspaces(
@@ -1203,9 +1289,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if s.isMutatingDocsAPIRequest(r) && !isLoopbackRemoteAddr(r.RemoteAddr) {
-			writeProblemResponse(w, newProblem(
+			writeProblemResponse(w, httpapi.NewProblem(
 				http.StatusForbidden,
-				CodeForbidden,
+				httpapi.CodeForbidden,
 				"docs mutations require a loopback client",
 				map[string]any{"reason": "loopbackOnly"},
 			))
@@ -1213,18 +1299,18 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		if s.isMutatingMessagesAPIRequest(r) {
 			if !isLoopbackRemoteAddr(r.RemoteAddr) {
-				writeProblemResponse(w, newProblem(
+				writeProblemResponse(w, httpapi.NewProblem(
 					http.StatusForbidden,
-					CodeForbidden,
+					httpapi.CodeForbidden,
 					"message configuration changes require a loopback client",
 					map[string]any{"reason": "loopbackOnly"},
 				))
 				return
 			}
 			if r.Header.Get(middlemanCSRFHeaderName) == "" {
-				writeProblemResponse(w, newProblem(
+				writeProblemResponse(w, httpapi.NewProblem(
 					http.StatusForbidden,
-					CodeForbidden,
+					httpapi.CodeForbidden,
 					"message mutations require the "+middlemanCSRFHeaderName+" header",
 					map[string]any{"reason": "missingCsrfHeader"},
 				))
@@ -1233,27 +1319,27 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if r.Method == http.MethodGet && s.isDocsBrowseAPIRequest(r) && !isLoopbackRemoteAddr(r.RemoteAddr) {
-		writeProblemResponse(w, newProblem(
+		writeProblemResponse(w, httpapi.NewProblem(
 			http.StatusForbidden,
-			CodeForbidden,
+			httpapi.CodeForbidden,
 			"docs browse requires a loopback client",
 			map[string]any{"reason": "loopbackOnly"},
 		))
 		return
 	}
 	if r.Method == http.MethodGet && s.isDocsReadAPIRequest(r) && !isLoopbackRemoteAddr(r.RemoteAddr) {
-		writeProblemResponse(w, newProblem(
+		writeProblemResponse(w, httpapi.NewProblem(
 			http.StatusForbidden,
-			CodeForbidden,
+			httpapi.CodeForbidden,
 			"docs reads require a loopback client",
 			map[string]any{"reason": "loopbackOnly"},
 		))
 		return
 	}
 	if r.Method == http.MethodGet && s.isMessagesSavedSearchesAPIRequest(r) && !isLoopbackRemoteAddr(r.RemoteAddr) {
-		writeProblemResponse(w, newProblem(
+		writeProblemResponse(w, httpapi.NewProblem(
 			http.StatusForbidden,
-			CodeForbidden,
+			httpapi.CodeForbidden,
 			"message saved searches require a loopback client",
 			map[string]any{"reason": "loopbackOnly"},
 		))
@@ -1280,9 +1366,9 @@ func checkListenerHost(
 	if !authorityIsLoopbackHost(r.Host) || isLoopbackRemoteAddr(r.RemoteAddr) {
 		return true
 	}
-	writeProblemResponse(w, newProblem(
+	writeProblemResponse(w, httpapi.NewProblem(
 		http.StatusForbidden,
-		CodeForbidden,
+		httpapi.CodeForbidden,
 		"host is not allowed",
 		map[string]any{"reason": "hostNotAllowed"},
 	))
@@ -1306,7 +1392,7 @@ func (s *Server) isKataProxyAPIRequest(r *http.Request) bool {
 		prefix := strings.TrimSuffix(s.basePath, "/")
 		path = strings.TrimPrefix(path, prefix)
 	}
-	return path == kataProxyPrefix || strings.HasPrefix(path, kataProxyPrefix+"/")
+	return kataapi.IsProxyPath(path)
 }
 
 func (s *Server) isMutatingDocsAPIRequest(r *http.Request) bool {
@@ -1539,19 +1625,8 @@ func (s *Server) streamEvents(
 			cursor, hasCursor := parseLastEventID(r)
 			ch, done := s.hub.Subscribe(ctx.Context(), !hasCursor)
 			releaseSelection := func() {}
-			if input.WorkspaceID != "" && s.workspaceDiffCache != nil {
-				releaseSelection = s.workspaceDiffCache.Select(
-					input.WorkspaceID,
-					func(resolveCtx context.Context) (workspaceDiffLogicalKey, error) {
-						req, err := s.workspaceDiffRequest(
-							resolveCtx, input.WorkspaceID, string(workspace.WorktreeDiffBaseHead),
-						)
-						if err != nil {
-							return workspaceDiffLogicalKey{}, err
-						}
-						return s.workspaceDiffCacheKey(req, false), nil
-					},
-				)
+			if input.WorkspaceID != "" && s.workspaceAPI != nil {
+				releaseSelection = s.workspaceAPI.SelectWorkspaceDiff(input.WorkspaceID)
 			}
 			defer releaseSelection()
 			s.serveSSESubscribed(ctx.Context(), w, rc, cursor, hasCursor, ch, done)
