@@ -179,6 +179,13 @@ runs `git worktree add` from the managed clone or configured base checkout, so
 relative paths would be interpreted relative to that Git directory while later
 API reads interpret them relative to the middleman server process.
 
+Keep Git worktree and merge-request lifecycle semantics in
+`go.kenn.io/kit/git/managed`; Middleman supplies application policy instead of
+maintaining a local lifecycle fork (`internal/server/projects_handlers.go::createWorktreeOnDisk`).
+Classify same-repository merge requests with the provider-hosted project
+identity, not the effective origin URL: the origin may be a local mirror
+(`internal/server/projects_handlers.go::createProjectWorktreeFromMergeRequest`).
+
 All workspace API timestamps are emitted as UTC RFC3339 strings. Keep timestamp
 normalization in the DB/server boundary; the Svelte UI can present local time
 where needed.
