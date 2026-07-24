@@ -39,10 +39,13 @@
   import RepoBrowserFeature from "./lib/features/repo-browser/RepoBrowserFeature.svelte";
   import { fetchKataDaemons } from "./lib/api/kata/daemons.js";
   import { kataLinkingEnabledForEffectiveDaemon } from "./lib/api/kata/daemonSelection.js";
+  import { searchKataTaskReferences } from "./lib/api/kata/snapshot.js";
   import { createKataTaskAPI } from "./lib/api/kata/taskClient.js";
+  import type { KataIssueNavigationTarget } from "./lib/api/kata/navigation.js";
   import type { KataTaskViewName } from "./lib/api/kata/taskTypes.js";
   import { createDocsAPI } from "./lib/api/docs/api.js";
   import { createMessageIssueLinker } from "./lib/messages/kataMessageLinker.js";
+  import { createKataAuxiliaryAuthority } from "./lib/features/kata/kataAuxiliaryAuthority.svelte.js";
   import { FlashBanner, Spinner } from "@kenn-io/kit-ui";
   import { MonitorIcon } from "./lib/icons.ts";
   import { showFlash } from "@middleman/ui/stores/flash";
@@ -67,6 +70,7 @@
   import {
     getActiveKataDaemon,
     getKataDaemonRoster,
+    getKataDaemonRosterLoaded,
     setActiveKataDaemon,
     setKataDaemonRoster,
   } from "./lib/stores/active-kata-daemon.svelte.js";
@@ -177,6 +181,7 @@
   const appIconSrc = `${getBasePath().replace(/\/$/, "")}/favicon.svg`;
   const kataAPI = createKataTaskAPI();
   const kataWorkspaceAPI = createKataTaskAPI();
+  const kataAuxiliaryAuthority = createKataAuxiliaryAuthority();
 
   const trackMobileHeaderHeight: Attachment<HTMLElement> = (node) => {
     const update = () => {
@@ -191,7 +196,7 @@
     };
   };
   const docsAPI = createDocsAPI();
-  const messageIssueLinker = createMessageIssueLinker(kataAPI);
+  const messageIssueLinker = createMessageIssueLinker(kataAuxiliaryAuthority, kataAPI);
 
   function stopFullAppShell() {
     fullShellStores?.events.disconnect();
@@ -249,17 +254,55 @@
     return query ? `/kata?${query}` : "/kata";
   }
 
-  function kataIssueHref(uid: string, daemon?: string): string {
-    return kataHref({ ...currentKataRouteUpdate(), issue: uid, daemon: daemon ?? null });
+  function kataIssueHref(target: KataIssueNavigationTarget, daemon?: string): string {
+    return kataHref({
+      view: target.status === "closed" ? "logbook" : "all",
+      scope: target.project_uid ?? null,
+      issue: target.uid,
+      daemon: daemon ?? null,
+    });
   }
 
-  function openKataIssue(uid: string | null, daemonId?: string): void {
+  function selectKataIssue(uid: string | null): void {
     if (uid === null) {
       navigate("/kata");
       return;
     }
-    const targetDaemon = daemonId && getKataDaemonRoster().includes(daemonId) ? daemonId : undefined;
-    navigate(kataIssueHref(uid, targetDaemon));
+    navigate(kataHref({ ...currentKataRouteUpdate(), issue: uid }));
+  }
+
+  function openKataIssue(target: KataIssueNavigationTarget): void {
+    const targetDaemon = target.daemon_id && getKataDaemonRoster().includes(target.daemon_id)
+      ? target.daemon_id
+      : undefined;
+    navigate(kataIssueHref(target, targetDaemon));
+  }
+
+  let auxiliaryNavigationToken = 0;
+
+  async function openAuxiliaryKataIssue(uid: string, daemonID?: string): Promise<void> {
+    // UID-only sources carry no status/project authority, and rows in the
+    // shared auxiliary snapshot can be stale during invalidation reloads.
+    // Always resolve routing authority through an isolated pinned selection,
+    // honoring an explicit daemon (for example a daemon-bound Docs folder).
+    // Only the latest click may navigate or surface an error: an older
+    // selection resolving after a newer one must not steal the route.
+    const token = ++auxiliaryNavigationToken;
+    try {
+      const selection = await kataAuxiliaryAuthority.selectIssue(uid, daemonID);
+      if (token !== auxiliaryNavigationToken) return;
+      navigate(kataIssueHref(
+        {
+          uid,
+          status: selection.detail.issue.status,
+          project_uid: selection.detail.issue.project_uid,
+        },
+        selection.daemonID,
+      ));
+    } catch {
+      if (token !== auxiliaryNavigationToken) return;
+      showFlash("Could not open linked task", { tone: "danger" });
+    }
   }
 
   function updateKataRoute(update: KataRouteUpdate, options?: { replace?: boolean }): void {
@@ -348,7 +391,7 @@
   }
 
   async function runModePaletteSearch(query: string) {
-    return searchModePalette(query, { kata: kataAPI, docs: docsAPI });
+    return searchModePalette(query, { kata: kataAuxiliaryAuthority, docs: docsAPI });
   }
 
   async function loadKataDaemonRoster(): Promise<{
@@ -387,18 +430,25 @@
 
   async function openKataShortId(shortId: string, project?: string, daemonId?: string): Promise<void> {
     try {
-      const results = await kataAPI.search({
-        scope: { kind: "all" },
-        status: "all",
-        owner: "",
-        label: "",
-        query: shortId,
-      }, daemonId ? { daemonId } : undefined);
-      const match = results.issues.find(
-        (issue) => issue.short_id === shortId && (!project || issue.project_name === project),
+      const requestedReference = project ? `${project}#${shortId}` : shortId;
+      const results = await searchKataTaskReferences(
+        requestedReference,
+        { ...(daemonId ? { daemon_id: daemonId } : {}), status: "all" },
+      );
+      const match = (results.references ?? []).find((reference) =>
+        reference.reference === requestedReference
+        || reference.qualified_id === requestedReference
+        || (project !== undefined
+          && reference.short_id === shortId
+          && (reference.project_name === project || reference.project_uid === project)),
       );
       if (match) {
-        openKataIssue(match.uid, daemonId);
+        openKataIssue({
+          uid: match.uid,
+          status: match.status,
+          project_uid: match.project_uid,
+          ...(daemonId ? { daemon_id: daemonId } : {}),
+        });
       }
     } catch {
       showFlash("Could not open linked task", { tone: "danger" });
@@ -463,6 +513,13 @@
       doc: route.doc,
     };
     void loadDocsFeature();
+  });
+
+  $effect(() => {
+    if (!appReady || !getKataDaemonRosterLoaded()) return;
+    const daemonID = getActiveKataDaemon() ?? kataDefaultDaemonId;
+    const load = untrack(() => kataAuxiliaryAuthority.load(daemonID));
+    void load.catch(() => {});
   });
 
   $effect(() => {
@@ -604,6 +661,7 @@
   }
 
   onDestroy(() => {
+    kataAuxiliaryAuthority.stop();
     stopFullAppShell();
     stores?.events.disconnect();
   });
@@ -1181,11 +1239,12 @@
         {#if route.page === "kata"}
           <KataFeature
             api={kataWorkspaceAPI}
+            searchReferences={searchKataTaskReferences}
             selectedIssueUID={route.issue ?? null}
             routeViewName={route.view ?? null}
             routeScopeUID={route.scope ?? null}
             requestedDaemonId={route.daemon ?? null}
-            onSelectedIssueChange={openKataIssue}
+            onSelectedIssueChange={selectKataIssue}
             onRouteStateChange={updateKataRoute}
             onOpenMessage={isModeVisible("messages") ? openMessage : undefined}
           />
@@ -1284,8 +1343,8 @@
               if (options?.replace) replaceUrl(docsHref(next));
               else navigate(docsHref(next));
             }}
-            {kataAPI}
-            onOpenIssue={openKataIssue}
+            searchReferences={searchKataTaskReferences}
+            onOpenIssue={openAuxiliaryKataIssue}
             onOpenKataShortId={(shortId, project, daemonId) => {
               void openKataShortId(shortId, project, daemonId);
             }}
@@ -1302,9 +1361,10 @@
           <MessagesFeature
             route={messagesRoute}
             onRouteChange={(next) => navigate(messagesHref(next))}
-            kata={kataLinkingEnabled ? kataAPI : undefined}
+            kataAuthority={kataLinkingEnabled ? kataAuxiliaryAuthority : undefined}
+            searchReferences={kataLinkingEnabled ? searchKataTaskReferences : undefined}
             onLinkMessage={kataLinkingEnabled ? messageIssueLinker.linkMessage : undefined}
-            onOpenIssue={kataLinkingEnabled ? openKataIssue : undefined}
+            onOpenIssue={kataLinkingEnabled ? openAuxiliaryKataIssue : undefined}
           />
         </section>
       {/if}

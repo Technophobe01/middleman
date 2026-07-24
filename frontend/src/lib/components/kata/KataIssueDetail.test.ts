@@ -4,7 +4,6 @@ import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import type {
   KataProjectSummary,
   KataRecurrence,
-  KataTaskAPI,
   KataTaskDetail,
   KataTaskViewResponse,
 } from "../../api/kata/taskTypes.js";
@@ -93,24 +92,12 @@ function makeView(): KataTaskViewResponse {
   };
 }
 
-function makeAPI(): KataTaskAPI {
-  return {
-    search: vi.fn(async () => ({
-      filters: { scope: { kind: "all" }, status: "open", owner: "", label: "", query: "" },
-      issues: [],
-      fetched_at: "2026-06-01T12:00:00Z",
-    })),
-    issue: vi.fn(async () => makeIssue()),
-  } as unknown as KataTaskAPI;
-}
-
 function renderDetail(props: Partial<KataIssueDetailProps> = {}) {
   return render(KataIssueDetail, {
     props: {
       issue: makeIssue({ recurrence_id: 9 }),
       events: [],
-      currentView: makeView(),
-      api: makeAPI(),
+      issueCatalog: makeView().groups.flatMap((group) => group.issues),
       activeDaemonId: "home",
       linkFilters: createKataLinkFilters("open"),
       onLinkFiltersChange: vi.fn(),
@@ -184,6 +171,56 @@ describe("KataIssueDetail", () => {
     await fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
     expect(onEditIssue).toHaveBeenCalledWith("issue-1", { body: "Updated body" });
+  });
+
+  it("resets only the draft owned by the accepted mutation", async () => {
+    const onEditIssue = vi.fn(async () => true);
+    const view = renderDetail({ onEditIssue });
+
+    await fireEvent.click(screen.getByRole("button", { name: "Edit description" }));
+    await fireEvent.input(screen.getByLabelText("Edit description"), {
+      target: { value: "Keep this unrelated body draft" },
+    });
+    await fireEvent.click(screen.getByRole("button", { name: "Edit title" }));
+    await fireEvent.input(screen.getByLabelText("Edit title"), {
+      target: { value: "Accepted title" },
+    });
+    await fireEvent.keyDown(screen.getByLabelText("Edit title"), { key: "Enter" });
+
+    await view.rerender({ actionsDisabled: true });
+
+    expect((screen.getByRole("region", { name: "Task detail" }) as HTMLElement & { inert: boolean }).inert).toBe(true);
+    expect((screen.getByRole("textbox", { name: "Edit title" }) as HTMLInputElement).value).toBe("Accepted title");
+    expect((screen.getByRole("textbox", { name: "Edit description" }) as HTMLTextAreaElement).value).toBe(
+      "Keep this unrelated body draft",
+    );
+
+    await view.rerender({ actionsDisabled: true, draftResetGeneration: 1 });
+    await view.rerender({ actionsDisabled: false });
+
+    expect(screen.queryByRole("textbox", { name: "Edit title" })).toBeNull();
+    expect((screen.getByRole("textbox", { name: "Edit description" }) as HTMLTextAreaElement).value).toBe(
+      "Keep this unrelated body draft",
+    );
+    expect(onEditIssue).toHaveBeenCalledWith("issue-1", { title: "Accepted title" });
+  });
+
+  it("preserves a newer selection draft when an older mutation reset arrives", async () => {
+    const view = renderDetail({
+      issue: makeIssue({ uid: "issue-2", short_id: "I-2", qualified_id: "INBOX-2" }),
+    });
+
+    await fireEvent.click(screen.getByRole("button", { name: "Edit description" }));
+    await fireEvent.input(screen.getByLabelText("Edit description"), {
+      target: { value: "Draft on the newer task" },
+    });
+
+    await view.rerender({ actionsDisabled: true, draftResetGeneration: 1 });
+    await view.rerender({ actionsDisabled: false });
+
+    expect((screen.getByRole("textbox", { name: "Edit description" }) as HTMLTextAreaElement).value).toBe(
+      "Draft on the newer task",
+    );
   });
 
   it("moves the issue from the task actions menu", async () => {

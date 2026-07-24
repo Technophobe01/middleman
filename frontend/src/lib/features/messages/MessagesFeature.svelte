@@ -2,18 +2,20 @@
   import { onMount } from "svelte";
 
   import { createMessagesAPI } from "../../api/messages/api.js";
+  import type { KataTaskReferenceSearch } from "../../api/kata/snapshot.js";
   import type { MessagesCapabilities } from "../../api/messages/types";
   import type { MessagesRoute } from "../../messages/route";
   import { createSavedSearchesAPI } from "../../api/messages/savedSearchesClient.js";
   import type { MessageLinkInput } from "../../messages/messageLinks";
-  import type { KataAPI } from "../../messages/types";
+  import type { KataAuxiliaryAuthoritySource } from "../kata/kataAuxiliaryAuthority.svelte";
   import MessagesSetupDialog from "../../components/messages/MessagesSetupDialog.svelte";
   import MessagesWorkspace from "../../components/messages/MessagesWorkspace.svelte";
 
   interface Props {
     route: MessagesRoute;
     onRouteChange: (next: MessagesRoute) => void;
-    kata?: Pick<KataAPI, "search"> | undefined;
+    kataAuthority?: KataAuxiliaryAuthoritySource | undefined;
+    searchReferences?: KataTaskReferenceSearch | undefined;
     onLinkMessage?: ((
       issueUid: string,
       input: MessageLinkInput,
@@ -25,7 +27,8 @@
   let {
     route,
     onRouteChange,
-    kata = undefined,
+    kataAuthority = undefined,
+    searchReferences = undefined,
     onLinkMessage = undefined,
     onOpenIssue = undefined,
     onCapabilitiesChange = undefined,
@@ -102,7 +105,8 @@
       {capabilities}
       {route}
       {onRouteChange}
-      {kata}
+      {kataAuthority}
+      {searchReferences}
       {onLinkMessage}
       {onOpenIssue}
       onConfigure={() => (setupOpen = true)}

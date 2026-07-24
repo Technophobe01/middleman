@@ -213,6 +213,8 @@ type Server struct {
 	kataProxyMu                 sync.Mutex
 	kataProxyCache              map[kataProxyCacheKey]kataProxyCacheEntry
 	kataProxyIdleCloseOnce      sync.Once
+	kataSnapshots               *kataSnapshotCoordinator
+	kataEvents                  *kataFrontendEventRegistry
 	docsRegistry                *docs.Registry
 	docsPublishLocks            *docsPublishLockSet
 	msgvault                    *msgvaultHandler
@@ -451,6 +453,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	// client disconnect, hanging the shutdown until ctx expires.
 	if first && s.hub != nil {
 		s.hub.Close()
+	}
+	if first && s.kataEvents != nil {
+		s.kataEvents.Close()
 	}
 	if first && s.runtime != nil {
 		s.runtime.Shutdown()
@@ -764,6 +769,17 @@ func newServer(
 	s.runBackground(func(ctx context.Context) {
 		<-ctx.Done()
 		s.workspaceDiffCache.Wait()
+	})
+	s.kataSnapshots = newKataSnapshotCoordinator(s.bgCtx, kataSnapshotCoordinatorDeps{})
+	s.runBackground(s.kataSnapshots.run)
+	s.kataEvents = newKataFrontendEventRegistry(s.bgCtx, kataFrontendEventRegistryDeps{
+		invalidate:       s.kataSnapshots.invalidateDaemon,
+		daemonEpoch:      s.kataSnapshots.daemonEpoch,
+		serverInstanceID: s.kataSnapshots.serverInstanceID,
+	})
+	s.runBackground(func(ctx context.Context) {
+		<-ctx.Done()
+		s.kataEvents.Close()
 	})
 
 	s.hostOpts.Store(&hostOpts)
@@ -1600,6 +1616,58 @@ func (s *Server) serveSSESubscribed(
 	ch <-chan RecordedEvent,
 	done <-chan struct{},
 ) {
+	serveSSESubscribedFromHub(
+		ctx,
+		w,
+		rc,
+		s.hub,
+		cursor,
+		hasCursor,
+		ch,
+		done,
+		func(id uint64) Event {
+			return Event{Type: "reconnect.stale", Data: struct{}{}}
+		},
+	)
+}
+
+func serveSSESubscribedFromHub(
+	ctx context.Context,
+	w io.Writer,
+	rc sseController,
+	hub *EventHub,
+	cursor uint64,
+	hasCursor bool,
+	ch <-chan RecordedEvent,
+	done <-chan struct{},
+	staleEvent func(uint64) Event,
+) {
+	serveSSESubscribedFromHubTransformed(
+		ctx, w, rc, hub, cursor, hasCursor, ch, done, staleEvent,
+		func(rec RecordedEvent) (RecordedEvent, bool) { return rec, true },
+		nil,
+	)
+}
+
+type sseReplaySnapshot struct {
+	records []RecordedEvent
+	staleID uint64
+	stale   bool
+}
+
+func serveSSESubscribedFromHubTransformed(
+	ctx context.Context,
+	w io.Writer,
+	rc sseController,
+	hub *EventHub,
+	cursor uint64,
+	hasCursor bool,
+	ch <-chan RecordedEvent,
+	done <-chan struct{},
+	staleEvent func(uint64) Event,
+	transform func(RecordedEvent) (RecordedEvent, bool),
+	preparedReplay *sseReplaySnapshot,
+) {
 
 	if err := rc.Flush(); err != nil {
 		return
@@ -1610,18 +1678,29 @@ func (s *Server) serveSSESubscribed(
 	// live broadcasts and never out of order with them.
 	deliveredThrough := cursor
 	if hasCursor {
-		replay, synID, stale := s.hub.ReplaySnapshotSince(cursor)
+		replay, synID, stale := []RecordedEvent(nil), uint64(0), false
+		if preparedReplay == nil {
+			replay, synID, stale = hub.ReplaySnapshotSince(cursor)
+		} else {
+			replay = preparedReplay.records
+			synID = preparedReplay.staleID
+			stale = preparedReplay.stale
+		}
 		if stale {
-			if !writeSSEFrame(w, rc, synID, "reconnect.stale", []byte("{}")) {
+			if !writeSSERecorded(w, rc, RecordedEvent{ID: synID, Event: staleEvent(synID)}) {
 				return
 			}
 			deliveredThrough = synID
 		} else {
 			for _, rec := range replay {
-				if !writeSSERecorded(w, rc, rec) {
+				deliveredThrough = rec.ID
+				transformed, ok := transform(rec)
+				if !ok {
+					continue
+				}
+				if !writeSSERecorded(w, rc, transformed) {
 					return
 				}
-				deliveredThrough = rec.ID
 			}
 		}
 	}
@@ -1650,7 +1729,12 @@ func (s *Server) serveSSESubscribed(
 				// the snapshot read and a fresh broadcast.
 				continue
 			}
-			if !writeSSERecorded(w, rc, ev) {
+			deliveredThrough = ev.ID
+			transformed, include := transform(ev)
+			if !include {
+				continue
+			}
+			if !writeSSERecorded(w, rc, transformed) {
 				return
 			}
 		case <-ticker.C:

@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
+import { fireEvent, render, screen, waitFor } from "@testing-library/svelte";
 import { describe, expect, test, vi } from "vite-plus/test";
 
 import type { KataProjectSummary, KataTaskSearchFilters } from "../../api/kata/taskTypes.js";
@@ -57,20 +57,14 @@ describe("KataSearchPanel", () => {
     });
   });
 
-  test("displays duplicate candidate details", () => {
-    render(KataSearchPanel, {
-      props: {
-        filters,
-        projects: [],
-        duplicateCandidates: [{ title: "Pay rent", qualified_id: "Finances#rent", reason: "same title" }],
-        onChange: vi.fn(),
-      },
-    });
+  test("emits the Ready status filter", async () => {
+    const onChange = vi.fn();
+    render(KataSearchPanel, { props: { filters, projects, onChange } });
 
-    const candidate = screen.getByRole("listitem");
-    expect(within(candidate).getByText("Pay rent")).toBeTruthy();
-    expect(within(candidate).getByText("Finances#rent")).toBeTruthy();
-    expect(within(candidate).getByText("same title")).toBeTruthy();
+    await fireEvent.click(screen.getByRole("combobox", { name: "Status: Open" }));
+    await fireEvent.click(screen.getByRole("option", { name: "Ready" }));
+
+    expect(onChange).toHaveBeenCalledWith({ ...filters, status: "ready" });
   });
 
   test("keeps fast filter edits when parent state has not rerendered yet", async () => {

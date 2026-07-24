@@ -5,15 +5,19 @@
   import { renderMarkdown, renderMarkdownSync } from "@middleman/ui/utils/markdown";
   import { localDateTimeLabel, timeAgo } from "@middleman/ui/utils/time";
 
+  import {
+    searchKataTaskReferences,
+    type KataTaskReferenceSearch,
+  } from "../../api/kata/snapshot.js";
   import type {
     KataProjectSummary,
     KataRecurrence,
-    KataTaskAPI,
     KataTaskDetail,
     KataTaskEditPatch,
     KataTaskEvent,
-    KataTaskGroup,
+    KataTaskSummary,
   } from "../../api/kata/taskTypes.js";
+  import type { KataIssueNavigationTarget } from "../../api/kata/navigation.js";
   import type { KataLinkFilters } from "../../features/kata/kataLinkFilters.js";
   import type { MessageLinkRef } from "../../messages/types";
   import IssueMessageLinks from "../../features/kata/IssueMessageLinks.svelte";
@@ -34,8 +38,8 @@
   interface Props {
     issue: KataTaskDetail;
     events: KataTaskEvent[];
-    currentView: { groups: KataTaskGroup[] };
-    api: KataTaskAPI;
+    issueCatalog: readonly KataTaskSummary[];
+    searchReferences?: KataTaskReferenceSearch | undefined;
     activeDaemonId?: string | undefined;
     linkFilters: KataLinkFilters;
     onLinkFiltersChange: (next: KataLinkFilters) => void;
@@ -45,6 +49,9 @@
     unlinkBusyIds: ReadonlySet<number>;
     selectedRecurrences: KataRecurrence[];
     checklistRevealed: boolean;
+    actionsDisabled?: boolean | undefined;
+    authorityBlocked?: boolean | undefined;
+    draftResetGeneration?: number | undefined;
     movePending?: boolean | undefined;
     onMoveIssue: (toProjectUID: string) => boolean | Promise<boolean>;
     onPatchMetadata: (uid: string, patch: Record<string, unknown>) => boolean | Promise<boolean>;
@@ -67,7 +74,7 @@
     ) => boolean | Promise<boolean>;
     onReopenIssue: () => void | Promise<void>;
     onDeleteIssue: () => boolean | Promise<boolean>;
-    onSelectIssue: (uid: string) => void | Promise<void>;
+    onSelectIssue: (target: KataIssueNavigationTarget) => void | Promise<void>;
     onOpenGraph?: ((issue: KataTaskDetail["issue"]) => void) | undefined;
     workspaceAction?: WorkspaceAction | undefined;
   }
@@ -75,8 +82,8 @@
   let {
     issue,
     events,
-    currentView,
-    api,
+    issueCatalog,
+    searchReferences = searchKataTaskReferences,
     activeDaemonId = undefined,
     linkFilters,
     onLinkFiltersChange,
@@ -86,6 +93,9 @@
     unlinkBusyIds,
     selectedRecurrences,
     checklistRevealed,
+    actionsDisabled = false,
+    authorityBlocked = undefined,
+    draftResetGeneration = 0,
     movePending = false,
     onMoveIssue,
     onPatchMetadata,
@@ -120,8 +130,14 @@
   let bodyTextarea: HTMLTextAreaElement | null = $state(null);
   let cancelingTitle = $state(false);
   let lastIssueUID = $state<string | null>(null);
+  let lastDraftResetGeneration = $state<number | null>(null);
+  let pendingTitleResetUID = $state<string | null>(null);
+  let pendingTitleResetGeneration = $state<number | null>(null);
+  let pendingBodyResetUID = $state<string | null>(null);
+  let pendingBodyResetGeneration = $state<number | null>(null);
 
   const canCreateRecurrence = $derived(issue.issue.recurrence_id === undefined);
+  const detailInert = $derived(authorityBlocked ?? actionsDisabled);
   const visibleRecurrences = $derived.by(() => {
     const attachedID = issue.issue.recurrence_id;
     if (attachedID !== undefined) {
@@ -140,7 +156,43 @@
     savingTitle = false;
     savingBody = false;
     cancelingTitle = false;
+    pendingTitleResetUID = null;
+    pendingTitleResetGeneration = null;
+    pendingBodyResetUID = null;
+    pendingBodyResetGeneration = null;
   });
+
+  $effect(() => {
+    const nextGeneration = draftResetGeneration;
+    if (lastDraftResetGeneration === null) {
+      lastDraftResetGeneration = nextGeneration;
+      return;
+    }
+    if (nextGeneration === lastDraftResetGeneration) return;
+    lastDraftResetGeneration = nextGeneration;
+    const uid = issue.issue.uid;
+    if (pendingTitleResetUID === uid && pendingTitleResetGeneration !== nextGeneration) {
+      resetTitleDraft();
+    }
+    if (pendingBodyResetUID === uid && pendingBodyResetGeneration !== nextGeneration) {
+      resetBodyDraft();
+    }
+  });
+
+  function resetTitleDraft(): void {
+    editingTitle = false;
+    cancelingTitle = false;
+    titleDraft = "";
+    pendingTitleResetUID = null;
+    pendingTitleResetGeneration = null;
+  }
+
+  function resetBodyDraft(): void {
+    editingBody = false;
+    bodyDraft = "";
+    pendingBodyResetUID = null;
+    pendingBodyResetGeneration = null;
+  }
 
   function checklistItems() {
     return issue.issue.metadata.checklist ?? [];
@@ -156,6 +208,7 @@
   }
 
   function startEditingTitle(): void {
+    if (actionsDisabled) return;
     cancelingTitle = false;
     titleDraft = issue.issue.title;
     editingTitle = true;
@@ -166,7 +219,7 @@
   }
 
   async function commitTitle(): Promise<void> {
-    if (savingTitle) return;
+    if (actionsDisabled || savingTitle) return;
     if (cancelingTitle) {
       cancelingTitle = false;
       editingTitle = false;
@@ -177,10 +230,18 @@
       editingTitle = false;
       return;
     }
+    const mutationUID = issue.issue.uid;
+    const resetGeneration = draftResetGeneration;
     savingTitle = true;
     try {
-      if (await onEditIssue(issue.issue.uid, { title: next })) {
-        editingTitle = false;
+      if (await onEditIssue(mutationUID, { title: next })) {
+        if (issue.issue.uid !== mutationUID) return;
+        if (draftResetGeneration !== resetGeneration) {
+          resetTitleDraft();
+        } else {
+          pendingTitleResetUID = mutationUID;
+          pendingTitleResetGeneration = resetGeneration;
+        }
       }
     } finally {
       savingTitle = false;
@@ -199,22 +260,31 @@
   }
 
   function startEditingBody(): void {
+    if (actionsDisabled) return;
     bodyDraft = issue.issue.body;
     editingBody = true;
     queueMicrotask(() => bodyTextarea?.focus());
   }
 
   async function commitBody(): Promise<void> {
-    if (savingBody) return;
+    if (actionsDisabled || savingBody) return;
     const next = bodyDraft;
     if (next === issue.issue.body) {
       editingBody = false;
       return;
     }
+    const mutationUID = issue.issue.uid;
+    const resetGeneration = draftResetGeneration;
     savingBody = true;
     try {
-      if (await onEditIssue(issue.issue.uid, { body: next })) {
-        editingBody = false;
+      if (await onEditIssue(mutationUID, { body: next })) {
+        if (issue.issue.uid !== mutationUID) return;
+        if (draftResetGeneration !== resetGeneration) {
+          resetBodyDraft();
+        } else {
+          pendingBodyResetUID = mutationUID;
+          pendingBodyResetGeneration = resetGeneration;
+        }
       }
     } finally {
       savingBody = false;
@@ -232,7 +302,8 @@
   }
 </script>
 
-<section class="kata-detail" aria-label="Task detail">
+<section class="kata-detail" aria-label="Task detail" aria-busy={actionsDisabled || detailInert} inert={detailInert}>
+  <fieldset class="mutation-controls" disabled={actionsDisabled || detailInert}>
   <div class="detail-heading">
     <div class="detail-heading-main">
       <div class="detail-kicker">
@@ -345,10 +416,13 @@
       <p class="detail-body-empty">No description.</p>
     {/if}
   </section>
+  </fieldset>
 
   <KataIssueProperties
     {issue}
     {ownerOptions}
+    {actionsDisabled}
+    {draftResetGeneration}
     onPatchMetadata={onPatchMetadata}
     onAssignOwner={onAssignOwner}
     onUnassignOwner={onUnassignOwner}
@@ -357,6 +431,7 @@
     onRemoveLabel={onRemoveLabel}
   />
 
+  <fieldset class="mutation-controls" disabled={actionsDisabled || detailInert}>
   <IssueMessageLinks
     links={messageLinks}
     busyIds={unlinkBusyIds}
@@ -366,7 +441,14 @@
     }}
   />
 
-  <KataChecklistEditor {issue} revealed={checklistRevealed} onPatchMetadata={onPatchMetadata} onReveal={onRevealChecklist} />
+  <KataChecklistEditor
+    {issue}
+    revealed={checklistRevealed}
+    disabled={actionsDisabled}
+    {draftResetGeneration}
+    onPatchMetadata={onPatchMetadata}
+    onReveal={onRevealChecklist}
+  />
 
   {#if visibleRecurrences.length > 0}
     <section class="recurrence-section" aria-label="Recurrence">
@@ -378,16 +460,19 @@
       />
     </section>
   {/if}
+  </fieldset>
 
   {#key issue.issue.uid}
     <KataIssueDiscussion
       {issue}
       {events}
-      {currentView}
-      {api}
+      {issueCatalog}
+      {searchReferences}
       {activeDaemonId}
       {linkFilters}
       {onLinkFiltersChange}
+      {actionsDisabled}
+      {draftResetGeneration}
       onAddComment={onAddComment}
       onEditIssue={onEditIssue}
       onSelectIssue={onSelectIssue}
@@ -403,6 +488,10 @@
     overflow: auto;
     background: var(--bg-primary);
     padding: 18px 22px;
+  }
+
+  .mutation-controls {
+    display: contents;
   }
 
   .detail-heading {

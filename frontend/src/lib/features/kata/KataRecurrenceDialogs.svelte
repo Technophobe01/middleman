@@ -11,12 +11,13 @@
   interface Props {
     selectedIssue: KataTaskDetail | null;
     actor: string;
+    disabled?: boolean | undefined;
     onCreate: (projectID: number, input: KataCreateRecurrenceInput) => Promise<void>;
     onPatch: (id: number, input: KataPatchRecurrenceInput, etag: string) => Promise<void>;
     onDelete: (recurrence: KataRecurrence) => Promise<boolean>;
   }
 
-  let { selectedIssue, actor, onCreate, onPatch, onDelete }: Props = $props();
+  let { selectedIssue, actor, disabled = false, onCreate, onPatch, onDelete }: Props = $props();
 
   let recurrenceDialog = $state<
     | { open: false; mode: "create"; recurrence: null; etag: "" }
@@ -30,10 +31,12 @@
   let deletingRecurrence = $state(false);
 
   export function openCreateRecurrence(): void {
+    if (disabled) return;
     recurrenceDialog = { open: true, mode: "create", recurrence: null, etag: "" };
   }
 
   export function openEditRecurrence(recurrence: KataRecurrence): void {
+    if (disabled) return;
     recurrenceDialog = {
       open: true,
       mode: "edit",
@@ -43,12 +46,28 @@
   }
 
   export function openDeleteRecurrence(recurrence: KataRecurrence): void {
+    if (disabled) return;
     recurrenceDelete = { open: true, recurrence };
   }
 
   export function closeAll(): void {
     closeRecurrenceDialog();
     closeDeleteRecurrence();
+  }
+
+  // A delete conflict (412) reloads the recurrence list; without reconciling,
+  // the open delete dialog would retry with the stale revision forever.
+  export function reconcileRecurrences(recurrences: readonly KataRecurrence[]): void {
+    const target = recurrenceDelete.recurrence;
+    if (!recurrenceDelete.open || !target) return;
+    const fresh = recurrences.find((item) => item.uid === target.uid);
+    if (!fresh) {
+      recurrenceDelete = { open: false, recurrence: null };
+      return;
+    }
+    if (fresh.revision !== target.revision) {
+      recurrenceDelete = { open: true, recurrence: fresh };
+    }
   }
 
   function closeRecurrenceDialog(): void {
@@ -62,7 +81,7 @@
 
   async function confirmDeleteRecurrence(): Promise<void> {
     const recurrence = recurrenceDelete.recurrence;
-    if (!recurrence || deletingRecurrence) return;
+    if (disabled || !recurrence || deletingRecurrence) return;
     deletingRecurrence = true;
     try {
       const ok = await onDelete(recurrence);
@@ -82,6 +101,7 @@
       ? { kind: "create", projectID: selectedIssue.issue.project_id }
       : { kind: "edit", recurrence: recurrenceDialog.recurrence, etag: recurrenceDialog.etag }}
     {actor}
+    {disabled}
     onClose={closeRecurrenceDialog}
     onCreate={onCreate}
     onPatch={onPatch}
@@ -92,6 +112,7 @@
   <RecurrenceDeleteDialog
     open={recurrenceDelete.open}
     recurrence={recurrenceDelete.recurrence}
+    {disabled}
     onConfirm={() => {
       void confirmDeleteRecurrence();
     }}

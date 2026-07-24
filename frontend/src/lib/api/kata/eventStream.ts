@@ -1,6 +1,5 @@
-import { KATA_DAEMON_HEADER, kataProxyPath } from "./daemons.js";
-import { normalizeKataEvents } from "./taskNormalizers.js";
-import type { KataTaskEventStreamMessage } from "./taskTypes.js";
+import { KATA_DAEMON_HEADER } from "./daemons.js";
+import { createRuntimeClient } from "../runtime.js";
 
 interface FrameState {
   id?: number;
@@ -12,10 +11,17 @@ export interface ReadKataEventStreamOptions {
   daemonId?: string | undefined;
   fetchImpl?: typeof fetch | undefined;
   lastEventID?: number | undefined;
-  projectID?: number | undefined;
   signal?: AbortSignal | undefined;
   onOpen?: (() => void) | undefined;
-  onMessage(message: KataTaskEventStreamMessage): void | Promise<void>;
+  onMessage(message: KataTaskEventStreamFrame): void | Promise<void>;
+}
+
+export interface KataTaskEventStreamFrame {
+  kind: "reset" | "invalidation";
+  server_instance_id: string;
+  daemon_id: string;
+  epoch: number;
+  cursor: number;
 }
 
 export class KataEventStreamError extends Error {
@@ -36,8 +42,12 @@ function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function optionalNumber(value: unknown): number | undefined {
-  return typeof value === "number" ? value : undefined;
+function nonNegativeSafeInteger(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
 function parseData(data: string): Record<string, unknown> | undefined {
@@ -49,17 +59,13 @@ function parseData(data: string): Record<string, unknown> | undefined {
   }
 }
 
-function frameID(frame: FrameState, body: Record<string, unknown>): number {
-  return frame.id ?? optionalNumber(body.event_id) ?? optionalNumber(body.reset_after_id) ?? 0;
-}
-
 export class KataEventStreamParser {
   private buffer = "";
   private frame: FrameState = { data: [] };
 
-  push(chunk: string): KataTaskEventStreamMessage[] {
+  push(chunk: string): KataTaskEventStreamFrame[] {
     this.buffer += chunk;
-    const messages: KataTaskEventStreamMessage[] = [];
+    const messages: KataTaskEventStreamFrame[] = [];
 
     for (;;) {
       const newline = this.buffer.indexOf("\n");
@@ -74,8 +80,8 @@ export class KataEventStreamParser {
     return messages;
   }
 
-  flush(): KataTaskEventStreamMessage[] {
-    const messages: KataTaskEventStreamMessage[] = [];
+  flush(): KataTaskEventStreamFrame[] {
+    const messages: KataTaskEventStreamFrame[] = [];
     if (this.buffer.length > 0) {
       const line = this.buffer.endsWith("\r") ? this.buffer.slice(0, -1) : this.buffer;
       this.buffer = "";
@@ -87,7 +93,7 @@ export class KataEventStreamParser {
     return messages;
   }
 
-  private consumeLine(line: string): KataTaskEventStreamMessage | undefined {
+  private consumeLine(line: string): KataTaskEventStreamFrame | undefined {
     if (line === "") {
       return this.commitFrame();
     }
@@ -103,7 +109,7 @@ export class KataEventStreamParser {
     switch (field) {
       case "id": {
         const id = Number(value);
-        if (Number.isFinite(id)) this.frame.id = id;
+        if (Number.isSafeInteger(id) && id >= 0) this.frame.id = id;
         break;
       }
       case "event":
@@ -118,52 +124,42 @@ export class KataEventStreamParser {
     return undefined;
   }
 
-  private commitFrame(): KataTaskEventStreamMessage | undefined {
+  private commitFrame(): KataTaskEventStreamFrame | undefined {
     const frame = this.frame;
     this.frame = { data: [] };
-    if (frame.data.length === 0) return undefined;
+    if (frame.id === undefined || frame.data.length === 0) return undefined;
+    let kind: KataTaskEventStreamFrame["kind"];
+    if (frame.event === "kata.tasks.reset") {
+      kind = "reset";
+    } else if (frame.event === "kata.tasks.invalidated") {
+      kind = "invalidation";
+    } else {
+      return undefined;
+    }
 
     const body = parseData(frame.data.join("\n"));
     if (!body) return undefined;
-    const id = frameID(frame, body);
-    const type = typeof body.type === "string" ? body.type : frame.event;
-
-    if (
-      frame.event === "sync.reset_required" ||
-      type === "sync.reset_required" ||
-      typeof body.reset_after_id === "number"
-    ) {
-      const resetAfterID = optionalNumber(body.reset_after_id) ?? id;
-      return {
-        kind: "reset",
-        event_id: id,
-        reset_after_id: resetAfterID,
-        lastEventID: id,
-      };
+    const serverInstanceID = nonEmptyString(body.server_instance_id);
+    const daemonID = nonEmptyString(body.daemon_id);
+    const epoch = nonNegativeSafeInteger(body.epoch);
+    const cursor = nonNegativeSafeInteger(body.cursor);
+    if (serverInstanceID === undefined || daemonID === undefined || epoch === undefined || cursor !== frame.id) {
+      return undefined;
     }
 
-    const event = normalizeKataEvents({
-      reset_required: false,
-      events: [{ ...body, event_id: optionalNumber(body.event_id) ?? id, type }],
-      next_after_id: id,
-    }).events[0];
-    if (!event) return undefined;
-
     return {
-      kind: "event",
-      event,
-      lastEventID: id,
+      kind,
+      server_instance_id: serverInstanceID,
+      daemon_id: daemonID,
+      epoch,
+      cursor,
     };
   }
 }
 
 export async function readKataEventStream(options: ReadKataEventStreamOptions): Promise<void> {
   const fetchImpl = options.fetchImpl ?? fetch;
-  const params = new URLSearchParams();
-  if (options.projectID !== undefined) {
-    params.set("project_id", String(options.projectID));
-  }
-  const suffix = params.toString() ? `?${params.toString()}` : "";
+  const client = createRuntimeClient(fetchImpl);
 
   const headers = new Headers({ Accept: "text/event-stream" });
   if (options.daemonId) {
@@ -174,12 +170,16 @@ export async function readKataEventStream(options: ReadKataEventStreamOptions): 
   }
 
   let response: Response;
+  let body: ReadableStream<Uint8Array> | null | undefined;
   try {
-    const init: RequestInit = { headers };
-    if (options.signal) {
-      init.signal = options.signal;
-    }
-    response = await fetchImpl(kataProxyPath(`/api/v1/events/stream${suffix}`), init);
+    const init = {
+      headers,
+      parseAs: "stream" as const,
+      ...(options.signal ? { signal: options.signal } : {}),
+    };
+    const result = await client.GET("/kata/tasks/events", init);
+    response = result.response;
+    body = result.data;
   } catch (error) {
     if (options.signal?.aborted) return;
     throw error;
@@ -190,16 +190,29 @@ export async function readKataEventStream(options: ReadKataEventStreamOptions): 
       retryable: isRetryableStreamSetupStatus(response.status),
     });
   }
-  if (!response.body) {
+  if (!body) {
     throw new KataEventStreamError("Kata event stream response has no body", { retryable: false });
   }
   options.onOpen?.();
 
-  const reader = response.body.getReader();
+  const reader = body.getReader();
+  if (options.signal?.aborted) {
+    try {
+      // An aborted response body may already be errored, in which case
+      // cancel() rejects with the stored stream error; the abort contract is
+      // still a clean return.
+      await reader.cancel();
+    } catch {
+      // Ignored: cancellation of an errored stream.
+    } finally {
+      reader.releaseLock();
+    }
+    return;
+  }
   const decoder = new TextDecoder();
   const parser = new KataEventStreamParser();
   const abortReader = () => {
-    void reader.cancel();
+    reader.cancel().catch(() => {});
   };
   options.signal?.addEventListener("abort", abortReader, { once: true });
 

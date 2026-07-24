@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -485,6 +486,122 @@ func TestServerShutdownClosesSSESubscribers(t *testing.T) {
 	select {
 	case e := <-serveErr:
 		req.ErrorIs(e, http.ErrServerClosed)
+	case <-time.After(time.Second):
+		req.FailNow("Serve did not return after Shutdown")
+	}
+}
+
+func TestServerShutdownClosesKataSSESubscribersBeforeHTTPDrain(t *testing.T) {
+	req := require.New(t)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/events":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"events":[],"next_after_id":0,"reset_required":false}`)
+		case "/api/v1/events/stream":
+			w.Header().Set("Content-Type", "text/event-stream")
+			_ = http.NewResponseController(w).Flush()
+			<-r.Context().Done()
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	home := t.TempDir()
+	t.Setenv("KATA_HOME", home)
+	writeKataServerCatalog(t, home, `
+[[daemon]]
+name = "primary"
+url = "`+upstream.URL+`"
+	`)
+	srv, _ := setupTestServer(t)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	req.NoError(err)
+	addr := ln.Addr().String()
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.Serve(ln) }()
+
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://"+addr+"/api/v1/kata/tasks/events", nil)
+	req.NoError(err)
+	request.Header.Set(kataDaemonHeaderName, "primary")
+	response, err := http.DefaultClient.Do(request)
+	req.NoError(err)
+	defer response.Body.Close()
+	req.Equal(http.StatusOK, response.StatusCode)
+
+	readDone := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(io.Discard, response.Body)
+		close(readDone)
+	}()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	start := time.Now()
+	req.NoError(srv.Shutdown(ctx))
+	req.Less(time.Since(start), time.Second, "Shutdown waited on the Kata SSE handler")
+
+	select {
+	case <-readDone:
+	case <-time.After(time.Second):
+		req.FailNow("Kata SSE connection did not close after Shutdown")
+	}
+	select {
+	case err := <-serveErr:
+		req.ErrorIs(err, http.ErrServerClosed)
+	case <-time.After(time.Second):
+		req.FailNow("Serve did not return after Shutdown")
+	}
+}
+
+func TestServerShutdownRejectsKataSSEAdmittedAfterEventRegistryCloses(t *testing.T) {
+	req := require.New(t)
+	home := t.TempDir()
+	t.Setenv("KATA_HOME", home)
+	writeKataServerCatalog(t, home, `
+[[daemon]]
+name = "primary"
+url = "http://127.0.0.1:1"
+	`)
+	srv, _ := setupTestServer(t)
+	srv.kataEvents.Close()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	req.NoError(err)
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.Serve(ln) }()
+
+	requestCtx, cancelRequest := context.WithTimeout(t.Context(), time.Second)
+	defer cancelRequest()
+	request, err := http.NewRequestWithContext(
+		requestCtx,
+		http.MethodGet,
+		"http://"+ln.Addr().String()+"/api/v1/kata/tasks/events",
+		nil,
+	)
+	req.NoError(err)
+	request.Header.Set(kataDaemonHeaderName, "primary")
+	response, err := http.DefaultClient.Do(request)
+	req.NoError(err)
+	body, readErr := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	req.NoError(readErr)
+	req.Equal(http.StatusServiceUnavailable, response.StatusCode, string(body))
+	req.Contains(response.Header.Values("Vary"), kataDaemonHeaderName)
+	req.NotEqual("text/event-stream", response.Header.Get("Content-Type"))
+	req.Contains(string(body), "serviceUnavailable")
+
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	start := time.Now()
+	req.NoError(srv.Shutdown(ctx))
+	req.Less(time.Since(start), time.Second, "Shutdown waited on a post-close Kata event stream")
+
+	select {
+	case err := <-serveErr:
+		req.ErrorIs(err, http.ErrServerClosed)
 	case <-time.After(time.Second):
 		req.FailNow("Serve did not return after Shutdown")
 	}

@@ -25,12 +25,6 @@ export interface KataProjectMetadata {
   [key: string]: unknown;
 }
 
-export interface KataInstanceResponse {
-  instance_uid: string;
-  version: string;
-  schema_version: number;
-}
-
 export interface KataProjectSummary {
   id: number;
   uid: string;
@@ -40,11 +34,6 @@ export interface KataProjectSummary {
   created_at?: string | undefined;
   deleted_at?: string | undefined;
   open_count: number;
-}
-
-export interface KataProjectsResponse {
-  projects: KataProjectSummary[];
-  fetched_at: string;
 }
 
 export interface KataLinkPeer {
@@ -94,10 +83,9 @@ export interface KataTaskViewResponse {
   view: KataTaskViewName;
   groups: KataTaskGroup[];
   fetched_at: string;
-  daemon_id?: string | undefined;
 }
 
-export type KataTaskStatusFilter = "open" | "closed" | "all";
+export type KataTaskStatusFilter = "open" | "ready" | "closed" | "all";
 export type KataTaskSearchScope = { kind: "all" } | { kind: "project"; project_uid: string };
 
 export interface KataTaskSearchFilters {
@@ -108,20 +96,8 @@ export interface KataTaskSearchFilters {
   query: string;
 }
 
-export interface KataTaskSearchResponse {
-  filters: KataTaskSearchFilters;
-  issues: KataTaskSummary[];
-  fetched_at: string;
-  daemon_id?: string | undefined;
-}
-
 export type KataReachableGraphDepth = "full" | "1" | "2" | "3";
 export type KataReachableGraphEdgeKind = "parent" | "blocks" | "related";
-
-export interface KataReachableGraphQuery {
-  depth?: KataReachableGraphDepth | undefined;
-  hide_done?: boolean | undefined;
-}
 
 export interface KataReachableGraphEdge {
   from_uid: string;
@@ -145,12 +121,6 @@ export interface KataReachableGraphResponse {
   edges: KataReachableGraphEdge[];
   unresolved_refs: KataReachableGraphUnresolvedRef[];
   fetched_at: string;
-}
-
-export interface KataDuplicateCandidateDisplay {
-  title: string;
-  qualified_id: string;
-  reason?: string | undefined;
 }
 
 export interface KataComment {
@@ -205,9 +175,8 @@ export interface KataTaskDetail {
   links: KataTaskLink[];
   parent?: KataTaskRef | undefined;
   children?: KataTaskSummary[] | undefined;
-  // Resolved by middleman alongside the daemon detail read, so the
-  // workspace action renders together with the pane instead of after a
-  // second round trip.
+  // Accepted snapshot enrichment carries the workspace action atomically
+  // with selected task detail.
   workspace_target?: KataWorkspaceTarget | undefined;
 }
 
@@ -231,24 +200,6 @@ export interface KataTaskEvent {
   payload?: Record<string, unknown> | undefined;
   created_at: string;
 }
-
-export interface KataTaskEventsQuery {
-  project_id?: number | undefined;
-  issue_uid?: string | undefined;
-  after_id?: number | undefined;
-  limit?: number | undefined;
-}
-
-export interface KataTaskEventsResponse {
-  reset_required: boolean;
-  reset_after_id?: number | undefined;
-  events: KataTaskEvent[];
-  next_after_id: number;
-}
-
-export type KataTaskEventStreamMessage =
-  | { kind: "event"; event: KataTaskEvent; lastEventID: number }
-  | { kind: "reset"; event_id: number; reset_after_id: number; lastEventID: number };
 
 export interface KataRecurrence {
   id: number;
@@ -347,7 +298,6 @@ export interface KataTaskLinkDelta {
 }
 
 export type KataTaskMetadataPatch = Record<string, unknown>;
-export type KataProjectMetadataPatch = Record<string, unknown | null>;
 
 export interface KataTaskCloseOptions {
   reason?: "done" | "wontfix" | "duplicate" | "superseded" | "audit-no-change" | undefined;
@@ -357,103 +307,114 @@ export interface KataTaskCloseOptions {
 
 export interface KataTaskMutationResponse {
   changed: boolean;
-  issue?: KataTaskSummary | undefined;
-  comment?: KataComment | undefined;
-  label?: KataTaskLabel | undefined;
-  event?: KataTaskEvent | undefined;
-  etag?: string | undefined;
 }
 
-export interface KataProjectMutationResponse {
-  changed: boolean;
-  project?: KataProjectSummary | undefined;
-  event?: KataTaskEvent | undefined;
-  etag?: string | undefined;
+export interface KataPinnedDaemonOptions {
+  daemonId: string;
 }
 
-export interface KataTaskMoveResponse extends KataTaskMutationResponse {
-  new_short_id: string;
-}
-
-export interface KataTaskIssuesQuery {
-  view: KataTaskViewName;
-  project_uid?: string | undefined;
-  area?: string | undefined;
-}
-
-export interface KataTaskRequestOptions {
-  daemonId?: string | undefined;
+export interface KataPinnedDaemonRequestOptions extends KataPinnedDaemonOptions {
   signal?: AbortSignal | undefined;
 }
 
 export interface KataTaskAPI {
-  bindWorkflowDaemon?(daemonId?: string): void;
-  instance(opts?: KataTaskRequestOptions): Promise<KataInstanceResponse>;
-  projects(opts?: KataTaskRequestOptions): Promise<KataProjectsResponse>;
-  createProject(name: string): Promise<KataProjectSummary>;
-  renameProject(projectID: number, name: string): Promise<KataProjectSummary>;
-  patchProjectMetadata(
-    projectID: number,
-    actor: string,
-    patch: KataProjectMetadataPatch,
-    ifMatch: string,
-  ): Promise<KataProjectMutationResponse>;
+  createProject(name: string, options: KataPinnedDaemonOptions): Promise<KataTaskMutationResponse>;
   createIssue(
     projectID: number,
     actor: string,
     draft: KataTaskCreateDraft,
+    options: KataPinnedDaemonOptions,
     idempotencyKey?: string | undefined,
   ): Promise<KataTaskMutationResponse>;
-  issues(query: KataTaskIssuesQuery, opts?: KataTaskRequestOptions): Promise<KataTaskViewResponse>;
-  search(filters: KataTaskSearchFilters, opts?: KataTaskRequestOptions): Promise<KataTaskSearchResponse>;
-  issue(uid: string, opts?: KataTaskRequestOptions & { pinned?: boolean | undefined }): Promise<KataTaskDetail>;
-  reachableGraph(
-    projectID: number,
-    ref: string,
-    query?: KataReachableGraphQuery,
-    opts?: { daemonId?: string; signal?: AbortSignal },
-  ): Promise<KataReachableGraphResponse>;
-  events(
-    query?: KataTaskEventsQuery,
-    opts?: KataTaskRequestOptions & { signal?: AbortSignal },
-  ): Promise<KataTaskEventsResponse>;
-  addComment(target: KataTaskMutationTarget, actor: string, body: string): Promise<KataTaskMutationResponse>;
-  addLabel(target: KataTaskMutationTarget, actor: string, label: string): Promise<KataTaskMutationResponse>;
-  removeLabel(target: KataTaskMutationTarget, actor: string, label: string): Promise<KataTaskMutationResponse>;
-  assignOwner(target: KataTaskMutationTarget, actor: string, owner: string): Promise<KataTaskMutationResponse>;
-  unassignOwner(target: KataTaskMutationTarget, actor: string): Promise<KataTaskMutationResponse>;
+  addComment(
+    target: KataTaskMutationTarget,
+    actor: string,
+    body: string,
+    options: KataPinnedDaemonOptions,
+  ): Promise<KataTaskMutationResponse>;
+  addLabel(
+    target: KataTaskMutationTarget,
+    actor: string,
+    label: string,
+    options: KataPinnedDaemonOptions,
+  ): Promise<KataTaskMutationResponse>;
+  removeLabel(
+    target: KataTaskMutationTarget,
+    actor: string,
+    label: string,
+    options: KataPinnedDaemonOptions,
+  ): Promise<KataTaskMutationResponse>;
+  assignOwner(
+    target: KataTaskMutationTarget,
+    actor: string,
+    owner: string,
+    options: KataPinnedDaemonOptions,
+  ): Promise<KataTaskMutationResponse>;
+  unassignOwner(
+    target: KataTaskMutationTarget,
+    actor: string,
+    options: KataPinnedDaemonOptions,
+  ): Promise<KataTaskMutationResponse>;
   setPriority(
     target: KataTaskMutationTarget,
     actor: string,
     priority: number | null,
+    options: KataPinnedDaemonOptions,
   ): Promise<KataTaskMutationResponse>;
   closeIssue(
     target: KataTaskMutationTarget,
     actor: string,
-    options?: KataTaskCloseOptions,
+    close: KataTaskCloseOptions,
+    options: KataPinnedDaemonOptions,
   ): Promise<KataTaskMutationResponse>;
-  reopenIssue(target: KataTaskMutationTarget, actor: string): Promise<KataTaskMutationResponse>;
-  editIssue(target: KataTaskMutationTarget, actor: string, patch: KataTaskEditPatch): Promise<KataTaskMutationResponse>;
+  reopenIssue(
+    target: KataTaskMutationTarget,
+    actor: string,
+    options: KataPinnedDaemonOptions,
+  ): Promise<KataTaskMutationResponse>;
+  editIssue(
+    target: KataTaskMutationTarget,
+    actor: string,
+    patch: KataTaskEditPatch,
+    options: KataPinnedDaemonOptions,
+  ): Promise<KataTaskMutationResponse>;
   patchIssueMetadata(
     target: KataTaskMutationTarget,
     actor: string,
     patch: KataTaskMetadataPatch,
     ifMatch: string,
+    options: KataPinnedDaemonOptions,
   ): Promise<KataTaskMutationResponse>;
   moveIssue(
     target: KataTaskMutationTarget,
     actor: string,
     toProjectUID: string,
     ifMatch: string,
-  ): Promise<KataTaskMoveResponse>;
-  recurrences(projectID: number, opts?: KataTaskRequestOptions): Promise<KataRecurrencesResponse>;
-  createRecurrence(projectID: number, input: KataCreateRecurrenceInput): Promise<KataRecurrenceResponse>;
-  showRecurrence(projectID: number, recurrenceUID: string): Promise<KataRecurrenceResponse>;
+    options: KataPinnedDaemonOptions,
+  ): Promise<KataTaskMutationResponse>;
+  recurrences(projectID: number, options: KataPinnedDaemonRequestOptions): Promise<KataRecurrencesResponse>;
+  createRecurrence(
+    projectID: number,
+    input: KataCreateRecurrenceInput,
+    options: KataPinnedDaemonOptions,
+  ): Promise<KataRecurrenceResponse>;
+  showRecurrence(
+    projectID: number,
+    recurrenceUID: string,
+    options: KataPinnedDaemonOptions,
+  ): Promise<KataRecurrenceResponse>;
   patchRecurrence(
     projectID: number,
     recurrenceUID: string,
     patch: KataPatchRecurrenceInput,
     ifMatch: string,
+    options: KataPinnedDaemonOptions,
   ): Promise<KataRecurrenceResponse>;
-  deleteRecurrence(projectID: number, recurrenceUID: string, actor: string, ifMatch?: string): Promise<void>;
+  deleteRecurrence(
+    projectID: number,
+    recurrenceUID: string,
+    actor: string,
+    options: KataPinnedDaemonOptions,
+    ifMatch?: string,
+  ): Promise<void>;
 }

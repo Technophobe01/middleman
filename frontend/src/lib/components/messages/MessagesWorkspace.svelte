@@ -11,7 +11,9 @@
     MessagesSearchMode,
     MessagesSearchResult,
   } from "../../api/messages/types";
-  import type { IssueSummary, IssueRef, KataAPI } from "../../messages/types";
+  import type { KataTaskReferenceSearch } from "../../api/kata/snapshot.js";
+  import type { IssueRef } from "../../messages/types";
+  import type { KataAuxiliaryAuthoritySource } from "../../features/kata/kataAuxiliaryAuthority.svelte";
   import type {
     SavedSearchesAPI,
     SavedSearchesAPIError,
@@ -49,11 +51,8 @@
      * and the banner falls back to a text-only alert.
      */
     onConfigure?: (() => void) | undefined;
-    /**
-     * Resolved kata API for issue search. Optional because Messages-only
-     * deployments do not have Kata issue context.
-     */
-    kata?: Pick<KataAPI, "search"> | undefined;
+    kataAuthority?: KataAuxiliaryAuthoritySource | undefined;
+    searchReferences?: KataTaskReferenceSearch | undefined;
     /**
      * App-owned callback that resolves the chosen issue, applies the
      * computed metadata patch, and returns the qualified id for the
@@ -82,7 +81,8 @@
     route,
     onRouteChange,
     onConfigure,
-    kata,
+    kataAuthority,
+    searchReferences,
     onLinkMessage,
     onOpenIssue,
     messagesConfigVersion,
@@ -414,79 +414,20 @@
       });
   });
 
-  // Fetch all open issues once on mount so we can build the per-message reverse-link index.
-  let linkedIssues: IssueSummary[] | null = $state(null);
-  let linkedIssuesLoading = $state(false);
-  let linkedIssuesError: string | null = $state(null);
-  // Terminal first-attempt flag: set true once the initial auto-load resolves
-  // (success OR failure) so the mount $effect can never auto-retry in a loop.
-  let linkedIssuesLoaded = $state(false);
-
-  // null while never loaded; otherwise the grouped rows (empty array = nothing linked).
   const linkedIndex = $derived(
-    linkedIssues === null ? null : buildLinkedMessagesIndex(linkedIssues),
+    kataAuthority === undefined ? null : buildLinkedMessagesIndex(kataAuthority.issues),
   );
-
-  // Generation counter for refresh races: if a successful link triggers
-  // refreshLinkedIssues() while the initial auto-load is still in flight,
-  // both calls eventually resolve. Without this guard, the older response
-  // could overwrite the newer one and re-stale the index.
-  let linkedIssuesRefreshGen = 0;
-
-  async function refreshLinkedIssues(): Promise<void> {
-    if (!kata) return;
-    const myGen = ++linkedIssuesRefreshGen;
-    linkedIssuesLoading = true;
-    linkedIssuesError = null;
-    try {
-      const res = await kata.search({
-        scope: { kind: "all" },
-        status: "all",
-        owner: "",
-        label: "",
-        query: "",
-      });
-      if (myGen !== linkedIssuesRefreshGen) return; // a newer refresh raced ahead
-      linkedIssues = res.issues;
-    } catch (err) {
-      if (myGen !== linkedIssuesRefreshGen) return;
-      linkedIssuesError = err instanceof Error ? err.message : "Failed to load linked issues.";
-      // Leave linkedIssues at its prior value so a refresh failure doesn't wipe the last good index.
-    } finally {
-      if (myGen === linkedIssuesRefreshGen) {
-        linkedIssuesLoading = false;
-        linkedIssuesLoaded = true;
-      }
-    }
-  }
-
-  $effect(() => {
-    // Guard on linkedIssuesLoaded (terminal), NOT on linkedIssues === null -
-    // a failed first fetch leaves linkedIssues null, so a === null guard would
-    // re-fire forever. After the first attempt resolves, recovery is the
-    // explicit Refresh button in the linked-messages view.
-    if (kata && !linkedIssuesLoaded && !linkedIssuesLoading) {
-      void refreshLinkedIssues();
-    }
-  });
-
-  // Wrap onLinkMessage so a successful link refreshes the reverse index.
-  async function handleLinkMessage(
-    issueUid: string,
-    input: MessageLinkInput,
-  ): Promise<{ qualified_id: string }> {
-    if (!onLinkMessage) throw new Error("link unavailable");
-    const result = await onLinkMessage(issueUid, input);
-    void refreshLinkedIssues();
-    return result;
-  }
+  const linkedIssuesLoading = $derived(
+    kataAuthority?.phase === "idle" || kataAuthority?.phase === "loading",
+  );
+  const linkedIssuesError = $derived(kataAuthority?.error ?? null);
 
   // Subset of linked issues for the currently-viewed message, passed to
   // MessageDetail's reverse pills as the "Linked to" section.
   const reverseLinksForCurrent = $derived.by(() => {
     const id = messageIdFromRoute(route.message);
-    if (id === null || linkedIssues === null) return [];
-    return findIssuesLinkedToMessage(linkedIssues, id);
+    if (id === null || kataAuthority === undefined) return [];
+    return findIssuesLinkedToMessage(kataAuthority.issues, id);
   });
 
   function handleSearch(query: string, mode: MessagesSearchMode): void {
@@ -783,7 +724,7 @@
           domains={{ rows: domains }}
           error={facetsError}
           onSelectFacet={handleSelectFacet}
-          showLinkedView={kata !== undefined}
+          showLinkedView={kataAuthority !== undefined}
           activeView={route.view === "linked" ? "linked" : null}
           onSelectView={(v) => onRouteChange({
             ...route,
@@ -797,13 +738,13 @@
       </aside>
       <div class="messages-sash-wrapper" bind:clientWidth={null, handleSashWidth}>
         <div class="messages-pane messages-pane-list" style:flex-basis={`${listSize}px`}>
-          {#if kata !== undefined && route.view === "linked"}
+          {#if kataAuthority !== undefined && route.view === "linked"}
             <LinkedMessagesView
               rows={linkedIndex}
               loading={linkedIssuesLoading}
               error={linkedIssuesError}
               selectedMessageId={messageIdFromRoute(route.message)}
-              onRefresh={refreshLinkedIssues}
+              onRefresh={() => void kataAuthority.retry().catch(() => {})}
               onSelectMessage={(id) => onRouteChange({ ...route, message: String(id) })}
               onOpenIssue={(uid) => onOpenIssue?.(uid)}
             />
@@ -841,8 +782,8 @@
               {threadError}
               permalinkOf={(id) => `messages:msgvault:${id}`}
               remoteImageURL={messagesApi.remoteImageURL}
-              {kata}
-              onLinkMessage={onLinkMessage ? handleLinkMessage : undefined}
+              {searchReferences}
+              {onLinkMessage}
               reverseLinks={reverseLinksForCurrent}
               {onOpenIssue}
               imagesLoaded={detail !== null && loadedImagesFor.has(imageConsentKey(detail.id, detail.remote_image_token ?? ""))}
@@ -860,8 +801,8 @@
               error={detailError}
               permalinkOf={(id) => `messages:msgvault:${id}`}
               remoteImageURL={messagesApi.remoteImageURL}
-              {kata}
-              onLinkMessage={onLinkMessage ? handleLinkMessage : undefined}
+              {searchReferences}
+              {onLinkMessage}
               reverseLinks={reverseLinksForCurrent}
               {onOpenIssue}
               imagesLoaded={detail !== null && loadedImagesFor.has(imageConsentKey(detail.id, detail.remote_image_token ?? ""))}

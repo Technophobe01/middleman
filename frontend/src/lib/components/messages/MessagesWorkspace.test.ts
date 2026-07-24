@@ -1,5 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
 import { tick } from "svelte";
+import { SvelteMap } from "svelte/reactivity";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
 import type {
@@ -10,11 +11,15 @@ import type {
   MessageSummary,
   MessagesSearchResult,
 } from "../../api/messages/types";
+import type { KataTaskReferenceSearch } from "../../api/kata/snapshot.js";
 import type { SavedSearchesAPI, SavedSearchesAPIError } from "../../api/messages/savedSearchesClient";
 import type { SavedSearch } from "../../messages/savedSearches";
 import { defaultMessagesRoute, type MessagesRoute } from "../../messages/route";
 import type { MessageLinkInput } from "../../messages/messageLinks";
-import type { IssueFilters, IssueSummary, KataAPI, SearchResponse } from "../../messages/types";
+import type {
+  KataAuxiliaryAuthoritySource,
+  KataAuxiliaryIssue,
+} from "../../features/kata/kataAuxiliaryAuthority.svelte";
 import MessagesWorkspace from "./MessagesWorkspace.svelte";
 
 const resizeObservers = new Map<Element, { callback: ResizeObserverCallback; observer: ResizeObserver }>();
@@ -49,13 +54,6 @@ afterEach(() => {
   vi.restoreAllMocks();
   localStorage.clear();
 });
-
-async function openTaskPickerSearch(): Promise<HTMLInputElement> {
-  const existing = screen.queryByPlaceholderText(/Title or qualified ID/i);
-  if (existing) return existing as HTMLInputElement;
-  await fireEvent.click(screen.getByRole("button", { name: /Title or qualified ID/i }));
-  return screen.getByPlaceholderText(/Title or qualified ID/i) as HTMLInputElement;
-}
 
 function makeCapabilities(overrides: Partial<MessagesCapabilities> = {}): MessagesCapabilities {
   return {
@@ -153,7 +151,8 @@ function renderWorkspace(
     messagesApi?: MessagesAPI;
     savedSearchesApi?: SavedSearchesAPI;
     messagesConfigVersion?: number;
-    kata?: Pick<KataAPI, "search">;
+    kataAuthority?: KataAuxiliaryAuthoritySource;
+    searchReferences?: KataTaskReferenceSearch;
     onLinkMessage?: (issueUid: string, input: MessageLinkInput) => Promise<{ qualified_id: string }>;
     onOpenIssue?: (uid: string) => void;
   } = {},
@@ -166,7 +165,8 @@ function renderWorkspace(
       route: options.route ?? defaultMessagesRoute,
       onRouteChange: options.onRouteChange ?? (() => {}),
       messagesConfigVersion: options.messagesConfigVersion ?? 0,
-      kata: options.kata,
+      kataAuthority: options.kataAuthority,
+      searchReferences: options.searchReferences,
       onLinkMessage: options.onLinkMessage,
       onOpenIssue: options.onOpenIssue,
     },
@@ -968,14 +968,15 @@ describe("MessagesWorkspace threading", () => {
 });
 
 describe("MessagesWorkspace linked messages", () => {
-  function makeLinkedIssue(overrides: Partial<IssueSummary> = {}): IssueSummary {
+  function makeLinkedIssue(overrides: Partial<KataAuxiliaryIssue> = {}): KataAuxiliaryIssue {
     return {
-      id: 1,
       uid: "issue-uid-1",
       short_id: "1",
       qualified_id: "PROJECT-1",
       title: "Issue with message link",
-      status: "all",
+      project_uid: "project-uid",
+      project_name: "Project",
+      status: "open",
       metadata: {
         mail_links: [
           {
@@ -992,33 +993,27 @@ describe("MessagesWorkspace linked messages", () => {
     };
   }
 
-  function linkedSearchResponse(issues: IssueSummary[], query = ""): SearchResponse {
+  function kataAuthority(issues: readonly KataAuxiliaryIssue[]): KataAuxiliaryAuthoritySource {
     return {
-      filters: {
-        scope: { kind: "all" },
-        status: "all",
-        owner: "",
-        label: "",
-        query,
-      },
       issues,
-      fetched_at: "2026-05-15T10:00:00Z",
+      daemonID: "home",
+      phase: "accepted",
+      error: null,
+      retry: vi.fn(async () => true),
     };
   }
 
   it("view=linked renders linked messages and wires row and issue actions", async () => {
-    const kataSearch = vi.fn(async () => linkedSearchResponse([makeLinkedIssue()]));
     const onRouteChange = vi.fn();
     const onOpenIssue = vi.fn();
 
     renderWorkspace({
       route: { mode: "messages", q: null, message: null, view: "linked" },
-      kata: { search: kataSearch },
+      kataAuthority: kataAuthority([makeLinkedIssue()]),
       onRouteChange,
       onOpenIssue,
     });
 
-    await waitFor(() => expect(kataSearch).toHaveBeenCalledOnce());
     const linkedRegion = await waitFor(() => screen.getByRole("region", { name: "Linked messages" }));
 
     await fireEvent.click(within(linkedRegion).getByRole("button", { name: "PROJECT-1" }));
@@ -1028,90 +1023,72 @@ describe("MessagesWorkspace linked messages", () => {
     expect(onRouteChange).toHaveBeenCalledWith(expect.objectContaining({ message: "555", view: "linked" }));
   });
 
-  it("ignores a stale linked-issue refresh after linking a message", async () => {
-    const baseIssue: IssueSummary = {
-      id: 42,
-      uid: "issue-uid-42",
-      short_id: "42",
-      qualified_id: "Kata#42",
-      title: "Picked issue",
-      status: "open",
-      metadata: {},
+  it("replaces reverse links when the shared accepted snapshot changes", async () => {
+    const issues = new SvelteMap([["issue-uid-1", makeLinkedIssue()]]);
+    const authority: KataAuxiliaryAuthoritySource = {
+      get issues() {
+        return [...issues.values()];
+      },
+      daemonID: "home",
+      phase: "accepted",
+      error: null,
+      retry: vi.fn(async () => true),
     };
-    const issueWithLink = makeLinkedIssue({
-      ...baseIssue,
-      metadata: {
-        mail_links: [
-          {
-            message_id: 1001,
-            conversation_id: 1001,
-            subject: "Subject 1001",
-            from: "sender1001@example.com",
-            sent_at: "2026-05-15T09:00:00Z",
-            added_at: "2026-05-15T10:00:00Z",
-          },
-        ],
+    const props = {
+      messagesApi: makeMessagesApi({ message: async () => makeDetail(555) }),
+      savedSearchesApi: makeSavedSearchesAPI(),
+      capabilities: makeCapabilities(),
+      route: { mode: "messages" as const, q: null, message: "555", view: "linked" as const },
+      onRouteChange: vi.fn(),
+      messagesConfigVersion: 0,
+      kataAuthority: authority,
+      onOpenIssue: vi.fn(),
+    };
+    render(MessagesWorkspace, { props });
+
+    const linkedMessages = await screen.findByRole("region", { name: "Linked messages" });
+    const linkedTasks = await screen.findByRole("region", { name: "Linked tasks" });
+    expect(within(linkedMessages).getByRole("button", { name: "PROJECT-1" })).toBeTruthy();
+    expect(within(linkedTasks).getByRole("button", { name: /PROJECT-1/ })).toBeTruthy();
+
+    issues.clear();
+    issues.set(
+      "issue-uid-2",
+      makeLinkedIssue({
+        uid: "issue-uid-2",
+        short_id: "2",
+        qualified_id: "PROJECT-2",
+        title: "Replacement issue",
+      }),
+    );
+    await tick();
+
+    await waitFor(() => expect(within(linkedMessages).getByRole("button", { name: "PROJECT-2" })).toBeTruthy());
+    expect(within(linkedTasks).getByRole("button", { name: /PROJECT-2/ })).toBeTruthy();
+    expect(within(linkedMessages).queryByRole("button", { name: "PROJECT-1" })).toBeNull();
+    expect(within(linkedTasks).queryByRole("button", { name: /PROJECT-1/ })).toBeNull();
+  });
+
+  it("handles a rejected manual authority retry without discarding degraded UI state", async () => {
+    const catchRejection = vi.fn(() => Promise.resolve(false));
+    const handled = { catch: catchRejection } as unknown as Promise<boolean>;
+    const retry = vi.fn(() => handled);
+    renderWorkspace({
+      route: { mode: "messages", q: null, message: null, view: "linked" },
+      kataAuthority: {
+        issues: [makeLinkedIssue()],
+        daemonID: "home",
+        phase: "degraded",
+        error: "snapshot unavailable",
+        retry,
       },
     });
 
-    let refreshCalls = 0;
-    let resolveFirstRefresh!: (response: SearchResponse) => void;
-    const firstRefreshPending = new Promise<SearchResponse>((resolve) => {
-      resolveFirstRefresh = resolve;
-    });
-    const kataSearch = vi.fn(async (filters: IssueFilters) => {
-      if (filters.query !== "") return linkedSearchResponse([baseIssue], filters.query);
-      refreshCalls++;
-      if (refreshCalls === 1) return firstRefreshPending;
-      return linkedSearchResponse([issueWithLink]);
-    });
-    const onLinkMessage = vi.fn().mockResolvedValue({ qualified_id: "Kata#42" });
-
-    renderWorkspace({
-      capabilities: makeCapabilities({
-        features: {
-          threads_endpoint: false,
-          mutations: false,
-          attachments_download: false,
-          sse_events: false,
-        },
-      }),
-      route: { mode: "messages", q: "anything", message: "1001" },
-      messagesApi: makeMessagesApi({
-        search: async () => makeSearchResult([makeMessage(1001)]),
-        message: async () => makeDetail(1001, { body: "hello" }),
-      }),
-      kata: { search: kataSearch },
-      onLinkMessage,
-      onOpenIssue: vi.fn(),
-    });
-
-    await waitFor(() => expect(refreshCalls).toBe(1));
-
-    await fireEvent.click(await waitFor(() => screen.getByRole("button", { name: /Link to task/i })));
-    await fireEvent.input(await openTaskPickerSearch(), {
-      target: { value: "test" },
-    });
-    await new Promise((resolve) => setTimeout(resolve, 250));
-
-    await fireEvent.mouseDown(await waitFor(() => screen.getByRole("option", { name: /Kata#42.*Picked issue/i })));
-    await fireEvent.click(screen.getByRole("button", { name: /^Link$/ }));
-
-    await waitFor(() => expect(onLinkMessage).toHaveBeenCalledOnce());
-    await Promise.resolve();
-    await waitFor(() => expect(refreshCalls).toBe(2));
-
-    const linkedRegion = await waitFor(() => screen.getByRole("region", { name: "Linked tasks" }));
-    expect(within(linkedRegion).getByRole("button", { name: /Kata#42/ })).toBeTruthy();
-
-    resolveFirstRefresh(linkedSearchResponse([baseIssue]));
-    await firstRefreshPending;
-    await Promise.resolve();
-    await tick();
-
-    expect(
-      within(screen.getByRole("region", { name: "Linked tasks" })).getByRole("button", { name: /Kata#42/ }),
-    ).toBeTruthy();
+    expect((await screen.findByRole("alert")).textContent).toContain("snapshot unavailable");
+    await fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    await waitFor(() => expect(retry).toHaveBeenCalledOnce());
+    expect(catchRejection).toHaveBeenCalledOnce();
+    expect(screen.getByRole("button", { name: "PROJECT-1" })).toBeTruthy();
   });
 });
 

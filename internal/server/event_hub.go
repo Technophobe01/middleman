@@ -18,8 +18,8 @@ type Event struct {
 }
 
 // RecordedEvent is an Event stamped with its monotonically-increasing
-// ID. The hub assigns the ID at broadcast time, scoped to its lifetime
-// (so daemon restart resets the sequence). Subscribers receive
+// ID. The hub assigns the ID at broadcast time, scoped to its lifetime.
+// Subscribers receive
 // RecordedEvent values so the SSE handler can write the id back out on
 // the wire and clients can carry it on reconnect.
 type RecordedEvent struct {
@@ -54,11 +54,16 @@ func NewEventHub() *EventHub {
 // would mean the hub cannot replay anything and break the stale-cursor
 // detection logic that needs at least one event to compare against.
 func NewEventHubWithCapacity(capacity int) *EventHub {
+	return newEventHubWithCapacityAndGeneration(capacity, 0)
+}
+
+func newEventHubWithCapacityAndGeneration(capacity int, generation uint64) *EventHub {
 	if capacity < 1 {
 		panic("server: NewEventHubWithCapacity requires capacity >= 1")
 	}
 	return &EventHub{
 		subscribers: make(map[uint64]chan RecordedEvent),
+		nextEventID: generation,
 		ring:        make([]RecordedEvent, capacity),
 		done:        make(chan struct{}),
 	}
@@ -145,10 +150,28 @@ func (h *EventHub) unsubscribe(id uint64) {
 // which is useful for tests and for callers that need to correlate the
 // broadcast with downstream state.
 func (h *EventHub) Broadcast(event Event) uint64 {
+	return h.BroadcastBuild(func(uint64) Event { return event })
+}
+
+// BroadcastBuild assigns the next event ID while holding the hub lock, then
+// builds and publishes the event with that ID available to its payload. This
+// keeps cursor-bearing JSON data identical to the SSE id on the wire.
+func (h *EventHub) BroadcastBuild(build func(uint64) Event) uint64 {
+	return h.BroadcastBuildAtLeast(0, build)
+}
+
+// BroadcastBuildAtLeast publishes one event whose ID is strictly greater than
+// floor. It is used when an authority moves to a replacement hub but browser
+// cursors must remain monotonic across the handoff.
+func (h *EventHub) BroadcastBuildAtLeast(floor uint64, build func(uint64) Event) uint64 {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
+	if h.nextEventID < floor {
+		h.nextEventID = floor
+	}
 	h.nextEventID++
+	event := build(h.nextEventID)
 	rec := RecordedEvent{ID: h.nextEventID, Event: event}
 
 	switch event.Type {
@@ -239,7 +262,7 @@ func (h *EventHub) ringSnapshotSinceLocked(
 	cursor uint64,
 ) (events []RecordedEvent, stale bool) {
 	if h.ringCount == 0 {
-		if cursor > 0 {
+		if cursor > h.nextEventID {
 			return nil, true
 		}
 		return nil, false

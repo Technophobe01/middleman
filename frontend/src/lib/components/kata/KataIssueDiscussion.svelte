@@ -4,18 +4,17 @@
   import { renderMarkdown, renderMarkdownSync } from "@middleman/ui/utils/markdown";
   import { localDateTimeLabel, timeAgo } from "@middleman/ui/utils/time";
 
+  import type { KataIssueNavigationTarget } from "../../api/kata/navigation.js";
+  import type { KataTaskReferenceSearch } from "../../api/kata/snapshot.js";
   import type {
-    KataTaskAPI,
     KataTaskDetail,
     KataTaskEditPatch,
     KataTaskEvent,
-    KataTaskGroup,
     KataTaskLink,
     KataTaskSummary,
   } from "../../api/kata/taskTypes.js";
   import { describeKataEvent } from "../../features/kata/eventFormatter";
   import {
-    kataLinkCouldAffectVisibleResults,
     kataLinkMatchesFilters,
     relationForKataLink,
     type KataLinkFilters,
@@ -27,24 +26,37 @@
   interface Props {
     issue: KataTaskDetail;
     events: KataTaskEvent[];
-    currentView: { groups: KataTaskGroup[] };
-    api: KataTaskAPI;
+    issueCatalog: readonly KataTaskSummary[];
+    searchReferences: KataTaskReferenceSearch;
     activeDaemonId?: string | undefined;
     linkFilters: KataLinkFilters;
     onLinkFiltersChange: (next: KataLinkFilters) => void;
+    actionsDisabled?: boolean | undefined;
+    draftResetGeneration?: number | undefined;
     onAddComment: (uid: string, body: string) => boolean | Promise<boolean>;
     onEditIssue: (uid: string, patch: KataTaskEditPatch) => boolean | Promise<boolean>;
-    onSelectIssue: (uid: string) => void | Promise<void>;
+    // Navigation always carries the peer's full identity from the resolved
+    // catalog row; bare-UID navigation is not representable.
+    onSelectIssue: (target: KataIssueNavigationTarget) => void | Promise<void>;
+  }
+
+  interface PendingDraftReset {
+    uid: string;
+    generation: number;
+    value: string;
+    revision: number;
   }
 
   let {
     issue,
     events,
-    currentView,
-    api,
+    issueCatalog,
+    searchReferences,
     activeDaemonId = undefined,
     linkFilters,
     onLinkFiltersChange,
+    actionsDisabled = false,
+    draftResetGeneration = 0,
     onAddComment,
     onEditIssue,
     onSelectIssue,
@@ -52,10 +64,11 @@
 
   let commentDraft = $state("");
   let relatedDraft = $state("");
-  let hydratedPeers = $state<Record<string, KataTaskSummary | null>>({});
-  let peerHydrationSignature = $state("");
-  let pendingPeerKeys = $state<ReadonlySet<string>>(new Set());
-  let lastSelectedDetail: KataTaskDetail | null = null;
+  let commentDraftRevision = 0;
+  let relatedDraftRevision = 0;
+  let lastDraftResetGeneration = $state<number | null>(null);
+  let pendingCommentReset = $state<PendingDraftReset | null>(null);
+  let pendingRelatedReset = $state<PendingDraftReset | null>(null);
 
   const sortedComments = $derived.by(() => {
     const comments = issue.comments ?? [];
@@ -67,84 +80,68 @@
     });
   });
 
-  $effect(() => {
-    const current = issue;
-    if (lastSelectedDetail !== null && current !== lastSelectedDetail && current.issue.uid === lastSelectedDetail.issue.uid) {
-      hydratedPeers = Object.fromEntries(Object.entries(hydratedPeers).filter(([, peer]) => peer !== null));
-    }
-    lastSelectedDetail = current;
-  });
-
-  $effect(() => {
-    const signature = linkHydrationSignature();
-    if (signature !== peerHydrationSignature) {
-      peerHydrationSignature = signature;
-      hydratedPeers = {};
-      pendingPeerKeys = new Set();
-    }
-    const peerUIDs = issue.links
-      .map((link) => linkPeerUIDFor(link, issue.issue.uid))
-      .filter(
-        (uid) =>
-          uid &&
-          currentViewPeer(uid) === undefined &&
-          hydratedPeers[uid] === undefined &&
-          !pendingPeerKeys.has(`${signature}:${uid}`),
-      );
-    if (peerUIDs.length === 0) return;
-    for (const uid of new Set(peerUIDs)) {
-      const key = `${signature}:${uid}`;
-      pendingPeerKeys = new Set([...pendingPeerKeys, key]);
-      void api
-        .issue(uid)
-        .then((detail) => {
-          if (signature !== linkHydrationSignature()) return;
-          hydratedPeers = { ...hydratedPeers, [uid]: detail.issue };
-        })
-        .catch(() => {
-          if (signature !== linkHydrationSignature()) return;
-          hydratedPeers = { ...hydratedPeers, [uid]: null };
-        })
-        .finally(() => {
-          pendingPeerKeys = new Set([...pendingPeerKeys].filter((candidate) => candidate !== key));
-        });
-    }
-  });
-
   const visibleLinks = $derived(
     issue.links.filter((link) =>
       kataLinkMatchesFilters(link, issue.issue.uid, peerResolution(link), linkFilters),
     ),
   );
   const showStateChips = $derived(linkFilters.statuses.open && linkFilters.statuses.closed);
-  const unresolvedPeerCount = $derived(
-    issue.links.filter(
-      (link) =>
-        peerResolution(link).kind === "pending" &&
-        kataLinkCouldAffectVisibleResults(link, issue.issue.uid, linkFilters),
-    ).length,
-  );
+
+  $effect(() => {
+    const nextGeneration = draftResetGeneration;
+    if (lastDraftResetGeneration === null) {
+      lastDraftResetGeneration = nextGeneration;
+      return;
+    }
+    if (nextGeneration === lastDraftResetGeneration) return;
+    lastDraftResetGeneration = nextGeneration;
+    const uid = issue.issue.uid;
+    if (pendingCommentReset?.uid === uid && pendingCommentReset.generation !== nextGeneration) {
+      if (commentDraftRevision === pendingCommentReset.revision && commentDraft === pendingCommentReset.value) {
+        commentDraft = "";
+      }
+    }
+    if (pendingRelatedReset?.uid === uid && pendingRelatedReset.generation !== nextGeneration) {
+      if (relatedDraftRevision === pendingRelatedReset.revision && relatedDraft === pendingRelatedReset.value) {
+        relatedDraft = "";
+      }
+    }
+    pendingCommentReset = null;
+    pendingRelatedReset = null;
+  });
+
+  function updateCommentDraft(value: string): void {
+    commentDraft = value;
+    commentDraftRevision += 1;
+  }
+
+  function updateRelatedDraft(value: string): void {
+    relatedDraft = value;
+    relatedDraftRevision += 1;
+  }
 
   async function submitComment(): Promise<void> {
-    const body = commentDraft.trim();
+    if (actionsDisabled) return;
+    const draft = commentDraft;
+    const body = draft.trim();
     if (!body) return;
-    const ok = await onAddComment(issue.issue.uid, body);
+    const mutationUID = issue.issue.uid;
+    const resetGeneration = draftResetGeneration;
+    const draftRevision = commentDraftRevision;
+    const ok = await onAddComment(mutationUID, body);
     if (ok) {
-      commentDraft = "";
+      if (issue.issue.uid !== mutationUID) return;
+      if (draftResetGeneration !== resetGeneration) {
+        if (commentDraftRevision === draftRevision && commentDraft === draft) commentDraft = "";
+      } else {
+        pendingCommentReset = {
+          uid: mutationUID,
+          generation: resetGeneration,
+          value: draft,
+          revision: draftRevision,
+        };
+      }
     }
-  }
-
-  function currentViewPeer(uid: string): KataTaskSummary | undefined {
-    for (const group of currentView.groups) {
-      const found = group.issues.find((candidate) => candidate.uid === uid);
-      if (found) return found;
-    }
-    return undefined;
-  }
-
-  function linkHydrationSignature(): string {
-    const links = issue.links.map((link) => `${link.id}:${linkPeerUIDFor(link, issue.issue.uid)}:${link.type}`).join("|");
-    return `${activeDaemonId ?? ""}:${issue.issue.uid}:${links}`;
   }
 
   function linkPeerUIDFor(link: KataTaskLink, selectedUID: string | undefined): string {
@@ -160,13 +157,8 @@
   }
 
   function peerResolution(link: KataTaskLink): KataLinkPeerResolution {
-    const uid = linkPeerUID(link);
-    const current = currentViewPeer(uid);
-    if (current) return { kind: "resolved", peer: current };
-    const hydrated = hydratedPeers[uid];
-    if (hydrated === null) return { kind: "failed" };
-    if (hydrated !== undefined) return { kind: "resolved", peer: hydrated };
-    return { kind: "pending" };
+    const peer = issueCatalog.find((candidate) => candidate.uid === linkPeerUID(link));
+    return peer ? { kind: "resolved", peer } : { kind: "failed" };
   }
 
   const relationLabels: Record<KataLinkRelation, string> = {
@@ -182,13 +174,28 @@
   }
 
   async function submitRelatedLink(): Promise<void> {
-    const ref = relatedDraft.trim();
+    if (actionsDisabled) return;
+    const draft = relatedDraft;
+    const ref = draft.trim();
     if (ref === "") return;
-    const ok = await onEditIssue(issue.issue.uid, {
+    const mutationUID = issue.issue.uid;
+    const resetGeneration = draftResetGeneration;
+    const draftRevision = relatedDraftRevision;
+    const ok = await onEditIssue(mutationUID, {
       links_delta: { add_related: [ref] },
     });
     if (ok) {
-      relatedDraft = "";
+      if (issue.issue.uid !== mutationUID) return;
+      if (draftResetGeneration !== resetGeneration) {
+        if (relatedDraftRevision === draftRevision && relatedDraft === draft) relatedDraft = "";
+      } else {
+        pendingRelatedReset = {
+          uid: mutationUID,
+          generation: resetGeneration,
+          value: draft,
+          revision: draftRevision,
+        };
+      }
     }
   }
 
@@ -200,20 +207,13 @@
   }
 
   async function searchTaskReferences(query: string): Promise<MentionOption[]> {
-    const response = await api.search({
-      scope: { kind: "all" },
-      status: "open",
-      owner: "",
-      label: "",
-      query,
+    const response = await searchReferences(query, {
+      ...(activeDaemonId ? { daemon_id: activeDaemonId } : {}),
+      limit: 20,
     });
-    const shortIDCounts = new Map<string, number>();
-    for (const task of response.issues) {
-      shortIDCounts.set(task.short_id, (shortIDCounts.get(task.short_id) ?? 0) + 1);
-    }
-    return response.issues.map((task) => ({
+    return (response.references ?? []).map((task) => ({
       id: task.uid,
-      insert: shortIDCounts.get(task.short_id) === 1 ? task.short_id : task.qualified_id,
+      insert: task.reference,
       label: task.title,
       meta: task.project_name,
     }));
@@ -229,18 +229,15 @@
           ? issue.links.length
           : `${visibleLinks.length} / ${issue.links.length}`}
       </span>
-      {#if unresolvedPeerCount > 0}<span class="link-loading">Resolving {unresolvedPeerCount}</span>{/if}
       <KataLinkFilterMenu filters={linkFilters} onChange={onLinkFiltersChange} />
     </div>
   </div>
   {#if issue.links.length === 0}
     <p class="link-empty">No links.</p>
-  {:else if visibleLinks.length === 0 && unresolvedPeerCount > 0}
-    <p class="link-empty">Resolving linked tasks...</p>
   {:else if visibleLinks.length === 0}
     <p class="link-empty">No links match these filters.</p>
   {:else}
-    <div class="link-list" aria-busy={unresolvedPeerCount > 0}>
+    <div class="link-list">
       {#each visibleLinks as link (link.id)}
         {@const resolution = peerResolution(link)}
         {@const peer = resolution.kind === "resolved" ? resolution.peer : undefined}
@@ -248,8 +245,11 @@
           type="button"
           class={["link-row", (showStateChips || resolution.kind === "failed") && "link-row--with-state"]}
           aria-label={`${linkLabel(link)} ${linkPeerShortID(link)} ${peer?.title ?? ""}${showStateChips && peer ? ` ${peer.status}` : ""}${resolution.kind === "failed" ? " state unavailable" : ""}`.trim()}
+          disabled={!peer}
+          title={peer ? undefined : "Task state unavailable; the link cannot be opened"}
           onclick={() => {
-            void onSelectIssue(linkPeerUID(link));
+            if (!peer) return;
+            void onSelectIssue({ uid: peer.uid, status: peer.status, project_uid: peer.project_uid });
           }}
         >
           <span class="link-kind">{linkLabel(link)}</span>
@@ -276,7 +276,7 @@
       <input
         aria-label="Related issue"
         placeholder="Short id"
-        bind:value={relatedDraft}
+        bind:value={() => relatedDraft, updateRelatedDraft}
         onkeydown={handleRelatedKeydown}
       />
     </label>
@@ -285,7 +285,7 @@
       surface="outline"
       size="sm"
       label="Link"
-      disabled={relatedDraft.trim() === ""}
+      disabled={actionsDisabled || relatedDraft.trim() === ""}
     />
   </form>
 </section>
@@ -302,7 +302,7 @@
     <MentionTextarea
       ariaLabel="Comment"
       rows={3}
-      bind:value={commentDraft}
+      bind:value={() => commentDraft, updateCommentDraft}
       search={searchTaskReferences}
       emptyLabel="No matching tasks"
       placeholder="Add a comment..."
@@ -314,7 +314,7 @@
       size="sm"
       class="comment-submit"
       label="Add comment"
-      disabled={commentDraft.trim() === ""}
+      disabled={actionsDisabled || commentDraft.trim() === ""}
     />
   </form>
   {#if sortedComments.length === 0}
@@ -400,10 +400,6 @@
   .link-header-actions > span {
     color: var(--text-muted);
     font-size: var(--font-size-xs);
-  }
-
-  .link-header-actions > .link-loading {
-    color: var(--text-faint);
   }
 
   .link-empty,

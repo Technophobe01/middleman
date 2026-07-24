@@ -18,32 +18,69 @@ state.
 - `POST /repos/{owner}/{name}/issues/{number}/workspace`: create or reuse an
   issue-backed workspace; these start from the repo's current `origin/HEAD`,
   not from a PR head branch.
-- `GET /kata/tasks/{issue_uid}`: middleman's combined Kata task read. It
-  fetches the daemon's issue detail server-side and returns it together with
-  the resolved workspace target, so the detail pane and its workspace action
-  render from one response. There is no separate workspace-target endpoint;
-  do not reintroduce one. The UI hides the workspace action when the embedded
-  target has `available:false`. The issue read is the critical path and the
-  `/projects` read is best-effort enrichment that must never fail the detail
-  response. The exact latency contract: when the issue payload carries
-  `project_name`, the handler never waits on `/projects` (it takes the
-  result only if already available); when the payload has no name, it may
-  wait only up to the short `/projects`-specific budget
-  (`internal/server/kata_task_detail.go::kataDaemonProjectsReadTimeout`)
-  before falling back to the (empty) payload name. Server-side daemon reads
-  never follow redirects, matching the passthrough proxy and health probe: a
-  redirected issue read surfaces as a `502 upstream_error`, and a redirected
-  `/projects` read is just a failed best-effort read that falls back to the
-  payload name. All outcomes, including problem responses, depend on the
-  daemon selection and must declare `Vary: X-Middleman-Kata-Daemon`. The
-  frontend mirrors the critical-path rule for direct user selections only: a
-  direct selection resolves (and syncs the route) as soon as the detail
-  applies, with the event-log read finishing in a guarded background
-  continuation whose failure silently leaves the event list empty rather
-  than failing the selection. View/bootstrap loads intentionally stay
-  atomic; do not move them to the background-events behavior, or the
-  route-sync effect can stomp a fresh selection
-  (`frontend/src/lib/stores/kata-workspace.svelte.ts::loadSelectedIssue`).
+- `GET /kata/tasks/snapshot`: the browser's sole Kata task authority. Daemon,
+  scope, project, status authority, selected task, and graph source form request
+  identity; selected detail, history, graph, and workspace target belong to the
+  same accepted snapshot, while query, owner, and label remain local presentation
+  state (`internal/server/kata_snapshot_frontend.go::kataTaskSnapshot`).
+- Middleman persists no Kata task, snapshot, or cursor state. Its only Kata
+  authority storage is a bounded, non-touching in-memory TTL cache
+  (`internal/server/kata_snapshot_cache.go::newKataSnapshotCacheWithConfig`).
+- Global Kata issue/event reads establish workspace authority and invalidation;
+  selected detail uses generated issue-detail, while complete retained history
+  uses project events with at most one valid purge reset and no global fallback
+  (`internal/server/kata_snapshot_enrichment.go::kataSnapshotEnricher`).
+- Cache capacity may evict Kata authority or enrichment entries but must never
+  truncate an API result; daemon invalidation clears every cached read for that
+  daemon (`internal/server/kata_snapshot_cache.go::kataSnapshotCache`).
+- The 128 MiB Kata authority/graph response and authority-cache ceilings bound
+  input and retention, not peak heap; transient processing amplification is acceptable
+  (`internal/server/kata_client.go::kataGeneratedResponseLimit`).
+- Do not approximate heap use with finer payload quotas absent an observed problem.
+- Oversized project history must keep paginating selected history without
+  retaining the complete project stream, but aggregated selected history is
+  bounded by `kataSelectedHistoryMaxBytes`; exceeding it degrades the history
+  stage instead of growing memory without bound
+  (`internal/server/kata_snapshot_enrichment.go::loadProjectEvents`).
+- Initial project-event miss coalescing is daemon + exact epoch + project;
+  selected UID belongs only to oversized selected-history fallback flights
+  (`internal/server/kata_snapshot_enrichment_cache.go::projectEvents`).
+- `GraphFetchedAt` identifies the daemon read that produced the graph and stays
+  stable across cache hits (`internal/server/kata_snapshot_enrichment.go::loadGraph`).
+- Selected detail and graph enrichment are revision-fenced against the
+  authority and cached under that revision; a mismatch is stale and retries
+  through epoch invalidation, never merged into an accepted snapshot
+  (`internal/server/kata_snapshot_enrichment.go::validateKataGraph`).
+- `GET /kata/tasks/events`: compact reset/invalidation transport only. Replay
+  starts at the accepted snapshot cursor; raw daemon events never enter browser
+  authority (`frontend/src/lib/features/kata/kataWorkspaceAuthorityController.svelte.ts::KataWorkspaceAuthorityController`).
+- Cursorless live-only catch-up establishes its stream before invalidating; publishing
+  first creates an unreplayable mutation gap between snapshot reload and subscription
+  (`internal/server/kata_event_hub.go::runSupervisor`).
+- Frontend Kata event streaming must use the generated runtime client with stream
+  parsing; raw fetch paths bypass base-path and tracing policy
+  (`frontend/src/lib/api/kata/eventStream.ts::readKataEventStream`).
+- Auxiliary selected-detail reads must remain independent from shared global/all
+  authority refresh; catalog-visible mutations refresh shared authority separately,
+  without reclassifying an acknowledged write as failed
+  (`frontend/src/lib/messages/kataMessageLinker.ts::patchFreshDetail`).
+- Every frontend Kata mutation and recurrence request is explicitly pinned to
+  the accepted snapshot daemon; ambient active/default daemon fallback is
+  forbidden (`frontend/src/lib/api/kata/taskClient.ts::pinnedDaemonHeaders`).
+- Frontend mutation results are acknowledgement-only `{ changed }`; canonical
+  project/task identity and rendered state come from a newly accepted snapshot,
+  never mutation response payloads (`frontend/src/lib/api/kata/taskTypes.ts::KataTaskMutationResponse`).
+- `GET /kata/tasks/references`: middleman's global Kata reference service; it
+  defaults to open tasks for autocomplete, while navigation explicitly requests
+  `status=all` and routes from the returned canonical task status.
+  Rank exact short, qualified, or UID matches before substring matches and only
+  then apply the response limit. The returned `reference` decides whether a
+  short ID is globally unique; syntax-specific consumers may wrap that identity
+  but must not reconstruct it from display fields. Consumers needing status,
+  metadata, or closed tasks must use a snapshot. Selected link peers may be
+  best-effort enriched into the snapshot catalog without joining
+  `member_issue_uids`; browsers never issue detail reads to hydrate link rows
+  (`internal/server/kata_snapshot_enrichment.go::loadLinkedPeerCatalog`).
 - `POST /kata/workspaces`: create or reuse a Kata-task-backed workspace. Kata
   tasks are not provider issues, so this path never resolves or syncs a
   provider issue row.

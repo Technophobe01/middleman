@@ -48,13 +48,16 @@ type KataBackendHandle = {
 
 const kataNow = "2026-05-15T10:00:00Z";
 const middlemanCSRFHeader = { "X-Middleman-Csrf": "1" };
+const q3KataAuthorityURL = /\/kata\?view=all&scope=project-messages&issue=issue-q3&daemon=e2e$/;
 const kataProjects = [
   {
     id: 1,
     uid: "project-messages",
     name: "Messages",
     metadata: { area: "Work", sidebar_order: 1 },
-    open_count: 2,
+    revision: 1,
+    created_at: kataNow,
+    stats: { open: 2, closed: 0 },
   },
 ];
 
@@ -1436,7 +1439,7 @@ test("Kata restoration preserves distinct browser history entries", async ({ pag
 
     const linkedTasks = page.getByRole("region", { name: "Linked tasks" });
     await linkedTasks.getByRole("button", { name: /Kata#kat-7/ }).click();
-    await expect(page).toHaveURL(/\/kata\?issue=issue-q3$/);
+    await expect(page).toHaveURL(q3KataAuthorityURL);
     await expect(page.getByRole("region", { name: "Task detail" })).toContainText(
       "Confirm the Q3 project review agenda.",
     );
@@ -1445,7 +1448,7 @@ test("Kata restoration preserves distinct browser history entries", async ({ pag
     await expect(page).toHaveURL(/\/docs$/);
 
     await page.goBack();
-    await expect(page).toHaveURL(/\/kata\?issue=issue-q3$/);
+    await expect(page).toHaveURL(q3KataAuthorityURL);
     await expect(page.getByRole("region", { name: "Task detail" })).toContainText(
       "Confirm the Q3 project review agenda.",
     );
@@ -1455,7 +1458,7 @@ test("Kata restoration preserves distinct browser history entries", async ({ pag
     await expect(page.getByRole("heading", { name: "Project sync", exact: true })).toBeVisible();
 
     await page.goForward();
-    await expect(page).toHaveURL(/\/kata\?issue=issue-q3$/);
+    await expect(page).toHaveURL(q3KataAuthorityURL);
     await expect(page.getByRole("region", { name: "Task detail" })).toContainText(
       "Confirm the Q3 project review agenda.",
     );
@@ -1957,7 +1960,7 @@ test("messages detail reverse-link pill opens the linked Kata task", async ({ pa
 
     await linkedTasks.getByRole("button", { name: /Kata#kat-7/ }).click();
 
-    await expect(page).toHaveURL(/\/kata\?issue=issue-q3/);
+    await expect(page).toHaveURL(q3KataAuthorityURL);
     await expect(page.getByRole("region", { name: "Task detail" })).toContainText(
       "Confirm the Q3 project review agenda.",
     );
@@ -2015,7 +2018,7 @@ test("message links a message to an external Kata task and refreshes linked mess
     await expect(dialog).toBeVisible();
     await dialog.getByRole("button", { name: "Title or qualified ID..." }).click();
     await dialog.getByRole("combobox", { name: "Title or qualified ID..." }).fill("q3");
-    await dialog.getByRole("option", { name: /Kata#kat-7.*Email Susan re: Q3/ }).click();
+    await dialog.getByRole("option", { name: /kat-7.*Email Susan re: Q3/ }).click();
     await dialog.getByRole("button", { name: "Link", exact: true }).click();
 
     await expect(page.getByRole("status").filter({ hasText: "Linked to Kata#kat-7." })).toBeVisible();
@@ -2043,7 +2046,7 @@ test("message links a message to an external Kata task and refreshes linked mess
     const linkedMessagesURL = page.url();
     await linked.getByRole("button", { name: "Kata#kat-7" }).click();
 
-    await expect(page).toHaveURL(/\/kata\?issue=issue-q3/);
+    await expect(page).toHaveURL(q3KataAuthorityURL);
     await expect(page.getByRole("region", { name: "Task detail" })).toContainText(
       "Confirm the Q3 project review agenda.",
     );
@@ -2055,7 +2058,7 @@ test("message links a message to an external Kata task and refreshes linked mess
     await expect(restoredLinked.getByRole("button", { name: "Kata#kat-7" })).toBeVisible();
 
     await page.goForward();
-    await expect(page).toHaveURL(/\/kata\?issue=issue-q3/);
+    await expect(page).toHaveURL(q3KataAuthorityURL);
     await expect(page.getByRole("region", { name: "Task detail" })).toContainText(
       "Confirm the Q3 project review agenda.",
     );
