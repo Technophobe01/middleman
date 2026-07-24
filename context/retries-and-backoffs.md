@@ -72,6 +72,38 @@ cadence.
 Do not migrate cadence loops into `backoff/v5`; they are scheduling policy, not
 failure recovery.
 
+Repository-disabled issue and merge-request scopes use a 24-hour in-memory
+background probe gate. Expiry admits one reserved background probe across all
+lanes; any pre-provider exit abandons only the reservation, while completed provider
+work either renews or releases the observed generation. (`internal/github/feature_cooldown.go::repositoryFeatureProbe.abandon`)
+Explicit sync bypasses only cooldown generations present when the run begins; any
+non-disabled attempt clears that observed generation even when retry bits remain, while
+newer disabled results gate follow-on lanes. (`internal/github/feature_cooldown.go::repositoryFeatureProbe.release`)
+Cooldown keys use provider-canonical repository identity; GitHub host, owner/name case,
+and derived-path aliases must converge. (`internal/github/feature_cooldown.go::repositoryFeatureKey`)
+Completion clears only the observed generation, so a concurrent disabled renewal wins.
+(`internal/github/feature_cooldown.go::repositoryFeatureProbe.clear`)
+Follow-on lanes after index completion must acquire a fresh probe; clearing the index
+generation does not authorize an unchanged-list comment refresh. (`internal/github/sync.go::refreshRepoPRComments`)
+Classify repository-disabled reads before generic fallback or detail handling. GitHub
+uses its definitive disabled 410; other providers confirm candidate 403/404/410 failures
+against repository metadata and preserve unconfirmed errors. (`internal/platform/gitealike/feature_disabled.go::Provider.repositoryFeatureError`)
+Custom GitHub GraphQL timeline transports must preserve structured non-2xx errors before
+closing the body so disabled-feature classification can inspect 410 responses.
+(`internal/github/client.go::ListPullRequestTimelineEvents`)
+Recording a disabled result must preserve any earlier same-scope item failure so retry
+and ETag invalidation state survives the cooldown. (`internal/github/sync.go::indexSyncRepo`)
+Apply the gate before shared budget exhaustion so suppressed work cannot starve
+unaffected scopes. (`internal/github/sync.go::drainDetailQueue`)
+Archive inventory, maintenance, and hydration share this in-memory gate; pre-provider
+deferral skips only that repo/type so unaffected streams and later same-host repositories
+remain eligible. (`internal/archive/scheduler.go::runProviderHostWork`)
+Feature deferral preserves scan cursors and pending lookup state and is never persisted as
+provider-budget or item-retry state. (`internal/github/sync.go::Admit`)
+Hydration excludes the cooled repository feature only while selecting work in the current
+pass, so unaffected due items remain eligible and restart or manual recovery can resume
+immediately. (`internal/archive/scheduler.go::runNextHydrationWork`)
+
 ## Single-flight: `Manager.EnsureClone`
 
 [`clone.go`](../internal/gitclone/clone.go). `EnsureClone` opens a

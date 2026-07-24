@@ -529,6 +529,39 @@ func TestArchiveClaimItemUsesEligibleDueWorkAndStableOrder(t *testing.T) {
 	assert.Nil(claim)
 }
 
+func TestArchiveClaimItemExcludesFeatureScope(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	d := openTestDB(t)
+	ctx := t.Context()
+	now := archiveTestTime()
+	repoID := insertTestRepo(t, d, "acme", "feature-scope")
+	require.NoError(d.EnsureDiscoveryArchives(ctx, []int64{repoID}, now))
+	require.NoError(d.StartFullArchives(ctx, []int64{repoID}, now))
+	insertArchiveItemForTest(t, d, repoID, ArchiveItemTypeIssue, 1, now.Add(-time.Hour))
+	insertArchiveProgressForTest(
+		t, d, repoID, ArchiveItemTypeIssue, 1,
+		ArchiveDatasetLookup, ArchiveDatasetProgressPending,
+	)
+	insertArchiveItemForTest(t, d, repoID, ArchiveItemTypeMergeRequest, 2, now)
+	insertArchiveProgressForTest(
+		t, d, repoID, ArchiveItemTypeMergeRequest, 2,
+		ArchiveDatasetLookup, ArchiveDatasetProgressPending,
+	)
+
+	claim, err := d.ClaimArchiveItem(ctx, ClaimArchiveItemOpts{
+		RepoIDs: []int64{repoID},
+		Now:     now,
+		ExcludedScopes: []ArchiveItemScope{{
+			RepoID: repoID, ItemType: ArchiveItemTypeIssue,
+		}},
+	})
+	require.NoError(err)
+	require.NotNil(claim)
+	assert.Equal(ArchiveItemTypeMergeRequest, claim.ItemType)
+	assert.Equal(2, claim.ItemNumber)
+}
+
 func TestArchivePromptRediscoveryMakesTerminalItemClaimable(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)

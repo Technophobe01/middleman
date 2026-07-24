@@ -249,6 +249,7 @@ type RepoRef struct {
 type PartialSyncError struct {
 	MergeRequests bool
 	Issues        bool
+	Cause         error
 }
 
 func (e *PartialSyncError) Error() string {
@@ -259,9 +260,17 @@ func (e *PartialSyncError) Error() string {
 	if e.Issues {
 		failedPaths = append(failedPaths, "issue")
 	}
-	return fmt.Sprintf(
+	message := fmt.Sprintf(
 		"one or more %s sync items failed", strings.Join(failedPaths, " and "),
 	)
+	if e.Cause != nil {
+		return message + ": " + e.Cause.Error()
+	}
+	return message
+}
+
+func (e *PartialSyncError) Unwrap() error {
+	return e.Cause
 }
 
 // ExclusivePartialSyncFailure returns the typed partial failure only when the
@@ -529,6 +538,8 @@ type Syncer struct {
 	// "host/owner/name". Cleared on the next successful sync.
 	failedRepos sync.Map
 
+	featureCooldowns repositoryFeatureCooldowns
+
 	// runCtx is the syncer's lifetime context. It is canceled in
 	// Stop so in-flight RunOnce / TriggerRun goroutines observe
 	// cancellation and unblock any long-running GitHub calls. Both
@@ -607,10 +618,36 @@ const (
 	failIssues                       // issue sync path failed
 )
 
+func preservePartialSyncFailure(scope failScope, failed bool, cause error) error {
+	if !failed {
+		return cause
+	}
+	return &PartialSyncError{
+		MergeRequests: scope&failMR != 0,
+		Issues:        scope&failIssues != 0,
+		Cause:         cause,
+	}
+}
+
+func partialSyncFailureScope(err error) failScope {
+	var partial *PartialSyncError
+	if !errors.As(err, &partial) {
+		return 0
+	}
+	var scope failScope
+	if partial.MergeRequests {
+		scope |= failMR
+	}
+	if partial.Issues {
+		scope |= failIssues
+	}
+	return scope
+}
+
 // markRepoFailed records that the most recent sync of this repo hit
 // a partial failure after the ETag cache may have been populated, so
 // the next cycle must force an unconditional refetch of the affected
-// list endpoints. Matched by clearRepoFailed on a clean cycle.
+// list endpoints. Successful attempted scopes clear their own bits.
 func (s *Syncer) markRepoFailed(repo RepoRef, scope failScope) {
 	key := repoFailKey(repo)
 	for {
@@ -632,10 +669,24 @@ func (s *Syncer) markRepoFailed(repo RepoRef, scope failScope) {
 	}
 }
 
-// clearRepoFailed clears the partial-failure flag after a clean
-// doSyncRepo pass.
-func (s *Syncer) clearRepoFailed(repo RepoRef) {
-	s.failedRepos.Delete(repoFailKey(repo))
+func (s *Syncer) clearRepoFailedScope(repo RepoRef, scope failScope) {
+	key := repoFailKey(repo)
+	for {
+		value, ok := s.failedRepos.Load(key)
+		if !ok {
+			return
+		}
+		remaining := value.(failScope) &^ scope
+		if remaining == 0 {
+			if s.failedRepos.CompareAndDelete(key, value) {
+				return
+			}
+			continue
+		}
+		if s.failedRepos.CompareAndSwap(key, value, remaining) {
+			return
+		}
+	}
 }
 
 // repoFailKey returns the sync.Map key for a repo. Includes provider
@@ -804,21 +855,45 @@ func (s *Syncer) ConfiguredRepositories(context.Context) ([]platform.RepoRef, er
 func (s *Syncer) Admit(
 	ctx context.Context,
 	ref platform.RepoRef,
+	itemType db.ArchiveItemType,
 	cost int,
 ) (archive.AdmissionResult, error) {
+	feature := ""
+	switch itemType {
+	case db.ArchiveItemTypeIssue:
+		feature = platform.RepositoryFeatureIssues
+	case db.ArchiveItemTypeMergeRequest:
+		feature = platform.RepositoryFeatureMergeRequests
+	default:
+		return archive.AdmissionResult{}, fmt.Errorf("archive admission: invalid item type %q", itemType)
+	}
+	repo := RepoRef{
+		Platform: ref.Platform, PlatformHost: ref.Host,
+		Owner: ref.Owner, Name: ref.Name, RepoPath: ref.RepoPath,
+	}
+	probe, due, featureRetryAt := s.beginRepositoryFeatureProbeWithRetry(ctx, repo, feature)
+	if !due {
+		return archive.AdmissionResult{FeatureDeferred: &archive.FeatureDeferral{
+			RetryAt: featureRetryAt,
+			Detail:  "repository feature cooldown active",
+		}}, nil
+	}
 	now := s.now().UTC()
 	if s.running.Load() {
+		probe.abandon()
 		retryAt := now.Add(time.Second)
 		return archive.AdmissionResult{RetryAt: &retryAt, Detail: "normal sync is active"}, nil
 	}
 	key := rateBucketKeyFor(ref.Platform, ref.Host)
 	if s.higherPriorityProviderWorkActive(key, archive.PriorityFullArchive) {
+		probe.abandon()
 		retryAt := now.Add(time.Second)
 		return archive.AdmissionResult{RetryAt: &retryAt, Detail: "higher-priority sync work is active"}, nil
 	}
 	tracker := s.rateTrackers[key]
 	if tracker != nil && (tracker.IsPaused() ||
 		tracker.Known() && tracker.Remaining()-cost < RateReserveBuffer) {
+		probe.abandon()
 		retryAt := now.Add(time.Minute)
 		if reset := tracker.ResetAt(); reset != nil && reset.After(now) {
 			retryAt = reset.UTC()
@@ -832,24 +907,46 @@ func (s *Syncer) Admit(
 		available = budget.ArchiveSpendAvailable(now, resetAt, archiveLiveFloor(ref.Platform))
 	}
 	if available < cost {
+		probe.abandon()
 		retryAt := now.Add(time.Minute)
 		if resetAt != nil && resetAt.After(now) && resetAt.Before(retryAt) {
 			retryAt = resetAt.UTC()
 		}
 		return archive.AdmissionResult{RetryAt: &retryAt, Detail: "archive surplus budget unavailable"}, nil
 	}
-	requestCtx, release, allowed := s.tryBeginArchiveProviderRequest(ctx, key)
+	requestCtx, releaseProviderRequest, allowed := s.tryBeginArchiveProviderRequest(ctx, key)
 	if !allowed {
+		probe.abandon()
 		retryAt := now.Add(time.Second)
 		return archive.AdmissionResult{RetryAt: &retryAt, Detail: "higher-priority sync work is active"}, nil
+	}
+	requestCtx = WithArchiveAttemptAllowance(WithArchiveSyncBudget(requestCtx), available)
+	var completeOnce sync.Once
+	var featureDeferred *archive.FeatureDeferral
+	complete := func(cause error, providerAttempted bool) *archive.FeatureDeferral {
+		completeOnce.Do(func() {
+			if !providerAttempted {
+				probe.abandon()
+			} else if disabled := repositoryFeatureDisabledError(repo, feature, cause); disabled != nil {
+				nextProbe, _ := s.recordRepositoryFeatureDisabledUntil(repo, feature, disabled)
+				featureDeferred = &archive.FeatureDeferral{
+					RetryAt: nextProbe,
+					Detail:  disabled.Error(),
+				}
+			} else {
+				probe.release()
+			}
+			releaseProviderRequest()
+		})
+		return featureDeferred
 	}
 	// The declared cost is the admission minimum. Once admitted, the request may
 	// use the archive surplus currently available without crossing the live
 	// floor; provider-SDK and authentication retries share this allowance.
 	return archive.AdmissionResult{
-		Allowed: true,
-		Context: WithArchiveAttemptAllowance(WithArchiveSyncBudget(requestCtx), available),
-		Release: release,
+		Allowed:  true,
+		Context:  requestCtx,
+		Complete: complete,
 	}, nil
 }
 
@@ -896,9 +993,9 @@ func archiveBudgetResetAt(tracker *RateTracker) *time.Time {
 }
 
 func archiveLiveFloor(kind platform.Kind) int {
-	floor := PRDetailWorstCase + 1 // one full live detail plus one current-index page
+	floor := detailWorstCaseAttemptCost(kind, QueueItemPR) + wireAttemptsPerRequest
 	if kind == platform.KindGitHub {
-		floor++ // one notification page
+		floor += wireAttemptsPerRequest // one notification page
 	}
 	return floor
 }
@@ -1345,6 +1442,11 @@ func (p *gitHubClientProvider) ListOpenMergeRequests(
 ) ([]platform.MergeRequest, error) {
 	prs, err := p.client.ListOpenPullRequests(ctx, ref.Owner, ref.Name)
 	if err != nil {
+		if disabledErr := githubRepositoryFeatureDisabled(
+			p.host, platform.RepositoryFeatureMergeRequests, err,
+		); disabledErr != nil {
+			return nil, disabledErr
+		}
 		return nil, err
 	}
 	out := make([]platform.MergeRequest, 0, len(prs))
@@ -1540,6 +1642,11 @@ func (p *gitHubClientProvider) ListOpenGitHubIssues(
 ) ([]*gh.Issue, error) {
 	issues, err := p.client.ListOpenIssues(ctx, ref.Owner, ref.Name)
 	if err != nil {
+		if disabledErr := githubRepositoryFeatureDisabled(
+			p.host, platform.RepositoryFeatureIssues, err,
+		); disabledErr != nil {
+			return nil, disabledErr
+		}
 		return nil, err
 	}
 	if err := p.validateOpenIssuesContract(ref, issues); err != nil {
@@ -3279,6 +3386,12 @@ func (s *Syncer) syncWatchedMRs(ctx context.Context) {
 	for _, mr := range mrs {
 		host := watchedMRHost(mr)
 		bucket := watchedMRRateBucketKey(mr)
+		repo := RepoRef{
+			Platform:     watchedMRPlatform(mr),
+			PlatformHost: host,
+			Owner:        mr.Owner,
+			Name:         mr.Name,
+		}
 		if !eligibleBuckets[bucket] {
 			slog.Debug("skipping fast-sync for throttled host",
 				"host", host,
@@ -3297,8 +3410,35 @@ func (s *Syncer) syncWatchedMRs(ctx context.Context) {
 			)
 			continue
 		}
-		err := s.syncMRWithWatchedRef(ctx, mr)
+		probe, due := s.beginRepositoryFeatureProbe(
+			ctx, repo, platform.RepositoryFeatureMergeRequests,
+		)
+		if !due {
+			slog.Debug("skipping fast-sync for disabled repository feature",
+				"platform", repoPlatform(repo),
+				"host", repoHost(repo),
+				"repo", platformRepoRef(repo).RepoPath,
+				"feature", platform.RepositoryFeatureMergeRequests,
+			)
+			continue
+		}
+		providerAttempted := false
+		err := s.syncMRWithWatchedRefTracking(ctx, mr, &providerAttempted)
 		if err != nil {
+			disabledErr := repositoryFeatureDisabledError(
+				repo, platform.RepositoryFeatureMergeRequests, err,
+			)
+			disabled := disabledErr != nil && s.recordRepositoryFeatureDisabled(
+				repo, platform.RepositoryFeatureMergeRequests, disabledErr,
+			)
+			if providerAttempted {
+				probe.release()
+			} else {
+				probe.abandon()
+			}
+			if disabled {
+				continue
+			}
 			slog.Warn("fast-sync watched MR failed",
 				"owner", mr.Owner,
 				"name", mr.Name,
@@ -3310,6 +3450,11 @@ func (s *Syncer) syncWatchedMRs(ctx context.Context) {
 				syncedAny = true
 			}
 			continue
+		}
+		if providerAttempted {
+			probe.release()
+		} else {
+			probe.abandon()
 		}
 		syncedAny = true
 	}
@@ -3867,6 +4012,11 @@ func (s *Syncer) runOnce(
 	}()
 
 	rateLimitSnapshotCtx := ctx
+	if bypassNextSyncAfter {
+		ctx = withRepositoryFeatureCooldownBypass(
+			ctx, s.featureCooldowns.currentGeneration(),
+		)
+	}
 
 	// Mark context so the budget transport counts HTTP calls
 	// made during background sync. User-initiated server
@@ -4920,17 +5070,37 @@ func (s *Syncer) indexSyncRepo(
 		}
 	}
 
-	// Track partial-failure signals per path so the next cycle only
-	// forces refresh on the paths that actually failed.
+	// Track partial-failure and disabled-feature signals per path so
+	// disabled repository features never enter transient recovery.
+	var attemptedScope failScope
 	var failedScope failScope
+	var disabledScope failScope
 
 	prListUnchanged := false
+	var mrProbe repositoryFeatureProbe
+	mrProbeDue := false
 	if caps.ReadMergeRequests {
+		mrProbe, mrProbeDue = s.beginRepositoryFeatureProbe(
+			ctx, repo, platform.RepositoryFeatureMergeRequests,
+		)
+	}
+	if caps.ReadMergeRequests && mrProbeDue {
+		mrProviderAttempted := false
+		defer func() {
+			if mrProviderAttempted {
+				mrProbe.release()
+			} else {
+				mrProbe.abandon()
+			}
+		}()
+		attemptedScope |= failMR
 		mrReader, err := s.mergeRequestReaderFor(repo)
 		if err != nil {
 			return fmt.Errorf("resolve merge request reader for %s/%s: %w", repo.Owner, repo.Name, err)
 		}
+		mrProviderAttempted = true
 		openMRs, err := mrReader.ListOpenMergeRequests(ctx, platformRef)
+		mrListBlocked := false
 		if err != nil {
 			// 304 Not Modified means the open-PR list is byte-identical
 			// to the previous fetch. No PR opened, no PR closed, no
@@ -4939,6 +5109,11 @@ func (s *Syncer) indexSyncRepo(
 			// produced the cached etag.
 			if IsNotModified(err) {
 				prListUnchanged = true
+			} else if s.recordRepositoryFeatureDisabled(
+				repo, platform.RepositoryFeatureMergeRequests, err,
+			) {
+				disabledScope |= failMR
+				mrListBlocked = true
 			} else {
 				s.markRepoFailed(repo, failMR)
 				return fmt.Errorf("list open PRs: %w", err)
@@ -4948,7 +5123,7 @@ func (s *Syncer) indexSyncRepo(
 		if prListUnchanged {
 			// 304 — nothing to do. The detail drain handles CI
 			// updates for PRs with pending checks via priority scoring.
-		} else {
+		} else if !mrListBlocked {
 			// GraphQL path: if fetcher available and not rate-limited,
 			// do a bulk fetch that replaces both index upsert and
 			// detail drain for complete PRs. For large repos that
@@ -4963,15 +5138,29 @@ func (s *Syncer) indexSyncRepo(
 						ctx, repo.Owner, repo.Name,
 					)
 					if gqlErr != nil {
-						slog.Warn("GraphQL fetch failed, falling back to REST index",
-							"repo", repo.Owner+"/"+repo.Name,
-							"err", gqlErr,
-						)
+						if s.recordRepositoryFeatureDisabled(
+							repo, platform.RepositoryFeatureMergeRequests, gqlErr,
+						) {
+							disabledScope |= failMR
+							graphQLDone = true
+						} else {
+							slog.Warn("GraphQL fetch failed, falling back to REST index",
+								"repo", repo.Owner+"/"+repo.Name,
+								"err", gqlErr,
+							)
+						}
 					} else {
 						if err := s.doSyncRepoGraphQL(
 							ctx, repo, repoID, result, cloneFetchOK,
 						); err != nil {
-							failedScope |= failMR
+							if s.recordRepositoryFeatureDisabled(
+								repo, platform.RepositoryFeatureMergeRequests, err,
+							) {
+								disabledScope |= failMR
+								failedScope |= partialSyncFailureScope(err) & failMR
+							} else {
+								failedScope |= failMR
+							}
 						}
 						graphQLDone = true
 					}
@@ -4982,11 +5171,18 @@ func (s *Syncer) indexSyncRepo(
 				if err := s.syncMergeRequestsFromList(
 					ctx, mrReader, repo, repoID, openMRs, cloneFetchOK,
 				); err != nil {
-					slog.Error("merge request sync failed",
-						"repo", repo.Owner+"/"+repo.Name,
-						"err", err,
-					)
-					failedScope |= failMR
+					if s.recordRepositoryFeatureDisabled(
+						repo, platform.RepositoryFeatureMergeRequests, err,
+					) {
+						disabledScope |= failMR
+						failedScope |= partialSyncFailureScope(err) & failMR
+					} else {
+						slog.Error("merge request sync failed",
+							"repo", repo.Owner+"/"+repo.Name,
+							"err", err,
+						)
+						failedScope |= failMR
+					}
 				}
 			}
 		}
@@ -4996,7 +5192,23 @@ func (s *Syncer) indexSyncRepo(
 	// Same structure as PR sync: REST list first (ETag gate),
 	// then GraphQL if available, REST fallback if not.
 	issueListUnchanged := false
+	var issueProbe repositoryFeatureProbe
+	issueProbeDue := false
 	if caps.ReadIssues {
+		issueProbe, issueProbeDue = s.beginRepositoryFeatureProbe(
+			ctx, repo, platform.RepositoryFeatureIssues,
+		)
+	}
+	if caps.ReadIssues && issueProbeDue {
+		issueProviderAttempted := false
+		defer func() {
+			if issueProviderAttempted {
+				issueProbe.release()
+			} else {
+				issueProbe.abandon()
+			}
+		}()
+		attemptedScope |= failIssues
 		issueReader, err := s.issueReaderFor(repo)
 		if err != nil {
 			slog.Error("resolve issue reader failed",
@@ -5009,6 +5221,7 @@ func (s *Syncer) indexSyncRepo(
 			}
 			return fmt.Errorf("resolve issue reader for %s/%s: %w", repo.Owner, repo.Name, err)
 		}
+		issueProviderAttempted = true
 
 		var openIssues []platform.Issue
 		var ghIssues []*gh.Issue
@@ -5030,6 +5243,10 @@ func (s *Syncer) indexSyncRepo(
 			if IsNotModified(issueListErr) {
 				// 304: open issue list unchanged, skip.
 				issueListUnchanged = true
+			} else if s.recordRepositoryFeatureDisabled(
+				repo, platform.RepositoryFeatureIssues, issueListErr,
+			) {
+				disabledScope |= failIssues
 			} else {
 				slog.Error("list open issues failed",
 					"repo", repo.Owner+"/"+repo.Name,
@@ -5046,15 +5263,29 @@ func (s *Syncer) indexSyncRepo(
 						ctx, repo.Owner, repo.Name,
 					)
 					if gqlErr != nil {
-						slog.Warn("GraphQL issue fetch failed, falling back to REST",
-							"repo", repo.Owner+"/"+repo.Name,
-							"err", gqlErr,
-						)
+						if s.recordRepositoryFeatureDisabled(
+							repo, platform.RepositoryFeatureIssues, gqlErr,
+						) {
+							disabledScope |= failIssues
+							graphQLIssuesDone = true
+						} else {
+							slog.Warn("GraphQL issue fetch failed, falling back to REST",
+								"repo", repo.Owner+"/"+repo.Name,
+								"err", gqlErr,
+							)
+						}
 					} else {
 						if err := s.doSyncRepoGraphQLIssues(
 							ctx, repo, repoID, issueResult,
 						); err != nil {
-							failedScope |= failIssues
+							if s.recordRepositoryFeatureDisabled(
+								repo, platform.RepositoryFeatureIssues, err,
+							) {
+								disabledScope |= failIssues
+								failedScope |= partialSyncFailureScope(err) & failIssues
+							} else {
+								failedScope |= failIssues
+							}
 						}
 						graphQLIssuesDone = true
 					}
@@ -5066,25 +5297,47 @@ func (s *Syncer) indexSyncRepo(
 					if err := s.syncIssuesFromList(
 						ctx, gitHubClient, repo, repoID, ghIssues, forceIssues,
 					); err != nil {
-						slog.Error("REST issue sync failed",
-							"repo", repo.Owner+"/"+repo.Name,
-							"err", err,
-						)
-						failedScope |= failIssues
+						if s.recordRepositoryFeatureDisabled(
+							repo, platform.RepositoryFeatureIssues, err,
+						) {
+							disabledScope |= failIssues
+							failedScope |= partialSyncFailureScope(err) & failIssues
+						} else {
+							slog.Error("REST issue sync failed",
+								"repo", repo.Owner+"/"+repo.Name,
+								"err", err,
+							)
+							failedScope |= failIssues
+						}
 					}
 				} else {
 					if err := s.syncPlatformIssuesFromList(
 						ctx, issueReader, repo, repoID, openIssues, forceIssues,
 					); err != nil {
-						slog.Error("issue sync failed",
-							"repo", repo.Owner+"/"+repo.Name,
-							"err", err,
-						)
-						failedScope |= failIssues
+						if s.recordRepositoryFeatureDisabled(
+							repo, platform.RepositoryFeatureIssues, err,
+						) {
+							disabledScope |= failIssues
+							failedScope |= partialSyncFailureScope(err) & failIssues
+						} else {
+							slog.Error("issue sync failed",
+								"repo", repo.Owner+"/"+repo.Name,
+								"err", err,
+							)
+							failedScope |= failIssues
+						}
 					}
 				}
 			}
 		}
+	}
+	if attemptedScope&failIssues != 0 &&
+		failedScope&failIssues == 0 && disabledScope&failIssues == 0 {
+		issueProbe.clear()
+	}
+	if attemptedScope&failMR != 0 &&
+		failedScope&failMR == 0 && disabledScope&failMR == 0 {
+		mrProbe.clear()
 	}
 
 	if failedScope != 0 {
@@ -5092,15 +5345,18 @@ func (s *Syncer) indexSyncRepo(
 		// failed so the next cycle forces an unconditional refetch
 		// only for the affected list endpoints.
 		s.markRepoFailed(repo, failedScope)
-	} else {
-		// Clean pass — drop any leftover flag from a prior cycle.
-		s.clearRepoFailed(repo)
+	}
+	succeededScope := attemptedScope &^ failedScope &^ disabledScope
+	if succeededScope != 0 {
+		s.clearRepoFailedScope(repo, succeededScope)
 	}
 
-	if caps.ReadMergeRequests && prListUnchanged && failedScope&failMR == 0 {
+	if caps.ReadMergeRequests && prListUnchanged &&
+		failedScope&failMR == 0 && disabledScope&failMR == 0 {
 		s.refreshRepoPRComments(ctx, repo)
 	}
-	if caps.ReadIssues && issueListUnchanged && failedScope&failIssues == 0 {
+	if caps.ReadIssues && issueListUnchanged &&
+		failedScope&failIssues == 0 && disabledScope&failIssues == 0 {
 		s.refreshRepoIssueComments(ctx, repo)
 	}
 
@@ -5137,6 +5393,9 @@ func (s *Syncer) syncMergeRequestsFromList(
 	progress := newMergeRequestSyncProgressLogger(repo, "provider", len(mrs))
 	for i, mr := range mrs {
 		if err := s.indexUpsertMergeRequest(ctx, repo, repoID, mr, cloneFetchOK); err != nil {
+			if errors.Is(err, platform.ErrRepositoryFeatureDisabled) {
+				return preservePartialSyncFailure(failMR, hadItemFailure, err)
+			}
 			slog.Error("index upsert MR failed",
 				"repo", repo.Owner+"/"+repo.Name,
 				"number", mr.Number,
@@ -5158,6 +5417,9 @@ func (s *Syncer) syncMergeRequestsFromList(
 		if err := s.fetchAndUpdateClosedMergeRequest(
 			ctx, reader, repo, repoID, number, cloneFetchOK,
 		); err != nil {
+			if errors.Is(err, platform.ErrRepositoryFeatureDisabled) {
+				return preservePartialSyncFailure(failMR, hadItemFailure, err)
+			}
 			slog.Error("update closed MR failed",
 				"repo", repo.Owner+"/"+repo.Name,
 				"number", number,
@@ -5454,26 +5716,31 @@ func (s *Syncer) refreshPRCommentsForItem(
 	client Client,
 	repo RepoRef,
 	pr *db.MergeRequest,
-) {
+) (bool, bool) {
 	if pr == nil || pr.DetailFetchedAt == nil {
-		return
+		return false, false
 	}
 	if !s.canSpendCommentRefresh(repo) {
-		return
+		return false, false
 	}
 	comments, err := s.listCommentsForRefresh(
 		ctx, client, repo, pr.Number, pr.CommentCount,
 	)
 	if err != nil {
 		if IsNotModified(err) {
-			return
+			return true, false
+		}
+		if s.recordGitHubRepositoryFeatureDisabled(
+			repo, platform.RepositoryFeatureMergeRequests, err,
+		) {
+			return true, true
 		}
 		slog.Warn("comment refresh: list PR comments failed",
 			"repo", repo.Owner+"/"+repo.Name,
 			"number", pr.Number,
 			"err", err,
 		)
-		return
+		return true, false
 	}
 	if err := s.persistPRComments(ctx, repo, pr, comments); err != nil {
 		client.InvalidateListETagsForRepo(repo.Owner, repo.Name, "comments")
@@ -5483,6 +5750,7 @@ func (s *Syncer) refreshPRCommentsForItem(
 			"err", err,
 		)
 	}
+	return true, false
 }
 
 func (s *Syncer) refreshIssueCommentsForItem(
@@ -5490,26 +5758,31 @@ func (s *Syncer) refreshIssueCommentsForItem(
 	client Client,
 	repo RepoRef,
 	issue *db.Issue,
-) {
+) (bool, bool) {
 	if issue == nil || issue.DetailFetchedAt == nil {
-		return
+		return false, false
 	}
 	if !s.canSpendCommentRefresh(repo) {
-		return
+		return false, false
 	}
 	comments, err := s.listCommentsForRefresh(
 		ctx, client, repo, issue.Number, issue.CommentCount,
 	)
 	if err != nil {
 		if IsNotModified(err) {
-			return
+			return true, false
+		}
+		if s.recordGitHubRepositoryFeatureDisabled(
+			repo, platform.RepositoryFeatureIssues, err,
+		) {
+			return true, true
 		}
 		slog.Warn("comment refresh: list issue comments failed",
 			"repo", repo.Owner+"/"+repo.Name,
 			"number", issue.Number,
 			"err", err,
 		)
-		return
+		return true, false
 	}
 	if err := s.persistIssueComments(ctx, repo, issue, comments); err != nil {
 		client.InvalidateListETagsForRepo(repo.Owner, repo.Name, "comments")
@@ -5519,6 +5792,7 @@ func (s *Syncer) refreshIssueCommentsForItem(
 			"err", err,
 		)
 	}
+	return true, false
 }
 
 func (s *Syncer) resetPendingCommentSyncs() {
@@ -5596,7 +5870,18 @@ func (s *Syncer) drainPendingCommentSyncs(
 			)
 			continue
 		}
-		s.refreshPRCommentsForItem(ctx, client, item.repo, pr)
+		probe, due := s.beginRepositoryFeatureProbe(
+			ctx, item.repo, platform.RepositoryFeatureMergeRequests,
+		)
+		if !due {
+			continue
+		}
+		providerAttempted, _ := s.refreshPRCommentsForItem(ctx, client, item.repo, pr)
+		if providerAttempted {
+			probe.release()
+		} else {
+			probe.abandon()
+		}
 	}
 
 	for _, item := range issues {
@@ -5638,7 +5923,18 @@ func (s *Syncer) drainPendingCommentSyncs(
 			)
 			continue
 		}
-		s.refreshIssueCommentsForItem(ctx, client, item.repo, issue)
+		probe, due := s.beginRepositoryFeatureProbe(
+			ctx, item.repo, platform.RepositoryFeatureIssues,
+		)
+		if !due {
+			continue
+		}
+		providerAttempted, _ := s.refreshIssueCommentsForItem(ctx, client, item.repo, issue)
+		if providerAttempted {
+			probe.release()
+		} else {
+			probe.abandon()
+		}
 	}
 }
 
@@ -5662,6 +5958,9 @@ func (s *Syncer) doSyncRepoGraphQL(
 		if err := s.syncOpenMRFromBulk(
 			ctx, repo, repoID, bulk, cloneFetchOK,
 		); err != nil {
+			if errors.Is(err, platform.ErrRepositoryFeatureDisabled) {
+				return preservePartialSyncFailure(failMR, failedScope&failMR != 0, err)
+			}
 			slog.Error("GraphQL sync MR failed",
 				"repo", repo.Owner+"/"+repo.Name,
 				"number", number,
@@ -5683,6 +5982,9 @@ func (s *Syncer) doSyncRepoGraphQL(
 		if err := s.fetchAndUpdateClosed(
 			ctx, repo, repoID, number, cloneFetchOK,
 		); err != nil {
+			if errors.Is(err, platform.ErrRepositoryFeatureDisabled) {
+				return preservePartialSyncFailure(failMR, failedScope&failMR != 0, err)
+			}
 			slog.Error("update closed MR failed",
 				"repo", repo.Owner+"/"+repo.Name,
 				"number", number,
@@ -5718,6 +6020,13 @@ func (s *Syncer) doSyncRepoGraphQLIssues(
 		if err := s.syncOpenIssueFromBulk(
 			ctx, repo, repoID, bulk,
 		); err != nil {
+			if disabledErr := repositoryFeatureDisabledError(
+				repo, platform.RepositoryFeatureIssues, err,
+			); disabledErr != nil {
+				return preservePartialSyncFailure(
+					failIssues, failedScope&failIssues != 0, disabledErr,
+				)
+			}
 			slog.Error("GraphQL sync issue failed",
 				"repo", repo.Owner+"/"+repo.Name,
 				"number", number,
@@ -5739,6 +6048,13 @@ func (s *Syncer) doSyncRepoGraphQLIssues(
 		if err := s.fetchAndUpdateClosedIssue(
 			ctx, repo, repoID, number,
 		); err != nil {
+			if disabledErr := repositoryFeatureDisabledError(
+				repo, platform.RepositoryFeatureIssues, err,
+			); disabledErr != nil {
+				return preservePartialSyncFailure(
+					failIssues, failedScope&failIssues != 0, disabledErr,
+				)
+			}
 			slog.Error("update closed issue failed",
 				"repo", repo.Owner+"/"+repo.Name,
 				"number", number,
@@ -6984,6 +7300,9 @@ func (s *Syncer) classifyProviderItemLookupError(
 	repo RepoRef,
 	err error,
 ) error {
+	if errors.Is(err, platform.ErrLookupNotPresent) {
+		return err
+	}
 	if !errors.Is(err, platform.ErrNotFound) {
 		return err
 	}
@@ -7034,6 +7353,11 @@ func (s *Syncer) refreshTimeline(
 	timelineEventsFetched := true
 	timelineEvents, err := client.ListPullRequestTimelineEvents(ctx, repo.Owner, repo.Name, number)
 	if err != nil {
+		if disabledErr := repositoryFeatureDisabledError(
+			repo, platform.RepositoryFeatureMergeRequests, err,
+		); disabledErr != nil {
+			return disabledErr
+		}
 		slog.Warn("timeline event fetch failed during timeline refresh",
 			"repo", repo.Owner+"/"+repo.Name,
 			"number", number,
@@ -7594,6 +7918,11 @@ func (s *Syncer) syncIssuesFromList(
 	progress := newIssueSyncProgressLogger(repo, "rest", len(ghIssues))
 	for i, ghIssue := range ghIssues {
 		if err := s.syncOpenIssue(ctx, client, repo, repoID, ghIssue, forceRefresh); err != nil {
+			if disabledErr := repositoryFeatureDisabledError(
+				repo, platform.RepositoryFeatureIssues, err,
+			); disabledErr != nil {
+				return preservePartialSyncFailure(failIssues, hadItemFailure, disabledErr)
+			}
 			slog.Error("sync issue failed",
 				"repo", repo.Owner+"/"+repo.Name,
 				"number", ghIssue.GetNumber(),
@@ -7614,6 +7943,11 @@ func (s *Syncer) syncIssuesFromList(
 		if err := s.fetchAndUpdateClosedIssue(
 			ctx, repo, repoID, number,
 		); err != nil {
+			if disabledErr := repositoryFeatureDisabledError(
+				repo, platform.RepositoryFeatureIssues, err,
+			); disabledErr != nil {
+				return preservePartialSyncFailure(failIssues, hadItemFailure, disabledErr)
+			}
 			slog.Error("update closed issue failed",
 				"repo", repo.Owner+"/"+repo.Name,
 				"number", number,
@@ -7647,6 +7981,9 @@ func (s *Syncer) syncPlatformIssuesFromList(
 	progress := newIssueSyncProgressLogger(repo, "provider", len(issues))
 	for i, issue := range issues {
 		if err := s.syncOpenPlatformIssue(ctx, reader, repo, repoID, issue, forceRefresh); err != nil {
+			if errors.Is(err, platform.ErrRepositoryFeatureDisabled) {
+				return preservePartialSyncFailure(failIssues, hadItemFailure, err)
+			}
 			slog.Error("sync issue failed",
 				"repo", repo.Owner+"/"+repo.Name,
 				"number", issue.Number,
@@ -7667,6 +8004,9 @@ func (s *Syncer) syncPlatformIssuesFromList(
 		if err := s.fetchAndUpdateClosedPlatformIssue(
 			ctx, repo, repoID, number,
 		); err != nil {
+			if errors.Is(err, platform.ErrRepositoryFeatureDisabled) {
+				return preservePartialSyncFailure(failIssues, hadItemFailure, err)
+			}
 			slog.Error("update closed issue failed",
 				"repo", repo.Owner+"/"+repo.Name,
 				"number", number,
@@ -7835,6 +8175,11 @@ func (s *Syncer) refreshIssueTimeline(
 			ctx, repo.Owner, repo.Name, number,
 		)
 		if err != nil {
+			if disabledErr := repositoryFeatureDisabledError(
+				repo, platform.RepositoryFeatureIssues, err,
+			); disabledErr != nil {
+				return disabledErr
+			}
 			slog.Warn("issue timeline event fetch failed during timeline refresh",
 				"repo", repo.Owner+"/"+repo.Name,
 				"number", number,
@@ -7878,6 +8223,21 @@ func (s *Syncer) refreshRepoPRComments(
 	ctx context.Context,
 	repo RepoRef,
 ) {
+	probe, due := s.beginRepositoryFeatureProbe(
+		ctx, repo, platform.RepositoryFeatureMergeRequests,
+	)
+	if !due {
+		return
+	}
+	providerAttempted := false
+	defer func() {
+		if providerAttempted {
+			probe.release()
+		} else {
+			probe.abandon()
+		}
+	}()
+
 	prs, err := s.db.ListMergeRequests(ctx, db.ListMergeRequestsOpts{
 		PlatformHost: repoHost(repo),
 		RepoOwner:    repo.Owner,
@@ -7905,7 +8265,11 @@ func (s *Syncer) refreshRepoPRComments(
 		if ctx.Err() != nil {
 			return
 		}
-		s.refreshPRCommentsForItem(ctx, client, repo, &prs[i])
+		attempted, disabled := s.refreshPRCommentsForItem(ctx, client, repo, &prs[i])
+		providerAttempted = providerAttempted || attempted
+		if disabled {
+			return
+		}
 	}
 }
 
@@ -7913,6 +8277,21 @@ func (s *Syncer) refreshRepoIssueComments(
 	ctx context.Context,
 	repo RepoRef,
 ) {
+	probe, due := s.beginRepositoryFeatureProbe(
+		ctx, repo, platform.RepositoryFeatureIssues,
+	)
+	if !due {
+		return
+	}
+	providerAttempted := false
+	defer func() {
+		if providerAttempted {
+			probe.release()
+		} else {
+			probe.abandon()
+		}
+	}()
+
 	issues, err := s.db.ListIssues(ctx, db.ListIssuesOpts{
 		PlatformHost: repoHost(repo),
 		RepoOwner:    repo.Owner,
@@ -7940,7 +8319,11 @@ func (s *Syncer) refreshRepoIssueComments(
 		if ctx.Err() != nil {
 			return
 		}
-		s.refreshIssueCommentsForItem(ctx, client, repo, &issues[i])
+		attempted, disabled := s.refreshIssueCommentsForItem(ctx, client, repo, &issues[i])
+		providerAttempted = providerAttempted || attempted
+		if disabled {
+			return
+		}
 	}
 }
 
@@ -8111,25 +8494,6 @@ func (s *Syncer) drainDetailQueue(
 		if !eligibleBuckets[bucket] {
 			continue
 		}
-		if exhausted[bucket] {
-			continue
-		}
-
-		budget := s.budgets[bucket]
-		if budget == nil {
-			continue
-		}
-
-		// Soft admission gate: check if the budget has nominal
-		// capacity for this item. The transport layer handles
-		// actual per-RoundTrip accounting; this prevents starting
-		// work we almost certainly can't afford.
-		worstCase := qi.WorstCaseCost()
-		if !budget.CanSpend(worstCase) {
-			exhausted[bucket] = true
-			continue
-		}
-
 		repo := RepoRef{
 			Platform:     qi.Platform,
 			Owner:        qi.RepoOwner,
@@ -8142,8 +8506,38 @@ func (s *Syncer) drainDetailQueue(
 			repo.Name = qi.RepoName
 			repo.PlatformHost = host
 		}
+		feature := platform.RepositoryFeatureIssues
+		if qi.Type == QueueItemPR {
+			feature = platform.RepositoryFeatureMergeRequests
+		}
+		probe, due := s.beginRepositoryFeatureProbe(ctx, repo, feature)
+		if !due {
+			continue
+		}
+		if exhausted[bucket] {
+			probe.abandon()
+			continue
+		}
+
+		budget := s.budgets[bucket]
+		if budget == nil {
+			probe.abandon()
+			continue
+		}
+
+		// Soft admission gate: check if the budget has nominal
+		// capacity for this item. The transport layer handles
+		// actual per-RoundTrip accounting; this prevents starting
+		// work we almost certainly can't afford.
+		worstCase := qi.WorstCaseCost()
+		if !budget.CanSpend(worstCase) {
+			probe.abandon()
+			exhausted[bucket] = true
+			continue
+		}
 		repoID, err := s.db.UpsertRepo(ctx, platform.DBRepoIdentity(platformRepoRef(repo)))
 		if err != nil {
+			probe.abandon()
 			slog.Warn("detail drain: upsert repo failed",
 				"repo", qi.RepoOwner+"/"+qi.RepoName,
 				"err", err,
@@ -8167,23 +8561,41 @@ func (s *Syncer) drainDetailQueue(
 			}
 		}
 
+		providerCalls := 0
 		if qi.Type == QueueItemPR {
-			_, err = s.fetchMRDetail(
+			providerCalls, err = s.fetchMRDetail(
 				ctx, repo, repoID, qi.Number, cloneFetchOK,
 			)
 		} else {
-			_, err = s.fetchIssueDetail(
+			providerCalls, err = s.fetchIssueDetail(
 				ctx, repo, repoID, qi.Number,
 			)
 		}
 
 		if err != nil {
+			disabledErr := repositoryFeatureDisabledError(repo, feature, err)
+			disabled := disabledErr != nil &&
+				s.recordRepositoryFeatureDisabled(repo, feature, disabledErr)
+			if providerCalls > 0 {
+				probe.release()
+			} else {
+				probe.abandon()
+			}
+			if disabled {
+				continue
+			}
 			slog.Warn("detail drain: fetch failed",
 				"repo", qi.RepoOwner+"/"+qi.RepoName,
 				"number", qi.Number,
 				"type", qi.Type,
 				"err", err,
 			)
+			continue
+		}
+		if providerCalls > 0 {
+			probe.release()
+		} else {
+			probe.abandon()
 		}
 	}
 }
@@ -8354,7 +8766,9 @@ func (s *Syncer) SyncRepoOnProvider(
 	repo.Owner = owner
 	repo.Name = name
 	repo.PlatformHost = repoHost(repo)
-	return s.syncRepo(ctx, repo)
+	return s.syncRepo(withRepositoryFeatureCooldownBypass(
+		ctx, s.featureCooldowns.currentGeneration(),
+	), repo)
 }
 
 // SyncMR fetches fresh data for a single MR from GitHub and updates the DB.
@@ -8383,7 +8797,7 @@ func (s *Syncer) SyncMROnProvider(
 	repo.Owner = owner
 	repo.Name = name
 	repo.PlatformHost = repoHost(repo)
-	return s.syncMRForRepo(ctx, repo, number, false)
+	return s.syncMRForRepo(ctx, repo, number, false, nil)
 }
 
 // syncMRWithHost is the internal implementation of SyncMR.
@@ -8421,12 +8835,20 @@ func (s *Syncer) syncMRWithHost(
 	repo.Owner = owner
 	repo.Name = name
 	repo.PlatformHost = repoHost(repo)
-	return s.syncMRForRepo(ctx, repo, number, false)
+	return s.syncMRForRepo(ctx, repo, number, false, nil)
 }
 
 func (s *Syncer) syncMRWithWatchedRef(
 	ctx context.Context,
 	mr WatchedMR,
+) error {
+	return s.syncMRWithWatchedRefTracking(ctx, mr, nil)
+}
+
+func (s *Syncer) syncMRWithWatchedRefTracking(
+	ctx context.Context,
+	mr WatchedMR,
+	providerAttempted *bool,
 ) error {
 	kind := watchedMRPlatform(mr)
 	repo, ok := s.trackedRepoByIdentity(
@@ -8439,7 +8861,7 @@ func (s *Syncer) syncMRWithWatchedRef(
 			mr.Owner, mr.Name, kind, host,
 		)
 	}
-	return s.syncMRForRepo(ctx, repo, mr.Number, true)
+	return s.syncMRForRepo(ctx, repo, mr.Number, true, providerAttempted)
 }
 
 func (s *Syncer) syncMRForRepo(
@@ -8447,6 +8869,7 @@ func (s *Syncer) syncMRForRepo(
 	repo RepoRef,
 	number int,
 	useConditionalPRDetail bool,
+	providerAttempted *bool,
 ) error {
 	if !IsArchiveSyncBudgetContext(ctx) {
 		releaseProviderWork := s.beginProviderWork(
@@ -8486,6 +8909,9 @@ func (s *Syncer) syncMRForRepo(
 	}); ok {
 		if client, ok := s.optionalGitHubClientFor(repo); ok && useConditionalPRDetail {
 			var notModified bool
+			if providerAttempted != nil {
+				*providerAttempted = true
+			}
 			ghPR, newETag, notModified, err = s.getPullRequestForDetail(
 				ctx, client, repo, number,
 			)
@@ -8511,12 +8937,18 @@ func (s *Syncer) syncMRForRepo(
 				normalized, err = NormalizePR(repoID, ghPR)
 			}
 		} else {
+			if providerAttempted != nil {
+				*providerAttempted = true
+			}
 			ghPR, platformMR, err = rawReader.GetGitHubPullRequest(ctx, platformRepoRef(repo), number)
 			if err == nil {
 				normalized = platform.DBMergeRequest(repoID, platformMR)
 			}
 		}
 	} else {
+		if providerAttempted != nil {
+			*providerAttempted = true
+		}
 		platformMR, err = mrReader.GetMergeRequest(ctx, platformRepoRef(repo), number)
 		if err == nil {
 			normalized = platform.DBMergeRequest(repoID, platformMR)
@@ -8966,7 +9398,7 @@ func (s *Syncer) SyncIssueOnProvider(
 	repo.Owner = owner
 	repo.Name = name
 	repo.PlatformHost = repoHost(repo)
-	return s.syncIssueForRepo(ctx, repo, number)
+	return s.syncIssueForRepo(ctx, repo, number, nil)
 }
 
 func (s *Syncer) syncIssueWithHost(
@@ -9000,13 +9432,14 @@ func (s *Syncer) syncIssueWithHost(
 	repo.Owner = owner
 	repo.Name = name
 	repo.PlatformHost = repoHost(repo)
-	return s.syncIssueForRepo(ctx, repo, number)
+	return s.syncIssueForRepo(ctx, repo, number, nil)
 }
 
 func (s *Syncer) syncIssueForRepo(
 	ctx context.Context,
 	repo RepoRef,
 	number int,
+	providerAttempted *bool,
 ) error {
 	if !IsArchiveSyncBudgetContext(ctx) {
 		releaseProviderWork := s.beginProviderWork(
@@ -9020,7 +9453,11 @@ func (s *Syncer) syncIssueForRepo(
 		return fmt.Errorf("upsert repo %s/%s: %w", repo.Owner, repo.Name, err)
 	}
 
-	if _, err := s.fetchIssueDetail(ctx, repo, repoID, number); err != nil {
+	providerCalls, err := s.fetchIssueDetail(ctx, repo, repoID, number)
+	if providerAttempted != nil && providerCalls > 0 {
+		*providerAttempted = true
+	}
+	if err != nil {
 		return err
 	}
 	return s.markClosedLinkedNotificationsDone(ctx)
@@ -9029,11 +9466,11 @@ func (s *Syncer) syncIssueForRepo(
 // ArchiveItemSyncCost returns the worst-case wire-attempt allowance for the
 // existing full item sync. One logical request may spend a second attempt
 // after authentication refresh.
-func (s *Syncer) ArchiveItemSyncCost(_ platform.Kind, itemType db.ArchiveItemType) int {
+func (s *Syncer) ArchiveItemSyncCost(kind platform.Kind, itemType db.ArchiveItemType) int {
 	if itemType == db.ArchiveItemTypeMergeRequest {
-		return 2 * PRDetailWorstCase
+		return detailWorstCaseAttemptCost(kind, QueueItemPR)
 	}
-	return 2 * IssueDetailWorstCase
+	return detailWorstCaseAttemptCost(kind, QueueItemIssue)
 }
 
 // SyncArchiveItem runs archive hydration through the canonical live item
@@ -9045,10 +9482,10 @@ func (s *Syncer) SyncArchiveItem(
 	ref platform.RepoRef,
 	itemType db.ArchiveItemType,
 	number int,
-) error {
+) (bool, error) {
 	repo, ok := s.trackedRepoByIdentity(ref.Platform, ref.Owner, ref.Name, ref.Host)
 	if !ok {
-		return fmt.Errorf(
+		return false, fmt.Errorf(
 			"repo %s/%s on %s/%s is not tracked",
 			ref.Owner, ref.Name, ref.Platform, ref.Host,
 		)
@@ -9058,15 +9495,18 @@ func (s *Syncer) SyncArchiveItem(
 	repo.PlatformHost = repoHost(repo)
 	switch itemType {
 	case db.ArchiveItemTypeIssue:
-		return s.syncIssueForRepo(ctx, repo, number)
+		providerAttempted := false
+		err := s.syncIssueForRepo(ctx, repo, number, &providerAttempted)
+		return providerAttempted, err
 	case db.ArchiveItemTypeMergeRequest:
-		err := s.syncMRForRepo(ctx, repo, number, false)
+		providerAttempted := false
+		err := s.syncMRForRepo(ctx, repo, number, false, &providerAttempted)
 		if _, onlyDiffFailed := err.(*DiffSyncError); onlyDiffFailed { //nolint:errorlint // joined hard failures must propagate
-			return nil
+			return providerAttempted, nil
 		}
-		return err
+		return providerAttempted, err
 	default:
-		return fmt.Errorf("sync archive item: invalid item type %q", itemType)
+		return false, fmt.Errorf("sync archive item: invalid item type %q", itemType)
 	}
 }
 

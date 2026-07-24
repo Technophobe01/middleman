@@ -211,6 +211,11 @@ func TestSyncArchiveItemClassifiesOnlyConfirmedParentNotFound(t *testing.T) {
 			wantNotPresent: true, wantRepoQueries: 1,
 		},
 		{
+			name:           "provider metadata already confirms missing parent",
+			getIssueErr:    errors.Join(platform.ErrLookupNotPresent, platform.ErrNotFound),
+			wantNotPresent: true,
+		},
+		{
 			name: "child event not found stays retryable", issues: []platform.Issue{issue},
 			listEventsErr: platform.ErrNotFound,
 		},
@@ -241,10 +246,30 @@ func TestSyncArchiveItemClassifiesOnlyConfirmedParentNotFound(t *testing.T) {
 				Owner: ref.Owner, Name: ref.Name, RepoPath: ref.RepoPath,
 			}}, time.Minute, nil, nil)
 
-			err = syncer.SyncArchiveItem(t.Context(), ref, db.ArchiveItemTypeIssue, issue.Number)
+			_, err = syncer.SyncArchiveItem(t.Context(), ref, db.ArchiveItemTypeIssue, issue.Number)
 			require.Error(err)
 			assert.Equal(test.wantNotPresent, errors.Is(err, platform.ErrLookupNotPresent))
 			assert.Equal(test.wantRepoQueries, provider.getRepositoryCalls.Load())
+		})
+	}
+}
+
+func TestArchiveItemSyncCostIncludesProviderConfirmationAndAuthRetry(t *testing.T) {
+	syncer := &Syncer{}
+	tests := []struct {
+		name     string
+		kind     platform.Kind
+		itemType db.ArchiveItemType
+		want     int
+	}{
+		{name: "GitHub pull request", kind: platform.KindGitHub, itemType: db.ArchiveItemTypeMergeRequest, want: 20},
+		{name: "GitLab pull request", kind: platform.KindGitLab, itemType: db.ArchiveItemTypeMergeRequest, want: 22},
+		{name: "GitHub issue", kind: platform.KindGitHub, itemType: db.ArchiveItemTypeIssue, want: 4},
+		{name: "Forgejo issue", kind: platform.KindForgejo, itemType: db.ArchiveItemTypeIssue, want: 6},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert.Equal(t, test.want, syncer.ArchiveItemSyncCost(test.kind, test.itemType))
 		})
 	}
 }
@@ -801,6 +826,19 @@ type mockClient struct {
 	dismissedReviewID               int64
 	dismissedReviewMessage          string
 	dismissReviewCalls              atomic.Int32
+}
+
+type issueTimelineMockClient struct {
+	mockClient
+	issueTimelineCalls atomic.Int32
+	issueTimelineErr   error
+}
+
+func (c *issueTimelineMockClient) ListIssueTimelineEvents(
+	context.Context, string, string, int,
+) ([]PullRequestTimelineEvent, error) {
+	c.issueTimelineCalls.Add(1)
+	return nil, c.issueTimelineErr
 }
 
 func (m *mockClient) bypassNotificationReadRateReserve() bool {
@@ -9745,11 +9783,11 @@ func TestDetailDrainRespectsBudget(t *testing.T) {
 		prs = append(prs, buildOpenPR(i, now))
 	}
 
-	// Index overhead: GetRepo(1) + ListPRs(1) + ListIssues(1) +
-	// GetUser(1, deduplicated by singleflight) = 4 calls. The PR
-	// detail admission reserve is 11 calls. Budget of 16 leaves
-	// enough nominal capacity for one detail, but not a second.
-	budget := testBudget(16)
+	// Index overhead: GetRepo(1) + releases(1) + tags(1) + ListPRs(1) +
+	// ListIssues(1) + GetUser(1, deduplicated by singleflight) = 6 calls.
+	// The PR detail admission reserve is 20 wire attempts. Budget of 26
+	// leaves enough nominal capacity for one detail, but not a second.
+	budget := testBudget(26)
 	mc := &detailTrackingClient{}
 	mc.budget = budget["github.com"]
 	mc.openPRs = prs
@@ -10914,6 +10952,7 @@ type partialFailureMock struct {
 	mockClient
 	issuesCached         bool
 	prsCached            bool
+	listOpenIssuesFn     func(context.Context, string, string) ([]*gh.Issue, error)
 	listOpenPRsErr       error // injected error for ListOpenPullRequests
 	listIssueCommentsErr error // injected error for ListIssueComments
 	listReviewsErr       error // injected error for ListReviews (MR timeline)
@@ -10931,7 +10970,10 @@ func (m *partialFailureMock) ListOpenPullRequests(_ context.Context, _, _ string
 	return m.openPRs, nil
 }
 
-func (m *partialFailureMock) ListOpenIssues(_ context.Context, _, _ string) ([]*gh.Issue, error) {
+func (m *partialFailureMock) ListOpenIssues(ctx context.Context, owner, repo string) ([]*gh.Issue, error) {
+	if m.listOpenIssuesFn != nil {
+		return m.listOpenIssuesFn(ctx, owner, repo)
+	}
 	if m.listOpenIssuesErr != nil {
 		return nil, m.listOpenIssuesErr
 	}
@@ -11214,6 +11256,161 @@ func TestSyncerClosedIssueFailureMarksRepoFailed(t *testing.T) {
 	assert.False(flagged, "failedRepos must be cleared after successful retry")
 }
 
+func TestDisabledIssuesStopClosureDetectionAfterFirstLookup(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	ctx := t.Context()
+	database := openTestDB(t)
+	now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
+	repo := RepoRef{
+		Platform: platform.KindGitHub, PlatformHost: "github.com",
+		Owner: "owner", Name: "repo",
+	}
+
+	seedClient := &mockClient{
+		openPRs:    []*gh.PullRequest{buildOpenPR(1, now)},
+		openIssues: []*gh.Issue{buildOpenIssue(7, now), buildOpenIssue(8, now)},
+		comments:   []*gh.IssueComment{},
+		reviews:    []*gh.PullRequestReview{},
+		commits:    []*gh.RepositoryCommit{},
+	}
+	NewSyncer(
+		map[string]Client{"github.com": seedClient}, database, nil,
+		[]RepoRef{repo}, time.Minute, nil, nil,
+	).RunOnce(ctx)
+	for _, number := range []int{7, 8} {
+		issue, err := database.GetIssue(
+			ctx, "github", "github.com", "owner", "repo", number,
+		)
+		require.NoError(err)
+		require.NotNil(issue)
+	}
+
+	var getIssueCalls atomic.Int32
+	client := &partialFailureMock{}
+	client.openPRs = []*gh.PullRequest{buildOpenPR(1, now)}
+	client.openIssues = []*gh.Issue{}
+	client.comments = []*gh.IssueComment{}
+	client.reviews = []*gh.PullRequestReview{}
+	client.commits = []*gh.RepositoryCommit{}
+	client.getIssueFn = func(context.Context, string, string, int) (*gh.Issue, error) {
+		getIssueCalls.Add(1)
+		return nil, &gh.ErrorResponse{
+			Response: &http.Response{StatusCode: http.StatusGone},
+			Message:  "Issues are disabled for this repo",
+		}
+	}
+
+	syncer := NewSyncer(
+		map[string]Client{"github.com": client}, database, nil,
+		[]RepoRef{repo}, time.Minute, nil, nil,
+	)
+	syncer.RunOnce(ctx)
+
+	assert.Equal(int32(1), getIssueCalls.Load())
+	_, failed := syncer.failedRepos.Load(repoFailKey(repo))
+	assert.False(failed)
+}
+
+func TestSyncIssuesFromListStopsAfterWrappedRawDisabledResponse(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	ctx := t.Context()
+	database := openTestDB(t)
+	repo := RepoRef{
+		Platform: platform.KindGitHub, PlatformHost: "github.com",
+		Owner: "owner", Name: "repo",
+	}
+	repoID, err := database.UpsertRepo(
+		ctx, platform.DBRepoIdentity(platformRepoRef(repo)),
+	)
+	require.NoError(err)
+	now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
+	issues := []*gh.Issue{buildOpenIssue(1, now), buildOpenIssue(2, now)}
+	rawDisabledErr := fmt.Errorf("list issue comments: %w", &gh.ErrorResponse{
+		Response: &http.Response{StatusCode: http.StatusGone},
+		Message:  "Issues are disabled for this repo",
+	})
+	var commentCalls atomic.Int32
+	client := &mockClient{
+		comments: []*gh.IssueComment{},
+		listIssueCommentsFn: func(context.Context, string, string, int) ([]*gh.IssueComment, error) {
+			commentCalls.Add(1)
+			return nil, rawDisabledErr
+		},
+	}
+	syncer := NewSyncer(
+		map[string]Client{"github.com": client}, database, nil,
+		[]RepoRef{repo}, time.Minute, nil, nil,
+	)
+
+	err = syncer.syncIssuesFromList(ctx, client, repo, repoID, issues, false)
+	require.ErrorIs(err, platform.ErrRepositoryFeatureDisabled)
+	assert.Equal(int32(1), commentCalls.Load())
+}
+
+func TestSyncIssuesFromListStopsAfterWrappedRawDisabledTimelineResponse(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	ctx := t.Context()
+	database := openTestDB(t)
+	repo := RepoRef{
+		Platform: platform.KindGitHub, PlatformHost: "github.com",
+		Owner: "owner", Name: "repo",
+	}
+	repoID, err := database.UpsertRepo(ctx, platform.DBRepoIdentity(platformRepoRef(repo)))
+	require.NoError(err)
+	now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
+	client := &issueTimelineMockClient{
+		mockClient: mockClient{comments: []*gh.IssueComment{}},
+		issueTimelineErr: fmt.Errorf("list issue timeline: %w", &gh.ErrorResponse{
+			Response: &http.Response{StatusCode: http.StatusGone},
+			Message:  "Issues are disabled for this repo",
+		}),
+	}
+	syncer := NewSyncer(
+		map[string]Client{"github.com": client}, database, nil,
+		[]RepoRef{repo}, time.Minute, nil, nil,
+	)
+
+	err = syncer.syncIssuesFromList(
+		ctx, client, repo, repoID,
+		[]*gh.Issue{buildOpenIssue(1, now), buildOpenIssue(2, now)}, false,
+	)
+
+	require.ErrorIs(err, platform.ErrRepositoryFeatureDisabled)
+	assert.Equal(int32(1), client.issueTimelineCalls.Load())
+	assert.Equal(int32(1), client.listIssueCommentsCalled.Load())
+}
+
+func TestSyncIssuesFromListRetainsBestEffortTimelineErrors(t *testing.T) {
+	require := require.New(t)
+	ctx := t.Context()
+	database := openTestDB(t)
+	repo := RepoRef{
+		Platform: platform.KindGitHub, PlatformHost: "github.com",
+		Owner: "owner", Name: "repo",
+	}
+	repoID, err := database.UpsertRepo(ctx, platform.DBRepoIdentity(platformRepoRef(repo)))
+	require.NoError(err)
+	now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
+	client := &issueTimelineMockClient{
+		mockClient:       mockClient{comments: []*gh.IssueComment{}},
+		issueTimelineErr: errors.New("timeline temporarily unavailable"),
+	}
+	syncer := NewSyncer(
+		map[string]Client{"github.com": client}, database, nil,
+		[]RepoRef{repo}, time.Minute, nil, nil,
+	)
+
+	err = syncer.syncIssuesFromList(
+		ctx, client, repo, repoID, []*gh.Issue{buildOpenIssue(1, now)}, false,
+	)
+
+	require.NoError(err)
+	require.Equal(int32(1), client.issueTimelineCalls.Load())
+}
+
 // TestSyncerMRListFailureMarksRepoFailed verifies that when the
 // PR list fails, the MR path is marked failed, and the next cycle
 // invalidates the ETag and retries. Also verifies issue path is NOT
@@ -11235,6 +11432,11 @@ func TestSyncerMRListFailureMarksRepoFailed(t *testing.T) {
 	mc.commits = []*gh.RepositoryCommit{}
 	// PR list fails on first call.
 	mc.listOpenPRsErr = fmt.Errorf("transient PR list failure")
+	var issueListCalls atomic.Int32
+	mc.listOpenIssuesFn = func(context.Context, string, string) ([]*gh.Issue, error) {
+		issueListCalls.Add(1)
+		return nil, nil
+	}
 
 	syncer := NewSyncer(
 		map[string]Client{"github.com": mc},
@@ -11243,6 +11445,8 @@ func TestSyncerMRListFailureMarksRepoFailed(t *testing.T) {
 
 	// Cycle 1: PR list fails → failMR set, issues unaffected.
 	syncer.RunOnce(ctx)
+	assert.Zero(int(issueListCalls.Load()),
+		"a non-disabled PR list failure must abort before issue sync")
 
 	mr, err := d.GetMergeRequest(ctx, "github", "github.com", "owner", "repo", 1)
 	require.NoError(err)
@@ -12821,6 +13025,42 @@ func TestSyncRepoGraphQLIssuesCommentsIncomplete(t *testing.T) {
 	assert.Equal("REST comment", events[0].Body)
 }
 
+func TestSyncRepoGraphQLIssuesStopsAfterWrappedRawDisabledFallback(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	ctx := t.Context()
+	database := openTestDB(t)
+	repo := RepoRef{
+		Platform: platform.KindGitHub, PlatformHost: "github.com",
+		Owner: "owner", Name: "repo",
+	}
+	repoID, err := database.UpsertRepo(ctx, platform.DBRepoIdentity(platformRepoRef(repo)))
+	require.NoError(err)
+	now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
+	rawDisabledErr := fmt.Errorf("list issue comments: %w", &gh.ErrorResponse{
+		Response: &http.Response{StatusCode: http.StatusGone},
+		Message:  "Issues are disabled for this repo",
+	})
+	client := &mockClient{
+		listIssueCommentsFn: func(context.Context, string, string, int) ([]*gh.IssueComment, error) {
+			return nil, rawDisabledErr
+		},
+	}
+	syncer := NewSyncer(
+		map[string]Client{"github.com": client}, database, nil,
+		[]RepoRef{repo}, time.Minute, nil, nil,
+	)
+	result := &RepoBulkResult{Issues: []BulkIssue{
+		{Issue: buildOpenIssue(1, now), CommentsComplete: false},
+		{Issue: buildOpenIssue(2, now), CommentsComplete: false},
+	}}
+
+	err = syncer.doSyncRepoGraphQLIssues(ctx, repo, repoID, result)
+
+	require.ErrorIs(err, platform.ErrRepositoryFeatureDisabled)
+	assert.Equal(int32(1), client.listIssueCommentsCalled.Load())
+}
+
 func TestSyncRepoGraphQLIssuesClosureDetection(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
@@ -13692,7 +13932,7 @@ func TestDeferredCommentRefreshYieldsBudgetToDetailDrain(t *testing.T) {
 	d := openTestDB(t)
 
 	now := time.Date(2026, 4, 20, 12, 0, 0, 0, time.UTC)
-	budget := testBudget(14)
+	budget := testBudget(23)
 	repoID, err := d.UpsertRepo(ctx, db.GitHubRepoIdentity("github.com", "owner", "repo"))
 	require.NoError(err)
 	repo := RepoRef{Owner: "owner", Name: "repo", PlatformHost: "github.com"}

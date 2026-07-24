@@ -69,11 +69,39 @@ const (
 	lookupInaccessible lookupOutcome = "inaccessible"
 )
 
+func githubRepositoryFeatureDisabled(host, capability string, err error) error {
+	var responseErr *gh.ErrorResponse
+	if !errors.As(err, &responseErr) || responseErr.Response == nil ||
+		responseErr.Response.StatusCode != http.StatusGone {
+		return nil
+	}
+
+	message := strings.ToLower(responseErr.Message)
+	var phrase string
+	switch capability {
+	case platform.RepositoryFeatureIssues:
+		phrase = "issues are disabled"
+	case platform.RepositoryFeatureMergeRequests:
+		phrase = "pull requests are disabled"
+	default:
+		return nil
+	}
+	if !strings.Contains(message, phrase) {
+		return nil
+	}
+	return platform.RepositoryFeatureDisabled(platform.KindGitHub, host, capability, err)
+}
+
 func (p *gitHubClientProvider) classifyIssueLookup(
 	ctx context.Context,
 	ref platform.RepoRef,
 	err error,
 ) (lookupOutcome, *platform.RepoRef, error) {
+	if disabledErr := githubRepositoryFeatureDisabled(
+		p.host, platform.RepositoryFeatureIssues, err,
+	); disabledErr != nil {
+		return "", nil, disabledErr
+	}
 	mapped := p.archiveTransportError(platform.ArchiveCapabilityHistoricalIssues, err)
 	if errors.Is(mapped, platform.ErrRateLimited) {
 		return "", nil, mapped
@@ -99,6 +127,11 @@ func (p *gitHubClientProvider) classifyMergeRequestLookup(
 	ref platform.RepoRef,
 	err error,
 ) (lookupOutcome, *platform.RepoRef, error) {
+	if disabledErr := githubRepositoryFeatureDisabled(
+		p.host, platform.RepositoryFeatureMergeRequests, err,
+	); disabledErr != nil {
+		return "", nil, disabledErr
+	}
 	mapped := p.archiveTransportError(platform.ArchiveCapabilityHistoricalMergeRequests, err)
 	if errors.Is(mapped, platform.ErrRateLimited) {
 		return "", nil, mapped
@@ -756,6 +789,20 @@ func (p *gitHubClientProvider) archiveRepositoryProbeError(err error) error {
 func (p *gitHubClientProvider) archiveTransportError(capability platform.ArchiveCapability, err error) error {
 	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return err
+	}
+	switch capability {
+	case platform.ArchiveCapabilityHistoricalIssues:
+		if disabled := githubRepositoryFeatureDisabled(
+			p.host, platform.RepositoryFeatureIssues, err,
+		); disabled != nil {
+			return disabled
+		}
+	case platform.ArchiveCapabilityHistoricalMergeRequests:
+		if disabled := githubRepositoryFeatureDisabled(
+			p.host, platform.RepositoryFeatureMergeRequests, err,
+		); disabled != nil {
+			return disabled
+		}
 	}
 	var existing *platform.Error
 	if errors.As(err, &existing) {

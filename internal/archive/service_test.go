@@ -622,6 +622,27 @@ func TestArchiveBudgetDeferralDoesNotIncrementAttempts(t *testing.T) {
 	assert.Empty(provider.calls)
 }
 
+func TestArchiveInventoryAdmissionReservesProviderConfirmationAttempts(t *testing.T) {
+	require := require.New(t)
+	database := dbtest.Open(t)
+	now := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
+	ref := archiveServiceRef(platform.KindGitLab, "gitlab.test", "repo")
+	archiveServiceSeedRepo(t, database, ref)
+	provider := newArchiveServiceProvider(ref.Platform, ref.Host)
+	registry, err := platform.NewRegistry(provider)
+	require.NoError(err)
+	admission := &archiveTestAdmission{}
+	service := newArchiveTestService(t, database, registry, []platform.RepoRef{ref}, admission, now)
+	require.NoError(service.EnsureConfigured(t.Context(), []platform.RepoRef{ref}))
+	_, err = service.Start(t.Context(), []platform.RepoRef{ref})
+	require.NoError(err)
+
+	require.NoError(service.RunEligible(t.Context()))
+
+	require.NotEmpty(admission.costs)
+	assert.Equal(t, 4, admission.costs[0])
+}
+
 func TestArchivePausePreventsFutureProviderReads(t *testing.T) {
 	require := require.New(t)
 	database := dbtest.Open(t)
@@ -654,8 +675,8 @@ func (archiveTestSource) SyncArchiveItem(
 	platform.RepoRef,
 	db.ArchiveItemType,
 	int,
-) error {
-	return nil
+) (bool, error) {
+	return true, nil
 }
 
 type archiveMutableSource struct{ refs []platform.RepoRef }
@@ -679,7 +700,12 @@ func (archiveTestRetryClassifier) Classify(error, int, time.Time) RetryDecision 
 	return RetryDecision{Code: db.ArchiveErrorCodeTransient}
 }
 
-func (a *archiveTestAdmission) Admit(ctx context.Context, _ platform.RepoRef, cost int) (AdmissionResult, error) {
+func (a *archiveTestAdmission) Admit(
+	ctx context.Context,
+	_ platform.RepoRef,
+	_ db.ArchiveItemType,
+	cost int,
+) (AdmissionResult, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.calls++
@@ -687,7 +713,13 @@ func (a *archiveTestAdmission) Admit(ctx context.Context, _ platform.RepoRef, co
 	if a.deny || a.denyAfter > 0 && a.calls > a.denyAfter {
 		return AdmissionResult{RetryAt: &a.retryAt, Detail: "test budget exhausted"}, nil
 	}
-	return AdmissionResult{Allowed: true, Context: ctx}, nil
+	return AdmissionResult{
+		Allowed: true,
+		Context: ctx,
+		Complete: func(error, bool) *FeatureDeferral {
+			return nil
+		},
+	}, nil
 }
 
 type archiveServiceProvider struct {

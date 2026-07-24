@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"go.kenn.io/middleman/internal/db"
+	"go.kenn.io/middleman/internal/platform"
 )
 
 type WorkPriority int
@@ -52,6 +53,19 @@ func (s *Scheduler) Run(ctx context.Context, groups map[string][]resolvedReposit
 
 var errAdmissionDeferred = errors.New("archive request deferred by admission")
 
+type featureDeferredError struct {
+	FeatureDeferral
+	providerAttempted bool
+}
+
+func (e *featureDeferredError) Error() string { return e.Detail }
+func (e *featureDeferredError) Unwrap() error { return errAdmissionDeferred }
+
+func featureDeferredBeforeProvider(err error) bool {
+	var deferred *featureDeferredError
+	return errors.As(err, &deferred) && deferred != nil && !deferred.providerAttempted
+}
+
 func (s *Service) RunEligible(ctx context.Context) error {
 	if s.configured == nil {
 		return errors.New("run eligible archives: configured repository source is required")
@@ -93,10 +107,17 @@ func (s *Service) runProviderHostWork(ctx context.Context, repos []resolvedRepos
 			continue
 		}
 		if archiveScanNotStarted(state.IssueInventory) {
-			return s.swallowAdmissionDeferred(s.inventoryPage(ctx, repo, state, db.ArchiveItemTypeIssue))
+			err := s.inventoryPage(ctx, repo, state, db.ArchiveItemTypeIssue)
+			if !featureDeferredBeforeProvider(err) {
+				return s.swallowAdmissionDeferred(err)
+			}
 		}
 		if archiveScanNotStarted(state.MergeRequestInventory) {
-			return s.swallowAdmissionDeferred(s.inventoryPage(ctx, repo, state, db.ArchiveItemTypeMergeRequest))
+			err := s.inventoryPage(ctx, repo, state, db.ArchiveItemTypeMergeRequest)
+			if featureDeferredBeforeProvider(err) {
+				continue
+			}
+			return s.swallowAdmissionDeferred(err)
 		}
 	}
 
@@ -114,7 +135,11 @@ func (s *Service) runProviderHostWork(ctx context.Context, repos []resolvedRepos
 			state.OperatorState == db.ArchiveOperatorStateActive &&
 			state.PromptScanStartedAt != nil && !archiveRepoDeferred(state, s.now()) &&
 			maintenanceBoundaryActionable(state) {
-			return s.swallowAdmissionDeferred(s.promptMaintenance(ctx, repo, state))
+			err := s.promptMaintenance(ctx, repo, state)
+			if featureDeferredBeforeProvider(err) {
+				continue
+			}
+			return s.swallowAdmissionDeferred(err)
 		}
 	}
 
@@ -126,17 +151,14 @@ func (s *Service) runProviderHostWork(ctx context.Context, repos []resolvedRepos
 			fullIDs = append(fullIDs, repo.ID)
 		}
 	}
-	item, err := s.db.ClaimArchiveItem(ctx, db.ClaimArchiveItemOpts{RepoIDs: fullIDs, Now: s.now()})
-	if err != nil {
+	if handled, err := s.runNextHydrationWork(ctx, repos, fullIDs); handled || err != nil {
 		return err
 	}
-	if item != nil {
-		repo := resolvedRepoByID(repos, item.RepoID)
-		return s.swallowAdmissionDeferred(s.hydrateItem(ctx, repo, *item))
-	}
 
-	if repo, state, itemType, ok := nextInventoryWork(repos, stateByID, db.ArchiveCollectionModeFull, s.now()); ok {
-		return s.swallowAdmissionDeferred(s.inventoryPage(ctx, repo, state, itemType))
+	if handled, err := s.runNextInventoryWork(
+		ctx, repos, stateByID, db.ArchiveCollectionModeFull,
+	); handled || err != nil {
+		return err
 	}
 	for _, repo := range repos {
 		state := stateByID[repo.ID]
@@ -145,13 +167,75 @@ func (s *Service) runProviderHostWork(ctx context.Context, repos []resolvedRepos
 			continue
 		}
 		if promptMaintenanceDue(state, s.now(), s.maintenanceInterval) && maintenanceBoundaryActionable(state) {
-			return s.swallowAdmissionDeferred(s.promptMaintenance(ctx, repo, state))
+			err := s.promptMaintenance(ctx, repo, state)
+			if featureDeferredBeforeProvider(err) {
+				continue
+			}
+			return s.swallowAdmissionDeferred(err)
 		}
 	}
-	if repo, state, itemType, ok := nextInventoryWork(repos, stateByID, db.ArchiveCollectionModeDiscovery, s.now()); ok {
-		return s.swallowAdmissionDeferred(s.inventoryPage(ctx, repo, state, itemType))
+	if handled, err := s.runNextInventoryWork(
+		ctx, repos, stateByID, db.ArchiveCollectionModeDiscovery,
+	); handled || err != nil {
+		return err
 	}
 	return nil
+}
+
+type archiveInventoryScope struct {
+	repoID   int64
+	itemType db.ArchiveItemType
+}
+
+func (s *Service) runNextHydrationWork(
+	ctx context.Context,
+	repos []resolvedRepository,
+	repoIDs []int64,
+) (bool, error) {
+	var excluded []db.ArchiveItemScope
+	for {
+		item, err := s.db.ClaimArchiveItem(ctx, db.ClaimArchiveItemOpts{
+			RepoIDs: repoIDs, Now: s.now(), ExcludedScopes: excluded,
+		})
+		if err != nil {
+			return false, err
+		}
+		if item == nil {
+			return false, nil
+		}
+		repo := resolvedRepoByID(repos, item.RepoID)
+		err = s.hydrateItem(ctx, repo, *item)
+		if featureDeferredBeforeProvider(err) {
+			excluded = append(excluded, db.ArchiveItemScope{
+				RepoID: item.RepoID, ItemType: item.ItemType,
+			})
+			continue
+		}
+		return true, s.swallowAdmissionDeferred(err)
+	}
+}
+
+func (s *Service) runNextInventoryWork(
+	ctx context.Context,
+	repos []resolvedRepository,
+	states map[int64]db.ArchiveRepoState,
+	mode db.ArchiveCollectionMode,
+) (bool, error) {
+	skipped := make(map[archiveInventoryScope]struct{})
+	for {
+		repo, state, itemType, ok := nextInventoryWork(
+			repos, states, mode, s.now(), skipped,
+		)
+		if !ok {
+			return false, nil
+		}
+		err := s.inventoryPage(ctx, repo, state, itemType)
+		if featureDeferredBeforeProvider(err) {
+			skipped[archiveInventoryScope{repoID: repo.ID, itemType: itemType}] = struct{}{}
+			continue
+		}
+		return true, s.swallowAdmissionDeferred(err)
+	}
 }
 
 func (s *Service) swallowAdmissionDeferred(err error) error {
@@ -190,16 +274,22 @@ func maintenanceBoundaryActionable(state db.ArchiveRepoState) bool {
 	return state.MaintenanceIssues.Complete() && state.MaintenanceMergeRequests.Complete()
 }
 
-func nextInventoryWork(repos []resolvedRepository, states map[int64]db.ArchiveRepoState, mode db.ArchiveCollectionMode, now time.Time) (resolvedRepository, db.ArchiveRepoState, db.ArchiveItemType, bool) {
+func nextInventoryWork(
+	repos []resolvedRepository,
+	states map[int64]db.ArchiveRepoState,
+	mode db.ArchiveCollectionMode,
+	now time.Time,
+	skipped map[archiveInventoryScope]struct{},
+) (resolvedRepository, db.ArchiveRepoState, db.ArchiveItemType, bool) {
 	for _, repo := range repos {
 		state := states[repo.ID]
 		if state.CollectionMode != mode || state.OperatorState != db.ArchiveOperatorStateActive || archiveRepoDeferred(state, now) {
 			continue
 		}
-		if archiveScanEligible(state.IssueInventory) {
+		if _, skip := skipped[archiveInventoryScope{repoID: repo.ID, itemType: db.ArchiveItemTypeIssue}]; !skip && archiveScanEligible(state.IssueInventory) {
 			return repo, state, db.ArchiveItemTypeIssue, true
 		}
-		if archiveScanEligible(state.MergeRequestInventory) {
+		if _, skip := skipped[archiveInventoryScope{repoID: repo.ID, itemType: db.ArchiveItemTypeMergeRequest}]; !skip && archiveScanEligible(state.MergeRequestInventory) {
 			return repo, state, db.ArchiveItemTypeMergeRequest, true
 		}
 	}
@@ -229,17 +319,21 @@ func resolvedRepoByID(repos []resolvedRepository, repoID int64) resolvedReposito
 func (s *Service) admit(
 	ctx context.Context,
 	repo resolvedRepository,
+	itemType db.ArchiveItemType,
 	cost int,
-) (context.Context, func(), error) {
+) (context.Context, AdmissionComplete, error) {
 	if err := s.db.ClearArchiveRepositoryError(ctx, repo.ID, s.now()); err != nil {
 		return nil, nil, err
 	}
 	if s.admission == nil {
-		return ctx, func() {}, nil
+		return ctx, func(error, bool) *FeatureDeferral { return nil }, nil
 	}
-	result, err := s.admission.Admit(ctx, repo.Ref, cost)
+	result, err := s.admission.Admit(ctx, repo.Ref, itemType, cost)
 	if err != nil {
 		return nil, nil, err
+	}
+	if result.FeatureDeferred != nil {
+		return nil, nil, &featureDeferredError{FeatureDeferral: *result.FeatureDeferred}
 	}
 	if !result.Allowed {
 		if result.RetryAt == nil {
@@ -254,11 +348,11 @@ func (s *Service) admit(
 	if result.Context != nil {
 		requestCtx = result.Context
 	}
-	release := result.Release
-	if release == nil {
-		release = func() {}
+	complete := result.Complete
+	if complete == nil {
+		complete = func(error, bool) *FeatureDeferral { return nil }
 	}
-	return requestCtx, release, nil
+	return requestCtx, complete, nil
 }
 
 type fixedClock struct{ value time.Time }
@@ -273,6 +367,14 @@ func (c fixedClock) Now() time.Time { return c.value }
 // ceiling and the live floor it protects.
 func archiveAttemptCost(logical int) int {
 	return logical * 2
+}
+
+func archiveFeatureReadAttemptCost(kind platform.Kind) int {
+	logicalRequests := 1
+	if kind != platform.KindGitHub {
+		logicalRequests++ // repository metadata confirmation after a candidate feature error
+	}
+	return archiveAttemptCost(logicalRequests)
 }
 
 // archivePreempted reports whether a provider read failed because live

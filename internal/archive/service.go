@@ -21,19 +21,29 @@ type ConfiguredRepositorySource interface {
 // grow a second provider read/normalize/persist pipeline.
 type ItemSyncer interface {
 	ArchiveItemSyncCost(platform.Kind, db.ArchiveItemType) int
-	SyncArchiveItem(context.Context, platform.RepoRef, db.ArchiveItemType, int) error
+	SyncArchiveItem(
+		context.Context, platform.RepoRef, db.ArchiveItemType, int,
+	) (providerAttempted bool, err error)
 }
 
 type AdmissionResult struct {
-	Allowed bool
-	RetryAt *time.Time
-	Context context.Context
-	Release func()
+	Allowed         bool
+	RetryAt         *time.Time
+	Context         context.Context
+	FeatureDeferred *FeatureDeferral
+	Complete        AdmissionComplete
+	Detail          string
+}
+
+type AdmissionComplete func(cause error, providerAttempted bool) *FeatureDeferral
+
+type FeatureDeferral struct {
+	RetryAt time.Time
 	Detail  string
 }
 
 type Admission interface {
-	Admit(context.Context, platform.RepoRef, int) (AdmissionResult, error)
+	Admit(context.Context, platform.RepoRef, db.ArchiveItemType, int) (AdmissionResult, error)
 }
 
 type RetryDecision struct {

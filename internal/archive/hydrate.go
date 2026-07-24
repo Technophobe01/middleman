@@ -20,17 +20,23 @@ func (s *Service) hydrateItem(
 	if s.items == nil {
 		return errors.New("archive item syncer is required")
 	}
-	requestCtx, release, err := s.admit(
-		ctx, repo, s.items.ArchiveItemSyncCost(repo.Ref.Platform, work.ItemType),
+	requestCtx, complete, err := s.admit(
+		ctx, repo, work.ItemType,
+		s.items.ArchiveItemSyncCost(repo.Ref.Platform, work.ItemType),
 	)
 	if err != nil {
 		return err
 	}
-	syncErr := s.items.SyncArchiveItem(requestCtx, repo.Ref, work.ItemType, work.ItemNumber)
+	providerAttempted, syncErr := s.items.SyncArchiveItem(
+		requestCtx, repo.Ref, work.ItemType, work.ItemNumber,
+	)
 	preempted := archivePreempted(ctx, requestCtx)
-	release()
+	deferred := complete(syncErr, providerAttempted)
 	if preempted {
 		return errAdmissionDeferred
+	}
+	if deferred != nil {
+		return &featureDeferredError{FeatureDeferral: *deferred, providerAttempted: true}
 	}
 	commit := db.ArchiveItemSyncCommit{
 		RepoID: work.RepoID, ItemType: work.ItemType, ItemNumber: work.ItemNumber,

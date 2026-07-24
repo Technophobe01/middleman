@@ -2,11 +2,15 @@ package github
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"net/http"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	gh "github.com/google/go-github/v88/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -28,6 +32,43 @@ type archiveLifecycleRecorder struct {
 }
 
 type archiveWorkerProvider struct{ ref platform.RepoRef }
+
+type archiveLifecycleClock struct{ now func() time.Time }
+
+func (c archiveLifecycleClock) Now() time.Time { return c.now() }
+
+type archivePageMockClient struct {
+	*mockClient
+	listInventoryIssuesPageFn func(
+		context.Context, string, string, string, string, string,
+	) ([]*gh.Issue, string, bool, error)
+	listInventoryPullRequestsPageFn func(
+		context.Context, string, string, string, int,
+	) ([]*gh.PullRequest, bool, error)
+}
+
+func (m *archivePageMockClient) ListInventoryIssuesPage(
+	ctx context.Context,
+	owner string,
+	repo string,
+	sortBy string,
+	cursor string,
+	since string,
+) ([]*gh.Issue, string, bool, error) {
+	m.trackCall()
+	return m.listInventoryIssuesPageFn(ctx, owner, repo, sortBy, cursor, since)
+}
+
+func (m *archivePageMockClient) ListInventoryPullRequestsPage(
+	ctx context.Context,
+	owner string,
+	repo string,
+	sortBy string,
+	page int,
+) ([]*gh.PullRequest, bool, error) {
+	m.trackCall()
+	return m.listInventoryPullRequestsPageFn(ctx, owner, repo, sortBy, page)
+}
 
 type priorityWorkOperation string
 
@@ -272,6 +313,233 @@ func TestArchivePreemptedItemRecordsNoFailureAndCompletesOnNextPass(t *testing.T
 	assert.NotNil(lookup.CompletedAt)
 }
 
+func TestArchiveDisabledIssueInventorySharesCooldownWithoutBlockingMergeRequests(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	database := dbtest.Open(t)
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	ref := platform.RepoRef{
+		Platform: platform.KindGitHub, Host: "github.com",
+		Owner: "acme", Name: "widget", RepoPath: "acme/widget",
+	}
+	rawDisabled := fmt.Errorf("list archive issues: %w", &gh.ErrorResponse{
+		Response: &http.Response{StatusCode: http.StatusGone},
+		Message:  "Issues are disabled for this repo",
+	})
+	var issueCalls atomic.Int32
+	var mergeRequestCalls atomic.Int32
+	client := &archivePageMockClient{
+		mockClient: &mockClient{},
+		listInventoryIssuesPageFn: func(
+			context.Context, string, string, string, string, string,
+		) ([]*gh.Issue, string, bool, error) {
+			issueCalls.Add(1)
+			return nil, "", false, rawDisabled
+		},
+		listInventoryPullRequestsPageFn: func(
+			context.Context, string, string, string, int,
+		) ([]*gh.PullRequest, bool, error) {
+			mergeRequestCalls.Add(1)
+			return nil, false, nil
+		},
+	}
+	tracker := NewPlatformRateTracker(database, "github", "github.com", "rest")
+	tracker.UpdateFromRate(Rate{
+		Limit: 5000, Remaining: 4999, Reset: now.Add(time.Minute),
+	})
+	syncer := NewSyncer(
+		map[string]Client{"github.com": client}, database, nil,
+		[]RepoRef{{
+			Platform: platform.KindGitHub, PlatformHost: "github.com",
+			Owner: "acme", Name: "widget",
+		}},
+		time.Hour, map[string]*RateTracker{"github.com": tracker}, testBudget(5000),
+	)
+	syncer.now = func() time.Time { return now }
+	clock := archiveLifecycleClock{now: func() time.Time { return now }}
+	service, err := archive.NewService(
+		database, syncer.clients, syncer, syncer, nil, clock,
+	)
+	require.NoError(err)
+	require.NoError(service.EnsureConfigured(t.Context(), []platform.RepoRef{ref}))
+	_, err = service.Start(t.Context(), []platform.RepoRef{ref})
+	require.NoError(err)
+
+	require.NoError(service.RunEligible(t.Context()))
+	require.NoError(service.RunEligible(t.Context()))
+	require.NoError(service.RunEligible(t.Context()))
+
+	assert.Equal(int32(1), issueCalls.Load())
+	assert.Equal(int32(1), mergeRequestCalls.Load())
+	repo, err := database.GetRepoByIdentity(t.Context(), platform.DBRepoIdentity(ref))
+	require.NoError(err)
+	require.NotNil(repo)
+	states, err := database.ListArchiveRepoStates(t.Context(), []int64{repo.ID})
+	require.NoError(err)
+	require.Len(states, 1)
+	assert.False(states[0].IssueInventory.Complete())
+	assert.True(states[0].MergeRequestInventory.Complete())
+
+	now = now.Add(repositoryFeatureProbeInterval)
+	tracker.UpdateFromRate(Rate{
+		Limit: 5000, Remaining: 4999, Reset: now.Add(time.Minute),
+	})
+	require.NoError(service.RunEligible(t.Context()))
+	assert.Equal(int32(2), issueCalls.Load())
+}
+
+type disabledArchiveHydrationFixture struct {
+	database       *db.DB
+	now            time.Time
+	ref            platform.RepoRef
+	item           *gh.Issue
+	disabled       atomic.Bool
+	hydrationCalls atomic.Int32
+	client         *archivePageMockClient
+	tracker        *RateTracker
+	syncer         *Syncer
+	service        *archive.Service
+}
+
+func newDisabledArchiveHydrationFixture(t *testing.T) *disabledArchiveHydrationFixture {
+	t.Helper()
+	require := require.New(t)
+	fixture := &disabledArchiveHydrationFixture{
+		database: dbtest.Open(t),
+		now:      time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC),
+		ref: platform.RepoRef{
+			Platform: platform.KindGitHub, Host: "github.com",
+			Owner: "acme", Name: "widget", RepoPath: "acme/widget",
+		},
+	}
+	fixture.disabled.Store(true)
+	fixture.item = buildOpenIssue(7, fixture.now)
+	state := "closed"
+	fixture.item.State = &state
+	rawDisabled := fmt.Errorf("get archive issue: %w", &gh.ErrorResponse{
+		Response: &http.Response{StatusCode: http.StatusGone},
+		Message:  "Issues are disabled for this repo",
+	})
+	fixture.client = &archivePageMockClient{
+		mockClient: &mockClient{
+			getIssueFn: func(context.Context, string, string, int) (*gh.Issue, error) {
+				fixture.hydrationCalls.Add(1)
+				if fixture.disabled.Load() {
+					return nil, rawDisabled
+				}
+				return fixture.item, nil
+			},
+		},
+		listInventoryIssuesPageFn: func(
+			context.Context, string, string, string, string, string,
+		) ([]*gh.Issue, string, bool, error) {
+			return []*gh.Issue{fixture.item}, "", true, nil
+		},
+		listInventoryPullRequestsPageFn: func(
+			context.Context, string, string, string, int,
+		) ([]*gh.PullRequest, bool, error) {
+			return nil, false, nil
+		},
+	}
+	fixture.tracker = NewPlatformRateTracker(
+		fixture.database, "github", "github.com", "rest",
+	)
+	fixture.tracker.UpdateFromRate(Rate{
+		Limit: 5000, Remaining: 4999, Reset: fixture.now.Add(time.Minute),
+	})
+	fixture.syncer = NewSyncer(
+		map[string]Client{"github.com": fixture.client}, fixture.database, nil,
+		[]RepoRef{{
+			Platform: platform.KindGitHub, PlatformHost: "github.com",
+			Owner: "acme", Name: "widget",
+		}},
+		time.Hour,
+		map[string]*RateTracker{"github.com": fixture.tracker},
+		testBudget(5000),
+	)
+	fixture.syncer.now = func() time.Time { return fixture.now }
+	clock := archiveLifecycleClock{now: func() time.Time { return fixture.now }}
+	var err error
+	fixture.service, err = archive.NewService(
+		fixture.database, fixture.syncer.clients,
+		fixture.syncer, fixture.syncer, nil, clock,
+	)
+	require.NoError(err)
+	require.NoError(fixture.service.EnsureConfigured(t.Context(), []platform.RepoRef{fixture.ref}))
+	_, err = fixture.service.Start(t.Context(), []platform.RepoRef{fixture.ref})
+	require.NoError(err)
+	for range 3 {
+		require.NoError(fixture.service.RunEligible(t.Context()))
+	}
+	return fixture
+}
+
+func (f *disabledArchiveHydrationFixture) progress(t *testing.T) db.ArchiveDatasetProgress {
+	t.Helper()
+	require := require.New(t)
+	repo, err := f.database.GetRepoByIdentity(t.Context(), platform.DBRepoIdentity(f.ref))
+	require.NoError(err)
+	require.NotNil(repo)
+	progress, err := f.database.GetDatasetProgress(
+		t.Context(), repo.ID, db.ArchiveItemTypeIssue, 7, db.ArchiveDatasetLookup,
+	)
+	require.NoError(err)
+	return progress
+}
+
+func TestArchiveDisabledIssueHydrationRecoversImmediatelyAfterRestart(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	fixture := newDisabledArchiveHydrationFixture(t)
+	progress := fixture.progress(t)
+	assert.Equal(db.ArchiveDatasetProgressPending, progress.Status)
+	assert.Zero(progress.AttemptCount)
+	assert.Nil(progress.NextRetryAt)
+	assert.Equal(int32(1), fixture.hydrationCalls.Load())
+
+	fixture.disabled.Store(false)
+	fixture.now = fixture.now.Add(time.Minute)
+	restartedTracker := NewPlatformRateTracker(
+		fixture.database, "github", "github.com", "rest",
+	)
+	restartedTracker.UpdateFromRate(Rate{
+		Limit: 5000, Remaining: 4999, Reset: fixture.now.Add(time.Minute),
+	})
+	restarted := NewSyncer(
+		map[string]Client{"github.com": fixture.client}, fixture.database, nil,
+		[]RepoRef{{
+			Platform: platform.KindGitHub, PlatformHost: "github.com",
+			Owner: "acme", Name: "widget",
+		}},
+		time.Hour,
+		map[string]*RateTracker{"github.com": restartedTracker},
+		testBudget(5000),
+	)
+	restarted.now = func() time.Time { return fixture.now }
+	service, err := archive.NewService(
+		fixture.database, restarted.clients, restarted, restarted, nil,
+		archiveLifecycleClock{now: func() time.Time { return fixture.now }},
+	)
+	require.NoError(err)
+	require.NoError(service.RunEligible(t.Context()))
+	assert.Equal(db.ArchiveDatasetProgressComplete, fixture.progress(t).Status)
+	assert.Equal(int32(2), fixture.hydrationCalls.Load())
+}
+
+func TestArchiveDisabledIssueHydrationRecoversAfterManualProbe(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	fixture := newDisabledArchiveHydrationFixture(t)
+	fixture.disabled.Store(false)
+
+	require.NoError(fixture.syncer.SyncRepoOnProvider(
+		t.Context(), platform.KindGitHub, "github.com", "acme", "widget",
+	))
+	require.NoError(fixture.service.RunEligible(t.Context()))
+	assert.Equal(db.ArchiveDatasetProgressComplete, fixture.progress(t).Status)
+	assert.Equal(int32(2), fixture.hydrationCalls.Load())
+}
+
 func (*archiveLifecycleRecorder) RunEligible(context.Context) error { return nil }
 
 func (r *archiveLifecycleRecorder) EnsureConfigured(_ context.Context, refs []platform.RepoRef) error {
@@ -408,14 +676,14 @@ func TestArchiveAdmissionSharesSyncBudgetAndProviderReserve(t *testing.T) {
 	syncer.now = func() time.Time { return now }
 	ref := platform.RepoRef{Platform: platform.KindGitHub, Host: "github.test", Owner: "acme", Name: "widget"}
 
-	allowed, err := syncer.Admit(t.Context(), ref, 1)
+	allowed, err := syncer.Admit(t.Context(), ref, db.ArchiveItemTypeIssue, 1)
 	require.NoError(err)
 	require.True(allowed.Allowed)
 	assert.True(IsSyncBudgetContext(allowed.Context))
 	assert.True(IsArchiveSyncBudgetContext(allowed.Context))
 
 	budget.Spend(archiveLiveFloor(ref.Platform) + 87)
-	denied, err := syncer.Admit(t.Context(), ref, 1)
+	denied, err := syncer.Admit(t.Context(), ref, db.ArchiveItemTypeIssue, 1)
 	require.NoError(err)
 	assert.False(denied.Allowed)
 	require.NotNil(denied.RetryAt)
@@ -430,13 +698,13 @@ func TestArchiveAdmissionSharesSyncBudgetAndProviderReserve(t *testing.T) {
 	reserveKey := RateBucketKey("github", reserveRef.Host)
 	syncer.rateTrackers[reserveKey] = reserveTracker
 	syncer.budgets[reserveKey] = NewSyncBudget(100)
-	denied, err = syncer.Admit(t.Context(), reserveRef, 1)
+	denied, err = syncer.Admit(t.Context(), reserveRef, db.ArchiveItemTypeIssue, 1)
 	require.NoError(err)
 	assert.False(denied.Allowed)
 	assert.Contains(denied.Detail, "reserve")
 
 	syncer.running.Store(true)
-	denied, err = syncer.Admit(t.Context(), ref, 1)
+	denied, err = syncer.Admit(t.Context(), ref, db.ArchiveItemTypeIssue, 1)
 	require.NoError(err)
 	assert.False(denied.Allowed)
 	assert.Contains(denied.Detail, "normal sync")
@@ -458,10 +726,10 @@ func TestArchiveAdmissionAttemptAllowanceUsesAvailableSurplus(t *testing.T) {
 	syncer.now = func() time.Time { return now }
 	ref := platform.RepoRef{Platform: platform.KindGitHub, Host: "github.test", Owner: "acme", Name: "widget"}
 
-	admission, err := syncer.Admit(t.Context(), ref, 1)
+	admission, err := syncer.Admit(t.Context(), ref, db.ArchiveItemTypeIssue, 1)
 	require.NoError(err)
 	require.True(admission.Allowed)
-	t.Cleanup(admission.Release)
+	t.Cleanup(func() { admission.Complete(nil, true) })
 	for range PRDetailWorstCase {
 		assert.True(ConsumeArchiveAttemptAllowance(admission.Context))
 	}
@@ -494,7 +762,9 @@ func TestArchiveAdmissionPreservesProviderReserveForDeclaredCost(t *testing.T) {
 	syncer.now = func() time.Time { return now }
 	ref := platform.RepoRef{Platform: platform.KindGitHub, Host: "github.test", Owner: "acme", Name: "widget"}
 
-	denied, err := syncer.Admit(t.Context(), ref, retryHeadroomCost)
+	denied, err := syncer.Admit(
+		t.Context(), ref, db.ArchiveItemTypeIssue, retryHeadroomCost,
+	)
 	require.NoError(err)
 	assert.False(denied.Allowed)
 	assert.Contains(denied.Detail, "reserve")
@@ -518,7 +788,7 @@ func TestArchiveRampDenialRetriesWithinCurrentWindow(t *testing.T) {
 	syncer.now = func() time.Time { return now }
 	ref := platform.RepoRef{Platform: platform.KindGitHub, Host: "github.test", Owner: "acme", Name: "widget"}
 
-	denied, err := syncer.Admit(t.Context(), ref, 1)
+	denied, err := syncer.Admit(t.Context(), ref, db.ArchiveItemTypeIssue, 1)
 	require.NoError(err)
 	assert.False(denied.Allowed)
 	require.NotNil(denied.RetryAt)
@@ -547,16 +817,111 @@ func TestArchiveAdmissionDefersToNotificationAndActiveDetailWork(t *testing.T) {
 		archive.PriorityActiveDetail,
 	} {
 		release := syncer.beginProviderWork(key, priority)
-		denied, err := syncer.Admit(t.Context(), ref, 1)
+		denied, err := syncer.Admit(t.Context(), ref, db.ArchiveItemTypeIssue, 1)
 		require.NoError(err)
 		assert.False(denied.Allowed)
 		assert.Contains(denied.Detail, "higher-priority sync work is active")
 		release()
 	}
 
-	allowed, err := syncer.Admit(t.Context(), ref, 1)
+	allowed, err := syncer.Admit(t.Context(), ref, db.ArchiveItemTypeIssue, 1)
 	require.NoError(err)
 	assert.True(allowed.Allowed)
+}
+
+func TestArchiveAdmissionDenialAbandonsExpiredFeatureProbeReservation(t *testing.T) {
+	require := require.New(t)
+	database := dbtest.Open(t)
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	key := RateBucketKey("github", "github.test")
+	syncer := NewSyncerWithRegistry(
+		nil, database, nil, nil, time.Hour,
+		nil, map[string]*SyncBudget{key: NewSyncBudget(100)},
+	)
+	syncer.now = func() time.Time { return now }
+	ref := platform.RepoRef{
+		Platform: platform.KindGitHub, Host: "github.test", Owner: "acme", Name: "widget",
+	}
+	repo := RepoRef{
+		Platform: ref.Platform, PlatformHost: ref.Host, Owner: ref.Owner, Name: ref.Name,
+	}
+	disabledErr := platform.RepositoryFeatureDisabled(
+		platform.KindGitHub, ref.Host, platform.RepositoryFeatureIssues,
+		errors.New("repository issues disabled"),
+	)
+	require.True(syncer.recordRepositoryFeatureDisabled(
+		repo, platform.RepositoryFeatureIssues, disabledErr,
+	))
+	now = now.Add(repositoryFeatureProbeInterval)
+
+	syncer.running.Store(true)
+	denied, err := syncer.Admit(t.Context(), ref, db.ArchiveItemTypeIssue, 1)
+	require.NoError(err)
+	require.False(denied.Allowed)
+	syncer.running.Store(false)
+
+	first, due := syncer.beginRepositoryFeatureProbe(
+		t.Context(), repo, platform.RepositoryFeatureIssues,
+	)
+	require.True(due)
+	defer first.release()
+	_, due = syncer.beginRepositoryFeatureProbe(
+		t.Context(), repo, platform.RepositoryFeatureIssues,
+	)
+	require.False(due)
+}
+
+func TestArchiveCompletionWithoutProviderAttemptAbandonsExpiredFeatureProbeReservation(t *testing.T) {
+	require := require.New(t)
+	database := dbtest.Open(t)
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	key := RateBucketKey("github", "github.test")
+	tracker := NewPlatformRateTracker(database, "github", "github.test", "rest")
+	tracker.UpdateFromRate(Rate{
+		Limit: 5000, Remaining: 4999,
+		Reset: now.Add(repositoryFeatureProbeInterval + time.Minute),
+	})
+	syncer := NewSyncerWithRegistry(
+		nil, database, nil, nil, time.Hour,
+		map[string]*RateTracker{key: tracker},
+		map[string]*SyncBudget{key: NewSyncBudget(100)},
+	)
+	syncer.now = func() time.Time { return now }
+	ref := platform.RepoRef{
+		Platform: platform.KindGitHub, Host: "github.test", Owner: "acme", Name: "widget",
+	}
+	repo := RepoRef{
+		Platform: ref.Platform, PlatformHost: ref.Host, Owner: ref.Owner, Name: ref.Name,
+	}
+	require.True(syncer.recordRepositoryFeatureDisabled(
+		repo,
+		platform.RepositoryFeatureIssues,
+		platform.RepositoryFeatureDisabled(
+			platform.KindGitHub, ref.Host, platform.RepositoryFeatureIssues,
+			errors.New("repository issues disabled"),
+		),
+	))
+	now = now.Add(repositoryFeatureProbeInterval)
+
+	admission, err := syncer.Admit(t.Context(), ref, db.ArchiveItemTypeIssue, 1)
+	require.NoError(err)
+	require.True(admission.Allowed, admission.Detail)
+	providerAttempted, syncErr := syncer.SyncArchiveItem(
+		admission.Context, ref, db.ArchiveItemTypeIssue, 7,
+	)
+	require.Error(syncErr)
+	require.False(providerAttempted)
+	require.Nil(admission.Complete(syncErr, providerAttempted))
+
+	first, due := syncer.beginRepositoryFeatureProbe(
+		t.Context(), repo, platform.RepositoryFeatureIssues,
+	)
+	require.True(due)
+	defer first.release()
+	_, due = syncer.beginRepositoryFeatureProbe(
+		t.Context(), repo, platform.RepositoryFeatureIssues,
+	)
+	require.False(due)
 }
 
 func TestArchiveAdmissionLeaseSerializesProviderRequests(t *testing.T) {
@@ -577,23 +942,23 @@ func TestArchiveAdmissionLeaseSerializesProviderRequests(t *testing.T) {
 		Platform: platform.KindGitHub, Host: "github.test", Owner: "acme", Name: "widget",
 	}
 
-	first, err := syncer.Admit(t.Context(), ref, 1)
+	first, err := syncer.Admit(t.Context(), ref, db.ArchiveItemTypeIssue, 1)
 	require.NoError(err)
 	require.True(first.Allowed)
-	require.NotNil(first.Release)
+	require.NotNil(first.Complete)
 
-	second, err := syncer.Admit(t.Context(), ref, 1)
+	second, err := syncer.Admit(t.Context(), ref, db.ArchiveItemTypeIssue, 1)
 	require.NoError(err)
 	assert.False(second.Allowed)
 	assert.Contains(second.Detail, "higher-priority sync work is active")
 
-	first.Release()
-	first.Release()
-	third, err := syncer.Admit(t.Context(), ref, 1)
+	first.Complete(nil, true)
+	first.Complete(nil, true)
+	third, err := syncer.Admit(t.Context(), ref, db.ArchiveItemTypeIssue, 1)
 	require.NoError(err)
 	require.True(third.Allowed)
-	require.NotNil(third.Release)
-	third.Release()
+	require.NotNil(third.Complete)
+	third.Complete(nil, true)
 }
 
 func TestLiveProviderWorkCancelsAndWaitsForArchiveRequest(t *testing.T) {
@@ -687,7 +1052,9 @@ func TestArchiveAdmissionDefersToForegroundSyncEntryPoints(t *testing.T) {
 			case <-time.After(5 * time.Second):
 				require.Fail("foreground provider call did not start")
 			}
-			admission, err := syncer.Admit(t.Context(), ref, 1)
+			admission, err := syncer.Admit(
+				t.Context(), ref, db.ArchiveItemTypeIssue, 1,
+			)
 			require.NoError(err)
 			assert.False(admission.Allowed)
 			assert.Contains(admission.Detail, "higher-priority sync work is active")
