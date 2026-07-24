@@ -6,10 +6,19 @@ const port = parseE2EPort(process.env.PLAYWRIGHT_PORT) ?? (await getAvailablePor
 process.env.PLAYWRIGHT_PORT = String(port);
 const baseURL = `http://${host}:${port}`;
 
+function ciWorkers(): number | undefined {
+  // Mock tests share one Vite dev server. At 28 Chromium workers, concurrent
+  // navigation and reload bursts can starve that server past the 30s test
+  // timeout; the runner's guaranteed 14 cores complete the suite cleanly.
+  return process.env.CI ? 14 : undefined;
+}
+
+const workers = ciWorkers();
+
 export default defineConfig({
   testDir: "./tests/e2e",
   fullyParallel: true,
-  ...(process.env.CI ? { workers: 2 } : {}),
+  ...(workers ? { workers } : {}),
   timeout: 30_000,
   retries: process.env.CI ? 2 : 0,
   expect: {

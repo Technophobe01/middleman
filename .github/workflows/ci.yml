@@ -199,12 +199,13 @@ jobs:
   test_go:
     name: Go tests
     runs-on: kenn-linux-x64
-    # Bound package fan-out on high-core runners so concurrent test binaries
-    # and in-package parallel tests stay within the job's memory budget.
+    # The runner guarantees 14 cores and can burst to 32. Seven four-thread
+    # package processes can use 28 burst cores while leaving headroom for the
+    # runner and compiler. The 28 GiB job does not need an artificial Go heap
+    # limit; package fan-out remains bounded by GOFLAGS.
     env:
       GOMAXPROCS: "4"
-      GOMEMLIMIT: "4GiB"
-      GOFLAGS: "-p=1"
+      GOFLAGS: "-p=7"
     needs: detect_changes
     if: needs.detect_changes.outputs.backend == 'true'
     steps:
@@ -225,7 +226,7 @@ jobs:
       - name: Run tests
         run: |
           mkdir -p tmp
-          go tool gotestsum --format pkgname-and-test-fails --jsonfile=tmp/test-output.json -- ./... -shuffle=on -parallel=2
+          go tool gotestsum --format pkgname-and-test-fails --jsonfile=tmp/test-output.json -- ./... -shuffle=on -parallel=4
 
       - name: Publish unit test report
         if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
@@ -257,7 +258,7 @@ jobs:
       - name: Run integration tests (git-dependent)
         run: |
           mkdir -p tmp
-          go tool gotestsum --format pkgname-and-test-fails --jsonfile=tmp/test-integration-output.json -- -tags integration ./... -run '^TestIntegration' -shuffle=on -parallel=2
+          go tool gotestsum --format pkgname-and-test-fails --jsonfile=tmp/test-integration-output.json -- -tags integration ./... -run '^TestIntegration' -shuffle=on -parallel=4
 
       - name: Publish integration test report
         if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
@@ -330,11 +331,11 @@ jobs:
   race:
     name: go test -race
     runs-on: kenn-linux-x64
-    # Race-instrumented packages are especially memory-intensive.
+    # Seven four-thread package processes can use 28 burst cores; the runner's
+    # 28 GiB memory guarantee leaves room for race instrumentation overhead.
     env:
       GOMAXPROCS: "4"
-      GOMEMLIMIT: "4GiB"
-      GOFLAGS: "-p=1"
+      GOFLAGS: "-p=7"
     needs: detect_changes
     if: needs.detect_changes.outputs.backend == 'true'
     steps:
@@ -355,7 +356,7 @@ jobs:
       - name: Run tests (race detector)
         run: |
           mkdir -p tmp
-          go tool gotestsum --format pkgname-and-test-fails --jsonfile=tmp/test-race-output.json --jsonfile-timing-events=tmp/test-race-timing-events.json -- -race ./... -shuffle=on -parallel=2 -timeout 20m
+          go tool gotestsum --format pkgname-and-test-fails --jsonfile=tmp/test-race-output.json --jsonfile-timing-events=tmp/test-race-timing-events.json -- -race ./... -shuffle=on -parallel=4 -timeout 20m
 
       - name: Summarize race test timings
         if: ${{ !cancelled() && hashFiles('tmp/test-race-output.json') != '' }}
