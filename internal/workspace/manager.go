@@ -548,7 +548,8 @@ func (m *Manager) issueBranchInspectionDir(
 	}
 
 	if err := m.clones.EnsureCloneInNamespace(
-		ctx, workspaceCloneNamespace(platform), platformHost, owner, name, remoteURL,
+		ctx, workspaceCloneNamespace(platform), platform, platformHost,
+		owner, name, remoteURL,
 	); err != nil {
 		return "", false, false, fmt.Errorf("ensure clone: %w", err)
 	}
@@ -928,7 +929,10 @@ func (m *Manager) refreshExistingWorkspaceWorktree(
 	commonDir string,
 	ws *Workspace,
 ) (bool, error) {
-	if err := m.fetchWorkspaceBase(ctx, commonDir, ws.PlatformHost, false); err != nil {
+	if err := m.fetchWorkspaceBase(
+		ctx, commonDir, ws.Platform, ws.PlatformHost,
+		ws.RepoOwner, ws.RepoName, false,
+	); err != nil {
 		return false, err
 	}
 	if ws.ItemType != db.WorkspaceItemTypePullRequest {
@@ -1082,8 +1086,8 @@ func (m *Manager) workspaceSetupGitDir(
 		return "", false, err
 	}
 	if err := m.clones.EnsureCloneInNamespace(
-		ctx, workspaceCloneNamespace(ws.Platform), ws.PlatformHost, ws.RepoOwner,
-		ws.RepoName, remoteURL,
+		ctx, workspaceCloneNamespace(ws.Platform), ws.Platform, ws.PlatformHost,
+		ws.RepoOwner, ws.RepoName, remoteURL,
 	); err != nil {
 		return "", false, err
 	}
@@ -1447,7 +1451,8 @@ func (m *Manager) addWorktree(
 	err := m.withRepoLockForGitDir(ctx, cloneDir, func() error {
 		if refreshBeforeAdd {
 			if err := m.fetchWorkspaceBase(
-				ctx, cloneDir, ws.PlatformHost,
+				ctx, cloneDir, ws.Platform, ws.PlatformHost,
+				ws.RepoOwner, ws.RepoName,
 				workspaceUsesOriginHead(ws),
 			); err != nil {
 				return err
@@ -3339,13 +3344,15 @@ func gitArgsWithoutHooks(args ...string) []string {
 
 func (m *Manager) fetchWorkspaceBase(
 	ctx context.Context,
-	dir, platformHost string,
+	dir, platformName, platformHost, owner, name string,
 	requireOriginHead bool,
 ) error {
 	run := runGitWithoutHooks
 	if m.clones != nil {
 		run = func(ctx context.Context, dir string, args ...string) error {
-			out, err := m.clones.RunGit(ctx, platformHost, dir, args...)
+			out, err := m.clones.RunGitForRepo(
+				ctx, platformName, platformHost, owner, name, dir, args...,
+			)
 			if err != nil {
 				return fmt.Errorf(
 					"%w: %s", err, strings.TrimSpace(string(out)),
@@ -3365,7 +3372,9 @@ func (m *Manager) fetchWorkspaceMergeRequestHeadRef(
 	run := runGitWithoutHooks
 	if m.clones != nil {
 		run = func(ctx context.Context, dir string, args ...string) error {
-			out, err := m.clones.RunGit(ctx, ws.PlatformHost, dir, args...)
+			out, err := m.clones.RunGitForRepo(
+				ctx, ws.Platform, ws.PlatformHost, ws.RepoOwner, ws.RepoName, dir, args...,
+			)
 			if err != nil {
 				return fmt.Errorf(
 					"%w: %s", err, strings.TrimSpace(string(out)),
