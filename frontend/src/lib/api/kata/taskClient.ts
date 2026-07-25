@@ -34,8 +34,6 @@ interface ErrorEnvelope {
   details?: unknown;
 }
 
-const KATA_TASK_API_PREFIX = "/api" + "/v1";
-
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -58,7 +56,7 @@ function parseErrorEnvelope(body: unknown, status: number): ErrorEnvelope {
 }
 
 function taskPath(path: string): string {
-  return `${KATA_TASK_API_PREFIX}${path}`;
+  return path.startsWith("/") ? path : `/${path}`;
 }
 
 interface KataCreateProtocolResponse extends KataTaskMutationResponse {

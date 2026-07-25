@@ -82,6 +82,10 @@ registry helpers return typed errors for missing providers or capabilities.
 
 - Missing optional capabilities should degrade that feature with a typed
   platform error, not break unrelated sync work.
+- Never put foreground deadlines on a shared provider HTTP client; scope them to
+  the operation context (`internal/platform/gitlab/client.go::NewClient`).
+- Resolve opaque provider repo IDs by `repo_path` before numeric-only operations
+  (`internal/platform/gitlab/client.go::projectScopedArg`).
 - `priority_repo` reorders a full run; `only_repo` restricts every repo-derived
   phase and must not delay full-run cadence. Resolve both by full identity, and
   never fall back from invalid exclusive scope. (`internal/github/sync.go::runOnce`)
@@ -196,6 +200,10 @@ provider labels to SQLite so the next sync does not revert the edit.
 GitLab API calls address projects by numeric id or URL-escaped path with
 slashes. Middleman should prefer the stored provider id after resolution and
 preserve `path_with_namespace` as `repo_path`.
+
+GitLab private Markdown upload web URLs do not accept API-token authentication.
+Translate only repo-scoped upload URLs to the authenticated project-upload API;
+never proxy arbitrary provider URLs. (`internal/platform/gitlab/markdown_images.go::GetMarkdownImage`)
 
 GitLab merge request and issue `iid` values are repo-scoped numbers. Persist
 provider object ids separately from user-visible numbers, and scope events by

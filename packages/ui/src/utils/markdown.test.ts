@@ -3,6 +3,74 @@ import { buildCanonicalProviderItemURL } from "./item-reference.js";
 import { renderMarkdown, renderMarkdownBlocks } from "./markdown.js";
 
 describe("renderMarkdown task lists", () => {
+  it("proxies private GitHub attachment images through the repo-scoped API", async () => {
+    const source = "https://github.com/user-attachments/assets/11111111-2222-3333-4444-555555555555";
+    const html = await renderMarkdown(`<img width="1440" height="1000" alt="Project list" src="${source}" />`, {
+      provider: "github",
+      platformHost: "github.com",
+      owner: "acme",
+      name: "widgets",
+      repoPath: "acme/widgets",
+    });
+
+    expect(html).toContain(
+      `src="/api/v1/repo/github/acme/widgets/markdown-image?source=${encodeURIComponent(source)}"`,
+    );
+    expect(html).toContain('width="1440"');
+    expect(html).toContain('height="1000"');
+  });
+
+  it("keeps the configured base path in proxied image URLs", async () => {
+    const previousBasePath = window.__BASE_PATH__;
+    window.__BASE_PATH__ = "/middleman/";
+    const source = "https://github.com/user-attachments/assets/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+
+    try {
+      const html = await renderMarkdown(`![Private image](${source})`, {
+        provider: "github",
+        platformHost: "github.com",
+        owner: "acme",
+        name: "widgets",
+        repoPath: "acme/widgets",
+      });
+
+      expect(html).toContain(
+        `src="/middleman/api/v1/repo/github/acme/widgets/markdown-image?source=${encodeURIComponent(source)}"`,
+      );
+    } finally {
+      if (previousBasePath === undefined) delete window.__BASE_PATH__;
+      else window.__BASE_PATH__ = previousBasePath;
+    }
+  });
+
+  it("proxies private GitLab upload images through the repo-scoped API", async () => {
+    const source = "/uploads/0123456789abcdef/private-image.png";
+    const canonicalSource = "https://gitlab.example.com/group/project/uploads/0123456789abcdef/private-image.png";
+    const html = await renderMarkdown(`![Private image](${source})`, {
+      provider: "gitlab",
+      platformHost: "gitlab.example.com",
+      owner: "group",
+      name: "project",
+      repoPath: "group/project",
+    });
+
+    expect(html).toContain(
+      `src="/api/v1/host/gitlab.example.com/repo/gitlab/group/project/markdown-image?source=${encodeURIComponent(canonicalSource)}"`,
+    );
+
+    const fullSource = "https://gitlab.example.com/-/project/42/uploads/0123456789abcdef/private-image.png";
+    const fullPathHtml = await renderMarkdown(`![Private image](${fullSource})`, {
+      provider: "gitlab",
+      platformHost: "gitlab.example.com",
+      owner: "group",
+      name: "project",
+      repoPath: "group/project",
+    });
+    expect(fullPathHtml).toContain(
+      `src="/api/v1/host/gitlab.example.com/repo/gitlab/group/project/markdown-image?source=${encodeURIComponent(fullSource)}"`,
+    );
+  });
+
   it("renders item references with the shared internal route and data attributes", async () => {
     const html = await renderMarkdown("See #12 and acme/tools#13", {
       provider: "github",

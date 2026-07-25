@@ -37,6 +37,7 @@ type Client struct {
 	host              string
 	baseURL           string
 	api               *gitlab.Client
+	httpClient        *http.Client
 	foregroundTimeout time.Duration
 
 	// userIDMu guards userIDs, a username -> user ID cache for
@@ -129,9 +130,10 @@ func NewClient(host string, source tokenauth.Source, options ...ClientOption) (*
 		RetryOnUnauthorized: true,
 		AllowedOrigin:       opts.baseURL,
 	}
-	clientOptions = append(clientOptions, gitlab.WithHTTPClient(&http.Client{
+	httpClient := &http.Client{
 		Transport: authRT,
-	}))
+	}
+	clientOptions = append(clientOptions, gitlab.WithHTTPClient(httpClient))
 
 	api, err := gitlab.NewClient("", clientOptions...)
 	if err != nil {
@@ -141,6 +143,7 @@ func NewClient(host string, source tokenauth.Source, options ...ClientOption) (*
 		host:              host,
 		baseURL:           opts.baseURL,
 		api:               api,
+		httpClient:        httpClient,
 		foregroundTimeout: opts.foregroundTimeout,
 		userIDs:           make(map[string]int64),
 		projectCloneURLs:  make(map[int64]string),
@@ -257,6 +260,7 @@ func (c *Client) Capabilities() platform.Capabilities {
 		ReadReleases:           true,
 		ReadCI:                 true,
 		ReadLabels:             true,
+		ReadMarkdownImages:     true,
 		CommentMutation:        true,
 		StateMutation:          true,
 		MergeMutation:          true,
