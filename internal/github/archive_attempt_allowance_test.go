@@ -85,7 +85,7 @@ func TestArchiveAttemptAllowanceBoundsAuthRetries(t *testing.T) {
 	assert.Equal(1, budget.ArchiveSpent())
 }
 
-func TestArchiveAttemptAllowanceLeavesLiveRequestsUnbounded(t *testing.T) {
+func TestArchiveAttemptAllowanceLeavesLiveContextsUnbounded(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 	base := &countingRoundTripper{status: http.StatusInternalServerError}

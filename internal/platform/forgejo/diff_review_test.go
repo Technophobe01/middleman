@@ -3,15 +3,43 @@ package forgejo
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	forgejosdk "codeberg.org/mvdkleijn/forgejo-sdk/forgejo/v3"
 	"github.com/stretchr/testify/assert"
 	Require "github.com/stretchr/testify/require"
 	"go.kenn.io/middleman/internal/platform"
 )
+
+func TestForgejoReviewThreadPreservesContextCoordinates(t *testing.T) {
+	assert := assert.New(t)
+	thread := forgejoReviewThread(
+		&forgejosdk.PullReview{ID: 99},
+		&forgejosdk.PullReviewComment{
+			ID:         101,
+			Path:       "src/main.go",
+			LineNum:    7,
+			OldLineNum: 5,
+		},
+	)
+
+	assert.Equal("right", thread.Range.Side)
+	assert.Equal(7, thread.Range.Line)
+	if assert.NotNil(thread.Range.OldLine) {
+		assert.Equal(5, *thread.Range.OldLine)
+	}
+	if assert.NotNil(thread.Range.NewLine) {
+		assert.Equal(7, *thread.Range.NewLine)
+	}
+	assert.Equal("context", thread.Range.LineType)
+}
 
 func TestPublishDiffReviewDraftCreatesForgejoReview(t *testing.T) {
 	assert := assert.New(t)
@@ -198,6 +226,46 @@ func TestListMergeRequestReviewThreadsReadsForgejoReviewComments(t *testing.T) {
 	assert.Equal("head-sha", threads[0].Range.CommitSHA)
 }
 
+func TestListMergeRequestReviewThreadsReadsBeyondTenthReviewPage(t *testing.T) {
+	assert := assert.New(t)
+	require := Require.New(t)
+	var reviewRequests atomic.Int32
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path != "/api/v1/repos/acme/widgets/pulls/42/reviews" {
+			reviewPath := strings.TrimSuffix(r.URL.Path, "/comments")
+			reviewID, err := strconv.Atoi(reviewPath[strings.LastIndexByte(reviewPath, '/')+1:])
+			assert.NoError(err)
+			assert.NoError(json.NewEncoder(w).Encode([]map[string]any{{"id": 1000 + reviewID}}))
+			return
+		}
+		reviewRequests.Add(1)
+		page, err := strconv.Atoi(r.URL.Query().Get("page"))
+		assert.NoError(err)
+		if page < 11 {
+			w.Header().Set("Link", fmt.Sprintf(
+				`<%s/api/v1/repos/acme/widgets/pulls/42/reviews?page=%d&limit=100>; rel="next"`,
+				server.URL, page+1,
+			))
+		}
+		assert.NoError(json.NewEncoder(w).Encode([]map[string]any{{"id": page}}))
+	}))
+	defer server.Close()
+	client, err := NewClient("codeberg.test", testTokenSource("token"), WithBaseURLForTesting(server.URL))
+	require.NoError(err)
+
+	threads, err := client.ListMergeRequestReviewThreads(t.Context(), platform.RepoRef{
+		Owner: "acme", Name: "widgets",
+	}, 42)
+
+	require.NoError(err)
+	require.Len(threads, 11)
+	assert.Equal("1", threads[0].ProviderReviewID)
+	assert.Equal("11", threads[10].ProviderReviewID)
+	assert.Equal(int32(11), reviewRequests.Load())
+}
+
 func TestListMergeRequestReviewThreadsClassifiesDisabledMergeRequests(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -262,4 +330,104 @@ func TestListMergeRequestReviewThreadsClassifiesDisabledMergeRequests(t *testing
 			assert.Equal(1, metadataRequests)
 		})
 	}
+}
+
+func TestListMergeRequestReviewThreadsMapsAuthenticationErrors(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			require := Require.New(t)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				http.Error(w, http.StatusText(status), status)
+			}))
+			defer server.Close()
+
+			client, err := NewClient(
+				"codeberg.test", testTokenSource("token"),
+				WithBaseURLForTesting(server.URL),
+			)
+			require.NoError(err)
+			_, err = client.ListMergeRequestReviewThreads(t.Context(), platform.RepoRef{
+				Owner: "acme", Name: "widgets",
+			}, 42)
+
+			require.ErrorIs(err, platform.ErrPermissionDenied)
+			var platformErr *platform.Error
+			require.ErrorAs(err, &platformErr)
+			require.Equal(platform.KindForgejo, platformErr.Provider)
+			require.Equal("codeberg.test", platformErr.PlatformHost)
+		})
+	}
+}
+
+func TestListMergeRequestReviewThreadsReadsEveryLargeDatasetReview(t *testing.T) {
+	assert := assert.New(t)
+	require := Require.New(t)
+	var commentRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/api/v1/repos/acme/widgets/pulls/42/reviews" {
+			reviews := make([]map[string]any, 101)
+			for i := range reviews {
+				reviews[i] = map[string]any{"id": i + 1}
+			}
+			assert.NoError(json.NewEncoder(w).Encode(reviews))
+			return
+		}
+		commentRequests.Add(1)
+		reviewPath := strings.TrimSuffix(r.URL.Path, "/comments")
+		reviewID, err := strconv.Atoi(reviewPath[strings.LastIndexByte(reviewPath, '/')+1:])
+		assert.NoError(err)
+		assert.NoError(json.NewEncoder(w).Encode([]map[string]any{{"id": 1000 + reviewID}}))
+	}))
+	defer server.Close()
+
+	client, err := NewClient(
+		"codeberg.test", testTokenSource("token"),
+		WithBaseURLForTesting(server.URL),
+	)
+	require.NoError(err)
+	threads, err := client.ListMergeRequestReviewThreads(t.Context(), platform.RepoRef{
+		Owner: "acme", Name: "widgets",
+	}, 42)
+
+	require.NoError(err)
+	require.Len(threads, 101)
+	assert.Equal("1", threads[0].ProviderReviewID)
+	assert.Equal("101", threads[100].ProviderReviewID)
+	assert.Equal(int32(101), commentRequests.Load())
+}
+
+func TestListMergeRequestReviewThreadsReadsEveryLargeDatasetComment(t *testing.T) {
+	assert := assert.New(t)
+	require := Require.New(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v1/repos/acme/widgets/pulls/42/reviews":
+			assert.NoError(json.NewEncoder(w).Encode([]map[string]any{{"id": 99}}))
+		case "/api/v1/repos/acme/widgets/pulls/42/reviews/99/comments":
+			comments := make([]map[string]any, 1001)
+			for i := range comments {
+				comments[i] = map[string]any{"id": i + 1}
+			}
+			assert.NoError(json.NewEncoder(w).Encode(comments))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewClient(
+		"codeberg.test", testTokenSource("token"),
+		WithBaseURLForTesting(server.URL),
+	)
+	require.NoError(err)
+	threads, err := client.ListMergeRequestReviewThreads(t.Context(), platform.RepoRef{
+		Owner: "acme", Name: "widgets",
+	}, 42)
+
+	require.NoError(err)
+	require.Len(threads, 1001)
+	assert.Equal("1", threads[0].ProviderCommentID)
+	assert.Equal("1001", threads[1000].ProviderCommentID)
 }

@@ -103,12 +103,19 @@ func (t *transport) listAllPullReviews(
 	ref platform.RepoRef,
 	number int,
 ) ([]*forgejosdk.PullReview, error) {
-	var out []*forgejosdk.PullReview
-	page := 1
-	for {
+	return platform.CollectAllPages(ctx, "1", func(
+		ctx context.Context,
+		cursor string,
+	) (platform.Page[*forgejosdk.PullReview], error) {
+		page, err := strconv.Atoi(cursor)
+		if err != nil {
+			return platform.Page[*forgejosdk.PullReview]{}, fmt.Errorf(
+				"parse Forgejo review page cursor: %w", err,
+			)
+		}
 		var reviews []*forgejosdk.PullReview
 		var resp *forgejosdk.Response
-		err := t.withRequestContext(ctx, func() error {
+		err = t.withRequestContext(ctx, func() error {
 			var err error
 			reviews, resp, err = t.api.ListPullReviews(ref.Owner, ref.Name, int64(number), forgejosdk.ListPullReviewsOptions{
 				ListOptions: forgejosdk.ListOptions{Page: page, PageSize: 100},
@@ -116,14 +123,15 @@ func (t *transport) listAllPullReviews(
 			return err
 		})
 		if err != nil {
-			return nil, forgejoHTTPError(resp, err)
+			return platform.Page[*forgejosdk.PullReview]{}, forgejoHTTPError(resp, err)
 		}
-		out = append(out, reviews...)
 		if resp == nil || resp.NextPage == 0 {
-			return out, nil
+			return platform.Page[*forgejosdk.PullReview]{Items: reviews, Exhausted: true}, nil
 		}
-		page = resp.NextPage
-	}
+		return platform.Page[*forgejosdk.PullReview]{
+			Items: reviews, NextCursor: strconv.Itoa(resp.NextPage),
+		}, nil
+	})
 }
 
 func (t *transport) listPullReviewComments(
@@ -184,13 +192,22 @@ func forgejoReviewThread(
 	lineType := "add"
 	var oldLine *int
 	var newLine *int
-	if comment.OldLineNum > 0 {
-		line = int(comment.OldLineNum)
+	if comment.OldLineNum > 0 && comment.LineNum > 0 {
+		old := int(comment.OldLineNum)
+		new := int(comment.LineNum)
+		line = new
+		lineType = "context"
+		oldLine = &old
+		newLine = &new
+	} else if comment.OldLineNum > 0 {
+		old := int(comment.OldLineNum)
+		line = old
 		side = "left"
 		lineType = "delete"
-		oldLine = &line
-	} else {
-		newLine = &line
+		oldLine = &old
+	} else if comment.LineNum > 0 {
+		new := int(comment.LineNum)
+		newLine = &new
 	}
 	resolvedAt := (*time.Time)(nil)
 	resolved := comment.Resolver != nil

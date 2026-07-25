@@ -146,6 +146,7 @@ func (c *Client) Capabilities() platform.Capabilities {
 	caps := c.provider.Capabilities()
 	caps.ReviewDraftMutation = true
 	caps.ReadReviewThreads = true
+	caps.Archive.InlineReviewComments = true
 	caps.NativeMultilineRanges = false
 	return caps
 }
@@ -201,6 +202,9 @@ func (t *rateTrackingTransport) RoundTrip(req *http.Request) (*http.Response, er
 	resp, err := base.RoundTrip(req)
 	if resp != nil && t.rateTracker != nil {
 		t.rateTracker.RecordRequest()
+		if rate, ok := gitealike.RateFromHeaders(resp.Header); ok {
+			t.rateTracker.UpdateFromRate(rate)
+		}
 	}
 	return resp, err
 }

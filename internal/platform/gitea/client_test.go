@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -15,25 +16,65 @@ import (
 	ghsync "go.kenn.io/middleman/internal/github"
 	"go.kenn.io/middleman/internal/platform"
 	"go.kenn.io/middleman/internal/platform/gitealike"
+	"go.kenn.io/middleman/internal/ratelimit"
+	"go.kenn.io/middleman/internal/testutil/dbtest"
 )
 
+const testGiteaServerVersion = "1.26.0"
+
 var (
-	_ gitealike.Transport             = (*transport)(nil)
-	_ gitealike.ActionsTransport      = (*transport)(nil)
-	_ platform.RepositoryReader       = (*Client)(nil)
-	_ platform.MergeRequestReader     = (*Client)(nil)
-	_ platform.IssueReader            = (*Client)(nil)
-	_ platform.ReleaseReader          = (*Client)(nil)
-	_ platform.TagReader              = (*Client)(nil)
-	_ platform.CIReader               = (*Client)(nil)
-	_ platform.CommentMutator         = (*Client)(nil)
-	_ platform.StateMutator           = (*Client)(nil)
-	_ platform.MergeMutator           = (*Client)(nil)
-	_ platform.ReviewMutator          = (*Client)(nil)
-	_ platform.IssueMutator           = (*Client)(nil)
-	_ platform.IssuePageReader        = (*Client)(nil)
-	_ platform.MergeRequestPageReader = (*Client)(nil)
+	_ gitealike.Transport                     = (*transport)(nil)
+	_ gitealike.ActionsTransport              = (*transport)(nil)
+	_ platform.RepositoryReader               = (*Client)(nil)
+	_ platform.MergeRequestReader             = (*Client)(nil)
+	_ platform.IssueReader                    = (*Client)(nil)
+	_ platform.ReleaseReader                  = (*Client)(nil)
+	_ platform.TagReader                      = (*Client)(nil)
+	_ platform.CIReader                       = (*Client)(nil)
+	_ platform.CommentMutator                 = (*Client)(nil)
+	_ platform.StateMutator                   = (*Client)(nil)
+	_ platform.MergeMutator                   = (*Client)(nil)
+	_ platform.ReviewMutator                  = (*Client)(nil)
+	_ platform.IssueMutator                   = (*Client)(nil)
+	_ platform.IssuePageReader                = (*Client)(nil)
+	_ platform.MergeRequestPageReader         = (*Client)(nil)
+	_ platform.MergeRequestReviewThreadReader = (*Client)(nil)
 )
+
+func TestClientRecordsRateLimitHeaders(t *testing.T) {
+	assert := assert.New(t)
+	require := Require.New(t)
+	reset := time.Now().UTC().Add(30 * time.Minute).Unix()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-RateLimit-Limit", "5000")
+		w.Header().Set("X-RateLimit-Remaining", "4999")
+		w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(reset, 10))
+		_, _ = w.Write([]byte(`{"id":1,"name":"repo","full_name":"owner/repo","owner":{"id":2,"login":"owner"}}`))
+	}))
+	defer server.Close()
+	database := dbtest.Open(t)
+	tracker := ratelimit.NewPlatformRateTracker(database, "gitea", "gitea.test", "rest")
+	client, err := NewClient(
+		"gitea.test",
+		testTokenSource("token"),
+		WithBaseURLForTesting(server.URL),
+		WithServerVersionForTesting(testGiteaServerVersion),
+		WithRateTracker(tracker),
+	)
+	require.NoError(err)
+
+	_, err = client.GetRepository(t.Context(), platform.RepoRef{Owner: "owner", Name: "repo"})
+	require.NoError(err)
+	row, err := database.GetPlatformRateLimit("gitea", "gitea.test", "rest")
+	require.NoError(err)
+	require.NotNil(row)
+	assert.Equal(1, row.RequestsHour)
+	assert.Equal(5000, row.RateLimit)
+	assert.Equal(4999, row.RateRemaining)
+	require.NotNil(row.RateResetAt)
+	assert.Equal(reset, row.RateResetAt.Unix())
+}
 
 func TestClientClassifiesDisabledIssuesFromRepositoryMetadata(t *testing.T) {
 	assert := assert.New(t)
@@ -58,7 +99,12 @@ func TestClientClassifiesDisabledIssuesFromRepositoryMetadata(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	client, err := NewClient("gitea.test", testTokenSource("token"), WithBaseURLForTesting(server.URL))
+	client, err := NewClient(
+		"gitea.test",
+		testTokenSource("token"),
+		WithBaseURLForTesting(server.URL),
+		WithServerVersionForTesting(testGiteaServerVersion),
+	)
 	require.NoError(err)
 
 	_, err = client.ListOpenIssues(t.Context(), platform.RepoRef{
@@ -98,7 +144,7 @@ func TestArchiveInventoryUsesAllStateOrderingAndOneBudgetedRequestPerPage(t *tes
 	}))
 	defer server.Close()
 	budget := ghsync.NewSyncBudget(20)
-	client, err := NewClient("gitea.test", testTokenSource("token"), WithBaseURLForTesting(server.URL), WithSyncBudget(budget))
+	client, err := NewClient("gitea.test", testTokenSource("token"), WithBaseURLForTesting(server.URL), WithServerVersionForTesting(testGiteaServerVersion), WithSyncBudget(budget))
 	require.NoError(err)
 	ref := platform.RepoRef{Platform: platform.KindGitea, Host: "gitea.test", Owner: "owner", Name: "repo"}
 	ctx := ghsync.WithArchiveSyncBudget(context.Background())
@@ -146,7 +192,7 @@ func TestClientLooksUpRepositoryAndSendsToken(t *testing.T) {
 	client, err := NewClient(
 		"gitea.test",
 		testTokenSource("gitea-token"),
-		WithBaseURLForTesting(server.URL),
+		WithBaseURLForTesting(server.URL), WithServerVersionForTesting(testGiteaServerVersion),
 	)
 	require.NoError(err)
 
@@ -166,7 +212,7 @@ func TestClientLookupUsesForegroundTimeout(t *testing.T) {
 	client, err := NewClient(
 		"gitea.test",
 		testTokenSource("gitea-token"),
-		WithBaseURLForTesting(server.URL),
+		WithBaseURLForTesting(server.URL), WithServerVersionForTesting(testGiteaServerVersion),
 		WithForegroundTimeoutForTesting(20*time.Millisecond),
 	)
 	require.NoError(err)
@@ -190,7 +236,7 @@ func TestTransportGetRepositoryRawCancelsInFlightRequest(t *testing.T) {
 	client, err := NewClient(
 		"gitea.test",
 		testTokenSource("gitea-token"),
-		WithBaseURLForTesting(server.URL),
+		WithBaseURLForTesting(server.URL), WithServerVersionForTesting(testGiteaServerVersion),
 		WithForegroundTimeoutForTesting(time.Minute),
 	)
 	require.NoError(err)
@@ -243,7 +289,7 @@ func TestTransportGetRepositoryRawCancelsWhileWaitingForRequestContext(t *testin
 	client, err := NewClient(
 		"gitea.test",
 		testTokenSource("gitea-token"),
-		WithBaseURLForTesting(server.URL),
+		WithBaseURLForTesting(server.URL), WithServerVersionForTesting(testGiteaServerVersion),
 		WithForegroundTimeoutForTesting(time.Minute),
 	)
 	require.NoError(err)
@@ -301,7 +347,7 @@ func TestClientLookupCountsSyncBudget(t *testing.T) {
 	client, err := NewClient(
 		"gitea.test",
 		testTokenSource("gitea-token"),
-		WithBaseURLForTesting(server.URL),
+		WithBaseURLForTesting(server.URL), WithServerVersionForTesting(testGiteaServerVersion),
 		WithSyncBudget(budget),
 	)
 	require.NoError(err)
@@ -324,7 +370,7 @@ func TestClientProviderIdentityExposesReadCapabilities(t *testing.T) {
 	client, err := NewClient(
 		"gitea.test",
 		testTokenSource("gitea-token"),
-		WithBaseURLForTesting(server.URL),
+		WithBaseURLForTesting(server.URL), WithServerVersionForTesting(testGiteaServerVersion),
 	)
 	require.NoError(err)
 
@@ -347,6 +393,7 @@ func TestClientProviderIdentityExposesReadCapabilities(t *testing.T) {
 		AssigneeMutation:    true,
 		ReviewerMutation:    true,
 		MutationHeadBinding: true,
+		ReadReviewThreads:   true,
 		SupportedReviewActions: []platform.ReviewAction{
 			platform.ReviewActionComment,
 			platform.ReviewActionApprove,
@@ -354,9 +401,69 @@ func TestClientProviderIdentityExposesReadCapabilities(t *testing.T) {
 		},
 		Archive: platform.ArchiveCapabilities{
 			HistoricalIssues: true, HistoricalMergeRequests: true,
-			OrdinaryComments: true, SubmittedReviews: true,
+			OrdinaryComments: true, SubmittedReviews: true, InlineReviewComments: true,
 		},
 	}, client.Capabilities())
+}
+
+func TestClientReviewThreadCapabilitiesUseValidatedVersionFloor(t *testing.T) {
+	tests := []struct {
+		name      string
+		version   string
+		supported bool
+	}{
+		{name: "below floor", version: "1.24.5", supported: false},
+		{name: "at floor", version: "1.24.6", supported: true},
+		{name: "newer", version: "1.26.0", supported: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert := assert.New(t)
+			require := Require.New(t)
+			server := httptest.NewServer(http.NotFoundHandler())
+			defer server.Close()
+			client, err := NewClient(
+				"gitea.test",
+				testTokenSource("token"),
+				WithBaseURLForTesting(server.URL),
+				WithServerVersionForTesting(tt.version),
+			)
+			require.NoError(err)
+
+			caps := client.Capabilities()
+			assert.Equal(tt.supported, caps.ReadReviewThreads)
+			assert.Equal(tt.supported, caps.Archive.InlineReviewComments)
+			if !tt.supported {
+				_, err = client.ListMergeRequestReviewThreads(
+					t.Context(), platform.RepoRef{Owner: "owner", Name: "repo"}, 42,
+				)
+				assert.ErrorIs(err, platform.ErrUnsupportedCapability)
+			}
+		})
+	}
+}
+
+func TestClientDiscoversVersionAtTestingBaseURL(t *testing.T) {
+	assert := assert.New(t)
+	require := Require.New(t)
+	versionRequested := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal("/api/v1/version", r.URL.Path)
+		versionRequested = true
+		w.Header().Set("Content-Type", "application/json")
+		assert.NoError(json.NewEncoder(w).Encode(map[string]string{"version": "1.24.6"}))
+	}))
+	defer server.Close()
+
+	client, err := NewClient(
+		"gitea.test",
+		testTokenSource("token"),
+		WithBaseURLForTesting(server.URL),
+	)
+	require.NoError(err)
+	assert.True(versionRequested)
+	assert.True(client.Capabilities().ReadReviewThreads)
+	assert.True(client.Capabilities().Archive.InlineReviewComments)
 }
 
 func TestClientReadsOpenPullRequestsIssuesAndCIChecks(t *testing.T) {
@@ -408,7 +515,7 @@ func TestClientReadsOpenPullRequestsIssuesAndCIChecks(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewClient("gitea.test", testTokenSource("gitea-token"), WithBaseURLForTesting(server.URL))
+	client, err := NewClient("gitea.test", testTokenSource("gitea-token"), WithBaseURLForTesting(server.URL), WithServerVersionForTesting(testGiteaServerVersion))
 	require.NoError(err)
 	ref := platform.RepoRef{Owner: "owner", Name: "repo"}
 
@@ -450,6 +557,7 @@ func TestClientReadsTimelineAssignmentAndTitleEvents(t *testing.T) {
 			assert.NoError(json.NewEncoder(w).Encode([]map[string]any{
 				{
 					"id": 11, "type": "assigned", "user": map[string]any{"login": "bob"},
+					"label":      map[string]any{"id": 1, "name": "bug"},
 					"created_at": "2026-05-01T10:01:00Z",
 				},
 				{
@@ -464,7 +572,7 @@ func TestClientReadsTimelineAssignmentAndTitleEvents(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewClient("gitea.test", testTokenSource("gitea-token"), WithBaseURLForTesting(server.URL))
+	client, err := NewClient("gitea.test", testTokenSource("gitea-token"), WithBaseURLForTesting(server.URL), WithServerVersionForTesting(testGiteaServerVersion))
 	require.NoError(err)
 	ref := platform.RepoRef{Owner: "owner", Name: "repo", RepoPath: "owner/repo"}
 
@@ -578,7 +686,7 @@ func TestClientMutationCapabilityUsesGiteaEndpoints(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewClient("gitea.test", testTokenSource("gitea-token"), WithBaseURLForTesting(server.URL))
+	client, err := NewClient("gitea.test", testTokenSource("gitea-token"), WithBaseURLForTesting(server.URL), WithServerVersionForTesting(testGiteaServerVersion))
 	require.NoError(err)
 	ref := platform.RepoRef{Owner: "owner", Name: "repo"}
 
@@ -642,7 +750,7 @@ func TestClientApproveMergeRequestSubmitsReview(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewClient("gitea.test", testTokenSource("gitea-token"), WithBaseURLForTesting(server.URL))
+	client, err := NewClient("gitea.test", testTokenSource("gitea-token"), WithBaseURLForTesting(server.URL), WithServerVersionForTesting(testGiteaServerVersion))
 	require.NoError(err)
 
 	event, err := client.ApproveMergeRequest(
@@ -684,7 +792,7 @@ func TestClientRequestChangesSubmitsReview(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewClient("gitea.test", testTokenSource("gitea-token"), WithBaseURLForTesting(server.URL))
+	client, err := NewClient("gitea.test", testTokenSource("gitea-token"), WithBaseURLForTesting(server.URL), WithServerVersionForTesting(testGiteaServerVersion))
 	require.NoError(err)
 	require.NoError(client.RequestChanges(
 		context.Background(), platform.RepoRef{Owner: "owner", Name: "repo"},
@@ -715,7 +823,7 @@ func TestClientMapsNotFoundResponsesToPlatformError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewClient("gitea.test", testTokenSource("gitea-token"), WithBaseURLForTesting(server.URL))
+	client, err := NewClient("gitea.test", testTokenSource("gitea-token"), WithBaseURLForTesting(server.URL), WithServerVersionForTesting(testGiteaServerVersion))
 	require.NoError(err)
 
 	_, err = client.GetMergeRequest(
@@ -747,7 +855,7 @@ func TestClientMergeRejectionSurfacesProviderStatusAndMessage(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewClient("gitea.test", testTokenSource("gitea-token"), WithBaseURLForTesting(server.URL))
+	client, err := NewClient("gitea.test", testTokenSource("gitea-token"), WithBaseURLForTesting(server.URL), WithServerVersionForTesting(testGiteaServerVersion))
 	require.NoError(err)
 	ref := platform.RepoRef{Owner: "owner", Name: "repo"}
 
@@ -795,7 +903,7 @@ func TestClientConcurrentMergeRejectionsDoNotCrossTalk(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewClient("gitea.test", testTokenSource("gitea-token"), WithBaseURLForTesting(server.URL))
+	client, err := NewClient("gitea.test", testTokenSource("gitea-token"), WithBaseURLForTesting(server.URL), WithServerVersionForTesting(testGiteaServerVersion))
 	require.NoError(err)
 	ref := platform.RepoRef{Owner: "owner", Name: "repo"}
 

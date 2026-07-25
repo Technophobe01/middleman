@@ -904,7 +904,12 @@ func (s *Syncer) Admit(
 	resetAt := archiveBudgetResetAt(tracker)
 	available := 0
 	if budget != nil {
-		available = budget.ArchiveSpendAvailable(now, resetAt, archiveLiveFloor(ref.Platform))
+		liveFloor := archiveLiveFloor(ref.Platform)
+		if resetAt == nil && (ref.Platform == platform.KindGitea || ref.Platform == platform.KindForgejo) {
+			available = budget.LocalArchiveSpendAvailable(liveFloor)
+		} else {
+			available = budget.ArchiveSpendAvailable(now, resetAt, liveFloor)
+		}
 	}
 	if available < cost {
 		probe.abandon()
@@ -920,7 +925,12 @@ func (s *Syncer) Admit(
 		retryAt := now.Add(time.Second)
 		return archive.AdmissionResult{RetryAt: &retryAt, Detail: "higher-priority sync work is active"}, nil
 	}
-	requestCtx = WithArchiveAttemptAllowance(WithArchiveSyncBudget(requestCtx), available)
+	requestCtx = WithArchiveSyncBudget(requestCtx)
+	completeGitealikeMR := itemType == db.ArchiveItemTypeMergeRequest &&
+		(ref.Platform == platform.KindGitea || ref.Platform == platform.KindForgejo)
+	if !completeGitealikeMR {
+		requestCtx = WithArchiveAttemptAllowance(requestCtx, available)
+	}
 	var completeOnce sync.Once
 	var featureDeferred *archive.FeatureDeferral
 	complete := func(cause error, providerAttempted bool) *archive.FeatureDeferral {
@@ -940,9 +950,10 @@ func (s *Syncer) Admit(
 		})
 		return featureDeferred
 	}
-	// The declared cost is the admission minimum. Once admitted, the request may
-	// use the archive surplus currently available without crossing the live
-	// floor; provider-SDK and authentication retries share this allowance.
+	// The declared cost is the admission minimum. Gitealike merge-request reads
+	// are atomic and data-complete, so they remain preemptible but are not cut
+	// off mid-dataset by the admission estimate. Other archive reads may use the
+	// currently available surplus without crossing the live floor.
 	return archive.AdmissionResult{
 		Allowed:  true,
 		Context:  requestCtx,
@@ -993,6 +1004,9 @@ func archiveBudgetResetAt(tracker *RateTracker) *time.Time {
 }
 
 func archiveLiveFloor(kind platform.Kind) int {
+	if kind == platform.KindGitea || kind == platform.KindForgejo {
+		return detailWorstCaseAttemptCost(kind, QueueItemPR)
+	}
 	floor := detailWorstCaseAttemptCost(kind, QueueItemPR) + wireAttemptsPerRequest
 	if kind == platform.KindGitHub {
 		floor += wireAttemptsPerRequest // one notification page
@@ -7042,7 +7056,7 @@ func (s *Syncer) syncProviderMRDetailExtras(
 func (s *Syncer) syncProviderMRReviewThreads(
 	ctx context.Context,
 	repo RepoRef,
-	_ int64,
+	mrID int64,
 	number int,
 	expectedRevision int64,
 ) (int, error) {
@@ -8574,7 +8588,6 @@ func (s *Syncer) drainDetailQueue(
 				cloneFetchOK = true
 			}
 		}
-
 		providerCalls := 0
 		if qi.Type == QueueItemPR {
 			providerCalls, err = s.fetchMRDetail(
@@ -9477,9 +9490,9 @@ func (s *Syncer) syncIssueForRepo(
 	return s.markClosedLinkedNotificationsDone(ctx)
 }
 
-// ArchiveItemSyncCost returns the worst-case wire-attempt allowance for the
-// existing full item sync. One logical request may spend a second attempt
-// after authentication refresh.
+// ArchiveItemSyncCost returns the provider-aware admission estimate for the
+// existing full item sync. Gitealike merge-request hydration may exceed this
+// estimate after admission because its complete dataset is committed atomically.
 func (s *Syncer) ArchiveItemSyncCost(kind platform.Kind, itemType db.ArchiveItemType) int {
 	if itemType == db.ArchiveItemTypeMergeRequest {
 		return detailWorstCaseAttemptCost(kind, QueueItemPR)

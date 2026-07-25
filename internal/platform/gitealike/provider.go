@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"go.kenn.io/middleman/internal/platform"
@@ -611,7 +612,9 @@ func (p *Provider) MergeMergeRequest(
 		ExpectedHeadSHA: expectedHeadSHA,
 	})
 	if err != nil {
-		if expectedHeadSHA != "" && isHeadMismatchConflict(err) {
+		if expectedHeadSHA != "" && p.mergeRejectedForStaleHead(
+			ctx, ref, number, expectedHeadSHA, err,
+		) {
 			return platform.MergeResult{}, &platform.Error{
 				Code:         platform.ErrCodeStaleState,
 				Provider:     p.kind,
@@ -623,6 +626,28 @@ func (p *Provider) MergeMergeRequest(
 		return platform.MergeResult{}, p.mapError(err)
 	}
 	return platform.MergeResult{Merged: result.Merged, SHA: result.SHA, Message: result.Message}, nil
+}
+
+func (p *Provider) mergeRejectedForStaleHead(
+	ctx context.Context,
+	ref platform.RepoRef,
+	number int,
+	expectedHeadSHA string,
+	err error,
+) bool {
+	if isHeadMismatchConflict(err) {
+		return true
+	}
+	var httpErr *HTTPError
+	if !errors.As(err, &httpErr) || httpErr == nil ||
+		(httpErr.StatusCode != http.StatusConflict && httpErr.StatusCode != http.StatusMethodNotAllowed) {
+		return false
+	}
+	current, readErr := p.transport.GetPullRequest(ctx, ref, number)
+	if readErr != nil || strings.TrimSpace(current.Head.SHA) == "" {
+		return false
+	}
+	return current.Head.SHA != expectedHeadSHA
 }
 
 func (p *Provider) ApproveMergeRequest(
@@ -912,6 +937,12 @@ func isHeadMismatchConflict(err error) bool {
 }
 
 func (p *Provider) mapError(err error) error {
+	return p.MapError(err)
+}
+
+// MapError attaches provider identity and stable platform classification to a
+// transport error returned by a concrete provider extension.
+func (p *Provider) MapError(err error) error {
 	return mapTransportError(p.kind, p.host, err)
 }
 
