@@ -236,34 +236,6 @@ test.describe("collapsible sidebar", () => {
     await expect(sidebar).not.toHaveClass(/kit-sidebar-layout__sidebar--collapsed/);
   });
 
-  test("header expand on non-list route after collapsing", async ({ page }) => {
-    await page.goto("/pulls");
-    await waitForPRList(page);
-
-    const sidebar = page.locator(".kit-sidebar-layout__sidebar");
-    await collapseToggle(sidebar).click();
-    await expect(sidebar).toHaveClass(/kit-sidebar-layout__sidebar--collapsed/);
-
-    // Navigate to board view (no sidebar strip).
-    await page.goto("/pulls/board");
-    await expect(page).toHaveURL(/\/pulls\/board$/);
-
-    // Header expand button should be visible.
-    const headerToggle = page.getByRole("button", {
-      name: "Expand sidebar",
-    });
-    await expect(headerToggle).toBeVisible();
-
-    // Click it to expand.
-    await headerToggle.click();
-
-    // Navigate back to list view and verify sidebar is expanded.
-    await page.goto("/pulls");
-    await waitForPRList(page);
-    const restoredSidebar = page.locator(".kit-sidebar-layout__sidebar");
-    await expect(restoredSidebar).not.toHaveClass(/kit-sidebar-layout__sidebar--collapsed/);
-  });
-
   test("keyboard shortcut toggles sidebar", async ({ page }) => {
     await page.goto("/pulls");
     await waitForPRList(page);
@@ -340,7 +312,7 @@ test.describe("collapsible sidebar", () => {
 
     const dropdown = await openCompactFilters(filterBar);
     await expect(dropdown.locator(".kit-filter-dropdown__section-title", { hasText: "PR" })).toBeVisible();
-    await expect(dropdown.locator(".kit-filter-dropdown__section-title", { hasText: "Kanban" })).toBeVisible();
+    await expect(dropdown.locator(".kit-filter-dropdown__section-title", { hasText: "Status" })).toBeVisible();
     await dropdown.locator(".kit-filter-dropdown__item", { hasText: "Closed" }).click();
     await expect(filterBar.page().locator(".state-note")).toBeVisible();
     await expect(dropdown).toBeVisible();
@@ -363,7 +335,7 @@ test.describe("collapsible sidebar", () => {
     await expect(filterBar.locator(".compact-filter-menu .kit-filter-dropdown__badge")).toHaveCount(0);
   });
 
-  test("pull compact filters apply PR attributes and kanban status against the real API", async ({ page }) => {
+  test("retired Board route falls back to the PR list with workflow status filters", async ({ page }) => {
     const server = await startIsolatedE2EServer();
     try {
       const stateResponse = await page.request.put(`${server.info.base_url}/api/v1/pulls/github/acme/widgets/1/state`, {
@@ -379,7 +351,10 @@ test.describe("collapsible sidebar", () => {
         .map((pull) => pull.Title);
       expect(expectedTitles).toEqual(["Add widget caching layer"]);
 
-      const filterBar = await setPersistedSidebarWidth(page, `${server.info.base_url}/pulls`, 395, waitForPRList);
+      const filterBar = await setPersistedSidebarWidth(page, `${server.info.base_url}/pulls/board`, 395, waitForPRList);
+      await expect(page).toHaveURL(/\/pulls\/board$/);
+      await expect(page.locator(".pull-list")).toBeVisible();
+      await expect(page.getByRole("button", { name: "Board", exact: true })).toHaveCount(0);
       await expectCompactFilterBar(filterBar);
 
       const dropdown = await openCompactFilters(filterBar);
