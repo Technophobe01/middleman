@@ -148,6 +148,75 @@ change what a field means. Provider-neutral persistence should receive the same
 semantic shape regardless of whether data came from GraphQL, REST, tags, or
 fallback repository listing.
 
+## Native Stack Rules
+
+- Confirmed native stacks claim and order their PRs first; branch inference always
+  runs afterward on every unclaimed PR, including when the preview is disabled,
+  incomplete, or failing. (`internal/stacks/detect.go::RunDetectionWithNativeStacks`)
+- Compare current PR hints with cached stack rows; scan `/stacks` newest-first
+  and stop once every target is found or passed.
+  (`internal/github/native_stack_sync.go::refreshGitHubNativeStackCache`)
+- Native projections use the bottom PR number as the neutral stack key; GitHub's
+  independent stack number remains cache-only.
+  (`internal/stacks/detect.go::persistStackChain`)
+- Disabling the preference synchronously restores branch-derived projections;
+  cached native rows remain dormant. The syncer's preference is the transition
+  authority — every server binds it to the boot config and reconciles on the
+  swap's own previous value, never on a separately read config snapshot, so
+  concurrent writers cannot reconcile twice or not at all. The swap happens under
+  cfgMu so the preference order matches the persisted order, and the
+  reconciliation that follows the unlock is committed-state work: it runs on the
+  server-lifecycle context, never the request's, and rechecks the current
+  preference under the projection lock so a disable that lost to a later enable
+  cannot replay over it. That recheck is only sound because the swap itself
+  takes the projection lock. Reconciliation covers every repository holding
+  cached native stacks, not just tracked ones: a repository dropped from config
+  still serves its stored pull requests and no sync will revisit it. Boot with
+  the preference off reconciles the same way, since the setting can change while
+  the daemon is stopped.
+  (`internal/server/native_stack_settings.go::reconcileGitHubNativeStackProjection`,
+  `internal/github/sync.go::SetPreferGitHubNativeStacks`)
+- The preview must not widen the blast radius of the list it rides on. The REST
+  hint decodes separately from the pull request, so a changed field shape costs
+  that hint and not the list, and hint-listing errors get the same
+  feature-disabled classification as the plain list so a repository with pull
+  requests off still enters the cooldown.
+  (`internal/github/native_stacks.go::decodeNativeStackHint`,
+  `internal/github/sync.go::ListOpenMergeRequestsWithNativeStackHints`)
+- Preview-only GraphQL fields must be absent from disabled query shapes;
+  `@include(false)` does not bypass schema validation on servers without those
+  fields. Schema rejection drops the fields for that host instead of abandoning
+  bulk fetch. (`internal/github/graphql.go::isNativeStackSchemaRejection`)
+- Confirmation reconciles against currently observed open-PR hints, never cached
+  or payload member state. Hints cannot attest to merged or closed members, so a
+  stack holding one is refetched on a bounded schedule and its confirmation ages
+  out rather than surviving every 304. The deadline is anchored to each stack's
+  own observation time and the earliest one wins, so re-confirming an old stack
+  during an unrelated refresh cannot extend its window.
+  (`internal/github/native_stack_sync.go::cachedStackMatchesCurrentHints`,
+  `internal/github/native_stack_sync.go::nativeStackObservationExpired`)
+- A pull request may belong to at most one projected stack. Member eviction
+  would silently shorten the stack written first and hide a preceding merge
+  blocker, and projecting one side of an overlap does the same to the other, so
+  an overlap makes the whole native projection ambiguous and branch inference
+  owns the repository for that pass.
+  (`internal/stacks/detect.go::RunDetectionWithNativeStacks`)
+- Only a query that requested the preview fields may replace stack hints;
+  a GraphQL shape that dropped them says nothing about membership and must leave
+  REST-derived hints intact. (`internal/github/graphql.go::RepoBulkResult`)
+- Only a refresh that resolved every target seeds the confirmation a later 304
+  reuses; an incomplete refresh evicts the pull-request list ETag so the next
+  sync retries. It also projects nothing for that pass, not the subset it did
+  confirm: an unresolved stack is invisible to the overlap scan, so a confirmed
+  stack could claim a pull request the unresolved one holds and hide its
+  predecessor. A target dropped without being persisted -- fetch failure,
+  malformed row, or disagreement with current hints -- makes the pass partial.
+  (`internal/github/native_stack_sync.go::refreshGitHubNativeStackCache`)
+- Native results carry the preference generation and project under the shared
+  stack-projection lock, so a sync that began while the preview was enabled
+  cannot reinstate it afterward.
+  (`internal/github/sync.go::dropStaleNativeStackResults`)
+
 ## Historical Archive Rules
 
 - The legacy closed-item backfill is retired; configured repositories seed durable archive discovery before sync cutover, with no cursor translation. (`internal/github/sync.go::SetReposWithContext`)
@@ -231,7 +300,10 @@ unsupported on every routed host. When adding an optional GitHub client
 interface, give `RoutedClient` a repository-routed method and add its
 `_ iface = (*RoutedClient)(nil)` assertion; carry owner and repository name in
 the interface so exact `repo:` routes pick their own credential
-(`internal/github/auth_router.go::RoutedClient.GetMarkdownImage`).
+(`internal/github/auth_router.go::RoutedClient.GetMarkdownImage`). List each
+optional interface in the routing guard so an unrouted owner-bearing method
+fails a test instead of silently disabling the feature
+(`internal/github/public_api_guard_test.go::TestRoutedClientExplicitlyImplementsOwnerBearingClientMethods`).
 
 A wire call issued during repository sync routes by repository even when the
 endpoint itself is host-scoped (`/users/{login}` for author display names).

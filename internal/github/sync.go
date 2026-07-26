@@ -298,6 +298,9 @@ type RepoSyncResult struct {
 	// partial per-item failure; nil on success and on hard repository
 	// failures.
 	PartialFailure *PartialSyncError
+	// GitHubNativeStacks is non-nil only when the preview setting participated
+	// in this repository sync. Completion hooks may project only these numbers.
+	GitHubNativeStacks *GitHubNativeStackSyncResult
 }
 
 // WatchedMR identifies a merge request to sync on a fast interval.
@@ -488,6 +491,7 @@ type Syncer struct {
 	branchActivityMu         sync.RWMutex
 	branchActivityRetention  time.Duration
 	branchActivityMaxCommits int
+	preferGitHubNativeStacks atomic.Bool
 	parallelism              atomic.Int32
 	runMu                    sync.Mutex
 	running                  atomic.Bool
@@ -541,6 +545,21 @@ type Syncer struct {
 	// instead of being skipped by a silent 304. Keyed by
 	// "host/owner/name". Cleared on the next successful sync.
 	failedRepos sync.Map
+	// nativeStackResults transfers per-repository preview confirmation from the
+	// index sync to the ordered completion hook without persisting run state.
+	nativeStackResults sync.Map // map[string]*GitHubNativeStackSyncResult
+	// nativeStackConfirmations pairs the in-memory PR-list ETag lifecycle with
+	// the last native stack set confirmed from that exact representation.
+	nativeStackConfirmations sync.Map // map[string][]int
+	// nativeStackGeneration advances on every native-stack preference change.
+	// A sync that captured an older generation must not project its native
+	// result, or an in-flight run could reinstate native ordering after the
+	// user turned the preview off.
+	nativeStackGeneration atomic.Uint64
+	// stackProjectionMu serializes stack projection between the sync
+	// completion hook and preference-change reconciliation so the last write
+	// always reflects the current preference.
+	stackProjectionMu sync.Mutex
 
 	featureCooldowns repositoryFeatureCooldowns
 
@@ -1543,6 +1562,40 @@ func (p *gitHubClientProvider) ListOpenMergeRequests(
 		out = append(out, mr)
 	}
 	return out, nil
+}
+
+func (p *gitHubClientProvider) ListOpenMergeRequestsWithNativeStackHints(
+	ctx context.Context,
+	ref platform.RepoRef,
+) ([]platform.MergeRequest, map[int]*NativeStackHint, error) {
+	nativeClient, ok := p.client.(NativeStackClient)
+	if !ok {
+		mrs, err := p.ListOpenMergeRequests(ctx, ref)
+		return mrs, nil, err
+	}
+	prs, hints, err := nativeClient.ListOpenPullRequestsWithNativeStackHints(
+		ctx, ref.Owner, ref.Name,
+	)
+	if err != nil {
+		// Same classification as ListOpenMergeRequests: a repository with pull
+		// requests disabled must enter the feature cooldown, not be retried as a
+		// hard failure every cycle just because the preview is enabled.
+		if disabledErr := githubRepositoryFeatureDisabled(
+			p.host, platform.RepositoryFeatureMergeRequests, err,
+		); disabledErr != nil {
+			return nil, nil, disabledErr
+		}
+		return nil, nil, err
+	}
+	out := make([]platform.MergeRequest, 0, len(prs))
+	for _, pr := range prs {
+		mr, err := platformgithub.NormalizePullRequest(ref, pr)
+		if err != nil {
+			return nil, nil, err
+		}
+		out = append(out, mr)
+	}
+	return out, hints, nil
 }
 
 func (p *gitHubClientProvider) GetMergeRequest(
@@ -2608,6 +2661,44 @@ func (s *Syncer) SetActiveMRWindow(d time.Duration) {
 	s.activeMRWindow = d
 }
 
+// SetPreferGitHubNativeStacks enables GitHub's read-only preview metadata for
+// subsequent repository syncs. Existing branch inference remains the fallback.
+// It returns the previous value so a caller reconciles on the transition it
+// actually performed: two concurrent config writers reading the preference from
+// their own config snapshots could otherwise both believe they turned it off.
+func (s *Syncer) SetPreferGitHubNativeStacks(enabled bool) bool {
+	// The swap takes the projection lock so a transition cannot land while a
+	// reconciliation or a sync hook is mid-projection. Rechecking the preference
+	// inside that lock is only sound if no swap can interleave with the check.
+	s.stackProjectionMu.Lock()
+	defer s.stackProjectionMu.Unlock()
+	previous := s.preferGitHubNativeStacks.Swap(enabled)
+	if previous != enabled {
+		// Invalidate results captured under the old preference before any
+		// caller reconciles projections.
+		s.nativeStackGeneration.Add(1)
+	}
+	if !enabled || previous {
+		return previous
+	}
+	s.nativeStackConfirmations.Range(func(key, _ any) bool {
+		s.nativeStackConfirmations.Delete(key)
+		return true
+	})
+	// A cached validator may describe a PR response fetched before native
+	// metadata was enabled. Force one fresh list response so the first enabled
+	// sync can seed hints; later syncs retain the normal ETag optimization.
+	for _, repo := range s.TrackedRepos() {
+		if repoPlatform(repo) != platform.KindGitHub {
+			continue
+		}
+		if client, ok := s.optionalGitHubClientFor(repo); ok {
+			client.InvalidateListETagsForRepo(repo.Owner, repo.Name, "pulls")
+		}
+	}
+	return previous
+}
+
 func (s *Syncer) watchSettings() (time.Duration, time.Duration) {
 	s.watchMu.Lock()
 	defer s.watchMu.Unlock()
@@ -2735,6 +2826,26 @@ func (s *Syncer) SetOnNotificationSyncComplete(fn func()) {
 // SetFetchers registers fallback GitHub GraphQL fetchers keyed by platform host.
 func (s *Syncer) SetFetchers(fetchers map[string]*GraphQLFetcher) {
 	s.fetchers = fetchers
+}
+
+// PrefersGitHubNativeStacks reports the preference currently in force. Callers
+// reconciling a past transition recheck it under the projection lock: a newer
+// transition may have already landed and projected, and replaying the older
+// decision would overwrite it.
+func (s *Syncer) PrefersGitHubNativeStacks() bool {
+	return s.preferGitHubNativeStacks.Load()
+}
+
+// SetClock replaces the syncer's time source. Cache aging bounds -- notably the
+// native-stack observation window -- span hours, so callers that need to observe
+// those transitions inject a clock instead of waiting. The field is read without
+// synchronization on the sync path, so this must not be called while a sync is
+// running.
+func (s *Syncer) SetClock(now func() time.Time) {
+	if now == nil {
+		return
+	}
+	s.now = now
 }
 
 // SetGitHubRouters registers configuration-bounded credential routers keyed by
@@ -4267,7 +4378,12 @@ func (s *Syncer) runWorker(
 		}
 		repoName := repo.Owner + "/" + repo.Name
 		slog.Info("syncing repo", "repo", repoName)
+		nativeResultKey := repoFailKey(repo)
+		s.nativeStackResults.Delete(nativeResultKey)
 		err := s.syncRepo(ctx, repo)
+		if nativeResult, ok := s.nativeStackResults.LoadAndDelete(nativeResultKey); ok {
+			state.results[item.index].GitHubNativeStacks = nativeResult.(*GitHubNativeStackSyncResult)
+		}
 		if err != nil {
 			// Bail without counting this repo only when the
 			// *run* context itself is canceled and the error
@@ -4548,7 +4664,10 @@ dispatch:
 	slog.Info("sync complete", "repos", total)
 
 	if s.onSyncCompleted != nil {
-		s.onSyncCompleted(results)
+		s.RunUnderStackProjection(func() {
+			s.dropStaleNativeStackResults(results)
+			s.onSyncCompleted(results)
+		})
 	}
 
 	s.publishStatus(&SyncStatus{
@@ -5469,6 +5588,10 @@ func (s *Syncer) indexSyncRepo(
 	var failedScope failScope
 	var disabledScope failScope
 
+	preferNativeStacks := s.preferGitHubNativeStacks.Load() &&
+		repoPlatform(repo) == platform.KindGitHub
+	var nativeStackHints map[int]*NativeStackHint
+
 	prListUnchanged := false
 	var mrProbe repositoryFeatureProbe
 	mrProbeDue := false
@@ -5492,7 +5615,16 @@ func (s *Syncer) indexSyncRepo(
 			return fmt.Errorf("resolve merge request reader for %s/%s: %w", repo.Owner, repo.Name, err)
 		}
 		mrProviderAttempted = true
-		openMRs, err := mrReader.ListOpenMergeRequests(ctx, platformRef)
+		var openMRs []platform.MergeRequest
+		if nativeReader, ok := mrReader.(interface {
+			ListOpenMergeRequestsWithNativeStackHints(
+				context.Context, platform.RepoRef,
+			) ([]platform.MergeRequest, map[int]*NativeStackHint, error)
+		}); preferNativeStacks && ok {
+			openMRs, nativeStackHints, err = nativeReader.ListOpenMergeRequestsWithNativeStackHints(ctx, platformRef)
+		} else {
+			openMRs, err = mrReader.ListOpenMergeRequests(ctx, platformRef)
+		}
 		mrListBlocked := false
 		if err != nil {
 			// 304 Not Modified means the open-PR list is byte-identical
@@ -5528,7 +5660,7 @@ func (s *Syncer) indexSyncRepo(
 				s.shouldUseBulkGraphQLForMRs(ctx, repo, repoID, len(openMRs)) {
 				if backoff, _ := fetcher.ShouldBackoff(); !backoff {
 					result, gqlErr := fetcher.FetchRepoPRs(
-						ctx, repo.Owner, repo.Name,
+						ctx, repo.Owner, repo.Name, preferNativeStacks,
 					)
 					if gqlErr != nil {
 						if s.recordRepositoryFeatureDisabled(
@@ -5543,6 +5675,12 @@ func (s *Syncer) indexSyncRepo(
 							)
 						}
 					} else {
+						// Only a query that asked for the preview fields can
+						// speak for stack membership. A GraphQL fallback that
+						// dropped them must leave REST-derived hints intact.
+						if preferNativeStacks && result.NativeStacksQueried {
+							nativeStackHints = nativeStackHintsFromBulk(result)
+						}
 						if err := s.doSyncRepoGraphQL(
 							ctx, repo, repoID, result, cloneFetchOK,
 						); err != nil {
@@ -5579,6 +5717,12 @@ func (s *Syncer) indexSyncRepo(
 				}
 			}
 		}
+	}
+	if preferNativeStacks && failedScope&failMR == 0 {
+		nativeResult := s.refreshGitHubNativeStackCache(
+			ctx, repo, repoID, nativeStackHints, prListUnchanged,
+		)
+		s.nativeStackResults.Store(repoFailKey(repo), nativeResult)
 	}
 
 	// Index issues — ETag-gated, with GraphQL when available.

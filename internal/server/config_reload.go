@@ -420,6 +420,9 @@ func (s *Server) applyConfigChange(ctx context.Context) configChangedEvent {
 
 	s.cfgMu.Lock()
 	*s.cfg = cloneReloadedConfig(newCfg)
+	nativeStacksPrevious := s.swapGitHubNativeStackPreferenceLocked(
+		newCfg.PullRequests.PreferGitHubNativeStacks,
+	)
 	s.refreshRuntimeTargetsLocked()
 	if s.runtime != nil {
 		s.runtime.UpdateStripEnvVars(s.updateRuntimeStripEnvVarsLocked(newCfg))
@@ -442,6 +445,10 @@ func (s *Server) applyConfigChange(ctx context.Context) configChangedEvent {
 	if s.docsAPI != nil {
 		s.docsAPI.ReplaceFolders(newCfg.DocFolders)
 	}
+	s.reconcileGitHubNativeStackProjection(
+		nativeStacksPrevious, newCfg.PullRequests.PreferGitHubNativeStacks,
+	)
+
 	slog.Info(
 		"config reload applied",
 		"path", s.cfgPath,
