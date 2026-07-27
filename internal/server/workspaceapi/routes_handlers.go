@@ -1487,7 +1487,36 @@ func (s *Handler) toWorkspaceResponse(
 	ctx context.Context,
 	summary *db.WorkspaceSummary,
 ) workspaceResponse {
-	return s.workspaceResponseWithEnrichment(ctx, summary).response
+	resp := s.workspaceResponseWithEnrichment(ctx, summary).response
+	s.applyAgentActivity(&resp, summary)
+	return resp
+}
+
+func (s *Handler) applyAgentActivity(
+	resp *workspaceResponse,
+	summary *db.WorkspaceSummary,
+) {
+	if s.agentActivity == nil || s.runtime == nil || resp == nil || summary == nil {
+		return
+	}
+	liveSessionKeys := make([]string, 0)
+	for _, session := range s.runtime.ListSessions(summary.ID) {
+		if session.Kind == localruntime.LaunchTargetAgent &&
+			(session.Status == localruntime.SessionStatusRunning ||
+				session.Status == localruntime.SessionStatusStarting) {
+			liveSessionKeys = append(liveSessionKeys, session.Key)
+		}
+	}
+	snapshot, ok := s.agentActivity.SnapshotForWorkspace(
+		summary.WorktreePath, liveSessionKeys,
+	)
+	if !ok {
+		return
+	}
+	state := string(snapshot.State)
+	updatedAt := snapshot.UpdatedAt.UTC().Format(time.RFC3339)
+	resp.AgentState = &state
+	resp.AgentStateUpdatedAt = &updatedAt
 }
 
 // Response returns the cached public DTO for a persisted workspace summary.
@@ -2023,6 +2052,7 @@ func (s *Handler) stopWorkspaceRuntimeSession(
 				)
 			}
 			if stopped {
+				s.removeAgentActivityRuntimeSession(input.SessionKey)
 				s.invalidateWorkspaceEnrichment(summary.ID)
 				return nil, nil
 			}
@@ -2035,6 +2065,7 @@ func (s *Handler) stopWorkspaceRuntimeSession(
 	); err != nil {
 		return nil, httpapi.Internal("forget runtime session: " + err.Error())
 	}
+	s.removeAgentActivityRuntimeSession(input.SessionKey)
 	s.invalidateWorkspaceEnrichment(summary.ID)
 	return nil, nil
 }
@@ -2256,7 +2287,11 @@ func (s *Handler) deleteWorkspace(
 		ctx, input.ID, input.Force,
 		func(stopCtx context.Context) {
 			if s.runtime != nil {
+				sessions := s.runtime.ListSessions(input.ID)
 				s.runtime.StopWorkspace(stopCtx, input.ID)
+				for _, session := range sessions {
+					s.removeAgentActivityRuntimeSession(session.Key)
+				}
 			}
 		},
 	)

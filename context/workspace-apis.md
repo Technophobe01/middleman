@@ -233,6 +233,17 @@ Before writing, middleman ignores the generated path through the worktree's
 private exclude file, not tracked `.gitignore`. If the path would remain
 visible to Git, the write fails.
 
+## Agent Activity Hooks
+
+- User-level hooks are single-target: install merges, uninstall preserves other
+  handlers, and the last install wins (`internal/agentactivity/integration.go::Install`).
+- Matching live runtime/worktree reports use approval, input, working, idle priority;
+  latest state expires after 30 minutes or session exit, then tmux resumes (`internal/agentactivity/`, `internal/server/workspaceapi/lifecycle.go::Handler.HandleRuntimeSessionExit`).
+- Hook installs require absolute data roots and update symlink targets instead of replacing
+  config links; report/worktree matching uses canonical filesystem paths (`cmd/middleman/main.go::runAgentHookInstall`,
+  `internal/agentactivity/integration.go::writeJSONObject`, `internal/agentactivity/store.go::canonicalWorkspacePath`).
+- The active sidebar polls every five seconds, and hook receipt fails open (`frontend/src/lib/components/terminal/WorkspaceListSidebar.svelte::onMount`, `cmd/middleman/main.go::runAgentHookReceiver`).
+
 ## Diff Scopes
 
 Workspace diffs compare against local `HEAD`, the pushed branch, or a merge
