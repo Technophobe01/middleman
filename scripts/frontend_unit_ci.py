@@ -1,0 +1,234 @@
+"""Run frontend unit tests with best-effort CI diagnostics."""
+
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Sequence
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+CGROUP_ROOT = Path("/sys/fs/cgroup")
+TEST_COMMAND = ("../node_modules/.bin/vp", "test", "run", "--project", "unit")
+VERSION_COMMANDS = (
+    ("node", "--version"),
+    ("bun", "--version"),
+    ("./node_modules/.bin/vp", "--version"),
+)
+CGROUP_METRICS = ("memory.current", "memory.peak", "memory.max", "memory.events")
+
+
+def _status(returncode: int) -> int:
+    return 128 - returncode if returncode < 0 else returncode
+
+
+def _disable_console_output() -> None:
+    try:
+        stdout_fd = sys.stdout.fileno()
+        null_fd = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(null_fd, stdout_fd)
+        finally:
+            os.close(null_fd)
+    except (AttributeError, OSError, ValueError):
+        sys.stdout = None
+
+
+def _run_direct(command: Sequence[str], cwd: Path) -> int:
+    try:
+        returncode = subprocess.run(command, cwd=cwd, check=False).returncode
+        return _status(returncode)
+    except FileNotFoundError:
+        return 127
+    except PermissionError:
+        return 126
+
+
+def _prepare_diagnostics(diagnostics_dir: Path) -> tuple[Path, Path, Path]:
+    diagnostics_dir.mkdir(parents=True, exist_ok=True)
+    node_reports = diagnostics_dir / "node-reports"
+    node_reports.mkdir(exist_ok=True)
+    vitest_log = diagnostics_dir / "vitest.log"
+    versions_file = diagnostics_dir / "versions.txt"
+    vitest_log.touch()
+    versions_file.touch()
+    return node_reports, vitest_log, versions_file
+
+
+def _record_versions(commands: Sequence[Sequence[str]], cwd: Path, destination: Path) -> None:
+    try:
+        with destination.open("w") as versions_file:
+            for command in commands:
+                try:
+                    result = subprocess.run(
+                        command,
+                        cwd=cwd,
+                        check=False,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                    )
+                    output = result.stdout
+                except OSError:
+                    output = f"{' '.join(command)}: unavailable\n"
+                versions_file.write(output)
+    except OSError:
+        return
+
+
+def _capture_cgroup_metrics(cgroup_root: Path, destination: Path) -> None:
+    try:
+        with destination.open("w") as metrics_file:
+            for metric in CGROUP_METRICS:
+                try:
+                    value = (cgroup_root / metric).read_text()
+                except OSError:
+                    continue
+                metrics_file.write(f"== {metric} ==\n{value}")
+                if not value.endswith("\n"):
+                    metrics_file.write("\n")
+    except OSError:
+        return
+
+
+def _timing_snapshot() -> tuple[float, float, float] | None:
+    try:
+        process_times = os.times()
+        return (
+            time.monotonic(),
+            process_times.children_user,
+            process_times.children_system,
+        )
+    except (AttributeError, OSError):
+        return None
+
+
+def _record_timing(
+    destination: Path, started: tuple[float, float, float] | None
+) -> None:
+    if started is None:
+        return
+    finished = _timing_snapshot()
+    if finished is None:
+        return
+    try:
+        destination.write_text(
+            "\n".join(
+                (
+                    f"Elapsed wall time (seconds): {finished[0] - started[0]:.3f}",
+                    f"Child user CPU time (seconds): {finished[1] - started[1]:.3f}",
+                    f"Child system CPU time (seconds): {finished[2] - started[2]:.3f}",
+                    "",
+                )
+            )
+        )
+    except OSError:
+        return
+
+
+def _diagnostic_node_options(node_reports: Path) -> str:
+    return " ".join(
+        (
+            "--report-on-fatalerror",
+            "--report-uncaught-exception",
+            "--report-exclude-env",
+            f"--report-directory={node_reports.resolve()}",
+        )
+    )
+
+
+def run_frontend_unit(
+    *,
+    repo_root: Path = REPO_ROOT,
+    diagnostics_dir: Path | None = None,
+    cgroup_root: Path = CGROUP_ROOT,
+    test_command: Sequence[str] = TEST_COMMAND,
+    version_commands: Sequence[Sequence[str]] = VERSION_COMMANDS,
+) -> int:
+    frontend_dir = repo_root / "frontend"
+    diagnostics_dir = diagnostics_dir or repo_root / "tmp" / "frontend-unit-diagnostics"
+
+    try:
+        node_reports, vitest_log, versions_file = _prepare_diagnostics(diagnostics_dir)
+    except OSError as error:
+        print(
+            f"warning: frontend diagnostics unavailable ({error}); running tests directly",
+            file=sys.stderr,
+        )
+        return _run_direct(test_command, frontend_dir)
+
+    _record_versions(version_commands, frontend_dir, versions_file)
+    _capture_cgroup_metrics(cgroup_root, diagnostics_dir / "cgroup-before.txt")
+
+    environment = os.environ.copy()
+    existing_options = environment.get("NODE_OPTIONS", "")
+    environment["NODE_OPTIONS"] = " ".join(
+        option
+        for option in (existing_options, _diagnostic_node_options(node_reports))
+        if option
+    )
+
+    try:
+        timing_started = _timing_snapshot()
+        try:
+            process = subprocess.Popen(
+                test_command,
+                cwd=frontend_dir,
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except FileNotFoundError:
+            return 127
+        except PermissionError:
+            return 126
+
+        try:
+            log_file = vitest_log.open("w", encoding="utf-8")
+        except OSError:
+            log_file = None
+
+        assert process.stdout is not None
+        console_available = True
+        try:
+            for line in process.stdout:
+                if console_available:
+                    try:
+                        sys.stdout.write(line)
+                        sys.stdout.flush()
+                    except (OSError, UnicodeError, ValueError):
+                        _disable_console_output()
+                        console_available = False
+                if log_file is not None:
+                    try:
+                        log_file.write(line)
+                        log_file.flush()
+                    except OSError:
+                        try:
+                            log_file.close()
+                        except OSError:
+                            pass
+                        log_file = None
+        finally:
+            if log_file is not None:
+                try:
+                    log_file.close()
+                except OSError:
+                    pass
+            returncode = process.wait()
+            _record_timing(diagnostics_dir / "time.txt", timing_started)
+        return _status(returncode)
+    finally:
+        _capture_cgroup_metrics(cgroup_root, diagnostics_dir / "cgroup-after.txt")
+
+
+def main() -> int:
+    return run_frontend_unit()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

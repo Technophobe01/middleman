@@ -53,6 +53,8 @@ jobs:
               - package.json
               - bun.lock
               - vite.config.ts
+              - scripts/frontend_unit_ci.py
+              - scripts/test_frontend_unit_ci.py
             rust:
               - Cargo.toml
               - Cargo.lock
@@ -170,6 +172,7 @@ jobs:
       - name: Setup Vite+
         uses: voidzero-dev/setup-vp@2dec1e33f4ab2c6d5bce1b0c4607961bb1a3f7a1 # v1
         with:
+          version: "0.2.3"
           node-version-file: package.json
           cache: false
           run-install: true
@@ -289,12 +292,23 @@ jobs:
       - name: Setup Vite+
         uses: voidzero-dev/setup-vp@2dec1e33f4ab2c6d5bce1b0c4607961bb1a3f7a1 # v1
         with:
+          version: "0.2.3"
           node-version-file: package.json
           cache: false
           run-install: true
 
       - name: Run frontend unit tests
-        run: cd frontend && ../node_modules/.bin/vp test run --project unit
+        run: python3 scripts/frontend_unit_ci.py
+
+      - name: Upload frontend unit diagnostics
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: frontend-unit-diagnostics
+          path: tmp/frontend-unit-diagnostics/
+          if-no-files-found: warn
+          retention-days: 7
 
   pty-windows:
     name: PTY tests (windows)
@@ -422,6 +436,7 @@ jobs:
       - name: Setup Vite+
         uses: voidzero-dev/setup-vp@2dec1e33f4ab2c6d5bce1b0c4607961bb1a3f7a1 # v1
         with:
+          version: "0.2.3"
           node-version-file: package.json
           cache: false
           run-install: true
@@ -611,6 +626,7 @@ jobs:
       - name: Setup Vite+
         uses: voidzero-dev/setup-vp@2dec1e33f4ab2c6d5bce1b0c4607961bb1a3f7a1 # v1
         with:
+          version: "0.2.3"
           node-version-file: package.json
           cache: false
           run-install: true

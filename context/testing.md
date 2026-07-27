@@ -123,6 +123,12 @@ and materialize `node_modules` from the lockfile before invoking baked `vp`
 (`.github/workflows/ci.yml::ensure_playwright_image`, `.github/docker/playwright/Dockerfile:3`).
 Frontend unit tests use the runner's 14 guaranteed cores; the previous single-worker
 cap was for the retired memory-constrained runner (`frontend/vite.config.ts::resolveUnitTestWorkers`).
+When a frontend unit run exits without a summary, download the
+`frontend-unit-diagnostics` artifact: it contains any available Vitest output,
+Python-collected wall and child CPU time, Node fatal reports, and pre/post
+cgroup memory counters. If the exit is silent again, rerun it once with
+repository variable `ACTIONS_RUNNER_DEBUG=true`, download the runner diagnostic
+logs, then remove that variable.
 
 Mock Playwright shares one Vite dev server, so cap CI workers at guaranteed cores;
 burst-level worker counts starve navigation and reload requests into false 30-second
@@ -329,6 +335,12 @@ trigger, treat the HTTP 202 and DB row timestamps as intermediate observations.
 `TriggerRun` is non-blocking and single-flight; wait for `/api/v1/sync/status`
 to report `running=false` with a `last_run_at` before issuing the next trigger,
 or the next trigger can race the still-running sync and be skipped.
+
+A production timeout exercised by a test also bounds dialling the outbound
+request, so a sub-100ms value lets a loaded runner abandon the probe before the
+fake server ever receives it. Give such timeouts headroom over scheduling noise
+and await the fake's observation instead of reading its counter synchronously
+(`internal/server/e2etest/settings_test.go::awaitPeerRequest`).
 
 Workspace fixtures with background monitors must seed observer inputs before
 `server.New`; the pushed-head observer runs an immediate first pass and can
