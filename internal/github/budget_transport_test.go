@@ -4,10 +4,14 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/middleman/internal/platform"
 )
 
 func TestBudgetTransport_CountsSyncContext(t *testing.T) {
@@ -30,6 +34,82 @@ func TestBudgetTransport_CountsSyncContext(t *testing.T) {
 
 	assert.Equal(1, budget.Spent())
 	assert.Zero(budget.ArchiveSpent())
+}
+
+func TestBudgetTransportReservesBeforeConcurrentProviderIO(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	budget := NewSyncBudget(1)
+	var providerCalls atomic.Int32
+	transport := WrapSyncBudgetTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		providerCalls.Add(1)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       http.NoBody,
+			Header:     make(http.Header),
+			Request:    req,
+		}, nil
+	}), budget)
+
+	const attempts = 20
+	start := make(chan struct{})
+	errors := make(chan error, attempts)
+	var workers sync.WaitGroup
+	for range attempts {
+		workers.Go(func() {
+			<-start
+			req, err := http.NewRequestWithContext(
+				WithSyncBudget(t.Context()), http.MethodGet,
+				"https://api.github.com/repos/acme/widget", nil,
+			)
+			if err != nil {
+				errors <- err
+				return
+			}
+			_, err = transport.RoundTrip(req)
+			errors <- err
+		})
+	}
+	close(start)
+	workers.Wait()
+	close(errors)
+
+	exhausted := 0
+	for err := range errors {
+		if err != nil {
+			require.ErrorIs(err, platform.ErrSyncBudgetExhausted)
+			exhausted++
+		}
+	}
+	assert.Equal(attempts-1, exhausted)
+	assert.Equal(int32(1), providerCalls.Load())
+	assert.Equal(1, budget.Spent())
+	assert.Zero(budget.Remaining())
+}
+
+func TestBudgetTransportArchiveReservationUpdatesBothCountersAtomically(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	budget := NewSyncBudget(1)
+	transport := WrapSyncBudgetTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       http.NoBody,
+			Header:     make(http.Header),
+			Request:    req,
+		}, nil
+	}), budget)
+	req, err := http.NewRequestWithContext(
+		WithArchiveSyncBudget(t.Context()), http.MethodGet,
+		"https://api.github.com/repos/acme/widget/issues/1", nil,
+	)
+	require.NoError(err)
+	_, err = transport.RoundTrip(req)
+	require.NoError(err)
+
+	assert.Equal(1, budget.Spent())
+	assert.Equal(1, budget.ArchiveSpent())
+	assert.Zero(budget.Remaining())
 }
 
 func TestBudgetTransport_CountsArchiveContextSeparately(t *testing.T) {
@@ -159,4 +239,46 @@ func TestWithSyncBudget_PreservesExistingValues(t *testing.T) {
 	assert.Equal(t, "hello", ctx.Value(customKey{}))
 	_, ok := ctx.Value(syncBudgetKey{}).(bool)
 	assert.True(t, ok)
+}
+
+// The local ceiling refuses counted requests before any wire attempt, so a
+// provider response can never arrive to release an exhausted budget. Recovery
+// must therefore come from the budget's own window rollover.
+func TestBudgetTransportRecoversAfterWindowWithoutProviderResponse(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	budget := NewSyncBudget(1)
+	clock := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
+	budget.now = func() time.Time { return clock }
+	budget.windowStart = clock
+
+	var providerCalls atomic.Int32
+	transport := WrapSyncBudgetTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		providerCalls.Add(1)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       http.NoBody,
+			Header:     make(http.Header),
+			Request:    req,
+		}, nil
+	}), budget)
+
+	send := func() error {
+		req, err := http.NewRequestWithContext(
+			WithSyncBudget(t.Context()), http.MethodGet,
+			"https://api.github.com/repos/acme/widget", nil,
+		)
+		require.NoError(err)
+		_, err = transport.RoundTrip(req)
+		return err
+	}
+
+	require.NoError(send())
+	require.ErrorIs(send(), platform.ErrSyncBudgetExhausted)
+	assert.Equal(int32(1), providerCalls.Load())
+
+	clock = clock.Add(time.Hour)
+
+	require.NoError(send())
+	assert.Equal(int32(2), providerCalls.Load())
 }

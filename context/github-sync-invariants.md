@@ -336,6 +336,59 @@ removing a bounded route requires restart. Added, removed, or descriptor-changed
 bounded router keeps its boot descriptor until restart so it cannot lose auth or
 move to a different identity while retaining the old trackers and budget.
 
+## Credential-Aware Quota
+
+Provider quota is keyed by `IdentityKey` and REST/GraphQL resource, so a user
+response never overwrites an App installation pool
+(`internal/github/quota.go::QuotaRegistry`).
+
+- Each client transport chain carries a fixed identity: reads spend the route's
+  read identity, mutations and notifications its write identity
+  (`internal/github/client.go::WithQuotaAccounting`).
+- Background admission gates on the routed credential's own reserve; the local
+  `sync_budget_per_hour` ceiling is separate and is reported apart from provider
+  quota (`internal/github/sync.go::backgroundQuotaAvailability`).
+- There is one background reserve check, and it runs on the snapshot cadence
+  (`internal/github/sync.go::backgroundReserveExhausted`). The verdict is cached
+  per credential, resource, and foreground/background mode, recomputed at most
+  once per `rateLimitSnapshotRefreshInterval`, and dropped when a `/rate_limit`
+  refresh replaces the numbers it was derived from. Repository admission,
+  workers, both drains, bulk GraphQL, and notification acknowledgements all read
+  that one verdict. Do not add per-repository, per-queue-item, or per-page
+  reserve checks: the provider quota only moves when the snapshot refresh moves
+  it, so re-deriving more often mostly re-reads the same numbers, and the
+  divergent costs and fallbacks that grew up around those sites were the bug.
+- A credential that crosses its reserve inside a cadence window keeps spending
+  until the window turns. That is deliberate: the reserve is a soft buffer held
+  for foreground work, and the hard guard is the local hourly ceiling, enforced
+  per wire attempt in `budgetTransport`.
+- Gate background eligibility on REST only. Bulk GraphQL is an optimization with
+  a REST fallback, so requiring GraphQL capacity stops repositories that could
+  still sync (`internal/github/sync.go::repoEligibility`). `bulkGraphQLAllowed`
+  applies the GraphQL reserve where it is spent, and answers from the credential
+  verdict whenever that pool is known — falling through to the fetcher's tracker
+  would consult a host-wide signal both credentials on a split-auth host feed.
+- The quota registry is in-memory, so the check falls back to the rate tracker's
+  SQLite-backed state when a credential is unobserved; otherwise a restart
+  admits background work against a reserve the persisted state says is spent
+  (`internal/github/sync.go::persistedReserve`). An elapsed persisted reset
+  window says nothing and must not gate.
+- The local ceiling rolls its hourly window on its own clock and must never need
+  a provider response to reset: an exhausted ceiling refuses counted requests
+  before any wire attempt, so a reset driven only by response headers or
+  rate-tracker rollover wedges background sync for good
+  (`internal/github/budget.go::rollLocked`).
+- Reservations carry the window they were made in and refunds are dropped once
+  that window elapses, so a 304 arriving after a roll cannot raise the new
+  window's ceiling (`internal/github/budget.go::Refund`).
+- Notification reads and queued ack propagation resolve to the write identity,
+  so they gate on that credential's REST pool even when repository reads run on
+  an App token. Gate on the operation's worst-case request count, not one
+  request (`internal/github/notifications_sync.go::ensureNotificationBudget`).
+- A scheduling decision must read the pool of the credential that will perform
+  the work; a host-wide tracker lets one credential's exhaustion suppress
+  another's (`internal/github/sync.go::bulkGraphQLAllowed`).
+
 ## GitHub App Manifest Flow
 
 `middleman-github-app create` uses GitHub's App Manifest flow so sync can read

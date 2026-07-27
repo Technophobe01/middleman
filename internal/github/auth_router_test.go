@@ -868,9 +868,9 @@ func TestSyncerNotificationAdmissionRejectsMissingWriteIdentity(t *testing.T) {
 	require.NoError(err)
 	syncer := &Syncer{routers: map[string]*HostRouter{"github.com": router}}
 
-	err = syncer.ensureNotificationPageBudget(
+	err = syncer.ensureNotificationBudget(
 		RepoRef{Owner: "org-app", Name: "one", PlatformHost: "github.com"},
-		&routeRecordingClient{},
+		&routeRecordingClient{}, 1,
 	)
 	require.Error(err)
 	require.ErrorContains(err, "no startup-resolved write identity")
@@ -888,7 +888,8 @@ func TestSyncerNotificationAdmissionUsesRepositoryWriteIdentity(t *testing.T) {
 	require.NoError(err)
 	writeRT := NewRateTracker(database, "github.com", "user:123", "rest")
 	writeBudget := NewSyncBudget(1)
-	writeBudget.Spend(1)
+	writeBudgetWindow, spent := writeBudget.TrySpend(1)
+	require.True(spent)
 	syncer := &Syncer{
 		routers: map[string]*HostRouter{"github.com": router},
 		writeRateTrackers: map[string]*RateTracker{
@@ -899,20 +900,20 @@ func TestSyncerNotificationAdmissionUsesRepositoryWriteIdentity(t *testing.T) {
 		},
 	}
 
-	err = syncer.ensureNotificationPageBudget(
+	err = syncer.ensureNotificationBudget(
 		RepoRef{Owner: "org-a", Name: "one", PlatformHost: "github.com"},
-		&routeRecordingClient{},
+		&routeRecordingClient{}, 1,
 	)
 	require.Error(err)
 	require.ErrorContains(err, "sync budget exhausted")
 
-	writeBudget.Refund(1)
+	writeBudget.Refund(writeBudgetWindow, 1)
 	writeRT.UpdateFromRate(Rate{
 		Limit: 5000, Remaining: 0, Reset: time.Now().Add(time.Hour),
 	})
-	err = syncer.ensureNotificationPageBudget(
+	err = syncer.ensureNotificationBudget(
 		RepoRef{Owner: "org-a", Name: "one", PlatformHost: "github.com"},
-		&routeRecordingClient{marker: "fallback"},
+		&routeRecordingClient{marker: "fallback"}, 1,
 	)
 	require.Error(err)
 	require.ErrorContains(err, "rate reserve exhausted")
@@ -1106,11 +1107,10 @@ func TestSyncerAppPauseDoesNotDelayPATIdentityOnSameHost(t *testing.T) {
 		rateTrackers: map[string]*RateTracker{appBucket: appRT, userBucket: userRT},
 	}
 
-	appKey, err := syncer.bucketKeyForRepo(RepoRef{Owner: "org-app", Name: "one", PlatformHost: "github.com"}, false)
-	require.NoError(err)
-	patKey, err := syncer.bucketKeyForRepo(RepoRef{Owner: "org-pat", Name: "two", PlatformHost: "github.com"}, false)
-	require.NoError(err)
-	eligible := syncer.hostEligibility([]string{appKey, patKey}, map[string]time.Time{})
+	eligible := syncer.repoEligibility([]RepoRef{
+		{Owner: "org-app", Name: "one", PlatformHost: "github.com"},
+		{Owner: "org-pat", Name: "two", PlatformHost: "github.com"},
+	}, map[string]time.Time{})
 	assert.False(eligible[appBucket])
 	assert.True(eligible[userBucket])
 }
