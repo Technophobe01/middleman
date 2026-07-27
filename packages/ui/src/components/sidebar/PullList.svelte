@@ -201,12 +201,20 @@
     },
     {
       title: "Status",
-      items: kanbanFilterOptions.map((option) => ({
-        id: `kanban-${option.value}`,
-        label: option.label,
-        active: pulls.getKanbanStatusFilters().includes(option.value),
-        onSelect: () => pulls.toggleKanbanStatusFilter(option.value),
-      })),
+      items: [
+        ...kanbanFilterOptions.map((option) => ({
+          id: `kanban-${option.value}`,
+          label: option.label,
+          active: pulls.getKanbanStatusFilters().includes(option.value),
+          onSelect: () => pulls.toggleKanbanStatusFilter(option.value),
+        })),
+        {
+          id: "has-workspace",
+          label: "Has workspace",
+          active: pulls.getAttributeFilters().includes("has_workspace"),
+          onSelect: () => pulls.toggleAttributeFilter("has_workspace"),
+        },
+      ],
     },
     {
       title: "Visibility",
