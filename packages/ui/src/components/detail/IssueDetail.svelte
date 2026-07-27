@@ -546,6 +546,7 @@
     type?: string;
     title?: string;
     detail?: string;
+    details?: Record<string, unknown>;
     errors?: APIErrorDetail[] | null;
   };
 
@@ -553,6 +554,7 @@
     existingBranch: string;
     suggestedBranch: string;
     branchInput: string;
+    existingDirectory: boolean;
     error: string | null;
   };
 
@@ -647,6 +649,8 @@
       branchInput:
         suggestedBranch
         || `${existingBranch || issueWorkspaceBranch()}-2`,
+      existingDirectory:
+        error.details?.existingDirectory === true,
       error: null,
     };
   }
@@ -654,6 +658,7 @@
   type CreateWorkspaceOptions = {
     gitHeadRef?: string;
     reuseExistingBranch?: boolean;
+    reuseExistingDirectory?: boolean;
     fromConflictDialog?: boolean;
   };
 
@@ -729,6 +734,11 @@
                   reuse_existing_branch: true,
                 }
               : {}),
+            ...(options.reuseExistingDirectory
+              ? {
+                  reuse_existing_directory: true,
+                }
+              : {}),
           },
         },
       );
@@ -740,6 +750,15 @@
           requestError as APIError,
         );
         if (conflict) {
+          if (
+            options.fromConflictDialog
+            && options.reuseExistingBranch
+            && branchConflict
+          ) {
+            branchConflict.error =
+              "This branch is already checked out in another worktree. Create a new branch instead.";
+            return;
+          }
           branchConflict = conflict;
           return;
         }
@@ -748,6 +767,10 @@
           requestError.detail
           ?? requestError.title
           ?? "failed to create workspace";
+        if (options.fromConflictDialog && branchConflict) {
+          branchConflict.error = message;
+          return;
+        }
         throw new Error(
           message,
         );
@@ -1433,63 +1456,103 @@
     {#if branchConflict}
       {@const conflict = branchConflict}
       <Modal
-        title="Branch Name Conflict"
+        title={conflict.existingDirectory
+          ? "Existing Workspace Directory"
+          : "Branch Name Conflict"}
         width="min(560px, 92vw)"
         maxWidth="min(560px, 92vw)"
         onclose={closeBranchConflictDialog}
       >
           <div class="conflict-body">
-            <p class="modal-copy">
-              The branch <code>{conflict.existingBranch}</code> already exists locally.
-            </p>
-
-            <div class="branch-conflict-option">
-              <div>
-                <div class="branch-conflict-heading">
-                  Reuse the existing branch
-                </div>
-                <div class="branch-conflict-copy">
-                  Reopen the workspace on the branch that is already present in the local clone.
-                </div>
-              </div>
-              <Button
-                class="btn btn--primary"
-                onclick={() => void createWorkspace({
-                  gitHeadRef: conflict.existingBranch,
-                  reuseExistingBranch: true,
-                  fromConflictDialog: true,
-                })}
-                disabled={workspaceCreating}
-                tone="neutral"
-                surface="outline"
-                size="sm"
-              >
-                {workspaceCreating ? "Creating..." : "Use Existing Branch"}
-              </Button>
-            </div>
-
-            <div class="field">
-              <label
-                class="field-label"
-                for="issue-workspace-branch-name"
-              >
-                New branch name
-              </label>
-              <input
-                id="issue-workspace-branch-name"
-                class="field-input"
-                type="text"
-                bind:value={conflict.branchInput}
-                oninput={() => {
-                  if (branchConflict) {
-                    branchConflict.error = null;
-                  }
-                }}
-              />
-              <p class="field-hint">
-                Suggested: <code>{conflict.suggestedBranch}</code>
+            {#if conflict.existingDirectory}
+              <p class="modal-copy">
+                Middleman's workspace directory for this issue already contains branch
+                <code>{conflict.existingBranch}</code>. A different branch cannot use the same directory.
               </p>
-            </div>
+            {:else}
+              <p class="modal-copy">
+                The branch <code>{conflict.existingBranch}</code> already exists locally.
+              </p>
+            {/if}
+
+            {#if !conflict.existingDirectory}
+              <div class="branch-conflict-option">
+                <div>
+                  <div class="branch-conflict-heading">
+                    Reuse the existing branch
+                  </div>
+                  <div class="branch-conflict-copy">
+                    Reopen the workspace on the branch that is already present in the local clone.
+                  </div>
+                </div>
+                <Button
+                  class="btn btn--primary"
+                  onclick={() => void createWorkspace({
+                    gitHeadRef: conflict.existingBranch,
+                    reuseExistingBranch: true,
+                    fromConflictDialog: true,
+                  })}
+                  disabled={workspaceCreating}
+                  tone="neutral"
+                  surface="outline"
+                  size="sm"
+                >
+                  {workspaceCreating ? "Creating..." : "Use Existing Branch"}
+                </Button>
+              </div>
+            {/if}
+
+            {#if conflict.existingDirectory}
+              <div class="branch-conflict-option">
+                <div>
+                  <div class="branch-conflict-heading">
+                    Use the existing Middleman directory
+                  </div>
+                  <div class="branch-conflict-copy">
+                    Recover the worktree already present at the directory Middleman expects for this issue.
+                  </div>
+                </div>
+                <Button
+                  class="btn btn--primary"
+                  onclick={() => void createWorkspace({
+                    gitHeadRef: conflict.existingBranch,
+                    reuseExistingDirectory: true,
+                    fromConflictDialog: true,
+                  })}
+                  disabled={workspaceCreating}
+                  tone="neutral"
+                  surface="outline"
+                  size="sm"
+                >
+                  {workspaceCreating ? "Creating..." : "Use Existing Directory"}
+                </Button>
+              </div>
+            {/if}
+
+            {#if !conflict.existingDirectory}
+              <div class="field">
+                <label
+                  class="field-label"
+                  for="issue-workspace-branch-name"
+                >
+                  New branch name
+                </label>
+                <input
+                  id="issue-workspace-branch-name"
+                  class="field-input"
+                  type="text"
+                  bind:value={conflict.branchInput}
+                  oninput={() => {
+                    if (branchConflict) {
+                      branchConflict.error = null;
+                    }
+                  }}
+                />
+                <p class="field-hint">
+                  Suggested: <code>{conflict.suggestedBranch}</code>
+                </p>
+              </div>
+            {/if}
 
             {#if conflict.error}
               <p class="merge-error">{conflict.error}</p>
@@ -1506,18 +1569,20 @@
           >
             Cancel
           </Button>
-          <Button
-            class="btn btn--primary btn--green"
-            onclick={() => void createWorkspace({
-              gitHeadRef: conflict.branchInput,
-              fromConflictDialog: true,
-            })}
-            disabled={workspaceCreating}
-            tone="success"
-            surface="solid"
-          >
-            {workspaceCreating ? "Creating..." : "Create New Branch"}
-          </Button>
+          {#if !conflict.existingDirectory}
+            <Button
+              class="btn btn--primary btn--green"
+              onclick={() => void createWorkspace({
+                gitHeadRef: conflict.branchInput,
+                fromConflictDialog: true,
+              })}
+              disabled={workspaceCreating}
+              tone="success"
+              surface="solid"
+            >
+              {workspaceCreating ? "Creating..." : "Create New Branch"}
+            </Button>
+          {/if}
         {/snippet}
       </Modal>
     {/if}

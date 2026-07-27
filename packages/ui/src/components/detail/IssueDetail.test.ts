@@ -322,6 +322,101 @@ describe("IssueDetail inline workspace handoff", () => {
     return { apiClient, resolvePost };
   }
 
+  function workspaceBranchConflict(existingBranch = "middleman/issue-7-original-title", existingDirectory = false) {
+    return {
+      type: "urn:middleman:error:issue-workspace-branch-conflict",
+      title: "Issue workspace branch conflict",
+      detail: "A local branch with the requested name already exists.",
+      details: { existingDirectory },
+      errors: [
+        {
+          message: "Requested branch already exists",
+          location: "body.git_head_ref",
+          value: existingBranch,
+        },
+        {
+          message: "Suggested alternative branch name",
+          location: "body.suggested_git_head_ref",
+          value: `${existingBranch}-2`,
+        },
+      ],
+    };
+  }
+
+  it("recovers the expected existing workspace directory", async () => {
+    const controller = createTestController("split");
+    const conflict = workspaceBranchConflict("middleman/issue-7-original-title", true);
+    const apiClient = {
+      GET: vi.fn(),
+      POST: vi
+        .fn()
+        .mockResolvedValueOnce({ error: conflict })
+        .mockResolvedValueOnce({ data: { id: "ws-recovered", status: "provisioning" } }),
+    };
+    renderIssueDetail(issueDetail(), undefined, { inlineWorkspace: controller }, apiClient);
+
+    await fireEvent.click(screen.getByRole("button", { name: "Create Workspace" }));
+    const useExistingDirectory = await screen.findByRole("button", { name: "Use Existing Directory" });
+    expect(screen.queryByRole("button", { name: "Use Existing Branch" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Create New Branch" })).toBeNull();
+    expect(screen.queryByLabelText("New branch name")).toBeNull();
+    await fireEvent.click(useExistingDirectory);
+
+    expect(apiClient.POST.mock.calls[1]?.[1]).toMatchObject({
+      body: {
+        git_head_ref: "middleman/issue-7-original-title",
+        reuse_existing_directory: true,
+      },
+    });
+    await vi.waitFor(() => {
+      expect(controller.recordCreated).toHaveBeenCalledWith(identity, {
+        id: "ws-recovered",
+        status: "provisioning",
+      });
+    });
+  });
+
+  it("keeps directory recovery errors in the conflict dialog", async () => {
+    const conflict = workspaceBranchConflict("middleman/issue-7-original-title", true);
+    const apiClient = {
+      GET: vi.fn(),
+      POST: vi
+        .fn()
+        .mockResolvedValueOnce({ error: conflict })
+        .mockResolvedValueOnce({
+          error: {
+            code: "workspaceDirectoryNotReusable",
+            detail: "the expected Middleman worktree directory does not exist",
+            details: { reason: "missing" },
+          },
+        }),
+    };
+    renderIssueDetail(issueDetail(), undefined, {}, apiClient);
+
+    await fireEvent.click(screen.getByRole("button", { name: "Create Workspace" }));
+    await fireEvent.click(await screen.findByRole("button", { name: "Use Existing Directory" }));
+
+    expect(screen.getByRole("dialog", { name: "Existing Workspace Directory" })).toBeTruthy();
+    expect(screen.getByText("the expected Middleman worktree directory does not exist")).toBeTruthy();
+  });
+
+  it("explains when the existing branch is checked out elsewhere", async () => {
+    const conflict = workspaceBranchConflict();
+    const apiClient = {
+      GET: vi.fn(),
+      POST: vi.fn().mockResolvedValueOnce({ error: conflict }).mockResolvedValueOnce({ error: conflict }),
+    };
+    renderIssueDetail(issueDetail(), undefined, {}, apiClient);
+
+    await fireEvent.click(screen.getByRole("button", { name: "Create Workspace" }));
+    await fireEvent.click(await screen.findByRole("button", { name: "Use Existing Branch" }));
+
+    expect(
+      screen.getByText("This branch is already checked out in another worktree. Create a new branch instead."),
+    ).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Use Existing Directory" })).toBeNull();
+  });
+
   it("create with inline controller records the override and does not navigate", async () => {
     const controller = createTestController("split");
     const { apiClient, resolvePost } = deferredWorkspaceApiClient();

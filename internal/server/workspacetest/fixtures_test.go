@@ -32,6 +32,7 @@ type workspaceServerFixture struct {
 	bare             string
 	remote           string
 	agentActivityDir string
+	worktreeDir      string
 }
 
 func setupWorkspaceServerFixture(
@@ -79,6 +80,14 @@ func setupWorkspaceServerFixture(
 	require.NoError(t, os.MkdirAll(bareDir, 0o755))
 	bare := filepath.Join(bareDir, "github.com", "acme", "widget.git")
 	runGit(t, dir, "clone", "--bare", remote, bare)
+	runGit(
+		t, bare, "remote", "set-url", "origin",
+		"https://github.com/acme/widget.git",
+	)
+	runGit(
+		t, bare, "config", "--add",
+		"url."+remote+".insteadOf", "https://github.com/acme/widget.git",
+	)
 
 	clones := gitclone.New(bareDir, nil)
 	worktreeDir := filepath.Join(dir, "worktrees")
@@ -124,6 +133,7 @@ func setupWorkspaceServerFixture(
 		bare:             bare,
 		remote:           remote,
 		agentActivityDir: filepath.Join(dir, "agent-activity"),
+		worktreeDir:      worktreeDir,
 	}
 }
 
