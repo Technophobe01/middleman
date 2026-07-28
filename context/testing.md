@@ -92,7 +92,14 @@ owner:
 - Use Vitest browser tests (`*.browser.svelte.ts` with `vitest-browser-svelte`)
   when the behavior needs a real browser DOM, native focus or keyboard behavior,
   computed styles, layout, localStorage, matchMedia, or other browser primitives,
-  but does not need an external server or Playwright navigation flow.
+  but does not need an external server or Playwright navigation flow. A browser
+  test that mounts a component directly (not via `mountBrowserApp`, which loads
+  it) must `import "./app.css"` before measuring geometry, or it measures
+  content-box sizing and fallback tokens the app never ships. Text-dependent
+  layout thresholds move between the CI container's fonts and a developer
+  machine's, so assert the invariant that holds either side of a wrap boundary,
+  never which side a chosen width lands on
+  (`frontend/src/RoborevReviewDrawer.footer-layout.browser.svelte.ts`).
 - Use Playwright mock e2e when the regression is specifically about a
   multi-step browser workflow, viewport behavior, screenshots/video, drag,
   scroll/sticky/overflow geometry, canvas/xterm rendering, or browser navigation.
