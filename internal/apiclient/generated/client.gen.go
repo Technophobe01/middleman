@@ -3065,6 +3065,7 @@ type ProviderCapabilitiesResponse struct {
 	MergeMutation               bool      `json:"merge_mutation"`
 	MutationHeadBinding         bool      `json:"mutation_head_binding"`
 	NativeMultilineRanges       bool      `json:"native_multiline_ranges"`
+	ReadAuthenticatedUser       bool      `json:"read_authenticated_user"`
 	ReadCi                      bool      `json:"read_ci"`
 	ReadComments                bool      `json:"read_comments"`
 	ReadIssues                  bool      `json:"read_issues"`
@@ -3869,6 +3870,7 @@ type SettingsResponse struct {
 	PullRequests  PullRequests                  `json:"pull_requests"`
 	Repos         []ConfiguredRepoStatus        `json:"repos"`
 	Terminal      Terminal                      `json:"terminal"`
+	Workspaces    Workspaces                    `json:"workspaces"`
 }
 
 // Snapshot defines model for Snapshot.
@@ -4061,6 +4063,7 @@ type UpdateSettingsRequest struct {
 	Modes        *ModeVisibility           `json:"modes,omitempty"`
 	PullRequests *PullRequests             `json:"pull_requests,omitempty"`
 	Terminal     *Terminal                 `json:"terminal,omitempty"`
+	Workspaces   *Workspaces               `json:"workspaces,omitempty"`
 }
 
 // UserRepository defines model for UserRepository.
@@ -4200,6 +4203,11 @@ type WorkspaceRuntimeResponse struct {
 	Schema        *string         `json:"$schema,omitempty"`
 	LaunchTargets *[]LaunchTarget `json:"launch_targets"`
 	Sessions      *[]SessionInfo  `json:"sessions"`
+}
+
+// Workspaces defines model for Workspaces.
+type Workspaces struct {
+	AutoAssignOnCreate bool `json:"auto_assign_on_create"`
 }
 
 // WorktreeFromMergeRequestResponse defines model for WorktreeFromMergeRequestResponse.
