@@ -6399,8 +6399,12 @@ func (s *Syncer) indexUpsertMergeRequest(
 	// Preserve fields list endpoints commonly omit.
 	needsCIDetailRefresh := false
 	if existing != nil {
-		normalized.Additions = existing.Additions
-		normalized.Deletions = existing.Deletions
+		if !mr.AdditionsKnown {
+			normalized.Additions = existing.Additions
+		}
+		if !mr.DeletionsKnown {
+			normalized.Deletions = existing.Deletions
+		}
 		preservePlatformBaseSHAIfOmitted(normalized, existing)
 		preserveReviewDecisionIfOmitted(normalized, existing)
 		preserveMergeableStateIfOmitted(normalized, existing)
@@ -8085,6 +8089,10 @@ func (s *Syncer) getIssueForDetail(
 	repo RepoRef,
 	number int,
 ) (*gh.Issue, string, bool, error) {
+	if IsArchiveSyncBudgetContext(ctx) {
+		issue, err := client.GetIssue(ctx, repo.Owner, repo.Name, number)
+		return issue, "", false, err
+	}
 	conditional, ok := client.(conditionalIssueGetter)
 	if !ok {
 		issue, err := client.GetIssue(ctx, repo.Owner, repo.Name, number)
@@ -9087,6 +9095,11 @@ func (s *Syncer) refreshIssueTimeline(
 				repo, platform.RepositoryFeatureIssues, err,
 			); disabledErr != nil {
 				return disabledErr
+			}
+			if IsArchiveSyncBudgetContext(ctx) {
+				return fmt.Errorf(
+					"list timeline events for issue #%d: %w", number, err,
+				)
 			}
 			slog.Warn("issue timeline event fetch failed during timeline refresh",
 				"repo", repo.Owner+"/"+repo.Name,

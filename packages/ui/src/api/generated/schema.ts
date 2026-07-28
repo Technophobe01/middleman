@@ -4464,6 +4464,10 @@ export interface components {
             /** @enum {string} */
             inline_comments: "unknown" | "supported" | "unsupported";
             /** @enum {string} */
+            issues: "unknown" | "supported" | "unsupported";
+            /** @enum {string} */
+            merge_requests: "unknown" | "supported" | "unsupported";
+            /** @enum {string} */
             reviews: "unknown" | "supported" | "unsupported";
         };
         ArchiveFailureResponse: {
@@ -4496,12 +4500,22 @@ export interface components {
             unsupported_items: number;
         };
         ArchiveReportActivityResponse: {
+            actor?: string;
+            /** Format: int64 */
+            additions?: number;
             author: string;
             body: string;
             /** Format: int64 */
+            comments?: number;
+            /** Format: int64 */
+            deletions?: number;
+            /** Format: int64 */
+            files_changed?: number;
+            /** Format: int64 */
             item_number: number;
             /** @enum {string} */
-            kind: "issue" | "merge_request" | "ordinary_comment" | "review" | "inline_review_comment";
+            kind: "issue" | "issue_closed" | "merge_request" | "merge_request_merged" | "ordinary_comment" | "review" | "inline_review_comment";
+            merge_commit_sha?: string;
             /** Format: date-time */
             occurred_at: string;
             provider_external_id: string;
@@ -4519,7 +4533,11 @@ export interface components {
             /** Format: int64 */
             inline_review_comments: number;
             /** Format: int64 */
+            issues_closed: number;
+            /** Format: int64 */
             issues_opened: number;
+            /** Format: int64 */
+            merge_requests_merged: number;
             /** Format: int64 */
             merge_requests_opened: number;
             /** Format: int64 */
@@ -4543,8 +4561,12 @@ export interface components {
             initial_completed_at?: string;
             /** @enum {string} */
             inline_comments: "unknown" | "supported" | "unsupported";
+            /** @enum {string} */
+            issues: "unknown" | "supported" | "unsupported";
             /** Format: date-time */
             maintenance_succeeded_at?: string;
+            /** @enum {string} */
+            merge_requests: "unknown" | "supported" | "unsupported";
             /** @enum {string} */
             operator_state: "active" | "paused";
             /** @enum {string} */
@@ -4571,6 +4593,7 @@ export interface components {
             /** Format: date-time */
             end: string;
             repositories: components["schemas"]["ArchiveReportRepositoryResponse"][] | null;
+            schema: string;
             /** Format: date-time */
             start: string;
             totals: components["schemas"]["ArchiveReportCountsResponse"];
@@ -6067,6 +6090,8 @@ export interface components {
             Deletions: number;
             /** Format: date-time */
             DetailFetchedAt: string | null;
+            /** Format: int64 */
+            FilesChanged: number | null;
             HeadBranch: string;
             HeadRepoCloneURL: string;
             /** Format: int64 */
@@ -6077,6 +6102,7 @@ export interface components {
             KanbanStatus: "new" | "reviewing" | "waiting" | "awaiting_merge";
             /** Format: date-time */
             LastActivityAt: string;
+            MergeCommitSHA: string;
             MergeableState: string;
             /** Format: date-time */
             MergedAt: string | null;
@@ -6174,6 +6200,8 @@ export interface components {
             CreatedAt: string;
             /** Format: int64 */
             Deletions: number;
+            /** Format: int64 */
+            FilesChanged: number | null;
             HeadBranch: string;
             HeadRepoCloneURL: string;
             /** Format: int64 */
@@ -6184,6 +6212,7 @@ export interface components {
             KanbanStatus: "new" | "reviewing" | "waiting" | "awaiting_merge";
             /** Format: date-time */
             LastActivityAt: string;
+            MergeCommitSHA: string;
             MergeableState: string;
             /** Format: date-time */
             MergedAt: string | null;
@@ -17676,11 +17705,15 @@ export const activityTime_rangeValues: ReadonlyArray<FlattenedDeepRequired<compo
 export const activityView_modeValues: ReadonlyArray<FlattenedDeepRequired<components>["schemas"]["Activity"]["view_mode"]> = ["flat", "threaded"];
 export const archiveCoverageResponseCommentsValues: ReadonlyArray<FlattenedDeepRequired<components>["schemas"]["ArchiveCoverageResponse"]["comments"]> = ["unknown", "supported", "unsupported"];
 export const archiveCoverageResponseInline_commentsValues: ReadonlyArray<FlattenedDeepRequired<components>["schemas"]["ArchiveCoverageResponse"]["inline_comments"]> = ["unknown", "supported", "unsupported"];
+export const archiveCoverageResponseIssuesValues: ReadonlyArray<FlattenedDeepRequired<components>["schemas"]["ArchiveCoverageResponse"]["issues"]> = ["unknown", "supported", "unsupported"];
+export const archiveCoverageResponseMerge_requestsValues: ReadonlyArray<FlattenedDeepRequired<components>["schemas"]["ArchiveCoverageResponse"]["merge_requests"]> = ["unknown", "supported", "unsupported"];
 export const archiveCoverageResponseReviewsValues: ReadonlyArray<FlattenedDeepRequired<components>["schemas"]["ArchiveCoverageResponse"]["reviews"]> = ["unknown", "supported", "unsupported"];
-export const archiveReportActivityResponseKindValues: ReadonlyArray<FlattenedDeepRequired<components>["schemas"]["ArchiveReportActivityResponse"]["kind"]> = ["issue", "merge_request", "ordinary_comment", "review", "inline_review_comment"];
+export const archiveReportActivityResponseKindValues: ReadonlyArray<FlattenedDeepRequired<components>["schemas"]["ArchiveReportActivityResponse"]["kind"]> = ["issue", "issue_closed", "merge_request", "merge_request_merged", "ordinary_comment", "review", "inline_review_comment"];
 export const archiveReportCoverageResponseCollection_modeValues: ReadonlyArray<FlattenedDeepRequired<components>["schemas"]["ArchiveReportCoverageResponse"]["collection_mode"]> = ["discovery", "full"];
 export const archiveReportCoverageResponseCommentsValues: ReadonlyArray<FlattenedDeepRequired<components>["schemas"]["ArchiveReportCoverageResponse"]["comments"]> = ["unknown", "supported", "unsupported"];
 export const archiveReportCoverageResponseInline_commentsValues: ReadonlyArray<FlattenedDeepRequired<components>["schemas"]["ArchiveReportCoverageResponse"]["inline_comments"]> = ["unknown", "supported", "unsupported"];
+export const archiveReportCoverageResponseIssuesValues: ReadonlyArray<FlattenedDeepRequired<components>["schemas"]["ArchiveReportCoverageResponse"]["issues"]> = ["unknown", "supported", "unsupported"];
+export const archiveReportCoverageResponseMerge_requestsValues: ReadonlyArray<FlattenedDeepRequired<components>["schemas"]["ArchiveReportCoverageResponse"]["merge_requests"]> = ["unknown", "supported", "unsupported"];
 export const archiveReportCoverageResponseOperator_stateValues: ReadonlyArray<FlattenedDeepRequired<components>["schemas"]["ArchiveReportCoverageResponse"]["operator_state"]> = ["active", "paused"];
 export const archiveReportCoverageResponseReviewsValues: ReadonlyArray<FlattenedDeepRequired<components>["schemas"]["ArchiveReportCoverageResponse"]["reviews"]> = ["unknown", "supported", "unsupported"];
 export const archiveReportCoverageResponseStatusValues: ReadonlyArray<FlattenedDeepRequired<components>["schemas"]["ArchiveReportCoverageResponse"]["status"]> = ["running", "waiting_for_budget", "current", "partial", "paused", "blocked"];

@@ -151,12 +151,21 @@ type PullRequestDTO struct {
 	Labels    []LabelDTO
 	Comments  int
 	Mergeable *bool
-	Created   time.Time
-	Updated   time.Time
-	Merged    bool
-	MergedAt  *time.Time
-	MergedBy  UserDTO
-	Closed    *time.Time
+	Additions int
+	// AdditionsKnown and DeletionsKnown distinguish explicit zero values from
+	// fields omitted by the provider response.
+	AdditionsKnown bool
+	Deletions      int
+	DeletionsKnown bool
+	// FilesChanged is nil when the provider response did not expose the
+	// count and non-nil when the provider reported it, including zero.
+	FilesChanged *int
+	Created      time.Time
+	Updated      time.Time
+	Merged       bool
+	MergedAt     *time.Time
+	MergedBy     UserDTO
+	Closed       *time.Time
 	// Assignees and RequestedReviewers are nil when the transport's SDK
 	// does not expose the field (unknown) and an empty non-nil slice
 	// when the provider reported none. The Forgejo SDK has no
