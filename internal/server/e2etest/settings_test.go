@@ -123,7 +123,6 @@ func TestSettingsAPIE2EReadUpdateAndValidation(t *testing.T) {
 				CursorBlink:    true,
 				FontLigatures:  true,
 				HideTmuxStatus: true,
-				Renderer:       generated.Xterm,
 			},
 		},
 	)
@@ -370,7 +369,6 @@ name = "widget"
 				LineHeight:     1,
 				CursorBlink:    true,
 				HideTmuxStatus: true,
-				Renderer:       generated.Xterm,
 			},
 		},
 	)
