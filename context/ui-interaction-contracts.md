@@ -211,9 +211,19 @@ Whenever a control persists, document and test:
 
 Keyboard handlers must have one clear owner for each key press.
 
-- Input fields, textareas, contenteditable elements, and terminal surfaces own
-  printable keys while focused. Global shortcuts must not reinterpret those
-  keystrokes.
+- Input fields, textareas, and contenteditable elements own printable keys while
+  focused. Global shortcuts must not reinterpret those keystrokes, though
+  modified bindings still dispatch.
+- A focused TERMINAL owns every key, modified ones included, and outranks even
+  the modal stack: a TUI binds Escape, function keys, and Ctrl/Cmd chords
+  (Cmd-K and Cmd-P included), so any key the app reserves is a key the terminal
+  loses. Only `Ctrl/Cmd-Shift-K`, the documented command-palette escape hatch,
+  crosses this boundary; otherwise the dispatcher runs no handler and does not
+  preventDefault. Ownership
+  is matched from the terminal surface, not from xterm's hidden textarea alone,
+  because focus also rests on the session wrapper. Popovers close from their own
+  window Escape listeners, not from the registry
+  (`frontend/src/lib/utils/keyboardShortcuts.ts::isTerminalKeyboardTarget`).
 - Modal frames outrank page-level shortcuts. When a modal, drawer, popover, or
   command surface is active, route and list navigation should run only through
   actions explicitly registered for that active surface.
@@ -311,6 +321,25 @@ Keyboard handlers must have one clear owner for each key press.
   settles with no destination (the pane closed) — a cross-flush transfer's
   transient no-destination park keeps it. A restore fires only into unclaimed
   focus (`frontend/src/lib/components/terminal/PooledSessionTerminal.svelte`).
+- A slot's `visible` means PAINTED, never FOCUSED. It gates INTERACTIVITY — an
+  invisible slot's terminal is `inert`, dead to pointer and keyboard — so a
+  container that reports only its focused session makes the other halves of a
+  split unclickable. Every leaf of a split shares the container's own visibility
+  (`frontend/src/lib/components/terminal/TerminalSplitTree.svelte`).
+- Terminal SIZE and resize authority require PAINTED state plus a valid fit
+  measurement, never focus: `visibility:hidden` retains geometry, while focus
+  gating strands unfocused split leaves. Every pooled slot boundary must fill
+  its painted leaf in both axes; horizontal block stretch alone can leave the
+  xterm at a stale intrinsic height, so no vertical ResizeObserver result ever
+  reaches the PTY. A container with no content box (a
+  parked terminal) measures nothing, which is what keeps it from resizing a live
+  tmux pane to one row — the measurement IS the check. Record a size as sent
+  only once the socket carried it, or a resize computed before the socket opened
+  is suppressed forever and the PTY keeps its launch default. Synchronize
+  authority on every measurement because geometry changes independently of
+  painted state; reclaiming authority must push even an unchanged size
+  (`frontend/src/lib/components/terminal/TerminalSplitTree.svelte::terminal-leaf-body`,
+  `frontend/src/lib/components/terminal/XtermTerminalPane.svelte::resizeVisibleTerminal`).
 - A promoted session is recorded ONCE, in the detail surface's stored pane tree.
   Containers mask it out of what they render (derived, not an effect) and never
   prune their own stored trees, so demoting restores the tab order, split, and

@@ -1,7 +1,7 @@
 import { getStack } from "@middleman/ui/stores/keyboard/modal-stack";
 import { showFlash } from "@middleman/ui/stores/flash";
 import { getAllActions } from "./registry.svelte.js";
-import { shouldIgnoreGlobalShortcutTarget } from "../../utils/keyboardShortcuts.js";
+import { isTerminalKeyboardTarget, shouldIgnoreGlobalShortcutTarget } from "../../utils/keyboardShortcuts.js";
 import type { Action, Context, KeySpec } from "./types.js";
 
 const RESERVED_WHILE_MODAL_OPEN: KeySpec[] = [
@@ -20,6 +20,13 @@ const SCOPE_SPECIFICITY: Record<Action["scope"], number> = {
 };
 
 export function dispatchKeydown(event: KeyboardEvent, contextProvider: () => Context): void {
+  // A focused terminal owns every key except the explicit shifted palette
+  // chord, and it otherwise outranks the modal stack too: a frame that did not
+  // trap focus cannot be holding the keyboard the user is typing into. Not even
+  // preventDefault: the keystroke is xterm's, and suppressing the default is how
+  // it would fail to arrive. Popovers keep their own window Escape listeners.
+  if (isTerminalKeyboardTarget(event.target) && !isTerminalPaletteShortcut(event)) return;
+
   const stack = getStack();
   if (stack.length > 0) {
     const modalCtx = contextProvider();
@@ -54,6 +61,10 @@ export function dispatchKeydown(event: KeyboardEvent, contextProvider: () => Con
 
   event.preventDefault();
   runHandler(matchingActions[0]!, ctx);
+}
+
+function isTerminalPaletteShortcut(event: KeyboardEvent): boolean {
+  return event.key.toLowerCase() === "k" && (event.ctrlKey || event.metaKey) && event.shiftKey && !event.altKey;
 }
 
 interface RunnableAction {

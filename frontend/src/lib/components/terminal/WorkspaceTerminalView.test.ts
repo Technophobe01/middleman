@@ -84,6 +84,9 @@ vi.mock("@xterm/addon-fit", () => ({
   FitAddon: vi.fn().mockImplementation(function () {
     return {
       fit: mocks.mockFit,
+      // The pane measures its own region through the addon; a real one
+      // proposes nothing for a container with no content box.
+      proposeDimensions: () => ({ cols: 80, rows: 24 }),
     };
   }),
 }));
@@ -695,8 +698,8 @@ describe("WorkspaceTerminalView", () => {
     expect(screen.getByLabelText("Helper running").classList.contains("kit-status-dot--idle")).toBe(true);
   });
 
-  it("persists toolbar and focused-terminal font zoom through shared settings", async () => {
-    const { container } = render(WorkspaceTerminalView, {
+  it("persists toolbar font zoom through shared settings", async () => {
+    render(WorkspaceTerminalView, {
       props: {
         workspaceId: "ws-1",
       },
@@ -713,20 +716,33 @@ describe("WorkspaceTerminalView", () => {
       });
     });
     expect(mocks.mockSetTerminalSettings).toHaveBeenCalledWith(expect.objectContaining({ font_size: 15 }));
+  });
 
-    mocks.mockUpdateSettings.mockClear();
+  it.each([
+    ["Meta+=", { key: "=", metaKey: true }],
+    ["Ctrl+-", { key: "-", ctrlKey: true }],
+    ["Meta+0", { key: "0", metaKey: true }],
+  ] as const)("leaves %s untouched while a terminal is focused", async (_label, init) => {
+    const { container } = render(WorkspaceTerminalView, {
+      props: {
+        workspaceId: "ws-1",
+      },
+    });
+
+    await screen.findByRole("button", { name: "Increase terminal font size" });
     const terminalInput = document.createElement("textarea");
     container.querySelector(".terminal-container")?.append(terminalInput);
     terminalInput.focus();
-    await fireEvent.keyDown(terminalInput, {
-      key: "=",
-      metaKey: true,
+    const event = new KeyboardEvent("keydown", {
+      ...init,
+      bubbles: true,
+      cancelable: true,
     });
-    await waitFor(() => {
-      expect(mocks.mockUpdateSettings).toHaveBeenCalledWith({
-        terminal: expect.objectContaining({ font_size: 15 }),
-      });
-    });
+    terminalInput.dispatchEvent(event);
+    await Promise.resolve();
+
+    expect(event.defaultPrevented).toBe(false);
+    expect(mocks.mockUpdateSettings).not.toHaveBeenCalled();
   });
 
   it.each([
