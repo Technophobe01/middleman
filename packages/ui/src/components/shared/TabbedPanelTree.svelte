@@ -1,32 +1,66 @@
 <script lang="ts">
+  import GripVerticalIcon from "@lucide/svelte/icons/grip-vertical";
   import { SplitResizeHandle, StatusDot, type SplitResizeEvent } from "@kenn-io/kit-ui";
-  import type { Snippet } from "svelte";
+  import { untrack, type Snippet } from "svelte";
   import Self from "./TabbedPanelTree.svelte";
   import {
+    assertNamespacedDragScope,
     clearActiveTabbedPanelDrag,
+    onTabbedPanelDragEnd,
     readTabbedPanelTabDrag,
     startTabbedPanelTabDrag,
   } from "./tabbed-panel-drag.js";
   import type {
     TabbedPanelDescriptor,
     TabbedPanelDirection,
+    TabbedPanelLeaf,
     TabbedPanelNode,
     TabbedPanelSplitEdge,
   } from "./tabbed-panel-layout.js";
   import {
     clampTabbedPanelRatio,
+    collectTabbedPanelLeafIDs,
     tabbedPanelSplitEdgeFromPoint,
     tabbedPanelSplitPlacementForEdge,
   } from "./tabbed-panel-layout.js";
 
   interface Props {
     dragScope: string;
-    node: TabbedPanelNode;
+    /**
+     * Undefined only transiently, and only for the recursive children below: they
+     * read `node.first`/`node.second` off their parent, so an ancestor that stops
+     * being a split hands them nothing for the rest of that flush while they are
+     * still mounted. See the guards on every read.
+     */
+    node: TabbedPanelNode | undefined;
     tabs: TabbedPanelDescriptor[];
     activeTabKey: string;
     renderTab: Snippet<[string, boolean]>;
     tabIcon?: Snippet<[TabbedPanelDescriptor]> | undefined;
     tabActions?: Snippet<[TabbedPanelDescriptor]> | undefined;
+    /**
+     * Rendered once per leaf, right-aligned in its tab strip. Receives the leaf
+     * so callers can act on its id (split, maximize) rather than on a tab.
+     */
+    leafActions?: Snippet<[TabbedPanelLeaf]> | undefined;
+    /**
+     * Tabs that draw their own tab strip inside the pane body.
+     *
+     * A leaf holding one of these and nothing else renders no strip of its own: the
+     * pane below already has one, and two rows stacked to name the same thing is
+     * chrome. Its leaf actions float at the top-right of the body instead, which is
+     * where the pane's own strip ends, so the two read as one bar. A second tab
+     * landing in the leaf brings the strip back - there are two things to name then.
+     */
+    soloChromeTabKeys?: readonly string[];
+    /** Leaf rendered at full size; every other subtree is hidden but stays mounted. */
+    zoomedLeafID?: string | null;
+    /**
+     * Set only by this component's own recursive calls. A leaf's active tab is
+     * still invisible when an ancestor's other branch holds the zoom, so
+     * visibility has to descend rather than be recomputed per leaf.
+     */
+    ancestorHidden?: boolean;
     scrollPanels?: boolean;
     disabled?: boolean;
     tablistLabel?: string;
@@ -34,6 +68,12 @@
     resizeLabel?: string;
     dropTargetsLabel?: string;
     onSelectTab?: ((tabKey: string) => void) | undefined;
+    /**
+     * Focus landed inside a pane body. Surfaces that bind a pane to the URL use
+     * this to follow the user between two simultaneously visible panes, where
+     * there is no tab to click.
+     */
+    onFocusPane?: ((tabKey: string) => void) | undefined;
     onMoveTabBefore?: ((sourceTabKey: string, targetTabKey: string) => void) | undefined;
     onAppendTabToLeaf?: ((sourceTabKey: string, leafID: string) => void) | undefined;
     onSplitTab?:
@@ -59,6 +99,10 @@
     renderTab,
     tabIcon = undefined,
     tabActions = undefined,
+    leafActions = undefined,
+    soloChromeTabKeys = [],
+    zoomedLeafID = null,
+    ancestorHidden = false,
     scrollPanels = false,
     disabled = false,
     tablistLabel = "Panel group tabs",
@@ -66,6 +110,7 @@
     resizeLabel = "Resize panel split",
     dropTargetsLabel = "Panel group drop targets",
     onSelectTab,
+    onFocusPane = undefined,
     onMoveTabBefore,
     onAppendTabToLeaf,
     onSplitTab,
@@ -91,6 +136,13 @@
     targetTabKey: string;
     placement: "before" | "after";
   } | null>(null);
+
+  // Checked here rather than trusted at each call site: this primitive is what
+  // makes two scopes exchange tabs, so it is the only place that can guarantee a
+  // caller cannot hand it an un-namespaced one.
+  $effect(() => {
+    assertNamespacedDragScope(dragScope);
+  });
 
   function tabForKey(tabKey: string): TabbedPanelDescriptor | null {
     return tabs.find((tab) => tab.key === tabKey) ?? null;
@@ -208,7 +260,7 @@
   }
 
   function clearExternalTabDragState(): void {
-    if (draggedTabKey !== null && node.type === "leaf" && !node.tabs.includes(draggedTabKey)) {
+    if (draggedTabKey !== null && node?.type === "leaf" && !node.tabs.includes(draggedTabKey)) {
       clearTabDragState();
       return;
     }
@@ -220,6 +272,27 @@
     draggedTabWidth = 112;
     clearTabSortPreview();
   }
+
+  // Every strip drops its drag state when the drag ends, not only the one whose
+  // dragged tab element survived to receive `dragend`. A drop that moves a tab into
+  // another leaf destroys that element first, and the strip it left behind kept
+  // rendering the gap and the dragging styling - a shadow of a tab that now lives
+  // somewhere else.
+  //
+  // The body overlay hides here too, not only in the instance that took the drop.
+  // Trees nest (the workflow tree lives inside a detail pane's leaf) and a dragover
+  // bubbles through both, so both paint a split preview for the same drag - but the
+  // drop is consumed by the inner one, whose finish clears the shared payload, and
+  // the outer instance's own drop handler then reads null and leaves its preview
+  // painted over a drag that is already over.
+  $effect(() =>
+    onTabbedPanelDragEnd(() =>
+      untrack(() => {
+        hideDropTargets();
+        clearTabDragState();
+      }),
+    ),
+  );
 
   function finishTabDrag(): void {
     hideDropTargets();
@@ -257,7 +330,7 @@
     targetTabKey: string;
     placement: "before" | "after";
   } | null {
-    if (node.type !== "leaf") return null;
+    if (node?.type !== "leaf") return null;
     let lastTargetKey: string | null = null;
     const tabEls = Array.from(tablist.querySelectorAll<HTMLElement>("[data-tabbed-panel-tab-key]"));
     for (const tabEl of tabEls) {
@@ -281,7 +354,7 @@
   ): void {
     if (!canSortTabs()) return;
     if (sourceTabKey === targetTabKey) return;
-    if (node.type !== "leaf") return;
+    if (node?.type !== "leaf") return;
     if (placement === "before") {
       onMoveTabBefore?.(sourceTabKey, targetTabKey);
       return;
@@ -393,13 +466,15 @@
   }
 
   function measureSplit(): number {
-    if (node.type !== "split" || !splitEl) return 0;
+    // Reached from a ResizeObserver batch, which can be delivered after the
+    // parent stopped being a split.
+    if (node?.type !== "split" || !splitEl) return 0;
     const rect = splitEl.getBoundingClientRect();
     return node.direction === "horizontal" ? rect.width : rect.height;
   }
 
   $effect(() => {
-    if (node.type !== "split" || !splitEl) return;
+    if (node?.type !== "split" || !splitEl) return;
     splitSize = measureSplit();
     if (typeof ResizeObserver === "undefined") return;
     const observer = new ResizeObserver(() => {
@@ -410,14 +485,14 @@
   });
 
   function startResize(): void {
-    if (node.type !== "split") return;
+    if (node?.type !== "split") return;
     resizeStartRatio = node.ratio;
     splitSize = measureSplit();
     resizeStartSize = splitSize;
   }
 
   function handleResize(event: SplitResizeEvent): void {
-    if (node.type !== "split") return;
+    if (node?.type !== "split") return;
     const ratio = resizeStartRatio + event.delta / Math.max(1, resizeStartSize);
     onRatioChange?.(node.id, clampTabbedPanelRatio(ratio));
   }
@@ -426,13 +501,37 @@
     return !disabled && Boolean(onStartTabDrag || onMoveTabBefore || onAppendTabToLeaf || onSplitTab);
   }
 
+  /**
+   * Which branch of this split contains the zoomed leaf, if either.
+   *
+   * Drives three things at once: the zoomed branch grows to fill, the other is
+   * hidden, and the divider between them is dropped. Leaving the divider
+   * rendered would put a draggable handle on top of a supposedly full-size pane,
+   * silently changing ratios the user cannot see.
+   */
+  const zoomSide = $derived.by<"first" | "second" | null>(() => {
+    if (node?.type !== "split" || zoomedLeafID === null) return null;
+    if (collectTabbedPanelLeafIDs(node.first).includes(zoomedLeafID)) return "first";
+    if (collectTabbedPanelLeafIDs(node.second).includes(zoomedLeafID)) return "second";
+    return null;
+  });
+
+  function paneVisible(tabKey: string): boolean {
+    return !ancestorHidden && node?.type === "leaf" && node.activeTabKey === tabKey;
+  }
+
   function canSortTabs(): boolean {
     return !disabled && Boolean(onMoveTabBefore);
   }
 </script>
 
-{#if node.type === "leaf"}
-  <section class="tabbed-panel-leaf" aria-label={leafLabel}>
+{#if node === undefined}
+  <!-- A branch removed mid-flush: its children are still mounted for the rest of
+       the tick, with nothing left to render. -->
+{:else if node.type === "leaf"}
+  {@const soloChrome = node.tabs.length === 1 && soloChromeTabKeys.includes(node.tabs[0]!)}
+  <section class={["tabbed-panel-leaf", { "solo-chrome": soloChrome }]} aria-label={leafLabel}>
+    {#if !soloChrome}
     <div
       class={["tabbed-panel-tabs", { "drag-sorting": draggedTabKey !== null }]}
       role="tablist"
@@ -453,6 +552,11 @@
               aria-hidden="true"
             ></div>
           {/if}
+          <!-- aria-selected below reads this leaf's own activeTabKey, not the
+               tree-wide one: a split renders one tablist per leaf, so a single
+               shared value leaves every other tablist reporting nothing
+               selected — and under a zoom can leave the only visible tablist
+               with no selected tab while the selected one sits hidden. -->
           <div
             class={[
               "tabbed-panel-tab",
@@ -475,7 +579,7 @@
               ondragstart={(event) => startTabDrag(event, tab)}
               ondragend={finishTabDrag}
               ondblclick={() => onTabDoubleClick?.(tab.key)}
-              aria-selected={activeTabKey === tab.key}
+              aria-selected={node.activeTabKey === tab.key}
               aria-label={tab.status ? `${tab.label}, ${tab.status.label}` : tab.label}
               role="tab"
               onclick={() => onSelectTab?.(tab.key)}
@@ -508,7 +612,13 @@
           {/if}
         {/if}
       {/each}
+      {#if leafActions}
+        <div class="tabbed-panel-leaf-actions" data-testid="tabbed-panel-leaf-actions">
+          {@render leafActions(node)}
+        </div>
+      {/if}
     </div>
+    {/if}
     <div
       class={["tabbed-panel-body", { "show-drop-targets": dropTargetsVisible }]}
       role="group"
@@ -526,8 +636,10 @@
               scrollable: scrollPanels,
             },
           ]}
+          data-pane-key={tabKey}
+          onfocusin={onFocusPane ? () => onFocusPane(tabKey) : undefined}
         >
-          {@render renderTab(tabKey, node.activeTabKey === tabKey)}
+          {@render renderTab(tabKey, paneVisible(tabKey))}
         </div>
       {/each}
       <div
@@ -539,6 +651,31 @@
         aria-hidden="true"
       ></div>
     </div>
+    {#if soloChrome}
+      {@const soloTab = tabForKey(node.tabs[0]!)}
+      {#if soloTab}
+        <!-- The strip's contents with the strip taken away: they float at the top
+             right of the body, which is where the pane's own strip ends, so the two
+             read as one bar. The grip is the drag source the tab button used to be -
+             without it a pane with no strip could never be moved. -->
+        <div class="tabbed-panel-solo-actions" data-testid="tabbed-panel-solo-actions">
+          <button
+            class="tabbed-panel-tab-tool tabbed-panel-solo-grip"
+            type="button"
+            draggable={tabDragEnabled()}
+            disabled={disabled}
+            title={`Move ${soloTab.label}`}
+            aria-label={`Move ${soloTab.label}`}
+            ondragstart={(event) => startTabDrag(event, soloTab)}
+            ondragend={finishTabDrag}
+          >
+            <GripVerticalIcon size="12" strokeWidth="2.2" aria-hidden="true" />
+          </button>
+          {@render tabActions?.(soloTab)}
+          {@render leafActions?.(node)}
+        </div>
+    {/if}
+    {/if}
   </section>
 {:else}
   <div
@@ -546,7 +683,15 @@
     class={["tabbed-panel-split", node.direction]}
     style={`--first-ratio: ${node.ratio}; --second-ratio: ${1 - node.ratio};`}
   >
-    <div class="tabbed-panel-split-child first">
+    <div
+      class={[
+        "tabbed-panel-split-child",
+        "first",
+        { zoomed: zoomSide === "first" },
+      ]}
+      hidden={zoomSide === "second"}
+      inert={zoomSide === "second"}
+    >
       <Self
         {dragScope}
         node={node.first}
@@ -555,6 +700,10 @@
         {renderTab}
         {tabIcon}
         {tabActions}
+        {leafActions}
+        {soloChromeTabKeys}
+        {zoomedLeafID}
+        ancestorHidden={ancestorHidden || zoomSide === "second"}
         {scrollPanels}
         {disabled}
         {tablistLabel}
@@ -562,6 +711,7 @@
         {resizeLabel}
         {dropTargetsLabel}
         {onSelectTab}
+        {onFocusPane}
         {onMoveTabBefore}
         {onAppendTabToLeaf}
         {onSplitTab}
@@ -572,18 +722,28 @@
         {onClearDrag}
       />
     </div>
-    <SplitResizeHandle
-      class="tabbed-panel-split-divider"
-      ariaLabel={resizeLabel}
-      orientation={node.direction}
-      ariaValueMin={Math.round(MIN_RATIO * splitSize)}
-      ariaValueMax={Math.round(MAX_RATIO * splitSize)}
-      ariaValueNow={Math.round(node.ratio * splitSize)}
-      {disabled}
-      onResizeStart={startResize}
-      onResize={handleResize}
-    />
-    <div class="tabbed-panel-split-child second">
+    {#if zoomSide === null}
+      <SplitResizeHandle
+        class="tabbed-panel-split-divider"
+        ariaLabel={resizeLabel}
+        orientation={node.direction}
+        ariaValueMin={Math.round(MIN_RATIO * splitSize)}
+        ariaValueMax={Math.round(MAX_RATIO * splitSize)}
+        ariaValueNow={Math.round(node.ratio * splitSize)}
+        {disabled}
+        onResizeStart={startResize}
+        onResize={handleResize}
+      />
+    {/if}
+    <div
+      class={[
+        "tabbed-panel-split-child",
+        "second",
+        { zoomed: zoomSide === "second" },
+      ]}
+      hidden={zoomSide === "first"}
+      inert={zoomSide === "first"}
+    >
       <Self
         {dragScope}
         node={node.second}
@@ -592,6 +752,10 @@
         {renderTab}
         {tabIcon}
         {tabActions}
+        {leafActions}
+        {soloChromeTabKeys}
+        {zoomedLeafID}
+        ancestorHidden={ancestorHidden || zoomSide === "first"}
         {scrollPanels}
         {disabled}
         {tablistLabel}
@@ -599,6 +763,7 @@
         {resizeLabel}
         {dropTargetsLabel}
         {onSelectTab}
+        {onFocusPane}
         {onMoveTabBefore}
         {onAppendTabToLeaf}
         {onSplitTab}
@@ -615,6 +780,7 @@
 <style>
   .tabbed-panel-split,
   .tabbed-panel-leaf {
+    position: relative;
     min-width: 0;
     min-height: 0;
     height: 100%;
@@ -645,6 +811,29 @@
 
   .tabbed-panel-split-child.second {
     flex: var(--second-ratio) 1 0;
+  }
+
+  /* A zoomed branch takes the whole split, overriding its stored ratio. Its
+     sibling keeps its subtree mounted so scroll offsets and any reparented
+     singleton pane survive the zoom, but contributes no layout space. */
+  .tabbed-panel-split-child.zoomed {
+    flex: 1 1 100%;
+  }
+
+  .tabbed-panel-split-child[hidden] {
+    display: none;
+  }
+
+  .tabbed-panel-leaf-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 1px;
+    margin-left: auto;
+    padding-right: 4px;
+    /* Sits above the tab strip's bottom-border pseudo-element. */
+    position: relative;
+    z-index: 2;
+    flex-shrink: 0;
   }
 
   :global(.tabbed-panel-split-divider) {
@@ -682,6 +871,78 @@
     border: var(--chrome-border-width) solid var(--border-default);
     border-top: 0;
     background: var(--bg-surface);
+  }
+
+  /*
+   * Over the pane, not beside it: a strip-less leaf gives its whole height to the
+   * pane, so these have nowhere to sit in flow. The z-index is the same fight the
+   * controls popover had -- a terminal's canvas layers compete inside this body, and
+   * without it the cluster paints under them and every click lands on the terminal.
+   */
+  .tabbed-panel-solo-actions {
+    position: absolute;
+    top: 4px;
+    right: 6px;
+    /*
+     * Above every layer a hosted terminal paints. xterm's internal z-indexes run
+     * to 11 (its overlay scrollbar's slider), the body between us is not a
+     * stacking context, and this cluster hugs the same right edge that scrollbar
+     * does - at 5 the scrollbar sat over the rightmost button and swallowed its
+     * clicks while everything LOOKED fine, because the buttons further left were
+     * clear of it.
+     */
+    z-index: 20;
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    padding: 1px 2px;
+    border-radius: 4px;
+    background: var(--bg-surface);
+  }
+
+  /*
+   * The shared tool geometry and states, restated for this container: the rules
+   * above are scoped under the strip and the leaf-actions wrapper, and a leaf that
+   * renders neither leaves these buttons on the browser reset - shrunk to their
+   * icons, with no hover, focus, or disabled treatment. No hover-reveal here: this
+   * cluster is the ONLY chrome a strip-less pane has, and chrome that cannot be
+   * seen cannot be found.
+   */
+  .tabbed-panel-solo-actions :global(.tabbed-panel-tab-tool) {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    /* kit IconButton sm is 24x24 with a 13px glyph, and the Delete beside these IS
+       one - matching it is what makes the cluster read as one control row instead
+       of five buttons from five sources. */
+    width: 24px;
+    height: 24px;
+    border: 0;
+    border-radius: 3px;
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+  }
+
+  .tabbed-panel-solo-actions :global(.tabbed-panel-tab-tool svg) {
+    width: 13px;
+    height: 13px;
+  }
+
+  .tabbed-panel-solo-actions :global(.tabbed-panel-tab-tool:hover:not(:disabled)),
+  .tabbed-panel-solo-actions :global(.tabbed-panel-tab-tool:focus-visible) {
+    background: var(--bg-surface-hover);
+    color: var(--text-primary);
+    outline: none;
+  }
+
+  .tabbed-panel-solo-actions :global(.tabbed-panel-tab-tool:disabled) {
+    cursor: default;
+    opacity: 0.3;
+  }
+
+  .tabbed-panel-solo-grip {
+    cursor: grab;
   }
 
   .tabbed-panel-tabs {
@@ -825,6 +1086,47 @@
     opacity: 1;
   }
 
+  /* Leaf-level controls borrow the per-tab tool styling, but reveal on hover of
+     the whole leaf rather than of a single tab: they act on the leaf, not on the
+     tab the pointer happens to be over. */
+  .tabbed-panel-leaf-actions :global(.tabbed-panel-tab-tool) {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    /* Same 24x24/13px geometry as kit IconButton sm; the workspace leaf renders
+       one of those (Delete) in this same row. */
+    width: 24px;
+    height: 24px;
+    border: 0;
+    border-radius: 3px;
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+    opacity: 0;
+  }
+
+  .tabbed-panel-leaf-actions :global(.tabbed-panel-tab-tool svg) {
+    width: 13px;
+    height: 13px;
+  }
+
+  .tabbed-panel-leaf:hover .tabbed-panel-leaf-actions :global(.tabbed-panel-tab-tool),
+  .tabbed-panel-leaf-actions :global(.tabbed-panel-tab-tool:focus-visible) {
+    opacity: 1;
+  }
+
+  .tabbed-panel-leaf-actions :global(.tabbed-panel-tab-tool:hover:not(:disabled)),
+  .tabbed-panel-leaf-actions :global(.tabbed-panel-tab-tool:focus-visible) {
+    background: var(--bg-surface-hover);
+    color: var(--text-primary);
+    outline: none;
+  }
+
+  .tabbed-panel-leaf-actions :global(.tabbed-panel-tab-tool:disabled) {
+    cursor: default;
+    opacity: 0.3;
+  }
+
   .tabbed-panel-tab :global(.tabbed-panel-tab-tool:hover),
   .tabbed-panel-tab :global(.tabbed-panel-tab-tool:focus-visible) {
     background: var(--bg-surface-hover);
@@ -886,11 +1188,22 @@
     overflow: hidden;
   }
 
+  /* Flex so a pane body inherits the panel's height rather than growing to its
+     own content height. As a block container it left any child that expects to
+     fill a flex parent — the detail views' scroll regions — unconstrained, so
+     their internal scrolling silently turned into outer overflow. */
   .tabbed-panel-tab-panel {
     position: absolute;
     inset: 0;
+    display: flex;
     visibility: hidden;
     overflow: hidden;
+  }
+
+  .tabbed-panel-tab-panel > :global(*) {
+    flex: 1 1 auto;
+    min-width: 0;
+    min-height: 0;
   }
 
   .tabbed-panel-tab-panel.scrollable {

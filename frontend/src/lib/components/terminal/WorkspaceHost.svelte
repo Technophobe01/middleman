@@ -1,12 +1,16 @@
 <script lang="ts">
   import { flushSync, tick } from "svelte";
   import type { InlineDockMode } from "@middleman/ui";
+  import SessionTerminalPool from "./SessionTerminalPool.svelte";
+  import SessionTerminalSlot from "./SessionTerminalSlot.svelte";
   import WorkspaceTerminalView from "./WorkspaceTerminalView.svelte";
   import { getRoute } from "../../stores/router.svelte.ts";
   import {
     clearPendingHostFocus, consumePendingHostFocus,
     desiredKey, desiredSlot, getInlineWorkspaceController, getSlotElement, isHostVisible,
     notifyWorkspaceDeleted, registerHostElement, registerParkingElement,
+    hostedSessionRegistryKey,
+    registerSessionPaneSnippet,
     rememberTerminalRouteKey,
     type HostSlot,
   } from "../../stores/workspace-host.svelte.ts";
@@ -53,6 +57,18 @@
   // set while this host sits in an inline dock slot (activity/prs/issues),
   // never for the Workspaces tab or the parked (slot === null) case.
   const inlineDock = $derived(inlineDockForSlot(slot));
+
+  // The surface whose pane layout records which of this workspace's sessions the
+  // user promoted out of the workspace pane. Same slots as `inlineDock`: the
+  // Workspaces tab has no detail panes, and a parked host is claimed by nobody,
+  // so no promotion applies to what it renders.
+  const paneSurface = $derived(slot === null || slot === "tab" ? undefined : slot);
+
+  // Registered for the lifetime of the host, which the app shell always mounts.
+  $effect(() => {
+    registerSessionPaneSnippet(sessionPane);
+    return () => registerSessionPaneSnippet(null);
+  });
 
   $effect(() => {
     registerHostElement(hostWrapper);
@@ -127,6 +143,13 @@
 
 <div class="workspace-host-parking" bind:this={parkingNode} aria-hidden="true"></div>
 
+<!-- A SIBLING of the wrapper below, never a child. The wrapper is what gets
+     parked when the workspace pane closes or the host moves, and a session
+     promoted to its own detail pane has to outlive that: as a child, every
+     promoted terminal would be dragged into the parking node along with its
+     container and go blank. -->
+<SessionTerminalPool />
+
 <div
   class="workspace-host-wrapper"
   bind:this={hostWrapper}
@@ -156,8 +179,20 @@
     isSidebarToggleEnabled={embedded ? false : isSidebarToggleEnabled}
     onToggleSidebar={embedded ? undefined : onToggleSidebar}
     {inlineDock}
+    {paneSurface}
   />
 </div>
+
+<!-- The pane body a detail surface renders for a promoted session. It lives here,
+     not in the view: the views cannot reach the session registry, and this is the
+     component that already owns the terminal side. The slot owns both halves of
+     registration, so a superseded pane cannot hide the live one. -->
+{#snippet sessionPane({ paneKey, visible }: { paneKey: string; visible: boolean })}
+  {@const registryKey = hostedSessionRegistryKey(paneKey)}
+  {#if registryKey !== null}
+    <SessionTerminalSlot hostKey={registryKey} {visible} />
+  {/if}
+{/snippet}
 
 <style>
   .workspace-host-parking {

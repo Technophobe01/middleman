@@ -100,6 +100,12 @@ owner:
   machine's, so assert the invariant that holds either side of a wrap boundary,
   never which side a chosen width lands on
   (`frontend/src/RoborevReviewDrawer.footer-layout.browser.svelte.ts`).
+- Browser specs must live under `frontend/src`, even when they cover a
+  `packages/ui` component. The browser project includes only
+  `src/**/*.browser.svelte.ts` while the unit project also includes
+  `../packages/ui/src/**` (`frontend/vite.config.ts:214`, `:178`), so a
+  `*.browser.svelte.ts` file placed beside a `packages/ui` component never runs
+  at all — it is silently collected by nothing rather than failing.
 - Use Playwright mock e2e when the regression is specifically about a
   multi-step browser workflow, viewport behavior, screenshots/video, drag,
   scroll/sticky/overflow geometry, canvas/xterm rendering, or browser navigation.
@@ -115,6 +121,18 @@ that is already proven at those two boundaries.
 Agent lifecycle hooks intentionally have no full agent-launch E2E. Cover hook config,
 CLI relay, and HTTP handling independently because agent-process invocation is external
 and a combined test duplicates those seams (`internal/server/workspaceapi/agent_hook_test.go::TestReceiveAgentHookRecordsActivityAndGeneratesClaudeContext`).
+
+A leaf renders a body per tab and hides the inactive ones, so which bodies exist
+depends on the caller's `visible` gating, not on which tab is active: the
+conversation body is ungated and stays mounted behind the diff, while the diff
+body is gated and unmounts (asserting `.diff-view` has count 0 after switching to
+Conversation is correct). The mounted-but-hidden conversation matters for
+locators — its timeline renders review-thread diff snippets carrying the same
+`pierre-diff`, `[data-diff-*]`, `gutter--selected`, and `.file-content` markup as
+the diff, so scope diff locators to `.diff-area`.
+Pane tab headers are `role="tab"` with an `aria-label`, so use
+`getByRole("tab", { name })` — `getByRole(..., { hasText })` is not a valid
+option and silently matches every tab.
 
 Every `@lucide/svelte/icons/<name>` import added anywhere in `frontend/src` or
 `packages/ui/src` must also be added to the `optimizeDeps.include` list in

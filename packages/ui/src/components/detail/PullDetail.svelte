@@ -28,6 +28,7 @@
   import {
     Card,
     CopyButton,
+    FitStages,
     copyToClipboard,
     formatRelativeTime,
   } from "@kenn-io/kit-ui";
@@ -45,14 +46,17 @@
   } from "./keyboard-actions.js";
     import { SelectDropdown } from "@kenn-io/kit-ui";
   import ChevronDownIcon from "@lucide/svelte/icons/chevron-down";
+  import CheckIcon from "@lucide/svelte/icons/check";
   import ClockIcon from "@lucide/svelte/icons/clock";
   import ExternalLinkIcon from "@lucide/svelte/icons/external-link";
   import GitMergeIcon from "@lucide/svelte/icons/git-merge";
   import MonitorUpIcon from "@lucide/svelte/icons/monitor-up";
   import RefreshCwIcon from "@lucide/svelte/icons/refresh-cw";
+  import SendHorizontalIcon from "@lucide/svelte/icons/send-horizontal";
   import TagsIcon from "@lucide/svelte/icons/tags";
   import UserCheckIcon from "@lucide/svelte/icons/user-check";
   import UsersIcon from "@lucide/svelte/icons/users";
+  import WorkflowIcon from "@lucide/svelte/icons/workflow";
   import XIcon from "@lucide/svelte/icons/x";
   import { Button, Chip } from "@kenn-io/kit-ui";
   import { Spinner } from "@kenn-io/kit-ui";
@@ -1142,6 +1146,7 @@
   const createWorkspaceDescriptionId =
     "pull-create-workspace-description";
   let actionMenuOpen = $state(false);
+  let primaryActionStage = $state(0);
   let actionMenuWrapEl = $state<HTMLDivElement>();
   let stateMenuOpen = $state(false);
   let stateMenuWrapEl = $state<HTMLSpanElement>();
@@ -1838,6 +1843,7 @@
           <div
             class="pull-detail-content"
             class:pull-detail-content--has-compact-actions={pr.State !== "merged" && !stalePR}
+            class:pull-detail-content--actions-menu={primaryActionStage === 2}
           >
             {#snippet labelActionButton(iconSize = 16)}
               <Button
@@ -2161,7 +2167,7 @@
       {/if}
 
 
-      {#snippet primaryActionButtons()}
+      {#snippet primaryActionButtons(compactLabels = false)}
         {#if pr.State === "open"}
           {#if pr.IsDraft && capabilities.ready_for_review}
             {@const readyGate = operationGate(repoOperations?.mark_ready_for_review)}
@@ -2173,6 +2179,7 @@
               {platformHost}
               {repoPath}
               size="sm"
+              compactLabel={compactLabels}
               disabled={stalePR || readyGate.unavailable}
               title={readyGate.unavailable ? readyGate.reason : undefined}
               oncompleted={closeActionMenu}
@@ -2209,6 +2216,7 @@
               {repoPath}
               count={workflowApproval.count ?? 0}
               size="sm"
+              compactLabel={compactLabels}
               disabled={stalePR || workflowGate.unavailable}
               title={workflowGate.unavailable ? workflowGate.reason : undefined}
               oncompleted={closeActionMenu}
@@ -2245,8 +2253,18 @@
               tone="success"
               surface={deferredMergePending ? "soft" : "solid"}
               size="sm"
-              label={deferredMergePending ? "Merge queued" : mergeActionLabel(mergeSettings)}
-              shortLabel={deferredMergePending ? "Queued" : mergeActionShortLabel(mergeSettings)}
+              ariaLabel={compactLabels
+                ? deferredMergePending
+                  ? "Merge queued"
+                  : mergeActionLabel(mergeSettings)
+                : undefined}
+              label={compactLabels
+                ? deferredMergePending
+                  ? "Queued"
+                  : mergeActionShortLabel(mergeSettings)
+                : deferredMergePending
+                  ? "Merge queued"
+                  : mergeActionLabel(mergeSettings)}
             >
               {#if deferredMergePending}
                 <ClockIcon size="14" strokeWidth="2.2" aria-hidden="true" />
@@ -2275,7 +2293,6 @@
               surface="outline"
               size="sm"
               label={stateSubmitting ? "Closing..." : "Close"}
-              shortLabel={stateSubmitting ? "Closing..." : "Close"}
             >
               <XIcon size="14" strokeWidth="2.2" aria-hidden="true" />
             </Button>
@@ -2296,7 +2313,6 @@
               surface="solid"
               size="sm"
               label={stateSubmitting ? "Reopening..." : "Reopen"}
-              shortLabel={stateSubmitting ? "Reopening..." : "Reopen"}
             >
               <RefreshCwIcon size="14" strokeWidth="2.2" aria-hidden="true" />
             </Button>
@@ -2304,7 +2320,7 @@
         {/if}
       {/snippet}
 
-      {#snippet workspaceActionButton()}
+      {#snippet workspaceActionButton(compactLabels = false)}
         {#if workspace}
           {#if inlineWorkspace}
             <Button
@@ -2318,8 +2334,8 @@
               tone="info"
               surface="soft"
               size="sm"
-              label="Focus Terminal"
-              shortLabel="Terminal"
+              ariaLabel={compactLabels ? "Focus Terminal" : undefined}
+              label={compactLabels ? "Terminal" : "Focus Terminal"}
             >
               <MonitorUpIcon size="14" strokeWidth="2.2" aria-hidden="true" />
             </Button>
@@ -2334,8 +2350,8 @@
               tone="neutral"
               surface="soft"
               size="sm"
-              label="Open in Workspaces"
-              shortLabel="Workspaces"
+              ariaLabel={compactLabels ? "Open in Workspaces" : undefined}
+              label={compactLabels ? "Workspaces" : "Open in Workspaces"}
             >
               <ExternalLinkIcon size="14" strokeWidth="2.2" aria-hidden="true" />
             </Button>
@@ -2351,8 +2367,8 @@
               tone="info"
               surface="soft"
               size="sm"
-              label="Open Workspace"
-              shortLabel="Workspace"
+              ariaLabel={compactLabels ? "Open Workspace" : undefined}
+              label={compactLabels ? "Workspace" : "Open Workspace"}
             >
               <MonitorUpIcon size="14" strokeWidth="2.2" aria-hidden="true" />
             </Button>
@@ -2373,6 +2389,106 @@
         {/if}
       {/snippet}
 
+      {#snippet measuredPrimaryActions(compactLabels = false)}
+        <div
+          class="actions-row actions-row--primary actions-row--measure"
+          aria-hidden="true"
+          inert
+        >
+          {#if pr.State === "open"}
+            {#if pr.IsDraft && capabilities.ready_for_review}
+              <Button
+                size="sm"
+                label={compactLabels ? "Ready" : "Ready for review"}
+              >
+                <SendHorizontalIcon size="14" strokeWidth="2.2" aria-hidden="true" />
+              </Button>
+            {/if}
+            {#if capabilities.review_mutation}
+              <Button size="sm" label="Approve">
+                <CheckIcon size="14" strokeWidth="2.4" aria-hidden="true" />
+              </Button>
+            {/if}
+            {#if capabilities.workflow_approval && workflowApproval?.checked && workflowApproval.required}
+              {@const count = workflowApproval.count ?? 0}
+              <Button
+                size="sm"
+                label={compactLabels
+                  ? count > 1
+                    ? `Workflows (${count})`
+                    : "Workflows"
+                  : count > 1
+                    ? `Approve workflows (${count})`
+                    : "Approve workflows"}
+              >
+                <WorkflowIcon size="14" strokeWidth="2.2" aria-hidden="true" />
+              </Button>
+            {/if}
+            {@const mergeOp = repoOperations?.merge_pr}
+            {#if repoSettings && (mergeOp !== undefined
+                || (capabilities.merge_mutation && repoSettings.viewerCanMerge))}
+              <Button
+                size="sm"
+                label={compactLabels
+                  ? deferredMergePending
+                    ? "Queued"
+                    : mergeActionShortLabel(repoSettings)
+                  : deferredMergePending
+                    ? "Merge queued"
+                    : mergeActionLabel(repoSettings)}
+              >
+                {#if deferredMergePending}
+                  <ClockIcon size="14" strokeWidth="2.2" aria-hidden="true" />
+                {:else}
+                  <GitMergeIcon size="14" strokeWidth="2.2" aria-hidden="true" />
+                {/if}
+                {#snippet trailing()}
+                  {#if !deferredMergePending && repoSettings !== null && mergeActionHasMenu(repoSettings)}
+                    <ChevronDownIcon size="13" strokeWidth="2.2" aria-hidden="true" />
+                  {/if}
+                {/snippet}
+              </Button>
+            {/if}
+            {#if capabilities.state_mutation}
+              <Button
+                size="sm"
+                label={stateSubmitting ? "Closing..." : "Close"}
+              >
+                <XIcon size="14" strokeWidth="2.2" aria-hidden="true" />
+              </Button>
+            {/if}
+          {:else if pr.State === "closed" && capabilities.state_mutation}
+            <Button
+              size="sm"
+              label={stateSubmitting ? "Reopening..." : "Reopen"}
+            >
+              <RefreshCwIcon size="14" strokeWidth="2.2" aria-hidden="true" />
+            </Button>
+          {/if}
+        </div>
+      {/snippet}
+
+      {#snippet fullPrimaryActionMeasure()}
+        {@render measuredPrimaryActions(false)}
+      {/snippet}
+
+      {#snippet compactPrimaryActionMeasure()}
+        {@render measuredPrimaryActions(true)}
+      {/snippet}
+
+      {#snippet menuPrimaryActionMeasure()}
+        <div
+          class="actions-row actions-row--primary actions-row--measure"
+          aria-hidden="true"
+          inert
+        >
+          <button type="button" class="actions-menu-trigger">
+            <span>Actions</span>
+            <ChevronDownIcon size="14" strokeWidth="2.2" aria-hidden="true" />
+          </button>
+        </div>
+      {/snippet}
+
       <!-- Approve / Merge / Close / Reopen actions -->
       {#if !workspace}
         <span id={createWorkspaceDescriptionId} class="kit-sr-only">
@@ -2381,15 +2497,27 @@
       {/if}
       {#if pr.State !== "merged" && !stalePR}
         <div class="primary-actions-wrap">
-          <div class="actions-row actions-row--primary">
-            {@render primaryActionButtons()}
-            {#if !hideWorkspaceAction}
-              <div class="primary-workspace-action">
-                {@render workspaceActionButton()}
-              </div>
-            {/if}
-          </div>
-          <div class="actions-menu-wrap" bind:this={actionMenuWrapEl}>
+          <FitStages
+            class="primary-actions-fit"
+            bind:stage={primaryActionStage}
+            onstagechange={(stage) => {
+              if (stage !== 2) closeActionMenu();
+            }}
+            stages={[
+              fullPrimaryActionMeasure,
+              compactPrimaryActionMeasure,
+              menuPrimaryActionMeasure,
+            ]}
+          />
+          <div
+            class={[
+              "actions-menu-wrap",
+              {
+                "actions-menu-wrap--menu": primaryActionStage === 2,
+              },
+            ]}
+            bind:this={actionMenuWrapEl}
+          >
             <button
               type="button"
               class="actions-menu-trigger"
@@ -2400,21 +2528,33 @@
               <span>Actions</span>
               <ChevronDownIcon size="14" strokeWidth="2.2" aria-hidden="true" />
             </button>
-            {#if actionMenuOpen}
-              <div class="actions-menu-popover">
-                {@render primaryActionButtons()}
-                {#if capabilities.read_labels && capabilities.label_mutation}
-                  <div class="actions-menu-popover__item actions-menu-popover__item--labels label-editor-anchor">
-                    {@render labelActionButton(14)}
-                  </div>
-                {/if}
-                {#if !hideWorkspaceAction}
-                  <div class="actions-menu-popover__item">
-                    {@render workspaceActionButton()}
-                  </div>
-                {/if}
+            <div
+              class={[
+                "primary-actions-live",
+                {
+                  "actions-menu-popover":
+                    primaryActionStage === 2 || actionMenuOpen,
+                  "primary-actions-live--open":
+                    primaryActionStage === 2 && actionMenuOpen,
+                },
+              ]}
+              aria-hidden={primaryActionStage === 2 && !actionMenuOpen}
+              inert={primaryActionStage === 2 && !actionMenuOpen}
+            >
+              <div class="actions-row actions-row--primary">
+                {@render primaryActionButtons(primaryActionStage === 1)}
               </div>
-            {/if}
+              {#if actionMenuOpen && capabilities.read_labels && capabilities.label_mutation}
+                <div class="actions-menu-popover__item actions-menu-popover__item--labels label-editor-anchor">
+                  {@render labelActionButton(14)}
+                </div>
+              {/if}
+              {#if !hideWorkspaceAction}
+                <div class="actions-row actions-row--workspace">
+                  {@render workspaceActionButton(primaryActionStage === 1)}
+                </div>
+              {/if}
+            </div>
           </div>
           {#if stateConflict === "stale_state"}
             <span class="action-error action-error--state" role="status">
@@ -2454,13 +2594,6 @@
               {/if}
             </div>
           {/if}
-        </div>
-      {/if}
-
-      {#if !hideWorkspaceAction}
-        <!-- Workspace actions -->
-        <div class="actions-row actions-row--workspace">
-          {@render workspaceActionButton()}
         </div>
       {/if}
 
@@ -3154,6 +3287,20 @@
     min-width: 0;
   }
 
+  .primary-actions-wrap :global(.primary-actions-fit) {
+    position: absolute;
+    inset: 0 0 auto; /* kit-ui-check-ignore: zero-height hidden FitStages measurement layer, not an overlay */
+    width: 100%;
+    height: 0;
+    overflow: hidden;
+    visibility: hidden;
+    pointer-events: none;
+  }
+
+  .primary-actions-wrap :global(.actions-row--measure) {
+    flex-wrap: nowrap;
+  }
+
   .actions-row {
     display: flex;
     align-items: flex-start;
@@ -3173,25 +3320,25 @@
     max-width: 100%;
   }
 
-  .primary-workspace-action {
-    display: none;
-    min-width: 0;
-  }
-
-  @container pull-detail (max-width: 560px) {
-    .actions-row--primary :global(.btn--close svg) {
-      display: none;
-    }
+  .primary-actions-live {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
   }
 
   .actions-menu-wrap {
-    display: none;
+    display: contents;
+  }
+
+  .actions-menu-wrap--menu {
+    display: block;
     position: relative;
     z-index: 65;
   }
 
   .actions-menu-trigger {
-    display: inline-flex;
+    display: none;
     align-items: center;
     gap: 6px;
     min-height: 28px;
@@ -3203,6 +3350,26 @@
     font-size: var(--font-size-sm);
     font-weight: 600;
     cursor: pointer;
+  }
+
+  .actions-menu-wrap--menu > .actions-menu-trigger {
+    display: inline-flex;
+  }
+
+  .actions-menu-wrap--menu .primary-actions-live {
+    display: none;
+  }
+
+  .actions-menu-wrap--menu .primary-actions-live--open {
+    display: flex;
+  }
+
+  .primary-actions-live > .actions-menu-popover__item {
+    display: none;
+  }
+
+  .actions-menu-wrap--menu .primary-actions-live > .actions-menu-popover__item {
+    display: block;
   }
 
   .actions-menu-trigger:hover {
@@ -3265,45 +3432,13 @@
     flex-wrap: wrap;
   }
 
-  .actions-menu-popover :global(.kit-button__short-label) {
+  .actions-menu-popover > .actions-row--primary {
+    flex-direction: column;
+    width: 100%;
+  }
+
+  .pull-detail-content--actions-menu .label-editor-anchor--inline {
     display: none;
-  }
-
-  @media (max-width: 640px) {
-    .primary-workspace-action {
-      display: block;
-    }
-
-    .pull-detail-content--has-compact-actions .actions-row.actions-row--workspace {
-      display: none;
-    }
-  }
-
-  @container pull-detail (max-width: 520px) {
-    .actions-row--primary :global(.kit-button__label),
-    .actions-row--workspace :global(.kit-button__label) {
-      display: none;
-    }
-
-    .actions-row--primary :global(.kit-button__short-label),
-    .actions-row--workspace :global(.kit-button__short-label) {
-      display: inline;
-    }
-  }
-
-  @container pull-detail (max-width: 340px) {
-    .pull-detail-content .primary-actions-wrap .actions-row--primary {
-      display: none;
-    }
-
-    .pull-detail-content .primary-actions-wrap .actions-menu-wrap {
-      display: block;
-    }
-
-    .pull-detail-content--has-compact-actions .label-editor-anchor--inline,
-    .pull-detail-content--has-compact-actions .actions-row.actions-row--workspace {
-      display: none;
-    }
   }
 
   .action-error {

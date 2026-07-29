@@ -1,14 +1,21 @@
 <script lang="ts">
+  import type { Snippet } from "svelte";
   import type { ActivityItem } from "../api/types.js";
   import { getStackDepth } from "../stores/keyboard/modal-stack.svelte.js";
   import ActivityFeed from "../components/ActivityFeed.svelte";
   import CommitDiffPanel from "../components/CommitDiffPanel.svelte";
-  import WorkspaceDockPanel from "../components/workspace/WorkspaceDockPanel.svelte";
   import { IconButton, SidebarToggle, SplitResizeHandle } from "@kenn-io/kit-ui";
   import type { SplitResizeEvent } from "@kenn-io/kit-ui";
   import type { PullRequestRouteRef } from "../routes.js";
-  import PRListView from "./PRListView.svelte";
-  import IssueListView from "./IssueListView.svelte";
+  import IssueDetail from "../components/detail/IssueDetail.svelte";
+  import PullDetailPane from "../components/detail/PullDetailPane.svelte";
+  import { issueDetailMatchesRef, pullDetailMatchesRef } from "../components/detail/detail-match.js";
+  import DetailPaneLayout from "../components/shared/DetailPaneLayout.svelte";
+  import type { TabbedPanelLeaf } from "../components/shared/tabbed-panel-layout.js";
+  import { getPaneLayoutStore, type PaneTabSpec } from "../stores/paneLayout.svelte.js";
+  import { isSessionPaneKey } from "../stores/session-pane-key.js";
+  import { getStores } from "../context.js";
+  import { useItemWorkspaceClaim } from "../item-workspace-claim.svelte.js";
   import type { InlineWorkspaceController, WorkspaceItemIdentity } from "../workspace-inline.js";
 
   type ActivityDetailTab = "conversation" | "files";
@@ -45,10 +52,16 @@
     detailTab?: ActivityDetailTab;
     onSelectItem?: (item: ActivityItem) => void;
     onCloseDrawer?: () => void;
-    onDetailTabChange?: (tab: ActivityDetailTab) => void;
+    onDetailTabChange?: (tab: ActivityDetailTab, options?: { replace?: boolean }) => void;
     onDrawerItemChange?: (item: DrawerPRItem) => void;
     phone?: boolean;
     inlineWorkspace?: InlineWorkspaceController | null;
+    /**
+     * The workspace's own controls, rendered in the tab strip of the leaf holding
+     * the workspace pane or one of its promoted sessions. Supplied by the app
+     * shell: the controls live in `frontend/`, next to the state they act on.
+     */
+    workspacePaneControls?: Snippet<[boolean]> | undefined;
   }
 
   let {
@@ -60,7 +73,11 @@
     onDrawerItemChange,
     phone = false,
     inlineWorkspace = null,
+    workspacePaneControls = undefined,
   }: Props = $props();
+
+  const { detail: detailStore, issues: issuesStore } = getStores();
+  const paneLayout = getPaneLayoutStore("activity");
 
   const ACTIVITY_PANE_WIDTH_KEY = "middleman-activity-pane-width";
   const DEFAULT_ACTIVITY_PANE_WIDTH = 360;
@@ -180,10 +197,9 @@
         }
       : null,
   );
-  // The claim itself is made by the embedded PRListView/IssueListView's own
-  // claim effect (they receive {inlineWorkspace} below); this view only
-  // renders the dock, so it needs the identity to ask the controller
-  // whether that claim is currently active.
+  const isPRSelection = $derived(drawerPRSelection !== null);
+
+  /** The selected item, whichever kind, for the claim lifecycle. */
   const claimIdentity = $derived<WorkspaceItemIdentity | null>(
     activeDrawer
       ? {
@@ -199,11 +215,133 @@
       : null,
   );
 
+  /** Detail for the selected PR, or null while it is stale or absent. */
+  const selectedPullDetail = $derived.by(() => {
+    const detail = detailStore.getDetail();
+    return pullDetailMatchesRef(detail, drawerPRSelection) ? detail : null;
+  });
+
+  function loadedDetailMatchesSelection(): boolean {
+    if (drawerPRSelection) return pullDetailMatchesRef(detailStore.getDetail(), drawerPRSelection);
+    if (drawerIssueSelection) return issueDetailMatchesRef(issuesStore.getIssueDetail(), drawerIssueSelection);
+    return false;
+  }
+
+  function selectionEnvelopeRef() {
+    if (drawerPRSelection) return detailStore.getDetail()?.workspace ?? null;
+    if (drawerIssueSelection) return issuesStore.getIssueDetail()?.workspace ?? null;
+    return null;
+  }
+
+  function refreshSelectionDetail(): void {
+    if (drawerPRSelection) {
+      const ref = drawerPRSelection;
+      void detailStore.loadDetail(ref.owner, ref.name, ref.number, {
+        sync: false,
+        provider: ref.provider,
+        platformHost: ref.platformHost,
+        repoPath: ref.repoPath,
+      });
+      return;
+    }
+    if (drawerIssueSelection) {
+      const ref = drawerIssueSelection;
+      void issuesStore.loadIssueDetail(ref.owner, ref.name, ref.number, {
+        sync: false,
+        provider: ref.provider,
+        platformHost: ref.platformHost,
+        repoPath: ref.repoPath,
+      });
+    }
+  }
+
+  const workspaceClaim = useItemWorkspaceClaim({
+    controller: () => inlineWorkspace,
+    identity: () => claimIdentity,
+    detailMatches: loadedDetailMatchesSelection,
+    envelopeRef: selectionEnvelopeRef,
+    refresh: refreshSelectionDetail,
+  });
+
+  // One pane vocabulary for every Activity selection kind, with availability
+  // doing the switching: a PR contributes a diff pane, a commit contributes its
+  // own, and an issue contributes neither. Keeping them in one tree is what lets
+  // an arrangement survive moving between selections.
+  // One entry per session the surface's stored tree already holds. `available`
+  // never conjures a pane: a session pane exists only because the user promoted
+  // it, so a workspace whose sessions were never promoted adds nothing here.
+  const sessionTabs = $derived<PaneTabSpec[]>(
+    (inlineWorkspace?.promotableSessions() ?? []).map((session) => ({
+      key: session.paneKey,
+      label: session.label,
+      available: paneLayout.hasTab(session.paneKey),
+      hideable: true,
+    })),
+  );
+
+  const paneTabs = $derived<PaneTabSpec[]>([
+    { key: "conversation", label: "Conversation", available: activeDrawer !== null },
+    { key: "files", label: "Files changed", available: isPRSelection },
+    { key: "commit", label: "Commit", available: commitDrawer !== null },
+    {
+      key: "workspace",
+      label: inlineWorkspace?.workspacePaneLabel() ?? "Workspace",
+      // Retire an empty workflow container behind the surface-hosted dock. A
+      // promoted session then fills the branch beside it without a blank stage.
+      available:
+        workspaceClaim.ref() !== null &&
+        inlineWorkspace?.workspacePaneEmpty() !== true &&
+        inlineWorkspace?.workspacePaneRowOnly() !== true,
+      hideable: true,
+    },
+    ...sessionTabs,
+  ]);
+
+  // Whether the drawer's two route-bound panes are on screen at once, which is
+  // what decides that moving between them is a focus change rather than a
+  // navigation. Same arrangement rule as PRs mode.
+  const routePanesSplitApart = $derived.by(() => {
+    // Straight from the renderer, never inferred from the stored tree: flatten,
+    // a zoom over the other leaf, and a pane tabbed behind a sibling all show
+    // one pane while the tree still reads as split.
+    const render = paneLayout.paneRender();
+    if (render === null || render.flattened) return false;
+    return render.onScreenTabs.includes("conversation") && render.onScreenTabs.includes("files");
+  });
+
+  function handlePaneSelect(tabKey: string): void {
+    // Only the PR's two panes are bound to the drawer's tab state; commit and
+    // workspace have no equivalent.
+    if (tabKey === "conversation" || tabKey === "files") handleDetailTabChange(tabKey);
+  }
+
+  /**
+   * Follow the user between the two route-bound panes when both are visible.
+   *
+   * Without this the drawer's `detailTab` — and so the pane the layout treats as
+   * route-bound — stays on whichever pane was last clicked, even after the user
+   * moves into the other one and starts working in it. Only while split: sharing
+   * a leaf means the invisible sibling can still take focus programmatically.
+   */
+  function handlePaneFocus(tabKey: string): void {
+    // Every pane, before the detail-tab filter below: the host decides which keys
+    // name a workspace, and it needs the container and the promoted session panes
+    // that this branch would otherwise drop.
+    inlineWorkspace?.notePaneFocused(tabKey);
+    if (tabKey !== "conversation" && tabKey !== "files") return;
+    if (!isPRSelection || tabKey === effectiveDetailTab) return;
+    if (!routePanesSplitApart) return;
+    // Activity's selection lives in the query string and is always written with
+    // replaceUrl, so this only keeps the drawer's own tab state in step.
+    handleDetailTabChange(tabKey, { replace: true });
+  }
+
   function handleDetailTabChange(
     tab: ActivityDetailTab,
+    options?: { replace?: boolean },
   ): void {
     if (controlled) {
-      onDetailTabChange?.(tab);
+      onDetailTabChange?.(tab, options);
       return;
     }
     internalDetailTab = tab;
@@ -396,60 +534,84 @@
         </IconButton>
       </div>
 
-      {#if commitDrawer}
-        {#key commitDrawer.commitSha}
-          <CommitDiffPanel
-            provider={commitDrawer.provider}
-            platformHost={commitDrawer.platformHost}
-            owner={commitDrawer.owner}
-            name={commitDrawer.name}
-            repoPath={commitDrawer.repoPath}
-            commitSha={commitDrawer.commitSha}
-          />
-        {/key}
-      {:else if drawerPRSelection || drawerIssueSelection}
-        {#snippet activityEmbed()}
-          {#if drawerPRSelection}
-            <PRListView
-              selectedPR={drawerPRSelection}
-              detailTab={effectiveDetailTab}
-              isSidebarCollapsed={true}
-              hideSidebar={true}
-              autoSyncDetail="background"
-              hideStaleDetailWhileLoading={true}
+      <DetailPaneLayout
+        layout={paneLayout}
+        tabs={paneTabs}
+        tablistLabel="Activity detail panes"
+        leafLabel="Activity detail pane group"
+        routeTabKey={isPRSelection ? effectiveDetailTab : undefined}
+        onSelectTab={handlePaneSelect}
+        onFocusPane={handlePaneFocus}
+        paneLeafExtras={workspacePaneControls ? workspaceLeafExtras : undefined}
+      >
+        {#snippet renderPane(tabKey, visible)}
+          {#if tabKey === "commit" && commitDrawer && visible}
+            {#key commitDrawer.commitSha}
+              <CommitDiffPanel
+                provider={commitDrawer.provider}
+                platformHost={commitDrawer.platformHost}
+                owner={commitDrawer.owner}
+                name={commitDrawer.name}
+                repoPath={commitDrawer.repoPath}
+                commitSha={commitDrawer.commitSha}
+              />
+            {/key}
+          {:else if tabKey === "workspace" && inlineWorkspace && visible}
+            <!-- Portal target for the single live terminal subtree. Mounted only
+                 while visible: a slot left behind another tab or a zoom would stay
+                 the registered host and strand the terminal off screen. -->
+            <div class="detail-pane-workspace-slot" {@attach inlineWorkspace.slotAttachment}></div>
+          {:else if isSessionPaneKey(tabKey)}
+            {@const sessionPane = inlineWorkspace?.sessionPane() ?? null}
+            {#if sessionPane}
+              <!-- The frontend supplies the body: it owns the session registry, and
+                   the visibility argument travels with it so a pane tabbed behind a
+                   sibling leaves its terminal inert rather than off screen and live. -->
+              {@render sessionPane({ paneKey: tabKey, visible })}
+            {/if}
+          {:else if drawerPRSelection}
+            <PullDetailPane
+              {tabKey}
+              {visible}
+              pr={drawerPRSelection}
+              detail={selectedPullDetail}
+              autoSync="background"
+              hideStaleWhileLoading={true}
               workflowApprovalSync={false}
-              onDetailTabChange={handleDetailTabChange}
               onStackMemberNavigate={handleStackMemberNavigate}
-              renderWorkspaceDock={false}
               {inlineWorkspace}
             />
-          {:else if drawerIssueSelection}
-            <IssueListView
-              selectedIssue={drawerIssueSelection}
-              isSidebarCollapsed={true}
-              hideSidebar={true}
-              autoSyncDetail="background"
-              hideStaleDetailWhileLoading={true}
-              renderWorkspaceDock={false}
+          {:else if tabKey === "conversation" && drawerIssueSelection}
+            <IssueDetail
+              owner={drawerIssueSelection.owner}
+              name={drawerIssueSelection.name}
+              number={drawerIssueSelection.number}
+              provider={drawerIssueSelection.provider}
+              platformHost={drawerIssueSelection.platformHost}
+              repoPath={drawerIssueSelection.repoPath}
+              autoSync="background"
+              hideStaleWhileLoading={true}
               {inlineWorkspace}
             />
           {/if}
         {/snippet}
-
-        {#if inlineWorkspace}
-          <WorkspaceDockPanel
-            controller={inlineWorkspace}
-            active={claimIdentity !== null && inlineWorkspace.isClaimedFor(claimIdentity)}
-          >
-            {@render activityEmbed()}
-          </WorkspaceDockPanel>
-        {:else}
-          {@render activityEmbed()}
-        {/if}
-      {/if}
+      </DetailPaneLayout>
+      <!-- The terminal dock, anchored at this surface's bottom edge while the
+           container pane has retired because it is empty or row-only. The dock
+           normally lives inside that pane, and must remain reachable outside it. -->
+      {@render inlineWorkspace?.dockRow()?.()}
     </section>
   {/if}
 </div>
+
+<!-- Only the leaf actually holding the workspace or one of its promoted sessions:
+     the controls act on that workspace, so offering them from a leaf of unrelated
+     panes would be a control with no subject. -->
+{#snippet workspaceLeafExtras(leaf: TabbedPanelLeaf)}
+  {#if leaf.tabs.some((tabKey) => tabKey === "workspace" || isSessionPaneKey(tabKey))}
+    {@render workspacePaneControls?.(leaf.tabs.includes("workspace"))}
+  {/if}
+{/snippet}
 
 <style>
   .activity-shell {
@@ -529,6 +691,14 @@
     overflow: hidden;
     display: flex;
     flex-direction: column;
+  }
+
+  .detail-pane-workspace-slot {
+    display: flex;
+    flex: 1;
+    min-width: 0;
+    min-height: 0;
+    height: 100%;
   }
 
   @container (max-width: 760px) {

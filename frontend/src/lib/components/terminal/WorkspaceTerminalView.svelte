@@ -1,19 +1,22 @@
 <script lang="ts">
   import { EmptyState, IconButton, Spinner } from "@kenn-io/kit-ui";
-  import { onDestroy, tick } from "svelte";
+  import PlayIcon from "@lucide/svelte/icons/play";
+  import { onDestroy, tick, untrack } from "svelte";
   import { navigate } from "../../stores/router.svelte.ts";
   import { isNarrow } from "../../stores/container.svelte.js";
   import WorkspaceListSidebar from "./WorkspaceListSidebar.svelte";
   import KataWorkspaceSidebarPane from "./KataWorkspaceSidebarPane.svelte";
-  import TerminalPane from "./TerminalPane.svelte";
+  import SessionTerminalSlot from "./SessionTerminalSlot.svelte";
   import Modal from "../shared/Modal.svelte";
   import ConfirmDialog from "../shared/ConfirmDialog.svelte";
   import DialogButton from "../shared/DialogButton.svelte";
   import WorkspaceHome from "./WorkspaceHome.svelte";
+  import WorkspaceLauncherOverlay from "./WorkspaceLauncherOverlay.svelte";
   import LaunchMenu from "./LaunchMenu.svelte";
   import TerminalOptionsMenu from "./TerminalOptionsMenu.svelte";
   import TerminalZoomControl from "./TerminalZoomControl.svelte";
   import DockedTerminalPanel from "./DockedTerminalPanel.svelte";
+  import WorkspacePaneControls from "./WorkspacePaneControls.svelte";
   import WorkflowSplitTree, {
     type WorkflowTabDescriptor,
   } from "./WorkflowSplitTree.svelte";
@@ -31,6 +34,23 @@
     workspaceSessionWebSocketPath,
     type WorkspaceRuntimeState,
   } from "../../api/workspace-runtime.js";
+  import {
+    mountedSessions,
+    noteSessionMounted,
+    noteSessionUnmounted,
+    onSessionExited,
+    requestSessionFocus,
+    sessionHostKey,
+    sessionHostPrefix,
+    type MountedSession,
+    type SessionHostKey,
+  } from "../../stores/session-host.svelte.ts";
+  import {
+    publishHostedSessions,
+    registerWorkspaceControls,
+    registerWorkspaceLauncher,
+    setWorkspaceControlsBusy,
+  } from "../../stores/workspace-host.svelte.ts";
   import {
     beginWorkspaceSwitch,
     cancelWorkspaceSwitch,
@@ -52,6 +72,8 @@
     normalizeTerminalLayout,
     normalizeWorkflowTree,
     parseTerminalLayout,
+    pruneTree,
+    pruneWorkflowTreeToAvailable,
     splitPane,
     splitSessionIntoPane,
     splitWorkflowTabIntoLeaf,
@@ -65,6 +87,7 @@
     type TerminalGroup,
     type TerminalDock,
     type TerminalLayoutState,
+    type WorkflowNode,
     type WorkflowTabKey,
   } from "./terminal-layout";
   import {
@@ -78,16 +101,25 @@
   } from "./terminal-drag";
   import { shouldRetryFleetDiffWatch } from "./fleet-diff-watch.js";
   import { Button, CollapsibleSidebar,
+    clearActiveTabbedPanelDrag,
+    getPaneLayoutStore,
     getStores,
+    parseSessionPaneKey,
+    promoteSessionBesideWorkspace,
+    readTabbedPanelTabDrag,
+    sessionPaneKey,
+    sessionPaneKeyMatchesWorkspace,
     SplitResizeHandle,
     WorkspaceRightSidebar,
     type InlineDockMode,
+    type PaneSurfaceKey,
     type SplitResizeEvent,
     type WorkspaceItemIdentity, } from "@middleman/ui";
   import { getStackDepth } from "@middleman/ui/stores/keyboard/modal-stack";
   import ChevronsDownIcon from "@lucide/svelte/icons/chevrons-down";
   import ChevronsUpIcon from "@lucide/svelte/icons/chevrons-up";
   import PanelBottomCloseIcon from "@lucide/svelte/icons/panel-bottom-close";
+  import Trash2Icon from "@lucide/svelte/icons/trash-2";
   import {
     AlertIcon,
     RefreshIcon,
@@ -170,6 +202,13 @@
     // Backs the toolbar's expand/show-details/collapse controls, which
     // replace the inline dock's own removed header bar.
     inlineDock?: { getMode(): InlineDockMode; setMode(mode: InlineDockMode): void } | null;
+    // The detail surface this instance is embedded in, if any. Its pane layout is
+    // the only record of which of this workspace's sessions have been promoted
+    // out of here into a top-level pane, so it is also what tells this view which
+    // sessions NOT to render. Unset on the Workspaces tab and the embed routes,
+    // which have no detail panes: a session promoted in one surface is still at
+    // home in every other place the workspace is shown.
+    paneSurface?: PaneSurfaceKey | undefined;
     terminalSettingsReady?: boolean;
   }
 
@@ -186,6 +225,7 @@
     hostVisible = true,
     onWorkspaceDeleted = undefined,
     inlineDock = null,
+    paneSurface = undefined,
     terminalSettingsReady = true,
   }: Props = $props();
 
@@ -193,6 +233,16 @@
     window.__BASE_PATH__ ?? "/"
   ).replace(/\/$/, "");
   const { settings: settingsStore } = getStores();
+  // Launcher, controls, and pending-write state is keyed by workspace identity
+  // rather than held as bare flags: one embedded view serves every selection on its
+  // surface, so a switch would otherwise inherit the previous workspace's open
+  // overlay and its in-flight writes.
+  const viewWorkspaceKey = $derived(`${workspaceId}\u0000${workspaceHostKey ?? ""}`);
+  // Terminal font size and terminal options are APP settings, not workspace state:
+  // one write, one single-flight controller, and it is in flight for every workspace
+  // at once. So these two are plain booleans that follow the controller. Keying them
+  // by workspace would report the next workspace's control enabled while the shared
+  // controller is still refusing input.
   let terminalZoomSaving = $state(false);
   let terminalOptionsSaving = $state(false);
   const terminalZoom = createTerminalZoomController({
@@ -256,6 +306,7 @@
   let forcePromptIdentity: WorkspaceItemIdentity | undefined;
   let forceDeleting = $state(false);
   let stopPromptSession = $state<RuntimeSession | null>(null);
+  let deletePromptOpen = $state(false);
   let stopSessionStopping = $state(false);
   let renamePrompt = $state<{
     sessionKey: string;
@@ -311,7 +362,12 @@
 
   let workflowPresets = $state<WorkflowPreset[]>(loadWorkflowPresets());
   let selectedWorkflowPresetId = $state<string | null>(null);
-  let applyingWorkflowPreset = $state(false);
+  // A preset apply IS workspace work - it launches that workspace's sessions - so it
+  // is tracked per workspace, and as a set rather than one owner: two workspaces can
+  // have an apply in flight at once, and whichever finishes first must not re-enable
+  // the other's control while its sessions are still being launched.
+  let applyingWorkflowPresetFor = $state<string[]>([]);
+  const applyingWorkflowPreset = $derived(applyingWorkflowPresetFor.includes(viewWorkspaceKey));
 
   type SidebarTab = "diff" | "pr" | "issue" | "reviews" | "kata_task";
 
@@ -469,11 +525,362 @@
     }
     return labels;
   });
-  const terminalSessions = $derived(
-    runtimeSessions.filter(
-      (session) => sessionRegion(session) === "terminal",
+  // The surface this view is embedded in, whose stored pane tree is the sole
+  // record of which sessions have been promoted out of this container.
+  const surfaceLayout = $derived(paneSurface ? getPaneLayoutStore(paneSurface) : null);
+
+  function sessionPaneKeyFor(session: RuntimeSession): string {
+    return sessionPaneKey(workspaceId, workspaceHostKey, session.key);
+  }
+
+  function detailPaneKeyForSession(sessionKey: string): string | null {
+    const session = runtimeSessions.find((candidate) => candidate.key === sessionKey);
+    return session ? sessionPaneKeyFor(session) : null;
+  }
+
+  const promotedSessionKeys = $derived(
+    new Set(
+      surfaceLayout === null
+        ? []
+        : runtimeSessions
+            .filter((session) => surfaceLayout.hasTab(sessionPaneKeyFor(session)))
+            .map((session) => session.key),
     ),
   );
+
+  function isPromoted(session: RuntimeSession): boolean {
+    return promotedSessionKeys.has(session.key);
+  }
+
+  /**
+   * The one session this view is embedded to show, or null.
+   *
+   * A pane whose only content is a single terminal needs no chrome of its own: the
+   * pane's tab strip already names it and carries its controls, so the header bar
+   * and the one-tab strip under it were two bars saying what the tab above them
+   * says. Null unless the surface actually gives this view that strip - a flattened
+   * surface suppresses per-leaf chrome, so there the toolbar is the only thing left
+   * to carry the controls.
+   */
+  const soleEmbeddedSession = $derived.by(() => {
+    if (!controlsInPane || runtimeSessions.length !== 1) return null;
+    const session = runtimeSessions[0]!;
+    if (isPromoted(session)) return null;
+    // Only while the surface's strip actually names this session: a leaf holding
+    // the workspace alone drops that strip (solo chrome), and rendering a
+    // workflow session bare there leaves NOTHING on screen naming it - the inner
+    // session strip is the one bar that pane has. The dock's own sole session
+    // stays bare: its pane renders as a plain terminal, and the workflow tree it
+    // would otherwise mount has no tab for a docked session anyway.
+    if (
+      sessionRegion(session) !== "terminal" &&
+      surfaceLayout?.paneRender()?.soloChromeTabs.includes("workspace")
+    ) {
+      return null;
+    }
+    return session;
+  });
+
+  /**
+   * Its registry key, derived rather than computed where it is rendered.
+   *
+   * The slot's prop is its own derived, so it re-runs on the flush that clears this
+   * session (the host left the pane for the Workspaces tab) BEFORE the block
+   * rendering it is torn down. Computing the key from the session down there threw
+   * on null, and a throw mid-flush takes the whole app's render with it: the host
+   * stayed in its parking node and the workspace tab came up empty.
+   */
+  const soleEmbeddedSessionHostKey = $derived(
+    soleEmbeddedSession === null ? null : sessionHostKeyFor(soleEmbeddedSession),
+  );
+
+  /**
+   * Whether the one session filling a chrome-free pane is the dock's own.
+   *
+   * The dock otherwise stays on screen in a chrome-free pane, but a docked sole
+   * session is already what the stage is showing - rendering the dock under it would
+   * point a second slot at the same registry key, and one terminal host cannot be in
+   * two places at once.
+   */
+  const soleEmbeddedSessionIsDocked = $derived(
+    soleEmbeddedSession !== null && sessionRegion(soleEmbeddedSession) === "terminal",
+  );
+
+  // The two directions of the cross-tree drag: a session tab carries its pane key
+  // out, and a promoted pane's key resolves back to the tab it belongs to. Both
+  // reject anything that is not a live session of THIS workspace on this host — a
+  // session key is unique only within one workspace.
+  const workflowPromotion = $derived(
+    surfaceLayout === null
+      ? undefined
+      : {
+          paneKeyFor: (tabKey: WorkflowTabKey) => {
+            const sessionKey = sessionKeyFromWorkflowTab(tabKey);
+            if (sessionKey === null) return null;
+            const session = runtimeSessions.find((candidate) => candidate.key === sessionKey);
+            return session ? sessionPaneKeyFor(session) : null;
+          },
+          tabKeyFor: (paneKey: string) => {
+            if (!sessionPaneKeyMatchesWorkspace(paneKey, workspaceId, workspaceHostKey)) return null;
+            const sessionKey = parseSessionPaneKey(paneKey)?.sessionKey ?? null;
+            if (sessionKey === null) return null;
+            if (!runtimeSessions.some((candidate) => candidate.key === sessionKey)) return null;
+            return workflowTabKeyForSession(sessionKey);
+          },
+        },
+  );
+
+  // Publish what a detail surface may promote. Only this view knows the runtime,
+  // the display labels, and each session's generation, and the registry key needs
+  // the generation so a relaunched session is not handed the dead one's terminal.
+  $effect(() => {
+    const sessions = runtimeSessions.map((session) => ({
+      paneKey: sessionPaneKeyFor(session),
+      label: sessionDisplayLabels[session.key] ?? session.label,
+      hostKey: sessionHostKeyFor(session),
+      active: session.key === currentSessionKey,
+    }));
+    const key = { workspaceId, hostKey: workspaceHostKey };
+    untrack(() => publishHostedSessions(key, sessions));
+  });
+
+  // A detail pane trades the Home tab for the launcher overlay. Keyed off the pane
+  // surface rather than the flatten width: unlike the controls, the overlay is a
+  // modal and needs no chrome of its own to live in.
+  const launcherMode = $derived(paneSurface !== undefined);
+  // `auto` records who opened it: an overlay the view raised over an empty pane is
+  // its own to take back once there is something to show, while one the user asked
+  // for stays until they dismiss it - they may be picking a second session.
+  let launcherState = $state<{ workspaceKey: string; auto: boolean } | null>(null);
+  const launcherOpen = $derived(launcherState?.workspaceKey === viewWorkspaceKey);
+  // Which workspaces the overlay has auto-opened for, so selecting the same item
+  // twice does not reopen a launcher the user dismissed, while a different workspace
+  // with no session still gets one. A list rather than a single slot: A, then B,
+  // then back to A must not reopen A's launcher.
+  let launcherAutoOpenedFor = $state<string[]>([]);
+
+  function openLauncher(): void {
+    if (!launcherMode) {
+      selectWorkspaceTab("home");
+      return;
+    }
+    launcherState = { workspaceKey: viewWorkspaceKey, auto: false };
+  }
+
+  /**
+   * The view's own fallback when a pane has nothing left to render.
+   *
+   * Once per workspace, for every automatic path: the empty pane on arrival and the
+   * one left behind when the last session goes away are the same situation, and a
+   * launcher that came back each time would trap a user who dismissed it - revisit
+   * the item, close a session, and it is in the way again. Their own route back is
+   * the Launch button in the pane's controls.
+   */
+  function autoOpenLauncher(): void {
+    // Only over a workspace that can actually host a session, on every automatic
+    // path. A worktree still being created, or one whose setup failed - or whose tmux
+    // server dropped the session out from under it - reports zero sessions for the
+    // same reason it reports its state, and the launcher answered that by covering the
+    // state message, and the Retry and Delete beside it, with an invitation to start
+    // an agent inside something that cannot run one.
+    if (workspace?.status !== "ready") return;
+    if (launcherAutoOpenedFor.includes(viewWorkspaceKey)) return;
+    launcherAutoOpenedFor = [...launcherAutoOpenedFor, viewWorkspaceKey];
+    launcherState = { workspaceKey: viewWorkspaceKey, auto: true };
+  }
+
+  function closeLauncher(): void {
+    launcherState = null;
+  }
+
+  /**
+   * Withdraw an automatic launcher the view should never have shown.
+   *
+   * The marker goes with it, unlike a dismissal: it exists to stop a launcher the
+   * USER closed from coming back, and holding it for one the view took back itself
+   * would mean a workspace that recovers - Retry, setup finishes, still no sessions -
+   * never gets the launcher it should have had.
+   */
+  function withdrawAutoLauncher(): void {
+    if (launcherState?.workspaceKey !== viewWorkspaceKey || !launcherState.auto) return;
+    launcherAutoOpenedFor = launcherAutoOpenedFor.filter((key) => key !== viewWorkspaceKey);
+    launcherState = null;
+  }
+
+  /**
+   * Where to go when the tab the user was on disappears - a session stopped, the
+   * terminal panel closed, a tab moved to the dock.
+   *
+   * Home is that place outside a pane. Inside one there is no Home, so it is
+   * whatever workflow tab is left, and the launcher when the workspace has nothing
+   * left to show: a pane rendering an empty strip is a dead end.
+   */
+  function selectFallbackTab(): void {
+    if (!launcherMode) {
+      selectWorkspaceTab("home");
+      return;
+    }
+    const next = workflowTabDescriptors.find((tab) => tab.key !== activeTabKey);
+    if (next !== undefined) {
+      selectWorkspaceTab(next.key);
+      return;
+    }
+    // The dock counts as something to show: its sessions are not workflow tabs, so
+    // a workspace whose only terminal is docked has an empty strip and nothing
+    // missing.
+    if (runtimeSessions.length === 0) autoOpenLauncher();
+  }
+
+  // Reachable from outside the view: the palette command, and a Focus Terminal that
+  // finds no session to focus. Only while embedded, since that is the only mode with
+  // an overlay to open.
+  $effect(() => {
+    if (!launcherMode) return;
+    untrack(() => registerWorkspaceLauncher(openLauncher));
+    return () => untrack(() => registerWorkspaceLauncher(null));
+  });
+
+  // A pane whose only tab was Home has nothing to show, and a remembered Home tab
+  // names a tab that no longer exists here. Both resolve the same way: show whatever
+  // session is there, and open the launcher when there is none.
+  $effect(() => {
+    if (!launcherMode || !runtimeLive) return;
+    // A workspace that turns out not to be ready takes its launcher back. The runtime
+    // load lands before the workspace record does, so the overlay is already up by the
+    // time the state is known - and the guard in autoOpenLauncher cannot undo what it
+    // did not do.
+    if (workspace !== null && workspace.status !== "ready") {
+      untrack(() => withdrawAutoLauncher());
+      return;
+    }
+    const tabs = workflowTabDescriptors;
+    const activeMissing = !tabs.some((tab) => tab.key === activeTabKey);
+    const workspaceKey = viewWorkspaceKey;
+    const anySession = runtimeSessions.length > 0;
+    const openState = launcherState;
+    const autoOpened = launcherAutoOpenedFor.includes(workspaceKey);
+    untrack(() => {
+      if (tabs.length > 0 && activeMissing) selectWorkspaceTab(tabs[0]!.key);
+      // A docked terminal is not a workflow tab but is very much on screen, so an
+      // empty strip alone does not mean the workspace has nothing to show.
+      if (tabs.length > 0 || anySession) {
+        // Take back what the view opened, and only that: a reconnect, a relaunch,
+        // or a first runtime load that lands before its sessions do all report zero
+        // sessions for a moment, and an auto-opened launcher left over that gap
+        // would then cover the terminal it was standing in for.
+        if (openState?.workspaceKey === workspaceKey && openState.auto) closeLauncher();
+        return;
+      }
+      // Once per workspace: reopening a launcher the user dismissed would trap them
+      // in it, while a different session-less workspace still gets one.
+      if (openState?.workspaceKey === workspaceKey || autoOpened) return;
+      autoOpenLauncher();
+    });
+  });
+
+  // Below the flatten width a detail surface shows one tab strip for every pane and
+  // suppresses per-leaf chrome, so there is nowhere to hang the controls button and
+  // the toolbar is the only thing left that can carry them.
+  const paneFlattened = $derived(surfaceLayout?.paneRender()?.flattened ?? false);
+  const controlsInPane = $derived(paneSurface !== undefined && !paneFlattened);
+  // Reported against the workspace whose controls are on screen, and released on the
+  // way out. The workspace-scoped half of this (a preset apply) is tracked per
+  // workspace so a write that lands after a switch cannot pin the next workspace's
+  // popover open; the settings writes are global and hold whichever controls show
+  // them, which is where their feedback is.
+  $effect(() => {
+    const workspaceKey = viewWorkspaceKey;
+    // Only what a pane's popover can actually start. Presets are not offered there,
+    // so a preset apply cannot be the write that must not be interrupted.
+    const busy = terminalOptionsSaving || terminalZoomSaving;
+    untrack(() => setWorkspaceControlsBusy(workspaceKey, controlsInPane && busy));
+    return () => untrack(() => setWorkspaceControlsBusy(workspaceKey, false));
+  });
+
+  // The session a keyboard promote acts on: whichever one the user is looking at.
+  // A workflow tab wins because it fills the pane, and the dock's active tab only
+  // counts while the dock is open - a collapsed dock shows no terminal at all.
+  const currentSessionKey = $derived(
+    // A chrome-free pane shows its one session whatever region it belongs to and
+    // whether or not that region's dock is collapsed, so it is the current one by
+    // definition. Deriving "current" from the layout alone left a terminal the user
+    // is looking at reported as inactive, which took the promote command away from
+    // the only session there was to promote.
+    soleEmbeddedSession?.key ??
+      sessionKeyFromWorkflowTab(activeTabKey) ??
+      (terminalLayout.open ? terminalLayout.activeSessionKey : null),
+  );
+
+  // Promotion implies mounted. Demotion hands the session back to the workflow
+  // region, whose slot only renders for a mounted session, so a session promoted
+  // without ever having been opened here would go dark the instant it came home -
+  // its pool entry dropped in the same flush that gave it a tab.
+  $effect(() => {
+    const promoted = [...promotedSessionKeys];
+    untrack(() => {
+      for (const sessionKey of promoted) mountSessionTerminal(sessionKey);
+    });
+  });
+
+  /**
+   * The dock's own way out: give this session a pane of its own on the surface
+   * hosting the workspace. Undefined when nothing is hosting one, which is what
+   * keeps the control off the standalone tab and the embed routes.
+   */
+  const promoteSessionToPane = $derived(
+    surfaceLayout === null
+      ? undefined
+      : (sessionKey: string) => {
+          const session = runtimeSessions.find((candidate) => candidate.key === sessionKey);
+          if (!session) return;
+          promoteSessionBesideWorkspace(surfaceLayout, sessionPaneKeyFor(session));
+        },
+  );
+
+  /** Bring a promoted session home before a container edit places it. */
+  function demoteWorkflowTab(tabKey: WorkflowTabKey): void {
+    const sessionKey = sessionKeyFromWorkflowTab(tabKey);
+    if (sessionKey === null) return;
+    const session = runtimeSessions.find((candidate) => candidate.key === sessionKey);
+    if (!session || !isPromoted(session)) return;
+    surfaceLayout?.demoteTab(sessionPaneKeyFor(session));
+  }
+
+  const terminalSessions = $derived(
+    runtimeSessions.filter(
+      (session) => sessionRegion(session) === "terminal" && !isPromoted(session),
+    ),
+  );
+
+  // An open dock with nothing in it is a saved-height hole in the stage: the last
+  // docked session exiting (or moving to the workflow) leaves open=true behind, and
+  // the collapsed row is the only honest rendering of "no terminals here". Not
+  // while a launch is in flight - toggling the panel open auto-launches, and
+  // closing it under that race would flicker the dock shut on its own opening.
+  $effect(() => {
+    if (!runtimeLive || terminalLaunching) return;
+    // Bottom only. Docked to the top the dock is a workflow TAB, and an empty one
+    // is the drop target for moving a session into the terminal region - closing
+    // it there takes away the affordance instead of a hole.
+    if (terminalLayout.dock !== "bottom") return;
+    if (!terminalLayout.open || terminalSessions.length > 0) return;
+    untrack(() => {
+      terminalLayout = { ...terminalLayout, open: false };
+    });
+  });
+
+  // Masked, not pruned: the stored trees keep a promoted session's tab and leaf so
+  // demotion hands back the placement the user chose, rather than dropping it back
+  // wherever normalization would put a session it has never seen.
+  const dockTree = $derived(
+    promotedSessionKeys.size === 0
+      ? terminalLayout.tree
+      : pruneTree(
+          terminalLayout.tree,
+          terminalSessions.map((session) => session.key),
+        ),
+  );
+
   function upsertRuntimeSession(session: RuntimeSession): RuntimeSession[] {
     const sessions = [
       ...runtimeSessions.filter((candidate) => candidate.key !== session.key),
@@ -494,7 +901,7 @@
   const currentTerminalGroup = $derived(activeTerminalGroup(terminalLayout));
   const workflowSessions = $derived(
     runtimeSessions.filter(
-      (session) => sessionRegion(session) === "workflow",
+      (session) => sessionRegion(session) === "workflow" && !isPromoted(session),
     ),
   );
   function workflowSessionStatus(
@@ -514,13 +921,18 @@
   }
 
   const workflowTabDescriptors = $derived.by<WorkflowTabDescriptor[]>(() => {
-    const tabs: WorkflowTabDescriptor[] = [
-      {
-        key: "home",
-        label: "Home",
-        kind: "home",
-      },
-    ];
+    // No Home tab inside a detail pane: the workspace gets one pane there, and
+    // spending half its height on a surface only used to start something is the
+    // trade this mode exists to undo. The launcher overlay replaces it.
+    const tabs: WorkflowTabDescriptor[] = launcherMode
+      ? []
+      : [
+          {
+            key: "home",
+            label: "Home",
+            kind: "home",
+          },
+        ];
     if (
       terminalLayout.dock === "top" &&
       (terminalLayout.open || terminalSessions.length > 0)
@@ -546,6 +958,106 @@
     }
     return tabs;
   });
+  const renderedWorkflowTree = $derived(
+    promotedSessionKeys.size === 0 && !launcherMode
+      ? terminalLayout.workflowTree
+      : pruneWorkflowTreeToAvailable(
+          // Embedded too, not just when something is promoted: the stored tree still
+          // names Home, and a leaf whose only tab has no descriptor renders a strip
+          // with nothing in it.
+          terminalLayout.workflowTree,
+          workflowTabDescriptors.map((tab) => tab.key),
+      ),
+  );
+  const workspacePaneEmpty = $derived(
+    controlsInPane &&
+      runtimeSessions.length > 0 &&
+      promotedSessionKeys.size === runtimeSessions.length,
+  );
+  const workspacePaneRowOnly = $derived(
+    controlsInPane &&
+      runtimeLive &&
+      soleEmbeddedSessionHostKey === null &&
+      renderedWorkflowTree === null &&
+      terminalLayout.dock === "bottom" &&
+      terminalSessions.length > 0,
+  );
+  const externalControlsVisible = $derived(
+    workspacePaneEmpty ||
+      workspacePaneRowOnly ||
+      (surfaceLayout?.paneRender()?.onScreenTabs.some((tabKey) =>
+        sessionPaneKeyMatchesWorkspace(tabKey, workspaceId, workspaceHostKey),
+      ) ??
+        false),
+  );
+  // A parked terminal host stays inactive, but controls actually rendered in a
+  // promoted pane or external dock still own portalled UI. Do not use the broad
+  // `controlsInPane` flag here: it is also true during a selection handoff before
+  // the destination slot mounts, and opening a launcher in that parked window
+  // prevents Focus Terminal from completing the reveal on Firefox.
+  const interactionVisible = $derived(hostVisible || externalControlsVisible);
+
+  // Handed to the detail pane's controls popover, which is where the controls live
+  // once this view is embedded. Registered with the workspace it acts on, because
+  // one embedded view serves every selection on its surface: the snippet is the
+  // same object after a switch, so only the key can tell a popover that its
+  // subject changed. The row-only fact rides the same lifecycle so it cannot leak
+  // from a parked or previously selected workspace.
+  $effect(() => {
+    if (!controlsInPane) return;
+    const workspaceKey = viewWorkspaceKey;
+    const rowOnly = workspacePaneRowOnly;
+    // Untracked because the store compares against what is already registered:
+    // reading that inside a tracked effect that also writes it is the read-write
+    // loop Svelte aborts with effect_update_depth_exceeded.
+    untrack(() =>
+      registerWorkspaceControls({
+        snippet: workspaceControls,
+        stripActions: workspaceStripActions,
+        dockRow: workspaceDockRow,
+        workspacePaneRowOnly: rowOnly,
+        workspaceKey,
+      }),
+    );
+    return () => untrack(() => registerWorkspaceControls(null));
+  });
+
+  /**
+   * Session tabs the workflow tree is showing right now: one per rendered leaf.
+   *
+   * A leaf shows its active tab and nothing else, so this is what needs a terminal
+   * on screen -- the other tabs in the leaf are a click away and stay unmounted.
+   */
+  function activeWorkflowSessionKeys(node: WorkflowNode | null): string[] {
+    if (node === null) return [];
+    if (node.type === "leaf") {
+      const sessionKey = sessionKeyFromWorkflowTab(node.activeTabKey);
+      return sessionKey === null ? [] : [sessionKey];
+    }
+    return [...activeWorkflowSessionKeys(node.first), ...activeWorkflowSessionKeys(node.second)];
+  }
+
+  /**
+   * Mount whatever the workflow tree is showing, without waiting for a click.
+   *
+   * Mounting used to happen only in the tab strip's select handler, so a workspace
+   * whose session was ALREADY the active tab -- every workspace the user opens with
+   * an agent running in it -- rendered an empty pane. Nothing in the view said the
+   * terminal was one click away, so it read as a broken pane rather than a closed
+   * one, and any interaction that re-selected the tab fixed it by accident.
+   */
+  $effect(() => {
+    if (!runtimeLive) return;
+    const live = new Set(runtimeSessions.map((session) => session.key));
+    const showing = activeWorkflowSessionKeys(renderedWorkflowTree).filter((key) => live.has(key));
+    // Untracked: mountSessionTerminal writes the mounted list that the tree's own
+    // descriptors read, and it is a no-op for a session already mounted, so this
+    // settles instead of re-running itself.
+    untrack(() => {
+      for (const key of showing) mountSessionTerminal(key);
+    });
+  });
+
   const terminalPanelInStage = $derived(
     terminalLayout.open && terminalLayout.dock === "top",
   );
@@ -573,6 +1085,7 @@
   const modalOpen = $derived(
     forcePromptMessage !== null ||
       stopPromptSession !== null ||
+      deletePromptOpen ||
       renamePrompt !== null,
   );
 
@@ -787,6 +1300,102 @@
       (key) => key !== sessionKey,
     );
   }
+
+  function sessionHostKeyFor(session: RuntimeSession): SessionHostKey {
+    return sessionHostKey(
+      workspaceId,
+      workspaceHostKey,
+      session.key,
+      session.created_at,
+    );
+  }
+
+  // Prefixes this view has ever mounted terminals under, so moving to another
+  // workspace can take the previous one's down. Nothing else would: the pool
+  // outlives this view, and every parked terminal holds a live websocket, so
+  // browsing ten workspaces would otherwise leave ten attachments open.
+  const ownedSessionPrefixes = new Set<string>();
+
+  function releaseOwnedSessions(except?: string): void {
+    for (const prefix of [...ownedSessionPrefixes]) {
+      if (prefix === except) continue;
+      for (const session of mountedSessions()) {
+        if (session.hostKey.startsWith(prefix)) noteSessionUnmounted(session.hostKey);
+      }
+      ownedSessionPrefixes.delete(prefix);
+    }
+  }
+
+  // Sessions the terminal dock puts on screen: the leaves of its tree, and only
+  // while the panel is open. A terminal-region session with no leaf has no
+  // terminal today and must not gain one just because the pool could park it.
+  const dockedSessionKeys = $derived(
+    terminalLayout.open ? new Set(collectSessionKeys(dockTree)) : new Set<string>(),
+  );
+
+  // Mirror the sessions this workspace puts on screen into the app-level pool,
+  // which owns the live terminals. Both regions render pooled slots, so a shell
+  // dragged between the dock and the workflow area keeps its tmux attachment
+  // and its scrollback instead of being torn down and reattached.
+  //
+  // Reconciled from state rather than pushed from each mount/unmount call site:
+  // a session changes region without either side calling anything, and a missed
+  // noteSessionUnmounted would leave a socket attached to nothing.
+  $effect(() => {
+    const prefix = sessionHostPrefix(workspaceId, workspaceHostKey);
+    const desired = new Map<SessionHostKey, MountedSession>();
+    for (const session of runtimeSessions) {
+      // A promoted session is on screen in a detail pane, which renders its slot
+      // but cannot mount it: only this view knows the websocket path, the
+      // generation, and whether actions are blocked.
+      const onScreen =
+        isPromoted(session) ||
+        soleEmbeddedSession?.key === session.key ||
+        (sessionRegion(session) === "workflow"
+          ? mountedSessionKeys.includes(session.key)
+          : dockedSessionKeys.has(session.key));
+      if (!onScreen) continue;
+      const hostKey = sessionHostKeyFor(session);
+      desired.set(hostKey, {
+        hostKey,
+        websocketPath: workspaceSessionWebSocketPath(
+          workspaceId,
+          session.key,
+          workspaceHostKey,
+        ),
+        status: session.status,
+        disabled: actionsBlocked,
+      });
+    }
+    untrack(() => {
+      releaseOwnedSessions(prefix);
+      if (desired.size > 0) ownedSessionPrefixes.add(prefix);
+      for (const session of desired.values()) noteSessionMounted(session);
+      // Only this workspace's entries. Another surface's claimed workspace keeps
+      // its parked terminals until it stops being claimed.
+      for (const session of mountedSessions()) {
+        if (!session.hostKey.startsWith(prefix)) continue;
+        if (desired.has(session.hostKey)) continue;
+        noteSessionUnmounted(session.hostKey);
+      }
+    });
+  });
+
+  // The pool is app-level, so a destroyed view leaves its terminals running
+  // forever unless it hands them back.
+  $effect(() => () => untrack(() => releaseOwnedSessions()));
+
+  // Pooled terminals report an exit by key; only this view can map that back to
+  // a runtime session, and the generation in the key keeps a relaunched session
+  // from being mistaken for the dead one.
+  $effect(() =>
+    onSessionExited((hostKey) => {
+      const session = runtimeSessions.find(
+        (candidate) => sessionHostKeyFor(candidate) === hostKey,
+      );
+      if (session) handleSessionExit(session);
+    }),
+  );
 
   function sessionGenerationMatches(
     closed: ClosedRuntimeSession,
@@ -1290,7 +1899,7 @@
               sessionRegion(session) === "workflow",
           )
         ) {
-          selectWorkspaceTab("home");
+          selectFallbackTab();
         }
         mountedSessionKeys = mountedSessionKeys.filter(
           (key) =>
@@ -1337,12 +1946,24 @@
         region: "workflow",
       });
       if (!isCurrentWorkspace(id, hostKey)) return;
-      await fetchRuntime({ force: true });
+      const refreshed = await fetchRuntime({ force: true });
       if (!isCurrentWorkspace(id, hostKey)) return;
       clearClosedSession(session);
       moveSessionToWorkflow(session.key);
       mountSessionTerminal(session.key);
       selectWorkspaceTab(workflowTabKeyForSession(session.key));
+      // The launch succeeding is not enough to close on: the pane can only render
+      // what the refreshed runtime reports, so a failed refresh would drop the user
+      // on an empty pane with no explanation. The tab selection above stands either
+      // way, so the session appears as soon as a later refresh finds it.
+      if (refreshed?.sessions.some((candidate) => candidate.key === session.key) === true) {
+        closeLauncher();
+        requestSessionFocus(sessionHostKeyFor(session));
+      } else {
+        showFlash("Session launched, but the workspace could not be reloaded", {
+          tone: "danger",
+        });
+      }
     } catch (err) {
       if (!isCurrentWorkspace(id, hostKey)) return;
       showFlash(err instanceof Error ? err.message : "Launch failed", {
@@ -1418,7 +2039,7 @@
         ),
       );
       if (activeTabKey === `session:${session.key}`) {
-        selectWorkspaceTab("home");
+        selectFallbackTab();
       }
     } catch (err) {
       if (!isCurrentWorkspace(id, hostKey)) return;
@@ -1445,7 +2066,7 @@
       ),
     );
     if (activeTabKey === `session:${session.key}`) {
-      selectWorkspaceTab("home");
+      selectFallbackTab();
     }
     void fetchRuntime({ force: true });
   }
@@ -1515,7 +2136,7 @@
         open: false,
       });
       if (activeTabKey === "terminal") {
-        selectWorkspaceTab("home");
+        selectFallbackTab();
       }
       return;
     }
@@ -1570,6 +2191,7 @@
     if (actionsBlocked) return;
     const session = runtimeSessions.find((s) => s.key === sessionKey);
     if (!session) return;
+    if (isPromoted(session)) surfaceLayout?.demoteTab(sessionPaneKeyFor(session));
     const groups = addTerminalGroup(terminalLayout.terminalGroups, sessionKey);
     terminalLayout = normalizeLayoutForSessions(runtimeSessions, {
       ...layoutWithTerminalGroups(
@@ -1588,12 +2210,15 @@
     if (terminalLayout.dock === "top") {
       selectWorkspaceTab("terminal");
     } else if (activeTabKey === `session:${sessionKey}`) {
-      selectWorkspaceTab("home");
+      selectFallbackTab();
     }
   }
 
   function moveSessionToWorkflow(sessionKey: string): void {
     if (actionsBlocked) return;
+    const session = runtimeSessions.find((candidate) => candidate.key === sessionKey);
+    if (!session) return;
+    if (isPromoted(session)) surfaceLayout?.demoteTab(sessionPaneKeyFor(session));
     const terminalGroups = closeSessionInTerminalGroups(
       terminalLayout.terminalGroups,
       sessionKey,
@@ -1651,6 +2276,7 @@
     targetTabKey: WorkflowTabKey,
   ): void {
     if (actionsBlocked) return;
+    demoteWorkflowTab(sourceTabKey);
     if (sourceTabKey === targetTabKey) return;
     const prepared = normalizeLayoutForSessions(
       runtimeSessions,
@@ -1672,6 +2298,7 @@
     leafID: string,
   ): void {
     if (actionsBlocked) return;
+    demoteWorkflowTab(sourceTabKey);
     const prepared = normalizeLayoutForSessions(
       runtimeSessions,
       layoutWithWorkflowTab(sourceTabKey, terminalLayout),
@@ -1694,6 +2321,7 @@
     placement: "before" | "after",
   ): void {
     if (actionsBlocked) return;
+    demoteWorkflowTab(sourceTabKey);
     const prepared = normalizeLayoutForSessions(
       runtimeSessions,
       layoutWithWorkflowTab(sourceTabKey, terminalLayout),
@@ -1719,7 +2347,7 @@
         open: false,
       });
       if (activeTabKey === "terminal") {
-        selectWorkspaceTab("home");
+        selectFallbackTab();
       }
       return;
     }
@@ -1859,7 +2487,8 @@
     if (!preset) return;
     const id = workspaceId;
     const hostKey = workspaceHostKey;
-    applyingWorkflowPreset = true;
+    const presetOwner = viewWorkspaceKey;
+    applyingWorkflowPresetFor = [...applyingWorkflowPresetFor, presetOwner];
     try {
       const keyMap: Record<string, string> = {};
       for (const spec of preset.sessions) {
@@ -1899,7 +2528,11 @@
         tone: "danger",
       });
     } finally {
-      if (isCurrentWorkspace(id, hostKey)) applyingWorkflowPreset = false;
+      // Only this apply's own entry, whatever is selected now: keyed on the current
+      // workspace instead, a preset that finished after a switch would leave its own
+      // workspace stuck applying for the rest of the session.
+      const index = applyingWorkflowPresetFor.indexOf(presetOwner);
+      if (index !== -1) applyingWorkflowPresetFor = applyingWorkflowPresetFor.toSpliced(index, 1);
     }
   }
 
@@ -2058,6 +2691,7 @@
     const groupID = terminalLayout.activeTerminalGroupID;
     const group = currentTerminalGroup;
     if (!session || !groupID || !group) return;
+    if (isPromoted(session)) surfaceLayout?.demoteTab(sessionPaneKeyFor(session));
     const sourceLeaf = findLeafBySession(group.tree, sessionKey);
     if (sourceLeaf?.id === targetLeafID) {
       selectTerminalSession(sessionKey);
@@ -2122,7 +2756,7 @@
     if (dock === "top") {
       selectWorkspaceTab("terminal");
     } else if (activeTabKey === "terminal") {
-      selectWorkspaceTab("home");
+      selectFallbackTab();
     }
   }
 
@@ -2151,7 +2785,21 @@
   }
 
   function readDroppedSession(event: DragEvent): string | null {
-    return readRuntimeSessionDrag(event, workspaceId);
+    const runtimeSessionKey = readRuntimeSessionDrag(event, workspaceId);
+    if (runtimeSessionKey !== null) return runtimeSessionKey;
+    if (surfaceLayout === null) return null;
+    const paneKey = readTabbedPanelTabDrag(event, surfaceLayout.dragScope);
+    if (
+      paneKey === null ||
+      !sessionPaneKeyMatchesWorkspace(paneKey, workspaceId, workspaceHostKey)
+    ) {
+      return null;
+    }
+    const sessionKey = parseSessionPaneKey(paneKey)?.sessionKey ?? null;
+    return sessionKey !== null &&
+      runtimeSessions.some((session) => session.key === sessionKey)
+      ? sessionKey
+      : null;
   }
 
   function handleWorkflowDragOver(event: DragEvent): void {
@@ -2168,8 +2816,10 @@
     const sessionKey = readDroppedSession(event);
     if (sessionKey === null) return;
     event.preventDefault();
+    event.stopPropagation();
     moveSessionToWorkflow(sessionKey);
     clearActiveTerminalDrag();
+    clearActiveTabbedPanelDrag();
   }
 
   function startPolling(): void {
@@ -2342,7 +2992,32 @@
     };
   }
 
-  async function handleDelete(
+  /**
+   * Every workspace Delete confirms first. The strip's trash is a 13px icon beside
+   * the controls trigger, one slip from firing, and the backend refuses only a
+   * DIRTY worktree - a clean workspace with unpushed commits deletes silently. One
+   * uniform gate rather than a per-button one: the same action must not be safe
+   * from one button and instant from another.
+   */
+  function handleDelete(triggerEl: HTMLElement | null = null): void {
+    if (actionsBlocked) return;
+    previouslyFocusedEl =
+      triggerEl ??
+      (document.activeElement instanceof HTMLElement ? document.activeElement : null);
+    deletePromptOpen = true;
+  }
+
+  function cancelDeletePrompt(): void {
+    deletePromptOpen = false;
+  }
+
+  function confirmDeletePrompt(): void {
+    const triggerEl = previouslyFocusedEl;
+    deletePromptOpen = false;
+    void performDelete(triggerEl);
+  }
+
+  async function performDelete(
     triggerEl: HTMLElement | null = null,
   ): Promise<void> {
     if (actionsBlocked) return;
@@ -3021,129 +3696,137 @@
           {@render inlineCollapseControl()}
         </div>
       {:else}
-        <div class="header-bar">
-          <div class="header-start">
-            <span class="header-name">
-              {displayName(workspace)}
-            </span>
-            <code class="header-branch">
-              {workspace.git_head_ref}
-            </code>
-          </div>
-          <div class="header-end">
-            {#if !hideRightSidebar}
-              <div class="panel-toggle-group">
-                <button
-                  class="panel-toggle-btn"
-                  class:active={sidebarOpen && sidebarTab === "diff"}
-                  disabled={actionsBlocked}
-                  onclick={() => handleSidebarToggleClick("diff")}
+        <!-- Never in a detail pane, whatever it holds. The pane's tab strip already
+             names the workspace and carries its controls, so this bar only ever
+             repeated them - and its Expand/Collapse Terminal pair duplicated the
+             leaf's own maximize and close. A flattened surface is the exception it
+             has always been: no per-leaf strip exists there, so the chrome is the
+             only thing left to carry these. -->
+        {#if !controlsInPane}
+          <div class="header-bar">
+            <div class="header-start">
+              <span class="header-name">
+                {displayName(workspace)}
+              </span>
+              <code class="header-branch">
+                {workspace.git_head_ref}
+              </code>
+            </div>
+            <div class="header-end">
+              {#if !hideRightSidebar}
+                <div class="panel-toggle-group">
+                  <button
+                    class="panel-toggle-btn"
+                    class:active={sidebarOpen && sidebarTab === "diff"}
+                    disabled={actionsBlocked}
+                    onclick={() => handleSidebarToggleClick("diff")}
+                  >
+                    Diff
+                  </button>
+                  {#if workspace.item_type === "issue"}
+                    <button
+                      class="panel-toggle-btn"
+                      class:active={sidebarOpen && sidebarTab === "issue"}
+                      disabled={actionsBlocked}
+                      onclick={() => handleSidebarToggleClick("issue")}
+                    >
+                      Issue
+                    </button>
+                  {/if}
+                  {#if workspace.item_type === "kata_task"}
+                    <button
+                      class="panel-toggle-btn"
+                      class:active={sidebarOpen && sidebarTab === "kata_task"}
+                      disabled={actionsBlocked}
+                      onclick={() => handleSidebarToggleClick("kata_task")}
+                    >
+                      Kata task
+                    </button>
+                  {/if}
+                  {#if getWorkspacePRNumber(workspace) !== null}
+                    <button
+                      class="panel-toggle-btn"
+                      class:active={sidebarOpen && sidebarTab === "pr"}
+                      disabled={actionsBlocked}
+                      onclick={() => handleSidebarToggleClick("pr")}
+                    >
+                      PR
+                    </button>
+                  {/if}
+                  {#if workspace.item_type === "pull_request"}
+                    <button
+                      class="panel-toggle-btn"
+                      class:active={sidebarOpen && sidebarTab === "reviews"}
+                      disabled={actionsBlocked}
+                      onclick={() => handleSidebarToggleClick("reviews")}
+                    >
+                      Reviews
+                    </button>
+                  {/if}
+                </div>
+                <IconButton
+                  class="workspace-refresh-button"
+                  size="sm"
+                  disabled={actionsBlocked || refreshingWorkspace}
+                  ariaLabel="Refresh workspace details"
+                  onclick={() => void handleRefreshWorkspace()}
                 >
-                  Diff
+                  {#if refreshingWorkspace}
+                    <Spinner size={14} label="Refreshing workspace" />
+                  {:else}
+                    <RefreshIcon
+                      class="header-icon"
+                      size="14"
+                      strokeWidth="2.2"
+                      aria-hidden="true"
+                    />
+                  {/if}
+                </IconButton>
+              {/if}
+              {#if inlineDock && inlineDockMode !== null}
+                <!-- Dock mode changes are pure local UI: they must stay
+                     available while server-side actions are blocked
+                     (deletes in flight), or the dock cannot be collapsed
+                     out of the way. Only the modal guard applies, and only
+                     to the expand direction. -->
+                <button
+                  class="header-btn"
+                  disabled={inlineDockMode !== "expanded" && inlineDockExpandBlocked}
+                  title={
+                    inlineDockMode !== "expanded" && inlineDockExpandBlocked
+                      ? "Close the open dialog first."
+                      : undefined
+                  }
+                  onclick={() =>
+                    inlineDock?.setMode(inlineDockMode === "expanded" ? "split" : "expanded")}
+                >
+                  {#if inlineDockMode === "expanded"}
+                    <ChevronsDownIcon size="14" strokeWidth="2.2" aria-hidden="true" />
+                    Show Details
+                  {:else}
+                    <ChevronsUpIcon size="14" strokeWidth="2.2" aria-hidden="true" />
+                    Expand Terminal
+                  {/if}
                 </button>
-                {#if workspace.item_type === "issue"}
-                  <button
-                    class="panel-toggle-btn"
-                    class:active={sidebarOpen && sidebarTab === "issue"}
-                    disabled={actionsBlocked}
-                    onclick={() => handleSidebarToggleClick("issue")}
-                  >
-                    Issue
-                  </button>
-                {/if}
-                {#if workspace.item_type === "kata_task"}
-                  <button
-                    class="panel-toggle-btn"
-                    class:active={sidebarOpen && sidebarTab === "kata_task"}
-                    disabled={actionsBlocked}
-                    onclick={() => handleSidebarToggleClick("kata_task")}
-                  >
-                    Kata task
-                  </button>
-                {/if}
-                {#if getWorkspacePRNumber(workspace) !== null}
-                  <button
-                    class="panel-toggle-btn"
-                    class:active={sidebarOpen && sidebarTab === "pr"}
-                    disabled={actionsBlocked}
-                    onclick={() => handleSidebarToggleClick("pr")}
-                  >
-                    PR
-                  </button>
-                {/if}
-                {#if workspace.item_type === "pull_request"}
-                  <button
-                    class="panel-toggle-btn"
-                    class:active={sidebarOpen && sidebarTab === "reviews"}
-                    disabled={actionsBlocked}
-                    onclick={() => handleSidebarToggleClick("reviews")}
-                  >
-                    Reviews
-                  </button>
-                {/if}
-              </div>
-              <IconButton
-                class="workspace-refresh-button"
-                size="sm"
-                disabled={actionsBlocked || refreshingWorkspace}
-                ariaLabel="Refresh workspace details"
-                onclick={() => void handleRefreshWorkspace()}
-              >
-                {#if refreshingWorkspace}
-                  <Spinner size={14} label="Refreshing workspace" />
-                {:else}
-                  <RefreshIcon
-                    class="header-icon"
-                    size="14"
-                    strokeWidth="2.2"
-                    aria-hidden="true"
-                  />
-                {/if}
-              </IconButton>
-            {/if}
-            {#if inlineDock && inlineDockMode !== null}
-              <!-- Dock mode changes are pure local UI: they must stay
-                   available while server-side actions are blocked
-                   (deletes in flight), or the dock cannot be collapsed
-                   out of the way. Only the modal guard applies, and only
-                   to the expand direction. -->
+                <button
+                  class="header-btn"
+                  onclick={() => inlineDock?.setMode("collapsed")}
+                >
+                  <PanelBottomCloseIcon size="14" strokeWidth="2.2" aria-hidden="true" />
+                  Collapse Terminal
+                </button>
+              {/if}
               <button
-                class="header-btn"
-                disabled={inlineDockMode !== "expanded" && inlineDockExpandBlocked}
-                title={
-                  inlineDockMode !== "expanded" && inlineDockExpandBlocked
-                    ? "Close the open dialog first."
-                    : undefined
-                }
-                onclick={() =>
-                  inlineDock?.setMode(inlineDockMode === "expanded" ? "split" : "expanded")}
+                class="header-btn danger"
+                disabled={actionsBlocked}
+                onclick={(event) =>
+                  void handleDelete(event.currentTarget)}
               >
-                {#if inlineDockMode === "expanded"}
-                  <ChevronsDownIcon size="14" strokeWidth="2.2" aria-hidden="true" />
-                  Show Details
-                {:else}
-                  <ChevronsUpIcon size="14" strokeWidth="2.2" aria-hidden="true" />
-                  Expand Terminal
-                {/if}
+                Delete
               </button>
-              <button
-                class="header-btn"
-                onclick={() => inlineDock?.setMode("collapsed")}
-              >
-                <PanelBottomCloseIcon size="14" strokeWidth="2.2" aria-hidden="true" />
-                Collapse Terminal
-              </button>
-            {/if}
-            <button
-              class="header-btn danger"
-              disabled={actionsBlocked}
-              onclick={(event) =>
-                void handleDelete(event.currentTarget)}
-            >
-              Delete
-            </button>
+            </div>
           </div>
-        </div>
+        {/if}
         <div
           class="terminal-and-sidebar"
           bind:this={containerEl}
@@ -3151,43 +3834,17 @@
         >
           <div class="terminal-area">
             <div class="workspace-surface">
-              <div class="workspace-toolbar">
-                <div class="workspace-toolbar-title">Workflow</div>
-                <div class="workspace-actions">
-                  <WorkflowPresetMenu
-                    presets={workflowPresets}
-                    selectedPresetId={selectedWorkflowPresetId}
-                    applying={applyingWorkflowPreset}
-                    onSaveNew={saveWorkflowPreset}
-                    onUpdate={updateWorkflowPreset}
-                    onApply={(presetId) => void applyWorkflowPreset(presetId)}
-                    onDelete={deleteWorkflowPreset}
-                    disabled={actionsBlocked}
-                    {hostVisible}
-                  />
-                  <TerminalZoomControl
-                    fontSize={terminalFontSize}
-                    disabled={actionsBlocked || !terminalSettingsReady || terminalOptionsSaving}
-                    onDecrease={terminalZoom.decrease}
-                    onIncrease={terminalZoom.increase}
-                    onReset={terminalZoom.reset}
-                  />
-                  <TerminalOptionsMenu
-                    disabled={actionsBlocked || !terminalSettingsReady || terminalZoomSaving}
-                    {hostVisible}
-                    onSavingChange={(saving) => {
-                      terminalOptionsSaving = saving;
-                    }}
-                  />
-                  <LaunchMenu
-                    launchTargets={launchTargets}
-                    {launchingKey}
-                    disabled={actionsBlocked}
-                    {hostVisible}
-                    onLaunch={(key) => void handleLaunch(key)}
-                  />
+              {#if !controlsInPane}
+                <!-- Kept for the standalone Workspaces tab, whose panes have no tab
+                     strip to hold the controls, and for a flattened detail surface,
+                     which suppresses per-leaf chrome. Otherwise the pane's own
+                     popover renders these, and a bar here would be a second copy of
+                     them above the terminal. -->
+                <div class="workspace-toolbar">
+                  <div class="workspace-toolbar-title">Workflow</div>
+                  <div class="workspace-actions">{@render workspaceControls()}</div>
                 </div>
-              </div>
+              {/if}
               {#if runtimeError}
                 <div class="runtime-error">{runtimeError}</div>
               {/if}
@@ -3204,10 +3861,19 @@
                     <span>Loading workspace runtime...</span>
                   </div>
                 {:else}
-                  {#if terminalLayout.workflowTree}
+                  {#if soleEmbeddedSessionHostKey !== null}
+                    <div class="sole-embedded-session">
+                      <SessionTerminalSlot
+                        hostKey={soleEmbeddedSessionHostKey}
+                        visible={hostVisible}
+                      />
+                    </div>
+                  {:else if renderedWorkflowTree}
                     <WorkflowSplitTree
                       {workspaceId}
-                      node={terminalLayout.workflowTree}
+                      dragScope={surfaceLayout?.dragScope}
+                      promotion={workflowPromotion}
+                      node={renderedWorkflowTree}
                       tabs={workflowTabDescriptors}
                       {activeTabKey}
                       disabled={actionsBlocked}
@@ -3254,9 +3920,11 @@
                           <DockedTerminalPanel
                             {workspaceId}
                             {workspaceHostKey}
+                            dragScope={surfaceLayout?.dragScope}
+                            paneKeyForSession={detailPaneKeyForSession}
                             sessions={terminalSessions}
                             displayLabels={sessionDisplayLabels}
-                            tree={terminalLayout.tree}
+                            tree={dockTree}
                             activeSessionKey={terminalLayout.activeSessionKey}
                             open={terminalLayout.open}
                             dock={terminalLayout.dock}
@@ -3271,10 +3939,11 @@
                             onClose={(session) => void closeSession(session)}
                             onRename={renameSession}
                             onMoveToWorkflow={moveSessionToWorkflow}
+                            readSessionDrag={readDroppedSession}
+                            onPromoteSession={promoteSessionToPane}
                             onDock={dockTerminalPanel}
                             onResize={resizeTerminalPanel}
                             onDropSession={moveSessionToTerminal}
-                            onExit={handleSessionExit}
                             onSplitSession={splitTerminalSessionIntoPane}
                             onRatioChange={(splitId, ratio) => {
                               updateActiveTerminalTree(
@@ -3292,20 +3961,10 @@
                             (candidate) => candidate.key === sessionKey,
                           )}
                           {#if session && isSessionTerminalMounted(session.key)}
-                            {#key session.key}
-                              <TerminalPane
-                                websocketPath={workspaceSessionWebSocketPath(
-                                  workspaceId,
-                                  session.key,
-                                  workspaceHostKey,
-                                )}
-                                reconnectOnExit={false}
-                                disabled={actionsBlocked}
-                                active={active && hostVisible}
-                                onExit={() => handleSessionExit(session)}
-                                initialStatus={session.status}
-                              />
-                            {/key}
+                            <SessionTerminalSlot
+                              hostKey={sessionHostKeyFor(session)}
+                              visible={active && hostVisible}
+                            />
                           {/if}
                         {/if}
                       {/snippet}
@@ -3313,42 +3972,16 @@
                   {/if}
                 {/if}
               </div>
-              {#if terminalLayout.dock === "bottom"}
-                <DockedTerminalPanel
-                  {workspaceId}
-                  {workspaceHostKey}
-                  sessions={terminalSessions}
-                  displayLabels={sessionDisplayLabels}
-                  tree={terminalLayout.tree}
-                  activeSessionKey={terminalLayout.activeSessionKey}
-                  open={terminalLayout.open}
-                  dock={terminalLayout.dock}
-                  height={terminalLayout.height}
-                  loading={terminalLaunching}
-                  disabled={actionsBlocked}
-                  {hostVisible}
-                  onToggle={() => void toggleTerminalPanel()}
-                  onNewTerminal={() => void launchTerminalSession()}
-                  onSplit={(direction) => void splitTerminal(direction)}
-                  onSelect={selectTerminalSession}
-                  onClose={(session) => void closeSession(session)}
-                  onRename={renameSession}
-                  onMoveToWorkflow={moveSessionToWorkflow}
-                  onDock={dockTerminalPanel}
-                  onResize={resizeTerminalPanel}
-                  onDropSession={moveSessionToTerminal}
-                  onExit={handleSessionExit}
-                  onSplitSession={splitTerminalSessionIntoPane}
-                  onRatioChange={(splitId, ratio) => {
-                    updateActiveTerminalTree(
-                      updateSplitRatio(
-                        terminalLayout.tree,
-                        splitId,
-                        ratio,
-                      ),
-                    );
-                  }}
-                />
+              <!-- Kept even in a chrome-free pane. The header bar and the one-tab
+                   workflow strip are chrome that only restated what the pane's own tab
+                   already said, but the dock is a surface: it is the only route to a
+                   second session, and a workspace running one agent with no way to
+                   open a shell beside it is a dead end, not a simplification. -->
+              {#if terminalLayout.dock === "bottom" &&
+                !soleEmbeddedSessionIsDocked &&
+                !workspacePaneEmpty &&
+                !workspacePaneRowOnly}
+                {@render workspaceDockRowBody(hostVisible, false)}
               {/if}
             </div>
           </div>
@@ -3450,9 +4083,27 @@
   </CollapsibleSidebar>
 </div>
 
-{#if renamePrompt !== null && hostVisible}
+{#if launcherMode && workspace !== null}
+  <WorkspaceLauncherOverlay
+    open={launcherOpen && interactionVisible}
+    {workspace}
+    launchTargets={launchTargets}
+    sessions={runtimeSessions}
+    displayLabels={sessionDisplayLabels}
+    {launchingKey}
+    readonly={actionsBlocked}
+    onClose={closeLauncher}
+    onLaunch={(key) => void handleLaunch(key)}
+    onOpenSession={(sessionKey) => {
+      closeLauncher();
+      openSession(sessionKey);
+    }}
+  />
+{/if}
+
+{#if renamePrompt !== null && interactionVisible}
   <Modal
-    open={renamePrompt !== null && hostVisible}
+    open={renamePrompt !== null && interactionVisible}
     title="Rename tab"
     width={460}
     frameId="workspace-rename-session"
@@ -3497,7 +4148,7 @@
 {/if}
 
 <ConfirmDialog
-  open={stopPromptSession !== null && hostVisible}
+  open={stopPromptSession !== null && interactionVisible}
   title={stopPromptSession
     ? `Stop ${stopPromptSession.label}?`
     : "Stop session?"}
@@ -3513,7 +4164,21 @@
 />
 
 <ConfirmDialog
-  open={forcePromptMessage !== null && hostVisible}
+  open={deletePromptOpen && interactionVisible}
+  title="Delete workspace?"
+  message={workspace
+    ? `This removes the worktree and tmux session for ${workspace.git_head_ref}.`
+    : "This removes the worktree and tmux session."}
+  hint="Commits that exist nowhere but this worktree are lost with it. Uncommitted changes are refused and prompt again."
+  confirmLabel="Delete workspace"
+  tone="danger"
+  frameId="workspace-delete"
+  onCancel={cancelDeletePrompt}
+  onConfirm={confirmDeletePrompt}
+/>
+
+<ConfirmDialog
+  open={forcePromptMessage !== null && interactionVisible}
   title="Force delete workspace?"
   message={forcePromptMessage ?? ""}
   hint="Force-deleting discards any uncommitted changes in the worktree. This cannot be undone."
@@ -3525,6 +4190,201 @@
   onCancel={cancelForceDelete}
   onConfirm={() => void confirmForceDelete()}
 />
+
+<!-- The dock body has one definition for its internal and surface-hosted placements.
+     The internal copy follows the workspace host's visibility; the external copy is
+     visible even while that host is parked because the container pane retired. -->
+{#snippet workspaceDockRowBody(dockHostVisible: boolean, external: boolean)}
+  <DockedTerminalPanel
+                {workspaceId}
+                {workspaceHostKey}
+                dragScope={surfaceLayout?.dragScope}
+                paneKeyForSession={detailPaneKeyForSession}
+                headerActions={external ? workspaceDockHeaderActions : undefined}
+                sessions={terminalSessions}
+                displayLabels={sessionDisplayLabels}
+                tree={dockTree}
+                activeSessionKey={terminalLayout.activeSessionKey}
+                open={terminalLayout.open}
+                dock={terminalLayout.dock}
+                height={terminalLayout.height}
+                loading={terminalLaunching}
+                disabled={actionsBlocked}
+                hostVisible={dockHostVisible}
+                onToggle={() => void toggleTerminalPanel()}
+                onNewTerminal={() => void launchTerminalSession()}
+                onSplit={(direction) => void splitTerminal(direction)}
+                onSelect={selectTerminalSession}
+                onClose={(session) => void closeSession(session)}
+                onRename={renameSession}
+                onMoveToWorkflow={moveSessionToWorkflow}
+                readSessionDrag={readDroppedSession}
+                onPromoteSession={promoteSessionToPane}
+                onDock={dockTerminalPanel}
+                onResize={resizeTerminalPanel}
+                onDropSession={moveSessionToTerminal}
+                onSplitSession={splitTerminalSessionIntoPane}
+                onRatioChange={(splitId, ratio) => {
+                  updateActiveTerminalTree(
+                    updateSplitRatio(
+                      terminalLayout.tree,
+                      splitId,
+                      ratio,
+                    ),
+                  );
+                }}
+              />
+{/snippet}
+
+<!-- Registered with the surface, which only renders it while the container pane is
+     retired. Its own visible placement, not the parked host wrapper, owns whether
+     terminal slots may attach. -->
+{#snippet workspaceDockRow()}
+  {@render workspaceDockRowBody(true, true)}
+{/snippet}
+
+{#snippet workspaceDockHeaderActions()}
+  <WorkspacePaneControls showStripActions={true} />
+{/snippet}
+
+<!-- The workspace's own controls, defined here because every one of them is wired
+     to this view's state. In a detail pane the pane's popover renders this, so the
+     controls follow the workspace without the state leaving the view. -->
+{#snippet workspaceControls()}
+  {#if controlsInPane && inlineDock && inlineDockMode !== null && workspaceLive && workspace?.status === "ready"}
+    <!-- The dock's own modes, which the header bar carries everywhere it still
+         renders - so this copy is gated on exactly the case that hides it. A detail
+         pane's close button is not a replacement: it puts one pane away, while a
+         session the user promoted into a sibling pane stays on screen, so the
+         workspace is still there while the button claims it is gone. Collapse is
+         the only control that reaches every pane the workspace occupies. -->
+    <Button
+      size="sm"
+      surface="soft"
+      tone="neutral"
+      label={inlineDockMode === "expanded" ? "Show Details" : "Expand Terminal"}
+      disabled={inlineDockMode !== "expanded" && inlineDockExpandBlocked}
+      title={
+        inlineDockMode !== "expanded" && inlineDockExpandBlocked
+          ? "Close the open dialog first."
+          : undefined
+      }
+      onclick={() => inlineDock?.setMode(inlineDockMode === "expanded" ? "split" : "expanded")}
+    >
+      {#if inlineDockMode === "expanded"}
+        <ChevronsDownIcon size="13" strokeWidth="2" aria-hidden="true" />
+      {:else}
+        <ChevronsUpIcon size="13" strokeWidth="2" aria-hidden="true" />
+      {/if}
+    </Button>
+    <Button
+      size="sm"
+      surface="soft"
+      tone="neutral"
+      label="Collapse Terminal"
+      onclick={() => inlineDock?.setMode("collapsed")}
+    >
+      <PanelBottomCloseIcon size="13" strokeWidth="2" aria-hidden="true" />
+    </Button>
+  {/if}
+  {#if !launcherMode}
+    <!-- Presets compose a whole multi-session workflow, which is what the standalone
+         Workspaces tab is for. A PR or issue pane hosts one workspace beside the
+         thing being reviewed, so saving and applying layouts there is a surface the
+         maintainer never asked that pane for. -->
+    <WorkflowPresetMenu
+      presets={workflowPresets}
+      selectedPresetId={selectedWorkflowPresetId}
+      applying={applyingWorkflowPreset}
+      onSaveNew={saveWorkflowPreset}
+      onUpdate={updateWorkflowPreset}
+      onApply={(presetId) => void applyWorkflowPreset(presetId)}
+      onDelete={deleteWorkflowPreset}
+      disabled={actionsBlocked}
+      hostVisible={interactionVisible}
+    />
+  {/if}
+  <TerminalZoomControl
+    fontSize={terminalFontSize}
+    disabled={actionsBlocked || !terminalSettingsReady || terminalOptionsSaving}
+    onDecrease={terminalZoom.decrease}
+    onIncrease={terminalZoom.increase}
+    onReset={terminalZoom.reset}
+  />
+  <TerminalOptionsMenu
+    disabled={actionsBlocked || !terminalSettingsReady || terminalZoomSaving}
+    hostVisible={interactionVisible}
+    onSavingChange={(saving) => {
+      terminalOptionsSaving = saving;
+    }}
+  />
+  {#if launcherMode}
+    {#if soleEmbeddedSession !== null}
+      <!-- The chrome that carried these is gone in this state, and only in this
+           state: with the header bar or the session strip on screen they already
+           have an owner there, and a second copy with its own disabled and pending
+           behaviour is worse than none. Delete is not among them - it moved to the
+           strip, where it is one click in every pane. -->
+      <Button
+        size="sm"
+        surface="soft"
+        tone="neutral"
+        label="Rename session"
+        disabled={actionsBlocked}
+        onclick={() => renameSession(soleEmbeddedSession)}
+      />
+      <Button
+        size="sm"
+        surface="soft"
+        tone="neutral"
+        label="Stop session"
+        disabled={actionsBlocked}
+        onclick={() => closeSession(soleEmbeddedSession)}
+      />
+    {/if}
+    {#if workspace}
+      <code class="workspace-control-branch">{workspace.git_head_ref}</code>
+    {/if}
+    <!-- One opener rather than the menu: the overlay is the launch surface in a
+         pane, and a second copy of the target list inside a popover inside a tab
+         strip is the stacking this mode exists to remove. -->
+    <Button size="sm" surface="soft" tone="neutral" label="Launch session" onclick={openLauncher}>
+      <PlayIcon size="13" strokeWidth="2" aria-hidden="true" />
+    </Button>
+  {:else}
+    <LaunchMenu
+      launchTargets={launchTargets}
+      {launchingKey}
+      disabled={actionsBlocked}
+      hostVisible={interactionVisible}
+      onLaunch={(key) => void handleLaunch(key)}
+    />
+  {/if}
+{/snippet}
+
+<!-- Sits in the tab strip beside the controls trigger, not inside the popover.
+     Deleting the worktree is the action a maintainer reaches for most once a PR is
+     done, and behind a menu it costs a click to open, a target to find, and a second
+     click. It is the only strip action for that reason: everything else here is
+     either rare or lives with the thing it acts on. -->
+{#snippet workspaceStripActions()}
+  <!-- Ready only. A workspace whose setup failed renders its own Delete beside the
+       Retry in the error panel, which is where the user is already looking, and one
+       still being created has nothing to delete yet - the strip action there would
+       be the second owner this snippet exists to avoid. -->
+  {#if workspaceLive && workspace?.status === "ready"}
+    <IconButton
+      size="sm"
+      tone="danger"
+      disabled={actionsBlocked}
+      ariaLabel={`Delete workspace ${workspace.git_head_ref}`}
+      title={`Delete workspace ${workspace.git_head_ref}`}
+      onclick={(event) => void handleDelete(event.currentTarget as HTMLElement)}
+    >
+      <Trash2Icon size="13" strokeWidth="2" aria-hidden="true" />
+    </IconButton>
+  {/if}
+{/snippet}
 
 <style>
   .terminal-view {
@@ -3870,6 +4730,24 @@
     min-height: 0;
     overflow: hidden;
     background: var(--bg-primary);
+  }
+
+  .sole-embedded-session {
+    display: flex;
+    width: 100%;
+    height: 100%;
+    min-width: 0;
+    min-height: 0;
+  }
+
+  .workspace-control-branch {
+    max-width: 240px;
+    overflow: hidden;
+    color: var(--text-secondary);
+    font-family: var(--font-mono);
+    font-size: var(--font-size-sm);
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .panel-toggle-group {

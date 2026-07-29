@@ -5,6 +5,7 @@ export type {
   ActionRegistry,
   NavigateEvent,
   NavigateCallback,
+  NavigateOptions,
   MiddlemanEvent,
   EventCallback,
   PrepareRouteCallback,
@@ -59,6 +60,7 @@ export type {
   InlineDockMode,
   InlineWorkspaceController,
   InlineWorkspaceSurface,
+  PromotableSession,
   WorkspaceItemIdentity,
   WorkspaceRefLite,
 } from "./workspace-inline.js";
@@ -142,22 +144,34 @@ export type { SelectDropdownOption } from "@kenn-io/kit-ui";
 export { SplitResizeHandle } from "@kenn-io/kit-ui";
 export type { SplitResizeEvent, SplitResizeOrientation } from "@kenn-io/kit-ui";
 export { default as TabbedPanelTree } from "./components/shared/TabbedPanelTree.svelte";
+export { default as DetailPaneLayout } from "./components/shared/DetailPaneLayout.svelte";
+export { default as PaneLeafActions } from "./components/shared/PaneLeafActions.svelte";
 export {
   clearActiveTabbedPanelDrag,
+  onTabbedPanelDragEnd,
   readTabbedPanelTabDrag,
   startTabbedPanelTabDrag,
 } from "./components/shared/tabbed-panel-drag.js";
 export type { TabbedPanelTabDragPayload } from "./components/shared/tabbed-panel-drag.js";
 export {
+  FLATTENED_TABBED_PANEL_LEAF_ID,
   activateTabbedPanelTab,
   appendTabbedPanelTabToLeaf,
   clampTabbedPanelRatio,
+  collectTabbedPanelLeafIDs,
   collectTabbedPanelTabKeys,
   createTabbedPanelLeaf,
+  defaultTabbedPanelLayout,
   findTabbedPanelLeafByTab,
   firstTabbedPanelLeaf,
+  flattenTabbedPanelTree,
+  insertTabbedPanelTab,
   moveTabbedPanelTabBefore,
   normalizeTabbedPanelTree,
+  parseTabbedPanelLayout,
+  pruneTabbedPanelTreeToAvailable,
+  removeTabbedPanelTab,
+  serializeTabbedPanelLayout,
   splitTabbedPanelTabIntoLeaf,
   tabbedPanelSplitEdgeFromPoint,
   tabbedPanelSplitPlacementForEdge,
@@ -166,15 +180,33 @@ export {
 export type {
   TabbedPanelDescriptor,
   TabbedPanelDirection,
+  TabbedPanelInsertTarget,
+  TabbedPanelLayoutState,
   TabbedPanelLeaf,
   TabbedPanelNode,
   TabbedPanelSplit,
   TabbedPanelStatus,
   TabbedPanelSplitEdge,
 } from "./components/shared/tabbed-panel-layout.js";
+export type { PaneRenderReport } from "./stores/paneLayout.svelte.js";
+export { workspaceTabDragScope } from "./components/shared/tabbed-panel-drag.js";
+export {
+  PANE_LAYOUT_STORAGE_PREFIX,
+  createPaneLayoutStore,
+  getPaneLayoutStore,
+  promoteSessionBesideWorkspace,
+  resetPaneLayoutStoresForTest,
+} from "./stores/paneLayout.svelte.js";
+export type { PaneLayoutStore, PaneSurfaceKey, PaneTabSpec } from "./stores/paneLayout.svelte.js";
+export {
+  isSessionPaneKey,
+  parseSessionPaneKey,
+  sessionPaneKey,
+  sessionPaneKeyMatchesWorkspace,
+} from "./stores/session-pane-key.js";
+export type { SessionPaneRef } from "./stores/session-pane-key.js";
 export { default as WorkspaceRightSidebar } from "./components/workspace/WorkspaceRightSidebar.svelte";
 export { default as WorkspaceDiffPanel } from "./components/workspace/WorkspaceDiffPanel.svelte";
-export { default as WorkspaceDockPanel } from "./components/workspace/WorkspaceDockPanel.svelte";
 export { default as WorkspaceCreateSplitButton } from "./components/workspace/WorkspaceCreateSplitButton.svelte";
 export { default as DiffSidebar } from "./components/diff/DiffSidebar.svelte";
 export { default as DiffToolbar } from "./components/diff/DiffToolbar.svelte";

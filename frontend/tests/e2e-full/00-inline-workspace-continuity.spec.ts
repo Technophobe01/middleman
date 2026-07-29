@@ -2,7 +2,7 @@
 // dispatches files in path order, and multi-second tests that start near the
 // end of the run stretch the suite tail.
 //
-// These specs prove the inline workspace dock's core claim: the single
+// These specs prove the inline workspace pane's core claim: the single
 // hosted WorkspaceHost/WorkspaceTerminalView instance reparents between the
 // Workspaces tab slot and a per-surface WorkspaceDockPanel slot without
 // tearing down the terminal underneath it. A `data-continuity` tag applied
@@ -29,6 +29,7 @@ import {
   type Page,
 } from "@playwright/test";
 import { startIsolatedWorkspaceE2EServer, type IsolatedE2EServer } from "./support/e2eServer";
+import { runPaletteCommand } from "./support/paletteCommands";
 
 type WorkspaceStatusResponse = {
   id: string;
@@ -102,15 +103,48 @@ async function createIssueWorkspace(api: APIRequestContext, issueNumber: number)
   return waitForWorkspaceReady(api, workspace.id);
 }
 
+/**
+ * A workspace running nothing opens its launcher overlay as soon as it lands in a
+ * detail pane, and nothing behind a modal is clickable. Dismiss it the way a user
+ * who wants the dock instead would.
+ */
+async function dismissWorkspaceLauncher(page: Page): Promise<void> {
+  const launcher = page.getByRole("dialog", { name: "Launch a session" });
+  await expect(launcher).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(launcher).toBeHidden();
+}
+
+/**
+ * Open the dock and return its terminal.
+ *
+ * In a detail pane a workspace running exactly one session drops its chrome, dock
+ * included, and renders that session on its own - so the container to wait for
+ * depends on how many sessions the workspace has, not on which control opened it.
+ */
 async function openTerminalPanel(page: Page): Promise<Locator> {
   await page.getByRole("button", { name: "Open terminal panel" }).click();
-  const container = page.locator(".terminal-panel.open .terminal-container");
+  const container = page
+    .locator(".terminal-panel.open .terminal-container, .sole-embedded-session .terminal-container")
+    .first();
   await expect(container).toBeVisible();
   // xterm.js only paints a canvas when its WebGL addon activates. Without WebGL
   // (headless Firefox) it silently falls back to the DOM renderer, which
   // renders .xterm-screen rows and never creates a canvas.
   await expect(container.locator("canvas, .xterm-screen").first()).toBeVisible();
   return container;
+}
+
+/**
+ * Put the whole workspace away.
+ *
+ * A detail pane hides the workspace's own header bar, so collapse now lives in the
+ * pane's controls popover. The pane's close button is not a substitute: it hides one
+ * pane, while collapse reaches the container and every promoted session with it.
+ */
+async function collapseTerminal(page: Page): Promise<void> {
+  await page.getByRole("button", { name: "Workspace controls" }).first().click();
+  await page.getByRole("button", { name: "Collapse Terminal" }).click();
 }
 
 async function typeIntoTerminal(page: Page, container: Locator, command: string): Promise<void> {
@@ -189,10 +223,21 @@ async function expectPersistedTerminalFontSize(api: APIRequestContext, fontSize:
     .toBe(fontSize);
 }
 
-test.describe("inline workspace dock continuity", () => {
+test.describe("inline workspace pane continuity", () => {
   test.describe.configure({ mode: "serial", timeout: lockedWorkspaceTestTimeoutMs });
 
-  test("expanding an inline workspace keeps the app frame fixed and its controls reachable", async ({ page }) => {
+  // These tests share one page (serial mode) and the pane layout persists, so a
+  // test that closes or maximizes the workspace pane would hand that arrangement
+  // to the next one. Reset it on every document load.
+  test.beforeEach(async ({ page }) => {
+    await page.addInitScript(() => {
+      for (const surface of ["prs", "issues", "activity"]) {
+        localStorage.removeItem(`middleman-pane-layout-v1:${surface}`);
+      }
+    });
+  });
+
+  test("maximizing an inline workspace keeps the app frame fixed and its controls reachable", async ({ page }) => {
     test.skip(
       !hasCommand("git") || !hasCommand("tmux", ["-V"]),
       "git and tmux are required for the real workspace flow",
@@ -206,10 +251,18 @@ test.describe("inline workspace dock continuity", () => {
       await createIssueWorkspace(api, 10);
 
       await page.goto(`${isolatedServer.info.base_url}/issues/github/acme/widgets/10`);
+      await dismissWorkspaceLauncher(page);
       const appMain = page.locator(".app-main");
       const itemRail = page.locator(".issue-list");
-      const expand = page.getByRole("button", { name: "Expand Terminal" });
-      await expect(expand).toBeVisible();
+      // The pane's own controls, in its tab strip: a detail pane never shows the
+      // workspace's header bar, so maximize and close are what expand and collapse
+      // the inline dock now.
+      const workspaceLeaf = page.locator(".tabbed-panel-leaf").filter({
+        has: page.locator(".detail-pane-workspace-slot"),
+      });
+      const zoom = workspaceLeaf.locator('[data-testid="pane-toggle-zoom"]');
+      const close = workspaceLeaf.locator('[data-testid="pane-hide-workspace"]');
+      await expect(zoom).toBeVisible();
       const overflowMetrics = await appMain.evaluate((element) => {
         const overflowProbe = document.createElement("div");
         overflowProbe.dataset.testOverflowProbe = "true";
@@ -222,23 +275,24 @@ test.describe("inline workspace dock continuity", () => {
       await expect(appMain).toHaveJSProperty("scrollTop", 0);
       await appMain.locator("[data-test-overflow-probe]").evaluate((element) => element.remove());
 
-      await expand.click();
+      await zoom.click();
 
-      const collapse = page.getByRole("button", { name: "Collapse Terminal" });
-      const showDetails = page.getByRole("button", { name: "Show Details" });
-      await expect(showDetails).toBeVisible();
-      await expect(collapse).toBeVisible();
-      await showDetails.click();
-      await expect(expand).toBeVisible();
-      await expand.click();
-      await expect(showDetails).toBeVisible();
+      // Maximized: the control flips to Restore, and the pane's close is still there
+      // to put the workspace away entirely.
+      const restore = workspaceLeaf.getByRole("button", { name: "Restore pane size" });
+      await expect(restore).toBeVisible();
+      await expect(close).toBeVisible();
+      await restore.click();
+      await expect(workspaceLeaf.getByRole("button", { name: "Maximize pane" })).toBeVisible();
+      await zoom.click();
+      await expect(restore).toBeVisible();
       await expect(appMain).toHaveJSProperty("scrollTop", 0);
       await expect
         .poll(async () => {
           const [mainBox, railBox, panelBox] = await Promise.all([
             appMain.boundingBox(),
             itemRail.boundingBox(),
-            page.locator(".workspace-dock-panel").boundingBox(),
+            page.locator(".tabbed-panel-split-child.zoomed").boundingBox(),
           ]);
           return {
             railTopDelta: railBox && mainBox ? railBox.y - mainBox.y : undefined,
@@ -255,8 +309,618 @@ test.describe("inline workspace dock continuity", () => {
           panelBottomDelta: 0,
         });
 
-      await collapse.click();
-      await expect(page.locator(".workspace-dock-slot")).toHaveCount(0);
+      await close.click();
+      await expect(page.locator(".detail-pane-workspace-slot")).toHaveCount(0);
+    } finally {
+      await api?.dispose();
+      await isolatedServer?.stop();
+    }
+  });
+
+  test("the popover's dock modes expand and restore, and its Delete destroys the workspace", async ({ page }) => {
+    // Both halves of this only exist against a real surface. Expand Terminal drives
+    // a zoom the pane layout can silently undo (route authority once re-asserted on
+    // every tab-list re-derive, which the zoom itself triggers), and the strip
+    // Delete is the destructive path a jsdom placement assertion cannot prove
+    // reaches the API.
+    test.skip(
+      !hasCommand("git") || !hasCommand("tmux", ["-V"]),
+      "git and tmux are required for the real workspace flow",
+    );
+
+    let isolatedServer: IsolatedE2EServer | null = null;
+    let api: APIRequestContext | null = null;
+    try {
+      isolatedServer = await startIsolatedWorkspaceE2EServer();
+      api = await playwrightRequest.newContext({ baseURL: isolatedServer.info.base_url });
+      const created = await createIssueWorkspace(api, 10);
+
+      await page.goto(`${isolatedServer.info.base_url}/issues/github/acme/widgets/10`);
+      await dismissWorkspaceLauncher(page);
+
+      const detail = page.locator(".detail-pane-conversation, [data-testid='pane-conversation']").first();
+      const controls = page.getByRole("button", { name: "Workspace controls" }).first();
+      await expect(controls).toBeVisible();
+
+      await controls.click();
+      const popover = page.getByRole("dialog", { name: "Workspace controls" });
+      await popover.getByRole("button", { name: "Expand Terminal" }).click();
+
+      // Expanded: the workspace covers the surface, so the detail pane it shared it
+      // with is gone rather than merely narrower.
+      await expect(page.locator(".tabbed-panel-split-child.zoomed")).toHaveCount(1);
+      await expect(detail).toHaveCount(0);
+
+      // The popover stays open across its own actions on purpose, and the same
+      // button flips to the inverse mode.
+      await popover.getByRole("button", { name: "Show Details" }).click();
+      await expect(page.locator(".tabbed-panel-split-child.zoomed")).toHaveCount(0);
+      await controls.click();
+      await expect(popover).toBeHidden();
+
+      // The strip Delete: one click, then the confirmation every entry point shows.
+      await page.getByRole("button", { name: /^Delete workspace / }).click();
+      await page
+        .getByRole("dialog", { name: "Delete workspace?" })
+        .getByRole("button", { name: "Delete workspace" })
+        .click();
+
+      await expect(page.locator(".detail-pane-workspace-slot")).toHaveCount(0);
+      await expect.poll(async () => (await api!.get(`/api/v1/workspaces/${created.id}`)).status()).toBe(404);
+    } finally {
+      await api?.dispose();
+      await isolatedServer?.stop();
+    }
+  });
+
+  test("the pane's own maximize and close controls keep the live terminal", async ({ page }) => {
+    // The frame-geometry side of maximizing is covered above. This is the same pair
+    // of pane-native controls driven for a different question: that the single hosted
+    // terminal is reparented across the layout change rather than rebuilt.
+    test.skip(
+      !hasCommand("git") || !hasCommand("tmux", ["-V"]),
+      "git and tmux are required for the real workspace flow",
+    );
+
+    let isolatedServer: IsolatedE2EServer | null = null;
+    let api: APIRequestContext | null = null;
+    try {
+      isolatedServer = await startIsolatedWorkspaceE2EServer();
+      api = await playwrightRequest.newContext({ baseURL: isolatedServer.info.base_url });
+      const workspace = await createIssueWorkspace(api, 10);
+
+      await page.goto(`${isolatedServer.info.base_url}/issues/github/acme/widgets/10`);
+      await expect(page.locator(".detail-pane-workspace-slot .workspace-host-wrapper")).toBeVisible();
+      await dismissWorkspaceLauncher(page);
+      // The hosted shell opens on its workflow panel; the terminal container only
+      // exists once that panel is open.
+      const paneContainer = await openTerminalPanel(page);
+      await paneContainer.evaluate((el) => el.setAttribute("data-continuity", "witness"));
+      const witness = page.locator('[data-continuity="witness"]');
+
+      const workspaceLeaf = page.locator(".tabbed-panel-leaf").filter({
+        has: page.locator(".detail-pane-workspace-slot"),
+      });
+      const zoom = workspaceLeaf.locator('[data-testid="pane-toggle-zoom"]');
+      await zoom.click();
+      await expect(page.locator(".tabbed-panel-split-child.zoomed")).toBeVisible();
+      // Maximizing must not rebuild the shell: the tagged node is the live one.
+      await expect(paneContainer).toHaveAttribute("data-continuity", "witness");
+      await typeMarkerCommand(page, paneContainer, workspace.worktree_path, "pane-marker-zoomed");
+
+      await zoom.click();
+      await expect(page.locator(".tabbed-panel-split-child.zoomed")).toHaveCount(0);
+      await expect(witness).toBeVisible();
+
+      // Closing unmounts the slot, so the host parks; the terminal is not torn
+      // down, and reopening must reparent the same node back in.
+      await workspaceLeaf.locator('[data-testid="pane-hide-workspace"]').click();
+      await expect(page.locator(".detail-pane-workspace-slot")).toHaveCount(0);
+
+      // Named for the session, not the container: a pane holding one terminal takes
+      // that terminal's name, and the reopen strip has to agree with the tab.
+      await page.getByRole("button", { name: "Show Shell" }).click();
+      await expect(paneContainer).toHaveAttribute("data-continuity", "witness");
+      // A torn-down or wedged session cannot run this.
+      await typeMarkerCommand(page, paneContainer, workspace.worktree_path, "pane-marker-reopened");
+    } finally {
+      await api?.dispose();
+      await isolatedServer?.stop();
+    }
+  });
+
+  test("promoting a session to a pane of its own and back keeps the live shell", async ({ page }) => {
+    // Promotion moves a session out of the workspace pane and into a top-level
+    // pane of the detail surface. Nothing but a real backend shows whether the
+    // pooled terminal was reparented or rebuilt: the component lanes mount
+    // exited sessions, so a torn-down shell looks identical there.
+    //
+    // Driven through the palette commands rather than a drag, which is both the
+    // keyboard path and the only one that works without layout geometry.
+    test.skip(
+      !hasCommand("git") || !hasCommand("tmux", ["-V"]),
+      "git and tmux are required for the real workspace flow",
+    );
+
+    let isolatedServer: IsolatedE2EServer | null = null;
+    let api: APIRequestContext | null = null;
+    try {
+      isolatedServer = await startIsolatedWorkspaceE2EServer();
+      api = await playwrightRequest.newContext({ baseURL: isolatedServer.info.base_url });
+      const workspace = await createIssueWorkspace(api, 10);
+
+      await page.goto(`${isolatedServer.info.base_url}/issues/github/acme/widgets/10`);
+      await expect(page.locator(".detail-pane-workspace-slot .workspace-host-wrapper")).toBeVisible();
+      await dismissWorkspaceLauncher(page);
+      // The dock, so this also covers promoting out of the container promotion
+      // was not designed around.
+      const dockContainer = await openTerminalPanel(page);
+      // Stamped on the live node: the registry key is derived from the workspace,
+      // session, and generation, so a rebuilt terminal would still carry it.
+      await dockContainer.evaluate((el) => el.setAttribute("data-continuity", "promoted-shell"));
+      const witness = page.locator('[data-continuity="promoted-shell"]');
+      await typeMarkerCommand(page, dockContainer, workspace.worktree_path, "promote-marker-docked");
+
+      await runPaletteCommand(page, "Move terminal session to a pane");
+
+      // Out of the workspace pane entirely and into its own, carrying the very
+      // node the dock was showing.
+      await expect(page.locator('.detail-pane-workspace-slot [data-continuity="promoted-shell"]')).toHaveCount(0);
+      await expect(page.locator('.session-terminal-slot [data-continuity="promoted-shell"]')).toBeVisible();
+      // Same shell, still attached to the same tmux session. Focusing it here is
+      // also what makes it the pane commands' target, so the demotion below acts
+      // on the pane the user is working in.
+      await typeMarkerCommand(page, witness, workspace.worktree_path, "promote-marker-in-pane");
+
+      // Away and back while promoted. The pane is per surface and the session list
+      // is per hosted workspace, so the other issue must not inherit this pane -
+      // and returning must bring it back rather than leaving the terminal
+      // unreachable in a pane nothing renders.
+      // Away and back. The other issue has no workspace at all, so the surface
+      // stops hosting one; what this proves is that the promoted PLACEMENT is not
+      // lost by the round trip, which is the whole point of storing it in the
+      // surface's tree rather than in the view.
+      await selectIssueByTitle(page, DARK_MODE_ISSUE_TITLE);
+      await selectIssueByTitle(page, SAFARI_ISSUE_TITLE);
+
+      // A different DOM node this time: switching workspaces hands the previous
+      // one's pooled terminals back, so this asserts the PLACEMENT survived and the
+      // reattached shell is live, not that the node did.
+      const returnedPane = page.locator(".session-terminal-slot .terminal-container");
+      await expect(returnedPane).toBeVisible();
+      await typeMarkerCommand(page, returnedPane, workspace.worktree_path, "promote-marker-returned");
+
+      await runPaletteCommand(page, "Return terminal session to the workspace pane");
+
+      // Home again, back inside the workspace pane rather than left in a pane
+      // nothing renders. It is the workspace's only session, so the pane hands the
+      // whole box to the terminal and there is no dock bar to come back to - which
+      // is why this asserts on where the session landed, not on dock chrome.
+      const redocked = page.locator(".detail-pane-workspace-slot .sole-embedded-session .terminal-container");
+      await expect(redocked).toBeVisible();
+      await typeMarkerCommand(page, redocked, workspace.worktree_path, "promote-marker-redocked");
+    } finally {
+      await api?.dispose();
+      await isolatedServer?.stop();
+    }
+  });
+
+  test("a row-only workspace retires behind its dock and returns when its pane is dropped into the terminal", async ({
+    page,
+  }) => {
+    // This is the production-stack regression for the layout that exists when a
+    // workflow session is promoted but a different shell remains in the bottom
+    // dock. The container must leave the recursive pane tree without taking the
+    // dock with it, then return to its stored branch when the session comes home.
+    test.skip(
+      !hasCommand("git") || !hasCommand("tmux", ["-V"]),
+      "git and tmux are required for the real workspace flow",
+    );
+
+    let isolatedServer: IsolatedE2EServer | null = null;
+    let api: APIRequestContext | null = null;
+    try {
+      isolatedServer = await startIsolatedWorkspaceE2EServer();
+      api = await playwrightRequest.newContext({ baseURL: isolatedServer.info.base_url });
+      const workspace = await createIssueWorkspace(api, 10);
+
+      await page.goto(`${isolatedServer.info.base_url}/issues/github/acme/widgets/10`);
+      await expect(page.locator(".detail-pane-workspace-slot .workspace-host-wrapper")).toBeVisible();
+      await dismissWorkspaceLauncher(page);
+      await openTerminalPanel(page);
+
+      // A sole docked session fills the pane without dock chrome. Launch its
+      // sibling through the pane controls; new launcher sessions belong to the
+      // workflow stage, leaving the original shell in the bottom dock.
+      const workspaceControlsTrigger = page.getByRole("button", { name: "Workspace controls" }).first();
+      await workspaceControlsTrigger.click();
+      const workspaceControls = page.getByRole("dialog", { name: "Workspace controls" });
+      await workspaceControls.getByRole("button", { name: /Launch/ }).click();
+      const launcher = page.getByRole("dialog", { name: "Launch a session" });
+      await expect(launcher).toBeVisible();
+      await launcher.getByRole("button", { name: "Shell", exact: true }).click();
+      await expect(launcher).toBeHidden();
+      await page.locator(".detail-host").dispatchEvent("pointerdown");
+      await expect(workspaceControls).toBeHidden();
+
+      const internalDock = page.locator(".detail-pane-workspace-slot .terminal-panel");
+      await internalDock.getByRole("button", { name: "Close terminal panel", exact: true }).last().click();
+      const workflowTerminal = page.locator(
+        ".detail-pane-workspace-slot .workspace-stage .session-terminal-slot .terminal-container",
+      );
+      await expect(workflowTerminal).toBeVisible();
+      await typeMarkerCommand(page, workflowTerminal, workspace.worktree_path, "row-only-before-promote");
+
+      await runPaletteCommand(page, "Move terminal session to a pane");
+
+      // The promoted pane fills the stored branch. The container is gone, while
+      // the same dock row remains reachable at the surface edge.
+      const promotedTerminal = page.locator(".tabbed-panel-leaf .session-terminal-slot .terminal-container");
+      await expect(promotedTerminal).toBeVisible();
+      await promotedTerminal.evaluate((element) => element.setAttribute("data-continuity", "row-only-promoted"));
+      await expect(page.locator(".detail-pane-workspace-slot")).toHaveCount(0);
+      const surfaceDock = page.locator(".detail-host > .terminal-panel");
+      await expect(surfaceDock).toBeVisible();
+      await typeMarkerCommand(page, promotedTerminal, workspace.worktree_path, "row-only-promoted");
+      await surfaceDock.getByRole("button", { name: "Open terminal panel", exact: true }).click();
+      const dockedTerminal = surfaceDock.locator(".terminal-container");
+      await expect(dockedTerminal).toBeVisible();
+      await typeMarkerCommand(page, dockedTerminal, workspace.worktree_path, "row-only-external-dock");
+      // This is a detail-surface drag, not a terminal-session drag. The terminal
+      // must translate it back to the owning runtime session and consume the drop;
+      // otherwise it bubbles to the outer pane tree, which splits the detail
+      // surface and leaves a short dock above a large dead area.
+      const promotedLeaf = page.locator(".tabbed-panel-leaf").filter({
+        has: page.locator('[data-continuity="row-only-promoted"]'),
+      });
+      const paneTab = promotedLeaf.getByRole("tab");
+      const dockDropTarget = surfaceDock.getByRole("group", {
+        name: /split drop targets$/,
+      });
+      await paneTab.dragTo(dockDropTarget, {
+        targetPosition: { x: 8, y: 80 },
+      });
+
+      // The accepted drop demotes the pane into the terminal tree. With no
+      // workflow content the wrapper correctly stays retired; the single external
+      // dock now owns both live sessions and remains flush with the surface edge.
+      await expect(page.locator(".detail-pane-workspace-slot")).toHaveCount(0);
+      await expect(page.locator('[data-testid^="pane-hide-session:"]')).toHaveCount(0);
+      await expect(surfaceDock).toBeVisible();
+      await expect(surfaceDock.locator(".terminal-leaf")).toHaveCount(2);
+      const surfaceGeometry = await page.locator(".detail-host").evaluate((host) => {
+        const detail = host.querySelector(":scope > .detail-pane-layout");
+        const dock = host.querySelector(":scope > .terminal-panel");
+        if (!(detail instanceof HTMLElement) || !(dock instanceof HTMLElement)) return null;
+        const hostRect = host.getBoundingClientRect();
+        const detailRect = detail.getBoundingClientRect();
+        const dockRect = dock.getBoundingClientRect();
+        return {
+          detailTop: detailRect.top - hostRect.top,
+          gap: dockRect.top - detailRect.bottom,
+          dockBottom: hostRect.bottom - dockRect.bottom,
+          dockLeft: dockRect.left - hostRect.left,
+          dockRight: hostRect.right - dockRect.right,
+        };
+      });
+      expect(surfaceGeometry).not.toBeNull();
+      for (const delta of Object.values(surfaceGeometry!)) {
+        expect(Math.abs(delta)).toBeLessThanOrEqual(1);
+      }
+      const restoredPromotedTerminal = surfaceDock.locator('[data-continuity="row-only-promoted"]');
+      await expect(restoredPromotedTerminal).toBeVisible();
+      await typeMarkerCommand(
+        page,
+        restoredPromotedTerminal,
+        workspace.worktree_path,
+        "row-only-dropped-into-terminal",
+      );
+    } finally {
+      await api?.dispose();
+      await isolatedServer?.stop();
+    }
+  });
+
+  test("a pooled workflow session keeps its live tmux shell while its host is reparented", async ({ page }) => {
+    // Session terminals no longer live in the workspace view's own subtree:
+    // they are rendered once by the app-level pool and reparented into
+    // whichever slot shows them.
+    //
+    // Two distinct moves are under test. First a transfer between two DIFFERENT
+    // slots — the dock leaf hands the shell to a workflow tab — which is the
+    // pool's own source-to-destination path. Then a reparent of the slot itself,
+    // when the workspace host travels into a detail pane: there the pool sees
+    // the same slot at a new place in the document and must not park it.
+    test.skip(
+      !hasCommand("git") || !hasCommand("tmux", ["-V"]),
+      "git and tmux are required for the real workspace flow",
+    );
+
+    let isolatedServer: IsolatedE2EServer | null = null;
+    let api: APIRequestContext | null = null;
+    try {
+      isolatedServer = await startIsolatedWorkspaceE2EServer();
+      api = await playwrightRequest.newContext({ baseURL: isolatedServer.info.base_url });
+      const workspace = await createIssueWorkspace(api, 10);
+
+      await page.goto(`${isolatedServer.info.base_url}/terminal/${workspace.id}`);
+      const dockContainer = await openTerminalPanel(page);
+      // Readiness, not continuity: the session moved below may be either shell.
+      await typeMarkerCommand(page, dockContainer, workspace.worktree_path, "pooled-marker-in-dock");
+
+      // A second shell, because the per-session header carrying the move
+      // control only renders once the dock has more than one session.
+      await page.getByRole("button", { name: "New terminal" }).click();
+
+      // Move a session out of the terminal dock into the workflow region. Both
+      // render pooled slots, so this is a transfer between two different slots.
+      // The control is the SESSION's own, not the dock's "Move terminal panel
+      // to workflow" — that one only redocks the panel.
+      const dockLeaf = page.locator(".terminal-leaf").first();
+      const moveSession = dockLeaf.getByRole("button", { name: /^Move (?!terminal panel).+ to workflow$/ });
+      await expect(moveSession).toBeVisible();
+      const dockedHost = dockLeaf.locator("[data-session-host]");
+      await expect(dockedHost).toBeVisible();
+      // Stamped BEFORE the move, and unique to this node. The registry key alone
+      // would not do: it is derived from the workspace, session, and generation,
+      // so a terminal destroyed and rebuilt carries the same one.
+      await dockedHost.evaluate((el) => el.setAttribute("data-continuity", "moved-from-dock"));
+      await moveSession.click();
+
+      // The bottom dock still holds the other shell and takes the whole height,
+      // leaving the workflow area a 1px sliver. Close it so the moved session
+      // has somewhere to render.
+      await page.getByRole("button", { name: "Close terminal panel", exact: true }).nth(1).click();
+      // The very node the dock was showing, now inside a workflow tab. A rebuilt
+      // terminal loses the stamp, and a stranded one never arrives.
+      const movedHost = page.locator('.session-terminal-slot [data-continuity="moved-from-dock"]');
+      await expect(movedHost).toBeVisible();
+      const workflowContainer = movedHost.locator(".terminal-container");
+      await expect(workflowContainer).toBeVisible();
+      await workflowContainer.evaluate((el) => el.setAttribute("data-continuity", "pooled"));
+      const witness = page.locator('[data-continuity="pooled"]');
+      await typeMarkerCommand(page, workflowContainer, workspace.worktree_path, "pooled-marker-in-workflow");
+
+      // Selecting the issue reparents the whole workspace host into the detail
+      // pane. The pooled terminal has to travel with its slot: the pool sits
+      // OUTSIDE the reparented wrapper, so a wrong placement here parks it.
+      await selectIssueByTitle(page, SAFARI_ISSUE_TITLE);
+      await expect(page.locator(".detail-pane-workspace-slot .workspace-host-wrapper")).toBeVisible();
+      await expect(witness).toBeVisible();
+      await expect(workflowContainer).toHaveAttribute("data-continuity", "pooled");
+      // The same node AND a working input path: a parked or rebuilt terminal
+      // cannot create this file.
+      await typeMarkerCommand(page, workflowContainer, workspace.worktree_path, "pooled-marker-in-pane");
+
+      await selectTopBarTab(page, "Workspaces");
+      await expect(page).toHaveURL(new RegExp(`/terminal/${workspace.id}$`));
+      await expect(witness).toBeVisible();
+      await typeMarkerCommand(page, workflowContainer, workspace.worktree_path, "pooled-marker-back-in-tab");
+    } finally {
+      await api?.dispose();
+      await isolatedServer?.stop();
+    }
+  });
+
+  test("an embedded terminal route renders a live pooled session", async ({ page }) => {
+    // The embed routes replace the whole app shell, so they never mount
+    // WorkspaceHost — and therefore never got the pool that now owns every
+    // session terminal. Every session pane on this route rendered an empty
+    // portal slot until the embed shell mounted its own.
+    test.skip(
+      !hasCommand("git") || !hasCommand("tmux", ["-V"]),
+      "git and tmux are required for the real workspace flow",
+    );
+
+    let isolatedServer: IsolatedE2EServer | null = null;
+    let api: APIRequestContext | null = null;
+    try {
+      isolatedServer = await startIsolatedWorkspaceE2EServer();
+      api = await playwrightRequest.newContext({ baseURL: isolatedServer.info.base_url });
+      const workspace = await createIssueWorkspace(api, 10);
+
+      await page.goto(`${isolatedServer.info.base_url}/workspaces/embed/terminal/${workspace.id}`);
+      const dockContainer = await openTerminalPanel(page);
+      await page.getByRole("button", { name: "New terminal" }).click();
+      const moveSession = page.getByRole("button", { name: /^Move (?!terminal panel).+ to workflow$/ }).first();
+      await expect(moveSession).toBeVisible();
+      await moveSession.click();
+      await page.getByRole("button", { name: "Close terminal panel", exact: true }).nth(1).click();
+
+      const workflowContainer = page.locator(".session-terminal-slot .terminal-container");
+      await expect(workflowContainer).toBeVisible();
+      // A slot with no pool behind it is an empty div: this cannot pass without
+      // a terminal attached to the real tmux session.
+      await typeMarkerCommand(page, workflowContainer, workspace.worktree_path, "embed-pooled-marker");
+    } finally {
+      await api?.dispose();
+      await isolatedServer?.stop();
+    }
+  });
+
+  test("a promoted terminal is part of its workspace's dock", async ({ page }) => {
+    // The dock is a view of every pane of the workspace once a session is promoted.
+    // Only the real app proves it: the store tests drive controllers directly, so
+    // they cannot show the collapse control acting on both panes, or focus landing
+    // inside a pooled terminal that mounts a frame after its pane reveals.
+    test.skip(
+      !hasCommand("git") || !hasCommand("tmux", ["-V"]),
+      "git and tmux are required for the real workspace flow",
+    );
+
+    let isolatedServer: IsolatedE2EServer | null = null;
+    let api: APIRequestContext | null = null;
+    try {
+      isolatedServer = await startIsolatedWorkspaceE2EServer();
+      api = await playwrightRequest.newContext({ baseURL: isolatedServer.info.base_url });
+      const workspace = await createIssueWorkspace(api, 10);
+
+      await page.goto(`${isolatedServer.info.base_url}/issues/github/acme/widgets/10`);
+      await expect(page.locator(".detail-pane-workspace-slot .workspace-host-wrapper")).toBeVisible();
+      await dismissWorkspaceLauncher(page);
+      const dockContainer = await openTerminalPanel(page);
+      await typeMarkerCommand(page, dockContainer, workspace.worktree_path, "dock-marker-before-promote");
+
+      await runPaletteCommand(page, "Move terminal session to a pane");
+      const promoted = page.locator(".session-terminal-slot .terminal-container");
+      await expect(promoted).toBeVisible();
+      // Working in it is what makes it this workspace's last-focused pane, which is
+      // what Focus Terminal and an expand act on from here on.
+      await typeMarkerCommand(page, promoted, workspace.worktree_path, "promoted-marker-before-hide");
+
+      // Closed, so the reveal has to mount the slot and the pool has to reparent the
+      // wrapper before focus can land - the race a same-flush focus attempt loses.
+      const promotedLeaf = page.locator(".tabbed-panel-leaf").filter({ has: page.locator(".session-terminal-slot") });
+      await promotedLeaf.locator('[data-testid^="pane-hide-session:"]').click();
+      await expect(page.locator(".session-terminal-slot")).toHaveCount(0);
+
+      await page.getByRole("button", { name: "Focus Terminal" }).click();
+
+      const restored = page.locator(".session-terminal-slot .terminal-container");
+      await expect(restored).toBeVisible();
+      await expect
+        .poll(async () =>
+          restored.evaluate((el) => el.closest("[data-session-host]")?.contains(document.activeElement) ?? false),
+        )
+        .toBe(true);
+      await typeMarkerCommand(page, restored, workspace.worktree_path, "promoted-marker-after-focus");
+
+      // Collapse reaches both panes. A promoted terminal left on screen is the whole
+      // workspace still sitting there while the button claims it is away.
+      await collapseTerminal(page);
+      await expect(page.locator(".detail-pane-workspace-slot")).toHaveCount(0);
+      await expect(page.locator(".session-terminal-slot")).toHaveCount(0);
+
+      // Collapsing both panes at once drops a whole split node out of the pane tree,
+      // and the way back has to survive that. Focus restores the promoted terminal;
+      // the empty workspace container stays retired behind its external dock.
+      await page.getByRole("button", { name: "Focus Terminal" }).click();
+      await expect(page.locator(".detail-pane-workspace-slot")).toHaveCount(0);
+      await expect(page.locator(".detail-host > .terminal-panel")).toBeVisible();
+      await expect(restored).toBeVisible();
+      await typeMarkerCommand(page, restored, workspace.worktree_path, "marker-after-collapse");
+    } finally {
+      await api?.dispose();
+      await isolatedServer?.stop();
+    }
+  });
+
+  test("a workspace put away keeps its panes through another workspace's dock", async ({ page }) => {
+    // The container tab is shared by every workspace on a surface, so the collapse
+    // record is the only thing that knows what a given workspace put away. Only the
+    // real app runs the sequence that breaks it: collapse A, let B unhide the shared
+    // container, then come back to A - where the dock reports "split" while A's
+    // promoted terminal is still hidden.
+    test.skip(
+      !hasCommand("git") || !hasCommand("tmux", ["-V"]),
+      "git and tmux are required for the real workspace flow",
+    );
+
+    let isolatedServer: IsolatedE2EServer | null = null;
+    let api: APIRequestContext | null = null;
+    try {
+      isolatedServer = await startIsolatedWorkspaceE2EServer();
+      api = await playwrightRequest.newContext({ baseURL: isolatedServer.info.base_url });
+      const workspace = await createIssueWorkspace(api, 10);
+      await createIssueWorkspace(api, 11);
+
+      await page.goto(`${isolatedServer.info.base_url}/issues/github/acme/widgets/10`);
+      await expect(page.locator(".detail-pane-workspace-slot .workspace-host-wrapper")).toBeVisible();
+      await dismissWorkspaceLauncher(page);
+      await openTerminalPanel(page);
+      await runPaletteCommand(page, "Move terminal session to a pane");
+      const promoted = page.locator(".session-terminal-slot .terminal-container");
+      await expect(promoted).toBeVisible();
+      await typeMarkerCommand(page, promoted, workspace.worktree_path, "cross-marker-before");
+
+      await collapseTerminal(page);
+      await expect(page.locator(".session-terminal-slot")).toHaveCount(0);
+
+      // The other issue's workspace, brought back on screen. It has no promoted pane
+      // of its own, so this unhides the container both workspaces share.
+      await selectIssueByTitle(page, DARK_MODE_ISSUE_TITLE);
+      await page.getByRole("button", { name: "Focus Terminal" }).click();
+      await expect(page.locator(".detail-pane-workspace-slot .workspace-host-wrapper")).toBeVisible();
+      await dismissWorkspaceLauncher(page);
+
+      // Back to the first issue: the other workspace must not unhide this one's
+      // retired container or promoted terminal. Its own collapse record remains the
+      // only route back to that pane.
+      await selectIssueByTitle(page, SAFARI_ISSUE_TITLE);
+      await expect(page.locator(".detail-pane-workspace-slot")).toHaveCount(0);
+      await expect(page.locator(".session-terminal-slot")).toHaveCount(0);
+
+      await page.getByRole("button", { name: "Focus Terminal" }).click();
+      await expect(page.locator(".detail-pane-workspace-slot")).toHaveCount(0);
+      await expect(page.locator(".detail-host > .terminal-panel")).toBeVisible();
+      await expect(promoted).toBeVisible();
+      await typeMarkerCommand(page, promoted, workspace.worktree_path, "cross-marker-after");
+    } finally {
+      await api?.dispose();
+      await isolatedServer?.stop();
+    }
+  });
+
+  test("Focus Terminal reveals the workspace from behind a tab, a zoom, and a close", async ({ page }) => {
+    // Three ways to be invisible without being "collapsed", each of which left
+    // the terminal parked while the store reported it visible. Only a real
+    // backend proves the reveal actually lands on a live session rather than a
+    // rebuilt one.
+    test.skip(
+      !hasCommand("git") || !hasCommand("tmux", ["-V"]),
+      "git and tmux are required for the real workspace flow",
+    );
+
+    let isolatedServer: IsolatedE2EServer | null = null;
+    let api: APIRequestContext | null = null;
+    try {
+      isolatedServer = await startIsolatedWorkspaceE2EServer();
+      api = await playwrightRequest.newContext({ baseURL: isolatedServer.info.base_url });
+      const workspace = await createIssueWorkspace(api, 10);
+
+      await page.goto(`${isolatedServer.info.base_url}/issues/github/acme/widgets/10`);
+      await expect(page.locator(".detail-pane-workspace-slot .workspace-host-wrapper")).toBeVisible();
+      await dismissWorkspaceLauncher(page);
+      const paneContainer = await openTerminalPanel(page);
+      await paneContainer.evaluate((el) => el.setAttribute("data-continuity", "reveal"));
+
+      const workspaceLeaf = page.locator(".tabbed-panel-leaf").filter({
+        has: page.locator(".detail-pane-workspace-slot"),
+      });
+      const conversationLeaf = page.locator(".tabbed-panel-leaf").filter({
+        has: page.getByRole("tab", { name: "Conversation" }),
+      });
+      const focusTerminal = page.getByRole("button", { name: "Focus Terminal" });
+
+      // 1. Tabbed behind a sibling: drag the workspace into the conversation's
+      //    leaf, then switch away from it. Neither hidden nor maximized. Alone in
+      //    its leaf the pane has no tab; the floating grip is its drag source.
+      await workspaceLeaf
+        .getByRole("button", { name: /^Move / })
+        .dragTo(conversationLeaf.getByRole("tab", { name: "Conversation" }));
+      await page.getByRole("tab", { name: "Conversation" }).click();
+      await expect(page.locator(".detail-pane-workspace-slot")).toHaveCount(0);
+
+      await focusTerminal.click();
+      await expect(paneContainer).toHaveAttribute("data-continuity", "reveal");
+      await typeMarkerCommand(page, paneContainer, workspace.worktree_path, "reveal-from-tab");
+
+      // 2. Buried under another leaf's zoom.
+      await page.getByRole("tab", { name: "Conversation" }).click();
+      await conversationLeaf.locator('[data-testid="pane-toggle-zoom"]').click();
+      await expect(page.locator(".detail-pane-workspace-slot")).toHaveCount(0);
+
+      await focusTerminal.click();
+      await expect(paneContainer).toHaveAttribute("data-continuity", "reveal");
+      await typeMarkerCommand(page, paneContainer, workspace.worktree_path, "reveal-from-zoom");
+
+      // 3. Closed outright.
+      await page.locator('[data-testid="pane-hide-workspace"]').click();
+      await expect(page.locator(".detail-pane-workspace-slot")).toHaveCount(0);
+
+      await focusTerminal.click();
+      await expect(paneContainer).toHaveAttribute("data-continuity", "reveal");
+      await typeMarkerCommand(page, paneContainer, workspace.worktree_path, "reveal-from-closed");
     } finally {
       await api?.dispose();
       await isolatedServer?.stop();
@@ -342,19 +1006,19 @@ test.describe("inline workspace dock continuity", () => {
       });
 
       // Select the issue that owns this workspace: its detail carries a
-      // ready workspace ref, so the inline claim fires and the dock takes
+      // ready workspace ref, so the inline claim fires and the detail pane takes
       // the shared host — same hostedWorkspaceKey, so this must reparent
       // the exact tagged node rather than recreate it.
       await selectIssueByTitle(page, SAFARI_ISSUE_TITLE);
 
       const witness = page.locator('[data-continuity="witness"]');
       await expect(witness).toBeVisible();
-      const dockContainer = page.locator(".workspace-dock-panel .workspace-dock-slot .terminal-container");
-      await expect(dockContainer).toHaveAttribute("data-continuity", "witness");
-      await typeMarkerCommand(page, dockContainer, workspace.worktree_path, "continuity-marker-two");
+      const paneContainer = page.locator(".detail-pane-workspace-slot .terminal-container");
+      await expect(paneContainer).toHaveAttribute("data-continuity", "witness");
+      await typeMarkerCommand(page, paneContainer, workspace.worktree_path, "continuity-marker-two");
 
       // Flip back to the Workspaces tab: route memory returns to
-      // /terminal/{id} — the same hostedWorkspaceKey as the dock claim, so
+      // /terminal/{id} — the same hostedWorkspaceKey as the pane claim, so
       // this is another reparent, not a reconnect.
       await selectTopBarTab(page, "Workspaces");
       await expect(page).toHaveURL(new RegExp(`/terminal/${workspace.id}$`));
@@ -395,8 +1059,9 @@ test.describe("inline workspace dock continuity", () => {
       // Select issue A: its ready workspace claims the shared host inline,
       // a different hostedWorkspaceKey than the remembered B route.
       await selectIssueByTitle(page, SAFARI_ISSUE_TITLE);
-      const dockContainer = await openTerminalPanel(page);
-      await dockContainer.evaluate((el) => {
+      await dismissWorkspaceLauncher(page);
+      const paneContainer = await openTerminalPanel(page);
+      await paneContainer.evaluate((el) => {
         el.setAttribute("data-continuity", "witness-a");
       });
       await expect(page.locator('[data-continuity="witness-a"]')).toBeVisible();
@@ -408,6 +1073,77 @@ test.describe("inline workspace dock continuity", () => {
 
       await expect(page.locator('[data-continuity="witness-a"]')).toHaveCount(0);
       await expect(page.locator(".workspace-list-sidebar .ws-row.selected")).toContainText(DARK_MODE_ISSUE_TITLE);
+    } finally {
+      await api?.dispose();
+      await isolatedServer?.stop();
+    }
+  });
+
+  test("switching workspaces closes the previous workspace's live attachment", async ({ page }) => {
+    // The pool outlives the view, and a parked terminal keeps its websocket, so
+    // nothing hands one back on its own: browsing workspaces would leave a live
+    // tmux attachment per workspace visited. The view's release is the only
+    // thing that closes this one.
+    //
+    // Registry-level unit coverage cannot see a real socket, and an earlier
+    // attempt at this test navigated with page.goto — which closes every socket
+    // on its own and passed with the release removed. This switch is
+    // client-side, so the socket's fate is the behavior under test.
+    test.skip(
+      !hasCommand("git") || !hasCommand("tmux", ["-V"]),
+      "git and tmux are required for the real workspace flow",
+    );
+
+    let isolatedServer: IsolatedE2EServer | null = null;
+    let api: APIRequestContext | null = null;
+    try {
+      isolatedServer = await startIsolatedWorkspaceE2EServer();
+      api = await playwrightRequest.newContext({ baseURL: isolatedServer.info.base_url });
+      const workspaceA = await createIssueWorkspace(api, 10);
+      const workspaceB = await createIssueWorkspace(api, 11);
+
+      // Record every session websocket the app opens and whether it has closed.
+      // The real connection is untouched; only its lifecycle is observed.
+      await page.addInitScript(() => {
+        const log: Array<{ url: string; closed: boolean }> = [];
+        (window as unknown as { __wsLog: typeof log }).__wsLog = log;
+        const Native = window.WebSocket;
+        class TrackedWebSocket extends Native {
+          constructor(url: string | URL, protocols?: string | string[]) {
+            super(url, protocols);
+            const entry = { url: String(url), closed: false };
+            log.push(entry);
+            this.addEventListener("close", () => {
+              entry.closed = true;
+            });
+          }
+        }
+        window.WebSocket = TrackedWebSocket as unknown as typeof WebSocket;
+      });
+
+      const sessionSockets = (workspaceId: string) =>
+        page.evaluate((needle) => {
+          const log = (window as unknown as { __wsLog?: Array<{ url: string; closed: boolean }> }).__wsLog ?? [];
+          return log.filter((entry) => entry.url.includes(needle));
+        }, `/workspaces/${workspaceId}/runtime/sessions/`);
+
+      await page.goto(`${isolatedServer.info.base_url}/terminal/${workspaceA.id}`);
+      const containerA = await openTerminalPanel(page);
+      // Attached, not merely constructed: only a live socket can create this.
+      await typeMarkerCommand(page, containerA, workspaceA.worktree_path, "release-marker-a");
+      expect(await sessionSockets(workspaceA.id)).toHaveLength(1);
+
+      // Client-side switch through the workspace list, so nothing but the view's
+      // own release can close A's socket.
+      await page.locator(".workspace-list-sidebar .ws-row", { hasText: DARK_MODE_ISSUE_TITLE }).click();
+      await expect(page).toHaveURL(new RegExp(`/terminal/${workspaceB.id}$`));
+      await expect
+        .poll(async () => (await sessionSockets(workspaceA.id)).every((entry) => entry.closed), { timeout: 15_000 })
+        .toBe(true);
+
+      // And the workspace switched to is fully live, not collateral damage.
+      const containerB = await openTerminalPanel(page);
+      await typeMarkerCommand(page, containerB, workspaceB.worktree_path, "release-marker-b");
     } finally {
       await api?.dispose();
       await isolatedServer?.stop();

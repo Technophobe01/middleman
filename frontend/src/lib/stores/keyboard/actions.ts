@@ -15,6 +15,15 @@ import {
   buildRepoBrowserRoute,
   type RepositoryRouteRef,
 } from "@middleman/ui/routes";
+import {
+  getPaneLayoutStore,
+  promoteSessionBesideWorkspace,
+  type PaneLayoutStore,
+  type PaneRenderReport,
+  type PaneSurfaceKey,
+} from "@middleman/ui/stores/paneLayout";
+import { isSessionPaneKey } from "@middleman/ui";
+import { activeHostedSession, hostedWorkspaceLauncher } from "../workspace-host.svelte.js";
 import type { ConfigRepo } from "@middleman/ui/api/types";
 import type { StoreInstances } from "@middleman/ui";
 import type { Action, Context, PreviewBlock } from "./types.js";
@@ -355,6 +364,112 @@ function navigateToSelectedPR(): void {
   }
 }
 
+/**
+ * The detail pane surface the current page arranges, if any.
+ *
+ * Pane commands are surface-scoped, never global: the Workspaces tab has its
+ * own tree with its own drag scope and must not be reachable from here.
+ */
+function paneSurfaceFor(ctx: Context): PaneSurfaceKey | null {
+  switch (ctx.page) {
+    case "pulls":
+      return "prs";
+    case "issues":
+      return "issues";
+    case "activity":
+      return "activity";
+    default:
+      return null;
+  }
+}
+
+interface PaneCommandTarget {
+  layout: PaneLayoutStore;
+  tabKey: string;
+  leafID: string;
+}
+
+/**
+ * The layout a command may act on: one that is actually mounted and not flattened.
+ *
+ * A page can be a pane surface with nothing on screen (a list with no selection),
+ * and below the flatten width every structural edit is disabled — a command that
+ * ignored either would rearrange a persisted tree the user cannot see. The same
+ * goes for the target: the last-focused pane may since have been hidden, and
+ * maximizing a hidden pane is a dead command while splitting one moves it behind
+ * the user's back.
+ */
+function mountedPaneLayout(ctx: Context): { layout: PaneLayoutStore; render: PaneRenderReport } | null {
+  const surface = paneSurfaceFor(ctx);
+  if (surface === null) return null;
+  const layout = getPaneLayoutStore(surface);
+  const render = layout.paneRender();
+  if (render === null || render.flattened) return null;
+  return { layout, render };
+}
+
+/**
+ * The pane a command acts on: the last one focused, falling back to the pane the
+ * route names so the commands work before the user has touched a tab header. The
+ * target must be a pane this surface currently offers — Activity's diff pane, for
+ * instance, is gone the moment the selection stops being a pull request.
+ */
+function paneCommandTarget(ctx: Context): PaneCommandTarget | null {
+  const mounted = mountedPaneLayout(ctx);
+  if (mounted === null) return null;
+  const { layout, render } = mounted;
+  const preferred = layout.lastFocusedTabKey() ?? (paneSurfaceFor(ctx) === "issues" ? "conversation" : ctx.detailTab);
+  const tabKey = render.editableTabs.includes(preferred) ? preferred : render.editableTabs[0];
+  if (tabKey === undefined) return null;
+  const leafID = layout.leafIDForTab(tabKey);
+  if (leafID === null) return null;
+  return { layout, tabKey, leafID };
+}
+
+function paneIsZoomed(ctx: Context): boolean {
+  const target = paneCommandTarget(ctx);
+  return target !== null && target.layout.zoomedLeafID() === target.leafID;
+}
+
+/**
+ * The promotion a keyboard command can perform here: the workspace pane's
+ * current session, the leaf it would split off, and the layout to record it in.
+ *
+ * Null once the session already has a pane — promoting twice would move the tab
+ * the user placed by hand — and null unless the workspace pane is actually ON
+ * SCREEN. Holding a leaf in the tree is not enough: a pane closed, tabbed behind a
+ * sibling, or covered by another leaf's zoom still has one, while the view keeps
+ * publishing its sessions from the parked host, so the command would move a
+ * terminal the user cannot see. The split also needs a rendered leaf to grow from.
+ *
+ * `promoteSessionBesideWorkspace` refuses on the same grounds, which is what covers
+ * the dock's own control. The check is repeated here because this decides whether
+ * the command is OFFERED: a palette row that does nothing when chosen is worse than
+ * one that is absent.
+ */
+function sessionPromotionTarget(ctx: Context): { layout: PaneLayoutStore; paneKey: string } | null {
+  const mounted = mountedPaneLayout(ctx);
+  const surface = paneSurfaceFor(ctx);
+  if (mounted === null || surface === null) return null;
+  if (!mounted.render.onScreenTabs.includes("workspace")) return null;
+  const session = activeHostedSession(surface);
+  if (session === null || mounted.layout.hasTab(session.paneKey)) return null;
+  if (mounted.layout.leafIDForTab("workspace") === null) return null;
+  return { layout: mounted.layout, paneKey: session.paneKey };
+}
+
+/** The pane command target when it names a promoted session, for demotion. */
+function sessionDemotionTarget(ctx: Context): PaneCommandTarget | null {
+  const target = paneCommandTarget(ctx);
+  return target !== null && isSessionPaneKey(target.tabKey) ? target : null;
+}
+
+function splitActivePane(ctx: Context, direction: "horizontal" | "vertical"): void {
+  const target = paneCommandTarget(ctx);
+  if (target === null) return;
+  target.layout.splitTab(target.tabKey, target.leafID, direction, "after");
+}
+
 export const defaultActions: Action[] = [
   {
     id: "go.next",
@@ -514,6 +629,109 @@ export const defaultActions: Action[] = [
     handler: (ctx) => {
       const detail = labelPickerDetail(ctx);
       if (detail !== null) openLabelPickerFor(detail);
+    },
+  },
+  {
+    id: "pane.splitRight",
+    label: "Split pane right",
+    scope: "detail",
+    binding: null,
+    priority: 0,
+    // Splitting a lone tab out of its own leaf is a no-op in the tree model, so
+    // offering it would put a dead row in the palette.
+    when: (ctx) => {
+      const target = paneCommandTarget(ctx);
+      return target !== null && target.layout.canSplitTab(target.tabKey);
+    },
+    handler: (ctx) => splitActivePane(ctx, "horizontal"),
+  },
+  {
+    id: "pane.splitDown",
+    label: "Split pane down",
+    scope: "detail",
+    binding: null,
+    priority: 0,
+    when: (ctx) => {
+      const target = paneCommandTarget(ctx);
+      return target !== null && target.layout.canSplitTab(target.tabKey);
+    },
+    handler: (ctx) => splitActivePane(ctx, "vertical"),
+  },
+  {
+    id: "pane.toggleZoom",
+    label: "Maximize pane",
+    scope: "detail",
+    binding: null,
+    priority: 0,
+    when: (ctx) => paneCommandTarget(ctx) !== null && !paneIsZoomed(ctx),
+    handler: (ctx) => {
+      const target = paneCommandTarget(ctx);
+      target?.layout.toggleZoom(target.leafID);
+    },
+  },
+  {
+    id: "pane.restore",
+    label: "Restore pane size",
+    scope: "detail",
+    binding: null,
+    priority: 0,
+    when: paneIsZoomed,
+    handler: (ctx) => {
+      const target = paneCommandTarget(ctx);
+      target?.layout.toggleZoom(target.leafID);
+    },
+  },
+  {
+    id: "pane.reset",
+    label: "Reset pane layout",
+    scope: "detail",
+    binding: null,
+    priority: 0,
+    // Surface-scoped and only here: a leaf cluster is the wrong place for an
+    // action that discards arrangements the user cannot currently see. Gated on a
+    // mounted, unflattened layout for the same reason the splits are.
+    when: (ctx) => mountedPaneLayout(ctx) !== null,
+    handler: (ctx) => mountedPaneLayout(ctx)?.layout.reset(),
+  },
+  {
+    id: "session.promote",
+    label: "Move terminal session to a pane",
+    scope: "detail",
+    binding: null,
+    priority: 0,
+    when: (ctx) => sessionPromotionTarget(ctx) !== null,
+    handler: (ctx) => {
+      const target = sessionPromotionTarget(ctx);
+      if (target !== null) promoteSessionBesideWorkspace(target.layout, target.paneKey);
+    },
+  },
+  {
+    id: "workspace.launcher",
+    label: "Launch a workspace session",
+    scope: "detail",
+    binding: null,
+    priority: 0,
+    // The launcher is an overlay, not a pane, so it needs no room in the layout -
+    // only a hosted workspace to launch into.
+    when: (ctx) => {
+      const surface = paneSurfaceFor(ctx);
+      return surface !== null && hostedWorkspaceLauncher(surface) !== null;
+    },
+    handler: (ctx) => {
+      const surface = paneSurfaceFor(ctx);
+      if (surface !== null) hostedWorkspaceLauncher(surface)?.();
+    },
+  },
+  {
+    id: "session.demote",
+    label: "Return terminal session to the workspace pane",
+    scope: "detail",
+    binding: null,
+    priority: 0,
+    when: (ctx) => sessionDemotionTarget(ctx) !== null,
+    handler: (ctx) => {
+      const target = sessionDemotionTarget(ctx);
+      target?.layout.demoteTab(target.tabKey);
     },
   },
   {

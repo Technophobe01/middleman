@@ -234,45 +234,258 @@ Keyboard handlers must have one clear owner for each key press.
   `hostVisible` goes false; only dialog open-state designed to restore on
   reveal may persist the hidden window
   (`frontend/src/lib/components/terminal/TerminalOptionsMenu.svelte`).
-- Detail views hidden behind an expanded inline dock stay mounted with live
-  window-level command listeners: a command that opens detail UI must restore
-  the dock to split first so it cannot build an invisible overlay
+- Panes hidden behind a maximized one stay mounted with live window-level
+  command listeners: a command that opens detail UI must un-maximize first so it
+  cannot build an invisible overlay
   (`packages/ui/src/components/detail/PullDetail.svelte::onOpenLabelPickerCommand`).
-- Focus Terminal reveals, it never maximizes: a collapsed inline dock reopens
-  in split — the layout the workspace first appeared in — and a visible dock
-  keeps its mode; expanding over the detail is only ever the terminal
-  toolbar's explicit action. A collapsed dock also keeps its own reopen
-  affordance at the bottom of the pane
+- Focus Terminal reveals, it never maximizes: a closed workspace pane reopens
+  alongside the detail and a visible one keeps its arrangement. Maximizing over
+  the detail is only ever an explicit user action. Reopening also has to clear a
+  zoom held by any other leaf, or the revealed pane sits behind it
   (`frontend/src/lib/stores/workspace-host.svelte.ts::focusTerminal`).
-- Terminal panes call `.focus()` only once, at terminal
-  creation, and only when a focus-intent guard captured at mount still holds:
-  `document.activeElement` must be unchanged since mount and not "sacred"
-  (inside `[role="dialog"|"menu"|"listbox"]`, or a form control/
-  contenteditable). This covers the async font-load window before `.focus()`
-  runs, during which something else can claim focus. Re-running the active/disabled effect on a
-  reveal or an enable flip must never call `.focus()` again — that would
-  fight the opt-in focus contracts above (`pendingHostFocus`,
+- Terminal renderers autofocus only once, at creation, and only when a
+  mount-time focus-intent guard still holds; explicit pool/host requests may
+  focus an existing renderer separately. Reveal or enable effects never focus,
+  or they fight the opt-in contracts above (`pendingHostFocus`,
   `shouldReclaimFocus`)
   (`frontend/src/lib/components/terminal/terminal-focus.ts`,
   `frontend/src/lib/components/terminal/XtermTerminalPane.svelte::start`).
-- Expanded inline workspaces reuse the live hosted shell and fill the pane
+- A maximized inline workspace reuses the live hosted shell and fills the pane
   edge-to-edge; never add outer chrome or mutate the shell's workflow/terminal
-  layout state (`packages/ui/src/components/workspace/WorkspaceDockPanel.svelte::expanded`).
+  layout state (`frontend/src/lib/components/terminal/WorkspaceHost.browser.svelte.ts`).
+- History semantics for a URL-bound pane follow the ARRANGEMENT, never which
+  control the user touched: while the route-bound panes share a leaf a change
+  pushes, and once they are split apart — both on screen — it replaces, so
+  walking between them does not fill the Back stack. Keying off "click pushes,
+  focus replaces" is wrong because a pane split into its own leaf still renders a
+  clickable tab header. The URL wins over stored layout state on load: it
+  activates the pane it names and drops a zoom held elsewhere
+  (`packages/ui/src/views/PRListView.svelte::routePanesSplitApart`).
+- The stored pane tree is intent, not what is on screen: below the flatten width
+  one pane renders however the tree is split, hidden panes stay in the tree, and
+  a zoom covers every other leaf. Anything acting on the arrangement — palette
+  split/zoom/close commands, the push-vs-replace history rule — reads the
+  renderer's report and is unavailable until the host has been measured. The
+  report distinguishes EDITABLE tabs (rendered, a legitimate command target even
+  behind a sibling tab) from ON-SCREEN tabs (one per rendered leaf); only the
+  latter answers "are both route panes visible at once"
+  (`packages/ui/src/stores/paneLayout.svelte.ts::PaneRenderReport`).
+- Tab drag scopes are namespaced `<kind>:<id>` and matched by string equality, so
+  an un-namespaced scope silently lets two unrelated trees exchange tabs. The
+  primitive that moves tabs rejects one rather than trusting call sites
+  (`packages/ui/src/components/shared/tabbed-panel-drag.ts::assertNamespacedDragScope`).
+- Pane availability must be derived at render time, not read back from an effect's
+  result: a claim made in an effect lags one tick, and one tick of an unavailable
+  pane prunes it out, collapses a split into a bare leaf, and remounts the whole
+  subtree — losing scroll state and reparenting the live terminal
+  (`packages/ui/src/item-workspace-claim.svelte.ts::useItemWorkspaceClaim`).
+  For the same reason the release-on-teardown guard reads its controller
+  untracked: reactive reads re-run the effect on a mere prop reassignment and its
+  cleanup then clobbers the claim just made in the same flush.
+- Rendered visibility is not dock mode. A workspace pane that is neither hidden
+  nor maximized still renders nothing when it is tabbed behind a sibling or
+  buried under another leaf's zoom, and its portal slot is unmounted in both
+  cases — so revealing it means unhide, activate its tab, AND clear a zoom held
+  by another leaf, while leaving its own zoom untouched
+  (`frontend/src/lib/stores/workspace-host.svelte.ts::workspacePaneVisible`).
+- The hosted terminal is one live DOM subtree reparented between registered
+  portal slots, so exactly one slot may be mounted at a time. A host that
+  embeds a view owning its own workspace pane must not also wrap it in a
+  second slot: registration order alone decides which one gets the terminal,
+  and the loser renders empty
+  (`frontend/src/lib/components/terminal/WorkspaceHost.svelte`).
+- Session terminals are one live subtree PER SESSION KEY, owned by the app-level
+  pool: every container — workflow tabs, the terminal dock, a promoted detail
+  pane — renders a `SessionTerminalSlot` and none renders a `TerminalPane` of its
+  own, or one tmux session gets two sockets. A container mounts a session into
+  the pool only while it actually renders it, since a parked terminal keeps its
+  websocket (`frontend/src/lib/stores/session-host.svelte.ts`).
+- A pooled terminal constructs immediately, even in parking, so every mounted
+  session keeps its websocket; it opts out of renderer autofocus and the pool
+  focuses only explicit requests after attachment
+  (`frontend/src/lib/components/terminal/PooledSessionTerminal.svelte`).
+- A promoted session is recorded ONCE, in the detail surface's stored pane tree.
+  Containers mask it out of what they render (derived, not an effect) and never
+  prune their own stored trees, so demoting restores the tab order, split, and
+  group the user chose. The pane body crosses the `packages/ui` boundary as an
+  `InlineWorkspaceController` snippet: views get `{paneKey, label}` and pass
+  their own `visible` back, and the generation-carrying registry key stays in
+  `frontend/` (`frontend/src/lib/stores/workspace-host.svelte.ts`).
+- A workspace pane holding exactly ONE session renders no chrome of its own: no
+  header bar, no one-tab workflow strip. The pane's own tab takes that session's name
+  (supplied through `InlineWorkspaceController`, since only the frontend knows the
+  sessions), and its reopen strip follows. Two sessions, none, or a promoted sole
+  session bring the chrome and the "Workspace" label back. A flattened surface keeps
+  the chrome: it suppresses per-leaf strips, so the toolbar is the only thing left to
+  carry the controls
+  (`frontend/src/lib/components/terminal/WorkspaceTerminalView.svelte::soleEmbeddedSession`).
+  The bare render also requires the surface's strip to actually name the session:
+  in a solo-chrome leaf that strip is gone, so a sole WORKFLOW session keeps its
+  inner one-tab strip (the only bar naming the agent), read from the render
+  report's `soloChromeTabs`. A sole DOCKED session stays bare either way.
+- A leaf holding ONLY the workspace pane renders no outer tab strip at all
+  (`TabbedPanelTree`'s `soloChromeTabKeys`, wired in `DetailPaneLayout`): the pane
+  draws its own strip inside, and an outer row saying "Workspace" named the same
+  thing twice. Its strip contents float top-right of the leaf instead - a grip (the
+  tab's replacement as HTML5 drag source; without it a strip-less pane could never
+  be moved), the hide X, caller extras, and Maximize. A second tab in the leaf, or a
+  flattened surface, brings the strip back. The floating cluster must stack ABOVE
+  xterm's internal layers (its overlay scrollbar slider is z-index 11 and hugs the
+  same right edge; nothing between the leaf and xterm's internals is a stacking
+  context) - below that, the scrollbar silently swallows clicks on the rightmost
+  button while everything looks fine, and only Playwright's hit-target check
+  ("intercepts pointer events") names the interceptor.
+- The workspace container pane's tab goes away once EVERY session of that workspace
+  sits in a promoted pane: its body would render nothing, and a pane with an empty
+  body is a hole in the surface, not a pane. The workspace stays claimed and its
+  controls stay hosted, so Launch is one click away from the promoted pane, and
+  demoting any session brings the tab back
+  (`frontend/src/lib/stores/workspace-host.svelte.ts::workspacePaneEmptyFor`).
+- The bottom dock is NOT part of that chrome and stays, collapsed to its row, in a
+  chrome-free pane: it is the only route to a second session, so dropping it made a
+  one-session workspace a dead end. The one exception is a sole session that lives in
+  the dock itself -- the stage is already showing it, and a dock underneath would aim
+  a second slot at the same terminal host.
+- An empty workflow container retires behind its surface-hosted bottom dock instead
+  of resizing the recursive tree. Promoted panes then fill the stored branch, and
+  demotion restores the untouched arrangement (`frontend/src/lib/stores/workspace-host.svelte.ts::workspacePaneRowOnlyFor`).
+- A detail pane NEVER shows the workspace's own header bar (name, branch, Expand and
+  Collapse Terminal, Delete). The pane's tab strip already names the workspace and
+  carries its controls. A flattened surface keeps the chrome, since it has no
+  per-leaf strip to carry any of it
+  (`frontend/src/lib/components/terminal/WorkspaceTerminalView.svelte`).
+- A pane's tab strip carries ONE structural control, Maximize. Split right and Split
+  down were removed: a single-tab leaf cannot split, so on the panes that most need
+  it they were permanently greyed, and elsewhere they duplicated the two routes that
+  remain -- dragging a tab to a pane edge, and the `pane.splitRight`/`pane.splitDown`
+  palette commands. Tests split through the palette or the layout store, never a
+  button.
+- Deleting a workspace is a strip action, not a popover one: it is registered as
+  `HostedWorkspaceControls.stripActions` and renders beside the controls trigger. It
+  lives in exactly one place -- two Deletes with independent disabled and pending
+  states is worse than one behind a menu -- and the surface passes
+  `showStripActions` true only for the leaf holding the workspace pane itself, so a
+  workspace split across leaves cannot grow one Delete per leaf.
+- Every Delete entry point (strip icon, header bar, error panel) opens the same
+  ConfirmDialog before any request is issued; the 409 force-delete prompt is a
+  second, separate gate. Delete removes a worktree whose unpushed commits go with
+  it, one click from a strip
+  (`frontend/src/lib/components/terminal/WorkspaceTerminalView.svelte::handleDelete`).
+- Buttons that share a row with a kit `IconButton --sm` (the solo cluster, the strip
+  actions, the controls trigger) share its 24x24 box and 13px glyph. Three
+  near-miss geometries in one row read as three unrelated controls.
+- The dock modes (Expand Terminal / Show Details / Collapse Terminal) move into the
+  pane's controls popover wherever the header bar is hidden, gated on exactly the
+  complement of the header's own condition so neither state shows two copies. The
+  leaf's close button is NOT a substitute for Collapse: it hides one pane, while
+  collapse reaches the container and every session promoted out of it.
+- A session the workflow tree is SHOWING mounts its terminal without a click: one per
+  rendered leaf's active tab. Mounting only from the tab strip's select handler left
+  every workspace opened with an agent already running showing an empty pane, which
+  reads as broken rather than as one click away.
+- Workflow presets are a standalone-Workspaces-tab surface only. A PR or issue pane
+  hosts one workspace beside the thing being reviewed, so composing multi-session
+  layouts there is chrome that pane was never asked for.
+- Drag state is cleared by a drag-END broadcast, not only by the dragged element's
+  own `dragend`: a drop that moves a tab into another leaf destroys that element
+  first, so the strip it left keeps the gap and the dragging styling. The strip that
+  accepted the drop adopts the dragged key to preview an insertion, so "this leaf no
+  longer holds it" cannot tell a leftover from a live preview
+  (`packages/ui/src/components/shared/tabbed-panel-drag.ts::onTabbedPanelDragEnd`,
+  `frontend/src/lib/components/terminal/terminal-drag.ts::onTerminalDragEnd`).
+  The broadcast also hides body drop previews: trees nest (workflow tree inside a
+  detail leaf) and a dragover bubbles through both, so both preview the same drag,
+  but only the inner one consumes the drop - the outer's own drop handler reads
+  the already-cleared payload as null and would leave its preview painted.
+- Route authority over pane layout (`DetailPaneLayout`'s `routeTabKey` effect) is a
+  TRANSITION, not an invariant: it activates the route's pane and drops foreign
+  zooms only when the route names a different pane than last applied. The effect
+  also tracks `tabs`, whose identity changes as a consequence of a zoom itself;
+  re-asserting on every change silently undid Expand Terminal and Maximize.
+- The pane controls popover is portalled to `<body>`. The leaf's action container is
+  a stacking context (`position: relative; z-index: 2`), so a popover parented inside
+  it is clamped under xterm's canvas layers, which compete one level up - every click
+  lands on the terminal instead
+  (`frontend/src/lib/components/terminal/WorkspacePaneControls.svelte::portalToBody`).
+- A portalled popover whose own actions open modals sits BELOW the modal layer
+  (`calc(var(--z-overlay) - 1)`), not level with it. Portalling puts it after every
+  in-tree modal in document order, so an equal z-index paints it over the dialog it
+  just opened.
+- A renderer publishing what it shows must not clear that report from the
+  publishing effect's cleanup. Cleanup runs before every re-run, so a consumer that
+  feeds the report back into the renderer's inputs (the pane tab named from it) sees
+  a null on each republish, changes the inputs, and the effect never settles. Clear
+  it from a separate dependency-free effect, which only runs at unmount
+  (`packages/ui/src/components/shared/DetailPaneLayout.svelte`).
+- A slot key computed from a session that can disappear is derived, and nullable.
+  Child props are their own deriveds: they re-run on the flush that clears the
+  session, before the `{#if}` guarding them is torn down, and a throw there aborts
+  the app's whole render - the host stayed parked and its tab came up empty. Only the
+  real-backend lane reproduces it; jsdom's flush ordering does not
+  (`frontend/src/lib/components/terminal/WorkspaceTerminalView.svelte::soleEmbeddedSessionHostKey`).
+- One embedded workspace view serves every selection on its surface, so anything
+  it hands to a detail pane - the controls snippet, a mid-save busy flag, the
+  launcher overlay's open state - is keyed by `(workspaceId, hostKey)`. An unkeyed
+  flag survives the switch and acts on the next workspace: a popover pinned open by
+  a write that will never report done, or a launcher covering a live terminal. Keyed
+  by WORKSPACE WORK only: terminal font size and terminal options write app
+  settings through one single-flight controller, so those are in flight for every
+  workspace at once and keying them reports a control enabled that the controller
+  is still refusing. Workspace-scoped writes are tracked as a SET of owners, since
+  two workspaces can have one in flight at once
+  (`frontend/src/lib/components/terminal/WorkspaceTerminalView.svelte`).
+- Promoting a session into a pane requires the workspace pane to be ON SCREEN, and
+  that is enforced in `promoteSessionBesideWorkspace`, not per caller: holding a
+  leaf in the stored tree says nothing about being visible, and the view keeps
+  publishing its sessions from a parked host
+  (`packages/ui/src/stores/paneLayout.svelte.ts`).
+- The inline dock mode covers EVERY pane of the hosted workspace - the container
+  plus the sessions promoted out of it - so a container hidden while a promoted
+  terminal is on screen is "split", not "collapsed", and collapsing hides exactly
+  the panes it later restores. Which pane an expand or a Focus Terminal acts on is
+  the workspace's last-focused one, recorded per WORKSPACE (views forward every
+  focused pane; the host keeps the ones whose key names a workspace) so it survives
+  promotion, demotion, and a visit to another item
+  (`frontend/src/lib/stores/workspace-host.svelte.ts`).
+- A promoted session pane is dropped from a surface's stored tree only on an
+  authoritative deletion of its workspace. A stopped, exited, or reconnecting
+  session is absent from the runtime in exactly the same way, and keeping the
+  placement is what lets a relaunch reappear where the user put it. There is no
+  session-deletion signal to react to either: the API's only session mutation is
+  `stop-host-runtime-session`, a DELETE that means stop.
+- Getting back to a collapsed dock restores the whole collapsed set, not the
+  remembered pane alone: a container masks the sessions its workspace promoted, so
+  revealing it by itself hands back an empty pane while the terminal the user asked
+  for stays hidden. A ledger on record is what says a workspace is put away - not
+  the derived dock mode, since the container tab is shared and another workspace's
+  expand unhides it (`frontend/src/lib/stores/workspace-host.svelte.ts::restoreCollapsedPanes`).
+- A deferred session focus is cancelled when its session unmounts and when the
+  surface's claim changes. Left armed it waits for anything to mount under that key
+  and steals the keyboard for a Focus Terminal pressed in a workspace the user has
+  since left (`frontend/src/lib/stores/session-host.svelte.ts`).
+- A pane tree node that leaves the on-screen tree takes its children with it, and
+  those children read the removed node's `first`/`second` for the rest of that
+  flush - `undefined`, while still mounted, including from a `ResizeObserver`
+  batch. Every read of that prop is guarded: throwing there unmounts the whole
+  surface, leaving a detail with no panes and no way back
+  (`packages/ui/src/components/shared/TabbedPanelTree.svelte`).
 - The desktop `.app-main` clips overflow but must never become a scroll
   container; focus-driven scrolling there shifts every mode rail and creates
   matching chrome gaps (`frontend/src/App.svelte::.app-main`).
-- An expanded dock mode must not outlive its claim: WorkspaceDockPanel resets
-  on inactive and on teardown, and the store resets `expanded` itself both
-  when a claim is directly replaced by a different identity (`setClaim`) and
-  synchronously on release (`clearClaim`) — a release-and-reclaim within one
-  update leaves no observable inactive gap for the panel and no previous
-  claim for setClaim's replacement check
-  (`frontend/src/lib/stores/workspace-host.svelte.ts::clearClaim`).
-- A collapse control must be reachable in every inline workspace state, not
-  only from the ready toolbar: WorkspaceDockPanel's BottomDock is not
-  closable, so the creating, fetch-failure, and setup-error branches render
-  their own collapse button or the dock cannot be closed short of deleting
-  the workspace
+- The inline dock mode is DERIVED from the surface's pane layout — maximized is
+  the workspace pane's leaf holding the zoom, collapsed is that pane hidden —
+  never stored alongside it, or the two disagree when a leaf's own controls
+  maximize a pane. A maximized workspace must not outlive its claim: the store
+  un-zooms both when a claim is replaced by a different identity (`setClaim`)
+  and synchronously on release (`clearClaim`), because a release-and-reclaim
+  within one update gives the layout host no availability gap to notice and
+  leaves setClaim no previous claim to compare against. Same-identity
+  re-asserts (a ref status change) must NOT un-zoom
+  (`frontend/src/lib/stores/workspace-host.svelte.ts::dockModeFor`).
+- A collapse control must be reachable in every inline workspace state, not only
+  from the ready toolbar: the creating, fetch-failure, and setup-error branches
+  render their own collapse button, since the pane's own close control is the
+  only other way out short of deleting the workspace
   (`frontend/src/lib/components/terminal/WorkspaceTerminalView.svelte::inlineCollapseControl`).
   Dock mode changes are pure local UI — never disable them behind mutation
   guards like `actionsBlocked`; only the modal-stack guard applies, and only
@@ -297,9 +510,9 @@ shortcuts while it is open.
 - Unmounting a subtree that holds focus (dock close, claim release) must
   reclaim focus for a deliberate target after the DOM update — and only when
   focus fell to `<body>` or was still inside the closing subtree, so a
-  transition triggered in the background (e.g. a selection change resetting
-  an expanded dock) never steals focus from a control the user moved to
-  (`packages/ui/src/components/workspace/WorkspaceDockPanel.svelte::shouldReclaimFocus`).
+  transition triggered in the background (e.g. a selection change un-zooming a
+  maximized pane) never steals focus from a control the user moved to
+  (`packages/ui/src/components/shared/DetailPaneLayout.svelte::shouldReclaimFocus`).
 - Background actions that are still visible should be disabled or skipped when
   their `when` predicate no longer matches the active modal state.
 - Outside-click, focus-leave, and Escape close paths should converge on the same

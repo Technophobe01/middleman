@@ -106,13 +106,18 @@ prebundled: keep it in vite `optimizeDeps.exclude` with transitive deps as
   Provider-mode repo selector visibility must not move the tab row; non-provider
   modes reserve its footprint unless embed config hides it
   (`frontend/src/lib/components/layout/AppHeader.svelte::reserveProviderRepoSelectorSlot`).
-- `FitStages`: how an action row degrades under pressure (labelled `Button`
-  row to `IconButton` row), never a media query or a wrapping group. Inside a
-  `flex-wrap` row the host needs `flex: 1 1 0` *and* a `min-width` at the
+- `FitStages`: how an action row degrades under pressure (richest labelled
+  `Button` row to compact labelled or `IconButton` rows, then a measured menu
+  trigger when needed), never a media query, Button-internal overrides, or a
+  wrapping stage. Measurement probes must be stateless and hidden from the
+  accessibility tree; stateful action controls render exactly once outside the
+  probes so dialog drafts and pending state survive stage changes. Inside a `flex-wrap` parent
+  the host needs `flex: 1 1 0` *and* a `min-width` at the
   compact stage's intrinsic width: grow otherwise leaves the host narrower
   than that stage, and the icons paint over the sibling that should have
   wrapped instead. Every stage must expose the same accessible names
-  (`packages/ui/src/components/roborev/ReviewDrawer.svelte::.footer-actions-fit`).
+  (`packages/ui/src/components/roborev/ReviewDrawer.svelte::.footer-actions-fit`,
+  `packages/ui/src/components/detail/PullDetail.svelte::measuredPrimaryActions`).
 - Flash: one shared store (`@middleman/ui/stores/flash`); kit `FlashBanner`
   mounts once per shell in a page-level fixed layer below measured shell chrome
   and above modal backdrops, never inside feature containers; headerless shells
@@ -226,18 +231,17 @@ such as `Resize Activity rail`.
 Use kit-ui `BottomDock` for resizable inline bottom panels. The app owns whether
 the dock is open plus its domain header/body/footer content; the shared dock
 owns shell geometry, top-edge resizing, bounds, close control, and body
-scrolling. It exposes no prop to hide its resize handle; a mode that forces a
-controlled `height` (for example, an expanded 100% state) must hide the
-handle itself via a scoped `:global(.kit-bottom-dock > .kit-split-resize-handle)`
-rule under an app-owned class, or a live drag will silently corrupt persisted
-height state that isn't visibly changing (`WorkspaceDockPanel.svelte`). Keep
-the child combinator: dock bodies can host content with its own kit split
-handles (the reparented terminal split tree), and a descendant selector
-would disable those nested handles too. Re-audit the
-selector on every kit-ui SHA bump — `frontend/src/lib/components/terminal/
-WorkspaceDockPanel.browser.svelte.ts` pins the actual computed `display` in a
-real browser, so a SHA bump that renames or restructures the handle out from
-under the override fails that test instead of only a manual check.
+scrolling. It exposes no prop to hide its resize handle, so a mode that forces a
+controlled `height` (for example a 100% expanded state) must hide the handle
+itself via a scoped `:global(.kit-bottom-dock > .kit-split-resize-handle)` rule
+under an app-owned class, or a live drag silently corrupts persisted height state
+that isn't visibly changing. Keep the child combinator: dock bodies can host
+content with its own kit split handles, and a descendant selector would disable
+those nested handles too. Pin the computed `display` in a real browser rather
+than asserting the class name, so a kit-ui SHA bump that renames or restructures
+the handle out from under the override fails a test instead of only a manual
+check. The inline workspace no longer uses this — it is a pane in the detail
+tree — so no consumer currently needs the override.
 
 ### Styling shared components
 
@@ -271,6 +275,12 @@ inside a draggable workspace. Do not use it for simple fixed sidebars,
 single-purpose drawers, or file-tree/content splits where `SplitResizeHandle`
 or a narrower layout primitive is enough.
 
+PR, issue, and activity detail panes (conversation, diff, inline workspace) are
+an intended home for this primitive, not an exception to the line above: they
+are rearrangeable panes, so do not hand-roll another splitter for them. List
+rails stay on `CollapsibleSidebar`/`SplitResizeHandle`. See
+`docs/superpowers/specs/2026-07-25-generalized-pane-layout-design.md`.
+
 Use neutral `tabbed-panel-*` DOM classes/selectors for tests and consumers.
 Do not add workflow-specific aliases or compatibility selectors when moving
 this primitive into new surfaces.
@@ -280,6 +290,24 @@ Pass the mutation callbacks that match the interactions you expose:
 `onSplitTab` for edge drops, and `onRatioChange` for divider resizing. Omitted
 callbacks make that interaction read-only instead of rendering a visual drop
 target that cannot apply.
+
+A leaf renders every one of its tabs, showing only the active one, so the
+`visible` flag passed to `renderTab` is the caller's only signal. Gate expensive
+or side-effecting pane bodies (a diff fetch, the workspace portal slot) on it:
+unconditional bodies mount for every selected item, and a portal slot that
+lingers behind another tab stays the registered host and strands its content off
+screen.
+
+A pane body is stretched by its panel, which is a flex container: a pane body
+must not size itself from its own content. Detail views end their chain at a
+`ScrollBox` that expects a height-constrained flex parent, so a block panel
+turns their internal scrolling into outer overflow with no visible error
+(`packages/ui/src/components/shared/TabbedPanelTree.svelte::.tabbed-panel-tab-panel`).
+
+Zoom is transient focus state, not part of the saved arrangement. Drop it
+whenever what was zoomed stops rendering (`DetailPaneLayout`'s reconciliation
+effect covers availability, which the store cannot see) and on any successful
+split, which mints a leaf the older zoom would hide.
 
 The current accessibility scope is labeled tab groups, focusable tabs and tab
 actions, and labeled pointer resize handles. Keyboard tab reordering, keyboard

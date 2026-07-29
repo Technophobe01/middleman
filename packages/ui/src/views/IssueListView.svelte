@@ -1,16 +1,20 @@
 <script lang="ts">
+  import type { Snippet } from "svelte";
   import { getSidebar, getStores } from "../context.js";
   import { CollapsibleSidebar } from "@kenn-io/kit-ui";
   import IssueList
     from "../components/sidebar/IssueList.svelte";
   import IssueDetail
     from "../components/detail/IssueDetail.svelte";
-  import WorkspaceDockPanel from "../components/workspace/WorkspaceDockPanel.svelte";
-  import type { IssueDetail as IssueDetailResponse } from "../api/types.js";
+  import DetailPaneLayout from "../components/shared/DetailPaneLayout.svelte";
+  import type { TabbedPanelLeaf } from "../components/shared/tabbed-panel-layout.js";
+  import { getPaneLayoutStore, type PaneTabSpec } from "../stores/paneLayout.svelte.js";
+  import { isSessionPaneKey } from "../stores/session-pane-key.js";
   import type { IssueDetailSyncMode } from "../stores/issues.svelte.js";
   import type { IssueRouteRef } from "../routes.js";
-  import { canonicalProvider, resolvedPlatformHost } from "../api/provider-routes.js";
-  import { identityEquals, type InlineWorkspaceController, type WorkspaceItemIdentity } from "../workspace-inline.js";
+  import { issueDetailMatchesRef } from "../components/detail/detail-match.js";
+  import type { InlineWorkspaceController, WorkspaceItemIdentity } from "../workspace-inline.js";
+  import { useItemWorkspaceClaim } from "../item-workspace-claim.svelte.js";
 
   const { isSidebarToggleEnabled, toggleSidebar } = getSidebar();
   const { issues } = getStores();
@@ -26,9 +30,12 @@
     hideStaleDetailWhileLoading?: boolean;
     onSidebarResize?: (width: number) => void;
     inlineWorkspace?: InlineWorkspaceController | null;
-    /** ActivityFeedView embeds this view and owns a single outer dock; it
-     * passes false so the embedded view never renders its own. */
-    renderWorkspaceDock?: boolean;
+    /**
+     * The workspace's own controls, rendered in the tab strip of the leaf holding
+     * the workspace pane or one of its promoted sessions. Supplied by the app
+     * shell: the controls live in `frontend/`, next to the state they act on.
+     */
+    workspacePaneControls?: Snippet<[boolean]> | undefined;
   }
 
   let {
@@ -41,25 +48,8 @@
     hideStaleDetailWhileLoading = false,
     onSidebarResize,
     inlineWorkspace = null,
-    renderWorkspaceDock = true,
+    workspacePaneControls = undefined,
   }: Props = $props();
-
-  function detailMatchesSelected(
-    detail: IssueDetailResponse | null,
-    ref: IssueRouteRef | null,
-  ): boolean {
-    return (
-      !!detail &&
-      !!ref &&
-      detail.repo_owner === ref.owner &&
-      detail.repo_name === ref.name &&
-      detail.issue.Number === ref.number &&
-      canonicalProvider(detail.repo?.provider ?? "") === canonicalProvider(ref.provider) &&
-      resolvedPlatformHost(ref.provider, detail.repo?.platform_host) ===
-        resolvedPlatformHost(ref.provider, ref.platformHost) &&
-      detail.repo?.repo_path === ref.repoPath
-    );
-  }
 
   function refreshSelectedDetail(): Promise<void> | undefined {
     if (selectedIssue === null) return undefined;
@@ -86,34 +76,47 @@
       : null,
   );
 
-  $effect(() => {
-    const controller = inlineWorkspace;
-    if (!controller) return;
-    const detail = issues.getIssueDetail();
-    if (!claimIdentity || !detailMatchesSelected(detail, selectedIssue ?? null)) {
-      controller.release();
-      return;
-    }
-    const ref = controller.effectiveWorkspaceRef(claimIdentity, detail?.workspace ?? null);
-    if (ref) controller.claim(claimIdentity, ref);
-    else controller.release();
+  const paneLayout = getPaneLayoutStore("issues");
+
+  const workspaceClaim = useItemWorkspaceClaim({
+    controller: () => inlineWorkspace,
+    identity: () => claimIdentity,
+    detailMatches: () => issueDetailMatchesRef(issues.getIssueDetail(), selectedIssue ?? null),
+    envelopeRef: () => issues.getIssueDetail()?.workspace ?? null,
+    refresh: () => void refreshSelectedDetail(),
   });
 
-  $effect(() => {
-    const controller = inlineWorkspace;
-    if (!controller) return;
-    return () => controller.release();
-  });
+  function handlePaneFocus(tabKey: string): void {
+    inlineWorkspace?.notePaneFocused(tabKey);
+  }
 
-  $effect(() => {
-    const controller = inlineWorkspace;
-    if (!controller) return;
-    return controller.onIdentityInvalidated((identity) => {
-      if (claimIdentity && identityEquals(identity, claimIdentity)) {
-        void refreshSelectedDetail();
-      }
-    });
-  });
+  // One entry per session the surface's stored tree already holds. `available`
+  // never conjures a pane: a session pane exists only because the user promoted
+  // it, so a workspace whose sessions were never promoted adds nothing here.
+  const sessionTabs = $derived<PaneTabSpec[]>(
+    (inlineWorkspace?.promotableSessions() ?? []).map((session) => ({
+      key: session.paneKey,
+      label: session.label,
+      available: paneLayout.hasTab(session.paneKey),
+      hideable: true,
+    })),
+  );
+
+  const paneTabs = $derived<PaneTabSpec[]>([
+    { key: "conversation", label: "Conversation", available: true },
+    {
+      key: "workspace",
+      label: inlineWorkspace?.workspacePaneLabel() ?? "Workspace",
+      // Retire an empty workflow container behind the surface-hosted dock. A
+      // promoted session then fills the branch beside it without a blank stage.
+      available:
+        workspaceClaim.ref() !== null &&
+        inlineWorkspace?.workspacePaneEmpty() !== true &&
+        inlineWorkspace?.workspacePaneRowOnly() !== true,
+      hideable: true,
+    },
+    ...sessionTabs,
+  ]);
 </script>
 
 <CollapsibleSidebar
@@ -131,31 +134,49 @@
   {/snippet}
 
   {#if selectedIssue !== null}
-    {#snippet detailContent()}
-      <IssueDetail
-        owner={selectedIssue.owner}
-        name={selectedIssue.name}
-        number={selectedIssue.number}
-        provider={selectedIssue.provider}
-        platformHost={selectedIssue.platformHost}
-        repoPath={selectedIssue.repoPath}
-        autoSync={autoSyncDetail}
-        hideStaleWhileLoading={hideStaleDetailWhileLoading}
-        {inlineWorkspace}
-      />
-    {/snippet}
-
     <div class="detail-host">
-      {#if inlineWorkspace && renderWorkspaceDock}
-        <WorkspaceDockPanel
-          controller={inlineWorkspace}
-          active={claimIdentity !== null && inlineWorkspace.isClaimedFor(claimIdentity)}
-        >
-          {@render detailContent()}
-        </WorkspaceDockPanel>
-      {:else}
-        {@render detailContent()}
-      {/if}
+      <DetailPaneLayout
+        layout={paneLayout}
+        tabs={paneTabs}
+        tablistLabel="Issue detail panes"
+        leafLabel="Issue detail pane group"
+        paneLeafExtras={workspacePaneControls ? workspaceLeafExtras : undefined}
+        onFocusPane={handlePaneFocus}
+      >
+        {#snippet renderPane(tabKey, visible)}
+          {#if tabKey === "conversation"}
+            <IssueDetail
+              owner={selectedIssue.owner}
+              name={selectedIssue.name}
+              number={selectedIssue.number}
+              provider={selectedIssue.provider}
+              platformHost={selectedIssue.platformHost}
+              repoPath={selectedIssue.repoPath}
+              autoSync={autoSyncDetail}
+              hideStaleWhileLoading={hideStaleDetailWhileLoading}
+              {inlineWorkspace}
+            />
+          {:else if tabKey === "workspace" && inlineWorkspace && visible}
+            <!-- Portal target for the single live terminal subtree, which the
+                 frontend host reparents in here. Mounted only while visible: a slot
+                 that lingered behind another tab or a zoom would stay the registered
+                 host and strand the terminal off screen. Unmounting parks it. -->
+            <div class="detail-pane-workspace-slot" {@attach inlineWorkspace.slotAttachment}></div>
+          {:else if isSessionPaneKey(tabKey)}
+            {@const sessionPane = inlineWorkspace?.sessionPane() ?? null}
+            {#if sessionPane}
+              <!-- The frontend supplies the body: it owns the session registry, and
+                   the visibility argument travels with it so a pane tabbed behind a
+                   sibling leaves its terminal inert rather than off screen and live. -->
+              {@render sessionPane({ paneKey: tabKey, visible })}
+            {/if}
+          {/if}
+        {/snippet}
+      </DetailPaneLayout>
+      <!-- The terminal dock, anchored at this surface's bottom edge while the
+           container pane has retired because it is empty or row-only. The dock
+           normally lives inside that pane, and must remain reachable outside it. -->
+      {@render inlineWorkspace?.dockRow()?.()}
     </div>
   {:else}
     <div class="placeholder-content">
@@ -165,7 +186,24 @@
   {/if}
 </CollapsibleSidebar>
 
+<!-- Only the leaf actually holding the workspace or one of its promoted sessions:
+     the controls act on that workspace, so offering them from a leaf of unrelated
+     panes would be a control with no subject. -->
+{#snippet workspaceLeafExtras(leaf: TabbedPanelLeaf)}
+  {#if leaf.tabs.some((tabKey) => tabKey === "workspace" || isSessionPaneKey(tabKey))}
+    {@render workspacePaneControls?.(leaf.tabs.includes("workspace"))}
+  {/if}
+{/snippet}
+
 <style>
+  .detail-pane-workspace-slot {
+    display: flex;
+    flex: 1;
+    min-width: 0;
+    min-height: 0;
+    height: 100%;
+  }
+
   .detail-host {
     display: flex;
     flex: 1;

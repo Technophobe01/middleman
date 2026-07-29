@@ -6,6 +6,7 @@
     websocketPath?: string | undefined;
     reconnectOnExit?: boolean | undefined;
     active?: boolean | undefined;
+    autoFocus?: boolean | undefined;
     disabled?: boolean;
     onExit?: ((code: number) => void) | undefined;
     // When the session is already exited at mount time, skip the
@@ -19,17 +20,26 @@
     websocketPath = undefined,
     reconnectOnExit = undefined,
     active = undefined,
+    autoFocus = undefined,
     disabled = false,
     onExit = undefined,
     initialStatus = undefined,
   }: TerminalPaneProps = $props();
+
+  let xtermPane = $state<XtermTerminalPane | null>(null);
+
+  export function focus(): void {
+    xtermPane?.focus();
+  }
 </script>
 
 <XtermTerminalPane
+  bind:this={xtermPane}
   {workspaceId}
   {websocketPath}
   {reconnectOnExit}
   {active}
+  {autoFocus}
   {disabled}
   {onExit}
   {initialStatus}

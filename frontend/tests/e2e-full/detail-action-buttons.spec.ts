@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { access } from "node:fs/promises";
-import { expect, request as playwrightRequest, test, type APIRequestContext } from "@playwright/test";
+import { expect, request as playwrightRequest, test, type APIRequestContext, type Page } from "@playwright/test";
 import {
   startIsolatedE2EServer,
   startIsolatedE2EServerWithOptions,
@@ -40,6 +40,10 @@ function gitOutput(dir: string, args: string[]): string {
   }).trim();
 }
 
+function activePullAction(page: Page, selector: string) {
+  return page.locator(".primary-actions-live > .actions-row--primary").locator(selector);
+}
+
 async function waitForWorkspaceReady(api: APIRequestContext, workspaceId: string): Promise<WorkspaceStatusResponse> {
   for (let attempt = 0; attempt < 100; attempt += 1) {
     const response = await api.get(`/api/v1/workspaces/${workspaceId}`);
@@ -60,7 +64,7 @@ async function waitForWorkspaceReady(api: APIRequestContext, workspaceId: string
 test.describe("detail action buttons", () => {
   test.describe.configure({ timeout: lockedWorkspaceTestTimeoutMs });
 
-  test("issue detail creates a middleman workspace in the inline dock", async ({ page }) => {
+  test("issue detail creates a middleman workspace in its inline workspace pane", async ({ page }) => {
     test.skip(
       !hasCommand("git") || !hasCommand("tmux", ["-V"]),
       "git and tmux are required for the real workspace flow",
@@ -99,19 +103,26 @@ test.describe("detail action buttons", () => {
       expect(createdWorkspace.item_number).toBe(10);
       expect(createdWorkspace.git_head_ref).toBe("middleman/issue-10-widget-rendering-broken-on-safari");
 
-      // Creation stays on the issue: the workspace claims the inline dock
+      // Creation stays on the issue: the workspace claims the inline pane
       // instead of navigating away.
       await expect(page).toHaveURL(/\/issues\/github\/acme\/widgets\/10$/);
-      // The dock panel div renders before any claim; the slot (and the
+      // The pane tree renders before any claim; the workspace slot (and the
       // reparented workspace host inside it) exists only once the created
-      // workspace actually claims and hosts the inline dock.
-      await expect(page.locator(".workspace-dock-slot .workspace-host-wrapper")).toBeVisible();
+      // workspace actually claims and hosts the pane.
+      await expect(page.locator(".detail-pane-workspace-slot .workspace-host-wrapper")).toBeVisible();
 
       const readyWorkspace = await waitForWorkspaceReady(apiContext, createdWorkspace.id);
       await access(readyWorkspace.worktree_path);
       expect(gitOutput(readyWorkspace.worktree_path, ["branch", "--show-current"])).toBe(
         "middleman/issue-10-widget-rendering-broken-on-safari",
       );
+
+      // A workspace with nothing running opens its launcher overlay in the pane,
+      // and nothing behind a modal is clickable.
+      const launcher = page.getByRole("dialog", { name: "Launch a session" });
+      await expect(launcher).toBeVisible();
+      await page.keyboard.press("Escape");
+      await expect(launcher).toBeHidden();
 
       // The secondary action still navigates to the full Workspaces view.
       await page.getByRole("button", { name: "Open in Workspaces" }).click();
@@ -122,7 +133,7 @@ test.describe("detail action buttons", () => {
     }
   });
 
-  test("PR detail creates a middleman workspace in the inline dock", async ({ page }) => {
+  test("PR detail creates a middleman workspace in its inline workspace pane", async ({ page }) => {
     test.skip(
       !hasCommand("git") || !hasCommand("tmux", ["-V"]),
       "git and tmux are required for the real workspace flow",
@@ -161,17 +172,24 @@ test.describe("detail action buttons", () => {
       expect(createdWorkspace.item_number).toBe(1);
 
       // Creation stays on the pull request: the workspace claims the
-      // inline dock instead of navigating away. The dock panel div renders
+      // inline pane instead of navigating away. The pane tree renders
       // before any claim; the slot (and the reparented workspace host
       // inside it) exists only once the created workspace actually claims
-      // and hosts the inline dock.
+      // and hosts the pane.
       await expect(page).toHaveURL(/\/pulls\/github\/acme\/widgets\/1$/);
-      await expect(page.locator(".workspace-dock-slot .workspace-host-wrapper")).toBeVisible();
+      await expect(page.locator(".detail-pane-workspace-slot .workspace-host-wrapper")).toBeVisible();
 
       const readyWorkspace = await waitForWorkspaceReady(apiContext, createdWorkspace.id);
       await access(readyWorkspace.worktree_path);
       expect(readyWorkspace.git_head_ref).toBeTruthy();
       expect(gitOutput(readyWorkspace.worktree_path, ["branch", "--show-current"])).toBe(readyWorkspace.git_head_ref);
+
+      // A workspace with nothing running opens its launcher overlay in the pane,
+      // and nothing behind a modal is clickable.
+      const launcher = page.getByRole("dialog", { name: "Launch a session" });
+      await expect(launcher).toBeVisible();
+      await page.keyboard.press("Escape");
+      await expect(launcher).toBeHidden();
 
       // The secondary action still navigates to the full Workspaces view.
       await page.getByRole("button", { name: "Open in Workspaces" }).click();
@@ -182,7 +200,7 @@ test.describe("detail action buttons", () => {
     }
   });
 
-  test("activity feed hosts a created workspace in its inline dock", async ({ page }) => {
+  test("activity feed hosts a created workspace in its workspace pane", async ({ page }) => {
     test.skip(
       !hasCommand("git") || !hasCommand("tmux", ["-V"]),
       "git and tmux are required for the real workspace flow",
@@ -225,8 +243,8 @@ test.describe("detail action buttons", () => {
       // into its slot and the terminal view stays live on the activity page
       // (the selection URL, not /terminal).
       await expect(page).toHaveURL(/\?selected=pr%3A1/);
-      await expect(page.locator(".workspace-dock-slot .workspace-host-wrapper")).toBeVisible();
-      await expect(page.locator(".workspace-dock-slot .terminal-view")).toBeVisible();
+      await expect(page.locator(".detail-pane-workspace-slot .workspace-host-wrapper")).toBeVisible();
+      await expect(page.locator(".detail-pane-workspace-slot .terminal-view")).toBeVisible();
 
       await waitForWorkspaceReady(apiContext, createdWorkspace.id);
     } finally {
@@ -246,6 +264,17 @@ test.describe("detail action buttons", () => {
       await expect(page.getByRole("button", { name: "Approve workflows" })).toBeVisible({
         timeout: 10_000,
       });
+
+      const detail = page.locator(".pull-detail-content");
+      await detail.evaluate((element) => {
+        element.style.width = "350px";
+        element.style.flex = "0 0 350px";
+      });
+
+      const actions = detail.getByRole("button", { name: "Actions" });
+      await expect(actions).toBeVisible();
+      await actions.click();
+      await expect(detail.getByRole("button", { name: "Approve workflows" })).toBeVisible();
     } finally {
       await server.stop();
     }
@@ -350,12 +379,12 @@ test.describe("detail action buttons", () => {
     const createResponse = await createResponsePromise;
     expect(createResponse.status()).toBe(202);
     expect(createCalls).toBe(1);
-    // The workspace lands in the inline dock; the issue stays selected.
+    // The workspace lands in its inline workspace pane; the issue stays selected.
     await expect(page).toHaveURL(/\/issues\/github\/acme\/widgets\/10$/);
-    // The dock panel div renders before any claim; the slot (and the
+    // The pane tree renders before any claim; the workspace slot (and the
     // reparented workspace host inside it) exists only once the created
-    // workspace actually claims and hosts the inline dock.
-    await expect(page.locator(".workspace-dock-slot .workspace-host-wrapper")).toBeVisible();
+    // workspace actually claims and hosts the pane.
+    await expect(page.locator(".detail-pane-workspace-slot .workspace-host-wrapper")).toBeVisible();
   });
 
   for (const scenario of [
@@ -509,12 +538,12 @@ test.describe("detail action buttons", () => {
             ...scenario.reusePayload,
           },
         ]);
-      // The workspace lands in the inline dock; the issue stays selected.
+      // The workspace lands in its inline workspace pane; the issue stays selected.
       await expect(page).toHaveURL(/\/issues\/github\/acme\/widgets\/10$/);
-      // The dock panel div renders before any claim; the slot (and the
+      // The pane tree renders before any claim; the workspace slot (and the
       // reparented workspace host inside it) exists only once the created
-      // workspace actually claims and hosts the inline dock.
-      await expect(page.locator(".workspace-dock-slot .workspace-host-wrapper")).toBeVisible();
+      // workspace actually claims and hosts the pane.
+      await expect(page.locator(".detail-pane-workspace-slot .workspace-host-wrapper")).toBeVisible();
     });
   }
 
@@ -642,12 +671,12 @@ test.describe("detail action buttons", () => {
           git_head_ref: "middleman/issue-10-2",
         },
       ]);
-    // The workspace lands in the inline dock; the issue stays selected.
+    // The workspace lands in its inline workspace pane; the issue stays selected.
     await expect(page).toHaveURL(/\/issues\/github\/acme\/widgets\/10$/);
-    // The dock panel div renders before any claim; the slot (and the
+    // The pane tree renders before any claim; the workspace slot (and the
     // reparented workspace host inside it) exists only once the created
-    // workspace actually claims and hosts the inline dock.
-    await expect(page.locator(".workspace-dock-slot .workspace-host-wrapper")).toBeVisible();
+    // workspace actually claims and hosts the pane.
+    await expect(page.locator(".detail-pane-workspace-slot .workspace-host-wrapper")).toBeVisible();
   });
 
   test("supported pull request actions use shared ActionButton component", async ({ page }) => {
@@ -656,9 +685,9 @@ test.describe("detail action buttons", () => {
     await page.locator(".pull-item").filter({ hasText: "Add widget caching layer" }).first().click();
     await expect(page.locator(".pull-detail")).toBeVisible();
 
-    const approve = page.locator(".btn--approve");
-    const merge = page.locator(".btn--merge");
-    const close = page.locator(".btn--close");
+    const approve = activePullAction(page, ".btn--approve");
+    const merge = activePullAction(page, ".btn--merge");
+    const close = activePullAction(page, ".btn--close");
 
     await expect(approve).toBeVisible();
     await expect(merge).toBeVisible();
@@ -1041,8 +1070,8 @@ test.describe("detail action buttons", () => {
         ),
       ).toBeVisible();
       await expect(page.getByText("Could not refresh the pull request. Try again.")).toBeVisible();
-      await expect(page.locator(".btn--approve")).toBeDisabled();
-      await expect(page.locator(".btn--merge")).toBeDisabled();
+      await expect(activePullAction(page, ".btn--approve")).toBeDisabled();
+      await expect(activePullAction(page, ".btn--merge")).toBeDisabled();
 
       await page.unroute("**/api/v1/pulls/github/acme/widgets/1/sync");
       const reopenResponse = await page.request.post(`${baseURL}/__e2e/merge/conflict/open`);
@@ -1053,8 +1082,8 @@ test.describe("detail action buttons", () => {
           "This pull request is no longer open. Its current state is being refreshed before any further action.",
         ),
       ).toHaveCount(0);
-      await expect(page.locator(".btn--approve")).toBeEnabled();
-      await expect(page.locator(".btn--merge")).toBeEnabled();
+      await expect(activePullAction(page, ".btn--approve")).toBeEnabled();
+      await expect(activePullAction(page, ".btn--merge")).toBeEnabled();
     } finally {
       await isolatedServer?.stop();
     }
@@ -1107,8 +1136,8 @@ test.describe("detail action buttons", () => {
         })
         .not.toBe(initialDetail.platform_head_sha);
       await expect(commitSuggestion).toBeDisabled();
-      await expect(page.locator(".btn--approve")).toBeEnabled();
-      await expect(page.locator(".btn--merge")).toBeEnabled();
+      await expect(activePullAction(page, ".btn--approve")).toBeEnabled();
+      await expect(activePullAction(page, ".btn--merge")).toBeEnabled();
 
       await page.reload();
       await expect(page.getByRole("button", { name: "Commit suggestion" })).toBeDisabled();
@@ -1119,19 +1148,22 @@ test.describe("detail action buttons", () => {
 
   test("narrow actions menu closes when clicking outside", async ({ page }) => {
     await page.setViewportSize({ width: 320, height: 720 });
-    await page.goto("/pulls/github/acme/widgets/1");
+    await page.goto("/pulls/github/acme/widgets/6");
     await expect(page.locator(".pull-detail")).toBeVisible();
 
-    await page.locator(".actions-menu-trigger").click();
-    await expect(page.locator(".actions-menu-popover")).toBeVisible();
+    const actionsTrigger = page.getByRole("button", { name: "Actions", exact: true });
+    const actionsMenu = page.locator(".actions-menu-popover");
+    await actionsTrigger.click();
+    await expect(actionsMenu).toBeVisible();
 
     await page.locator(".detail-title").click();
-    await expect(page.locator(".actions-menu-popover")).toHaveCount(0);
+    await expect(actionsMenu).toBeHidden();
+    await expect(actionsTrigger).toHaveAttribute("aria-expanded", "false");
   });
 
   test("narrow actions menu shows state change failures after closing", async ({ page }) => {
     await page.setViewportSize({ width: 320, height: 720 });
-    await page.route("**/api/v1/pulls/github/acme/widgets/1/github-state", async (route) => {
+    await page.route("**/api/v1/pulls/github/acme/widgets/6/github-state", async (route) => {
       await route.fulfill({
         status: 500,
         contentType: "application/json",
@@ -1139,22 +1171,25 @@ test.describe("detail action buttons", () => {
       });
     });
 
-    await page.goto("/pulls/github/acme/widgets/1");
+    await page.goto("/pulls/github/acme/widgets/6");
     await expect(page.locator(".pull-detail")).toBeVisible();
 
-    await page.locator(".actions-menu-trigger").click();
+    const actionsTrigger = page.getByRole("button", { name: "Actions", exact: true });
+    const actionsMenu = page.locator(".actions-menu-popover");
+    await actionsTrigger.click();
     await page.locator(".actions-menu-popover .btn--close").click();
 
-    await expect(page.locator(".actions-menu-popover")).toHaveCount(0);
+    await expect(actionsMenu).toBeHidden();
+    await expect(actionsTrigger).toHaveAttribute("aria-expanded", "false");
     await expect(page.locator(".kit-flash-stack").getByRole("status")).toContainText("backend down");
   });
 
   test("narrow actions menu includes supported approve action", async ({ page }) => {
     await page.setViewportSize({ width: 320, height: 720 });
-    await page.goto("/pulls/github/acme/widgets/1");
+    await page.goto("/pulls/github/acme/widgets/6");
     await expect(page.locator(".pull-detail")).toBeVisible();
 
-    await page.locator(".actions-menu-trigger").click();
+    await page.getByRole("button", { name: "Actions", exact: true }).click();
     const menu = page.locator(".actions-menu-popover");
     await expect(menu).toBeVisible();
 
@@ -1171,7 +1206,7 @@ test.describe("detail action buttons", () => {
       const baseURL = isolatedServer.info.base_url;
       await page.goto(`${baseURL}/pulls/github/acme/widgets/1`);
       await expect(page.locator(".pull-detail")).toBeVisible();
-      await page.locator(".btn--approve").click();
+      await activePullAction(page, ".btn--approve").click();
 
       const popover = page.getByRole("dialog", { name: "Submit pull request review" });
       await expect(popover).toBeVisible();
@@ -1206,7 +1241,7 @@ test.describe("detail action buttons", () => {
       await page.goto(`${baseURL}/pulls/github/acme/widgets/6`);
       await expect(page.locator(".pull-detail")).toBeVisible();
 
-      await page.locator(".actions-menu-trigger").click();
+      await page.getByRole("button", { name: "Actions", exact: true }).click();
       await expect(page.locator(".actions-menu-popover")).toBeVisible();
 
       const readyResponse = page.waitForResponse((response) => {
@@ -1227,10 +1262,10 @@ test.describe("detail action buttons", () => {
     await page.goto("/pulls/github/acme/widgets/6");
     await expect(page.locator(".pull-detail")).toBeVisible();
 
-    const ready = page.locator(".btn--ready");
-    const approve = page.locator(".btn--approve");
-    const merge = page.locator(".btn--merge");
-    const close = page.locator(".btn--close");
+    const ready = activePullAction(page, ".btn--ready");
+    const approve = activePullAction(page, ".btn--approve");
+    const merge = activePullAction(page, ".btn--merge");
+    const close = activePullAction(page, ".btn--close");
 
     for (const btn of [ready, approve, merge, close]) {
       await expect(btn).toBeVisible();
@@ -1261,6 +1296,89 @@ test.describe("detail action buttons", () => {
     );
   });
 
+  test("primary and workspace action rows keep their vertical gap", async ({ page }) => {
+    await page.goto("/pulls/github/acme/widgets/1");
+    const liveActions = page.locator(".primary-actions-live");
+    const primaryRow = liveActions.locator(".actions-row--primary");
+    const workspaceRow = liveActions.locator(".actions-row--workspace");
+    await expect(primaryRow).toBeVisible();
+    await expect(workspaceRow).toBeVisible();
+
+    const [primaryBox, workspaceBox] = await Promise.all([primaryRow.boundingBox(), workspaceRow.boundingBox()]);
+    expect(primaryBox).not.toBeNull();
+    expect(workspaceBox).not.toBeNull();
+    expect(workspaceBox!.y - (primaryBox!.y + primaryBox!.height)).toBeGreaterThanOrEqual(8);
+  });
+
+  test("medium pull detail uses the compact Kit UI fit stage", async ({ page }) => {
+    await page.goto("/pulls/github/acme/widgets/6");
+    const detail = page.locator(".pull-detail-content");
+    await expect(detail).toBeVisible();
+    await detail.evaluate((element) => {
+      element.style.width = "400px";
+      element.style.flex = "0 0 400px";
+    });
+
+    const fitStages = detail.locator(".kit-fit-stages");
+    await expect(fitStages).toHaveCount(1);
+    const activeRow = detail.locator(".primary-actions-live > .actions-row--primary");
+    await expect(activeRow.locator(".btn--ready .kit-button__label-text")).toHaveText("Ready");
+    await expect(activeRow.locator(".kit-button__short-label")).toHaveCount(0);
+    await expect(detail.locator(".actions-menu-wrap > .actions-menu-trigger")).toBeHidden();
+
+    const metrics = await activeRow.evaluate((row) => {
+      const selectors = [".btn--ready", ".btn--approve", ".btn--merge", ".btn--close"];
+      return selectors.map((selector) => {
+        const button = row.querySelector<HTMLElement>(selector);
+        const label = button?.querySelector<HTMLElement>(".kit-button__label");
+        const labelText = label?.querySelector<HTMLElement>(".kit-button__label-text");
+        const icon = button?.querySelector<SVGElement>("svg");
+        if (!button || !label || !labelText || !icon) {
+          throw new Error(`incomplete Kit UI action button: ${selector}`);
+        }
+        const buttonRect = button.getBoundingClientRect();
+        const textRect = labelText.getBoundingClientRect();
+        return {
+          selector,
+          labelDisplay: getComputedStyle(label).display,
+          iconDisplay: getComputedStyle(icon).display,
+          centerDelta: Math.abs(textRect.top + textRect.height / 2 - (buttonRect.top + buttonRect.height / 2)),
+        };
+      });
+    });
+
+    for (const metric of metrics) {
+      expect(metric.labelDisplay, metric.selector).not.toBe("none");
+      expect(metric.iconDisplay, metric.selector).not.toBe("none");
+      expect(metric.centerDelta, metric.selector).toBeLessThan(0.5);
+    }
+  });
+
+  test("pull action state survives a measured stage change", async ({ page }) => {
+    await page.goto("/pulls/github/acme/widgets/1");
+    const detail = page.locator(".pull-detail-content");
+    await expect(detail).toBeVisible();
+    await detail.evaluate((element) => {
+      element.style.width = "800px";
+      element.style.flex = "0 0 800px";
+    });
+
+    await expect(detail.locator(".kit-fit-stages .approve-section")).toHaveCount(0);
+    await activePullAction(page, ".btn--approve").click();
+    const dialog = page.getByRole("dialog", { name: "Submit pull request review" });
+    const comment = dialog.getByPlaceholder("Leave an optional comment…");
+    await comment.fill("Keep this review draft while the pane resizes.");
+
+    await detail.evaluate((element) => {
+      element.style.width = "400px";
+      element.style.flex = "0 0 400px";
+    });
+
+    await expect(dialog).toBeVisible();
+    await expect(comment).toHaveValue("Keep this review draft while the pane resizes.");
+    await expect(activePullAction(page, ".btn--approve")).toHaveCount(1);
+  });
+
   test("ready for review updates API state and removes the draft action", async ({ page }) => {
     let isolatedServer: IsolatedE2EServer | null = null;
     let api: APIRequestContext | null = null;
@@ -1284,16 +1402,16 @@ test.describe("detail action buttons", () => {
         );
       });
 
-      await page.locator(".btn--ready").click();
+      await activePullAction(page, ".btn--ready").click();
 
       const readyResponse = await readyResponsePromise;
       expect(readyResponse.status()).toBe(200);
       expect((await readyResponse.json()).status).toBe("ready_for_review");
 
       await expect(page.locator(".btn--ready")).toHaveCount(0);
-      await expect(page.locator(".btn--approve")).toBeVisible();
-      await expect(page.locator(".btn--merge")).toBeVisible();
-      await expect(page.locator(".btn--close")).toBeVisible();
+      await expect(activePullAction(page, ".btn--approve")).toBeVisible();
+      await expect(activePullAction(page, ".btn--merge")).toBeVisible();
+      await expect(activePullAction(page, ".btn--close")).toBeVisible();
 
       await expect
         .poll(async () => {

@@ -37,6 +37,7 @@
   import RepoSummaryPage from "./lib/components/repositories/RepoSummaryPage.svelte";
   import SettingsPage from "./lib/components/settings/SettingsPage.svelte";
   import WorkspaceHost from "./lib/components/terminal/WorkspaceHost.svelte";
+  import WorkspacePaneControls from "./lib/components/terminal/WorkspacePaneControls.svelte";
   import WorkspaceEmbedShell from "./lib/components/terminal/WorkspaceEmbedShell.svelte";
   import WorkspaceFirstRunPanel from "./lib/components/terminal/WorkspaceFirstRunPanel.svelte";
   import DesignSystemPage from "./lib/components/design-system/DesignSystemPage.svelte";
@@ -559,12 +560,15 @@
   function navigateFocusPRDetailTab(
     ref: Parameters<typeof buildFocusPullRequestRoute>[0],
     tab: "conversation" | "files",
+    options?: { replace?: boolean },
   ): void {
-    navigate(
-      tab === "files"
-        ? buildFocusPullRequestFilesRoute(ref)
-        : buildFocusPullRequestRoute(ref),
-    );
+    const path =
+      tab === "files" ? buildFocusPullRequestFilesRoute(ref) : buildFocusPullRequestRoute(ref);
+    // Replace when the view says this only records which of two simultaneously
+    // visible panes the user is in, so moving between them does not fill the
+    // Back stack.
+    if (options?.replace) replaceUrl(path);
+    else navigate(path);
   }
 
   function desktopPathForMobileRoute(): string {
@@ -935,8 +939,11 @@
     roborevBaseUrl="/api/roborev"
     onError={(msg) => showFlash(msg, { tone: "danger" })}
     onNotification={showFlash}
-    onNavigate={(e) =>
-      navigate(typeof e === "string" ? e : e.path)}
+    onNavigate={(e, options) => {
+      const path = typeof e === "string" ? e : e.path;
+      if (options?.replace) replaceUrl(path);
+      else navigate(path);
+    }}
     onWorkspaceCommand={emitWorkspaceCommand}
     actions={{
       pull: getPullRequestActions().map((a) => ({
@@ -1012,7 +1019,7 @@
         <PRListView
           {selectedPR}
           detailTab={r.tab === "files" ? "files" : "conversation"}
-          onDetailTabChange={(tab) => navigateFocusPRDetailTab(selectedPR, tab)}
+          onDetailTabChange={(tab, options) => navigateFocusPRDetailTab(selectedPR, tab, options)}
           isSidebarCollapsed={true}
           hideSidebar={true}
           routeFamily="focus"
@@ -1153,6 +1160,7 @@
           onDetailTabChange={handleActivityDetailTabChange}
           onDrawerItemChange={handleActivityDrawerItemChange}
           inlineWorkspace={getInlineWorkspaceController("activity")}
+          {workspacePaneControls}
         />
       {:else if getPage() === "repos"}
         <RepoSummaryPage />
@@ -1207,6 +1215,7 @@
           sidebarOverlay={isNarrow()}
           onSidebarResize={handleSidebarResize}
           inlineWorkspace={getInlineWorkspaceController("prs")}
+          {workspacePaneControls}
         />
       {:else if getPage() === "issues"}
         {@const selectedIssue =
@@ -1220,6 +1229,7 @@
           sidebarOverlay={isNarrow()}
           onSidebarResize={handleSidebarResize}
           inlineWorkspace={getInlineWorkspaceController("issues")}
+          {workspacePaneControls}
         />
       {:else if getPage() === "reviews"}
         {@const route = getRoute()}
@@ -1305,6 +1315,13 @@
     />
   </Provider>
 {/if}
+
+<!-- Handed to every detail view: the controls themselves come from the hosted
+     workspace's live view, and this component is the popover that holds them in a
+     pane's tab strip. Declared here because packages/ui cannot import it. -->
+{#snippet workspacePaneControls(showStripActions: boolean)}
+  <WorkspacePaneControls {showStripActions} />
+{/snippet}
 
 <style>
   .mobile-shell {

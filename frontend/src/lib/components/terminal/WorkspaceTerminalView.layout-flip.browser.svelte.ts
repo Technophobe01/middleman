@@ -4,6 +4,7 @@ import { DEFAULT_TERMINAL_SETTINGS } from "@middleman/ui";
 
 import { STORES_KEY } from "../../../../../packages/ui/src/context.js";
 import { createMockApiFetch, jsonResponse, type MockRouteOverride } from "../../../test/mockApiFetch.js";
+import type { WorkspaceRuntimeState } from "../../api/workspace-runtime.ts";
 import WorkspaceTerminalView from "./WorkspaceTerminalView.svelte";
 
 const WAIT = 10_000;
@@ -30,13 +31,13 @@ const workspace = {
   created_at: "2026-04-29T00:00:00Z",
 };
 
-const emptyRuntime = { launch_targets: [], sessions: [] };
+const emptyRuntime: WorkspaceRuntimeState = { launch_targets: [], sessions: [] };
 
-function workspaceRoutes(): MockRouteOverride {
+function workspaceRoutes(runtime: WorkspaceRuntimeState = emptyRuntime): MockRouteOverride {
   return (req) => {
     if (req.method !== "GET") return null;
     if (req.url.pathname === "/api/v1/workspaces/ws-1") return jsonResponse(workspace);
-    if (req.url.pathname === "/api/v1/workspaces/ws-1/runtime") return jsonResponse(emptyRuntime);
+    if (req.url.pathname === "/api/v1/workspaces/ws-1/runtime") return jsonResponse(runtime);
     if (req.url.pathname === "/api/v1/workspaces") return jsonResponse({ workspaces: [workspace] });
     return null;
   };

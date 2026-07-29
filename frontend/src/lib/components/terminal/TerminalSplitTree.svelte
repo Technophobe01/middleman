@@ -1,13 +1,16 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   import { SplitResizeHandle, type SplitResizeEvent } from "@kenn-io/kit-ui";
+  import { clearActiveTabbedPanelDrag, startTabbedPanelTabDrag } from "@middleman/ui";
   import type { RuntimeSession } from "@middleman/ui/api/types";
   import XIcon from "@lucide/svelte/icons/x";
   import MoveIcon from "@lucide/svelte/icons/move";
+  import PanelRightIcon from "@lucide/svelte/icons/panel-right";
   import PencilIcon from "@lucide/svelte/icons/pencil";
   import SparklesIcon from "@lucide/svelte/icons/sparkles";
   import TerminalIcon from "@lucide/svelte/icons/terminal";
   import Self from "./TerminalSplitTree.svelte";
-  import TerminalPane from "./TerminalPane.svelte";
+  import SessionTerminalSlot from "./SessionTerminalSlot.svelte";
   import type { PaneNode, SplitDirection, SplitEdge } from "./terminal-layout";
   import {
     clampRatio,
@@ -16,10 +19,11 @@
   } from "./terminal-layout";
   import {
     clearActiveTerminalDrag,
+    onTerminalDragEnd,
     readRuntimeSessionDrag,
     startRuntimeSessionDrag,
   } from "./terminal-drag";
-  import { workspaceSessionWebSocketPath } from "../../api/workspace-runtime.js";
+  import { sessionHostKey } from "../../stores/session-host.svelte.ts";
 
   interface BorderTrim {
     top?: boolean;
@@ -43,11 +47,18 @@
     // host: ANDed into every TerminalPane's `active` prop so ResizeObserver-
     // driven refresh/resize work in the pane suspends while hidden.
     hostVisible?: boolean;
+    /** Shared detail-surface scope when terminal sessions may become top-level panes. */
+    dragScope?: string | undefined;
+    /** Maps a runtime session to its top-level detail-pane key. */
+    paneKeyForSession?: ((sessionKey: string) => string | null) | undefined;
     onSelect?: ((sessionKey: string) => void) | undefined;
     onClose?: ((session: RuntimeSession) => void) | undefined;
     onRename?: ((session: RuntimeSession) => void) | undefined;
     onMoveToWorkflow?: ((sessionKey: string) => void) | undefined;
-    onExit?: ((session: RuntimeSession) => void) | undefined;
+    /** Reads local runtime drags plus promoted detail-pane sessions when embedded. */
+    readSessionDrag?: ((event: DragEvent) => string | null) | undefined;
+    /** Absent unless a detail surface is hosting this workspace and can hold a pane. */
+    onPromoteSession?: ((sessionKey: string) => void) | undefined;
     onRatioChange?: ((splitId: string, ratio: number) => void) | undefined;
     onSplitSession?:
       | ((
@@ -69,11 +80,14 @@
     borderTrim = {},
     disabled = false,
     hostVisible = true,
+    dragScope = undefined,
+    paneKeyForSession = undefined,
     onSelect,
     onClose,
     onRename,
     onMoveToWorkflow,
-    onExit,
+    readSessionDrag,
+    onPromoteSession,
     onRatioChange,
     onSplitSession,
   }: Props = $props();
@@ -105,15 +119,26 @@
       workspaceId: session.workspace_id,
       sessionKey: session.key,
     });
+    const paneKey = paneKeyForSession?.(session.key) ?? null;
+    if (dragScope !== undefined && paneKey !== null) {
+      startTabbedPanelTabDrag(event, { scope: dragScope, tabKey: paneKey }, "Middleman session tab");
+    }
+  }
+
+  function clearDrag(): void {
+    clearActiveTerminalDrag();
+    clearActiveTabbedPanelDrag();
   }
 
   function readDroppedSession(event: DragEvent): string | null {
     if (disabled) return null;
-    const sessionKey = readRuntimeSessionDrag(event, workspaceId);
+    const sessionKey = readSessionDrag
+      ? readSessionDrag(event)
+      : readRuntimeSessionDrag(event, workspaceId);
     if (
       sessionKey === null ||
       (node.type === "leaf" && sessionKey === node.sessionKey) ||
-      !sessionForKey(sessionKey)
+      (readSessionDrag === undefined && !sessionForKey(sessionKey))
     ) {
       return null;
     }
@@ -144,6 +169,11 @@
     activeSplitEdge = null;
   }
 
+  // Every split drops its overlay when the drag ends, not only the one that handled
+  // the drop: a drop on a sibling restructures the tree under the pointer, so the
+  // dragleave that would have hidden this one never arrives.
+  $effect(() => onTerminalDragEnd(() => untrack(() => hideDropTargets())));
+
   function handleDragLeave(event: DragEvent): void {
     if (disabled) return;
     const current = event.currentTarget;
@@ -170,6 +200,7 @@
     const { direction, placement } = splitPlacementForEdge(edge);
     onSplitSession?.(sessionKey, node.id, direction, placement);
     clearActiveTerminalDrag();
+    clearActiveTabbedPanelDrag();
   }
 
   function measureSplit(): number {
@@ -264,13 +295,13 @@
           aria-label={`${labelFor(session)} terminal pane`}
           draggable={!disabled}
           ondragstart={(event) => startSessionDrag(event, session)}
-          ondragend={clearActiveTerminalDrag}
+          ondragend={clearDrag}
         >
           <button
             class="leaf-title"
             draggable={!disabled}
             ondragstart={(event) => startSessionDrag(event, session)}
-            ondragend={clearActiveTerminalDrag}
+            ondragend={clearDrag}
             onclick={() => {
               if (disabled) return;
               onSelect?.(session.key);
@@ -313,6 +344,20 @@
             >
               <MoveIcon size="12" strokeWidth="2" aria-hidden="true" />
             </button>
+            {#if onPromoteSession}
+              <button
+                class="leaf-action"
+                title="Move to a pane"
+                aria-label={`Move ${labelFor(session)} to a pane`}
+                disabled={disabled}
+                onclick={() => {
+                  if (disabled) return;
+                  onPromoteSession?.(session.key);
+                }}
+              >
+                <PanelRightIcon size="12" strokeWidth="2" aria-hidden="true" />
+              </button>
+            {/if}
             <button
               class="leaf-action"
               title="Close"
@@ -348,17 +393,14 @@
           ondragleave={handleDragLeave}
           ondrop={dropSplit}
         >
-          <TerminalPane
-            websocketPath={workspaceSessionWebSocketPath(
+          <SessionTerminalSlot
+            hostKey={sessionHostKey(
               workspaceId,
-              session.key,
               workspaceHostKey,
+              session.key,
+              session.created_at,
             )}
-            reconnectOnExit={false}
-            active={activeSessionKey === session.key && hostVisible}
-            {disabled}
-            onExit={() => onExit?.(session)}
-            initialStatus={session.status}
+            visible={activeSessionKey === session.key && hostVisible}
           />
           <div
             class={[
@@ -390,12 +432,15 @@
         {activeSessionKey}
         {disabled}
         {hostVisible}
+        {dragScope}
+        {paneKeyForSession}
         borderTrim={firstChildTrim(node.direction)}
         {onSelect}
         {onClose}
         {onRename}
         {onMoveToWorkflow}
-        {onExit}
+        {readSessionDrag}
+        {onPromoteSession}
         {onRatioChange}
         {onSplitSession}
       />
@@ -421,12 +466,15 @@
         {activeSessionKey}
         {disabled}
         {hostVisible}
+        {dragScope}
+        {paneKeyForSession}
         borderTrim={secondChildTrim(node.direction)}
         {onSelect}
         {onClose}
         {onRename}
         {onMoveToWorkflow}
-        {onExit}
+        {readSessionDrag}
+        {onPromoteSession}
         {onRatioChange}
         {onSplitSession}
       />

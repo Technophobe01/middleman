@@ -105,15 +105,28 @@ export function findTabbedPanelLeafByTab(node: TabbedPanelNode | null, tabKey: s
   return findTabbedPanelLeafByTab(node.first, tabKey) ?? findTabbedPanelLeafByTab(node.second, tabKey);
 }
 
+/**
+ * Identity-stable when the tab is already active, or absent.
+ *
+ * A split tree rebuilt its wrapper nodes on every call, so callers that commit
+ * the result wrote a new tree object each time — and any effect that both reads
+ * the layout and activates a tab (a deep link naming a pane) then re-ran forever.
+ */
 export function activateTabbedPanelTab(node: TabbedPanelNode | null, tabKey: string): TabbedPanelNode | null {
   if (!node) return null;
+  const leaf = findTabbedPanelLeafByTab(node, tabKey);
+  if (leaf === null || leaf.activeTabKey === tabKey) return node;
+  return activateTabbedPanelTabInner(node, tabKey);
+}
+
+function activateTabbedPanelTabInner(node: TabbedPanelNode, tabKey: string): TabbedPanelNode {
   if (node.type === "leaf") {
     return node.tabs.includes(tabKey) ? { ...node, activeTabKey: tabKey } : node;
   }
   return {
     ...node,
-    first: activateTabbedPanelTab(node.first, tabKey) ?? node.first,
-    second: activateTabbedPanelTab(node.second, tabKey) ?? node.second,
+    first: activateTabbedPanelTabInner(node.first, tabKey),
+    second: activateTabbedPanelTabInner(node.second, tabKey),
   };
 }
 
@@ -165,6 +178,56 @@ export function splitTabbedPanelTabIntoLeaf(
   );
 }
 
+/** Where a tab the tree has never held should land. */
+export type TabbedPanelInsertTarget =
+  | { kind: "tab"; leafID: string }
+  | { kind: "before"; tabKey: string }
+  | {
+      kind: "split";
+      leafID: string;
+      direction: TabbedPanelDirection;
+      placement: "before" | "after";
+    };
+
+/**
+ * Insert a tab the tree does not hold.
+ *
+ * The move primitives beside this one all refuse a source the tree does not
+ * already contain, which is what keeps a stray key from being dropped in. A
+ * promotion is the one legitimate exception, so it gets its own entry point
+ * rather than that guard being relaxed for everyone.
+ *
+ * Hands back the same node when the insert cannot apply — the tab is already
+ * held, or the target leaf is not in this tree — so callers can detect a refusal
+ * by identity, like the other primitives here.
+ */
+export function insertTabbedPanelTab(
+  node: TabbedPanelNode | null,
+  tabKey: string,
+  target: TabbedPanelInsertTarget,
+): TabbedPanelNode | null {
+  if (!node) return null;
+  if (findTabbedPanelLeafByTab(node, tabKey)) return node;
+  if (target.kind === "before") {
+    // Dropping between two tabs in a strip: the position is the point of the
+    // gesture, so landing at the end instead would read as a mis-drop.
+    if (!findTabbedPanelLeafByTab(node, target.tabKey)) return node;
+    const inserted = insertTabbedPanelTabBefore(node, tabKey, target.tabKey);
+    return inserted ? (activateTabbedPanelTab(inserted, tabKey) ?? inserted) : node;
+  }
+  if (!findTabbedPanelLeafByID(node, target.leafID)) return node;
+  if (target.kind === "tab") {
+    return insertTabbedPanelTabIntoLeaf(node, tabKey, target.leafID, "end") ?? node;
+  }
+  return splitTabbedPanelLeaf(
+    node,
+    target.leafID,
+    createTabbedPanelLeaf([tabKey], tabKey),
+    target.direction,
+    target.placement,
+  );
+}
+
 export function updateTabbedPanelSplitRatio(
   node: TabbedPanelNode | null,
   splitID: string,
@@ -186,9 +249,22 @@ export function normalizeTabbedPanelTree(
   node: TabbedPanelNode | null,
   availableTabKeys: readonly string[],
   fallbackTabKey = availableTabKeys[0] ?? "panel",
+  /**
+   * Keys kept when already stored, but never inserted — dynamic panes the user
+   * placed themselves.
+   *
+   * Both halves matter. Pruning exists to drop tabs a build no longer knows
+   * about, and a session pane is unknowable in advance. Reinsertion exists so a
+   * newly added static pane shows up for users with a stored layout, and a
+   * session pane must never be conjured into a tree it was removed from.
+   */
+  keepIfStored: (tabKey: string) => boolean = () => false,
 ): TabbedPanelNode {
   const available = uniqueTabbedPanelTabs(availableTabKeys.length > 0 ? [...availableTabKeys] : [fallbackTabKey]);
   const validTabs = new Set<string>(available);
+  for (const tabKey of collectTabbedPanelTabKeys(node)) {
+    if (keepIfStored(tabKey)) validTabs.add(tabKey);
+  }
   let tree = pruneTabbedPanelNode(node, validTabs);
   if (!tree) {
     return createTabbedPanelLeaf(available, available[0] ?? fallbackTabKey);
@@ -199,6 +275,180 @@ export function normalizeTabbedPanelTree(
     tree = insertTabbedPanelTabIntoFirstLeaf(tree, tabKey);
   }
   return tree;
+}
+
+export interface TabbedPanelLayoutState {
+  version: 1;
+  tree: TabbedPanelNode;
+  zoomedLeafID: string | null;
+  /**
+   * Tabs the user explicitly hid, keyed by TAB rather than by leaf.
+   *
+   * Hiding must be per-tab: a user who drags the inline workspace into the same
+   * leaf as the conversation and then closes the workspace expects only the
+   * workspace to go, not the conversation beside it. A collapsed-leaf model
+   * would take the whole strip down with it.
+   *
+   * A hidden tab is pruned from the rendered tree exactly like an unavailable
+   * one, so it keeps its place in the persisted tree and returns where the user
+   * left it.
+   */
+  hiddenTabKeys: string[];
+  /**
+   * The tab the user most recently focused, across every leaf.
+   *
+   * Needed because "the active tab" is not well defined for a whole tree: each
+   * leaf has its own. This single winner resolves two otherwise-ambiguous cases
+   * — which tab a flattened narrow layout shows, and which of two
+   * simultaneously visible panes a route should follow.
+   */
+  lastFocusedTabKey: string | null;
+}
+
+export function defaultTabbedPanelLayout(
+  knownTabs: readonly string[],
+  tree: TabbedPanelNode = createTabbedPanelLeaf(knownTabs),
+): TabbedPanelLayoutState {
+  return { version: 1, tree, zoomedLeafID: null, hiddenTabKeys: [], lastFocusedTabKey: null };
+}
+
+export function serializeTabbedPanelLayout(state: TabbedPanelLayoutState): string {
+  return JSON.stringify(state);
+}
+
+/**
+ * Synthetic id for the flattened leaf.
+ *
+ * Safe as a constant because every structural edit is disabled while flattened
+ * (see the design spec): no mutation is ever applied against this id. A flat leaf
+ * merges tabs drawn from several real leaves, so targeting it would move tabs
+ * between panes the user cannot currently see.
+ */
+export const FLATTENED_TABBED_PANEL_LEAF_ID = "tabbed-panel-flattened";
+
+/**
+ * Collapse a tree to a single leaf for narrow viewports, without mutating the
+ * persisted tree.
+ *
+ * `preferredActiveTabKey` should be the surface's last-focused tab. A tree has no
+ * single active tab of its own — each leaf carries one — so without that hint
+ * flattening would silently jump to whichever leaf happens to come first.
+ */
+export function flattenTabbedPanelTree(node: TabbedPanelNode, preferredActiveTabKey?: string): TabbedPanelLeaf {
+  const tabs = collectTabbedPanelTabKeys(node);
+  const activeTabKey =
+    preferredActiveTabKey !== undefined && tabs.includes(preferredActiveTabKey)
+      ? preferredActiveTabKey
+      : (firstTabbedPanelLeaf(node)?.activeTabKey ?? tabs[0]!);
+  return { type: "leaf", id: FLATTENED_TABBED_PANEL_LEAF_ID, tabs, activeTabKey };
+}
+
+export function collectTabbedPanelLeafIDs(node: TabbedPanelNode | null): string[] {
+  if (!node) return [];
+  if (node.type === "leaf") return [node.id];
+  return [...collectTabbedPanelLeafIDs(node.first), ...collectTabbedPanelLeafIDs(node.second)];
+}
+
+/**
+ * Prune to the currently available tabs WITHOUT reinserting anything.
+ *
+ * This is the render-time counterpart to `normalizeTabbedPanelTree`, which
+ * deliberately reinserts missing tabs. Availability is transient (an inline
+ * workspace exists only while claimed), so the persisted "intent" tree keeps
+ * unavailable tabs and only the rendered view drops them. Surviving leaves keep
+ * their ids, which is what lets an edit made against the rendered tree be
+ * applied to the intent tree by id.
+ */
+export function pruneTabbedPanelTreeToAvailable(
+  node: TabbedPanelNode,
+  availableTabs: readonly string[],
+): TabbedPanelNode | null {
+  return pruneTabbedPanelNode(node, new Set(availableTabs));
+}
+
+export function parseTabbedPanelLayout(
+  raw: string | null,
+  knownTabs: readonly string[],
+  defaultTree?: TabbedPanelNode,
+  keepIfStored?: (tabKey: string) => boolean,
+): TabbedPanelLayoutState {
+  // Surfaces pass their own default tree so a first run reproduces the intended
+  // arrangement — conversation and files sharing a leaf above the workspace —
+  // instead of dumping every tab into one strip.
+  const fallback = defaultTabbedPanelLayout(knownTabs, defaultTree);
+  if (!raw) return fallback;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return fallback;
+    const record = parsed as Record<string, unknown>;
+    if (record.version !== 1) return fallback;
+    const tree = parseTabbedPanelNode(record.tree);
+    if (!tree || !hasUniqueTabbedPanelIdentity(tree)) return fallback;
+    // Normalized against the surface's KNOWN tabs, never its available ones:
+    // a tab added since this layout was stored must appear, and a retired one
+    // must go, but availability is resolved later at render time.
+    const normalized = normalizeTabbedPanelTree(tree, knownTabs, undefined, keepIfStored);
+    const leafIDs = new Set(collectTabbedPanelLeafIDs(normalized));
+    const zoomedLeafID =
+      typeof record.zoomedLeafID === "string" && leafIDs.has(record.zoomedLeafID) ? record.zoomedLeafID : null;
+    const presentTabs = new Set(collectTabbedPanelTabKeys(normalized));
+    const hiddenTabKeys = Array.isArray(record.hiddenTabKeys)
+      ? record.hiddenTabKeys.filter((key): key is string => typeof key === "string" && presentTabs.has(key))
+      : [];
+    const lastFocusedTabKey =
+      typeof record.lastFocusedTabKey === "string" && presentTabs.has(record.lastFocusedTabKey)
+        ? record.lastFocusedTabKey
+        : null;
+    return { version: 1, tree: normalized, zoomedLeafID, hiddenTabKeys, lastFocusedTabKey };
+  } catch {
+    return fallback;
+  }
+}
+
+function collectTabbedPanelNodeIDs(node: TabbedPanelNode): string[] {
+  if (node.type === "leaf") return [node.id];
+  return [node.id, ...collectTabbedPanelNodeIDs(node.first), ...collectTabbedPanelNodeIDs(node.second)];
+}
+
+/**
+ * Reject rather than repair a persisted tree with a repeated tab key or node id.
+ *
+ * A pane can host a singleton portal (the inline workspace reparents one live
+ * DOM subtree into the rendered slot), so a tab key appearing twice would
+ * register two slot elements for one surface. Edits are applied by node id, so a
+ * repeated id would land in several nodes at once. `normalizeTabbedPanelTree`
+ * only dedupes within a single leaf and cannot catch either case.
+ */
+function hasUniqueTabbedPanelIdentity(node: TabbedPanelNode): boolean {
+  const tabs = collectTabbedPanelTabKeys(node);
+  const ids = collectTabbedPanelNodeIDs(node);
+  return new Set(tabs).size === tabs.length && new Set(ids).size === ids.length;
+}
+
+function parseTabbedPanelNode(value: unknown): TabbedPanelNode | null {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+  const node = value as Record<string, unknown>;
+  if (typeof node.id !== "string" || node.id === "") return null;
+  if (node.type === "leaf") {
+    if (!Array.isArray(node.tabs)) return null;
+    const tabs = node.tabs.filter((tab): tab is string => typeof tab === "string" && tab !== "");
+    if (tabs.length === 0) return null;
+    const activeTabKey =
+      typeof node.activeTabKey === "string" && tabs.includes(node.activeTabKey) ? node.activeTabKey : tabs[0]!;
+    return { type: "leaf", id: node.id, tabs, activeTabKey };
+  }
+  if (node.type !== "split") return null;
+  const first = parseTabbedPanelNode(node.first);
+  const second = parseTabbedPanelNode(node.second);
+  if (!first || !second) return null;
+  return {
+    type: "split",
+    id: node.id,
+    direction: node.direction === "vertical" ? "vertical" : "horizontal",
+    ratio: clampTabbedPanelRatio(typeof node.ratio === "number" ? node.ratio : 0.5),
+    first,
+    second,
+  };
 }
 
 function uniqueTabbedPanelTabs(tabs: string[]): string[] {
@@ -212,7 +462,7 @@ function uniqueTabbedPanelTabs(tabs: string[]): string[] {
   return unique;
 }
 
-function findTabbedPanelLeafByID(node: TabbedPanelNode | null, leafID: string): TabbedPanelLeaf | null {
+export function findTabbedPanelLeafByID(node: TabbedPanelNode | null, leafID: string): TabbedPanelLeaf | null {
   if (!node) return null;
   if (node.type === "leaf") {
     return node.id === leafID ? node : null;
@@ -243,7 +493,13 @@ function pruneTabbedPanelNode(node: TabbedPanelNode | null, validTabs: ReadonlyS
   };
 }
 
-function removeTabbedPanelTab(node: TabbedPanelNode | null, tabKey: string): TabbedPanelNode | null {
+/**
+ * Drop a tab, collapsing any leaf it emptied.
+ *
+ * Null means the tree would have nothing left, which callers must treat as a
+ * refusal rather than commit: a surface with no panes renders blank.
+ */
+export function removeTabbedPanelTab(node: TabbedPanelNode | null, tabKey: string): TabbedPanelNode | null {
   if (!node) return null;
   if (node.type === "leaf") {
     if (!node.tabs.includes(tabKey)) return node;
@@ -320,7 +576,7 @@ function insertTabbedPanelTabIntoFirstLeaf(node: TabbedPanelNode, tabKey: string
   };
 }
 
-function splitTabbedPanelLeaf(
+export function splitTabbedPanelLeaf(
   node: TabbedPanelNode,
   leafID: string,
   newLeaf: TabbedPanelLeaf,

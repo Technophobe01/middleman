@@ -1,10 +1,12 @@
 import { cleanup, render, screen } from "@testing-library/svelte";
-import { tick } from "svelte";
+import { createRawSnippet, tick, type Snippet } from "svelte";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { SIDEBAR_KEY, STORES_KEY } from "../context.js";
 import { resetModalStack } from "../stores/keyboard/modal-stack.svelte.js";
+import { getPaneLayoutStore, resetPaneLayoutStoresForTest } from "../stores/paneLayout.svelte.js";
 import type { IssueRouteRef } from "../routes.js";
 import type { InlineWorkspaceController } from "../workspace-inline.js";
+import { sessionPaneKey } from "../stores/session-pane-key.js";
 import { createClaimTestController, createReactiveValue } from "./viewWorkspaceTestDoubles.svelte.js";
 
 vi.mock("../components/sidebar/IssueList.svelte", async () => ({
@@ -53,9 +55,14 @@ function issueDetailFixture(workspace: { id: string; status: string } | undefine
 interface RenderIssueListViewOptions {
   selectedIssue?: IssueRouteRef | null;
   inlineWorkspace?: InlineWorkspaceController | null;
-  renderWorkspaceDock?: boolean;
   detail?: unknown;
+  workspacePaneControls?: Snippet | undefined;
 }
+
+/** Stands in for the frontend's workspace controls button. */
+const controlsDouble: Snippet = createRawSnippet(() => ({
+  render: () => `<button type="button" data-testid="workspace-pane-controls">Controls</button>`,
+}));
 
 function renderIssueListView(options: RenderIssueListViewOptions = {}) {
   const detailBox = createReactiveValue(options.detail ?? null);
@@ -72,7 +79,9 @@ function renderIssueListView(options: RenderIssueListViewOptions = {}) {
         selectedIssue: options.selectedIssue === undefined ? selectedIssue : options.selectedIssue,
         hideSidebar: true,
         ...(options.inlineWorkspace !== undefined ? { inlineWorkspace: options.inlineWorkspace } : {}),
-        ...(options.renderWorkspaceDock !== undefined ? { renderWorkspaceDock: options.renderWorkspaceDock } : {}),
+        ...(options.workspacePaneControls !== undefined
+          ? { workspacePaneControls: options.workspacePaneControls }
+          : {}),
       },
       context: new Map<symbol, unknown>([
         [
@@ -92,6 +101,7 @@ describe("IssueListView inline workspace", () => {
   beforeEach(() => {
     localStorage.clear();
     resetModalStack();
+    resetPaneLayoutStoresForTest();
     vi.stubGlobal(
       "MutationObserver",
       class {
@@ -109,9 +119,81 @@ describe("IssueListView inline workspace", () => {
   afterEach(() => {
     cleanup();
     resetModalStack();
+    resetPaneLayoutStoresForTest();
     localStorage.clear();
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
+  });
+
+  it("renders a promoted session's pane beside the issue conversation", () => {
+    const layout = getPaneLayoutStore("issues");
+    const paneKey = sessionPaneKey("ws-1", undefined, "ws-1:helper");
+    layout.promoteTab(paneKey, { kind: "tab", leafID: layout.leafIDForTab("workspace")! });
+    const { controller } = createClaimTestController("issues", {
+      sessions: [{ paneKey, label: "Helper" }],
+    });
+
+    renderIssueListView({
+      inlineWorkspace: controller,
+      detail: issueDetailFixture({ id: "ws-1", status: "ready" }),
+    });
+
+    expect(document.querySelector(`[data-session-pane="${paneKey}"]`)).not.toBeNull();
+    expect(screen.getByRole("tab", { name: "Helper" })).toBeTruthy();
+  });
+
+  it("reports a focused pane to the workspace host", () => {
+    const layout = getPaneLayoutStore("issues");
+    const paneKey = sessionPaneKey("ws-1", undefined, "ws-1:helper");
+    layout.promoteTab(paneKey, { kind: "tab", leafID: layout.leafIDForTab("workspace")! });
+    const { controller } = createClaimTestController("issues", {
+      sessions: [{ paneKey, label: "Helper" }],
+    });
+
+    renderIssueListView({
+      inlineWorkspace: controller,
+      detail: issueDetailFixture({ id: "ws-1", status: "ready" }),
+    });
+
+    document.querySelector(`[data-pane-key="${paneKey}"]`)?.dispatchEvent(new FocusEvent("focusin", { bubbles: true }));
+
+    // Focus is the host's only report of which pane the user is working in, and an
+    // expand or a Focus Terminal has to act on that one rather than the container.
+    expect(controller.notePaneFocused).toHaveBeenCalledWith(paneKey);
+  });
+
+  it("offers the workspace controls in the leaf holding a promoted session", () => {
+    const layout = getPaneLayoutStore("issues");
+    const paneKey = sessionPaneKey("ws-1", undefined, "ws-1:helper");
+    // Placed directly rather than through promoteSessionBesideWorkspace: that
+    // helper refuses until a container has reported the workspace pane on screen,
+    // and this test is about what the view renders once the pane exists.
+    layout.promoteTab(paneKey, {
+      kind: "split",
+      leafID: layout.leafIDForTab("workspace")!,
+      direction: "horizontal",
+      placement: "after",
+    });
+    const { controller } = createClaimTestController("issues", {
+      sessions: [{ paneKey, label: "Helper" }],
+    });
+
+    renderIssueListView({
+      inlineWorkspace: controller,
+      detail: issueDetailFixture({ id: "ws-1", status: "ready" }),
+      workspacePaneControls: controlsDouble,
+    });
+
+    // Each surface wires this separately, so each needs its own proof: the
+    // workspace leaf and the promoted session's leaf get the button, the leaf of
+    // route panes does not.
+    expect(screen.getAllByTestId("workspace-pane-controls")).toHaveLength(2);
+    expect(
+      document
+        .querySelector('[data-pane-key="conversation"]')
+        ?.closest(".tabbed-panel-leaf")
+        ?.querySelector('[data-testid="workspace-pane-controls"]'),
+    ).toBeNull();
   });
 
   it("claims when the loaded detail matches the selection and carries a workspace", () => {
@@ -197,29 +279,56 @@ describe("IssueListView inline workspace", () => {
     expect(controller.release).toHaveBeenCalled();
   });
 
-  it("renders the dock only when renderWorkspaceDock and claimed", () => {
-    const detail = issueDetailFixture({ id: "ws-1", status: "ready" });
-
-    // renderWorkspaceDock={false}: no dock even though the detail claims
-    // the workspace normally.
+  it("offers a workspace pane only once the workspace is claimed", () => {
+    // Unclaimed: the workspace tab is unavailable, so the tree prunes to the
+    // conversation pane alone and no portal slot exists to steal the terminal.
     {
       const { controller } = createClaimTestController();
-      renderIssueListView({ inlineWorkspace: controller, renderWorkspaceDock: false, detail });
-      expect(controller.claim).toHaveBeenCalled();
-      expect(document.querySelector(".workspace-dock-panel")).toBeNull();
+      renderIssueListView({ inlineWorkspace: controller, detail: issueDetailFixture(undefined) });
+      expect(controller.claim).not.toHaveBeenCalled();
       expect(screen.getByTestId("issue-detail")).toBeTruthy();
+      expect(screen.queryByRole("tab", { name: "Workspace" })).toBeNull();
+      expect(document.querySelector(".detail-pane-workspace-slot")).toBeNull();
       cleanup();
     }
 
-    // Default renderWorkspaceDock (true): the dock renders once claimed.
+    // Claimed: the workspace pane joins the tree with a live portal slot.
     {
       const { controller } = createClaimTestController();
-      renderIssueListView({ inlineWorkspace: controller, detail });
+      renderIssueListView({
+        inlineWorkspace: controller,
+        detail: issueDetailFixture({ id: "ws-1", status: "ready" }),
+      });
       expect(controller.claim).toHaveBeenCalled();
-      expect(document.querySelector(".workspace-dock-panel")).toBeTruthy();
-      expect(screen.getByRole("region", { name: "Workspace terminal" })).toBeTruthy();
+      expect(screen.getByRole("tab", { name: "Conversation" })).toBeTruthy();
+      // The slot, not a tab: a leaf holding the workspace alone draws no strip,
+      // because the workspace pane already draws one of its own inside.
+      expect(document.querySelector(".detail-pane-workspace-slot")).toBeTruthy();
+      expect(screen.queryByRole("tab", { name: "Workspace" })).toBeNull();
+      expect(controller.slotAttachment).toHaveBeenCalled();
       cleanup();
     }
+  });
+
+  it("hides the workspace pane on demand and offers a way back", async () => {
+    const { controller } = createClaimTestController();
+    renderIssueListView({
+      inlineWorkspace: controller,
+      detail: issueDetailFixture({ id: "ws-1", status: "ready" }),
+    });
+
+    screen.getByTestId("pane-hide-workspace").click();
+    await tick();
+
+    expect(document.querySelector(".detail-pane-workspace-slot")).toBeNull();
+    expect(screen.getByTestId("issue-detail")).toBeTruthy();
+
+    // The reopen strip is the only way back, so it must survive the pane's leaf
+    // emptying out.
+    screen.getByRole("button", { name: "Show Workspace" }).click();
+    await tick();
+
+    expect(document.querySelector(".detail-pane-workspace-slot")).toBeTruthy();
   });
 
   it("refetches the detail when the claimed identity is invalidated by deletion", async () => {
@@ -228,7 +337,7 @@ describe("IssueListView inline workspace", () => {
     const { issuesStore, detailBox } = renderIssueListView({ inlineWorkspace: controller, detail });
 
     expect(controller.claim).toHaveBeenCalled();
-    expect(screen.getByRole("region", { name: "Workspace terminal" })).toBeTruthy();
+    expect(document.querySelector(".detail-pane-workspace-slot")).toBeTruthy();
 
     notifyInvalidated(selectedIssueIdentity);
 
@@ -251,7 +360,7 @@ describe("IssueListView inline workspace", () => {
     await tick();
 
     expect(controller.release).toHaveBeenCalled();
-    expect(screen.queryByRole("region", { name: "Workspace terminal" })).toBeNull();
+    expect(document.querySelector(".detail-pane-workspace-slot")).toBeNull();
   });
 
   it("threads inlineWorkspace to IssueDetail", () => {

@@ -1,11 +1,14 @@
 <script lang="ts">
+  import type { Snippet } from "svelte";
   import { SplitResizeHandle, type SplitResizeEvent } from "@kenn-io/kit-ui";
+  import { clearActiveTabbedPanelDrag, startTabbedPanelTabDrag } from "@middleman/ui";
   import type { RuntimeSession } from "@middleman/ui/api/types";
   import PlusIcon from "@lucide/svelte/icons/plus";
   import XIcon from "@lucide/svelte/icons/x";
   import TerminalIcon from "@lucide/svelte/icons/terminal";
   import PanelBottomIcon from "@lucide/svelte/icons/panel-bottom";
   import PanelTopIcon from "@lucide/svelte/icons/panel-top";
+  import PanelRightIcon from "@lucide/svelte/icons/panel-right";
   import Columns2Icon from "@lucide/svelte/icons/columns-2";
   import Rows2Icon from "@lucide/svelte/icons/rows-2";
   import MoveIcon from "@lucide/svelte/icons/move";
@@ -44,6 +47,12 @@
     // False while the owning WorkspaceTerminalView is parked in a hidden
     // host: forwarded to TerminalSplitTree so its TerminalPanes deactivate.
     hostVisible?: boolean;
+    /** Shared detail-surface scope when terminal sessions may become top-level panes. */
+    dragScope?: string | undefined;
+    /** Maps a runtime session to its top-level detail-pane key. */
+    paneKeyForSession?: ((sessionKey: string) => string | null) | undefined;
+    /** Actions owned by the placement hosting this dock, rendered in its header. */
+    headerActions?: Snippet | undefined;
     onToggle?: (() => void) | undefined;
     onNewTerminal?: (() => void) | undefined;
     onSplit?: ((direction: SplitDirection) => void) | undefined;
@@ -51,10 +60,12 @@
     onClose?: ((session: RuntimeSession) => void) | undefined;
     onRename?: ((session: RuntimeSession) => void) | undefined;
     onMoveToWorkflow?: ((sessionKey: string) => void) | undefined;
+    /** Reads local runtime drags plus promoted detail-pane sessions when embedded. */
+    readSessionDrag?: ((event: DragEvent) => string | null) | undefined;
+    onPromoteSession?: ((sessionKey: string) => void) | undefined;
     onDock?: ((dock: TerminalDock) => void) | undefined;
     onResize?: ((height: number) => void) | undefined;
     onDropSession?: ((sessionKey: string) => void) | undefined;
-    onExit?: ((session: RuntimeSession) => void) | undefined;
     onRatioChange?: ((splitId: string, ratio: number) => void) | undefined;
     onSplitSession?:
       | ((
@@ -79,6 +90,9 @@
     loading = false,
     disabled = false,
     hostVisible = true,
+    dragScope = undefined,
+    paneKeyForSession = undefined,
+    headerActions = undefined,
     onToggle,
     onNewTerminal,
     onSplit,
@@ -86,10 +100,11 @@
     onClose,
     onRename,
     onMoveToWorkflow,
+    readSessionDrag,
+    onPromoteSession,
     onDock,
     onResize,
     onDropSession,
-    onExit,
     onRatioChange,
     onSplitSession,
   }: Props = $props();
@@ -101,6 +116,16 @@
     open && sessions.length > 0 && countLeaves(tree) < MAX_TERMINAL_LEAVES,
   );
   const showSelector = $derived(sessions.length > 1);
+  /**
+   * The session a panel-level "move to a pane" acts on.
+   *
+   * Only for a single docked session: with more than one, every leaf carries its own
+   * header and offers this per session, and a panel-level button would be ambiguous
+   * about which terminal it moves. A single docked terminal has no leaf header at
+   * all, and that is the common case - without this it is the one arrangement with
+   * no way to promote from the dock.
+   */
+  const soleSession = $derived(sessions.length === 1 ? (sessions[0] ?? null) : null);
 
   function labelFor(session: RuntimeSession): string {
     return displayLabels[session.key] ?? session.label;
@@ -115,10 +140,21 @@
       workspaceId: session.workspace_id,
       sessionKey: session.key,
     });
+    const paneKey = paneKeyForSession?.(session.key) ?? null;
+    if (dragScope !== undefined && paneKey !== null) {
+      startTabbedPanelTabDrag(event, { scope: dragScope, tabKey: paneKey }, "Middleman session tab");
+    }
+  }
+
+  function clearDrag(): void {
+    clearActiveTerminalDrag();
+    clearActiveTabbedPanelDrag();
   }
 
   function readDroppedSession(event: DragEvent): string | null {
-    return readRuntimeSessionDrag(event, workspaceId);
+    return readSessionDrag
+      ? readSessionDrag(event)
+      : readRuntimeSessionDrag(event, workspaceId);
   }
 
   function handleDragOver(event: DragEvent): void {
@@ -135,8 +171,10 @@
     const sessionKey = readDroppedSession(event);
     if (sessionKey === null) return;
     event.preventDefault();
+    event.stopPropagation();
     onDropSession?.(sessionKey);
     clearActiveTerminalDrag();
+    clearActiveTabbedPanelDrag();
   }
 
   function startPanelResize(): void {
@@ -181,6 +219,7 @@
       <span class="panel-count">{sessions.length}</span>
     </button>
     <div class="panel-actions">
+      {@render headerActions?.()}
       <button
         class="panel-action"
         title="New terminal"
@@ -208,6 +247,20 @@
       >
         <Rows2Icon size="13" strokeWidth="2" aria-hidden="true" />
       </button>
+      {#if onPromoteSession && soleSession !== null}
+        <button
+          class="panel-action"
+          title="Move to a pane"
+          aria-label={`Move ${labelFor(soleSession)} to a pane`}
+          disabled={disabled}
+          onclick={() => {
+            if (disabled) return;
+            onPromoteSession?.(soleSession.key);
+          }}
+        >
+          <PanelRightIcon size="13" strokeWidth="2" aria-hidden="true" />
+        </button>
+      {/if}
       <button
         class="panel-action"
         title={dock === "bottom" ? "Move to workflow" : "Move to bottom"}
@@ -246,11 +299,14 @@
             {activeSessionKey}
             {disabled}
             {hostVisible}
+            {dragScope}
+            {paneKeyForSession}
             {onSelect}
             {onClose}
             {onRename}
             {onMoveToWorkflow}
-            {onExit}
+            {readSessionDrag}
+            {onPromoteSession}
             {onRatioChange}
             {onSplitSession}
           />
@@ -273,7 +329,7 @@
             <button
               draggable={!disabled}
               ondragstart={(event) => startSessionDrag(event, session)}
-              ondragend={clearActiveTerminalDrag}
+              ondragend={clearDrag}
               class={[
                 "selector-row",
                 {

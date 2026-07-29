@@ -2,6 +2,13 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { createDiffStore } from "@middleman/ui/stores/diff";
 import {
+  clearActiveTabbedPanelDrag,
+  getPaneLayoutStore,
+  resetPaneLayoutStoresForTest,
+  sessionPaneKey,
+  startTabbedPanelTabDrag,
+} from "@middleman/ui";
+import {
   consumeWorkspaceLaunch,
   queueWorkspaceLaunch,
   resetWorkspaceCreatePendingForTest,
@@ -150,7 +157,21 @@ vi.mock("@middleman/ui/stores/flash", () => ({
   showFlash: mocks.showFlash,
 }));
 
-import WorkspaceTerminalView from "./WorkspaceTerminalView.svelte";
+// The harness pairs the view with the session terminal pool, which WorkspaceHost
+// mounts in the app. Terminals live in the pool now, so the view on its own
+// renders portal slots and no terminal would ever appear.
+import WorkspaceTerminalView from "./WorkspaceTerminalViewTestHarness.svelte";
+import WorkspacePaneControls from "./WorkspacePaneControls.svelte";
+import { mountedSessions, resetSessionHostForTest, sessionHostPrefix } from "../../stores/session-host.svelte.ts";
+import {
+  activeHostedSession,
+  getInlineWorkspaceController,
+  hostedWorkspaceLauncher,
+  hostedWorkspaceControls,
+  workspaceControlsBusy,
+  resetWorkspaceHostForTest,
+} from "../../stores/workspace-host.svelte.ts";
+import { navigate } from "../../stores/router.svelte.ts";
 
 const runningSession = {
   key: "ws-1:helper",
@@ -217,6 +238,34 @@ const workspaceResponse = {
   mr_head_repo_kind: "same_repo",
 };
 
+/**
+ * Serve any workspace id, not just ws-1.
+ *
+ * The default stub answers for ws-1 alone, so a test that switches the view to
+ * another workspace gets a body with no id, the view never reports that workspace
+ * live, and nothing renders - which makes "the overlay is gone" pass for the wrong
+ * reason.
+ */
+function serveAnyWorkspace(): void {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn().mockImplementation((input: Request | URL | string) => {
+      const url = input instanceof Request ? input.url : String(input);
+      const { pathname } = new URL(url, "http://localhost");
+      const match = /\/workspaces\/([^/]+)$/.exec(pathname);
+      if (match) {
+        return Promise.resolve(
+          Response.json({ ...workspaceResponse, id: match[1], tmux_session: `middleman-${match[1]}` }),
+        );
+      }
+      if (pathname.endsWith("/api/v1/workspaces")) {
+        return Promise.resolve(Response.json({ workspaces: [workspaceResponse] }));
+      }
+      return Promise.resolve(Response.json({}));
+    }),
+  );
+}
+
 function runtimeWithSession(createdAt: string) {
   return {
     launch_targets: [],
@@ -226,6 +275,22 @@ function runtimeWithSession(createdAt: string) {
         created_at: createdAt,
       },
     ],
+  };
+}
+
+/** A workspace that can launch but is running nothing yet. */
+function runtimeWithLaunchTargetsOnly() {
+  return {
+    launch_targets: [
+      {
+        key: "helper",
+        label: "Helper",
+        kind: "agent",
+        source: "config",
+        available: true,
+      },
+    ],
+    sessions: [],
   };
 }
 
@@ -314,12 +379,132 @@ function persistedTerminalLayout(workflowMode: "tabs" | "grid") {
   });
 }
 
+/** Home and one session tab in leaves of their own, so a demotion has a
+ *  placement it could plausibly lose. */
+function persistedSplitWorkflowLayout(sessionKey: string, region: "workflow" | "terminal" = "workflow") {
+  return JSON.stringify({
+    version: 1,
+    open: region === "terminal",
+    dock: "bottom",
+    height: 300,
+    activeSessionKey: region === "terminal" ? sessionKey : null,
+    tree: region === "terminal" ? { type: "leaf", id: "dock-leaf", sessionKey } : null,
+    sessionRegions: { [sessionKey]: region },
+    workflowMode: "tabs",
+    workflowTree: {
+      type: "split",
+      id: "wf-split",
+      direction: "horizontal",
+      ratio: 0.5,
+      first: { type: "leaf", id: "wf-home", tabs: ["home"], activeTabKey: "home" },
+      second:
+        region === "workflow"
+          ? { type: "leaf", id: "wf-session", tabs: [`session:${sessionKey}`], activeTabKey: `session:${sessionKey}` }
+          : { type: "leaf", id: "wf-session", tabs: ["home"], activeTabKey: "home" },
+    },
+    customSessionLabels: {},
+  });
+}
+
+/**
+ * Two workflow sessions, each in its own leaf. A detail pane has no Home tab, so a
+ * second session is what gives the strip something to render and a demotion
+ * somewhere to land.
+ */
+function persistedTwoSessionWorkflowLayout(firstKey: string, secondKey: string) {
+  return JSON.stringify({
+    version: 1,
+    open: false,
+    dock: "bottom",
+    height: 300,
+    activeSessionKey: null,
+    tree: null,
+    sessionRegions: { [firstKey]: "workflow", [secondKey]: "workflow" },
+    workflowMode: "tabs",
+    workflowTree: {
+      type: "split",
+      id: "wf-split",
+      direction: "horizontal",
+      ratio: 0.5,
+      first: {
+        type: "leaf",
+        id: "wf-first",
+        tabs: [`session:${firstKey}`],
+        activeTabKey: `session:${firstKey}`,
+      },
+      second: {
+        type: "leaf",
+        id: "wf-second",
+        tabs: [`session:${secondKey}`],
+        activeTabKey: `session:${secondKey}`,
+      },
+    },
+    customSessionLabels: {},
+  });
+}
+
+/**
+ * Put the workspace on the PRs detail surface, the way the app does before an
+ * embedded view exists: the session publication is surface-scoped, so a command
+ * cannot reach a terminal rendered on a page the user is not looking at.
+ */
+/**
+ * What the surface's container reports while the workspace pane is on screen.
+ *
+ * Promotion refuses without it, because a pane can hold a leaf in the stored tree
+ * while rendering nothing (closed, tabbed behind a sibling, under another leaf's
+ * zoom), and growing a split off screen looks to the user like the control failed.
+ * The container notes this from its own render; a view rendered on its own here has
+ * to stand in for it.
+ */
+function noteWorkspacePaneRendered(surface: "prs" | "issues" | "activity"): void {
+  getPaneLayoutStore(surface).notePaneRender({
+    editableTabs: ["conversation", "workspace"],
+    onScreenTabs: ["conversation", "workspace"],
+    flattened: false,
+    soloChromeTabs: [],
+  });
+}
+
+function claimForPrs(): void {
+  navigate("/pulls");
+  getInlineWorkspaceController("prs").claim(
+    {
+      provider: "github",
+      platformHost: "github.com",
+      owner: "octo",
+      name: "repo",
+      repoPath: "octo/repo",
+      number: 1,
+      itemType: "pull",
+    },
+    { id: "ws-1", status: "ready" },
+  );
+}
+
+function promoteSession(surface: "prs" | "issues" | "activity", sessionKey: string): string {
+  const layout = getPaneLayoutStore(surface);
+  const paneKey = sessionPaneKey("ws-1", undefined, sessionKey);
+  const leafID = layout.leafIDForTab("conversation");
+  if (leafID === null) throw new Error("surface default tree has no conversation leaf");
+  if (!layout.promoteTab(paneKey, { kind: "tab", leafID })) throw new Error("promotion refused");
+  return paneKey;
+}
+
 function deferred<T>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>((r) => {
     resolve = r;
   });
   return { promise, resolve };
+}
+
+// Every Delete entry point opens the same confirmation dialog before any
+// request goes out; "Delete workspace" is that dialog's confirm button.
+async function clickDeleteAndConfirm(trigger?: HTMLElement): Promise<void> {
+  await fireEvent.click(trigger ?? screen.getByRole("button", { name: "Delete" }));
+  const confirmButton = await screen.findByRole("button", { name: "Delete workspace" });
+  await fireEvent.click(confirmButton);
 }
 
 function fakeDataTransfer(): DataTransfer {
@@ -339,6 +524,9 @@ describe("WorkspaceTerminalView", () => {
   beforeEach(() => {
     delete window.__BASE_PATH__;
     localStorage.clear();
+    resetSessionHostForTest();
+    resetPaneLayoutStoresForTest();
+    resetWorkspaceHostForTest();
     localStorage.setItem("middleman-workspace-active-tab:ws-1", "session:ws-1:helper");
     sockets = [];
     resetWorkspaceCreatePendingForTest();
@@ -1299,6 +1487,66 @@ describe("WorkspaceTerminalView", () => {
     clearIntervalSpy.mockRestore();
   });
 
+  it("collapses a dock persisted open when no terminal session is left in it", async () => {
+    // The last docked session exiting leaves open=true behind; an open dock with
+    // nothing in it is a saved-height hole in the stage.
+    localStorage.setItem("middleman-workspace-active-tab:ws-1", "home");
+    localStorage.setItem(
+      "middleman-workspace-terminal-layout:ws-1",
+      JSON.stringify({
+        version: 1,
+        open: true,
+        dock: "bottom",
+        height: 300,
+        activeSessionKey: null,
+        tree: null,
+        sessionRegions: {},
+        workflowMode: "tabs",
+        workflowTree: null,
+        customSessionLabels: {},
+      }),
+    );
+    mocks.getWorkspaceRuntime.mockResolvedValue(runtimeWithLaunchTargetsOnly());
+
+    render(WorkspaceTerminalView, { props: { workspaceId: "ws-1" } });
+
+    // The toggle's label flips with `open`, so waiting for "Open terminal
+    // panel" is waiting for the reconcile to have closed the dock.
+    await screen.findByRole("button", { name: "Open terminal panel" });
+    expect(document.querySelector(".terminal-panel.open")).toBeNull();
+  });
+
+  it("hands back the previous workspace's pooled terminals when the selection moves on", async () => {
+    // The pool outlives this view, so nothing else would take them down. Every
+    // parked terminal holds a live websocket; browsing ten workspaces must not
+    // leave ten attachments open.
+    const { rerender } = render(WorkspaceTerminalView, {
+      props: { workspaceId: "ws-1" },
+    });
+
+    await screen.findByRole("tab", { name: /Helper/ });
+    await waitFor(() => expect(mountedSessions()).toHaveLength(1));
+    const firstPrefix = sessionHostPrefix("ws-1", undefined);
+    expect(mountedSessions()[0]?.hostKey.startsWith(firstPrefix)).toBe(true);
+
+    await rerender({ workspaceId: "ws-2" });
+
+    await waitFor(() => {
+      expect(mountedSessions().some((session) => session.hostKey.startsWith(firstPrefix))).toBe(false);
+    });
+  });
+
+  it("hands back its pooled terminals when the view itself goes away", async () => {
+    render(WorkspaceTerminalView, { props: { workspaceId: "ws-1" } });
+
+    await screen.findByRole("tab", { name: /Helper/ });
+    await waitFor(() => expect(mountedSessions()).toHaveLength(1));
+
+    cleanup();
+
+    expect(mountedSessions()).toHaveLength(0);
+  });
+
   it("shows a relaunched agent with the same key and a new generation", async () => {
     const relaunchedAt = "2026-04-29T00:01:00Z";
     const initialRuntime = deferred<ReturnType<typeof runtimeWithStaleSession>>();
@@ -1383,7 +1631,10 @@ describe("WorkspaceTerminalView", () => {
       }),
     );
 
-    await waitFor(() => expect(screen.getByText("No terminals")).toBeTruthy());
+    // The dock does not sit open and empty behind the exit: the reconcile
+    // collapses it, and the toggle's label is the collapse signal.
+    await screen.findByRole("button", { name: "Open terminal panel" });
+    expect(document.querySelector(".terminal-panel.open")).toBeNull();
   });
 
   it("uses an in-app modal when stopping a running shell", async () => {
@@ -1554,7 +1805,7 @@ describe("WorkspaceTerminalView", () => {
         data: JSON.stringify({ type: "exited", code: 0 }),
       }),
     );
-    await waitFor(() => expect(screen.getByText("No terminals")).toBeTruthy());
+    await screen.findByRole("button", { name: "Open terminal panel" });
     expect(sockets).toHaveLength(1);
   });
 
@@ -1722,7 +1973,7 @@ describe("WorkspaceTerminalView", () => {
         data: JSON.stringify({ type: "exited", code: 0 }),
       }),
     );
-    await waitFor(() => expect(screen.getByText("No terminals")).toBeTruthy());
+    await screen.findByRole("button", { name: "Open terminal panel" });
 
     await fireEvent.click(screen.getAllByRole("button", { name: "New terminal" })[0]!);
     freshRefresh.resolve(runtimeWithTerminalSession(relaunchedShellSession));
@@ -1759,6 +2010,61 @@ describe("WorkspaceTerminalView", () => {
 
     await waitFor(() => expect(screen.queryByRole("tab", { name: /Shell/ })).toBeNull());
     expect(screen.getByRole("button", { name: "Focus Shell" })).toBeTruthy();
+  });
+
+  it("keeps one live terminal while a shell moves between the terminal panel and the workflow area", async () => {
+    localStorage.setItem("middleman-workspace-active-tab:ws-1", "home");
+    mocks.getWorkspaceRuntime.mockResolvedValue(runtimeWithTwoTerminalSessions());
+
+    render(WorkspaceTerminalView, {
+      props: {
+        workspaceId: "ws-1",
+      },
+    });
+
+    await fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Open terminal panel",
+      }),
+    );
+    await waitFor(() => expect(sockets).toHaveLength(1));
+    const socket = sockets[0]!;
+    expect(socket.url).toContain("ws-1_shell_a");
+
+    await fireEvent.click(screen.getByRole("button", { name: "Move Shell to workflow" }));
+    await screen.findByRole("tab", { name: /Shell/ });
+    await fireEvent.click(screen.getByRole("button", { name: "Move Shell to terminal" }));
+    await waitFor(() => expect(screen.queryByRole("tab", { name: /Shell/ })).toBeNull());
+
+    // One tmux attachment from start to finish. Both regions render the same
+    // pooled terminal, so moving between them reparents it instead of tearing
+    // the shell down and reattaching to a scrollback-less new one.
+    expect(sockets.filter((candidate) => candidate.url.includes("ws-1_shell_a"))).toHaveLength(1);
+    expect(socket.close).not.toHaveBeenCalled();
+  });
+
+  it("hands a docked terminal back when the terminal panel closes", async () => {
+    localStorage.setItem("middleman-workspace-active-tab:ws-1", "home");
+    mocks.getWorkspaceRuntime.mockResolvedValue(runtimeWithTwoTerminalSessions());
+
+    render(WorkspaceTerminalView, {
+      props: {
+        workspaceId: "ws-1",
+      },
+    });
+
+    await fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Open terminal panel",
+      }),
+    );
+    await waitFor(() => expect(sockets).toHaveLength(1));
+
+    await fireEvent.click(screen.getAllByRole("button", { name: "Close terminal panel" })[0]!);
+
+    // A closed panel renders nothing, and a pooled terminal nothing renders
+    // would otherwise sit parked with its socket open forever.
+    await waitFor(() => expect(sockets[0]!.close).toHaveBeenCalled());
   });
 
   it("shows a workspace sidebar collapse button", async () => {
@@ -1837,7 +2143,7 @@ describe("WorkspaceTerminalView", () => {
     const shellPaneButton = await screen.findByRole("button", { name: "Focus Shell" });
     expect(shellPaneButton.getAttribute("draggable")).toBe("true");
 
-    await fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    await clickDeleteAndConfirm();
     await waitFor(() => {
       expect(
         fetchMock.mock.calls.some(([input]) => {
@@ -1877,7 +2183,7 @@ describe("WorkspaceTerminalView", () => {
     await waitFor(() => {
       expect(screen.getByRole("button", { name: "Delete" }).hasAttribute("disabled")).toBe(false);
     });
-    await fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    await clickDeleteAndConfirm();
     await waitFor(() => {
       expect(
         fetchMock.mock.calls.some(([input]) => {
@@ -1902,6 +2208,41 @@ describe("WorkspaceTerminalView", () => {
     otherDeleteRequest.resolve(new Response(null, { status: 204 }));
     deleteRequest.resolve(new Response(null, { status: 204 }));
     await waitFor(() => expect(window.location.pathname).toBe("/workspaces"));
+  });
+
+  it("issues no delete until the confirmation is accepted, and none on cancel", async () => {
+    // Delete removes a worktree whose unpushed commits go with it, from a
+    // one-click strip button — so every entry point confirms first.
+    localStorage.setItem("middleman-workspace-active-tab:ws-1", "home");
+    const fetchMock = vi.fn().mockImplementation((input: Request | URL | string) => {
+      const pathname = fetchPath(input);
+      if (pathname.endsWith("/workspaces/ws-1")) {
+        return Promise.resolve(Response.json(workspaceResponse));
+      }
+      if (pathname.endsWith("/api/v1/workspaces")) {
+        return Promise.resolve(Response.json({ workspaces: [workspaceResponse] }));
+      }
+      return Promise.resolve(Response.json({}));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.pushState({}, "", "/terminal/ws-1");
+
+    render(WorkspaceTerminalView, { props: { workspaceId: "ws-1" } });
+
+    await screen.findByRole("button", { name: "Delete" });
+    await fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+
+    await screen.findByRole("button", { name: "Delete workspace" });
+    const deleteIssued = () =>
+      fetchMock.mock.calls.some(([input]) => input instanceof Request && input.method === "DELETE");
+    expect(deleteIssued()).toBe(false);
+
+    await fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await waitFor(() => {
+      expect(screen.queryByRole("button", { name: "Delete workspace" })).toBeNull();
+    });
+    expect(deleteIssued()).toBe(false);
+    expect(screen.getByRole("button", { name: "Delete" }).hasAttribute("disabled")).toBe(false);
   });
 
   it("drops a failed delete response after unmounting and remounting the workspace", async () => {
@@ -1932,7 +2273,7 @@ describe("WorkspaceTerminalView", () => {
     });
 
     await screen.findByRole("button", { name: "Delete" });
-    await fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    await clickDeleteAndConfirm();
     await waitFor(() => {
       expect(fetchMock.mock.calls.some(([input]) => input instanceof Request && input.method === "DELETE")).toBe(true);
     });
@@ -1990,7 +2331,7 @@ describe("WorkspaceTerminalView", () => {
     });
 
     await screen.findByRole("button", { name: "Delete" });
-    await fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    await clickDeleteAndConfirm();
     await waitFor(() => {
       expect(
         fetchMock.mock.calls.some(([input]) => {
@@ -2066,7 +2407,7 @@ describe("WorkspaceTerminalView", () => {
     });
 
     await screen.findByRole("button", { name: "Delete" });
-    await fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    await clickDeleteAndConfirm();
 
     // The 409 opens the force-delete confirmation; confirming issues the
     // forced DELETE that stays in flight while the user switches away.
@@ -2139,7 +2480,7 @@ describe("WorkspaceTerminalView", () => {
     const terminalDataHandler = mocks.mockOnData.mock.calls.at(-1)?.[0] as ((data: string) => void) | undefined;
     expect(terminalDataHandler).toBeTypeOf("function");
 
-    await fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    await clickDeleteAndConfirm();
     await waitFor(() => {
       expect(
         fetchMock.mock.calls.some(([input]) => {
@@ -2159,7 +2500,6 @@ describe("WorkspaceTerminalView", () => {
     deleteRequest.resolve(new Response(null, { status: 204 }));
     await waitFor(() => expect(window.location.pathname).toBe("/workspaces"));
   });
-
   it("launches an explicitly queued target without a confirmation modal", async () => {
     queueWorkspaceLaunch("ws-1", "codex");
     mocks.getWorkspaceRuntime
@@ -2284,5 +2624,1306 @@ describe("WorkspaceTerminalView", () => {
     expect(mocks.launchWorkspaceSession).not.toHaveBeenCalled();
     expect(mocks.showFlash).not.toHaveBeenCalled();
     expect(consumeWorkspaceLaunch("ws-1")).toBeNull();
+  });
+
+  it("publishes the session the pane is showing, so a keyboard command can promote it", async () => {
+    localStorage.setItem("middleman-workspace-active-tab:ws-1", "session:ws-1:helper");
+    localStorage.setItem(
+      "middleman-workspace-terminal-layout:ws-1",
+      persistedTwoSessionWorkflowLayout("ws-1:helper", "ws-1:reviewer"),
+    );
+    mocks.getWorkspaceRuntime.mockResolvedValue(runtimeWithTwoWorkflowSessions());
+    claimForPrs();
+
+    render(WorkspaceTerminalView, {
+      props: {
+        workspaceId: "ws-1",
+        paneSurface: "prs" as const,
+      },
+    });
+
+    // The active workflow tab holds this session, so it is the one on screen.
+    // Only the view can decide that; a palette command sees stores alone.
+    await waitFor(() =>
+      expect(activeHostedSession("prs")?.paneKey).toBe(sessionPaneKey("ws-1", undefined, "ws-1:helper")),
+    );
+
+    await fireEvent.click(await screen.findByRole("tab", { name: /Reviewer/ }));
+
+    // Republished as the user moves around: the other session fills the pane now,
+    // so a promote command must act on that one instead.
+    await waitFor(() =>
+      expect(activeHostedSession("prs")?.paneKey).toBe(sessionPaneKey("ws-1", undefined, "ws-1:reviewer")),
+    );
+  });
+
+  it("hands its controls to the pane instead of a toolbar while embedded", async () => {
+    claimForPrs();
+
+    const { unmount } = render(WorkspaceTerminalView, {
+      props: {
+        workspaceId: "ws-1",
+        paneSurface: "prs" as const,
+      },
+    });
+
+    // One bar, not three: the pane's tab strip renders these controls, so a
+    // toolbar here would be a second copy of them above the terminal.
+    await waitFor(() => expect(hostedWorkspaceControls()).not.toBeNull());
+    expect(document.querySelector(".workspace-toolbar")).toBeNull();
+
+    // Unregistered on the way out, or a pane could open the controls of a
+    // workspace no longer hosted there.
+    unmount();
+    await waitFor(() => expect(hostedWorkspaceControls()).toBeNull());
+  });
+
+  it("renders a sole embedded session without workspace or workflow chrome, but keeps its dock", async () => {
+    claimForPrs();
+
+    render(WorkspaceTerminalView, {
+      props: {
+        workspaceId: "ws-1",
+        paneSurface: "prs" as const,
+      },
+    });
+
+    await waitFor(() => expect(activeHostedSession("prs")?.label).toBe("Helper"));
+    expect(document.querySelector(".header-bar")).toBeNull();
+    expect(screen.queryByRole("tablist", { name: "Workflow group tabs" })).toBeNull();
+
+    // The header bar and the one-tab strip only restated what the pane's own tab
+    // already said. The dock is not chrome: collapsed to a row it is the only route
+    // to a shell beside the agent, and without it a one-session workspace is a dead
+    // end -- the user cannot get a second terminal at all.
+    expect(screen.getByRole("region", { name: "Terminal panel" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Open terminal panel" })).toBeTruthy();
+  });
+
+  it("keeps the inner session strip when the pane's own strip is dropped", async () => {
+    claimForPrs();
+    // The surface reports the workspace leaf as solo-chrome: its strip is gone,
+    // so no tab above the terminal names the agent. Rendering the session bare
+    // here leaves nothing on screen naming it - the inner strip is the one bar
+    // that pane has.
+    getPaneLayoutStore("prs").notePaneRender({
+      editableTabs: ["conversation", "workspace"],
+      onScreenTabs: ["conversation", "workspace"],
+      flattened: false,
+      soloChromeTabs: ["workspace"],
+    });
+
+    render(WorkspaceTerminalView, {
+      props: {
+        workspaceId: "ws-1",
+        paneSurface: "prs" as const,
+      },
+    });
+
+    expect(await screen.findAllByRole("tablist", { name: "Workflow group tabs" })).not.toHaveLength(0);
+    expect(screen.getByRole("tab", { name: /Helper/ })).toBeTruthy();
+    expect(document.querySelector(".sole-embedded-session")).toBeNull();
+  });
+
+  it("keeps the workflow strip for two embedded sessions", async () => {
+    localStorage.setItem(
+      "middleman-workspace-terminal-layout:ws-1",
+      persistedTwoSessionWorkflowLayout("ws-1:helper", "ws-1:reviewer"),
+    );
+    mocks.getWorkspaceRuntime.mockResolvedValue(runtimeWithTwoWorkflowSessions());
+    claimForPrs();
+
+    render(WorkspaceTerminalView, {
+      props: {
+        workspaceId: "ws-1",
+        paneSurface: "prs" as const,
+      },
+    });
+
+    expect(await screen.findAllByRole("tablist", { name: "Workflow group tabs" })).not.toHaveLength(0);
+  });
+
+  it("keeps the workspace header for a sole standalone session", async () => {
+    render(WorkspaceTerminalView, {
+      props: {
+        workspaceId: "ws-1",
+      },
+    });
+
+    await waitFor(() => expect(mocks.mockTerminalInstances.length).toBeGreaterThanOrEqual(1));
+    expect(document.querySelector(".header-bar")).not.toBeNull();
+  });
+
+  it("offers the sole session's own rename and stop from the pane controls", async () => {
+    claimForPrs();
+
+    render(WorkspaceTerminalView, {
+      props: {
+        workspaceId: "ws-1",
+        paneSurface: "prs" as const,
+      },
+    });
+
+    await waitFor(() => expect(hostedWorkspaceControls()).not.toBeNull());
+    render(WorkspacePaneControls);
+    await fireEvent.click(screen.getByRole("button", { name: "Workspace controls" }));
+
+    // Dropping the chrome took the session's own tab actions with it, so without
+    // these a single-session workspace has no route to rename or stop the one thing
+    // it is running.
+    const controls = within(screen.getByRole("dialog", { name: "Workspace controls" }));
+    await fireEvent.click(controls.getByRole("button", { name: "Rename session" }));
+    expect(await screen.findByRole("dialog", { name: /Rename/ })).toBeTruthy();
+  });
+
+  it("leaves session and workspace actions to the chrome that already owns them", async () => {
+    localStorage.setItem(
+      "middleman-workspace-terminal-layout:ws-1",
+      persistedTwoSessionWorkflowLayout("ws-1:helper", "ws-1:reviewer"),
+    );
+    mocks.getWorkspaceRuntime.mockResolvedValue(runtimeWithTwoWorkflowSessions());
+    claimForPrs();
+
+    render(WorkspaceTerminalView, {
+      props: {
+        workspaceId: "ws-1",
+        paneSurface: "prs" as const,
+      },
+    });
+
+    await waitFor(() => expect(hostedWorkspaceControls()).not.toBeNull());
+    render(WorkspacePaneControls);
+    await fireEvent.click(screen.getByRole("button", { name: "Workspace controls" }));
+
+    // Two sessions means the header bar and the session strip are both on screen
+    // with their own Delete and per-session actions. A second copy in here would be
+    // a destructive action with two owners whose disabled and pending states drift.
+    const controls = within(screen.getByRole("dialog", { name: "Workspace controls" }));
+    expect(controls.queryByRole("button", { name: "Delete" })).toBeNull();
+    expect(controls.queryByRole("button", { name: "Rename session" })).toBeNull();
+  });
+
+  it("names the branch in the popover and puts delete one click away in the strip", async () => {
+    claimForPrs();
+
+    render(WorkspaceTerminalView, {
+      props: {
+        workspaceId: "ws-1",
+        paneSurface: "prs" as const,
+      },
+    });
+
+    await waitFor(() => expect(hostedWorkspaceControls()).not.toBeNull());
+    render(WorkspacePaneControls);
+
+    // Deleting the worktree is what a maintainer reaches for once a PR is done, and
+    // behind the popover it cost a click to open, a target to find, and a second
+    // click. It sits in the strip beside the trigger now, and only there: two
+    // Deletes with their own disabled and pending states is worse than one.
+    const strip = await screen.findByRole("button", { name: /^Delete workspace / });
+    expect(strip.closest("[role='dialog']")).toBeNull();
+
+    await fireEvent.click(screen.getByRole("button", { name: "Workspace controls" }));
+    const controls = within(screen.getByRole("dialog", { name: "Workspace controls" }));
+    expect(controls.getByText("feature/session-exit").closest("code")).not.toBeNull();
+    expect(controls.queryByRole("button", { name: "Delete" })).toBeNull();
+  });
+
+  it("leaves the strip Delete off a broken workspace, whose error panel owns one", async () => {
+    // The strip action is the single owner only while the workspace is ready. A
+    // failed setup renders its own Delete beside the Retry the user is already
+    // looking at, so a second one in the strip would be two Deletes with their own
+    // disabled and pending states -- exactly what moving it out of the popover
+    // avoided.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation((input: Request | URL | string) => {
+        const { pathname } = new URL(input instanceof Request ? input.url : String(input), "http://localhost");
+        if (/\/workspaces\/[^/]+$/.test(pathname)) {
+          return Promise.resolve(
+            Response.json({
+              ...workspaceResponse,
+              status: "error",
+              error_message: "tmux session is no longer running: middleman-ws-1",
+            }),
+          );
+        }
+        return Promise.resolve(Response.json({}));
+      }),
+    );
+    mocks.getWorkspaceRuntime.mockResolvedValue(runtimeWithLaunchTargetsOnly());
+    claimForPrs();
+
+    render(WorkspaceTerminalView, {
+      props: {
+        workspaceId: "ws-1",
+        paneSurface: "prs" as const,
+      },
+    });
+    render(WorkspacePaneControls);
+
+    await waitFor(() => expect(screen.getByText(/tmux session is no longer running/)).toBeTruthy());
+    expect(screen.getByRole("button", { name: "Delete" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /^Delete workspace / })).toBeNull();
+  });
+
+  it("carries the dock modes into the pane controls, since the header that held them is gone", async () => {
+    // Collapse is the only control that puts the whole workspace away: the pane's own
+    // close button hides one pane and leaves a promoted session on screen. Hiding the
+    // header bar in a pane took collapse with it, so the popover has to carry it.
+    const setMode = vi.fn();
+    claimForPrs();
+
+    render(WorkspaceTerminalView, {
+      props: {
+        workspaceId: "ws-1",
+        paneSurface: "prs" as const,
+        inlineDock: { getMode: () => "split" as const, setMode },
+      },
+    });
+
+    await waitFor(() => expect(hostedWorkspaceControls()).not.toBeNull());
+    expect(document.querySelector(".header-bar")).toBeNull();
+    render(WorkspacePaneControls);
+    await fireEvent.click(screen.getByRole("button", { name: "Workspace controls" }));
+
+    const controls = within(screen.getByRole("dialog", { name: "Workspace controls" }));
+    await fireEvent.click(controls.getByRole("button", { name: "Expand Terminal" }));
+    expect(setMode).toHaveBeenCalledWith("expanded");
+
+    await fireEvent.click(controls.getByRole("button", { name: "Collapse Terminal" }));
+    expect(setMode).toHaveBeenCalledWith("collapsed");
+  });
+
+  it("keeps each workspace's own preset apply pending while another one runs", async () => {
+    // Two applies in flight at once. With a single owner slot, B's apply overwrote
+    // A's and B finishing re-enabled A's control while A's sessions were still being
+    // launched - which is an invitation to launch the whole preset twice. Driven on
+    // the standalone tab, which is the only place presets are offered.
+    serveAnyWorkspace();
+    localStorage.setItem(
+      "middleman-workspace-layout-presets",
+      JSON.stringify([
+        {
+          id: "preset-1",
+          name: "Pair",
+          createdAt: "2026-04-29T00:00:00Z",
+          updatedAt: "2026-04-29T00:00:00Z",
+          sessions: [{ sourceKey: "s1", targetKey: "helper", region: "workflow", label: "Helper" }],
+          layout: JSON.parse(persistedSplitWorkflowLayout("s1")),
+        },
+      ]),
+    );
+    const launchA = deferred<typeof runningSession>();
+    const launchB = deferred<typeof runningSession>();
+    mocks.launchWorkspaceSession.mockReturnValueOnce(launchA.promise).mockReturnValueOnce(launchB.promise);
+    mocks.getWorkspaceRuntime.mockResolvedValue(runtimeWithLaunchTargetsOnly());
+
+    const { rerender } = render(WorkspaceTerminalView, { props: { workspaceId: "ws-1" } });
+
+    const presetTrigger = () => screen.getByRole("button", { name: "Workflow presets" });
+    async function applyPreset(): Promise<void> {
+      await fireEvent.click(presetTrigger());
+      await fireEvent.click(screen.getAllByRole("button", { name: /Pair/ })[0]!);
+    }
+
+    await waitFor(() => expect(presetTrigger()).toBeTruthy());
+    await applyPreset();
+    await waitFor(() => expect(presetTrigger().hasAttribute("disabled")).toBe(true));
+
+    await rerender({ workspaceId: "ws-2" });
+    await waitFor(() => expect(presetTrigger().hasAttribute("disabled")).toBe(false));
+    await applyPreset();
+    await waitFor(() => expect(presetTrigger().hasAttribute("disabled")).toBe(true));
+
+    // B finishes first.
+    launchB.resolve(runningSession);
+    await waitFor(() => expect(presetTrigger().hasAttribute("disabled")).toBe(false));
+
+    await rerender({ workspaceId: "ws-1" });
+    await waitFor(() => expect(presetTrigger().hasAttribute("disabled")).toBe(true));
+
+    launchA.resolve(runningSession);
+  });
+
+  it("leaves workflow presets out of an embedded workspace's controls", async () => {
+    claimForPrs();
+
+    render(WorkspaceTerminalView, {
+      props: {
+        workspaceId: "ws-1",
+        paneSurface: "prs" as const,
+      },
+    });
+
+    await waitFor(() => expect(hostedWorkspaceControls()).not.toBeNull());
+    render(WorkspacePaneControls);
+    await fireEvent.click(screen.getByRole("button", { name: "Workspace controls" }));
+
+    // Presets compose a whole multi-session workflow, which is the standalone tab's
+    // job; a pane hosts one workspace beside the thing being reviewed.
+    const controls = within(screen.getByRole("dialog", { name: "Workspace controls" }));
+    expect(controls.queryByRole("button", { name: "Workflow presets" })).toBeNull();
+    expect(controls.getByRole("button", { name: "Launch session" })).toBeTruthy();
+  });
+
+  it("keeps a terminal settings save busy across a workspace switch", async () => {
+    // Terminal font size is an app setting written through one single-flight
+    // controller, so a save is in flight for every workspace at once. Keying the busy
+    // flag by workspace reported the next one's controls free while the controller was
+    // still refusing input - an enabled button that does nothing.
+    serveAnyWorkspace();
+    const save = deferred<{ terminal: { font_size: number } }>();
+    mocks.mockUpdateSettings.mockReturnValueOnce(save.promise);
+    claimForPrs();
+
+    const { rerender } = render(WorkspaceTerminalView, {
+      props: {
+        workspaceId: "ws-1",
+        paneSurface: "prs" as const,
+      },
+    });
+    await waitFor(() => expect(hostedWorkspaceControls()).not.toBeNull());
+    render(WorkspacePaneControls);
+    await fireEvent.click(screen.getByRole("button", { name: "Workspace controls" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Increase terminal font size" }));
+    await waitFor(() => expect(workspaceControlsBusy()).toBe(true));
+
+    await rerender({ workspaceId: "ws-2", paneSurface: "prs" as const });
+    await waitFor(() => expect(hostedWorkspaceControls()?.workspaceKey).toContain("ws-2"));
+    expect(workspaceControlsBusy()).toBe(true);
+
+    save.resolve({ terminal: { font_size: 15 } });
+    await waitFor(() => expect(workspaceControlsBusy()).toBe(false));
+  });
+
+  it("keeps its own toolbar on the standalone Workspaces tab", async () => {
+    render(WorkspaceTerminalView, {
+      props: {
+        workspaceId: "ws-1",
+      },
+    });
+
+    // That tab's panes have no tab strip to hold the controls, so the bar stays
+    // and nothing is published for a detail pane to render.
+    await waitFor(() => expect(document.querySelector(".workspace-toolbar")).not.toBeNull());
+    expect(hostedWorkspaceControls()).toBeNull();
+  });
+
+  describe("launcher overlay", () => {
+    it("drops the Home tab in a pane and opens the launcher when nothing is running", async () => {
+      localStorage.setItem("middleman-workspace-active-tab:ws-1", "home");
+      mocks.getWorkspaceRuntime.mockResolvedValue(runtimeWithLaunchTargetsOnly());
+      claimForPrs();
+
+      render(WorkspaceTerminalView, {
+        props: {
+          workspaceId: "ws-1",
+          paneSurface: "prs" as const,
+        },
+      });
+
+      // The pane's one slot goes to a terminal, not to a surface only used to start
+      // one; with nothing to show, the launcher is what opens instead of an empty
+      // strip.
+      await waitFor(() => expect(screen.getByRole("dialog", { name: /Launch a session/ })).toBeTruthy());
+      expect(screen.queryByRole("tab", { name: "Home" })).toBeNull();
+    });
+
+    it("leaves a broken workspace's error on screen instead of covering it with the launcher", async () => {
+      // A worktree whose setup failed, or whose tmux server dropped its session,
+      // reports zero sessions for the same reason it reports an error. Auto-opening
+      // the launcher there covered the error message - and its Retry and Delete, the
+      // only two useful actions - with an invitation to start an agent inside
+      // something that cannot run one.
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockImplementation((input: Request | URL | string) => {
+          const { pathname } = new URL(input instanceof Request ? input.url : String(input), "http://localhost");
+          if (/\/workspaces\/[^/]+$/.test(pathname)) {
+            return Promise.resolve(
+              Response.json({
+                ...workspaceResponse,
+                status: "error",
+                error_message: "tmux session is no longer running: middleman-ws-1",
+              }),
+            );
+          }
+          return Promise.resolve(Response.json({}));
+        }),
+      );
+      mocks.getWorkspaceRuntime.mockResolvedValue(runtimeWithLaunchTargetsOnly());
+      claimForPrs();
+
+      render(WorkspaceTerminalView, {
+        props: {
+          workspaceId: "ws-1",
+          paneSurface: "prs" as const,
+        },
+      });
+
+      await waitFor(() => expect(screen.getByText(/tmux session is no longer running/)).toBeTruthy());
+      expect(screen.queryByRole("dialog", { name: /Launch a session/ })).toBeNull();
+    });
+
+    it("stays away while a workspace is still being created", async () => {
+      // Retry leaves the workspace "creating" while the runtime the view still holds
+      // -- zero sessions, from before the failure -- says it has nothing to show.
+      // Refusing only "error" would put the launcher over a half-built worktree.
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockImplementation((input: Request | URL | string) => {
+          const { pathname } = new URL(input instanceof Request ? input.url : String(input), "http://localhost");
+          if (/\/workspaces\/[^/]+$/.test(pathname)) {
+            return Promise.resolve(Response.json({ ...workspaceResponse, status: "creating" }));
+          }
+          return Promise.resolve(Response.json({}));
+        }),
+      );
+      mocks.getWorkspaceRuntime.mockResolvedValue(runtimeWithLaunchTargetsOnly());
+      claimForPrs();
+
+      render(WorkspaceTerminalView, {
+        props: { workspaceId: "ws-1", paneSurface: "prs" as const },
+      });
+
+      await waitFor(() => expect(mocks.getWorkspaceRuntime).toHaveBeenCalled());
+      await waitFor(() => expect(screen.queryByRole("dialog", { name: /Launch a session/ })).toBeNull());
+    });
+
+    it("gives a recovered workspace its launcher back", async () => {
+      // The view withdrew the launcher itself when the workspace broke under it, so
+      // the once-per-workspace marker has to come off with it. Kept, it would spend
+      // the workspace's one automatic launcher on a state that refused to show it,
+      // and the workspace that recovers -- setup finished, still nothing running --
+      // would come back with nothing on screen and no way to know why.
+      const eventListeners: Record<string, () => void> = {};
+      vi.stubGlobal(
+        "EventSource",
+        class {
+          addEventListener(type: string, callback: () => void): void {
+            eventListeners[type] = callback;
+          }
+          close(): void {}
+        },
+      );
+      let status = "ready";
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockImplementation((input: Request | URL | string) => {
+          const { pathname } = new URL(input instanceof Request ? input.url : String(input), "http://localhost");
+          if (/\/workspaces\/[^/]+$/.test(pathname)) {
+            return Promise.resolve(
+              Response.json({
+                ...workspaceResponse,
+                status,
+                error_message: status === "error" ? "tmux session is no longer running: middleman-ws-1" : null,
+              }),
+            );
+          }
+          return Promise.resolve(Response.json({}));
+        }),
+      );
+      mocks.getWorkspaceRuntime.mockResolvedValue(runtimeWithLaunchTargetsOnly());
+      claimForPrs();
+
+      render(WorkspaceTerminalView, {
+        props: { workspaceId: "ws-1", paneSurface: "prs" as const },
+      });
+      await waitFor(() => expect(screen.getByRole("dialog", { name: /Launch a session/ })).toBeTruthy());
+
+      // The tmux server drops the session out from under a workspace the view is
+      // already showing a launcher for.
+      status = "error";
+      eventListeners["reconnect.stale"]?.();
+      await waitFor(() => expect(screen.getByText(/tmux session is no longer running/)).toBeTruthy());
+      expect(screen.queryByRole("dialog", { name: /Launch a session/ })).toBeNull();
+
+      status = "ready";
+      eventListeners["reconnect.stale"]?.();
+      await waitFor(() => expect(screen.getByRole("dialog", { name: /Launch a session/ })).toBeTruthy());
+    });
+
+    it("leaves a docked terminal alone instead of covering it with the launcher", async () => {
+      localStorage.setItem("middleman-workspace-active-tab:ws-1", "home");
+      localStorage.setItem(
+        "middleman-workspace-terminal-layout:ws-1",
+        persistedSplitWorkflowLayout("ws-1_shell_a", "terminal"),
+      );
+      mocks.getWorkspaceRuntime.mockResolvedValue(runtimeWithTerminalSession());
+      claimForPrs();
+
+      render(WorkspaceTerminalView, {
+        props: {
+          workspaceId: "ws-1",
+          paneSurface: "prs" as const,
+        },
+      });
+
+      // The sole-session surface replaces the dock panel without changing the
+      // launcher's rule: the terminal is on screen, so the overlay stays away.
+      await waitFor(() => expect(document.querySelector(".sole-embedded-session")).not.toBeNull());
+      expect(screen.queryByRole("dialog", { name: /Launch a session/ })).toBeNull();
+    });
+
+    it("keeps the Home tab on the standalone Workspaces tab", async () => {
+      localStorage.setItem("middleman-workspace-active-tab:ws-1", "home");
+      mocks.getWorkspaceRuntime.mockResolvedValue(runtimeWithLaunchTargetsOnly());
+
+      render(WorkspaceTerminalView, {
+        props: {
+          workspaceId: "ws-1",
+        },
+      });
+
+      // That tab has room for it, and its chrome is out of scope here.
+      expect(await screen.findByRole("tab", { name: "Home" })).toBeTruthy();
+      expect(screen.queryByRole("dialog", { name: /Launch a session/ })).toBeNull();
+    });
+
+    it("leaves a running workspace's sessions on screen instead of the launcher", async () => {
+      localStorage.setItem("middleman-workspace-active-tab:ws-1", "home");
+      localStorage.setItem("middleman-workspace-terminal-layout:ws-1", persistedSplitWorkflowLayout("ws-1:helper"));
+      claimForPrs();
+
+      render(WorkspaceTerminalView, {
+        props: {
+          workspaceId: "ws-1",
+          paneSurface: "prs" as const,
+        },
+      });
+
+      // A remembered Home tab names a tab that does not exist here, so the session
+      // takes its place directly rather than the overlay covering a live terminal.
+      await waitFor(() => expect(document.querySelector(".sole-embedded-session")).not.toBeNull());
+      expect(screen.queryByRole("dialog", { name: /Launch a session/ })).toBeNull();
+    });
+
+    it("closes on a successful launch and stays open when one fails", async () => {
+      mocks.getWorkspaceRuntime.mockResolvedValue(runtimeWithLaunchTargetsOnly());
+      mocks.launchWorkspaceSession.mockRejectedValueOnce(new Error("helper not on PATH"));
+      claimForPrs();
+
+      render(WorkspaceTerminalView, {
+        props: {
+          workspaceId: "ws-1",
+          paneSurface: "prs" as const,
+        },
+      });
+
+      const dialog = await screen.findByRole("dialog", { name: /Launch a session/ });
+      await fireEvent.click(within(dialog).getByRole("button", { name: /Helper/ }));
+
+      // A failed launch leaves nothing to show, so closing the overlay would strand
+      // the user on an empty pane with the error out of sight.
+      await waitFor(() => expect(mocks.showFlash).toHaveBeenCalled());
+      expect(screen.getByRole("dialog", { name: /Launch a session/ })).toBeTruthy();
+
+      mocks.launchWorkspaceSession.mockResolvedValueOnce(runningSession);
+      mocks.getWorkspaceRuntime.mockResolvedValue(runtimeWithStaleSession());
+      await fireEvent.click(within(dialog).getByRole("button", { name: /Helper/ }));
+
+      await waitFor(() => expect(screen.queryByRole("dialog", { name: /Launch a session/ })).toBeNull());
+      await waitFor(() => expect(document.querySelector(".sole-embedded-session")).not.toBeNull());
+    });
+
+    it("takes back an auto-opened launcher once a session shows up", async () => {
+      const eventListeners: Record<string, () => void> = {};
+      vi.stubGlobal(
+        "EventSource",
+        class {
+          addEventListener(type: string, callback: () => void): void {
+            eventListeners[type] = callback;
+          }
+          close(): void {}
+        },
+      );
+      mocks.getWorkspaceRuntime.mockResolvedValue(runtimeWithLaunchTargetsOnly());
+      claimForPrs();
+
+      render(WorkspaceTerminalView, {
+        props: {
+          workspaceId: "ws-1",
+          paneSurface: "prs" as const,
+        },
+      });
+
+      await screen.findByRole("dialog", { name: /Launch a session/ });
+
+      // A reconnect (or a first runtime load that lands before its sessions do)
+      // reports zero sessions for a moment. The launcher opened over that gap is
+      // ours to take back, or it sits on top of the terminal it stood in for.
+      mocks.getWorkspaceRuntime.mockResolvedValue(runtimeWithStaleSession());
+      eventListeners["reconnect.stale"]?.();
+
+      await waitFor(() => expect(document.querySelector(".sole-embedded-session")).not.toBeNull());
+      await waitFor(() => expect(screen.queryByRole("dialog", { name: /Launch a session/ })).toBeNull());
+    });
+
+    it("keeps the launcher up when the reload after a launch fails", async () => {
+      mocks.getWorkspaceRuntime.mockResolvedValue(runtimeWithLaunchTargetsOnly());
+      claimForPrs();
+
+      render(WorkspaceTerminalView, {
+        props: {
+          workspaceId: "ws-1",
+          paneSurface: "prs" as const,
+        },
+      });
+
+      const dialog = await screen.findByRole("dialog", { name: /Launch a session/ });
+      mocks.launchWorkspaceSession.mockResolvedValueOnce(runningSession);
+      mocks.getWorkspaceRuntime.mockRejectedValueOnce(new Error("runtime unavailable"));
+      await fireEvent.click(within(dialog).getByRole("button", { name: /Helper/ }));
+
+      // The session did start, but the pane can only render what the runtime
+      // reports: closing here would leave an empty pane and no explanation.
+      await waitFor(() => expect(mocks.showFlash).toHaveBeenCalled());
+      expect(screen.getByRole("dialog", { name: /Launch a session/ })).toBeTruthy();
+    });
+
+    it("does not carry an open launcher into the next workspace", async () => {
+      serveAnyWorkspace();
+      mocks.getWorkspaceRuntime.mockResolvedValue(runtimeWithLaunchTargetsOnly());
+      claimForPrs();
+
+      const { rerender } = render(WorkspaceTerminalView, {
+        props: {
+          workspaceId: "ws-1",
+          paneSurface: "prs" as const,
+        },
+      });
+
+      await screen.findByRole("dialog", { name: /Launch a session/ });
+
+      // One embedded view serves every selection on the surface, so the overlay
+      // has to belong to the workspace it was opened for - otherwise it covers the
+      // next one's live terminal, and the once-per-workspace guard would refuse to
+      // open the launcher that workspace actually needs.
+      mocks.getWorkspaceRuntime.mockResolvedValue(runtimeWithStaleSession());
+      await rerender({ workspaceId: "ws-2", paneSurface: "prs" as const });
+
+      await waitFor(() => expect(screen.queryByRole("dialog", { name: /Launch a session/ })).toBeNull());
+    });
+
+    it("auto-opens again for a workspace visited after another one", async () => {
+      serveAnyWorkspace();
+      mocks.getWorkspaceRuntime.mockResolvedValue(runtimeWithLaunchTargetsOnly());
+      claimForPrs();
+
+      const { rerender } = render(WorkspaceTerminalView, {
+        props: {
+          workspaceId: "ws-1",
+          paneSurface: "prs" as const,
+        },
+      });
+
+      // Dismissed for ws-1, so ws-1 must not get another one...
+      await screen.findByRole("dialog", { name: /Launch a session/ });
+      await fireEvent.keyDown(window, { key: "Escape" });
+      await waitFor(() => expect(screen.queryByRole("dialog", { name: /Launch a session/ })).toBeNull());
+
+      // ...but ws-2 has never been offered one.
+      await rerender({ workspaceId: "ws-2", paneSurface: "prs" as const });
+      await screen.findByRole("dialog", { name: /Launch a session/ });
+      await fireEvent.keyDown(window, { key: "Escape" });
+      await waitFor(() => expect(screen.queryByRole("dialog", { name: /Launch a session/ })).toBeNull());
+
+      await rerender({ workspaceId: "ws-1", paneSurface: "prs" as const });
+
+      // Back on ws-1, whose launcher the user already dismissed. A single-slot
+      // memory forgets ws-1 the moment ws-2 is offered one, and reopening here
+      // traps the user in an overlay they closed.
+      // Settled: the runtime for ws-1 has been applied again and nothing reopened.
+      await waitFor(() => expect(document.querySelector(".terminal-view")).not.toBeNull());
+      expect(screen.queryByRole("dialog", { name: /Launch a session/ })).toBeNull();
+    });
+
+    it("hands the palette an opener only while a pane is hosting the workspace", async () => {
+      mocks.getWorkspaceRuntime.mockResolvedValue(runtimeWithStaleSession());
+      claimForPrs();
+
+      const { unmount } = render(WorkspaceTerminalView, {
+        props: {
+          workspaceId: "ws-1",
+          paneSurface: "prs" as const,
+        },
+      });
+
+      // A palette command sees stores, not components, and the overlay state lives
+      // in the view.
+      await waitFor(() => expect(hostedWorkspaceLauncher("prs")).not.toBeNull());
+      expect(hostedWorkspaceLauncher("issues")).toBeNull();
+
+      unmount();
+      await waitFor(() => expect(hostedWorkspaceLauncher("prs")).toBeNull());
+    });
+  });
+
+  it("keeps its toolbar when the detail surface is flattened", async () => {
+    claimForPrs();
+    // What a narrow detail surface reports: one strip for every pane, per-leaf
+    // chrome suppressed, so the pane has nowhere to hang a controls button and no
+    // tab of its own to name the session.
+    getPaneLayoutStore("prs").notePaneRender({
+      flattened: true,
+      editableTabs: [],
+      onScreenTabs: ["workspace"],
+      soloChromeTabs: [],
+    });
+    render(WorkspaceTerminalView, {
+      props: {
+        workspaceId: "ws-1",
+        paneSurface: "prs" as const,
+      },
+    });
+
+    // Even with a single session, dropping the chrome here would strip the only
+    // route to presets, zoom, terminal options, launch and delete.
+    await waitFor(() => expect(document.querySelector(".workspace-toolbar")).not.toBeNull());
+    expect(document.querySelector(".header-bar")).not.toBeNull();
+  });
+
+  it("publishes the dock's session while the dock is open", async () => {
+    localStorage.setItem("middleman-workspace-active-tab:ws-1", "home");
+    localStorage.setItem(
+      "middleman-workspace-terminal-layout:ws-1",
+      persistedSplitWorkflowLayout("ws-1_shell_a", "terminal"),
+    );
+    mocks.getWorkspaceRuntime.mockResolvedValue(runtimeWithTerminalSession());
+    claimForPrs();
+
+    render(WorkspaceTerminalView, {
+      props: {
+        workspaceId: "ws-1",
+        paneSurface: "prs" as const,
+      },
+    });
+
+    await waitFor(() =>
+      expect(activeHostedSession("prs")?.paneKey).toBe(sessionPaneKey("ws-1", undefined, "ws-1_shell_a")),
+    );
+  });
+
+  it("shows a sole session whose dock was collapsed, and treats it as current", async () => {
+    localStorage.setItem("middleman-workspace-active-tab:ws-1", "home");
+    localStorage.setItem(
+      "middleman-workspace-terminal-layout:ws-1",
+      JSON.stringify({
+        ...JSON.parse(persistedSplitWorkflowLayout("ws-1_shell_a", "terminal")),
+        open: false,
+      }),
+    );
+    mocks.getWorkspaceRuntime.mockResolvedValue(runtimeWithTerminalSession());
+    claimForPrs();
+
+    render(WorkspaceTerminalView, {
+      props: {
+        workspaceId: "ws-1",
+        paneSurface: "prs" as const,
+      },
+    });
+
+    // A pane with one session shows it whatever region it was parked in: the
+    // alternative is a pane rendering nothing but a collapsed dock bar.
+    await waitFor(() => expect(document.querySelector(".sole-embedded-session")).not.toBeNull());
+    // And it must be the current one, or the keyboard commands report no session to
+    // promote while the user is looking straight at it.
+    await waitFor(() => expect(activeHostedSession("prs")?.label).toBe("Shell"));
+  });
+
+  it("mounts a session the workflow tree is already showing, with no click first", async () => {
+    // Opening a PR whose workspace already has an agent running: its session is the
+    // active tab of a workflow leaf before the user touches anything. Mounting used
+    // to happen only in the tab strip's select handler, so that pane came up empty
+    // and stayed empty until something re-selected the tab -- which read as a broken
+    // pane rather than one that needed a click.
+    //
+    // TWO sessions on purpose. With one, the pane renders it through the sole-session
+    // path, which goes nowhere near the workflow tree - so a single session would pass
+    // this whether the mounting effect exists or not.
+    localStorage.setItem("middleman-workspace-active-tab:ws-1", "home");
+    localStorage.setItem(
+      "middleman-workspace-terminal-layout:ws-1",
+      JSON.stringify({
+        version: 1,
+        open: false,
+        dock: "bottom",
+        height: 300,
+        activeSessionKey: null,
+        tree: null,
+        sessionRegions: { "ws-1:helper": "workflow", "ws-1:reviewer": "workflow" },
+        workflowMode: "tabs",
+        workflowTree: {
+          type: "split",
+          id: "wf-split",
+          direction: "horizontal",
+          ratio: 0.5,
+          first: {
+            type: "leaf",
+            id: "wf-helper",
+            tabs: ["session:ws-1:helper"],
+            activeTabKey: "session:ws-1:helper",
+          },
+          second: {
+            type: "leaf",
+            id: "wf-reviewer",
+            tabs: ["session:ws-1:reviewer"],
+            activeTabKey: "session:ws-1:reviewer",
+          },
+        },
+        terminalGroups: [],
+      }),
+    );
+    mocks.getWorkspaceRuntime.mockResolvedValue(runtimeWithTwoWorkflowSessions());
+    claimForPrs();
+
+    render(WorkspaceTerminalView, {
+      props: {
+        workspaceId: "ws-1",
+        paneSurface: "prs" as const,
+      },
+    });
+
+    // One per rendered leaf: what the tree shows is what has a terminal.
+    await waitFor(() => expect(document.querySelectorAll(".session-terminal-slot").length).toBe(2));
+    expect(document.querySelector(".sole-embedded-session")).toBeNull();
+  });
+
+  it("publishes a collapsed dock's session without making it current", async () => {
+    localStorage.setItem("middleman-workspace-active-tab:ws-1", "session:ws-1:helper");
+    localStorage.setItem(
+      "middleman-workspace-terminal-layout:ws-1",
+      JSON.stringify({
+        version: 1,
+        open: false,
+        dock: "bottom",
+        height: 300,
+        activeSessionKey: "ws-1_shell_a",
+        tree: { type: "leaf", id: "dock-leaf", sessionKey: "ws-1_shell_a" },
+        sessionRegions: { "ws-1:helper": "workflow", "ws-1_shell_a": "terminal" },
+        workflowMode: "tabs",
+        workflowTree: { type: "leaf", id: "wf-leaf", tabKey: "session:ws-1:helper" },
+      }),
+    );
+    mocks.getWorkspaceRuntime.mockResolvedValue({
+      launch_targets: [],
+      sessions: [runningSession, runningShellSession],
+    });
+    claimForPrs();
+
+    render(WorkspaceTerminalView, {
+      props: {
+        workspaceId: "ws-1",
+        paneSurface: "prs" as const,
+      },
+    });
+
+    // Two sessions, so the pane keeps its chrome and the collapsed dock really does
+    // render nothing: promoting its session by keyboard would move a terminal the
+    // user cannot see. Its pane is still offered, since promoting from the strip is
+    // a different, deliberate act.
+    await waitFor(() => expect(getInlineWorkspaceController("prs").promotableSessions()).toHaveLength(2));
+    expect(activeHostedSession("prs")?.label).toBe("Helper");
+  });
+
+  describe("promoted sessions", () => {
+    it("gives a parked row-only dock the sole workspace actions and live dialogs", async () => {
+      localStorage.setItem(
+        "middleman-workspace-terminal-layout:ws-1",
+        JSON.stringify({
+          version: 1,
+          open: true,
+          dock: "bottom",
+          height: 300,
+          activeSessionKey: "ws-1_shell_a",
+          tree: { type: "leaf", id: "dock-leaf", sessionKey: "ws-1_shell_a" },
+          sessionRegions: {
+            "ws-1:helper": "workflow",
+            "ws-1_shell_a": "terminal",
+          },
+          workflowMode: "tabs",
+          workflowTree: {
+            type: "leaf",
+            id: "wf-session",
+            tabs: ["session:ws-1:helper"],
+            activeTabKey: "session:ws-1:helper",
+          },
+          customSessionLabels: {},
+        }),
+      );
+      mocks.getWorkspaceRuntime.mockResolvedValue({
+        launch_targets: [],
+        sessions: [runningSession, runningShellSession],
+      });
+      claimForPrs();
+      noteWorkspacePaneRendered("prs");
+      const paneKey = promoteSession("prs", "ws-1:helper");
+
+      render(WorkspaceTerminalView, {
+        props: {
+          workspaceId: "ws-1",
+          paneSurface: "prs" as const,
+          hostVisible: false,
+        },
+      });
+
+      const controller = getInlineWorkspaceController("prs");
+      await waitFor(() => expect(controller.workspacePaneRowOnly()).toBe(true));
+      expect(controller.dockRow()).not.toBeNull();
+
+      const externalDock = await screen.findByRole("region", { name: "Terminal panel" });
+      render(WorkspacePaneControls, { props: { showStripActions: false } });
+      expect(screen.getAllByRole("button", { name: /^Delete workspace / })).toHaveLength(1);
+      expect(screen.getAllByRole("button", { name: "Workspace controls" })).toHaveLength(2);
+
+      await fireEvent.click(within(externalDock).getByRole("button", { name: /^Delete workspace / }));
+      const deleteDialog = await screen.findByRole("dialog", { name: "Delete workspace?" });
+      await fireEvent.click(within(deleteDialog).getByRole("button", { name: "Cancel" }));
+
+      await fireEvent.click(within(externalDock).getByRole("button", { name: "Workspace controls" }));
+      const controls = await screen.findByRole("dialog", { name: "Workspace controls" });
+      await fireEvent.click(within(controls).getByRole("button", { name: "Launch session" }));
+      const launcher = await screen.findByRole("dialog", { name: "Launch a session" });
+      await fireEvent.click(within(launcher).getByRole("button", { name: "Close" }));
+
+      await fireEvent.click(within(externalDock).getByRole("button", { name: "Move Shell to a pane" }));
+      const shellPaneKey = sessionPaneKey("ws-1", undefined, "ws-1_shell_a");
+      const layout = getPaneLayoutStore("prs");
+      await waitFor(() => expect(layout.hasTab(shellPaneKey)).toBe(true));
+
+      layout.demoteTab(shellPaneKey);
+      layout.demoteTab(paneKey);
+      await waitFor(() => expect(controller.workspacePaneRowOnly()).toBe(false));
+      expect(controller.dockRow()).toBeNull();
+    });
+
+    it("masks a promoted session out of the workflow strip and gives back its placement on demote", async () => {
+      localStorage.setItem("middleman-workspace-active-tab:ws-1", "session:ws-1:reviewer");
+      localStorage.setItem(
+        "middleman-workspace-terminal-layout:ws-1",
+        persistedTwoSessionWorkflowLayout("ws-1:reviewer", "ws-1:helper"),
+      );
+      mocks.getWorkspaceRuntime.mockResolvedValue(runtimeWithTwoWorkflowSessions());
+      const paneKey = promoteSession("prs", "ws-1:helper");
+
+      render(WorkspaceTerminalView, {
+        props: {
+          workspaceId: "ws-1",
+          paneSurface: "prs" as const,
+        },
+      });
+
+      const reviewerTab = await screen.findByRole("tab", { name: /Reviewer/ });
+      // The detail pane is showing this session, so the container must not show it
+      // too: two slots for one terminal race for it and one renders empty.
+      expect(screen.queryByRole("tab", { name: /Helper/ })).toBeNull();
+
+      getPaneLayoutStore("prs").demoteTab(paneKey);
+
+      const helperTab = await screen.findByRole("tab", { name: /Helper/ });
+      // Its own leaf, not merged into the other session's. Masking must not prune
+      // the stored tree, or a demotion returns the session to the region and loses
+      // the place the user put it in.
+      expect(helperTab.closest('[role="tablist"]')).not.toBe(reviewerTab.closest('[role="tablist"]'));
+    });
+
+    it("keeps a promoted session's terminal live without a tab of its own", async () => {
+      localStorage.setItem("middleman-workspace-active-tab:ws-1", "home");
+      localStorage.setItem("middleman-workspace-terminal-layout:ws-1", persistedSplitWorkflowLayout("ws-1:helper"));
+      promoteSession("prs", "ws-1:helper");
+
+      render(WorkspaceTerminalView, {
+        props: {
+          workspaceId: "ws-1",
+          paneSurface: "prs" as const,
+        },
+      });
+
+      // Nothing in the container renders it, so only the pool can: a promoted
+      // session that is not mounted leaves the detail pane's slot empty.
+      await waitFor(() =>
+        expect(sockets.some((socket) => socket.url.includes("/sessions/ws-1:helper/terminal"))).toBe(true),
+      );
+    });
+
+    it("masks a promoted session out of the terminal dock too", async () => {
+      localStorage.setItem("middleman-workspace-active-tab:ws-1", "home");
+      localStorage.setItem(
+        "middleman-workspace-terminal-layout:ws-1",
+        persistedSplitWorkflowLayout("ws-1_shell_a", "terminal"),
+      );
+      mocks.getWorkspaceRuntime.mockResolvedValue(runtimeWithTerminalSession());
+      const paneKey = promoteSession("prs", "ws-1_shell_a");
+      claimForPrs();
+      noteWorkspacePaneRendered("prs");
+
+      render(WorkspaceTerminalView, {
+        props: {
+          workspaceId: "ws-1",
+          paneSurface: "prs" as const,
+        },
+      });
+
+      // A masked leaf must be pruned, not left rendering the dock's
+      // session-unavailable placeholder for a session that is alive elsewhere -
+      // and an emptied dock collapses rather than sitting open on nothing.
+      await screen.findByRole("button", { name: "Open terminal panel" });
+      expect(screen.queryByText("Session unavailable")).toBeNull();
+
+      getPaneLayoutStore("prs").demoteTab(paneKey);
+      // Back in the dock as the embedded pane's sole session, which renders
+      // chrome-free: no dock row at all, and still no placeholder.
+      await waitFor(() => {
+        expect(document.querySelector(".terminal-panel")).toBeNull();
+      });
+      expect(screen.queryByText("Session unavailable")).toBeNull();
+    });
+
+    it("promotes a docked session from its own control", async () => {
+      localStorage.setItem("middleman-workspace-active-tab:ws-1", "home");
+      localStorage.setItem(
+        "middleman-workspace-terminal-layout:ws-1",
+        persistedSplitWorkflowLayout("ws-1_shell_a", "terminal"),
+      );
+      // Two, because the per-session header carrying this control only renders
+      // once the dock holds more than one session.
+      mocks.getWorkspaceRuntime.mockResolvedValue(runtimeWithTwoTerminalSessions());
+      claimForPrs();
+      noteWorkspacePaneRendered("prs");
+
+      render(WorkspaceTerminalView, {
+        props: {
+          workspaceId: "ws-1",
+          paneSurface: "prs" as const,
+        },
+      });
+
+      const promote = await screen.findByRole("button", { name: "Move Shell to a pane" });
+      await fireEvent.click(promote);
+
+      const layout = getPaneLayoutStore("prs");
+      const paneKey = sessionPaneKey("ws-1", undefined, "ws-1_shell_a");
+      expect(layout.hasTab(paneKey)).toBe(true);
+      // Its own leaf beside the workspace pane, the same placement the palette
+      // command uses: a tab stacked behind the workspace pane would look like the
+      // control did nothing.
+      expect(layout.leafIDForTab(paneKey)).not.toBe(layout.leafIDForTab("workspace"));
+      // And masked out of the dock it came from; where the dock puts what is left
+      // is the masking tests' subject, not this one's.
+      await waitFor(() => expect(screen.queryByRole("button", { name: "Move Shell to a pane" })).toBeNull());
+    });
+
+    it("keeps the only docked session available to pane commands without dock chrome", async () => {
+      localStorage.setItem("middleman-workspace-active-tab:ws-1", "home");
+      localStorage.setItem(
+        "middleman-workspace-terminal-layout:ws-1",
+        persistedSplitWorkflowLayout("ws-1_shell_a", "terminal"),
+      );
+      mocks.getWorkspaceRuntime.mockResolvedValue(runtimeWithTerminalSession());
+      claimForPrs();
+      noteWorkspacePaneRendered("prs");
+
+      render(WorkspaceTerminalView, {
+        props: {
+          workspaceId: "ws-1",
+          paneSurface: "prs" as const,
+        },
+      });
+
+      const paneKey = sessionPaneKey("ws-1", undefined, "ws-1_shell_a");
+      await waitFor(() =>
+        expect(getInlineWorkspaceController("prs").promotableSessions()).toEqual([{ paneKey, label: "Shell" }]),
+      );
+      expect(screen.queryByRole("button", { name: "Move Shell to a pane" })).toBeNull();
+      // The dock stays on screen in a chrome-free pane, except here: the sole session
+      // IS the dock's, so the stage is already showing it. A dock underneath would
+      // aim a second slot at the same registry key, and one terminal host cannot be
+      // in two places at once.
+      expect(screen.queryByRole("region", { name: "Terminal panel" })).toBeNull();
+    });
+
+    it("offers no promote control on the standalone Workspaces tab", async () => {
+      localStorage.setItem("middleman-workspace-active-tab:ws-1", "home");
+      localStorage.setItem(
+        "middleman-workspace-terminal-layout:ws-1",
+        persistedSplitWorkflowLayout("ws-1_shell_a", "terminal"),
+      );
+      mocks.getWorkspaceRuntime.mockResolvedValue(runtimeWithTwoTerminalSessions());
+
+      render(WorkspaceTerminalView, {
+        props: {
+          workspaceId: "ws-1",
+        },
+      });
+
+      // The session's other controls are there, so the header rendered; only the
+      // promote one is absent. No detail surface is hosting this workspace, so
+      // there is no tree to promote into and the control would lead nowhere.
+      await screen.findByRole("button", { name: "Move Shell to workflow" });
+      expect(screen.queryByRole("button", { name: "Move Shell to a pane" })).toBeNull();
+    });
+
+    it("masks nothing on the standalone Workspaces tab, which has no detail panes", async () => {
+      localStorage.setItem("middleman-workspace-active-tab:ws-1", "home");
+      localStorage.setItem("middleman-workspace-terminal-layout:ws-1", persistedSplitWorkflowLayout("ws-1:helper"));
+      promoteSession("prs", "ws-1:helper");
+
+      render(WorkspaceTerminalView, {
+        props: {
+          workspaceId: "ws-1",
+        },
+      });
+
+      // Promotion is per surface. A session promoted in the PRs surface is still
+      // at home here, and hiding it would leave it unreachable.
+      expect(await screen.findByRole("tab", { name: /Helper/ })).toBeTruthy();
+    });
+  });
+  it("demotes a promoted session dropped back on the workflow strip", async () => {
+    localStorage.setItem("middleman-workspace-active-tab:ws-1", "session:ws-1:reviewer");
+    localStorage.setItem(
+      "middleman-workspace-terminal-layout:ws-1",
+      persistedTwoSessionWorkflowLayout("ws-1:reviewer", "ws-1:helper"),
+    );
+    mocks.getWorkspaceRuntime.mockResolvedValue(runtimeWithTwoWorkflowSessions());
+    const paneKey = promoteSession("prs", "ws-1:helper");
+
+    render(WorkspaceTerminalView, {
+      props: {
+        workspaceId: "ws-1",
+        paneSurface: "prs" as const,
+      },
+    });
+
+    // A pane has no Home tab, so the workspace's other session is the strip the
+    // promoted one can be dropped back onto.
+    const reviewerTab = await screen.findByRole("tab", { name: /Reviewer/ });
+    expect(screen.queryByRole("tab", { name: /Helper/ })).toBeNull();
+    await waitFor(() =>
+      expect(sockets.some((socket) => socket.url.includes("/sessions/ws-1:helper/terminal"))).toBe(true),
+    );
+    const socket = sockets.find((candidate) => candidate.url.includes("/sessions/ws-1:helper/terminal"))!;
+
+    // The pane's own drag, arriving from the surface's tree: same scope, and a
+    // key in the canonical form the workspace tab does not use.
+    const dataTransfer = fakeDataTransfer();
+    startTabbedPanelTabDrag({ dataTransfer } as unknown as DragEvent, { scope: "detail:prs", tabKey: paneKey });
+    const reviewerStrip = reviewerTab.closest('[role="tablist"]')!;
+    await fireEvent.dragOver(reviewerStrip, { dataTransfer, clientX: 5 });
+    await fireEvent.drop(reviewerStrip, { dataTransfer, clientX: 5 });
+    clearActiveTabbedPanelDrag();
+
+    // Demoted, and placed where it was dropped rather than back in the leaf it
+    // came from: the drop names a target, so honoring the stored placement here
+    // would ignore the gesture.
+    const helperTab = await screen.findByRole("tab", { name: /Helper/ });
+    expect(getPaneLayoutStore("prs").hasTab(paneKey)).toBe(false);
+    expect(helperTab.closest('[role="tablist"]')).toBe(reviewerStrip);
+    // Same shell, still attached: the drop reparents the pooled terminal into the
+    // workflow slot rather than tearing it down and reattaching.
+    expect(sockets.filter((candidate) => candidate.url.includes("/sessions/ws-1:helper/terminal"))).toHaveLength(1);
+    expect(socket.close).not.toHaveBeenCalled();
+  });
+
+  it("demotes a promoted session dropped into a terminal split", async () => {
+    const persisted = JSON.parse(persistedTwoSessionWorkflowLayout("ws-1:reviewer", "ws-1:helper")) as Record<
+      string,
+      unknown
+    >;
+    persisted.open = true;
+    persisted.activeSessionKey = "ws-1_shell_a";
+    persisted.tree = {
+      type: "leaf",
+      id: "dock-leaf",
+      sessionKey: "ws-1_shell_a",
+    };
+    persisted.sessionRegions = {
+      "ws-1:reviewer": "workflow",
+      "ws-1:helper": "workflow",
+      "ws-1_shell_a": "terminal",
+    };
+    localStorage.setItem("middleman-workspace-terminal-layout:ws-1", JSON.stringify(persisted));
+    mocks.getWorkspaceRuntime.mockResolvedValue({
+      launch_targets: [],
+      sessions: [reviewerSession, runningSession, runningShellSession],
+    });
+    claimForPrs();
+    noteWorkspacePaneRendered("prs");
+    const paneKey = promoteSession("prs", "ws-1:helper");
+
+    render(WorkspaceTerminalView, {
+      props: {
+        workspaceId: "ws-1",
+        paneSurface: "prs" as const,
+      },
+    });
+
+    const terminalTarget = await screen.findByRole("group", {
+      name: "Shell split drop targets",
+    });
+    vi.spyOn(terminalTarget, "getBoundingClientRect").mockReturnValue({
+      x: 0,
+      y: 0,
+      top: 0,
+      left: 0,
+      right: 400,
+      bottom: 300,
+      width: 400,
+      height: 300,
+      toJSON: () => ({}),
+    });
+
+    const dataTransfer = fakeDataTransfer();
+    startTabbedPanelTabDrag({ dataTransfer } as unknown as DragEvent, { scope: "detail:prs", tabKey: paneKey });
+    await fireEvent.dragOver(terminalTarget, {
+      dataTransfer,
+      clientX: 200,
+      clientY: 150,
+    });
+    await fireEvent.drop(terminalTarget, {
+      dataTransfer,
+      clientX: 200,
+      clientY: 150,
+    });
+    clearActiveTabbedPanelDrag();
+
+    expect(getPaneLayoutStore("prs").hasTab(paneKey)).toBe(false);
+    expect(await screen.findByRole("button", { name: "Move Helper to workflow" })).toBeTruthy();
+    expect(screen.getByRole("tab", { name: /Reviewer/ })).toBeTruthy();
+  });
+
+  it("refuses a session pane dropped from another workspace", async () => {
+    localStorage.setItem("middleman-workspace-active-tab:ws-1", "session:ws-1:reviewer");
+    localStorage.setItem(
+      "middleman-workspace-terminal-layout:ws-1",
+      persistedTwoSessionWorkflowLayout("ws-1:reviewer", "ws-1:helper"),
+    );
+    mocks.getWorkspaceRuntime.mockResolvedValue(runtimeWithTwoWorkflowSessions());
+
+    render(WorkspaceTerminalView, {
+      props: {
+        workspaceId: "ws-1",
+        paneSurface: "prs" as const,
+      },
+    });
+
+    const reviewerTab = await screen.findByRole("tab", { name: /Reviewer/ });
+    const helperTab = await screen.findByRole("tab", { name: /Helper/ });
+    const helperStrip = helperTab.closest('[role="tablist"]');
+    // Same session key, another workspace. A session key is unique only within
+    // its own workspace, so this must not move the local session of that name.
+    const dataTransfer = fakeDataTransfer();
+    startTabbedPanelTabDrag({ dataTransfer } as unknown as DragEvent, {
+      scope: "detail:prs",
+      tabKey: sessionPaneKey("ws-2", undefined, "ws-1:helper"),
+    });
+    const reviewerStrip = reviewerTab.closest('[role="tablist"]')!;
+    await fireEvent.dragOver(reviewerStrip, { dataTransfer, clientX: 5 });
+    await fireEvent.drop(reviewerStrip, { dataTransfer, clientX: 5 });
+    clearActiveTabbedPanelDrag();
+
+    expect(screen.getByRole("tab", { name: /Helper/ }).closest('[role="tablist"]')).toBe(helperStrip);
+    expect(helperStrip).not.toBe(reviewerStrip);
   });
 });
