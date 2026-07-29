@@ -41,21 +41,21 @@ test.describe("activity feed filters", () => {
   });
 
   test("PR filter shows only PR items", async ({ page }) => {
-    await page.getByRole("radio", { name: "PRs" }).click();
+    await page.getByRole("switch", { name: "Issues" }).click();
     await expectAllBadges(page, "PR");
   });
 
   test("Issues filter shows only issue items", async ({ page }) => {
-    await page.getByRole("radio", { name: "Issues" }).click();
+    await page.getByRole("switch", { name: "PRs" }).click();
     await expectAllBadges(page, "Issue");
   });
 
   test("All filter shows both PR and issue items", async ({ page }) => {
-    // Start on PRs to change state, then switch to All.
-    await page.getByRole("radio", { name: "PRs" }).click();
+    // Hide issues to change state, then restore them.
+    await page.getByRole("switch", { name: "Issues" }).click();
     await expectAllBadges(page, "PR");
 
-    await page.getByRole("radio", { name: "All" }).click();
+    await page.getByRole("switch", { name: "Issues" }).click();
 
     // Wait for both badge types to appear, proving the unfiltered
     // response has rendered.
@@ -66,6 +66,35 @@ test.describe("activity feed filters", () => {
     await expect(badges.filter({ hasText: "Issue" }).first()).toBeVisible({
       timeout: 10_000,
     });
+  });
+
+  test("notification-only URLs retain the default item scope", async ({ page }) => {
+    const notificationResponse = page.waitForResponse((response) => {
+      const url = new URL(response.url());
+      return url.pathname === "/api/v1/activity" && url.searchParams.getAll("types").includes("notification");
+    });
+
+    await page.goto("/?types=notification");
+    const requestURL = new URL((await notificationResponse).url());
+
+    expect(requestURL.searchParams.getAll("item_types")).toEqual([]);
+    await expect(page.getByRole("switch", { name: "PRs" })).toBeChecked();
+    await expect(page.getByRole("switch", { name: "Issues" })).toBeChecked();
+    await expect(page.locator(".activity-row .evt-label.evt-notification").first()).toBeVisible();
+    await expect(page.locator(".activity-row .evt-label:not(.evt-notification)")).toHaveCount(0);
+  });
+
+  test("Threaded item toggles hide the complete matching threads", async ({ page }) => {
+    await selectActivityFilterItem(page, "Threaded");
+    await expect(page.locator(".threaded-view .chip--kind-pr").first()).toBeVisible();
+    await expect(page.locator(".threaded-view .chip--kind-issue").first()).toBeVisible();
+
+    await page.getByRole("switch", { name: "PRs" }).click();
+
+    await expect(page.locator(".threaded-view .chip--kind-pr")).toHaveCount(0);
+    await expect(page.locator(".threaded-view .chip--kind-issue").first()).toBeVisible();
+    await expect.poll(() => new URL(page.url()).searchParams.get("types") ?? "").not.toContain("new_pr");
+    await expect.poll(() => new URL(page.url()).searchParams.get("types") ?? "").toContain("new_issue");
   });
 
   test("disabling Comments hides comment rows", async ({ page }) => {
@@ -143,8 +172,8 @@ test.describe("activity feed filters", () => {
   });
 
   test("combined: PRs + hide closed/merged shows only open PRs", async ({ page }) => {
-    // Click PRs filter and wait for filtered DOM.
-    await page.getByRole("radio", { name: "PRs" }).click();
+    // Hide issues and wait for filtered DOM.
+    await page.getByRole("switch", { name: "Issues" }).click();
     await expectAllBadges(page, "PR");
 
     // Enable hide closed/merged (client-side filter).
@@ -159,6 +188,43 @@ test.describe("activity feed filters", () => {
 
     // All remaining badges should still be PR.
     await expectAllBadges(page, "PR");
+  });
+});
+
+test.describe("activity repository-only filtering", () => {
+  let isolatedServer: IsolatedE2EServer | undefined;
+
+  test.beforeAll(async () => {
+    isolatedServer = await startIsolatedE2EServer();
+  });
+
+  test.afterAll(async () => {
+    await isolatedServer?.stop();
+  });
+
+  test("hides all item threads while retaining repository commits", async ({ page }) => {
+    const seeded = await page.request.post(`${isolatedServer!.info.base_url}/__e2e/activity/default-branch-commit`);
+    expect(seeded.status()).toBe(204);
+
+    await page.goto(isolatedServer!.info.base_url);
+    await waitForTable(page);
+    await selectActivityFilterItem(page, "Threaded");
+    await expect(page.locator(".threaded-view .item-row:not(.branch-activity-row)").first()).toBeVisible();
+    await page.getByRole("switch", { name: "PRs" }).click();
+    const repoOnlyResponse = page.waitForResponse((response) => {
+      const url = new URL(response.url());
+      const itemTypes = url.searchParams.getAll("item_types");
+      return url.pathname === "/api/v1/activity" && itemTypes.length === 1 && itemTypes[0] === "repo";
+    });
+    await page.getByRole("switch", { name: "Issues" }).click();
+    await repoOnlyResponse;
+
+    await expect(page.locator(".threaded-view .item-row:not(.branch-activity-row)")).toHaveCount(0);
+    await expect(
+      page.locator(".threaded-view .branch-activity-row", {
+        hasText: "Repository maintenance commit",
+      }),
+    ).toBeVisible();
   });
 });
 
