@@ -932,24 +932,28 @@ func (s *Syncer) Admit(
 	}
 	tracker := s.rateTrackers[key]
 	var providerResetAt *time.Time
+	var providerPacingWindow *QuotaPacingWindow
+	var providerResources []QuotaResource
 	identity, identityErr := s.identityForRepo(repo, false)
 	if ref.Platform == platform.KindGitHub && s.quotaRegistry != nil && identityErr == nil {
-		resources := []QuotaResource{QuotaResourceREST, QuotaResourceGraphQL}
+		providerResources = []QuotaResource{QuotaResourceREST, QuotaResourceGraphQL}
 		availability := s.quotaRegistry.CheckReserve(
-			identity, resources, cost, RateReserveBuffer,
+			identity, providerResources, cost, RateReserveBuffer,
 		)
-		providerResetAt = s.quotaRegistry.EarliestReset(identity, resources)
-		if !availability.Allowed {
+		pacingWindow, pacingKnown := s.quotaRegistry.PacingWindow(identity, providerResources)
+		if !availability.Allowed || !pacingKnown {
 			probe.abandon()
 			retryAt := now.Add(time.Minute)
 			detail := "provider rate reserve reached"
-			if !availability.Known {
+			if !availability.Known || !pacingKnown {
 				detail = "provider quota unknown"
 			} else if availability.ResetAt != nil && availability.ResetAt.After(now) {
 				retryAt = availability.ResetAt.UTC()
 			}
 			return archive.AdmissionResult{RetryAt: &retryAt, Detail: detail}, nil
 		}
+		providerPacingWindow = &pacingWindow
+		providerResetAt = &providerPacingWindow.ResetAt
 	} else if tracker != nil && (tracker.IsPaused() ||
 		tracker.Known() && tracker.Remaining()-cost < RateReserveBuffer) {
 		probe.abandon()
@@ -967,7 +971,15 @@ func (s *Syncer) Admit(
 	available := 0
 	if budget != nil {
 		liveFloor := archiveLiveFloor(ref.Platform)
-		if resetAt == nil && (ref.Platform == platform.KindGitea || ref.Platform == platform.KindForgejo) {
+		if providerPacingWindow != nil {
+			available = budget.ProviderArchiveSpendAvailable(
+				now,
+				*providerPacingWindow,
+				liveFloor,
+				RateReserveBuffer,
+			)
+		} else if resetAt == nil &&
+			(ref.Platform == platform.KindGitea || ref.Platform == platform.KindForgejo) {
 			available = budget.LocalArchiveSpendAvailable(liveFloor)
 		} else {
 			available = budget.ArchiveSpendAvailable(now, resetAt, liveFloor)
@@ -991,7 +1003,13 @@ func (s *Syncer) Admit(
 	completeGitealikeMR := itemType == db.ArchiveItemTypeMergeRequest &&
 		(ref.Platform == platform.KindGitea || ref.Platform == platform.KindForgejo)
 	if !completeGitealikeMR {
-		requestCtx = WithArchiveAttemptAllowance(requestCtx, available)
+		if providerPacingWindow != nil {
+			requestCtx = WithArchiveProviderAttemptAllowance(
+				requestCtx, available, identity, providerResources, RateReserveBuffer, budget,
+			)
+		} else {
+			requestCtx = WithArchiveAttemptAllowance(requestCtx, available)
+		}
 	}
 	var completeOnce sync.Once
 	var featureDeferred *archive.FeatureDeferral

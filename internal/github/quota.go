@@ -2,12 +2,15 @@ package github
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"go.kenn.io/middleman/internal/platform"
 )
 
 type QuotaResource string
@@ -21,14 +24,15 @@ const (
 // GitHub meters REST and GraphQL separately per principal, so a route's App
 // installation and the user's PAT hold independent pools on the same host.
 type QuotaPool struct {
-	Identity  IdentityKey
-	Resource  QuotaResource
-	Limit     int
-	Remaining int
-	ResetAt   time.Time
-	UpdatedAt time.Time
-	Requests  int
-	Known     bool
+	Identity    IdentityKey
+	Resource    QuotaResource
+	Limit       int
+	Remaining   int
+	ResetAt     time.Time
+	UpdatedAt   time.Time
+	Requests    int
+	AttemptCost int // largest observed Remaining decrease per response in this window
+	Known       bool
 }
 
 type quotaKey struct {
@@ -36,16 +40,29 @@ type quotaKey struct {
 	resource QuotaResource
 }
 
+type quotaReservationKey struct {
+	quotaKey
+	resetAt time.Time
+}
+
+type quotaReservation struct {
+	key  quotaReservationKey
+	cost int
+	pool QuotaPool
+}
+
 type QuotaRegistry struct {
-	mu    sync.RWMutex
-	pools map[quotaKey]QuotaPool
-	now   func() time.Time
+	mu           sync.RWMutex
+	pools        map[quotaKey]QuotaPool
+	reservations map[quotaReservationKey]int
+	now          func() time.Time
 }
 
 func NewQuotaRegistry() *QuotaRegistry {
 	return &QuotaRegistry{
-		pools: make(map[quotaKey]QuotaPool),
-		now:   time.Now,
+		pools:        make(map[quotaKey]QuotaPool),
+		reservations: make(map[quotaReservationKey]int),
+		now:          time.Now,
 	}
 }
 
@@ -76,15 +93,18 @@ func (r *QuotaRegistry) ObserveHeaders(
 			// Drop the observation, but the request itself still happened.
 		case pool.Known && reset.Equal(pool.ResetAt):
 			if rate.Remaining < pool.Remaining {
+				pool.AttemptCost = max(pool.AttemptCost, pool.Remaining-rate.Remaining)
 				pool.Remaining = rate.Remaining
 			}
 			pool.Limit = rate.Limit
 			pool.UpdatedAt = r.now().UTC()
 		default:
+			r.clearReservationsBeforeLocked(key, reset)
 			pool.Limit = rate.Limit
 			pool.Remaining = rate.Remaining
 			pool.ResetAt = reset
 			pool.UpdatedAt = r.now().UTC()
+			pool.AttemptCost = 1
 			pool.Known = true
 		}
 	}
@@ -121,6 +141,12 @@ func (r *QuotaRegistry) UpdateSnapshot(
 		r.pools[key] = pool
 		r.mu.Unlock()
 		return
+	}
+	if !pool.Known || !known || !reset.Equal(pool.ResetAt) {
+		pool.AttemptCost = 1
+	}
+	if known && (!pool.Known || reset.After(pool.ResetAt)) {
+		r.clearReservationsBeforeLocked(key, reset)
 	}
 	pool.Limit = rate.Limit
 	pool.Remaining = rate.Remaining
@@ -178,6 +204,48 @@ type QuotaAvailability struct {
 	ResetAt   *time.Time
 }
 
+type QuotaPacingWindow struct {
+	Limit          int
+	Remaining      int
+	ResetAt        time.Time
+	ResourceResets map[QuotaResource]time.Time
+}
+
+func (r *QuotaRegistry) PacingWindow(
+	identity IdentityKey,
+	resources []QuotaResource,
+) (QuotaPacingWindow, bool) {
+	if r == nil || len(resources) == 0 {
+		return QuotaPacingWindow{}, false
+	}
+	now := r.now().UTC()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	window := QuotaPacingWindow{
+		ResourceResets: make(map[QuotaResource]time.Time, len(resources)),
+	}
+	for index, resource := range resources {
+		key := newQuotaKey(identity, resource)
+		pool, ok := r.pools[key]
+		if !ok || !pool.Known || pool.Limit <= 0 || pool.Remaining < 0 ||
+			pool.ResetAt.IsZero() || !pool.ResetAt.After(now) {
+			return QuotaPacingWindow{}, false
+		}
+		if window.Limit == 0 || pool.Limit < window.Limit {
+			window.Limit = pool.Limit
+		}
+		remaining := r.effectiveRemainingLocked(key, pool)
+		if index == 0 || remaining < window.Remaining {
+			window.Remaining = remaining
+		}
+		if pool.ResetAt.After(window.ResetAt) {
+			window.ResetAt = pool.ResetAt
+		}
+		window.ResourceResets[resource] = pool.ResetAt
+	}
+	return window, true
+}
+
 // AllowedOrUnobserved reports whether background work may proceed. Unknown
 // quota is permission to proceed — ordinary response headers are what populate
 // the registry — but only while no observed resource sits at its reserve.
@@ -193,14 +261,17 @@ func (r *QuotaRegistry) CheckReserve(
 ) QuotaAvailability {
 	availability := QuotaAvailability{Allowed: true, Known: true}
 	now := r.now().UTC()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	for _, resource := range resources {
-		pool, ok := r.Get(identity, resource)
+		key := newQuotaKey(identity, resource)
+		pool, ok := r.pools[key]
 		if !ok || !pool.Known || pool.ResetAt.IsZero() || !pool.ResetAt.After(now) {
 			availability.Allowed = false
 			availability.Known = false
 			continue
 		}
-		if pool.Remaining-cost < reserve {
+		if r.effectiveRemainingLocked(key, pool)-cost < reserve {
 			availability.Allowed = false
 			availability.Exhausted = true
 			if !pool.ResetAt.IsZero() &&
@@ -211,6 +282,115 @@ func (r *QuotaRegistry) CheckReserve(
 		}
 	}
 	return availability
+}
+
+func (r *QuotaRegistry) reserveArchiveAttempt(
+	identity IdentityKey,
+	resources []QuotaResource,
+	resource QuotaResource,
+	reserve int,
+) (quotaReservation, bool) {
+	if r == nil || identity.Principal == "" {
+		return quotaReservation{}, false
+	}
+	now := r.now().UTC()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	var targetKey quotaKey
+	var target QuotaPool
+	for _, required := range resources {
+		key := newQuotaKey(identity, required)
+		pool, ok := r.pools[key]
+		if !ok || !pool.Known || pool.ResetAt.IsZero() || !pool.ResetAt.After(now) {
+			return quotaReservation{}, false
+		}
+		remaining := r.effectiveRemainingLocked(key, pool)
+		if required == resource {
+			targetKey = key
+			target = pool
+			continue
+		}
+		if remaining <= reserve {
+			return quotaReservation{}, false
+		}
+	}
+	if target.Resource == "" {
+		return quotaReservation{}, false
+	}
+	cost := max(target.AttemptCost, 1)
+	if r.effectiveRemainingLocked(targetKey, target)-cost < reserve {
+		return quotaReservation{}, false
+	}
+	key := quotaReservationKey{quotaKey: targetKey, resetAt: target.ResetAt.UTC()}
+	r.reservations[key] += cost
+	return quotaReservation{key: key, cost: cost, pool: target}, true
+}
+
+func (r *QuotaRegistry) reconcileArchiveReservation(
+	reservation quotaReservation,
+	observedReset time.Time,
+) {
+	if r == nil || reservation.cost <= 0 || observedReset.IsZero() ||
+		observedReset.Before(reservation.key.resetAt) {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.releaseArchiveReservationLocked(reservation)
+}
+
+func (r *QuotaRegistry) releaseArchiveReservation(reservation quotaReservation) {
+	if r == nil || reservation.cost <= 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.releaseArchiveReservationLocked(reservation)
+}
+
+func (r *QuotaRegistry) releaseArchiveReservationLocked(reservation quotaReservation) {
+	remaining := r.reservations[reservation.key] - reservation.cost
+	if remaining > 0 {
+		r.reservations[reservation.key] = remaining
+	} else {
+		delete(r.reservations, reservation.key)
+	}
+}
+
+func (r *QuotaRegistry) effectiveRemainingLocked(key quotaKey, pool QuotaPool) int {
+	reserved := r.reservations[quotaReservationKey{
+		quotaKey: key,
+		resetAt:  pool.ResetAt.UTC(),
+	}]
+	return max(pool.Remaining-reserved, 0)
+}
+
+func (r *QuotaRegistry) clearReservationsBeforeLocked(key quotaKey, reset time.Time) {
+	for reservation := range r.reservations {
+		if reservation.quotaKey == key && reservation.resetAt.Before(reset) {
+			delete(r.reservations, reservation)
+		}
+	}
+}
+
+func (r *QuotaRegistry) raiseAttemptCost(
+	key quotaKey,
+	resetAt time.Time,
+	cost int,
+) {
+	if r == nil || cost <= 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	pool, ok := r.pools[key]
+	if !ok || !pool.Known || !pool.ResetAt.Equal(resetAt) ||
+		cost <= pool.AttemptCost {
+		return
+	}
+	pool.AttemptCost = cost
+	r.pools[key] = pool
 }
 
 func (r *QuotaRegistry) EarliestReset(
@@ -288,14 +468,30 @@ type quotaTransport struct {
 }
 
 func (t *quotaTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	resp, err := t.base.RoundTrip(req)
-	if resp == nil || t.registry == nil || t.identity.Principal == "" {
+	resource := quotaResourceFromContext(req.Context(), t.resource)
+	guardedReq, reservation, allowed := reserveArchiveProviderAttempt(
+		req, t.registry, t.identity, resource,
+	)
+	if !allowed {
+		return nil, platform.ErrArchiveAttemptBudget
+	}
+	resp, err := t.base.RoundTrip(guardedReq)
+	if errors.Is(err, platform.ErrSyncBudgetExhausted) ||
+		errors.Is(err, platform.ErrArchiveAttemptBudget) {
+		t.registry.releaseArchiveReservation(reservation.quota)
 		return resp, err
 	}
+	var header http.Header
+	if resp == nil || t.registry == nil || t.identity.Principal == "" {
+		reconcileArchiveProviderAttempt(reservation, t.registry, resource, header)
+		return resp, err
+	}
+	header = resp.Header
 	t.registry.ObserveHeaders(
 		t.identity,
-		quotaResourceFromContext(req.Context(), t.resource),
-		resp.Header,
+		resource,
+		header,
 	)
+	reconcileArchiveProviderAttempt(reservation, t.registry, resource, header)
 	return resp, err
 }

@@ -3,6 +3,7 @@ package github
 import (
 	"context"
 	"net/http"
+	"slices"
 	"sync/atomic"
 
 	"go.kenn.io/middleman/internal/platform"
@@ -11,14 +12,30 @@ import (
 type syncBudgetKey struct{}
 type archiveSyncBudgetKey struct{}
 type archiveAttemptAllowanceKey struct{}
+type archiveProviderAttemptReservationKey struct{}
 
-// archiveAttemptAllowance is a shared, mutable counter of the wire attempts an
-// admitted archive request is still allowed to make. Every budget-counting
-// transport decrements it once per attempt and refuses the attempt when it
-// falls below zero, so provider-SDK retries and authentication retries together
-// cannot exceed the admitted cost.
+// archiveAttemptAllowance is a shared, mutable counter of the provider capacity
+// an admitted archive request is still allowed to consume. Headerless providers
+// debit one unit per wire attempt. GitHub transports reserve the resource's
+// largest observed same-window attempt cost and reconcile larger response
+// deltas, so SDK and authentication retries cannot outrun live quota headroom.
 type archiveAttemptAllowance struct {
 	remaining atomic.Int64
+	provider  *archiveProviderAttemptConfig
+}
+
+type archiveProviderAttemptConfig struct {
+	identity  IdentityKey
+	resources []QuotaResource
+	reserve   int
+	budget    *SyncBudget
+}
+
+type archiveProviderAttemptReservation struct {
+	allowance *archiveAttemptAllowance
+	before    QuotaPool
+	cost      int
+	quota     quotaReservation
 }
 
 // WithArchiveAttemptAllowance attaches a per-request wire-attempt allowance to
@@ -27,6 +44,27 @@ type archiveAttemptAllowance struct {
 // atomically at every wire attempt.
 func WithArchiveAttemptAllowance(ctx context.Context, attempts int) context.Context {
 	allowance := &archiveAttemptAllowance{}
+	allowance.remaining.Store(int64(attempts))
+	return context.WithValue(ctx, archiveAttemptAllowanceKey{}, allowance)
+}
+
+// WithArchiveProviderAttemptAllowance adds live provider-pool enforcement to
+// the admitted allowance. quotaTransport reserves capacity before every wire
+// attempt and updates the effective cost from response headers.
+func WithArchiveProviderAttemptAllowance(
+	ctx context.Context,
+	attempts int,
+	identity IdentityKey,
+	resources []QuotaResource,
+	reserve int,
+	budget *SyncBudget,
+) context.Context {
+	allowance := &archiveAttemptAllowance{
+		provider: &archiveProviderAttemptConfig{
+			identity: identity, resources: slices.Clone(resources), reserve: max(reserve, 0),
+			budget: budget,
+		},
+	}
 	allowance.remaining.Store(int64(attempts))
 	return context.WithValue(ctx, archiveAttemptAllowanceKey{}, allowance)
 }
@@ -41,7 +79,116 @@ func ConsumeArchiveAttemptAllowance(ctx context.Context) bool {
 	if !ok {
 		return true
 	}
-	return allowance.remaining.Add(-1) >= 0
+	if reserved, _ := ctx.Value(archiveProviderAttemptReservationKey{}).(*archiveAttemptAllowance); reserved == allowance {
+		return true
+	}
+	return allowance.consume(1)
+}
+
+func (a *archiveAttemptAllowance) consume(cost int) bool {
+	for {
+		remaining := a.remaining.Load()
+		if cost <= 0 || remaining < int64(cost) {
+			return false
+		}
+		if a.remaining.CompareAndSwap(remaining, remaining-int64(cost)) {
+			return true
+		}
+	}
+}
+
+func (a *archiveAttemptAllowance) debit(cost int) {
+	for cost > 0 {
+		remaining := a.remaining.Load()
+		next := max(remaining-int64(cost), 0)
+		if a.remaining.CompareAndSwap(remaining, next) {
+			return
+		}
+	}
+}
+
+func reserveArchiveProviderAttempt(
+	req *http.Request,
+	registry *QuotaRegistry,
+	identity IdentityKey,
+	resource QuotaResource,
+) (*http.Request, archiveProviderAttemptReservation, bool) {
+	if registry == nil || identity.Principal == "" {
+		return req, archiveProviderAttemptReservation{}, true
+	}
+	allowance, ok := req.Context().Value(archiveAttemptAllowanceKey{}).(*archiveAttemptAllowance)
+	if !ok || allowance.provider == nil {
+		return req, archiveProviderAttemptReservation{}, true
+	}
+	config := allowance.provider
+	resources := []QuotaResource{resource}
+	if identity == config.identity {
+		resources = config.resources
+	}
+	quota, allowed := registry.reserveArchiveAttempt(
+		identity, resources, resource, config.reserve,
+	)
+	if !allowed {
+		return req, archiveProviderAttemptReservation{}, false
+	}
+	cost := quota.cost
+	if !allowance.consume(cost) {
+		registry.releaseArchiveReservation(quota)
+		return req, archiveProviderAttemptReservation{}, false
+	}
+	reservation := archiveProviderAttemptReservation{
+		allowance: allowance, before: quota.pool, cost: cost, quota: quota,
+	}
+	ctx := context.WithValue(
+		req.Context(), archiveProviderAttemptReservationKey{}, allowance,
+	)
+	return req.Clone(ctx), reservation, true
+}
+
+func reconcileArchiveProviderAttempt(
+	reservation archiveProviderAttemptReservation,
+	registry *QuotaRegistry,
+	resource QuotaResource,
+	header http.Header,
+) {
+	if reservation.allowance == nil {
+		return
+	}
+	actualCost := reservation.cost
+	spendReset := reservation.before.ResetAt
+	if observed, ok := rateFromQuotaHeaders(header); ok {
+		observedReset := observed.Reset.UTC()
+		if observedReset.After(reservation.before.ResetAt) ||
+			(observedReset.Equal(reservation.before.ResetAt) &&
+				observed.Remaining <= reservation.before.Remaining) {
+			registry.reconcileArchiveReservation(reservation.quota, observedReset)
+		}
+		switch {
+		case observedReset.Equal(reservation.before.ResetAt) &&
+			observed.Remaining < reservation.before.Remaining:
+			actualCost = max(
+				actualCost,
+				reservation.before.Remaining-observed.Remaining,
+			)
+		case observedReset.After(reservation.before.ResetAt):
+			spendReset = observedReset
+			actualCost = max(
+				actualCost,
+				observed.Limit-observed.Remaining,
+			)
+			registry.raiseAttemptCost(
+				reservation.quota.key.quotaKey,
+				observedReset,
+				actualCost,
+			)
+		}
+	}
+	if budget := reservation.allowance.provider.budget; budget != nil {
+		budget.addProviderArchiveSpend(resource, spendReset, actualCost)
+	}
+	if actualCost > reservation.cost {
+		reservation.allowance.debit(actualCost - reservation.cost)
+	}
 }
 
 // WithSyncBudget marks a context so that HTTP calls made with
