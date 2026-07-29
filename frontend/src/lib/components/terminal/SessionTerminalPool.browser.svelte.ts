@@ -4,6 +4,7 @@ import { DEFAULT_TERMINAL_SETTINGS } from "@middleman/ui";
 
 import { STORES_KEY } from "../../../../../packages/ui/src/context.js";
 import {
+  consumeSessionFocus,
   noteSessionMounted,
   noteSessionUnmounted,
   registerSessionSlot,
@@ -189,6 +190,208 @@ describe("SessionTerminalPool", () => {
       expect(document.activeElement?.closest(".terminal-container")).not.toBeNull();
     }, WAIT);
     button.remove();
+  });
+
+  it("keeps keyboard focus inside the terminal across a pane move", async () => {
+    mountSession(agent);
+    mountPool();
+    showIn(agent, slotA);
+    await waitForReparent();
+
+    requestSessionFocus(agent);
+    await vi.waitFor(() => {
+      expect(document.activeElement?.closest(".terminal-container")).not.toBeNull();
+    }, WAIT);
+
+    // A pane move: the slot changes and nothing queues a focus request. The
+    // reparent through the display:none parking node blurs xterm's helper
+    // textarea, so unless the pool restores what it took, tmux copy/paste
+    // keys land on <body> until the user clicks the terminal again.
+    showIn(agent, slotB);
+    await waitForReparent();
+
+    expect(wrapperFor(agent)?.parentElement).toBe(slotB);
+    await vi.waitFor(() => {
+      expect(document.activeElement?.closest(".terminal-container")).not.toBeNull();
+    }, WAIT);
+  });
+
+  // The production path, unlike the registry-driven move above: a real pane
+  // move unmounts the source SessionTerminalSlot, whose cleanup parks the
+  // wrapper — silently blurring xterm, with no focusout — before the pool's
+  // placement effect runs. Focus must survive that ordering too.
+  for (const order of ["source-first", "destination-first"] as const) {
+    it(`keeps keyboard focus across a real slot transfer (${order})`, async () => {
+      mountSession(agent);
+      mountPool();
+      const harnessTarget = document.createElement("div");
+      document.body.append(harnessTarget);
+      const props = $state({ hostKey: agent, showSource: true, showDestination: false, order });
+      const harness = mount(SessionTerminalSlotTransferHarness, { target: harnessTarget, props });
+      await waitForReparent();
+
+      requestSessionFocus(agent);
+      await vi.waitFor(() => {
+        expect(document.activeElement?.closest(".terminal-container")).not.toBeNull();
+      }, WAIT);
+
+      flushSync(() => {
+        props.showSource = false;
+        props.showDestination = true;
+      });
+      await waitForReparent();
+
+      const wrapper = wrapperFor(agent) as HTMLElement;
+      expect(wrapper.parentElement?.parentElement?.dataset.slot).toBe("destination");
+      await vi.waitFor(() => {
+        expect(document.activeElement?.closest(".terminal-container")).not.toBeNull();
+      }, WAIT);
+
+      flushSync(() => unmount(harness as never));
+      harnessTarget.remove();
+    });
+  }
+
+  it("does not steal focus another element claimed during the move", async () => {
+    mountSession(agent);
+    mountPool();
+    showIn(agent, slotA);
+    await waitForReparent();
+
+    requestSessionFocus(agent);
+    await vi.waitFor(() => {
+      expect(document.activeElement?.closest(".terminal-container")).not.toBeNull();
+    }, WAIT);
+
+    const input = document.createElement("input");
+    document.body.append(input);
+
+    showIn(agent, slotB);
+    // Claimed between parking and attachment: the keyboard went somewhere on
+    // purpose, and the restore must not take it back.
+    input.focus();
+
+    const wrapper = wrapperFor(agent) as HTMLElement;
+    await vi.waitFor(() => expect(wrapper.inert).toBe(false), WAIT);
+    expect(document.activeElement).toBe(input);
+    input.remove();
+  });
+
+  it("drops ownership when its pane closes, even with no focus claim after", async () => {
+    mountSession(agent);
+    mountPool();
+    showIn(agent, slotA);
+    await waitForReparent();
+
+    requestSessionFocus(agent);
+    await vi.waitFor(() => {
+      expect(document.activeElement?.closest(".terminal-container")).not.toBeNull();
+    }, WAIT);
+
+    // The pane closes while the terminal holds focus, and the user touches
+    // nothing focusable afterwards: focus sits on <body>. A later, unrelated
+    // reveal must not replay ownership the close already took away.
+    showIn(agent, null);
+    await waitForReparent();
+
+    showIn(agent, slotB);
+    const wrapper = wrapperFor(agent) as HTMLElement;
+    await vi.waitFor(() => expect(wrapper.inert).toBe(false), WAIT);
+    expect(document.activeElement?.closest(".terminal-container")).toBeNull();
+  });
+
+  it("keeps ownership through a cross-flush transfer's transient park", async () => {
+    mountSession(agent);
+    mountPool();
+    showIn(agent, slotA);
+    await waitForReparent();
+
+    requestSessionFocus(agent);
+    await vi.waitFor(() => {
+      expect(document.activeElement?.closest(".terminal-container")).not.toBeNull();
+    }, WAIT);
+
+    // A promotion can unregister the source slot in one flush and register the
+    // destination in the next: the terminal passes through a no-destination
+    // park. That transient must not be mistaken for the pane closing.
+    showIn(agent, null);
+    showIn(agent, slotB);
+    await waitForReparent();
+
+    await vi.waitFor(() => {
+      expect(document.activeElement?.closest(".terminal-container")).not.toBeNull();
+    }, WAIT);
+  });
+
+  it("drops the restore intent once focus was claimed elsewhere while parked", async () => {
+    mountSession(agent);
+    mountPool();
+    showIn(agent, slotA);
+    await waitForReparent();
+
+    requestSessionFocus(agent);
+    await vi.waitFor(() => {
+      expect(document.activeElement?.closest(".terminal-container")).not.toBeNull();
+    }, WAIT);
+
+    showIn(agent, null);
+    await waitForReparent();
+
+    // The user worked somewhere else while the pane was closed and left focus
+    // on nothing. A much later reveal must not replay the stale intent.
+    const input = document.createElement("input");
+    document.body.append(input);
+    input.focus();
+    input.blur();
+
+    showIn(agent, slotB);
+    const wrapper = wrapperFor(agent) as HTMLElement;
+    await vi.waitFor(() => expect(wrapper.inert).toBe(false), WAIT);
+    expect(document.activeElement?.closest(".terminal-container")).toBeNull();
+    input.remove();
+  });
+
+  it("honors a soft focus request over a plain button's focus", async () => {
+    mountSession(agent);
+    mountPool();
+    showIn(agent, slotA);
+    await waitForReparent();
+    const wrapper = wrapperFor(agent) as HTMLElement;
+    await vi.waitFor(() => expect(wrapper.inert).toBe(false), WAIT);
+
+    // A PR list row is a plain button: like a launch tile, it is not a focus
+    // target the terminal must defer to when navigation asks for acquisition.
+    const button = document.createElement("button");
+    document.body.append(button);
+    button.focus();
+
+    requestSessionFocus(agent, { soft: true });
+    await vi.waitFor(() => {
+      expect(document.activeElement?.closest(".terminal-container")).not.toBeNull();
+    }, WAIT);
+    button.remove();
+  });
+
+  it("declines a soft focus request while a sacred element holds focus", async () => {
+    mountSession(agent);
+    mountPool();
+    showIn(agent, slotA);
+    await waitForReparent();
+    const wrapper = wrapperFor(agent) as HTMLElement;
+    await vi.waitFor(() => expect(wrapper.inert).toBe(false), WAIT);
+
+    const input = document.createElement("input");
+    document.body.append(input);
+    input.focus();
+
+    requestSessionFocus(agent, { soft: true });
+    flushSync();
+
+    // The user is typing somewhere: navigation-driven acquisition must lose,
+    // and the declined request must not stay armed for a later reveal.
+    expect(document.activeElement).toBe(input);
+    expect(consumeSessionFocus(agent)).toBe(false);
+    input.remove();
   });
 
   it("keeps two sessions live at once", async () => {

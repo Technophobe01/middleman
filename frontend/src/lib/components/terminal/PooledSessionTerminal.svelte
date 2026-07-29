@@ -1,6 +1,7 @@
 <script lang="ts">
   import { tick } from "svelte";
   import TerminalPane from "./TerminalPane.svelte";
+  import { focusIsSacred } from "./terminal-focus.ts";
   import { consumeSessionFocus, type MountedSession } from "../../stores/session-host.svelte.ts";
 
   interface Props {
@@ -20,6 +21,22 @@
   // the parking node and resize the real tmux pane to one row.
   let attached = $state(false);
 
+  // The wrapper owns the keyboard when the last focus event landed inside it.
+  // Focus events are the only reliable signal: a real pane move tears down the
+  // source slot, which rips the focused textarea out of the DOM (no focusout
+  // fires on removal) before this component's effects run, so sampling
+  // document.activeElement at park time never sees the focus it must restore.
+  // Ownership survives that silent loss and is revoked only when another
+  // element actually claims focus. Not $state: decisions are made when
+  // `attached`/`active` flip, which the focus effect already tracks.
+  let ownsFocus = false;
+
+  function handleDocumentFocusIn(event: FocusEvent): void {
+    const node = wrapper;
+    if (!node) return;
+    ownsFocus = event.target instanceof Node && node.contains(event.target);
+  }
+
   // Placement, mirroring WorkspaceHost's: park first, attach after a tick.
   // Parking rather than leaving the wrapper in place matters because the
   // previous slot may be unmounting in this same flush.
@@ -36,8 +53,26 @@
     if (!node || !park) return;
     attached = false;
     park.appendChild(node);
-    if (!destination || destination === park) return;
     let cancelled = false;
+    if (!destination || destination === park) {
+      // Parked with nowhere to go: the pane closed — unless this park is the
+      // transient first half of a cross-flush transfer whose destination
+      // registers a moment later (a promotion can do this). Settle on the
+      // same tick-then-frame cadence attachment uses before dropping
+      // ownership, so focus a close took is never replayed on some later,
+      // unrelated reveal, while a transfer mid-handoff keeps it.
+      void (async () => {
+        await tick();
+        if (cancelled) return;
+        requestAnimationFrame(() => {
+          if (cancelled) return;
+          ownsFocus = false;
+        });
+      })();
+      return () => {
+        cancelled = true;
+      };
+    }
     void (async () => {
       await tick();
       if (cancelled) return;
@@ -52,14 +87,25 @@
     };
   });
 
-  // Focus an explicitly requested terminal whether the request arrived before
-  // attachment or after it was already visible. The renderer queues the request
-  // through its async construction; the wrapper is an immediate fallback while
-  // that work finishes.
+  // Focus the terminal on an explicit request (whether it arrived before
+  // attachment or after it was already visible), or to give back focus a
+  // reparent took. Restoration is decided here, at attachment, and only into
+  // unclaimed focus: anything else that took the keyboard since the reparent
+  // keeps it, and an intent that was not honored now never fires later. The
+  // renderer queues explicit requests through its async construction; the
+  // wrapper is an immediate fallback while that work finishes.
   $effect(() => {
     if (!attached || !active) return;
     const node = wrapper;
-    if (!node || !consumeSessionFocus(session.hostKey)) return;
+    if (!node) return;
+    const requested = consumeSessionFocus(session.hostKey);
+    // A soft request is navigation asking, not the user: it loses to a sacred
+    // focus target (form fields, dialogs) but wins over a plain button, the
+    // same contract renderer autofocus follows at creation.
+    const granted =
+      requested === "explicit" || (requested === "soft" && !focusIsSacred(document.activeElement));
+    const unclaimed = document.activeElement === null || document.activeElement === document.body;
+    if (!granted && !(ownsFocus && unclaimed)) return;
     terminalPane?.focus();
     if (!node.contains(document.activeElement)) node.focus();
   });
@@ -69,6 +115,8 @@
   // terminal sitting in whatever slot last held it.
   $effect(() => () => wrapper?.remove());
 </script>
+
+<svelte:document onfocusin={handleDocumentFocusIn} />
 
 <!-- tabindex, like the workspace host's own wrapper: Focus Terminal on a session
      the user promoted has to put the keyboard somewhere inside its terminal, and
