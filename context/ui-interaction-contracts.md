@@ -347,6 +347,9 @@ Rows that contain buttons, links, or toggles need clear event ownership.
   surface is currently active.
 - Focus-visible states matter for controls that are visually subtle, such as tab
   close buttons or compact action affordances.
+- Explicit clipboard controls copy provider/repository values exactly; copying is
+  not code execution or a shell security boundary, so source UI must not filter,
+  quote, escape, or add shell confirmation (`packages/ui/src/components/diff/DiffFile.svelte`).
 - If a component claims menu-like behavior, it must honor the keyboard and focus
   contract of that role. Otherwise, use simpler semantics honestly.
 - Gate unavailable menu actions at the items when the menu remains safe to

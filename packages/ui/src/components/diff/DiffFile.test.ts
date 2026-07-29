@@ -362,6 +362,33 @@ describe("DiffFile", () => {
     await expectPierreDiffText(/old linenew line/);
   });
 
+  it("copies the exact title-bar file path from a dedicated copy button", async () => {
+    const path = "PROMPT_COMMAND+=src/payload;$(hidden-command).ts";
+    const originalClipboard = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+    const writeText = vi.fn(() => Promise.resolve());
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+
+    try {
+      renderDiffFile(makeFile({ path, old_path: path }));
+
+      const pathLabel = screen.getByText(path);
+      expect(pathLabel.tagName).toBe("SPAN");
+      await fireEvent.click(screen.getByRole("button", { name: `Copy file path ${path}` }));
+
+      expect(writeText).toHaveBeenCalledWith(path);
+      expect(document.querySelector(".file-content")).toBeTruthy();
+    } finally {
+      if (originalClipboard) {
+        Object.defineProperty(navigator, "clipboard", originalClipboard);
+      } else {
+        delete (navigator as Navigator & { clipboard?: Clipboard }).clipboard;
+      }
+    }
+  });
+
   it("exposes stable line targets inside the Pierre shadow root", async () => {
     renderDiffFile(makeFile());
 
@@ -566,9 +593,11 @@ describe("DiffFile", () => {
     renderDiffFile(makeFile());
 
     const header = screen.getByTitle("Collapse file");
+    expect(header.getAttribute("aria-expanded")).toBe("true");
     await fireEvent.click(header);
 
     expect(document.querySelector(".file-content")).toBeNull();
+    expect(header.getAttribute("aria-expanded")).toBe("false");
   });
 
   it("shows content again after toggling collapse twice", async () => {

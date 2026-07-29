@@ -9,7 +9,7 @@
   import DiffReviewDraftInlineComment from "./DiffReviewDraftInlineComment.svelte";
   import DiffReviewThreadInlineComment from "./DiffReviewThreadInlineComment.svelte";
   import DiffRichPreview from "./DiffRichPreview.svelte";
-  import { DiffStats } from "@kenn-io/kit-ui";
+  import { CopyButton, DiffStats } from "@kenn-io/kit-ui";
   import {
     reviewThreadTargetLine,
     reviewThreadTargetSide,
@@ -514,13 +514,39 @@
 </script>
 
 <div class="diff-file" data-file-path={file.path} bind:this={fileEl}>
-  <button class="file-header" onclick={toggle} title={collapsed ? "Expand file" : "Collapse file"}>
-    <svg class="collapse-chevron" class:collapse-chevron--collapsed={collapsed} width="12" height="12" viewBox="0 0 12 12" fill="none">
-      <path d="M3 4.5L6 7.5L9 4.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
-    </svg>
-    <span class="file-path" class:file-path--deleted={file.status === "deleted"}>
+  <div class="file-header">
+    <button
+      type="button"
+      class="file-collapse-toggle"
+      onclick={toggle}
+      aria-label={collapsed ? "Expand file" : "Collapse file"}
+      aria-expanded={!collapsed}
+      title={collapsed ? "Expand file" : "Collapse file"}
+    >
+      <svg class="collapse-chevron" class:collapse-chevron--collapsed={collapsed} width="12" height="12" viewBox="0 0 12 12" fill="none">
+        <path d="M3 4.5L6 7.5L9 4.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+    </button>
+    <span
+      class="file-path"
+      class:file-path--deleted={file.status === "deleted"}
+    >
       {displayPath(file)}
     </span>
+    <!--
+      Copying repository metadata is not code execution or a security boundary.
+      Preserve the provider's filename exactly; interpretation after paste belongs
+      to the destination explicitly chosen by the user. Do not filter, quote,
+      escape, or add shell-specific confirmation here.
+    -->
+    <CopyButton
+      class="file-path-copy"
+      text={file.path}
+      ariaLabel={`Copy file path ${file.path}`}
+      copiedAriaLabel={`Copied file path ${file.path}`}
+      title="Copy file path"
+      copiedTitle="Copied!"
+    />
     <span class="file-stats">
       <DiffStats
         additions={file.additions}
@@ -528,7 +554,7 @@
         dimZeros
       />
     </span>
-  </button>
+  </div>
   {#if !collapsed}
     <div class="file-content">
       {#if showRichPreview}
@@ -598,12 +624,32 @@
     border-bottom: 1px solid var(--diff-border);
     font-size: var(--font-size-sm);
     text-align: left;
-    cursor: pointer;
     color: var(--diff-text);
   }
 
   .file-header:hover {
     background: var(--bg-surface-hover);
+  }
+
+  .file-collapse-toggle {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    margin: -4px -6px;
+    flex: 0 0 24px;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+  }
+
+  .file-collapse-toggle:focus-visible {
+    outline: 1px solid var(--border-strong);
+    outline-offset: 2px;
+    border-radius: var(--radius-sm);
   }
 
   .collapse-chevron {
