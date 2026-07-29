@@ -12,6 +12,13 @@ export interface JobsStoreOptions {
   onError?: (msg: string) => void;
 }
 
+export interface JobStatusCounts {
+  queued: number;
+  running: number;
+  done: number;
+  failed: number;
+}
+
 type SortColumn = "id" | "status" | "verdict" | "agent" | "elapsed" | "cost" | "job_type" | "enqueued_at";
 type SortDirection = "asc" | "desc";
 
@@ -31,6 +38,8 @@ export function createJobsStore(opts: JobsStoreOptions) {
   let loading = $state(false);
   let hasMore = $state(false);
   let stats = $state<JobStats>({ done: 0, closed: 0, open: 0 });
+  let filteredStatusCounts = $state<JobStatusCounts | undefined>(undefined);
+  let filteredStatusCountsScope: string | undefined;
   let storeError = $state<string | null>(null);
   let selectedJobId = $state<number | undefined>(undefined);
   let highlightedJobId = $state<number | undefined>(undefined);
@@ -80,6 +89,29 @@ export function createJobsStore(opts: JobsStoreOptions) {
     if (filterJobType) q.job_type = filterJobType;
     if (!filterShowAutoDesign) q.hide_classify_jobs = "true";
     return q;
+  }
+
+  function hasActiveFilters(): boolean {
+    return Boolean(
+      filterRepo ||
+      filterBranch ||
+      filterStatus ||
+      filterSearch ||
+      filterHideClosed ||
+      filterJobType ||
+      !filterShowAutoDesign,
+    );
+  }
+
+  function countJobsByStatus(filteredJobs: ReviewJob[]): JobStatusCounts {
+    const counts: JobStatusCounts = { queued: 0, running: 0, done: 0, failed: 0 };
+    for (const job of filteredJobs) {
+      if (job.status === "queued") counts.queued += 1;
+      else if (job.status === "running") counts.running += 1;
+      else if (job.status === "done") counts.done += 1;
+      else if (job.status === "failed") counts.failed += 1;
+    }
+    return counts;
   }
 
   function getElapsedSeconds(job: ReviewJob): number {
@@ -146,17 +178,38 @@ export function createJobsStore(opts: JobsStoreOptions) {
 
   async function loadJobs(): Promise<void> {
     const version = ++requestVersion;
+    const filtered = hasActiveFilters();
     loading = true;
     storeError = null;
     try {
-      const { data, error } = await client.GET("/api/jobs", {
-        params: { query: buildQuery() },
-      });
+      const query = buildQuery();
+      const countQuery = { ...query, limit: 0, omit_prompt: "true" as const };
+      const countScope = JSON.stringify(countQuery);
+      if (filtered && filteredStatusCountsScope !== countScope) {
+        filteredStatusCounts = undefined;
+      }
+      const [listResult, countResult] = await Promise.all([
+        client.GET("/api/jobs", { params: { query } }),
+        filtered
+          ? client
+              .GET("/api/jobs", {
+                params: {
+                  query: countQuery,
+                },
+              })
+              .catch(() => undefined)
+          : Promise.resolve(undefined),
+      ]);
+      const { data, error } = listResult;
       if (error) throw new Error("Failed to load jobs");
       if (version !== requestVersion) return;
       jobs = sortJobs(data?.jobs ?? []);
       hasMore = data?.has_more ?? false;
       stats = data?.stats ?? { done: 0, closed: 0, open: 0 };
+      if (filtered && countResult && !countResult.error) {
+        filteredStatusCounts = countJobsByStatus(countResult.data?.jobs ?? []);
+        filteredStatusCountsScope = countScope;
+      }
       const expandedRuns: Record<string, true> = {};
       for (const job of jobs) {
         const runUuid = job.panel_run_uuid;
@@ -586,6 +639,12 @@ export function createJobsStore(opts: JobsStoreOptions) {
   function getStats(): JobStats {
     return stats;
   }
+  function getFilteredStatusCounts(): JobStatusCounts | undefined {
+    return filteredStatusCounts;
+  }
+  function usesFilteredStatusCounts(): boolean {
+    return hasActiveFilters();
+  }
   function getError(): string | null {
     return storeError;
   }
@@ -632,6 +691,8 @@ export function createJobsStore(opts: JobsStoreOptions) {
     isLoading,
     getHasMore,
     getStats,
+    getFilteredStatusCounts,
+    usesFilteredStatusCounts,
     getError,
     getSelectedJobId,
     getHighlightedJobId,
