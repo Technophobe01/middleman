@@ -60,6 +60,7 @@ import (
 	"go.kenn.io/middleman/internal/testutil"
 	"go.kenn.io/middleman/internal/testutil/dbtest"
 	"go.kenn.io/middleman/internal/testutil/gitfake"
+	"go.kenn.io/middleman/internal/testutil/gitsafe"
 	"go.kenn.io/middleman/internal/testutil/processjob"
 	"go.kenn.io/middleman/internal/tokenauth"
 	"go.kenn.io/middleman/internal/workspace"
@@ -89,7 +90,7 @@ func TestMain(m *testing.M) {
 	if envDirErr == nil {
 		_ = os.Setenv("MIDDLEMAN_TMUX_ENV_DIR", envDir)
 	}
-	code := m.Run()
+	code := gitsafe.RunIsolatedMain(m)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	if err := cleanupMiddlemanTestTmuxSessionsWithContext(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "cleanup middleman test tmux sessions: %v\n", err)
@@ -23862,11 +23863,16 @@ func cleanupMiddlemanTestTmuxSessionsWithContext(ctx context.Context) error {
 		var stderr bytes.Buffer
 		cmd.Stderr = &stderr
 		if err := procutil.Run(ctx, cmd, "test tmux cleanup"); err != nil {
+			msg := strings.TrimSpace(stderr.String())
+			if strings.Contains(msg, "can't find session") ||
+				isTmuxServerAbsentMessage(msg) {
+				continue
+			}
 			errs = append(
 				errs,
 				fmt.Errorf(
 					"kill leaked tmux session %s: %w: %s",
-					session, err, strings.TrimSpace(stderr.String()),
+					session, err, msg,
 				),
 			)
 		}
@@ -24324,6 +24330,37 @@ func TestMiddlemanTmuxSessionsTreatsMissingTmuxSocketAsEmpty(t *testing.T) {
 
 	require.NoError(err)
 	require.Empty(sessions)
+}
+
+func TestCleanupMiddlemanTestTmuxSessionsIgnoresConcurrentRemoval(t *testing.T) {
+	require := require.New(t)
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "removed")
+	tmuxPath := filepath.Join(dir, "tmux")
+	body := `#!/bin/sh
+if [ "$1" = "list-sessions" ]; then
+  if [ ! -f "$TMUX_REMOVED_STATE" ]; then
+    echo "middleman-concurrent:$TMUX_SESSION_PATH"
+  fi
+  exit 0
+fi
+if [ "$1" = "kill-session" ]; then
+  : > "$TMUX_REMOVED_STATE"
+  echo "can't find session: $3" >&2
+  exit 1
+fi
+exit 2
+`
+	require.NoError(os.WriteFile(tmuxPath, []byte(body), 0o755))
+	t.Setenv("PATH", dir)
+	t.Setenv("TMUX_REMOVED_STATE", statePath)
+	t.Setenv("TMUX_SESSION_PATH", dir)
+
+	err := cleanupMiddlemanTestTmuxSessionsWithContext(
+		context.Background(),
+	)
+
+	require.NoError(err)
 }
 
 func TestWorkspaceRuntimeTargetsRefreshAfterSettingsUpdateE2E(t *testing.T) {
