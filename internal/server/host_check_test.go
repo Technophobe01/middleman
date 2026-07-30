@@ -24,17 +24,126 @@ import (
 // resolveHostCheckOptions over both the cfg=nil fallback and the
 // test-friendly AllowLoopbackAnyPort relaxation.
 func setupHostCheckServer(t *testing.T, opts HostCheckOptions) *Server {
+	return setupHostCheckServerWithToken(t, opts, "")
+}
+
+func setupHostCheckServerWithToken(
+	t *testing.T, opts HostCheckOptions, token string,
+) *Server {
 	t.Helper()
 	database := dbtest.Open(t)
 	syncer := ghclient.NewSyncer(nil, database, nil, nil, time.Minute, nil, nil)
 	t.Cleanup(syncer.Stop)
 	return New(database, syncer, emptyFrontend(), "/", nil, ServerOptions{
 		HostCheck: opts,
+		DaemonAccess: DaemonAccessOptions{
+			Token: token, RequireAPIAuth: token != "",
+		},
 	})
 }
 
 func bindLoopback8091() config.HostKey {
 	return config.HostKey{Host: "127.0.0.1", Port: "8091"}
+}
+
+func directDaemonRequest(bearer string, headers http.Header) *http.Request {
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/snapshot", nil)
+	req.Host = "127.0.0.1:8091"
+	req.RemoteAddr = "127.0.0.1:1234"
+	if headers != nil {
+		req.Header = headers.Clone()
+	}
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
+	return req
+}
+
+func serveDirectDaemonRequest(srv *Server, bearer string, headers http.Header) int {
+	rr := httptest.NewRecorder()
+	srv.ServeHTTP(rr, directDaemonRequest(bearer, headers))
+	return rr.Code
+}
+
+// TestDirectDaemonBearerClassification protects the native-client trust
+// boundary without constructing the full application. If the classifier is
+// widened, cookies, listener aliases, non-loopback peers, or forwarded
+// requests can bypass reverse-proxy Host validation.
+func TestDirectDaemonBearerClassification(t *testing.T) {
+	tests := []struct {
+		name, token, host, remoteAddr, bearer string
+		headers                               http.Header
+		cookie, wantBypass                    bool
+		bind                                  config.HostKey
+	}{
+		{name: "valid", token: "secret", host: "127.0.0.1:8091", remoteAddr: "127.0.0.1:1", bearer: "secret", wantBypass: true},
+		{name: "missing bearer", token: "secret", host: "127.0.0.1:8091", remoteAddr: "127.0.0.1:1"},
+		{name: "invalid bearer", token: "secret", host: "127.0.0.1:8091", remoteAddr: "127.0.0.1:1", bearer: "wrong"},
+		{name: "cookie", token: "secret", host: "127.0.0.1:8091", remoteAddr: "127.0.0.1:1", cookie: true},
+		{name: "listener alias", token: "secret", host: "localhost:8091", remoteAddr: "127.0.0.1:1", bearer: "secret"},
+		{name: "non-loopback peer", token: "secret", host: "127.0.0.1:8091", remoteAddr: "192.0.2.1:1", bearer: "secret"},
+		{name: "public host", token: "secret", host: "mm.example.com", remoteAddr: "127.0.0.1:1", bearer: "secret"},
+		{name: "forwarded", token: "secret", host: "127.0.0.1:8091", remoteAddr: "127.0.0.1:1", bearer: "secret", headers: http.Header{"Forwarded": {"host=mm.example.com"}}},
+		{name: "missing token", host: "127.0.0.1:8091", remoteAddr: "127.0.0.1:1", bearer: "secret"},
+		{name: "IPv6", token: "secret", bind: config.HostKey{Host: "[::1]", Port: "8091"}, host: "[::1]:8091", remoteAddr: "[::1]:1", bearer: "secret", wantBypass: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			bind := bindLoopback8091()
+			if tt.bind.Host != "" {
+				bind = tt.bind
+			}
+			req := directDaemonRequest(tt.bearer, tt.headers)
+			req.Host, req.RemoteAddr = tt.host, tt.remoteAddr
+			if tt.cookie {
+				req.AddCookie(&http.Cookie{Name: authCookieName, Value: "secret"})
+			}
+			rr := httptest.NewRecorder()
+
+			admission := (daemonRequestPolicy{token: tt.token}).admit(
+				rr, req, HostCheckOptions{Bind: bind}, true,
+			)
+
+			assert.False(t, admission.handled)
+			assert.Equal(t, tt.wantBypass, admission.bypassProxyHostCheck)
+		})
+	}
+}
+
+// TestDirectDaemonBearerHostIntegration protects middleware ordering. Direct
+// bearer requests bypass proxy Host interpretation, while any forwarded shape
+// remains subject to the existing proxy validation and rejection rules.
+func TestDirectDaemonBearerHostIntegration(t *testing.T) {
+	srv := setupHostCheckServerWithToken(t, HostCheckOptions{
+		Bind:              bindLoopback8091(),
+		TrustReverseProxy: true,
+	}, "daemon-secret")
+	assert.Equal(t, http.StatusOK, serveDirectDaemonRequest(srv, "daemon-secret", nil))
+	assert.Equal(t, http.StatusForbidden, serveDirectDaemonRequest(srv, "", nil))
+	assert.Equal(t, http.StatusForbidden, serveDirectDaemonRequest(srv, "wrong", nil))
+}
+
+// TestDirectDaemonBearerClassificationWithoutGeneralAPIAuth protects the
+// distinction between the direct-listener credential and optional API auth.
+// A native client must still bypass proxy Host interpretation without forcing
+// proxied browser/API traffic to authenticate.
+func TestDirectDaemonBearerClassificationWithoutGeneralAPIAuth(t *testing.T) {
+	database := dbtest.Open(t)
+	syncer := ghclient.NewSyncer(nil, database, nil, nil, time.Minute, nil, nil)
+	t.Cleanup(syncer.Stop)
+	srv := New(database, syncer, emptyFrontend(), "/", nil, ServerOptions{
+		HostCheck: HostCheckOptions{
+			Bind:              bindLoopback8091(),
+			Allowed:           []config.HostKey{{Host: "mm.example.com"}},
+			TrustReverseProxy: true,
+		},
+		DaemonAccess: DaemonAccessOptions{Token: "daemon-secret"},
+	})
+	assert.Equal(t, http.StatusOK, serveDirectDaemonRequest(srv, "daemon-secret", nil))
+	assert.Equal(t, http.StatusOK, serveDirectDaemonRequest(srv, "", http.Header{
+		"X-Forwarded-Host": {"mm.example.com"},
+	}))
 }
 
 // TestHostCheckBackendHost exercises Step 1+2 of the spec: parse

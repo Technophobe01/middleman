@@ -10,7 +10,7 @@ import (
 )
 
 // API auth gates /api and /ws routes behind the daemon's bearer token
-// when the server is constructed with one (ServerOptions.APIAuthToken,
+// when the server is configured to require it (ServerOptions.DaemonAccess,
 // minted under data_dir at serve start). Two credentials are
 // accepted: an `Authorization: Bearer <token>` header (CLI, native
 // thin clients, SSE over plain HTTP clients) and the session cookie a
@@ -31,6 +31,15 @@ func tokenEqual(a, b string) bool {
 	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
 
+func hasValidBearer(r *http.Request, expected string) bool {
+	if expected == "" {
+		return false
+	}
+	header := r.Header.Get("Authorization")
+	token, ok := strings.CutPrefix(header, "Bearer ")
+	return ok && tokenEqual(strings.TrimSpace(token), expected)
+}
+
 // handleAuthBootstrap converts a valid ?auth_token= query into the
 // session cookie and redirects to the same URL without the parameter.
 // Returns true when it wrote a response (redirect or rejection).
@@ -41,7 +50,7 @@ func (s *Server) handleAuthBootstrap(
 	if token == "" {
 		return false
 	}
-	if !tokenEqual(token, s.apiAuthToken) {
+	if !tokenEqual(token, s.daemonRequests.token) {
 		http.Error(w, "invalid auth token", http.StatusForbidden)
 		return true
 	}
@@ -69,14 +78,11 @@ func (s *Server) handleAuthBootstrap(
 func (s *Server) authorizeAPIRequest(
 	w http.ResponseWriter, r *http.Request,
 ) bool {
-	header := r.Header.Get("Authorization")
-	if token, ok := strings.CutPrefix(header, "Bearer "); ok {
-		if tokenEqual(strings.TrimSpace(token), s.apiAuthToken) {
-			return true
-		}
+	if hasValidBearer(r, s.daemonRequests.token) {
+		return true
 	}
 	if cookie, err := r.Cookie(authCookieName); err == nil {
-		if tokenEqual(cookie.Value, s.apiAuthToken) {
+		if tokenEqual(cookie.Value, s.daemonRequests.token) {
 			return true
 		}
 	}

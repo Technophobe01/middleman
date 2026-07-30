@@ -25,7 +25,6 @@ import (
 	"go.kenn.io/middleman/internal/db"
 	ghclient "go.kenn.io/middleman/internal/github"
 	"go.kenn.io/middleman/internal/platform"
-	"go.kenn.io/middleman/internal/runtimelock"
 	"go.kenn.io/middleman/internal/server"
 	"go.kenn.io/middleman/internal/testutil"
 	"go.kenn.io/middleman/internal/testutil/dbtest"
@@ -38,7 +37,18 @@ func TestMain(m *testing.M) {
 			panic(err)
 		}
 	}
-	os.Exit(m.Run())
+	runtimeDir, err := os.MkdirTemp("", "middleman-test-home-")
+	if err != nil {
+		panic(err)
+	}
+	if err := os.Setenv("MIDDLEMAN_HOME", runtimeDir); err != nil {
+		panic(err)
+	}
+	code := m.Run()
+	if err := os.RemoveAll(runtimeDir); err != nil {
+		panic(err)
+	}
+	os.Exit(code)
 }
 
 func TestConfigureLoggingRedactsTokens(t *testing.T) {
@@ -119,49 +129,6 @@ func mainTestTokenSource(
 			EnvName: envName,
 		}},
 	}, tokenauth.Options{})
-}
-
-func TestWriteRuntimeMetadataRecordsBoundTCPPort(t *testing.T) {
-	require := require.New(t)
-	assert := assert.New(t)
-	dataDir := t.TempDir()
-	lockHandle, err := runtimelock.Acquire(dataDir)
-	require.NoError(err)
-	t.Cleanup(func() {
-		require.NoError(lockHandle.Release())
-	})
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(err)
-	t.Cleanup(func() {
-		require.NoError(ln.Close())
-	})
-
-	require.NoError(writeRuntimeMetadata(lockHandle, ln, dataDir, "/", false))
-
-	data, err := os.ReadFile(runtimelock.MetadataPath(dataDir))
-	require.NoError(err)
-	var meta runtimelock.Metadata
-	require.NoError(json.Unmarshal(data, &meta))
-	tcpAddr := ln.Addr().(*net.TCPAddr)
-	assert.Equal(tcpAddr.Port, meta.Port)
-	assert.Equal("127.0.0.1", meta.Host)
-	assert.Equal(ln.Addr().String(), meta.ListenAddr)
-}
-
-func TestWriteRuntimeMetadataRejectsNonTCPListener(t *testing.T) {
-	dataDir := t.TempDir()
-	lockHandle, err := runtimelock.Acquire(dataDir)
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		require.NoError(t, lockHandle.Release())
-	})
-
-	err = writeRuntimeMetadata(
-		lockHandle, fakeListener{addr: fakeAddr("not-an-address")},
-		dataDir, "/", false,
-	)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "non-TCP")
 }
 
 func TestRunMainShutdownStopsSignalsBeforeLongCleanup(t *testing.T) {
@@ -270,22 +237,6 @@ func TestResolveStartupReposExpandsConfiguredGlobs(t *testing.T) {
 		RepoPath:     "roborev-dev/middleman",
 	}}, repos)
 }
-
-type fakeAddr string
-
-func (a fakeAddr) Network() string { return "fake" }
-
-func (a fakeAddr) String() string { return string(a) }
-
-type fakeListener struct {
-	addr net.Addr
-}
-
-func (l fakeListener) Accept() (net.Conn, error) { return nil, errors.New("not implemented") }
-
-func (l fakeListener) Close() error { return nil }
-
-func (l fakeListener) Addr() net.Addr { return l.addr }
 
 func TestResolveStartupReposKeepsExactReposWhenResolutionFails(t *testing.T) {
 	assert := assert.New(t)
@@ -773,7 +724,7 @@ func TestRootHelpListsEveryPublicCommandWithoutStartingServer(t *testing.T) {
 	for _, name := range []string{
 		"activity", "agent-hook", "api", "archive", "config", "docs",
 		"issues", "pulls", "quickstart", "rate-limits", "repo-summaries",
-		"repos", "serve", "stacks", "status", "sync", "version", "workspaces",
+		"repos", "serve", "stacks", "start", "status", "sync", "version", "workspaces",
 	} {
 		assert.Contains(stdout.String(), name)
 	}
@@ -814,6 +765,7 @@ func TestRootNestedHelpExposesCommandFlags(t *testing.T) {
 		{name: "archive report", args: []string{"archive", "report", "--help"}, want: []string{"--days", "--start", "--end", "--format", "--repo"}},
 		{name: "agent hook run", args: []string{"agent-hook", "run", "--help"}, want: []string{"--agent", "--config", "--source"}},
 		{name: "status", args: []string{"status", "--help"}, want: []string{"--config", "--json"}},
+		{name: "start", args: []string{"start", "--help"}, want: []string{"--background", "--config"}},
 		{name: "serve", args: []string{"serve", "--help"}, want: []string{"--config", "--pprof-addr"}},
 		{name: "api", args: []string{"api", "--help"}, want: []string{"list", "--config", "-d", "-i", "--timeout"}},
 	}

@@ -3,18 +3,24 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/kit/daemon"
 
+	"go.kenn.io/middleman/internal/daemonruntime"
 	"go.kenn.io/middleman/internal/procutil"
 	"go.kenn.io/middleman/internal/runtimelock"
 )
@@ -31,6 +37,197 @@ func buildMiddleman(t *testing.T) string {
 	cmd.Stderr = os.Stderr
 	require.NoError(t, cmd.Run(), "go build ./cmd/middleman")
 	return binPath
+}
+
+// TestStartBackgroundSerializesAndReusesCompatibleRuntime protects the
+// process-level lifecycle contract. If serialization or rediscovery breaks,
+// simultaneous callers can launch competing children or a later call can
+// replace the verified runtime instead of reusing it.
+func TestStartBackgroundSerializesAndReusesCompatibleRuntime(t *testing.T) {
+	require := require.New(t)
+	bin := buildMiddleman(t)
+	root := t.TempDir()
+	dataDir := filepath.Join(root, "data")
+	require.NoError(os.MkdirAll(dataDir, 0o700))
+	runtimeDir := filepath.Join(root, "config-home")
+	require.NoError(os.MkdirAll(runtimeDir, 0o700))
+	t.Setenv("MIDDLEMAN_HOME", runtimeDir)
+	configPath := filepath.Join(runtimeDir, "config.toml")
+	writeMinimalConfig(t, configPath, "./data", reserveFreePort(t))
+
+	type commandResult struct {
+		stderr string
+		err    error
+	}
+	runStart := func() commandResult {
+		cmd := procutil.Command(bin, "start", "--background", "--config", configPath)
+		cmd.Dir = root
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		cmd.Env = append(os.Environ(), "MIDDLEMAN_LOG_LEVEL=warn")
+		return commandResult{stderr: stderr.String(), err: cmd.Run()}
+	}
+
+	gate := make(chan struct{})
+	results := make(chan commandResult, 2)
+	for range 2 {
+		go func() {
+			<-gate
+			results <- runStart()
+		}()
+	}
+	close(gate)
+	for range 2 {
+		result := <-results
+		require.NoError(result.err, result.stderr)
+	}
+
+	store := daemon.RuntimeStore{Dir: runtimeDir}
+	records, err := store.List()
+	require.NoError(err)
+	require.Len(records, 1)
+	record := records[0]
+	t.Cleanup(func() {
+		if process, findErr := os.FindProcess(record.PID); findErr == nil {
+			_ = process.Kill()
+		}
+	})
+	require.Equal("middleman", record.Service)
+	require.Equal(daemon.NetworkTCP, record.Network)
+	canonicalDir, err := filepath.EvalSymlinks(dataDir)
+	require.NoError(err)
+	require.Equal(canonicalDir, record.Metadata["data_dir"])
+
+	again := runStart()
+	require.NoError(again.err, again.stderr)
+	recordsAfter, err := store.List()
+	require.NoError(err)
+	require.Len(recordsAfter, 1)
+	require.Equal(record.PID, recordsAfter[0].PID)
+}
+
+// TestForegroundAndBackgroundStartShareAuthToken protects a fresh data
+// directory started through both lifecycle paths at once. If token creation
+// has multiple winners, discovery cannot authenticate the runtime that won the
+// authoritative data-directory lock.
+func TestForegroundAndBackgroundStartShareAuthToken(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	bin := buildMiddleman(t)
+	root := t.TempDir()
+	dataDir := filepath.Join(root, "data")
+	runtimeDir := filepath.Join(root, "config-home")
+	require.NoError(os.MkdirAll(runtimeDir, 0o700))
+	t.Setenv("MIDDLEMAN_HOME", runtimeDir)
+	configPath := filepath.Join(runtimeDir, "config.toml")
+	writeMinimalConfig(t, configPath, dataDir, reserveFreePort(t))
+	store := daemon.RuntimeStore{Dir: runtimeDir}
+
+	foreground := procutil.Command(bin, "serve", "--config", configPath)
+	var foregroundStderr bytes.Buffer
+	foreground.Stderr = &foregroundStderr
+	foreground.Env = append(os.Environ(), "MIDDLEMAN_LOG_LEVEL=warn")
+	background := procutil.Command(
+		bin, "start", "--background", "--config", configPath,
+	)
+	var backgroundStderr bytes.Buffer
+	background.Stderr = &backgroundStderr
+	background.Env = append(os.Environ(), "MIDDLEMAN_LOG_LEVEL=warn")
+	t.Cleanup(func() {
+		records, _ := store.List()
+		for _, record := range records {
+			if process, findErr := os.FindProcess(record.PID); findErr == nil {
+				_ = process.Kill()
+			}
+		}
+		if foreground.Process != nil {
+			_ = foreground.Process.Kill()
+			_ = foreground.Wait()
+		}
+	})
+
+	gate := make(chan struct{})
+	foregroundStarted := make(chan error, 1)
+	backgroundDone := make(chan error, 1)
+	go func() {
+		<-gate
+		foregroundStarted <- foreground.Start()
+	}()
+	go func() {
+		<-gate
+		backgroundDone <- background.Run()
+	}()
+	close(gate)
+	require.NoError(<-foregroundStarted)
+	require.NoError(<-backgroundDone, backgroundStderr.String())
+
+	records, err := store.List()
+	require.NoError(err)
+	require.Len(records, 1)
+	record := records[0]
+	token, err := runtimelock.ReadAuthToken(dataDir)
+	require.NoError(err)
+	proof, err := daemon.NewProof([]byte(token))
+	require.NoError(err)
+	ping, err := proof.Probe(t.Context(), record, daemon.ProbeOptions{
+		Path: daemonruntime.ProofPingPath,
+	})
+	require.NoError(err)
+	assert.Equal(record.PID, ping.PID)
+}
+
+// TestStartBackgroundReportsConfiguredBasePath protects the operator-facing
+// URL. If discovery drops the startup-bound prefix, the reported location
+// points at an unmounted route and returns 404.
+func TestStartBackgroundReportsConfiguredBasePath(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	bin := buildMiddleman(t)
+	root := t.TempDir()
+	dataDir := filepath.Join(root, "data")
+	runtimeDir := filepath.Join(root, "config-home")
+	require.NoError(os.MkdirAll(runtimeDir, 0o700))
+	t.Setenv("MIDDLEMAN_HOME", runtimeDir)
+	configPath := filepath.Join(runtimeDir, "config.toml")
+	port := reserveFreePort(t)
+	writeMinimalConfigWithBasePath(
+		t, configPath, dataDir, port, "/console/",
+	)
+	store := daemon.RuntimeStore{Dir: runtimeDir}
+	t.Cleanup(func() {
+		records, _ := store.List()
+		for _, record := range records {
+			if process, findErr := os.FindProcess(record.PID); findErr == nil {
+				_ = process.Kill()
+			}
+		}
+	})
+
+	cmd := procutil.Command(
+		bin, "start", "--background", "--config", configPath,
+	)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	cmd.Env = append(os.Environ(), "MIDDLEMAN_LOG_LEVEL=warn")
+	require.NoError(cmd.Run(), stderr.String())
+
+	records, err := store.List()
+	require.NoError(err)
+	require.Len(records, 1)
+	wantURL := fmt.Sprintf("http://127.0.0.1:%d/console", port)
+	require.Contains(strings.TrimSpace(stdout.String()), wantURL+" (pid ")
+	client := &http.Client{Timeout: 5 * time.Second}
+	request, err := http.NewRequestWithContext(
+		t.Context(), http.MethodGet, wantURL, nil,
+	)
+	require.NoError(err)
+	response, err := client.Do(request)
+	require.NoError(err)
+	t.Cleanup(func() { require.NoError(response.Body.Close()) })
+	_, err = io.Copy(io.Discard, response.Body)
+	require.NoError(err)
+	assert.Equal(http.StatusOK, response.StatusCode)
 }
 
 // reserveFreePort opens a listener on 127.0.0.1:0, closes it, and
@@ -51,6 +248,13 @@ func reserveFreePort(t *testing.T) int {
 // with the developer's real ~/.config/middleman.
 func writeMinimalConfig(t *testing.T, configPath, dataDir string, port int) {
 	t.Helper()
+	writeMinimalConfigWithBasePath(t, configPath, dataDir, port, "")
+}
+
+func writeMinimalConfigWithBasePath(
+	t *testing.T, configPath, dataDir string, port int, basePath string,
+) {
+	t.Helper()
 	binDir := t.TempDir()
 	ghName := "gh"
 	ghBody := "#!/bin/sh\nexit 1\n"
@@ -63,10 +267,14 @@ func writeMinimalConfig(t *testing.T, configPath, dataDir string, port int) {
 	))
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("MIDDLEMAN_GITHUB_TOKEN_UNSET_FOR_LOCK_E2E", "")
+	basePathConfig := ""
+	if basePath != "" {
+		basePathConfig = fmt.Sprintf("base_path = %q\n", basePath)
+	}
 	body := fmt.Sprintf(`host = "127.0.0.1"
 port = %d
 data_dir = %q
-sync_interval = "5m"
+%ssync_interval = "5m"
 github_token_env = "MIDDLEMAN_GITHUB_TOKEN_UNSET_FOR_LOCK_E2E"
 
 [activity]
@@ -74,7 +282,7 @@ view_mode = "threaded"
 time_range = "7d"
 
 [terminal]
-`, port, dataDir)
+`, port, dataDir, basePathConfig)
 	require.NoError(t, os.WriteFile(configPath, []byte(body), 0o600))
 }
 
@@ -85,6 +293,8 @@ func TestStartupLockCollisionAndStatus(t *testing.T) {
 	root := t.TempDir()
 	dataDir := filepath.Join(root, "data")
 	require.NoError(os.MkdirAll(dataDir, 0o700))
+	canonicalDataDir, err := filepath.EvalSymlinks(dataDir)
+	require.NoError(err)
 	cfgPath := filepath.Join(root, "config.toml")
 
 	port := reserveFreePort(t)
@@ -117,7 +327,7 @@ func TestStartupLockCollisionAndStatus(t *testing.T) {
 	startupJSONCmd.Stderr = os.Stderr
 	require.NoError(startupJSONCmd.Run())
 	require.Contains(startupJSONOut.String(), "\"running\": true")
-	require.Contains(startupJSONOut.String(), "\"data_dir\": \""+dataDir+"\"")
+	require.Contains(startupJSONOut.String(), "\"data_dir\": \""+canonicalDataDir+"\"")
 	require.Contains(startupJSONOut.String(), "\"metadata\": null")
 	require.Contains(startupJSONOut.String(), "\"metadata_error\": \"missing\"")
 
@@ -183,7 +393,7 @@ func TestStartupLockCollisionAndStatus(t *testing.T) {
 	jsonCmd.Stderr = os.Stderr
 	require.NoError(jsonCmd.Run())
 	require.Contains(jsonOut.String(), "\"running\": true")
-	require.Contains(jsonOut.String(), "\"data_dir\": \""+dataDir+"\"")
+	require.Contains(jsonOut.String(), "\"data_dir\": \""+canonicalDataDir+"\"")
 	require.Contains(jsonOut.String(), "\"port\": "+strconv.Itoa(port))
 
 	// Shut down the first process gracefully so the deferred Release

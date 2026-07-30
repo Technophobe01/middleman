@@ -18,10 +18,12 @@ import (
 	"syscall"
 	"time"
 
+	"go.kenn.io/kit/daemon"
 	oteltelemetry "go.kenn.io/kit/telemetry"
 	"go.kenn.io/middleman/internal/archive"
 	"go.kenn.io/middleman/internal/cli/serve"
 	"go.kenn.io/middleman/internal/config"
+	"go.kenn.io/middleman/internal/daemonruntime"
 	"go.kenn.io/middleman/internal/db"
 	"go.kenn.io/middleman/internal/gitclone"
 	ghclient "go.kenn.io/middleman/internal/github"
@@ -344,11 +346,6 @@ func run(opts serve.Options) error {
 	if err != nil {
 		return fmt.Errorf("ensure auth token: %w", err)
 	}
-	enforcedToken := ""
-	if cfg.API.RequireAuth {
-		enforcedToken = authToken
-	}
-
 	addr := cfg.ListenAddr()
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -363,10 +360,36 @@ func run(opts serve.Options) error {
 		)
 	}
 
-	if err := writeRuntimeMetadata(
-		lockHandle, ln, cfg.DataDir, cfg.BasePath, cfg.API.RequireAuth,
-	); err != nil {
+	runtimeIdentity, err := daemonruntime.NewIdentity(ln.Addr(), daemonruntime.IdentityOptions{
+		Version: version, Commit: commit, DataDir: cfg.DataDir,
+		BasePath: cfg.BasePath, RequireAuth: cfg.API.RequireAuth,
+	})
+	if err != nil {
+		_ = ln.Close()
+		return fmt.Errorf("build daemon runtime identity: %w", err)
+	}
+	if err := lockHandle.WriteMetadata(runtimeIdentity.LockMetadata); err != nil {
 		slog.Warn("write runtime metadata", "err", err)
+	}
+	runtimePath, err := daemonruntime.Publish(runtimeIdentity.Record)
+	if err != nil {
+		_ = ln.Close()
+		return fmt.Errorf("write daemon runtime record: %w", err)
+	}
+	defer func() {
+		if err := os.Remove(runtimePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			slog.Warn("remove daemon runtime record", "err", err)
+		}
+	}()
+	proof, err := daemon.NewProof([]byte(authToken))
+	if err != nil {
+		_ = ln.Close()
+		return fmt.Errorf("initialize daemon proof: %w", err)
+	}
+	daemonProofHandler, err := proof.NewPingHandler(runtimeIdentity.Record)
+	if err != nil {
+		_ = ln.Close()
+		return fmt.Errorf("initialize daemon ping: %w", err)
 	}
 
 	startupHandler := server.NewStartupHandler(
@@ -555,7 +578,10 @@ func run(opts serve.Options) error {
 	srv = server.NewWithConfig(
 		database, syncer, cloneMgr, assets,
 		cfg, configPath, server.ServerOptions{
-			APIAuthToken:        enforcedToken,
+			DaemonAccess: server.DaemonAccessOptions{
+				Token: authToken, RequireAPIAuth: cfg.API.RequireAuth,
+				ProofHandler: daemonProofHandler,
+			},
 			WorktreeDir:         filepath.Join(cfg.DataDir, "worktrees"),
 			PtyOwnerManagerPath: os.Getenv("MIDDLEMAN_PTY_MANAGER"),
 			Telemetry:           telemetryReporter,
@@ -717,44 +743,6 @@ func profilerSrvDone(srv *profiler.Server) <-chan error {
 		return nil
 	}
 	return srv.Done()
-}
-
-// writeRuntimeMetadata snapshots the bound listener and process state
-// into the runtime metadata file. The recorded port comes from
-// ln.Addr() (not cfg.Port) so it matches the kernel-assigned value if
-// they ever diverge.
-func writeRuntimeMetadata(
-	h *runtimelock.Handle, ln net.Listener,
-	dataDir, basePath string, requireAuth bool,
-) error {
-	tcpAddr, ok := ln.Addr().(*net.TCPAddr)
-	if !ok {
-		return fmt.Errorf("listener returned non-TCP address %T", ln.Addr())
-	}
-	return h.WriteMetadata(runtimelock.Metadata{
-		PID:         os.Getpid(),
-		Host:        tcpAddr.IP.String(),
-		Port:        tcpAddr.Port,
-		ListenAddr:  ln.Addr().String(),
-		StartedAt:   time.Now().UTC().Format(time.RFC3339),
-		Version:     version,
-		Commit:      commit,
-		TokenPath:   runtimelock.AuthTokenPath(dataDir),
-		BasePath:    canonicalBasePath(basePath),
-		RequireAuth: requireAuth,
-	})
-}
-
-// canonicalBasePath publishes the prefix form clients join paths
-// onto: no trailing slash, except the bare root.
-func canonicalBasePath(basePath string) string {
-	if basePath == "" {
-		return "/"
-	}
-	if trimmed := strings.TrimSuffix(basePath, "/"); trimmed != "" {
-		return trimmed
-	}
-	return "/"
 }
 
 func resolveStartupRepos(

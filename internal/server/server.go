@@ -63,11 +63,7 @@ type versionOutputBody BuildInfo
 type versionOutput = httpapi.BodyOutput[versionOutputBody]
 
 type ServerOptions struct {
-	// APIAuthToken, when non-empty, gates /api routes behind bearer
-	// or session-cookie auth (see api_auth.go). Health probes stay
-	// open. Minted under data_dir by the serve entrypoint when
-	// [api].require_auth is set.
-	APIAuthToken                       string
+	DaemonAccess                       DaemonAccessOptions
 	Clones                             *gitclone.Manager // optional clone manager for diff view
 	WorktreeDir                        string            // base dir for workspace worktrees
 	DisableWorkspaceBackgroundMonitors bool
@@ -222,8 +218,7 @@ type Server struct {
 	toolingStatus toolingStatusCache
 	toolingRun    toolingRunner
 
-	// apiAuthToken gates /api routes when non-empty (api_auth.go).
-	apiAuthToken string
+	daemonRequests daemonRequestPolicy
 
 	// bg tracks short-lived goroutines that HTTP handlers spawn
 	// outside of the Syncer's own wait group (e.g. mergePR's
@@ -750,20 +745,24 @@ func newServer(
 	})
 
 	s := &Server{
-		db:                     database,
-		repoResolver:           repoResolver,
-		basePath:               basePath,
-		syncer:                 syncer,
-		archive:                options.Archive,
-		clones:                 clones,
-		telemetry:              options.Telemetry,
-		cfg:                    cfg,
-		cfgPath:                cfgPath,
-		tokenSources:           options.TokenSources,
-		bootCfgSnapshot:        snapshotStartupConfig(cfg),
-		runtimeStripEnvVars:    initialRuntimeStripEnvNames(cfg),
-		options:                options,
-		apiAuthToken:           options.APIAuthToken,
+		db:                  database,
+		repoResolver:        repoResolver,
+		basePath:            basePath,
+		syncer:              syncer,
+		archive:             options.Archive,
+		clones:              clones,
+		telemetry:           options.Telemetry,
+		cfg:                 cfg,
+		cfgPath:             cfgPath,
+		tokenSources:        options.TokenSources,
+		bootCfgSnapshot:     snapshotStartupConfig(cfg),
+		runtimeStripEnvVars: initialRuntimeStripEnvNames(cfg),
+		options:             options,
+		daemonRequests: daemonRequestPolicy{
+			token:          options.DaemonAccess.Token,
+			requireAPIAuth: options.DaemonAccess.RequireAPIAuth,
+			proof:          options.DaemonAccess.ProofHandler,
+		},
 		now:                    time.Now,
 		hub:                    NewEventHubWithCapacity(cfg.SSEBufferSizeOrDefault()),
 		labelCatalogRefreshIDs: make(map[int64]struct{}),
@@ -1128,9 +1127,11 @@ func newServer(
 		prefix := strings.TrimSuffix(basePath, "/")
 		outer.Handle("/healthz", mux)
 		outer.Handle("/livez", mux)
+		s.registerDaemonPing(outer)
 		outer.Handle(basePath, stripPrefixPreservingPattern(prefix, mux))
 		assembled = outer
 	} else {
+		s.registerDaemonPing(mux)
 		assembled = mux
 	}
 	s.handler = otelhttp.NewHandler(assembled, "middleman.http",
@@ -1281,13 +1282,19 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 	hostOpts := *s.hostOpts.Load()
-	if !checkHost(w, r, hostOpts) {
+	admission := s.daemonRequests.admit(
+		w, r, hostOpts, s.isGatedAPIRequest(r),
+	)
+	if admission.handled {
+		return
+	}
+	if !admission.bypassProxyHostCheck && !checkHost(w, r, hostOpts) {
 		return
 	}
 	if !s.checkHost(w, r) {
 		return
 	}
-	if s.apiAuthToken != "" {
+	if s.daemonRequests.requireAPIAuth {
 		if s.handleAuthBootstrap(w, r) {
 			return
 		}
@@ -1534,20 +1541,16 @@ func (s *Server) AttachHTTPServer(srv *http.Server, ln net.Listener) {
 	s.bgMu.Unlock()
 }
 
-// adoptListenerHostPort repoints the Host-check bind at the actual
-// bound port when the configured bind asked for a kernel-assigned
-// one (port 0) - otherwise every request to an ephemeral-port daemon
-// would be rejected, since no Host header can match port "0".
+// adoptListenerHostPort repoints the Host-check bind at the listener's actual
+// authority. Besides kernel-assigned ports, this normalizes IP literals to the
+// form net/http places in direct request Host headers.
 func (s *Server) adoptListenerHostPort(ln net.Listener) {
 	opts := *s.hostOpts.Load()
-	if opts.Bind.Port != "0" {
+	bind, ok := listenerHostKey(ln)
+	if !ok {
 		return
 	}
-	_, port, err := net.SplitHostPort(ln.Addr().String())
-	if err != nil {
-		return
-	}
-	opts.Bind.Port = port
+	opts.Bind = bind
 	s.hostOpts.Store(&opts)
 }
 
