@@ -138,12 +138,14 @@ Silencing a failing guard without recording the decision is forbidden.
 | New-provider checklist, package layout | `context/provider-architecture.md` | Onboarding a provider |
 | GitHub-only sync behavior (GraphQL, ETag) | `context/github-sync-invariants.md` | Isolated optimization |
 | Schema evolution rules | `context/db-migrations.md` | Migrations are the source of truth |
+| Daemon startup, Host validation, SSE replay | `context/server-runtime.md` | Root server lifecycle and request boundary |
 | API error envelopes + frontend branching | `context/error-handling.md` | Stable contract |
 | Retry/backoff/single-flight | `context/retries-and-backoffs.md` | Upstream flakiness |
 | HTTP test discipline (apitest vs e2etest) | `context/testing.md` | Wire-level testing |
 | UI/TS/Svelte conventions, interaction contracts | `context/ui-design-system.md`, `context/ui-interaction-contracts.md` | Frontend consistency |
 | Phone-first mobile workflow | `context/mobile-ux.md` | `/m` is its own UX |
-| Kata / Docs mode integration | `docs/superpowers/specs/2026-06-08-kata-docs-msgvault-modes-design.md` | Until dedicated docs exist |
+| Kata daemon integration | `context/kata-mode.md`, `context/workspace-apis.md` | External authority and workspace contracts |
+| Docs mode integration | `context/docs-mode.md` | Local filesystem and git-publish boundary |
 | A decision chosen over an alternative | `docs/adr/NNNN-title.md` | Dated, durable rationale |
 | A feature still being designed | `docs/superpowers/specs/YYYY-MM-DD-topic-design.md` | Loaded only when needed |
 
