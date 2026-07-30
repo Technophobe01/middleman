@@ -3,6 +3,10 @@ package systemclipboard
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -21,10 +25,12 @@ func TestNativeWriterSelectsPlatformClipboardCommand(t *testing.T) {
 		wantInput string
 	}{
 		{
-			name:     "macOS",
-			goos:     "darwin",
-			paths:    map[string]string{"pbcopy": "/usr/bin/pbcopy"},
-			wantName: "/usr/bin/pbcopy",
+			name:      "macOS",
+			goos:      "darwin",
+			paths:     map[string]string{"pbcopy": "/usr/bin/pbcopy"},
+			wantName:  "/usr/bin/pbcopy",
+			text:      "clipboard — Unicode\u00a0text",
+			wantInput: "clipboard — Unicode\u00a0text",
 		},
 		{
 			name: "Wayland",
@@ -65,6 +71,10 @@ func TestNativeWriterSelectsPlatformClipboardCommand(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			assert := assert.New(t)
+			t.Setenv("LC_ALL", "C")
+			t.Setenv("MIDDLEMAN_CLIPBOARD_TEST_ENV", "preserved")
+
+			var gotEnvironment []string
 			var gotInput string
 			writer := nativeWriter{
 				goos: tt.goos,
@@ -82,10 +92,12 @@ func TestNativeWriterSelectsPlatformClipboardCommand(t *testing.T) {
 					_ context.Context,
 					name string,
 					args []string,
+					environment []string,
 					text string,
 				) error {
 					assert.Equal(tt.wantName, name)
 					assert.Equal(tt.wantArgs, args)
+					gotEnvironment = environment
 					gotInput = text
 					return nil
 				},
@@ -106,8 +118,58 @@ func TestNativeWriterSelectsPlatformClipboardCommand(t *testing.T) {
 
 			require.NoError(t, err)
 			assert.Equal(wantInput, gotInput)
+			if tt.goos == "darwin" {
+				assert.Equal("en_US.UTF-8", environmentValue(gotEnvironment, "LC_ALL"))
+				assert.Equal(
+					"preserved",
+					environmentValue(gotEnvironment, "MIDDLEMAN_CLIPBOARD_TEST_ENV"),
+				)
+				assert.Equal(1, environmentKeyCount(gotEnvironment, "LC_ALL"))
+			} else {
+				assert.Nil(gotEnvironment)
+			}
 		})
 	}
+}
+
+func TestNativeWriterRunsPbcopyWithUTF8Locale(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake pbcopy requires a POSIX shell")
+	}
+
+	assert := assert.New(t)
+	require := require.New(t)
+	tempDir := t.TempDir()
+	pbcopyPath := filepath.Join(tempDir, "pbcopy")
+	localePath := filepath.Join(tempDir, "locale")
+	stdinPath := filepath.Join(tempDir, "stdin")
+	require.NoError(os.WriteFile(pbcopyPath, []byte(`#!/bin/sh
+set -eu
+printf '%s' "$LC_ALL" > "$MIDDLEMAN_TEST_PBCOPY_LOCALE"
+cat > "$MIDDLEMAN_TEST_PBCOPY_STDIN"
+`), 0o755))
+	t.Setenv("LC_ALL", "C")
+	t.Setenv("MIDDLEMAN_TEST_PBCOPY_LOCALE", localePath)
+	t.Setenv("MIDDLEMAN_TEST_PBCOPY_STDIN", stdinPath)
+
+	writer := nativeWriter{
+		goos:   "darwin",
+		getenv: os.Getenv,
+		lookPath: func(string) (string, error) {
+			return pbcopyPath, nil
+		},
+		run: runCommand,
+	}
+	const text = "clipboard — Unicode\u00a0text"
+
+	require.NoError(writer.WriteText(t.Context(), text))
+	locale, err := os.ReadFile(localePath)
+	require.NoError(err)
+	input, err := os.ReadFile(stdinPath)
+	require.NoError(err)
+
+	assert.Equal("en_US.UTF-8", string(locale))
+	assert.Equal(text, string(input))
 }
 
 func TestNativeWriterReportsUnavailableClipboard(t *testing.T) {
@@ -121,6 +183,7 @@ func TestNativeWriterReportsUnavailableClipboard(t *testing.T) {
 			context.Context,
 			string,
 			[]string,
+			[]string,
 			string,
 		) error {
 			return nil
@@ -131,4 +194,25 @@ func TestNativeWriterReportsUnavailableClipboard(t *testing.T) {
 
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrUnavailable)
+}
+
+func environmentValue(environment []string, key string) string {
+	prefix := key + "="
+	for _, entry := range environment {
+		if after, ok := strings.CutPrefix(entry, prefix); ok {
+			return after
+		}
+	}
+	return ""
+}
+
+func environmentKeyCount(environment []string, key string) int {
+	prefix := key + "="
+	count := 0
+	for _, entry := range environment {
+		if strings.HasPrefix(entry, prefix) {
+			count++
+		}
+	}
+	return count
 }

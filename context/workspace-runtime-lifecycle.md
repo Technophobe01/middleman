@@ -105,6 +105,9 @@ stale tabs.
 - Treat terminal processes as native-terminal-equivalent, but accept bounded, write-only OSC 52 writes only after one
   recent one-shot trusted DOM gesture; terminal data callbacks are not input provenance, and browser denial falls back
   through CSRF-protected loopback (`frontend/src/lib/components/terminal/XtermTerminalPane.svelte::handleTerminalKeyDown`).
+- Keep OSC 52 validation synchronous and ahead of gesture consumption; replacing it with `@xterm/addon-clipboard`
+  would require custom prefilters, nonblocking write separation, and handler-order coupling to preserve current
+  rejection, parser-progress, and read-denial guarantees.
 - Pointer clipboard authority and keyboard authority created during it must remain timed and revocable through release
   grace on capture, focus, or visibility loss; a watchdog bounds missing releases
   (`frontend/src/lib/components/terminal/terminalClipboardWriter.ts::createTerminalClipboardWriter`).
@@ -114,6 +117,9 @@ stale tabs.
 - During active tmux SGR drags outside xterm bounds, add only clamped edge wheel, drag, and release reports; forward
   all other mouse reports unchanged, and never retain unsent drag state across a WebSocket boundary
   (`frontend/src/lib/components/terminal/XtermTerminalPane.svelte::connect`).
+- macOS loopback clipboard fallback must run `pbcopy` with `LC_ALL=en_US.UTF-8`; service launchers may omit
+  a UTF-8 locale and make `pbcopy` reinterpret unchanged UTF-8 input
+  (`internal/systemclipboard/systemclipboard.go::nativeWriter.WriteText`).
 - Windows loopback clipboard fallback must send UTF-16LE to `clip.exe`; UTF-8 stdin is code-page-dependent and corrupts
   non-ASCII text (`internal/systemclipboard/systemclipboard.go::encodeUTF16LE`).
 - The frontend may react immediately to terminal exit events, but should then
