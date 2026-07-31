@@ -11,7 +11,10 @@
   import { untrack } from "svelte";
   import { slide } from "svelte/transition";
   import type { IssueEvent, PREvent } from "../../api/types.js";
-  import type { DetailActivityViewMode } from "../../stores/detail-activity-view.svelte.js";
+  import type {
+    DetailActivityViewMode,
+    DetailTimelineOrder,
+  } from "../../stores/detail-activity-view.svelte.js";
   import { pushModalFrame } from "../../stores/keyboard/modal-stack.svelte.js";
   import type { StoreInstances } from "../../types.js";
   import { renderMarkdown, renderMarkdownSync } from "../../utils/markdown.js";
@@ -61,6 +64,7 @@
     filtered?: boolean;
     showCommitDetails?: boolean;
     activityViewMode?: DetailActivityViewMode;
+    timelineOrder?: DetailTimelineOrder;
     onEditComment?: ((event: PREvent | IssueEvent, body: string) => Promise<boolean>) | undefined;
     onDeleteComment?: ((event: PREvent | IssueEvent) => Promise<string | null>) | undefined;
     onApplySuggestion?: ((input: ApplySuggestionRequest) => Promise<boolean | SuggestionApplyResult>) | undefined;
@@ -87,6 +91,7 @@
     filtered = false,
     showCommitDetails = true,
     activityViewMode = "normal",
+    timelineOrder = "grouped",
     onEditComment,
     onDeleteComment,
     onApplySuggestion,
@@ -196,6 +201,7 @@
     threadID?: string | undefined;
     reviewThread?: TimelineReviewThread | undefined;
     replies: Array<PREvent | IssueEvent>;
+    obsoleteCommits?: Array<PREvent | IssueEvent> | undefined;
   };
 
   type TimelineReviewThread = {
@@ -582,11 +588,71 @@
     });
   }
 
+  function orderEventsForDisplay(
+    sourceEvents: Array<PREvent | IssueEvent>,
+    orderingSourceEvents: Array<PREvent | IssueEvent>,
+  ): Array<PREvent | IssueEvent> {
+    // Strict date order keeps events at their own timestamps instead of
+    // clamping re-pushed commits into force-push generations, so recent
+    // comments stay above older commit batches.
+    if (timelineOrder === "chronological") {
+      return [...sourceEvents].sort(compareEventsDescending);
+    }
+    return orderEventsForForcePushBoundaries(sourceEvents, orderingSourceEvents);
+  }
+
+  // A commit is obsolete once a later force push replaced the lineage it
+  // belongs to; the cutoff is the newest commit any force-push generation
+  // starts after. Grouped mode already communicates this by sorting those
+  // commits below their force-push row, so the cutoff only drives the
+  // collapsed runs in strict date order.
+  function obsoleteCommitCutoff(orderingSourceEvents: Array<PREvent | IssueEvent>): number {
+    const generations = buildForcePushGenerations(buildForcePushBoundaries(orderingSourceEvents));
+    return generations.reduce(
+      (cutoff, generation) => Math.max(cutoff, generation.effectiveStartAfterCommitID),
+      0,
+    );
+  }
+
+  function collapseObsoleteCommitEntries(
+    entries: TimelineEntry[],
+    orderingSourceEvents: Array<PREvent | IssueEvent>,
+    keyPrefix: string,
+  ): TimelineEntry[] {
+    const cutoff = obsoleteCommitCutoff(orderingSourceEvents);
+    if (cutoff <= 0) return entries;
+
+    const collapsed: TimelineEntry[] = [];
+    let run: Array<PREvent | IssueEvent> = [];
+    const flushRun = (): void => {
+      const [newest] = run;
+      if (newest === undefined) return;
+      collapsed.push({
+        key: `${keyPrefix}obsolete-${newest.ID}`,
+        event: newest,
+        obsoleteCommits: run,
+        replies: [],
+      });
+      run = [];
+    };
+
+    for (const entry of entries) {
+      if (entry.event.EventType === "commit" && commitOrder(entry.event) <= cutoff) {
+        run = [...run, entry.event];
+        continue;
+      }
+      flushRun();
+      collapsed.push(entry);
+    }
+    flushRun();
+    return collapsed;
+  }
+
   function buildTimelineEntries(
     sourceEvents: Array<PREvent | IssueEvent>,
     orderingSourceEvents: Array<PREvent | IssueEvent>,
   ): TimelineEntry[] {
-    const orderedEvents = orderEventsForForcePushBoundaries(sourceEvents, orderingSourceEvents);
+    const orderedEvents = orderEventsForDisplay(sourceEvents, orderingSourceEvents);
     const threads: Array<{ id: string; events: Array<PREvent | IssueEvent> }> = [];
 
     for (const event of orderedEvents) {
@@ -643,7 +709,9 @@
       });
     }
 
-    return entries;
+    return timelineOrder === "chronological"
+      ? collapseObsoleteCommitEntries(entries, orderingSourceEvents, "")
+      : entries;
   }
 
   const displayEvents = $derived(collapseLifecycleTransitions(events));
@@ -658,12 +726,15 @@
     sourceEvents: Array<PREvent | IssueEvent>,
     orderingSourceEvents: Array<PREvent | IssueEvent>,
   ): TimelineEntry[] {
-    return orderEventsForForcePushBoundaries(sourceEvents, orderingSourceEvents).map((event) => ({
+    const entries = orderEventsForDisplay(sourceEvents, orderingSourceEvents).map((event) => ({
       key: `compact-event-${event.ID}`,
       event,
       reviewThread: reviewThreadFor(event) ?? undefined,
       replies: [],
     }));
+    return timelineOrder === "chronological"
+      ? collapseObsoleteCommitEntries(entries, orderingSourceEvents, "compact-")
+      : entries;
   }
 
   function isCompactEvent(eventType: string): boolean {
@@ -921,6 +992,7 @@
   let deleteError = $state<string | null>(null);
   let collapsedThreads = $state<string[]>([]);
   let expandedCompactRows = $state<string[]>([]);
+  let expandedObsoleteGroups = $state<string[]>([]);
   let replyingThreadID = $state<string | null>(null);
   let replyingEntryKey = $state<string | null>(null);
   let replyDraft = $state("");
@@ -1056,6 +1128,22 @@
     collapsedThreads = collapsedThreads.includes(id)
       ? collapsedThreads.filter((item) => item !== id)
       : [...collapsedThreads, id];
+  }
+
+  function isObsoleteGroupExpanded(entry: TimelineEntry): boolean {
+    return expandedObsoleteGroups.includes(entry.key);
+  }
+
+  function toggleObsoleteGroup(entry: TimelineEntry): void {
+    expandedObsoleteGroups = expandedObsoleteGroups.includes(entry.key)
+      ? expandedObsoleteGroups.filter((item) => item !== entry.key)
+      : [...expandedObsoleteGroups, entry.key];
+  }
+
+  function obsoleteGroupSummary(commits: Array<PREvent | IssueEvent>): string {
+    return commits.length === 1
+      ? "1 commit replaced by a later force push"
+      : `${commits.length} commits replaced by a later force push`;
   }
 
   function compactEntryCanExpand(entry: TimelineEntry): boolean {
@@ -1671,6 +1759,45 @@
       {@const event = entry.event}
       {@const targetID = replyTargetID(entry)}
       {@const hasReplyOnlyAction = entry.replies.length === 0 && canReplyToThread(entry)}
+      {#if entry.obsoleteCommits}
+        {@const obsoleteExpanded = isObsoleteGroupExpanded(entry)}
+        <TimelineItem tone="muted" class="event--compact">
+          <Card level="default" padding="sm" class="event-card--compact event-card--obsolete-group">
+            <button
+              class="obsolete-group-row compact-event-toggle"
+              type="button"
+              onclick={() => toggleObsoleteGroup(entry)}
+              aria-expanded={obsoleteExpanded}
+              title={obsoleteExpanded ? "Collapse obsolete commits" : "Expand obsolete commits"}
+            >
+              <span class="compact-event-expander" aria-hidden="true">
+                {#if obsoleteExpanded}
+                  <ChevronDownIcon size={14} />
+                {:else}
+                  <ChevronRightIcon size={14} />
+                {/if}
+              </span>
+              <span class="event-type obsolete-group-type">Obsolete</span>
+              <span class="compact-event-summary">{obsoleteGroupSummary(entry.obsoleteCommits)}</span>
+              <span class="event-time compact-event-time">{formatRelativeTime(event.CreatedAt)}</span>
+            </button>
+            {#if obsoleteExpanded}
+              <div class="obsolete-commit-list">
+                {#each entry.obsoleteCommits as commit (commit.ID)}
+                  <div class="obsolete-commit-row">
+                    {#if commit.Author}
+                      <span class="event-author">{commit.Author}</span>
+                    {/if}
+                    <span class="commit-sha">{shortCommit(commit.Summary)}</span>
+                    <span class="commit-title">{commitTitle(commit.Body)}</span>
+                    <span class="event-time">{formatRelativeTime(commit.CreatedAt)}</span>
+                  </div>
+                {/each}
+              </div>
+            {/if}
+          </Card>
+        </TimelineItem>
+      {:else}
       <TimelineItem
         tone={eventTimelineTone(event.EventType)}
         class={activityViewMode === "compact" || isCompactEvent(event.EventType) ? "event--compact" : ""}
@@ -1922,6 +2049,7 @@
           </CommentCard>
         {/if}
       </TimelineItem>
+      {/if}
       {/each}
     </Timeline>
   </div>
@@ -2163,6 +2291,38 @@
   .commit-body-details {
     margin-top: var(--focus-detail-space-xs, 7px);
     padding-right: var(--focus-detail-space-sm, 10px);
+  }
+
+  .obsolete-group-row {
+    display: grid;
+    grid-template-columns: 15px max-content minmax(0, 1fr) max-content;
+    align-items: center;
+    gap: var(--focus-detail-space-xs, 6px);
+    min-width: 0;
+  }
+
+  .obsolete-group-type {
+    color: var(--text-muted);
+  }
+
+  .obsolete-commit-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--focus-detail-space-xs, 4px);
+    margin-top: var(--focus-detail-space-sm, 8px);
+    padding-top: var(--focus-detail-space-sm, 8px);
+    border-top: 1px solid var(--border-muted);
+  }
+
+  .obsolete-commit-row {
+    display: flex;
+    align-items: center;
+    gap: var(--focus-detail-space-sm, 8px);
+    min-width: 0;
+  }
+
+  .obsolete-commit-row .commit-title {
+    color: var(--text-secondary);
   }
 
   .system-event-summary,

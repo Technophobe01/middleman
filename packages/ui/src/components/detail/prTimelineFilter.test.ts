@@ -358,4 +358,59 @@ describe("DetailActivityViewMenu", () => {
     expect(screen.getByRole("button", { name: /force pushes/i })).toBeTruthy();
     expect(screen.getByRole("button", { name: /hide bot activity/i })).toBeTruthy();
   });
+
+  it("toggles strict date order on from a single order row", async () => {
+    const onOrderChange = vi.fn();
+    render(DetailActivityViewMenu, {
+      props: {
+        viewMode: "normal",
+        onViewChange: vi.fn(),
+        filter: DEFAULT_PR_TIMELINE_FILTER,
+        onFilterChange: vi.fn(),
+        timelineOrder: "grouped",
+        onOrderChange,
+      },
+    });
+
+    await fireEvent.click(screen.getByRole("button", { name: /view/i }));
+    await fireEvent.click(screen.getByRole("button", { name: /strict date order/i }));
+
+    expect(onOrderChange).toHaveBeenCalledWith("chronological");
+    expect(document.querySelector(".kit-filter-dropdown__panel")).toBeTruthy();
+  });
+
+  it("toggles strict date order back off from the same row", async () => {
+    const onOrderChange = vi.fn();
+    render(DetailActivityViewMenu, {
+      props: {
+        viewMode: "normal",
+        onViewChange: vi.fn(),
+        filter: DEFAULT_PR_TIMELINE_FILTER,
+        onFilterChange: vi.fn(),
+        timelineOrder: "chronological",
+        onOrderChange,
+      },
+    });
+
+    await fireEvent.click(screen.getByRole("button", { name: /view/i }));
+
+    const orderButtons = screen.getAllByRole("button", { name: /strict date order/i });
+    expect(orderButtons.length).toBe(1);
+    await fireEvent.click(orderButtons[0]!);
+
+    expect(onOrderChange).toHaveBeenCalledWith("grouped");
+  });
+
+  it("omits the timeline order toggle when order state is not provided", async () => {
+    render(DetailActivityViewMenu, {
+      props: {
+        viewMode: "normal",
+        onViewChange: vi.fn(),
+      },
+    });
+
+    await fireEvent.click(screen.getByRole("button", { name: /view/i }));
+
+    expect(screen.queryByRole("button", { name: /strict date order/i })).toBeNull();
+  });
 });
