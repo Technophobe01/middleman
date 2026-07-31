@@ -21,26 +21,28 @@ async function sqlite(dbPath, sql) {
 }
 
 test("dev-clone-db copies source database and rewrites cloned config", async () => {
-  const tmp = await mkdtemp(path.join(os.tmpdir(), "middleman-dev-clone-test-"));
-  const sourceHome = path.join(tmp, "source");
+  const tmp = await mkdtemp(path.join(os.tmpdir(), "kenn-forge-dev-clone-test-"));
+  const home = path.join(tmp, "home");
+  const sourceHome = path.join(home, ".kenn", "forge");
   const cloneDir = await realpath(path.join(tmp, "clone", ".."));
   const resolvedCloneDir = path.join(cloneDir, "clone");
   await mkdir(sourceHome, { recursive: true });
   await writeFile(
     path.join(sourceHome, "config.toml"),
-    'host = "127.0.0.1"\nport = 8091\ndata_dir = "' + sourceHome + '"\n',
+    'host = "127.0.0.1"\nport = 8091\n',
   );
   await sqlite(
-    path.join(sourceHome, "middleman.db"),
+    path.join(sourceHome, "forge.db"),
     "CREATE TABLE sample (value TEXT); INSERT INTO sample VALUES ('copied');",
   );
 
   const { stdout } = await execFileAsync("bash", ["scripts/dev-clone-db.sh"], {
     env: {
       ...process.env,
-      MIDDLEMAN_CONFIG: path.join(sourceHome, "config.toml"),
-      MIDDLEMAN_DEV_CLONE_DIR: resolvedCloneDir,
-      MIDDLEMAN_DEV_CLONE_PORT: "8123",
+      HOME: home,
+      KENN_FORGE_CONFIG: "",
+      KENN_FORGE_DEV_CLONE_DIR: resolvedCloneDir,
+      KENN_FORGE_DEV_CLONE_PORT: "8123",
     },
   });
 
@@ -66,12 +68,12 @@ test("dev-clone-db copies source database and rewrites cloned config", async () 
   const { stdout: queryStdout } = await execFileAsync("python3", [
     "-c",
     queryScript,
-    path.join(resolvedCloneDir, "middleman.db"),
+    path.join(resolvedCloneDir, "forge.db"),
   ]);
   assert.equal(queryStdout.trim(), "copied");
 
   const cloneDirMode = (await stat(resolvedCloneDir)).mode & 0o777;
-  const cloneDBMode = (await stat(path.join(resolvedCloneDir, "middleman.db"))).mode & 0o777;
+  const cloneDBMode = (await stat(path.join(resolvedCloneDir, "forge.db"))).mode & 0o777;
   const cloneConfigMode = (await stat(clonedConfigPath)).mode & 0o777;
   assert.equal(cloneDirMode, 0o700);
   assert.equal(cloneDBMode, 0o600);

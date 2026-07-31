@@ -84,7 +84,7 @@ describe("KataProjectMappingsSettings", () => {
       ],
       targets: [
         {
-          display_name: "Middleman",
+          display_name: "Kenn Forge",
           repo: {
             provider: "github",
             platform_host: "github.com",
@@ -109,10 +109,10 @@ describe("KataProjectMappingsSettings", () => {
 
     expect((screen.getByLabelText("Kata project project-kata daemon ID") as HTMLInputElement).value).toBe("work");
     expect((screen.getByLabelText("Kata project project-kata UID") as HTMLInputElement).value).toBe("project-kata");
-    expect(screen.getByRole("button", { name: /project-kata repository target/ }).textContent).toContain("Middleman");
+    expect(screen.getByRole("button", { name: /project-kata repository target/ }).textContent).toContain("Kenn Forge");
   });
 
-  it("saves a Kata mapping to a selected known Middleman project", async () => {
+  it("saves a Kata mapping to a selected known Kenn Forge project", async () => {
     const savedMappings = [
       {
         daemon_id: "work",
@@ -128,7 +128,7 @@ describe("KataProjectMappingsSettings", () => {
       projects: [],
       targets: [
         {
-          display_name: "Middleman",
+          display_name: "Kenn Forge",
           repo: {
             provider: "github",
             platform_host: "github.com",
@@ -176,9 +176,9 @@ describe("KataProjectMappingsSettings", () => {
     const query = screen.getByRole("combobox", { name: pickerName });
     await fireEvent.input(query, { target: { value: "middle" } });
 
-    expect(screen.getByRole("option", { name: "Middleman · kenn-io/middleman" })).toBeTruthy();
+    expect(screen.getByRole("option", { name: "Kenn Forge · kenn-io/middleman" })).toBeTruthy();
     expect(screen.queryByRole("option", { name: "Tools · acme/tools" })).toBeNull();
-    await fireEvent.mouseDown(screen.getByRole("option", { name: "Middleman · kenn-io/middleman" }));
+    await fireEvent.mouseDown(screen.getByRole("option", { name: "Kenn Forge · kenn-io/middleman" }));
 
     await fireEvent.click(screen.getByRole("button", { name: "Save Kata mappings" }));
 

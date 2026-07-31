@@ -2,4 +2,4 @@ version = 1
 
 [project]
 identity = "github.com/kenn-io/middleman"
-name = "middleman"
+name = "kenn-forge"

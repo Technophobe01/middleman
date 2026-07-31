@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 env:
-  MIDDLEMAN_CI_WORKERS: ${{ github.repository == 'kenn-io/middleman' && (github.event_name == 'push' && github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.base.repo.full_name == github.repository)) && '14' || '2' }}
+  KENN_FORGE_CI_WORKERS: ${{ github.repository == 'kenn-io/middleman' && (github.event_name == 'push' && github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.base.repo.full_name == github.repository)) && '14' || '2' }}
 
 permissions:
   checks: write
@@ -84,7 +84,7 @@ jobs:
     outputs:
       image: ${{ steps.resolve.outputs.image }}
     env:
-      PLAYWRIGHT_CI_IMAGE: ghcr.io/kenn-io/middleman-playwright
+      PLAYWRIGHT_CI_IMAGE: ghcr.io/kenn-io/kenn-forge-playwright
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -188,7 +188,7 @@ jobs:
       - name: Run guardrail checks
         run: make guardrail-check
         env:
-          MIDDLEMAN_MIGRATION_PR_BASE_REF: ${{ github.event.pull_request.base.sha }}
+          KENN_FORGE_MIGRATION_PR_BASE_REF: ${{ github.event.pull_request.base.sha }}
 
       - uses: golangci/golangci-lint-action@1e7e51e771db61008b38414a730f564565cf7c20 # v9.2.0
         with:
@@ -245,7 +245,7 @@ jobs:
         if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          MIDDLEMAN_LIVE_GITHUB_TESTS: "1"
+          KENN_FORGE_LIVE_GITHUB_TESTS: "1"
         run: |
           mkdir -p tmp
           go tool gotestsum --format pkgname-and-test-fails --jsonfile=tmp/test-graphql-output.json -- ./internal/github -run TestLiveGraphQLQueriesValidateAgainstGitHub -shuffle=on
@@ -344,7 +344,7 @@ jobs:
         run: go test ./internal/server/workspacetest -run 'TestWorkspaceCreatesRustPtyManagerSessionE2E|TestWorkspaceRuntimeLaunchesRustPtyManagerSessionE2E' -shuffle=on
 
       - name: Run Rust PTY manager tests
-        run: cargo test -p middleman-pty-manager
+        run: cargo test -p kenn-forge-pty-manager
 
   race:
     name: go test -race
@@ -453,7 +453,7 @@ jobs:
           cp -r frontend/dist internal/web/dist
 
       - name: Build binary
-        run: go build -o middleman ./cmd/middleman
+        run: go build -o kenn-forge ./cmd/kenn-forge
 
   e2e-mock:
     runs-on: ${{ github.repository == 'kenn-io/middleman' && (github.event_name == 'push' && github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.base.repo.full_name == github.repository)) && 'kenn-linux-x64-public' || 'ubuntu-latest' }}
@@ -577,7 +577,7 @@ jobs:
       # rides the chromium leg of the matrix.
       - name: Run GitHub App setup UI E2E tests
         if: matrix.browser == 'chromium'
-        run: ./node_modules/.bin/vp run --filter @middleman/github-app-ui test:e2e
+        run: ./node_modules/.bin/vp run --filter @kenn-forge/github-app-ui test:e2e
 
       - name: Upload Playwright report
         if: failure()
