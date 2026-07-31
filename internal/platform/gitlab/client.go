@@ -164,9 +164,12 @@ func (t *syncBudgetTransport) RoundTrip(req *http.Request) (*http.Response, erro
 	var window ghsync.BudgetWindow
 	if counted {
 		var reserved bool
-		if archive {
+		switch {
+		case archive:
 			window, reserved = t.budget.TrySpendArchive(1)
-		} else {
+		case ghsync.IsEssentialSyncBudgetContext(req.Context()):
+			window, reserved = t.budget.TrySpendEssential(1)
+		default:
 			window, reserved = t.budget.TrySpend(1)
 		}
 		if !reserved {
@@ -453,6 +456,11 @@ func (c *Client) ListOpenMergeRequests(
 		ListOptions: gitlab.ListOptions{Page: 1, PerPage: defaultPageSize},
 	}
 	var out []platform.MergeRequest
+	// Fork-source clone URL lookups are enrichment, not discovery: they run
+	// on the optional budget so they cannot drain the essential reserve, and
+	// a budget-refused lookup degrades to an unknown head repo instead of
+	// discarding the fetched list.
+	enrichCtx := ghsync.WithoutEssentialSyncBudget(ctx)
 	for {
 		mrs, resp, err := c.api.MergeRequests.ListProjectMergeRequests(pid, opt, gitlab.WithContext(ctx))
 		if err != nil {
@@ -464,9 +472,14 @@ func (c *Client) ListOpenMergeRequests(
 		for _, mr := range mrs {
 			normalized := NormalizeMergeRequest(normalizedRef, mr, nil)
 			normalized.HeadRepoCloneURL, normalized.HeadRepoCloneURLUnknown, err =
-				c.optionalHeadRepoCloneURL(ctx, normalizedRef, mr.ProjectID, mr.SourceProjectID)
+				c.optionalHeadRepoCloneURL(enrichCtx, normalizedRef, mr.ProjectID, mr.SourceProjectID)
 			if err != nil {
-				return nil, err
+				if errors.Is(err, platform.ErrSyncBudgetExhausted) {
+					normalized.HeadRepoCloneURL = ""
+					normalized.HeadRepoCloneURLUnknown = true
+				} else {
+					return nil, err
+				}
 			}
 			out = append(out, normalized)
 		}

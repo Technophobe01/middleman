@@ -204,6 +204,29 @@ func IsSyncBudgetContext(ctx context.Context) bool {
 	return ok
 }
 
+type essentialSyncBudgetKey struct{}
+
+// WithEssentialSyncBudget marks a context whose counted requests may spend
+// the budget's essential reserve. Only the list fetches that discover new
+// and closed items use it: they are the sync's source of truth, and optional
+// work (detail refreshes, fast-sync, archive) must not be able to starve
+// them within the configured ceiling.
+func WithEssentialSyncBudget(ctx context.Context) context.Context {
+	return context.WithValue(ctx, essentialSyncBudgetKey{}, true)
+}
+
+// WithoutEssentialSyncBudget demotes a context back to optional spend. List
+// implementations use it for per-item enrichment lookups nested inside an
+// essential list fetch, so enrichment cannot drain the discovery reserve.
+func WithoutEssentialSyncBudget(ctx context.Context) context.Context {
+	return context.WithValue(ctx, essentialSyncBudgetKey{}, false)
+}
+
+func IsEssentialSyncBudgetContext(ctx context.Context) bool {
+	essential, ok := ctx.Value(essentialSyncBudgetKey{}).(bool)
+	return ok && essential
+}
+
 func WithArchiveSyncBudget(ctx context.Context) context.Context {
 	return context.WithValue(WithSyncBudget(ctx), archiveSyncBudgetKey{}, true)
 }
@@ -245,9 +268,12 @@ func (t *budgetTransport) RoundTrip(
 	var window BudgetWindow
 	if counted {
 		var reserved bool
-		if archive {
+		switch {
+		case archive:
 			window, reserved = t.budget.TrySpendArchive(1)
-		} else {
+		case IsEssentialSyncBudgetContext(req.Context()):
+			window, reserved = t.budget.TrySpendEssential(1)
+		default:
 			window, reserved = t.budget.TrySpend(1)
 		}
 		if !reserved {
