@@ -17,6 +17,7 @@ import (
 
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/danielgtaylor/huma/v2/adapters/humago"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/forge/internal/config"
 	"go.kenn.io/forge/internal/db"
@@ -41,8 +42,33 @@ type Server struct {
 	workspaceAPI *workspaceapi.Handler
 }
 
+func TestKataTestServerCleanupStopsWorkspaceSetupBeforeDeleting(t *testing.T) {
+	var steps []string
+	runKataTestServerCleanup(
+		func() { steps = append(steps, "stop workspace setup") },
+		func() { steps = append(steps, "delete workspaces") },
+		func() { steps = append(steps, "stop Kata handler") },
+	)
+
+	assert.Equal(t, []string{
+		"stop workspace setup",
+		"delete workspaces",
+		"stop Kata handler",
+	}, steps)
+}
+
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.http.ServeHTTP(w, r)
+}
+
+func runKataTestServerCleanup(
+	stopWorkspaceSetup func(),
+	deleteWorkspaces func(),
+	stopKataHandler func(),
+) {
+	stopWorkspaceSetup()
+	deleteWorkspaces()
+	stopKataHandler()
 }
 
 func setupTestServer(t *testing.T) (*Server, *db.DB) {
@@ -100,6 +126,7 @@ func newKataTestServer(
 	var workspaces *workspace.Manager
 	if options.WorktreeDir != "" {
 		workspaces = workspace.NewManager(database, options.WorktreeDir)
+		workspaces.SetTmuxCommand(kataAPITestTmuxCommand)
 	}
 	workspaceHandler := workspaceapi.New(workspaceapi.Deps{
 		DB: database, Resolver: resolver, Workspaces: workspaces,
@@ -123,8 +150,27 @@ func newKataTestServer(
 	server := &Server{Handler: handler, http: mux, workspaceAPI: workspaceHandler}
 	handler.Start(t.Context())
 	t.Cleanup(func() {
-		require.NoError(t, handler.Shutdown(context.Background()))
-		require.NoError(t, workspaceHandler.Shutdown(context.Background()))
+		assert := assert.New(t)
+		runKataTestServerCleanup(
+			func() {
+				assert.NoError(workspaceHandler.Shutdown(context.Background()))
+			},
+			func() {
+				if workspaces == nil {
+					return
+				}
+				stored, err := database.ListWorkspaces(context.Background())
+				if assert.NoError(err) {
+					for _, ws := range stored {
+						_, err := workspaces.Delete(context.Background(), ws.ID, true, nil)
+						assert.NoError(err)
+					}
+				}
+			},
+			func() {
+				assert.NoError(handler.Shutdown(context.Background()))
+			},
+		)
 	})
 	return server
 }

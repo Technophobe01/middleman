@@ -77,6 +77,7 @@
   let sentCols = 0;
   let sentRows = 0;
   let sentResizeActive: boolean | null = null;
+  let resizeReady = true;
   let appliedTerminalFontFamily = "";
   let appliedFontSize = 0;
   let appliedScrollback = 0;
@@ -122,7 +123,7 @@
   const TERMINAL_MINIMUM_CONTRAST_RATIO = 4.5;
   const TERMINAL_FONT_WAIT_MS = 300;
   const TERMINAL_FONT_LOAD_GLYPHS = "0MWim@#";
-  const TERMINAL_SEQUENCE_CANCEL = "\x18";
+  const TERMINAL_SEQUENCE_CANCEL = new Uint8Array([0x18]);
 
   function isAttachableInitialStatus(status: string | undefined): boolean {
     return status === undefined || status === "running" || status === "starting";
@@ -136,8 +137,8 @@
     });
   }
 
-  function cancelPendingTerminalSequence(): void {
-    terminal?.write(TERMINAL_SEQUENCE_CANCEL);
+  function cancelPendingTerminalSequence(callback?: () => void): void {
+    terminal?.write(TERMINAL_SEQUENCE_CANCEL, callback);
   }
 
   function handleOsc52Clipboard(data: string): boolean {
@@ -289,36 +290,53 @@
     return workspaceTmuxWebSocketPath(workspaceId);
   }
 
-  function appendSizeParams(
+  function appendConnectionParams(
     url: string,
-    cols: number,
-    rows: number,
+    size: { cols: number; rows: number } | null,
+    replayBoundary: boolean,
   ): string {
     const sep = url.includes("?") ? "&" : "?";
     const resizeActive = resizeAuthorityRegionSize() !== null ? "1" : "0";
     const { traceparent, baggage } = traceHeadersForRequest();
-    let result = `${url}${sep}cols=${cols}&rows=${rows}&resize_active=${resizeActive}&traceparent=${encodeURIComponent(traceparent)}`;
+    const sizeParams = size
+      ? `cols=${size.cols}&rows=${size.rows}&`
+      : "";
+    const replayBoundaryParam = replayBoundary ? "replay_boundary=1&" : "";
+    let result = `${url}${sep}${sizeParams}${replayBoundaryParam}resize_active=${resizeActive}&traceparent=${encodeURIComponent(traceparent)}`;
     if (baggage !== null) result += `&baggage=${encodeURIComponent(baggage)}`;
     return result;
   }
 
   function buildWsUrl(
-    cols: number,
-    rows: number,
+    size: { cols: number; rows: number } | null,
+    replayBoundary: boolean,
   ): string | null {
     const path = websocketPath ?? defaultWebsocketPath();
     if (!path) return null;
 
-    const withSize = appendSizeParams(path, cols, rows);
-    if (/^wss?:\/\//.test(withSize)) {
-      return withSize;
+    const withConnectionParams = appendConnectionParams(path, size, replayBoundary);
+    if (/^wss?:\/\//.test(withConnectionParams)) {
+      return withConnectionParams;
     }
-    const embeddedUrl = embeddedWebSocketUrl(withBasePath(withSize));
+    const embeddedUrl = embeddedWebSocketUrl(withBasePath(withConnectionParams));
     if (embeddedUrl) return embeddedUrl;
-    const devUrl = buildDevApiWsUrl(withSize);
+    const devUrl = buildDevApiWsUrl(withConnectionParams);
     if (devUrl) return devUrl;
     const proto = location.protocol === "https:" ? "wss" : "ws";
-    return `${proto}://${location.host}${withBasePath(withSize)}`;
+    return `${proto}://${location.host}${withBasePath(withConnectionParams)}`;
+  }
+
+  function supportsReplayBoundary(): boolean {
+    if (!websocketPath) return false;
+    try {
+      const pathname = new URL(websocketPath, window.location.href).pathname;
+      return (
+        !pathname.includes("/fleet/hosts/") &&
+        /\/workspaces\/[^/]+\/runtime\/sessions\/[^/]+\/terminal$/.test(pathname)
+      );
+    } catch {
+      return false;
+    }
   }
 
   function withBasePath(path: string): string {
@@ -375,7 +393,7 @@
     cols: number,
     rows: number,
   ): boolean {
-    if (ws?.readyState !== WebSocket.OPEN) return false;
+    if (!resizeReady || ws?.readyState !== WebSocket.OPEN) return false;
     ws.send(JSON.stringify({ type, cols, rows }));
     return true;
   }
@@ -545,18 +563,23 @@
     mouseDragAutoscroll.reset();
     const cols = terminal.cols;
     const rows = terminal.rows;
-    const url = buildWsUrl(cols, rows);
+    const replayBoundary = supportsReplayBoundary();
+    const url = buildWsUrl(replayBoundary ? null : { cols, rows }, replayBoundary);
     if (!url) return;
     const socket = new WebSocket(url);
     socket.binaryType = "arraybuffer";
     sentResizeActive = null;
+    resizeReady = !replayBoundary;
     ws = socket;
 
     socket.onopen = () => {
       switchTimer.record("socket-open");
       reconnectDelay = 1000;
       sendResizeActive(resizeAuthorityRegionSize() !== null);
-      if (active) scheduleTerminalRefresh();
+      const size = resizeAuthorityRegionSize();
+      if (resizeReady && size && (size.cols !== sentCols || size.rows !== sentRows)) {
+        scheduleTerminalRefresh();
+      }
     };
 
     socket.onmessage = (ev: MessageEvent) => {
@@ -590,7 +613,13 @@
             type: string;
             code?: number;
           };
-          if (msg.type === "exited") {
+          if (msg.type === "replay_ready" && replayBoundary) {
+            cancelPendingTerminalSequence(() => {
+              if (disposed || ws !== socket) return;
+              resizeReady = true;
+              scheduleTerminalRefresh();
+            });
+          } else if (msg.type === "exited") {
             cancelPendingTerminalSequence();
             onExit?.(msg.code ?? 0);
             exited = true;

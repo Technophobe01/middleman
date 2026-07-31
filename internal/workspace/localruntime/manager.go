@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/creack/pty/v2"
 
@@ -163,27 +164,30 @@ var (
 )
 
 type session struct {
-	mu                    sync.Mutex
-	info                  SessionInfo
-	cmd                   *exec.Cmd
-	ptmx                  *os.File
-	pty                   ptyownerruntime.PTY
-	lifecycle             sessionLifecycle
-	tmuxSession           string
-	done                  chan struct{}
-	outputDone            chan struct{}
-	subscribers           map[chan []byte]struct{}
-	outputBuffer          []byte
-	outputClosed          bool
-	alternateScreenActive bool
-	alternateScreenTail   []byte
-	lifecycleMu           sync.Mutex
-	lifecycleClosed       bool
-	stopRequested         bool
-	nextAttachmentID      uint64
-	resizeOwnerID         uint64
-	resizeOwnerPriority   ResizePriority
-	resizeAttachments     map[uint64]resizeAttachment
+	mu                        sync.Mutex
+	info                      SessionInfo
+	cmd                       *exec.Cmd
+	ptmx                      *os.File
+	pty                       ptyownerruntime.PTY
+	lifecycle                 sessionLifecycle
+	tmuxSession               string
+	done                      chan struct{}
+	outputDone                chan struct{}
+	subscribers               map[chan []byte]struct{}
+	outputBuffer              []byte
+	outputClosed              bool
+	alternateScreenActive     bool
+	alternateScreenTail       []byte
+	terminalSequenceTail      []byte
+	inputModes                terminalInputModeState
+	lifecycleMu               sync.Mutex
+	lifecycleClosed           bool
+	stopRequested             bool
+	nextAttachmentID          uint64
+	resizeOwnerID             uint64
+	resizeOwnerPriority       ResizePriority
+	resizeAttachments         map[uint64]resizeAttachment
+	replayBoundarySubscribers map[chan []byte]struct{}
 }
 
 type ResizePriority int
@@ -196,6 +200,7 @@ const (
 type AttachSessionOptions struct {
 	ResizePriority ResizePriority
 	ResizeActive   bool
+	ReplayBoundary bool
 }
 
 type resizeAttachment struct {
@@ -1770,13 +1775,31 @@ func (s *session) broadcast(data []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	s.inputModes.observe(chunk)
 	s.appendReplayOutputLocked(chunk)
+	replayReady := len(s.terminalSequenceTail) == 0
 
 	for ch := range s.subscribers {
 		select {
 		case ch <- chunk:
 		default:
 			delete(s.subscribers, ch)
+			delete(s.replayBoundarySubscribers, ch)
+			close(ch)
+			continue
+		}
+		if !replayReady {
+			continue
+		}
+		if _, pending := s.replayBoundarySubscribers[ch]; !pending {
+			continue
+		}
+		select {
+		case ch <- nil:
+			delete(s.replayBoundarySubscribers, ch)
+		default:
+			delete(s.subscribers, ch)
+			delete(s.replayBoundarySubscribers, ch)
 			close(ch)
 		}
 	}
@@ -1789,6 +1812,8 @@ type alternateScreenEvent struct {
 }
 
 func (s *session) appendReplayOutputLocked(chunk []byte) {
+	s.updateTerminalSequenceTailLocked(chunk)
+
 	// Alternate-screen TUIs are stateful. Replaying a suffix of their
 	// screen history into a fresh terminal can corrupt the attach, so
 	// keep only normal-screen output for future subscribers.
@@ -1821,11 +1846,42 @@ func (s *session) appendReplayOutputLocked(chunk []byte) {
 	s.alternateScreenTail = trailingBytes(scan, maxAlternateScreenSequenceLen-1)
 }
 
+func (s *session) updateTerminalSequenceTailLocked(chunk []byte) {
+	scan := append(slices.Clone(s.terminalSequenceTail), chunk...)
+	tailLen := trailingIncompleteTerminalDataLen(scan)
+	if tailLen == 0 || tailLen > maxSessionOutputReplay {
+		s.terminalSequenceTail = nil
+		return
+	}
+	s.terminalSequenceTail = slices.Clone(scan[len(scan)-tailLen:])
+}
+
 func (s *session) appendOutputBufferLocked(chunk []byte) {
 	s.outputBuffer = append(s.outputBuffer, chunk...)
 	if extra := len(s.outputBuffer) - maxSessionOutputReplay; extra > 0 {
-		s.outputBuffer = slices.Clone(s.outputBuffer[extra:])
+		start := replaySuffixStart(s.outputBuffer, extra)
+		s.outputBuffer = slices.Clone(s.outputBuffer[start:])
 	}
+}
+
+// replaySuffixStart advances a size-based cutoff only when it demonstrably
+// splits a valid UTF-8 rune. Invalid continuation bytes are preserved because
+// terminals may use them as raw C1 controls.
+func replaySuffixStart(data []byte, start int) int {
+	if start <= 0 || start >= len(data) || utf8.RuneStart(data[start]) {
+		return start
+	}
+	for candidate := start - 1; candidate >= max(0, start-utf8.UTFMax+1); candidate-- {
+		if !utf8.RuneStart(data[candidate]) {
+			continue
+		}
+		_, size := utf8.DecodeRune(data[candidate:])
+		if size > 1 && candidate+size > start {
+			return candidate + size
+		}
+		return start
+	}
+	return start
 }
 
 func alternateScreenEvents(data []byte) []alternateScreenEvent {
@@ -1870,12 +1926,37 @@ func trailingBytes(data []byte, maxLen int) []byte {
 }
 
 func (s *session) subscribe() (<-chan []byte, func()) {
+	return s.subscribeInternal(false)
+}
+
+func (s *session) subscribeWithReplayBoundary() (<-chan []byte, func()) {
+	return s.subscribeInternal(true)
+}
+
+func (s *session) subscribeInternal(replayBoundary bool) (<-chan []byte, func()) {
 	ch := make(chan []byte, 64)
 
 	s.mu.Lock()
 	info := s.info
-	if len(s.outputBuffer) > 0 && !s.alternateScreenActive {
-		replay := slices.Clone(s.outputBuffer)
+	replay := make([]byte, 0)
+	if !s.alternateScreenActive {
+		replay = append(replay, s.outputBuffer...)
+	}
+	var replayModes terminalInputModeState
+	replayModes.observe(replay)
+	if pendingLen := trailingIncompleteTerminalDataLen(replay); pendingLen > 0 {
+		stableLen := len(replay) - pendingLen
+		pending := slices.Clone(replay[stableLen:])
+		replay = slices.Clone(replay[:stableLen])
+		replay = s.inputModes.appendTransitions(replay, replayModes)
+		replay = append(replay, pending...)
+	} else {
+		replay = s.inputModes.appendTransitions(replay, replayModes)
+	}
+	if s.alternateScreenActive {
+		replay = append(replay, s.terminalSequenceTail...)
+	}
+	if len(replay) > 0 {
 		ch <- replay
 		slog.Debug(
 			"runtime terminal replay queued",
@@ -1883,6 +1964,16 @@ func (s *session) subscribe() (<-chan []byte, func()) {
 			"session_key", info.Key,
 			"bytes", len(replay),
 		)
+	}
+	if replayBoundary {
+		if s.outputClosed || len(s.terminalSequenceTail) == 0 {
+			ch <- nil
+		} else {
+			if s.replayBoundarySubscribers == nil {
+				s.replayBoundarySubscribers = make(map[chan []byte]struct{})
+			}
+			s.replayBoundarySubscribers[ch] = struct{}{}
+		}
 	}
 	if s.outputClosed {
 		close(ch)
@@ -1904,6 +1995,7 @@ func (s *session) subscribe() (<-chan []byte, func()) {
 		info := s.info
 		if _, ok := s.subscribers[ch]; ok {
 			delete(s.subscribers, ch)
+			delete(s.replayBoundarySubscribers, ch)
 			close(ch)
 		}
 		subscriberCount := len(s.subscribers)
@@ -2025,6 +2117,13 @@ func (s *session) closeSubscribers() {
 	}
 	s.outputClosed = true
 	for ch := range s.subscribers {
+		if _, pending := s.replayBoundarySubscribers[ch]; pending {
+			select {
+			case ch <- nil:
+			default:
+			}
+			delete(s.replayBoundarySubscribers, ch)
+		}
 		delete(s.subscribers, ch)
 		close(ch)
 	}
@@ -2263,7 +2362,13 @@ func attachToSession(
 		return nil, fmt.Errorf("session %q is not running", key)
 	}
 
-	output, unsubscribe := s.subscribe()
+	var output <-chan []byte
+	var unsubscribe func()
+	if options.ReplayBoundary {
+		output, unsubscribe = s.subscribeWithReplayBoundary()
+	} else {
+		output, unsubscribe = s.subscribe()
+	}
 	resizeAttachmentID := s.registerResizeAttachment(
 		options.ResizePriority,
 		options.ResizeActive,

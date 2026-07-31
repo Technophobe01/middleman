@@ -58,6 +58,7 @@ let configuredLetterSpacing = 0;
 let configuredCursorBlink = true;
 let configuredFontLigatures = false;
 let mockSockets: MockWebSocket[] = [];
+let initialTerminalDimensions = { cols: 80, rows: 24 };
 // What the fit addon measures the region as. undefined models a container with
 // no content box (a parked terminal), for which the real addon proposes nothing.
 let fitDimensions: { cols: number; rows: number } | undefined = { cols: 80, rows: 24 };
@@ -154,8 +155,8 @@ vi.mock("@xterm/xterm", () => ({
   Terminal: vi.fn().mockImplementation(function (options) {
     xtermTerminalCtor(options);
     const terminal = {
-      cols: 80,
-      rows: 24,
+      cols: initialTerminalDimensions.cols,
+      rows: initialTerminalDimensions.rows,
       modes: { bracketedPasteMode: false },
       options: { ...options },
       clearTextureAtlas: vi.fn(),
@@ -227,6 +228,7 @@ describe("TerminalPane", () => {
     configuredLetterSpacing = 0;
     configuredCursorBlink = true;
     configuredFontLigatures = false;
+    initialTerminalDimensions = { cols: 80, rows: 24 };
     fitDimensions = { cols: 80, rows: 24 };
     ligaturesAddonCtor.mockReset();
     clipboardWriteText.mockReset();
@@ -815,6 +817,74 @@ describe("TerminalPane", () => {
     expect(mouseDragReset).toHaveBeenCalledTimes(1);
   });
 
+  it.each([
+    {
+      name: "legacy workspace terminal",
+      props: { workspaceId: "ws-123", active: true },
+    },
+    {
+      name: "Fleet session",
+      props: {
+        websocketPath: "/ws/v1/fleet/hosts/peer/workspaces/ws-123/runtime/sessions/ws-123%3Ashell/terminal",
+        active: true,
+      },
+    },
+  ])("resends dimensions without a client refresh when a $name reconnects", async ({ props }) => {
+    initialTerminalDimensions = { cols: 177, rows: 41 };
+    fitDimensions = initialTerminalDimensions;
+    render(TerminalPane, { props });
+
+    await waitFor(() => expect(mockSockets).toHaveLength(1));
+    const firstSocket = mockSockets[0]!;
+    firstSocket.onopen?.();
+    vi.useFakeTimers();
+
+    firstSocket.onclose?.();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(mockSockets).toHaveLength(2);
+    const reconnectedSocket = mockSockets[1]!;
+
+    const reconnectURL = new URL(reconnectedSocket.url);
+    expect(reconnectURL.searchParams.get("cols")).toBe("177");
+    expect(reconnectURL.searchParams.get("rows")).toBe("41");
+    reconnectedSocket.onopen?.();
+    expect(reconnectedSocket.sent.map(String)).not.toContainEqual(expect.stringContaining('"type":"refresh"'));
+  });
+
+  it("waits for replay parsing before resizing a reconnected local runtime session", async () => {
+    initialTerminalDimensions = { cols: 177, rows: 41 };
+    fitDimensions = initialTerminalDimensions;
+    render(TerminalPane, {
+      props: {
+        websocketPath: "/ws/v1/workspaces/ws-123/runtime/sessions/ws-123%3Ashell/terminal",
+        active: true,
+      },
+    });
+
+    await waitFor(() => expect(mockSockets).toHaveLength(1));
+    const firstSocket = mockSockets[0]!;
+    expect(new URL(firstSocket.url).searchParams.get("replay_boundary")).toBe("1");
+    expect(new URL(firstSocket.url).searchParams.has("cols")).toBe(false);
+    firstSocket.onopen?.();
+    expect(firstSocket.sent.map(String)).not.toContainEqual(expect.stringContaining('"type":"refresh"'));
+
+    firstSocket.onmessage?.(new MessageEvent("message", { data: JSON.stringify({ type: "replay_ready" }) }));
+    const firstBoundaryCallback = xtermInstances[0]!.write.mock.calls.at(-1)?.[1] as (() => void) | undefined;
+    expect(firstBoundaryCallback).toBeTypeOf("function");
+    firstBoundaryCallback?.();
+    expect(firstSocket.sent.map(String)).toContain(JSON.stringify({ type: "refresh", cols: 177, rows: 41 }));
+
+    vi.useFakeTimers();
+    firstSocket.onclose?.();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(mockSockets).toHaveLength(2);
+    const reconnectedSocket = mockSockets[1]!;
+    const reconnectURL = new URL(reconnectedSocket.url);
+    expect(reconnectURL.searchParams.get("replay_boundary")).toBe("1");
+    expect(reconnectURL.searchParams.has("cols")).toBe(false);
+    expect(reconnectURL.searchParams.has("rows")).toBe(false);
+  });
+
   it("aborts a partial OSC sequence before writing output from a reconnected socket", async () => {
     render(TerminalPane, { props: { workspaceId: "ws-123" } });
 
@@ -841,6 +911,39 @@ describe("TerminalPane", () => {
       typeof data === "string" ? data : new TextDecoder().decode(data),
     );
     expect(writtenChunks).toEqual(["\x1b]52;c;cGFydGlhbA==", "\x18", "fresh session output"]);
+    expect(terminal.write.mock.calls[1]![0]).toEqual(new Uint8Array([0x18]));
+  });
+
+  it("clears an incomplete UTF-8 byte before replaying it into the same terminal", async () => {
+    render(TerminalPane, { props: { workspaceId: "ws-123" } });
+
+    await waitFor(() => expect(mockSockets).toHaveLength(1));
+    const terminal = xtermInstances[0]!;
+    const firstSocket = mockSockets[0]!;
+    terminal.write.mockClear();
+    vi.useFakeTimers();
+    const binaryMessage = (bytes: number[]): MessageEvent => {
+      const data = new Uint8Array(new window.ArrayBuffer(bytes.length));
+      data.set(bytes);
+      return new MessageEvent("message", { data: data.buffer });
+    };
+
+    firstSocket.onmessage?.(binaryMessage([0xe2]));
+    firstSocket.onclose?.();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(mockSockets).toHaveLength(2);
+
+    // The new subscriber replays the prefix before live output completes the
+    // rune. The byte CAN between them must clear xterm's streaming decoder.
+    mockSockets[1]!.onmessage?.(binaryMessage([0xe2]));
+    mockSockets[1]!.onmessage?.(binaryMessage([0x98, 0x83]));
+
+    expect(terminal.write.mock.calls.map(([data]) => Array.from(data as Uint8Array))).toEqual([
+      [0xe2],
+      [0x18],
+      [0xe2],
+      [0x98, 0x83],
+    ]);
   });
 
   it("revokes pointer clipboard authorization when the window loses focus", async () => {
