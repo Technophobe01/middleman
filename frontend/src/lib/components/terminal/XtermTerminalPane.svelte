@@ -93,6 +93,7 @@
   const encoder = new TextEncoder();
   const clipboardWriter = createTerminalClipboardWriter(
     createBrowserTerminalClipboardPort(),
+    { onPointerGestureTimeout: cancelTerminalPointerGesture },
   );
   const mouseDragAutoscroll = createTmuxMouseDragAutoscroll({
     send(data) {
@@ -204,15 +205,34 @@
     mouseDragAutoscroll.endPointerGesture();
   }
 
-  function handleWindowBlur(): void {
+  function cancelTerminalClipboardAuthorization(): void {
     cancelTerminalPointerGesture();
+    clipboardWriter.cancelAuthorization();
+  }
+
+  function handleTerminalFocusOut(event: FocusEvent): void {
+    const nextTarget = event.relatedTarget;
+    if (nextTarget instanceof Node && containerEl.contains(nextTarget)) return;
+    // Pointer capture can briefly produce a focusout without a destination.
+    // A concrete external target is an actual focus transfer and must revoke.
+    if (nextTarget === null && activePointerId !== null) return;
+    cancelTerminalClipboardAuthorization();
+  }
+
+  function handleWindowBlur(): void {
+    cancelTerminalClipboardAuthorization();
   }
 
   function handleDocumentVisibilityChange(): void {
     if (document.visibilityState !== "visible") {
-      cancelTerminalPointerGesture();
+      cancelTerminalClipboardAuthorization();
     }
   }
+
+  $effect(() => {
+    if (active && !disabled) return;
+    cancelTerminalClipboardAuthorization();
+  });
 
   function handleTerminalKeyDown(event: KeyboardEvent): void {
     if (disposed || disabled || event.isComposing || !event.isTrusted) return;
@@ -910,6 +930,7 @@
   onpointerdowncapture={handleTerminalPointerDown}
   onlostpointercapture={handleTerminalLostPointerCapture}
   onkeydowncapture={handleTerminalKeyDown}
+  onfocusout={handleTerminalFocusOut}
 ></div>
 
 <style>
