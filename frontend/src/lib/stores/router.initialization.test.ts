@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vite-plus/test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 const issueRoute = "/host/ghe.example.com/issues/github/acme/widget/7";
 
@@ -9,9 +9,15 @@ async function importRouterAt(path: string) {
 }
 
 describe("router initialization", () => {
+  beforeEach(() => {
+    window.sessionStorage.clear();
+  });
+
   afterEach(() => {
     delete window.__kenn_forge_config;
     delete window.__BASE_PATH__;
+    vi.restoreAllMocks();
+    window.sessionStorage.clear();
     window.history.replaceState(null, "", "/");
     vi.resetModules();
   });
@@ -91,6 +97,97 @@ describe("router initialization", () => {
     const { getLastWorkspaceRoute } = await importRouterAt("/terminal/ws-seed");
 
     expect(getLastWorkspaceRoute()).toBe("/terminal/ws-seed");
+  });
+
+  it("restores the last Activity route after reloading on Workspaces", async () => {
+    const activityRoute = "/?types=new_pr,comment,review,force_push,notification";
+    const router = await importRouterAt(activityRoute);
+    router.navigate("/workspaces");
+
+    const reloadedRouter = await importRouterAt("/workspaces");
+
+    expect(reloadedRouter.getLastActivityRoute()).toBe(activityRoute);
+  });
+
+  it("restores stored Activity filters when a base-path URL only sets the view", async () => {
+    window.__BASE_PATH__ = "/kenn-forge/";
+    window.sessionStorage.setItem(
+      "kenn-forge:last-activity-route",
+      "/?view=flat&types=new_pr,comment,review,force_push&notif=0&hide_branch=1",
+    );
+
+    const router = await importRouterAt("/kenn-forge/?view=threaded");
+    const restoredURL = new URL(window.location.href);
+
+    expect(restoredURL.pathname).toBe("/kenn-forge/");
+    expect(restoredURL.searchParams.get("view")).toBe("threaded");
+    expect(restoredURL.searchParams.get("types")).toBe("new_pr,comment,review,force_push");
+    expect(restoredURL.searchParams.get("notif")).toBe("0");
+    expect(restoredURL.searchParams.get("hide_branch")).toBe("1");
+    expect(new URL(router.getLastActivityRoute(), "https://example.com").searchParams.get("view")).toBe("threaded");
+  });
+
+  it("restores stored Activity filters when SPA navigation enters from Settings", async () => {
+    window.__BASE_PATH__ = "/kenn-forge/";
+    window.sessionStorage.setItem(
+      "kenn-forge:last-activity-route",
+      "/?types=new_pr,comment,review,force_push&notif=0&hide_branch=1",
+    );
+    const router = await importRouterAt("/kenn-forge/settings");
+
+    router.navigate("/?view=threaded");
+    const restoredURL = new URL(window.location.href);
+
+    expect(restoredURL.pathname).toBe("/kenn-forge/");
+    expect(restoredURL.searchParams.get("view")).toBe("threaded");
+    expect(restoredURL.searchParams.get("types")).toBe("new_pr,comment,review,force_push");
+    expect(restoredURL.searchParams.get("notif")).toBe("0");
+    expect(restoredURL.searchParams.get("hide_branch")).toBe("1");
+  });
+
+  it("restores stored Activity filters when Back or Forward enters Activity", async () => {
+    window.__BASE_PATH__ = "/kenn-forge/";
+    window.sessionStorage.setItem("kenn-forge:last-activity-route", "/?types=new_pr,comment,review,force_push");
+    await importRouterAt("/kenn-forge/settings");
+
+    window.history.pushState(null, "", "/kenn-forge/?view=threaded");
+    window.dispatchEvent(new PopStateEvent("popstate"));
+    const restoredURL = new URL(window.location.href);
+
+    expect(restoredURL.searchParams.get("view")).toBe("threaded");
+    expect(restoredURL.searchParams.get("types")).toBe("new_pr,comment,review,force_push");
+  });
+
+  it.each(["/workspaces", "/unexpected", "//", "///?types=new_pr", "//example.com/?types=new_pr"])(
+    "ignores an invalid stored Activity route: %s",
+    async (storedRoute) => {
+      window.sessionStorage.setItem("kenn-forge:last-activity-route", storedRoute);
+
+      const router = await importRouterAt("/workspaces");
+
+      expect(router.getLastActivityRoute()).toBe("/");
+    },
+  );
+
+  it("uses the default Activity route when session storage reads are blocked", async () => {
+    vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
+      throw new DOMException("blocked", "SecurityError");
+    });
+
+    const router = await importRouterAt("/workspaces");
+
+    expect(router.getLastActivityRoute()).toBe("/");
+  });
+
+  it("keeps the in-memory Activity route when session storage writes are blocked", async () => {
+    const activityRoute = "/?types=new_pr,comment,review,force_push,notification";
+    const router = await importRouterAt(activityRoute);
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new DOMException("blocked", "SecurityError");
+    });
+
+    expect(() => router.navigate("/workspaces")).not.toThrow();
+    expect(router.getLastActivityRoute()).toBe(activityRoute);
   });
 
   it("preserves provider issue route state on popstate", async () => {

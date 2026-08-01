@@ -125,6 +125,85 @@ test("AppHeader workspaces tab navigates to /workspaces", async ({ page }) => {
   await expect(page).toHaveURL(/\/workspaces$/);
 });
 
+test("Activity filters survive a reload while viewing Workspaces", async ({ page }) => {
+  await page.goto("/");
+
+  const issuesToggle = page.getByRole("switch", { name: "Issues" });
+  await expect(issuesToggle).toBeChecked();
+  await issuesToggle.click();
+  await expect(issuesToggle).not.toBeChecked();
+
+  await page.locator(".activity-feed .kit-filter-dropdown__btn", { hasText: "View" }).click();
+  const commitsFilter = page
+    .locator(".activity-feed .kit-filter-dropdown__panel")
+    .getByRole("button", { name: "Commits", exact: true });
+  await expect(commitsFilter).toHaveClass(/\bactive\b/);
+  await commitsFilter.click();
+  await expect(commitsFilter).not.toHaveClass(/\bactive\b/);
+
+  const activitySearch = new URL(page.url()).search;
+  expect(activitySearch).toContain("types=");
+
+  await page.getByRole("button", { name: "Workspaces" }).click();
+  await expect(page).toHaveURL(/\/workspaces$/);
+  await page.reload();
+
+  await page.getByRole("button", { name: "Activity" }).click();
+  await expect.poll(() => new URL(page.url()).search).toBe(activitySearch);
+  await expect(page.getByRole("switch", { name: "Issues" })).not.toBeChecked();
+
+  await page.locator(".activity-feed .kit-filter-dropdown__btn", { hasText: "View" }).click();
+  await expect(
+    page.locator(".activity-feed .kit-filter-dropdown__panel").getByRole("button", { name: "Commits", exact: true }),
+  ).not.toHaveClass(/\bactive\b/);
+});
+
+test("Activity filters survive navigation to a URL that only sets the view", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("switch", { name: "Issues" }).click();
+
+  await page.locator(".activity-feed .kit-filter-dropdown__btn", { hasText: "View" }).click();
+  await page
+    .locator(".activity-feed .kit-filter-dropdown__panel")
+    .getByRole("button", { name: "Commits", exact: true })
+    .click();
+  const activityTypes = new URL(page.url()).searchParams.get("types");
+  expect(activityTypes).not.toBeNull();
+
+  await page.goto("/?view=threaded");
+
+  await expect.poll(() => new URL(page.url()).searchParams.get("types")).toBe(activityTypes);
+  await expect(page.getByRole("switch", { name: "Issues" })).not.toBeChecked();
+  await page.locator(".activity-feed .kit-filter-dropdown__btn", { hasText: "View" }).click();
+  await expect(
+    page.locator(".activity-feed .kit-filter-dropdown__panel").getByRole("button", { name: "Commits", exact: true }),
+  ).not.toHaveClass(/\bactive\b/);
+});
+
+test("Settings Back to app restores Activity filters after a reload", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("switch", { name: "Issues" }).click();
+  await page.locator(".activity-feed .kit-filter-dropdown__btn", { hasText: "View" }).click();
+  await page
+    .locator(".activity-feed .kit-filter-dropdown__panel")
+    .getByRole("button", { name: "Commits", exact: true })
+    .click();
+  const activityTypes = new URL(page.url()).searchParams.get("types");
+  expect(activityTypes).not.toBeNull();
+
+  await page.locator('button[title="Settings"]').click();
+  await expect(page.getByRole("button", { name: "Back to app" })).toBeVisible();
+  await page.reload();
+  await page.getByRole("button", { name: "Back to app" }).click();
+
+  await expect.poll(() => new URL(page.url()).searchParams.get("types")).toBe(activityTypes);
+  await expect(page.getByRole("switch", { name: "Issues" })).not.toBeChecked();
+  await page.locator(".activity-feed .kit-filter-dropdown__btn", { hasText: "View" }).click();
+  await expect(
+    page.locator(".activity-feed .kit-filter-dropdown__panel").getByRole("button", { name: "Commits", exact: true }),
+  ).not.toHaveClass(/\bactive\b/);
+});
+
 test("repo selector renders icon and still filters repos", async ({ page }) => {
   await page.goto("/pulls");
 
