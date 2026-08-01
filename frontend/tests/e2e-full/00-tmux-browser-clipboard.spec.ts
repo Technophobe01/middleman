@@ -49,6 +49,7 @@ type RuntimeAttachSpecResponse = {
 };
 
 let clipboardProbeSequence = 0;
+let tmuxClipboardWriteSequence = 0;
 const TERMINAL_OUTPUT_TIMEOUT_MS = 15_000;
 
 function hasCommand(command: string, args: string[] = ["--version"]): boolean {
@@ -79,6 +80,48 @@ async function createIssueWorkspace(api: APIRequestContext, issueNumber: number)
   expect(response.status()).toBe(202);
   const workspace = (await response.json()) as WorkspaceStatusResponse;
   return waitForWorkspaceReady(api, workspace.id);
+}
+
+async function createPullWorkspace(api: APIRequestContext, pullNumber: number): Promise<WorkspaceStatusResponse> {
+  const response = await api.post("/api/v1/workspaces", {
+    data: {
+      provider: "github",
+      platform_host: "github.com",
+      owner: "acme",
+      name: "widgets",
+      mr_number: pullNumber,
+    },
+  });
+  expect(response.status()).toBe(202);
+  const workspace = (await response.json()) as WorkspaceStatusResponse;
+  return waitForWorkspaceReady(api, workspace.id);
+}
+
+async function openPullDetailWithPromotedTerminal(
+  page: Page,
+  api: APIRequestContext,
+  baseUrl: string,
+): Promise<{
+  workspace: WorkspaceStatusResponse;
+  output: ReturnType<typeof observeTerminalOutput>;
+  terminal: Locator;
+}> {
+  const workspace = await createPullWorkspace(api, 1);
+  await launchDockedShell(api, workspace.id);
+  await launchDockedShell(api, workspace.id);
+  const output = observeTerminalOutput(page);
+
+  await page.setViewportSize({ width: 1800, height: 900 });
+  await page.goto(`${baseUrl}/pulls/github/acme/widgets/1`);
+  await expect(page.locator(".detail-pane-workspace-slot .workspace-host-wrapper")).toBeVisible();
+  await openTerminalPanel(page);
+  const chosenLeaf = page.locator('.terminal-panel.open .terminal-leaf:has(button[aria-label$=" to a pane"])').first();
+  await expect(chosenLeaf.locator(".terminal-container")).toBeVisible();
+  await chosenLeaf.getByRole("button", { name: /^Move .+ to a pane$/ }).click();
+  const terminal = page.locator(".session-terminal-slot .terminal-container");
+  await expect(terminal).toBeVisible();
+
+  return { workspace, output, terminal };
 }
 
 async function launchDockedShell(api: APIRequestContext, workspaceId: string): Promise<void> {
@@ -131,6 +174,7 @@ async function selectIssueByTitle(page: Page, title: string): Promise<void> {
 
 function observeTerminalOutput(page: Page): {
   includes(text: string): boolean;
+  count(text: string): number;
   inputIncludes(text: string): boolean;
   dimensionsForLatestInput(): TerminalDimensions | null;
   activeSocketCount(): number;
@@ -203,6 +247,7 @@ function observeTerminalOutput(page: Page): {
   });
   return {
     includes: (text: string) => streams.some((stream) => stream.output.includes(text)),
+    count: (text: string) => streams.reduce((total, stream) => total + stream.output.split(text).length - 1, 0),
     inputIncludes: (text: string) => streams.some((stream) => stream.input.includes(text)),
     activeSocketCount: () => streams.filter((stream) => !stream.closed).length,
     dimensionsForLatestInput: () => {
@@ -338,19 +383,20 @@ async function emitApplicationOsc52(
   await expect.poll(() => output.includes(marker), { timeout: TERMINAL_OUTPUT_TIMEOUT_MS }).toBe(true);
 }
 
-async function scheduleApplicationOsc52(page: Page, container: Locator): Promise<string> {
+async function scheduleTmuxClipboardWrite(page: Page, container: Locator): Promise<string> {
   await container.click({ position: { x: 10, y: 10 } });
-  return typeScheduledApplicationOsc52(page);
+  return typeScheduledTmuxClipboardWrite(page);
 }
 
-async function typeScheduledApplicationOsc52(page: Page): Promise<string> {
+async function typeScheduledTmuxClipboardWrite(page: Page): Promise<string> {
   const marker = "late terminal osc52 complete";
   const value = "late terminal write";
-  const payload = Buffer.from(value).toString("base64");
-  await page.keyboard.type(
-    `while [ ! -f .clipboard-osc52-gate ]; do sleep 0.05; done; printf '${shellOctal(`\x1b]52;c;${payload}\x07${marker}\n`)}'`,
+  tmuxClipboardWriteSequence += 1;
+  const channel = `kenn-forge-clipboard-write-${process.pid}-${tmuxClipboardWriteSequence}`;
+  await runAttachedTmuxCommand(
+    page,
+    `run-shell -b "while [ ! -f .clipboard-osc52-gate ]; do sleep 0.05; done; tmux wait-for -S '${channel}'" ; wait-for '${channel}' ; set-buffer -w '${value}' ; display-message '${marker}'`,
   );
-  await page.keyboard.press("Enter");
   return marker;
 }
 
@@ -422,6 +468,22 @@ async function interceptDeniedBrowserClipboard(page: Page): Promise<string[]> {
       writeText: { configurable: true, value: denied },
     });
   });
+  return captureTerminalClipboardFallback(page);
+}
+
+async function denyCurrentPageBrowserClipboardWrites(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const clipboard = navigator.clipboard;
+    if (!clipboard) return;
+    const denied = () => Promise.reject(new DOMException("denied", "NotAllowedError"));
+    Object.defineProperties(clipboard, {
+      write: { configurable: true, value: denied },
+      writeText: { configurable: true, value: denied },
+    });
+  });
+}
+
+async function captureTerminalClipboardFallback(page: Page): Promise<string[]> {
   const fallbackWrites: string[] = [];
   await page.route("**/api/v1/terminal/clipboard", async (route) => {
     const request = route.request();
@@ -519,6 +581,28 @@ async function dragTerminalCells(page: Page, container: Locator, cellCount: numb
   await page.mouse.move(points.start.x, points.start.y);
   await beginCapturedPointerGesture(page, container);
   await page.mouse.move(points.end.x, points.end.y, { steps: 10 });
+  await page.mouse.up();
+}
+
+async function jitterFirstTerminalCell(page: Page, container: Locator): Promise<void> {
+  const start = await container.evaluate((element) => {
+    const screen = element.querySelector<HTMLElement>(".xterm-screen");
+    const textarea = element.querySelector<HTMLElement>(".xterm-helper-textarea");
+    if (!screen || !textarea) throw new Error("xterm cell geometry unavailable");
+    const bounds = screen.getBoundingClientRect();
+    const cellBounds = textarea.getBoundingClientRect();
+    if (cellBounds.width <= 0 || cellBounds.height <= 0) {
+      throw new Error("xterm cell geometry is empty");
+    }
+    return {
+      x: bounds.left + cellBounds.width * 0.5,
+      y: bounds.top + cellBounds.height * 0.5,
+    };
+  });
+
+  await page.mouse.move(start.x, start.y);
+  await beginCapturedPointerGesture(page, container);
+  await page.mouse.move(start.x + 1, start.y);
   await page.mouse.up();
 }
 
@@ -822,7 +906,7 @@ test("visible terminal focus loss revokes keyboard authorization after a missed 
       .toBe(false);
     await page.mouse.up();
 
-    const lateWriteMarker = await typeScheduledApplicationOsc52(page);
+    const lateWriteMarker = await typeScheduledTmuxClipboardWrite(page);
     const copyButton = page.getByRole("button", { name: "Copy issue #10 link" });
     await copyButton.click();
     await expect(copyButton).toHaveAttribute("title", "Copied!");
@@ -830,6 +914,7 @@ test("visible terminal focus loss revokes keyboard authorization after a missed 
 
     await writeFile(join(workspace.worktree_path, ".clipboard-osc52-gate"), "go", { mode: 0o600 });
     await expect.poll(() => output.includes(lateWriteMarker), { timeout: TERMINAL_OUTPUT_TIMEOUT_MS }).toBe(true);
+    await expect.poll(() => output.includes("\x1b]52;"), { timeout: TERMINAL_OUTPUT_TIMEOUT_MS }).toBe(true);
     await page.waitForTimeout(250);
     expect(await readBrowserClipboard(page)).toBe("https://github.com/acme/widgets/issues/10");
   } finally {
@@ -867,7 +952,7 @@ test("visible detail copy wins when focus leaves a pointer-captured terminal", a
     const terminal = page.locator(".session-terminal-slot .terminal-container");
     await expect(terminal).toBeVisible();
 
-    const lateWriteMarker = await scheduleApplicationOsc52(page, terminal);
+    const lateWriteMarker = await scheduleTmuxClipboardWrite(page, terminal);
     const bounds = await terminal.boundingBox();
     if (!bounds) throw new Error("promoted terminal has no pointer bounds");
     await page.mouse.move(bounds.x + 10, bounds.y + 10);
@@ -890,12 +975,111 @@ test("visible detail copy wins when focus leaves a pointer-captured terminal", a
 
     await writeFile(join(workspace.worktree_path, ".clipboard-osc52-gate"), "go", { mode: 0o600 });
     await expect.poll(() => output.includes(lateWriteMarker), { timeout: TERMINAL_OUTPUT_TIMEOUT_MS }).toBe(true);
+    await expect.poll(() => output.includes("\x1b]52;"), { timeout: TERMINAL_OUTPUT_TIMEOUT_MS }).toBe(true);
     await page.waitForTimeout(250);
     await page.mouse.up();
     pointerIsDown = false;
     expect(await readBrowserClipboard(page)).toBe("https://github.com/acme/widgets/issues/10");
   } finally {
     if (pointerIsDown) await page.mouse.up();
+    await api?.dispose();
+    await isolatedServer?.stop();
+  }
+});
+
+test("PR comment copy survives a terminal focus click", async ({ page, browserName }) => {
+  test.skip(!hasCommand("git") || !hasCommand("tmux", ["-V"]), "git and tmux are required for the real workspace flow");
+  let fallbackWrites: string[] = [];
+  if (browserName === "chromium") {
+    await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+  } else {
+    fallbackWrites = await captureTerminalClipboardFallback(page);
+  }
+
+  let isolatedServer: IsolatedE2EServer | null = null;
+  let api: APIRequestContext | null = null;
+  try {
+    isolatedServer = await startIsolatedWorkspaceE2EServer();
+    api = await playwrightRequest.newContext({ baseURL: isolatedServer.info.base_url });
+    const { output, terminal } = await openPullDetailWithPromotedTerminal(page, api, isolatedServer.info.base_url);
+
+    await enableTmuxMouseAndRenderMarker(page, terminal, output, "focus click marker");
+    const copiedComment =
+      "Guard the cache fallback before returning stale data.\n\nExpanded context explains stale data handling.";
+    const commentCard = page.locator(".pull-detail .kit-comment-card", {
+      hasText: "Guard the cache fallback before returning stale data.",
+    });
+    await expect(commentCard).toBeVisible();
+    const copyButton = commentCard
+      .locator(":scope > .kit-card__header > .kit-card__actions")
+      .locator('button[aria-label="Copy comment"], button[aria-label="Copied"]');
+    await copyButton.evaluate((element) => element.scrollIntoView({ block: "center", inline: "nearest" }));
+    await commentCard.hover();
+    await copyButton.click();
+    await expect(copyButton).toHaveAttribute("aria-label", "Copied");
+    if (browserName === "firefox") await denyCurrentPageBrowserClipboardWrites(page);
+
+    const osc52Count = output.count("\x1b]52;");
+    await jitterFirstTerminalCell(page, terminal);
+    await expect
+      .poll(() => output.count("\x1b]52;"), { timeout: TERMINAL_OUTPUT_TIMEOUT_MS })
+      .toBeGreaterThan(osc52Count);
+    await page.waitForTimeout(250);
+    if (browserName === "firefox") {
+      expect(fallbackWrites).toEqual([]);
+    } else {
+      expect(await readBrowserClipboard(page)).toBe(copiedComment);
+    }
+  } finally {
+    await api?.dispose();
+    await isolatedServer?.stop();
+  }
+});
+
+test("outside PR comment copy revokes a delayed terminal write before focus changes", async ({ page, browserName }) => {
+  test.skip(browserName !== "chromium", "Clipboard ordering assertions require Chromium permissions");
+  test.skip(!hasCommand("git") || !hasCommand("tmux", ["-V"]), "git and tmux are required for the real workspace flow");
+  await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+
+  let isolatedServer: IsolatedE2EServer | null = null;
+  let api: APIRequestContext | null = null;
+  try {
+    isolatedServer = await startIsolatedWorkspaceE2EServer();
+    api = await playwrightRequest.newContext({ baseURL: isolatedServer.info.base_url });
+    const { workspace, output, terminal } = await openPullDetailWithPromotedTerminal(
+      page,
+      api,
+      isolatedServer.info.base_url,
+    );
+
+    const lateWriteMarker = await scheduleTmuxClipboardWrite(page, terminal);
+    const copiedComment =
+      "Guard the cache fallback before returning stale data.\n\nExpanded context explains stale data handling.";
+    const commentCard = page.locator(".pull-detail .kit-comment-card", {
+      hasText: "Guard the cache fallback before returning stale data.",
+    });
+    await expect(commentCard).toBeVisible();
+    const copyButton = commentCard
+      .locator(":scope > .kit-card__header > .kit-card__actions")
+      .locator('button[aria-label="Copy comment"], button[aria-label="Copied"]');
+    await copyButton.evaluate((element) => element.scrollIntoView({ block: "center", inline: "nearest" }));
+    await commentCard.hover();
+    expect(await terminal.evaluate((element) => element.contains(document.activeElement))).toBe(true);
+    // Keep DOM focus in the terminal so only outside pointerdown revocation can
+    // prevent the delayed terminal write from racing the real comment copy.
+    await copyButton.evaluate((element) => {
+      element.addEventListener("mousedown", (event) => event.preventDefault(), { once: true });
+    });
+    await copyButton.click();
+    await expect(copyButton).toHaveAttribute("aria-label", "Copied");
+    expect(await terminal.evaluate((element) => element.contains(document.activeElement))).toBe(true);
+
+    await writeFile(join(workspace.worktree_path, ".clipboard-osc52-gate"), "go", { mode: 0o600 });
+    await expect.poll(() => output.includes(lateWriteMarker), { timeout: TERMINAL_OUTPUT_TIMEOUT_MS }).toBe(true);
+    await expect.poll(() => output.includes("\x1b]52;"), { timeout: TERMINAL_OUTPUT_TIMEOUT_MS }).toBe(true);
+    await page.waitForTimeout(250);
+    expect(await readBrowserClipboard(page)).toBe(copiedComment);
+  } finally {
     await api?.dispose();
     await isolatedServer?.stop();
   }
@@ -935,7 +1119,7 @@ test("a parked pooled terminal cannot overwrite a newer detail clipboard copy", 
     const terminal = page.locator('.session-terminal-slot [data-clipboard-park-witness="live-terminal"]');
     await expect(terminal).toBeVisible();
 
-    const lateWriteMarker = await scheduleApplicationOsc52(page, terminal);
+    const lateWriteMarker = await scheduleTmuxClipboardWrite(page, terminal);
     await expect.poll(() => output.activeSocketCount()).toBeGreaterThan(0);
     const activeSocketsBeforePark = output.activeSocketCount();
     const promotedLeaf = page.locator(".tabbed-panel-leaf").filter({ has: terminal });
@@ -952,6 +1136,7 @@ test("a parked pooled terminal cannot overwrite a newer detail clipboard copy", 
 
     await writeFile(join(workspace.worktree_path, ".clipboard-osc52-gate"), "go", { mode: 0o600 });
     await expect.poll(() => output.includes(lateWriteMarker), { timeout: TERMINAL_OUTPUT_TIMEOUT_MS }).toBe(true);
+    await expect.poll(() => output.includes("\x1b]52;"), { timeout: TERMINAL_OUTPUT_TIMEOUT_MS }).toBe(true);
     await page.waitForTimeout(250);
     expect(await readBrowserClipboard(page)).toBe("https://github.com/acme/widgets/issues/10");
   } finally {
