@@ -294,7 +294,22 @@ func (s *Handler) runWorkspaceSetup(ws *workspace.Workspace) {
 }
 
 func (s *Handler) runWorkspaceSetupWithBasePath(ws *workspace.Workspace, basePath string) {
-	s.runBackground(func(bgCtx context.Context) {
+	done, start := s.beginWorkspaceSetup(ws.ID)
+	if done == nil {
+		return
+	}
+	if !start {
+		s.runBackground(func(ctx context.Context) {
+			select {
+			case <-done:
+				s.runWorkspaceSetupWithBasePath(ws, basePath)
+			case <-ctx.Done():
+			}
+		})
+		return
+	}
+	if !s.runBackground(func(bgCtx context.Context) {
+		defer s.finishWorkspaceSetup(ws.ID, done)
 		for {
 			setupErr := s.workspaces.SetupWithWorktreeBasePath(bgCtx, ws, basePath)
 			summary, getErr := s.workspaces.GetSummary(
@@ -367,7 +382,93 @@ func (s *Handler) runWorkspaceSetupWithBasePath(ws *workspace.Workspace, basePat
 				Data: s.toWorkspaceResponse(bgCtx, summary),
 			})
 		}
-	})
+	}) {
+		s.finishWorkspaceSetup(ws.ID, done)
+	}
+}
+
+// workspaceDeletion tracks concurrent DELETE requests for one workspace ID.
+// Setup admission stays closed while any deletion is active and permanently
+// once one succeeds; done is closed when the last active deletion finishes so
+// setup dispatchers queued behind a failed deletion can replay.
+type workspaceDeletion struct {
+	active    int
+	succeeded bool
+	closed    bool
+	done      chan struct{}
+}
+
+func (s *Handler) beginWorkspaceSetup(workspaceID string) (chan struct{}, bool) {
+	s.workspaceSetupMu.Lock()
+	defer s.workspaceSetupMu.Unlock()
+	if deletion := s.workspaceDeleting[workspaceID]; deletion != nil {
+		if deletion.succeeded {
+			return nil, false
+		}
+		return deletion.done, false
+	}
+	if done, ok := s.workspaceSetupDone[workspaceID]; ok {
+		return done, false
+	}
+	done := make(chan struct{})
+	s.workspaceSetupDone[workspaceID] = done
+	return done, true
+}
+
+func (s *Handler) finishWorkspaceSetup(workspaceID string, done chan struct{}) {
+	s.workspaceSetupMu.Lock()
+	if s.workspaceSetupDone[workspaceID] == done {
+		delete(s.workspaceSetupDone, workspaceID)
+		close(done)
+	}
+	s.workspaceSetupMu.Unlock()
+}
+
+func (s *Handler) markWorkspaceDeleting(workspaceID string) <-chan struct{} {
+	s.workspaceSetupMu.Lock()
+	defer s.workspaceSetupMu.Unlock()
+	deletion := s.workspaceDeleting[workspaceID]
+	if deletion == nil {
+		deletion = &workspaceDeletion{done: make(chan struct{})}
+		s.workspaceDeleting[workspaceID] = deletion
+	}
+	deletion.active++
+	return s.workspaceSetupDone[workspaceID]
+}
+
+func (s *Handler) finishWorkspaceDeleting(workspaceID string, succeeded bool) {
+	s.workspaceSetupMu.Lock()
+	defer s.workspaceSetupMu.Unlock()
+	deletion := s.workspaceDeleting[workspaceID]
+	if deletion == nil {
+		return
+	}
+	deletion.active--
+	if succeeded {
+		deletion.succeeded = true
+	}
+	if deletion.active > 0 {
+		return
+	}
+	if !deletion.closed {
+		close(deletion.done)
+		deletion.closed = true
+	}
+	if !deletion.succeeded {
+		delete(s.workspaceDeleting, workspaceID)
+	}
+}
+
+func waitForWorkspaceSetup(ctx context.Context, done <-chan struct{}) error {
+	if done == nil {
+		return nil
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // RunWorkspaceSetupWithBasePath starts asynchronous materialization for a
@@ -1526,6 +1627,9 @@ func (s *Handler) retryWorkspace(
 		if errors.Is(err, workspace.ErrWorkspaceInvalidState) {
 			return nil, httpapi.Conflict(httpapi.CodeConflict, err.Error(), nil)
 		}
+		if errors.Is(err, workspace.ErrWorkspaceOwnershipUnproven) {
+			return nil, httpapi.Conflict(httpapi.CodeConflict, err.Error(), nil)
+		}
 		return nil, httpapi.Internal("retry workspace: " + err.Error())
 	}
 	s.invalidateWorkspaceEnrichment(ws.ID)
@@ -2349,6 +2453,13 @@ func (s *Handler) deleteWorkspace(
 		return nil, httpapi.ServiceUnavailable("workspace manager not configured")
 	}
 
+	setupDone := s.markWorkspaceDeleting(input.ID)
+	deleted := false
+	// A successful deletion keeps admission closed permanently so queued setup
+	// dispatchers cannot recreate resources for the removed row; a failed one
+	// reopens admission only after every concurrent deletion has finished.
+	defer func() { s.finishWorkspaceDeleting(input.ID, deleted) }()
+
 	if s.runtime != nil {
 		// Block new launches before the dirty preflight; existing
 		// sessions are stopped only after the preflight passes.
@@ -2359,6 +2470,9 @@ func (s *Handler) deleteWorkspace(
 			s.runtime.EndStopping(input.ID)
 		}
 	}()
+	if err := waitForWorkspaceSetup(ctx, setupDone); err != nil {
+		return nil, httpapi.Internal("wait for workspace setup: " + err.Error())
+	}
 	dirty, err := s.workspaces.Delete(
 		ctx, input.ID, input.Force,
 		func(stopCtx context.Context) {
@@ -2375,6 +2489,9 @@ func (s *Handler) deleteWorkspace(
 		if errors.Is(err, workspace.ErrWorkspaceNotFound) {
 			return nil, httpapi.NotFound(httpapi.CodeWorkspaceNotFound, err.Error(), nil)
 		}
+		if errors.Is(err, workspace.ErrWorkspaceOwnershipUnproven) {
+			return nil, httpapi.Conflict(httpapi.CodeConflict, err.Error(), nil)
+		}
 		return nil, httpapi.Internal("delete workspace: " + err.Error())
 	}
 	if len(dirty) > 0 {
@@ -2382,5 +2499,6 @@ func (s *Handler) deleteWorkspace(
 			"workspace has uncommitted changes: "+strings.Join(dirty, ", "), nil)
 	}
 
+	deleted = true
 	return nil, nil
 }
