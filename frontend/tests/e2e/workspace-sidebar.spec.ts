@@ -3273,6 +3273,43 @@ test.describe("sidebar persistence", () => {
     expect(actualWidth).toBeGreaterThanOrEqual(savedWidth - 2);
     expect(actualWidth).toBeLessThanOrEqual(savedWidth + 2);
   });
+
+  test("temporary layout constraints preserve and restore the preferred sidebar width", async ({ page }) => {
+    await page.setViewportSize({ width: 1080, height: 720 });
+    await page.addInitScript(() => {
+      localStorage.setItem("kenn-forge-workspace-list-sidebar-width", "260");
+      localStorage.setItem("kenn-forge-workspace-sidebar-open", "true");
+      localStorage.setItem("kenn-forge-workspace-sidebar-width", "400");
+    });
+    await page.goto("/terminal/ws-123");
+
+    const rightSidebar = page.locator(".right-sidebar");
+    await expect(rightSidebar).toBeVisible();
+    await expect.poll(() => rightSidebar.evaluate((el) => el.offsetWidth)).toBe(400);
+
+    await page.setViewportSize({ width: 900, height: 720 });
+    await expect.poll(() => rightSidebar.evaluate((el) => el.offsetWidth)).toBeLessThan(280);
+
+    const handle = page.locator(".sidebar-resize-handle");
+    const box = await handle.boundingBox();
+    expect(box).toBeTruthy();
+    if (box) {
+      await page.mouse.move(box.x + 2, box.y + box.height / 2);
+      await page.mouse.down();
+      await page.mouse.move(box.x - 40, box.y + box.height / 2);
+      await page.mouse.up();
+    }
+
+    await expect
+      .poll(() => page.evaluate(() => localStorage.getItem("kenn-forge-workspace-sidebar-width")))
+      .toBe("400");
+
+    await page.setViewportSize({ width: 1080, height: 720 });
+    await expect.poll(() => rightSidebar.evaluate((el) => el.offsetWidth)).toBe(400);
+    await expect
+      .poll(() => page.evaluate(() => localStorage.getItem("kenn-forge-workspace-sidebar-width")))
+      .toBe("400");
+  });
 });
 
 // -------------------------------------------------------
