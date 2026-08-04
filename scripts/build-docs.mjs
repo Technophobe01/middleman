@@ -1,11 +1,12 @@
 import { spawn } from "node:child_process";
-import { cp, copyFile, mkdtemp, rm } from "node:fs/promises";
+import { cp, copyFile, mkdir, mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const scriptPath = fileURLToPath(import.meta.url);
 const repoRoot = path.resolve(path.dirname(scriptPath), "..");
+const zensicalVersion = "0.0.51";
 
 const publishedFiles = new Set([
   "archive.md",
@@ -29,11 +30,13 @@ function isPublishedDocsInput(sourceDir, candidate) {
   return publishedFiles.has(relative) || publishedDirectoryEntries.has(relative);
 }
 
-export async function stageDocsSource(sourceDir, destinationDir) {
+export async function stageDocsSource(sourceDir, destinationDir, faviconSource) {
   await cp(sourceDir, destinationDir, {
     recursive: true,
     filter: (candidate) => isPublishedDocsInput(sourceDir, candidate),
   });
+  await mkdir(path.join(destinationDir, "assets"), { recursive: true });
+  await copyFile(faviconSource, path.join(destinationDir, "assets", "favicon.svg"));
 }
 
 function run(command, args, options = {}) {
@@ -60,7 +63,7 @@ export async function buildDocs() {
   const stagedDocs = path.join(stagingRoot, "docs");
 
   try {
-    await stageDocsSource(sourceDir, stagedDocs);
+    await stageDocsSource(sourceDir, stagedDocs, path.join(repoRoot, "frontend", "public", "favicon.svg"));
     await copyFile(path.join(sourceDir, "zensical.toml"), path.join(stagingRoot, "zensical.toml"));
 
     await run(
@@ -86,7 +89,10 @@ export async function buildDocs() {
       },
     );
 
-    await run("uvx", ["zensical", "build"], { cwd: stagingRoot, env: process.env });
+    await run("uvx", ["--from", `zensical==${zensicalVersion}`, "zensical", "build"], {
+      cwd: stagingRoot,
+      env: process.env,
+    });
     await run(
       process.execPath,
       [

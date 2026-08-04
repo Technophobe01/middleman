@@ -1,0 +1,138 @@
+name: Deploy documentation
+
+on:
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-release:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push')
+    runs-on: ubuntu-latest
+    outputs:
+      release-sha: ${{ steps.release.outputs.sha }}
+      release-tag: ${{ steps.release.outputs.tag }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: main
+
+      - name: Verify released source
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORKFLOW_RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          latest_tag="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)"
+          git fetch --force origin "refs/tags/$latest_tag:refs/tags/$latest_tag"
+          latest_sha="$(git rev-list -n 1 "refs/tags/$latest_tag")"
+          release_sha="${WORKFLOW_RUN_SHA:-$latest_sha}"
+          if ! git merge-base --is-ancestor "$release_sha" refs/remotes/origin/main; then
+            echo "Refusing to deploy documentation from a release commit outside main." >&2
+            exit 1
+          fi
+          if [ "$latest_sha" != "$release_sha" ]; then
+            echo "Refusing to deploy $release_sha because $latest_tag points to $latest_sha." >&2
+            exit 1
+          fi
+          echo "sha=$release_sha" >> "$GITHUB_OUTPUT"
+          echo "tag=$latest_tag" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: validate-release
+    runs-on: ubuntu-latest
+    outputs:
+      deployment-url: ${{ steps.deploy.outputs.url }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          ref: ${{ needs.validate-release.outputs.release-sha }}
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: "1.3.14"
+
+      - name: Build production deployment without promoting it
+        id: deploy
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: |
+          set -euo pipefail
+          deployment_url="$(bunx --bun vercel@58.0.0 deploy --prod --skip-domain --yes --token "$VERCEL_TOKEN")"
+          echo "url=$deployment_url" >> "$GITHUB_OUTPUT"
+
+  promote:
+    needs: [validate-release, build]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ needs.validate-release.outputs.release-sha }}
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: "1.3.14"
+
+      - name: Verify the release is still latest
+        env:
+          EXPECTED_SHA: ${{ needs.validate-release.outputs.release-sha }}
+          EXPECTED_TAG: ${{ needs.validate-release.outputs.release-tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          latest_tag="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)"
+          if [ "$latest_tag" != "$EXPECTED_TAG" ]; then
+            gh workflow run deploy-docs.yml --repo "$GITHUB_REPOSITORY" --ref main
+            echo "Refusing to promote $EXPECTED_TAG because the latest release is $latest_tag; reconciliation dispatched." >&2
+            exit 1
+          fi
+          git fetch --force origin "refs/tags/$latest_tag:refs/tags/$latest_tag"
+          latest_sha="$(git rev-list -n 1 "refs/tags/$latest_tag")"
+          if [ "$latest_sha" != "$EXPECTED_SHA" ]; then
+            gh workflow run deploy-docs.yml --repo "$GITHUB_REPOSITORY" --ref main
+            echo "Refusing to promote $EXPECTED_SHA because $latest_tag points to $latest_sha; reconciliation dispatched." >&2
+            exit 1
+          fi
+
+      - name: Promote documentation
+        env:
+          DEPLOYMENT_URL: ${{ needs.build.outputs.deployment-url }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: bunx --bun vercel@58.0.0 promote "$DEPLOYMENT_URL" --yes --token "$VERCEL_TOKEN"
+
+      - name: Verify promoted release remains latest
+        env:
+          EXPECTED_SHA: ${{ needs.validate-release.outputs.release-sha }}
+          EXPECTED_TAG: ${{ needs.validate-release.outputs.release-tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          latest_tag="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)"
+          git fetch --force origin "refs/tags/$latest_tag:refs/tags/$latest_tag"
+          latest_sha="$(git rev-list -n 1 "refs/tags/$latest_tag")"
+          if [ "$latest_tag" != "$EXPECTED_TAG" ] || [ "$latest_sha" != "$EXPECTED_SHA" ]; then
+            gh workflow run deploy-docs.yml --repo "$GITHUB_REPOSITORY" --ref main
+            echo "A newer release was published during promotion; reconciliation dispatched." >&2
+            exit 1
+          fi

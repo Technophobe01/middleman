@@ -1,4 +1,4 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Locator, type Page } from "@playwright/test";
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 
@@ -10,6 +10,20 @@ import {
 const outputDir = process.env.KENN_FORGE_DOCS_SCREENSHOT_DIR;
 
 type ThemeName = "light" | "dark";
+
+const syntheticCodexTranscript = [
+  "› Implement in-flight request coalescing for the widget cache.",
+  "",
+  "• Inspected",
+  "  └ cache.mjs",
+  "  └ cache.test.mjs",
+  "",
+  "• Implemented in-flight request coalescing.",
+  "  └ Concurrent loads share one request.",
+  "  └ Failed requests clear so later calls retry.",
+  "",
+  "Test result: node --test — 3 passed, 0 failed.",
+].join("\n");
 
 type CaptureCase = {
   name:
@@ -37,11 +51,110 @@ async function openCodexLaunchMenu(page: Page): Promise<void> {
   await expect(page.getByRole("menuitem", { name: "Codex" })).toBeVisible();
 }
 
+async function embedSyntheticCodexTranscript(workspace: Locator): Promise<void> {
+  const terminal = workspace.locator(".terminal-container:visible").first();
+  await expect(terminal).toBeVisible();
+  await terminal.evaluate((element, transcript) => {
+    const existing = element.querySelector(".docs-codex-transcript");
+    if (existing) existing.remove();
+
+    const content = document.createElement("div");
+    content.className = "docs-codex-transcript";
+    content.setAttribute("aria-label", "Synthetic Codex session transcript");
+    content.style.cssText = [
+      "position: absolute",
+      "inset: 0",
+      "z-index: 3",
+      "box-sizing: border-box",
+      "overflow: hidden",
+      "background: #0d1117",
+      "color: #c9d1d9",
+      'font-family: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace',
+      "font-size: 12.5px",
+      "line-height: 1.4",
+      "display: flex",
+      "flex-direction: column",
+    ].join("; ");
+
+    const output = document.createElement("pre");
+    output.textContent = transcript;
+    output.style.cssText = [
+      "box-sizing: border-box",
+      "flex: 1 1 auto",
+      "min-height: 0",
+      "margin: 0",
+      "padding: 14px 22px 6px",
+      "overflow: hidden",
+      "color: inherit",
+      "font: inherit",
+      "white-space: pre-wrap",
+    ].join("; ");
+
+    const composer = document.createElement("div");
+    composer.setAttribute("aria-label", "Codex prompt composer");
+    composer.style.cssText = ["box-sizing: border-box", "flex: 0 0 auto", "margin: 0 12px 10px"].join("; ");
+
+    const prompt = document.createElement("div");
+    prompt.style.cssText = [
+      "box-sizing: border-box",
+      "display: flex",
+      "align-items: center",
+      "gap: 10px",
+      "min-height: 44px",
+      "padding: 10px 14px",
+      "border: 1px solid #444b55",
+      "background: #343941",
+    ].join("; ");
+
+    const promptMarker = document.createElement("span");
+    promptMarker.textContent = "›";
+    promptMarker.style.cssText = "color: #f0f3f6; font-weight: 700";
+
+    const promptText = document.createElement("span");
+    promptText.textContent = "Summarize recent commits";
+    promptText.style.cssText = "color: #9da4ad";
+    prompt.append(promptMarker, promptText);
+
+    const status = document.createElement("div");
+    status.setAttribute("aria-label", "Codex model and workspace status");
+    status.style.cssText = [
+      "display: flex",
+      "align-items: center",
+      "gap: 8px",
+      "padding: 3px 14px 0",
+      "font-size: 12.5px",
+      "line-height: 1.4",
+    ].join("; ");
+
+    const model = document.createElement("span");
+    model.textContent = "gpt-5.6-sol high";
+    model.style.cssText = "color: #f6e2b7";
+
+    const separator = document.createElement("span");
+    separator.textContent = "·";
+    separator.style.cssText = "color: #6e7681";
+
+    const workingDirectory = document.createElement("span");
+    workingDirectory.textContent = "~/src/kenn-io/forge";
+    workingDirectory.style.cssText = "color: #abdfa7";
+    status.append(model, separator, workingDirectory);
+
+    composer.append(prompt, status);
+    content.append(output, composer);
+    element.appendChild(content);
+  }, syntheticCodexTranscript);
+}
+
 async function showCodexWorkspace(page: Page): Promise<void> {
   const row = page.locator(".workspace-list-sidebar .ws-row", { hasText: "Add widget caching layer" });
   await row.click();
   await expect(row).toHaveClass(/\bselected\b/);
-  await expect(page.getByRole("region", { name: "Workflow panes" }).getByRole("tab", { name: "Codex" })).toBeVisible();
+  const workspace = page.locator(".terminal-view");
+  const codexTab = workspace.getByRole("region", { name: "Workflow panes" }).getByRole("tab", { name: "Codex" });
+  await expect(codexTab).toBeVisible();
+  await codexTab.click();
+  await expect(codexTab).toHaveAttribute("aria-selected", "true");
+  await embedSyntheticCodexTranscript(workspace);
 
   const syntheticPath = "/worktrees/github/github.com/acme/widgets/pr-1";
   await page.locator(".meta-chip.mono.path").evaluate((element, replacement) => {
@@ -52,28 +165,31 @@ async function showCodexWorkspace(page: Page): Promise<void> {
   }, syntheticPath);
 }
 
+async function showActivityCodexWorkspace(page: Page): Promise<void> {
+  const prRow = page
+    .locator(".activity-row")
+    .filter({ has: page.locator(".badge", { hasText: "PR" }) })
+    .filter({ hasText: "Add widget caching layer" })
+    .first();
+  await prRow.click();
+
+  const detail = page.locator(".activity-detail");
+  await expect(page.locator(".activity-shell.activity-shell--split")).toBeVisible();
+  await expect(detail.locator(".detail-title")).toContainText("Add widget caching layer");
+
+  const workspace = page.locator(".detail-pane-workspace-slot .workspace-host-wrapper");
+  await expect(workspace).toBeVisible();
+  const workflow = workspace.getByRole("region", { name: "Workflow panes" });
+  const codexTab = workflow.getByRole("tab", { name: "Codex" });
+  await expect(codexTab).toBeVisible();
+  await codexTab.click();
+  await expect(codexTab).toHaveAttribute("aria-selected", "true");
+  await expect(workspace.locator(".terminal-view")).toBeVisible();
+  await embedSyntheticCodexTranscript(workspace);
+  await waitForIdleSync(page);
+}
+
 const cases: CaptureCase[] = [
-  {
-    name: "maintainer-overview",
-    theme: "light",
-    path: "/",
-    readySelector: ".activity-feed",
-    readyText: "Add widget caching layer",
-    loadingText: /Loading activity/i,
-    waitForSync: true,
-    description: "Activity overview with recent pull request and issue context across seeded repositories.",
-  },
-  {
-    name: "maintainer-overview",
-    theme: "dark",
-    path: "/",
-    readySelector: ".activity-feed",
-    readyText: "Add widget caching layer",
-    loadingText: /Loading activity/i,
-    waitForSync: true,
-    description:
-      "Activity overview in dark mode with recent pull request and issue context across seeded repositories.",
-  },
   {
     name: "issue-triager",
     theme: "light",
@@ -169,6 +285,32 @@ const cases: CaptureCase[] = [
     description:
       "Workspaces view in dark mode with the pull request worktree selected and its Codex session available.",
   },
+  {
+    name: "maintainer-overview",
+    theme: "light",
+    path: "/",
+    readySelector: ".activity-feed",
+    readyText: "Add widget caching layer",
+    loadingText: /Loading activity/i,
+    waitForSync: true,
+    prepare: ensureSyntheticCodexWorkspace,
+    afterReady: showActivityCodexWorkspace,
+    description:
+      "Activity with a selected pull request, its live workspace, and the workspace's selected Codex session.",
+  },
+  {
+    name: "maintainer-overview",
+    theme: "dark",
+    path: "/",
+    readySelector: ".activity-feed",
+    readyText: "Add widget caching layer",
+    loadingText: /Loading activity/i,
+    waitForSync: true,
+    prepare: ensureSyntheticCodexWorkspace,
+    afterReady: showActivityCodexWorkspace,
+    description:
+      "Activity in dark mode with a selected pull request, its live workspace, and the workspace's selected Codex session.",
+  },
 ];
 
 const firstRunCases: CaptureCase[] = [
@@ -207,9 +349,8 @@ async function stabilizePage(page: Page): Promise<void> {
   await page.addStyleTag({
     content: `
       *, *::before, *::after {
-        animation-duration: 0.001s !important;
-        animation-delay: 0s !important;
-        transition-duration: 0s !important;
+        animation: none !important;
+        transition: none !important;
         caret-color: transparent !important;
       }
     `,
@@ -345,10 +486,9 @@ async function ensureSyntheticCodexWorkspace(page: Page, baseURL: string): Promi
   }
   const runtime = (await runtimeResponse.json()) as { sessions?: Array<{ target_key: string }> };
   if (!(runtime.sessions ?? []).some((session) => session.target_key === "codex")) {
-    const launchResponse = await page.request.post(
-      `${baseURL}/api/v1/workspaces/${workspace.id}/runtime/sessions`,
-      { data: { target_key: "codex" } },
-    );
+    const launchResponse = await page.request.post(`${baseURL}/api/v1/workspaces/${workspace.id}/runtime/sessions`, {
+      data: { target_key: "codex" },
+    });
     if (launchResponse.status() !== 200) {
       throw new Error(`POST runtime session returned ${launchResponse.status()}: ${await launchResponse.text()}`);
     }
@@ -489,9 +629,8 @@ body {
 *,
 *::before,
 *::after {
-  animation-duration: 0.001s !important;
-  animation-delay: 0s !important;
-  transition-duration: 0s !important;
+  animation: none !important;
+  transition: none !important;
   caret-color: transparent !important;
 }
 `;
@@ -565,6 +704,24 @@ async function captureCase(page: Page, baseURL: string, capture: CaptureCase): P
     .poll(() => page.evaluate(() => document.documentElement.classList.contains("dark")))
     .toBe(capture.theme === "dark");
 
+  if (capture.name === "workspace-codex-session" || capture.name === "maintainer-overview") {
+    const terminal = page.locator(".docs-codex-transcript:visible").first();
+    const composer = terminal.getByLabel("Codex prompt composer");
+    const status = terminal.getByLabel("Codex model and workspace status");
+    await expect(composer).toContainText("Summarize recent commits");
+    await expect(status).toContainText(/gpt-5\.6-sol high\s*·\s*~\/src\/kenn-io\/forge/);
+    const [terminalBox, composerBox, statusBox] = await Promise.all([
+      terminal.boundingBox(),
+      composer.boundingBox(),
+      status.boundingBox(),
+    ]);
+    expect(terminalBox).not.toBeNull();
+    expect(composerBox).not.toBeNull();
+    expect(statusBox).not.toBeNull();
+    expect(composerBox!.y + composerBox!.height).toBeLessThanOrEqual(terminalBox!.y + terminalBox!.height);
+    expect(statusBox!.y + statusBox!.height).toBeLessThanOrEqual(terminalBox!.y + terminalBox!.height);
+  }
+
   const svg = await svgDOMSnapshot(page, {
     title: `${capture.name} ${capture.theme}`,
     description: capture.description,
@@ -582,6 +739,13 @@ async function captureCase(page: Page, baseURL: string, capture: CaptureCase): P
   expect(svg).not.toMatch(/<img[^>]+src="(?:https?:|\/)/i);
   expect(svg).not.toMatch(/data:image\/(?:avif|gif|jpe?g|png|webp)/i);
   expect(svg).not.toMatch(/\/var\/folders|kenn-forge-e2e-\d+/i);
+  if (capture.name === "workspace-codex-session" || capture.name === "maintainer-overview") {
+    expect(svg).toContain("Implemented in-flight request coalescing.");
+    expect(svg).toContain("3 passed, 0 failed.");
+    expect(svg).toContain("Summarize recent commits");
+    expect(svg).toContain("gpt-5.6-sol high");
+    expect(svg).toContain("~/src/kenn-io/forge");
+  }
   await writeFile(path.join(outputDir!, `${capture.name}-${capture.theme}.svg`), svg);
 }
 

@@ -37,6 +37,18 @@ The workspace cases configure a synthetic Codex target backed by an isolated
 long-running shell. They never start the installed Codex binary or read agent
 credentials.
 
+The maintainer overview opens the seeded pull request from Activity, hosts its
+ready workspace in the detail layout, and selects the running Codex session
+before serialization.
+
+The visible Codex pane contains a short static transcript derived from a
+one-time real Codex run in a synthetic widget-cache repository. The capture
+harness injects the sanitized text into the terminal DOM because canvas pixels
+cannot be preserved by the SVG serializer. Its prompt composer and model/path
+status reproduce the same captured Codex TUI with the temporary path replaced
+by the public synthetic repository path. Docs builds never run Codex or read
+agent credentials.
+
 Dark captures must render as dark when opened as standalone SVG files. The
 capture task preserves the live root theme class and computed CSS custom
 properties because the app's `:root.dark` selectors do not apply inside an SVG
