@@ -1939,6 +1939,31 @@ func (s *Syncer) issueFetchOutcomeError(
 	return provider.issueLookupOutcomeError(ctx, platformRepoRef(repo), number, issue, err)
 }
 
+// issueOnlyFetchOutcomeError adds the GitHub Issues API's PR-shape
+// classification for callers that require an issue. Kind-dispatching callers
+// such as SyncItemByNumber use issueFetchOutcomeError directly so they can
+// route a PR-shaped response to merge-request sync instead.
+func (s *Syncer) issueOnlyFetchOutcomeError(
+	ctx context.Context,
+	repo RepoRef,
+	number int,
+	issue *gh.Issue,
+	err error,
+) error {
+	if outcomeErr := s.issueFetchOutcomeError(ctx, repo, number, issue, err); outcomeErr != nil {
+		return outcomeErr
+	}
+	reader, readerErr := s.issueReaderFor(repo)
+	if readerErr != nil {
+		return nil
+	}
+	provider, ok := reader.(*gitHubClientProvider)
+	if !ok {
+		return nil
+	}
+	return provider.issuePullRequestOutcomeError(platformRepoRef(repo), number, issue)
+}
+
 // mergeRequestFetchOutcomeError is the merge-request counterpart to
 // issueFetchOutcomeError.
 func (s *Syncer) mergeRequestFetchOutcomeError(
@@ -2074,6 +2099,9 @@ func (p *gitHubClientProvider) GetGitHubIssue(
 	// Raw fetch for the optimized detail path; outcomes still route
 	// through the one canonical lookup classification.
 	if outcomeErr := p.issueLookupOutcomeError(ctx, ref, number, issue, err); outcomeErr != nil {
+		return nil, outcomeErr
+	}
+	if outcomeErr := p.issuePullRequestOutcomeError(ref, number, issue); outcomeErr != nil {
 		return nil, outcomeErr
 	}
 	return issue, nil
@@ -8516,6 +8544,11 @@ func (s *Syncer) fetchIssueDetail(
 		); outcomeErr != nil {
 			return calls, fmt.Errorf("get issue #%d: %w", number, outcomeErr)
 		}
+		if outcomeErr := provider.issuePullRequestOutcomeError(
+			platformRepoRef(repo), number, ghIssue,
+		); outcomeErr != nil {
+			return calls, fmt.Errorf("get issue #%d: %w", number, outcomeErr)
+		}
 	}
 	if err == nil && ghIssue == nil {
 		if notModified {
@@ -9831,7 +9864,7 @@ func (s *Syncer) fetchAndUpdateClosedIssue(
 	// Route fetch failures and detected transfers through the canonical
 	// lookup classification so removed, inaccessible, and moved items
 	// surface typed outcomes instead of generic upstream failures.
-	if outcomeErr := s.issueFetchOutcomeError(ctx, repo, number, ghIssue, err); outcomeErr != nil {
+	if outcomeErr := s.issueOnlyFetchOutcomeError(ctx, repo, number, ghIssue, err); outcomeErr != nil {
 		// A not_found without a destination is a true removal and gets a
 		// terminal local state. A transfer carries the destination and
 		// keeps failing the cycle so the maintainer sees the moved item
