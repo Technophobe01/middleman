@@ -12,6 +12,7 @@ import (
 	"go.kenn.io/forge/internal/archive"
 	"go.kenn.io/forge/internal/archive/report"
 	"go.kenn.io/forge/internal/db"
+	ghclient "go.kenn.io/forge/internal/github"
 	"go.kenn.io/forge/internal/platform"
 	"go.kenn.io/forge/internal/server/httpapi"
 )
@@ -185,6 +186,70 @@ func (s *Server) registerArchiveAPI(api huma.API) {
 		OperationID: "get-archive-report", Method: http.MethodGet, Path: "/archive/report",
 		DefaultStatus: http.StatusOK, Summary: "Get historical archive activity report", Tags: []string{"Archive"},
 	}, s.getArchiveReport)
+	huma.Register(api, huma.Operation{
+		OperationID: "list-archive-pacing", Method: http.MethodGet, Path: "/archive/pacing",
+		DefaultStatus: http.StatusOK, Summary: "List archive hydration pacing per provider credential", Tags: []string{"Archive"},
+	}, s.listArchivePacing)
+}
+
+// archivePacingStatusResponse reports one provider credential's archive
+// hydration headroom. Limit, remaining, reserve, and reset all describe the
+// binding pool — the resource with the least headroom, the constraint that
+// currently limits admission — so the numbers are mutually consistent.
+// Available is that pool's remaining above its own limit/5 reserve. Known is
+// false when the combined window is unavailable (a required pool missing,
+// expired, or never observed) — the state archive admission defers as
+// "provider quota unknown" — and the pacing numbers are zero.
+type archivePacingStatusResponse struct {
+	Provider     string `json:"provider"`
+	PlatformHost string `json:"platform_host"`
+	Principal    string `json:"principal"`
+	Source       string `json:"source" enum:"provider"`
+	Known        bool   `json:"known"`
+	Limit        int    `json:"limit"`
+	Remaining    int    `json:"remaining"`
+	Reserve      int    `json:"reserve"`
+	Available    int    `json:"available"`
+	ResetAt      string `json:"reset_at,omitempty" format:"date-time"`
+}
+
+type archivePacingOutput = httpapi.BodyOutput[[]archivePacingStatusResponse]
+
+func (s *Server) listArchivePacing(
+	_ context.Context, _ *struct{},
+) (*archivePacingOutput, error) {
+	statuses := []archivePacingStatusResponse{}
+	if s.syncer == nil {
+		return &archivePacingOutput{Body: statuses}, nil
+	}
+	registry := s.syncer.QuotaRegistry()
+	resources := []ghclient.QuotaResource{
+		ghclient.QuotaResourceREST, ghclient.QuotaResourceGraphQL,
+	}
+	seen := map[ghclient.IdentityKey]bool{}
+	for _, pool := range registry.Snapshot() {
+		if seen[pool.Identity] {
+			continue
+		}
+		seen[pool.Identity] = true
+		status := archivePacingStatusResponse{
+			Provider:     string(platform.KindGitHub),
+			PlatformHost: pool.Identity.Host,
+			Principal:    pool.Identity.Principal,
+			Source:       "provider",
+		}
+		if window, ok := registry.PacingWindow(pool.Identity, resources); ok {
+			_, binding := window.ArchiveBindingResource()
+			status.Known = true
+			status.Limit = binding.Limit
+			status.Remaining = binding.Remaining
+			status.Reserve = binding.Remaining - binding.Headroom
+			status.Available = max(binding.Headroom, 0)
+			status.ResetAt = formatUTCRFC3339(binding.ResetAt)
+		}
+		statuses = append(statuses, status)
+	}
+	return &archivePacingOutput{Body: statuses}, nil
 }
 
 func (s *Server) startArchives(

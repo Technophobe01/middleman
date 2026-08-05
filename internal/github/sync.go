@@ -944,18 +944,15 @@ func (s *Syncer) Admit(
 	identity, identityErr := s.identityForRepo(repo, false)
 	if ref.Platform == platform.KindGitHub && s.quotaRegistry != nil && identityErr == nil {
 		providerResources = []QuotaResource{QuotaResourceREST, QuotaResourceGraphQL}
-		availability := s.quotaRegistry.CheckReserve(
-			identity, providerResources, cost, RateReserveBuffer,
-		)
 		pacingWindow, pacingKnown := s.quotaRegistry.PacingWindow(identity, providerResources)
-		if !availability.Allowed || !pacingKnown {
+		if !pacingKnown || pacingWindow.ArchiveHeadroom < cost {
 			probe.abandon()
 			retryAt := now.Add(time.Minute)
 			detail := "provider rate reserve reached"
-			if !availability.Known || !pacingKnown {
+			if !pacingKnown {
 				detail = "provider quota unknown"
-			} else if availability.ResetAt != nil && availability.ResetAt.After(now) {
-				retryAt = availability.ResetAt.UTC()
+			} else if reset := pacingWindow.ArchiveRetryAt(cost); reset.After(now) {
+				retryAt = reset.UTC()
 			}
 			return archive.AdmissionResult{RetryAt: &retryAt, Detail: detail}, nil
 		}
@@ -976,16 +973,14 @@ func (s *Syncer) Admit(
 		resetAt = archiveBudgetResetAt(tracker)
 	}
 	available := 0
-	if budget != nil {
+	if providerPacingWindow != nil {
+		// Provider quota is authoritative: archive may spend everything above
+		// each pool's own archive reserve, and the local sync budget meters
+		// live sync only.
+		available = max(providerPacingWindow.ArchiveHeadroom, 0)
+	} else if budget != nil {
 		liveFloor := archiveLiveFloor(ref.Platform)
-		if providerPacingWindow != nil {
-			available = budget.ProviderArchiveSpendAvailable(
-				now,
-				*providerPacingWindow,
-				liveFloor,
-				RateReserveBuffer,
-			)
-		} else if resetAt == nil &&
+		if resetAt == nil &&
 			(ref.Platform == platform.KindGitea || ref.Platform == platform.KindForgejo) {
 			available = budget.LocalArchiveSpendAvailable(liveFloor)
 		} else {
@@ -1012,7 +1007,7 @@ func (s *Syncer) Admit(
 	if !completeGitealikeMR {
 		if providerPacingWindow != nil {
 			requestCtx = WithArchiveProviderAttemptAllowance(
-				requestCtx, available, identity, providerResources, RateReserveBuffer, budget,
+				requestCtx, available, identity, providerResources,
 			)
 		} else {
 			requestCtx = WithArchiveAttemptAllowance(requestCtx, available)

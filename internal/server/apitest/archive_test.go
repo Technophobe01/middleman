@@ -413,3 +413,170 @@ func archiveGeneratedRef(ref platform.RepoRef) generated.ArchiveRepositoryRef {
 		Name: ref.Name, RepoPath: ref.RepoPath,
 	}
 }
+
+func TestAPIArchivePacingReportsProviderHeadroom(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	database := dbtest.Open(t)
+	syncer := ghclient.NewSyncer(nil, database, nil, nil, time.Minute, nil, nil)
+	t.Cleanup(syncer.Stop)
+	registry := ghclient.NewQuotaRegistry()
+	identity := ghclient.IdentityKey{Host: "github.test", Principal: "user:7"}
+	reset := time.Now().UTC().Add(30 * time.Minute).Truncate(time.Second)
+	registry.UpdateSnapshot(identity, ghclient.QuotaResourceREST,
+		ghclient.Rate{Limit: 5000, Remaining: 4500, Reset: reset})
+	registry.UpdateSnapshot(identity, ghclient.QuotaResourceGraphQL,
+		ghclient.Rate{Limit: 5000, Remaining: 4200, Reset: reset})
+	syncer.SetQuotaRegistry(registry)
+	srv := server.New(database, syncer, nil, "/", nil, server.ServerOptions{})
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		require.NoError(srv.Shutdown(ctx))
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/archive/pacing", http.NoBody)
+	req.Host = "forge.test"
+	rr := httptest.NewRecorder()
+	srv.ServeHTTP(rr, req)
+	require.Equal(http.StatusOK, rr.Code, rr.Body.String())
+	var rows []struct {
+		Provider     string `json:"provider"`
+		PlatformHost string `json:"platform_host"`
+		Principal    string `json:"principal"`
+		Source       string `json:"source"`
+		Known        bool   `json:"known"`
+		Limit        int    `json:"limit"`
+		Remaining    int    `json:"remaining"`
+		Reserve      int    `json:"reserve"`
+		Available    int    `json:"available"`
+		ResetAt      string `json:"reset_at"`
+	}
+	require.NoError(json.Unmarshal(rr.Body.Bytes(), &rows))
+	require.Len(rows, 1)
+	row := rows[0]
+	assert.Equal("github", row.Provider)
+	assert.Equal("github.test", row.PlatformHost)
+	assert.Equal("user:7", row.Principal)
+	assert.Equal("provider", row.Source)
+	assert.True(row.Known)
+	// Limit and remaining are the min across REST and GraphQL, matching what
+	// archive admission consumes.
+	assert.Equal(5000, row.Limit)
+	assert.Equal(4200, row.Remaining)
+	assert.Equal(1000, row.Reserve)
+	assert.Equal(3200, row.Available)
+	assert.Equal(reset.Format(time.RFC3339), row.ResetAt)
+}
+
+func TestAPIArchivePacingEmptyWithoutKnownPools(t *testing.T) {
+	require := require.New(t)
+	database := dbtest.Open(t)
+	syncer := ghclient.NewSyncer(nil, database, nil, nil, time.Minute, nil, nil)
+	t.Cleanup(syncer.Stop)
+	srv := server.New(database, syncer, nil, "/", nil, server.ServerOptions{})
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		require.NoError(srv.Shutdown(ctx))
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/archive/pacing", http.NoBody)
+	req.Host = "forge.test"
+	rr := httptest.NewRecorder()
+	srv.ServeHTTP(rr, req)
+	require.Equal(http.StatusOK, rr.Code, rr.Body.String())
+	var rows []map[string]any
+	require.NoError(json.Unmarshal(rr.Body.Bytes(), &rows))
+	require.Empty(rows)
+}
+
+// A credential whose pacing window cannot be combined (a pool missing,
+// expired, or never observed) must still appear, marked unknown: those are
+// exactly the identities archive admission defers as "provider quota
+// unknown", and omitting them would hide why hydration is blocked.
+func TestAPIArchivePacingReportsPartiallyKnownCredentials(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	database := dbtest.Open(t)
+	syncer := ghclient.NewSyncer(nil, database, nil, nil, time.Minute, nil, nil)
+	t.Cleanup(syncer.Stop)
+	registry := ghclient.NewQuotaRegistry()
+	identity := ghclient.IdentityKey{Host: "github.test", Principal: "user:7"}
+	reset := time.Now().UTC().Add(30 * time.Minute).Truncate(time.Second)
+	registry.UpdateSnapshot(identity, ghclient.QuotaResourceREST,
+		ghclient.Rate{Limit: 5000, Remaining: 4500, Reset: reset})
+	syncer.SetQuotaRegistry(registry)
+	srv := server.New(database, syncer, nil, "/", nil, server.ServerOptions{})
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		require.NoError(srv.Shutdown(ctx))
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/archive/pacing", http.NoBody)
+	req.Host = "forge.test"
+	rr := httptest.NewRecorder()
+	srv.ServeHTTP(rr, req)
+	require.Equal(http.StatusOK, rr.Code, rr.Body.String())
+	var rows []struct {
+		Principal string `json:"principal"`
+		Known     bool   `json:"known"`
+		Available int    `json:"available"`
+		ResetAt   string `json:"reset_at"`
+	}
+	require.NoError(json.Unmarshal(rr.Body.Bytes(), &rows))
+	require.Len(rows, 1)
+	assert.Equal("user:7", rows[0].Principal)
+	assert.False(rows[0].Known)
+	assert.Zero(rows[0].Available)
+	assert.Empty(rows[0].ResetAt)
+}
+
+// With unequal pool limits, the reported reserve and availability come from
+// per-pool headroom: a large pool at its own limit/5 floor zeroes archive
+// availability even though the smallest pool still has headroom.
+func TestAPIArchivePacingUsesPerPoolReserves(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	database := dbtest.Open(t)
+	syncer := ghclient.NewSyncer(nil, database, nil, nil, time.Minute, nil, nil)
+	t.Cleanup(syncer.Stop)
+	registry := ghclient.NewQuotaRegistry()
+	identity := ghclient.IdentityKey{Host: "github.test", Principal: "user:7"}
+	reset := time.Now().UTC().Add(30 * time.Minute).Truncate(time.Second)
+	registry.UpdateSnapshot(identity, ghclient.QuotaResourceREST,
+		ghclient.Rate{Limit: 15000, Remaining: 3000, Reset: reset})
+	registry.UpdateSnapshot(identity, ghclient.QuotaResourceGraphQL,
+		ghclient.Rate{Limit: 5000, Remaining: 4800, Reset: reset})
+	syncer.SetQuotaRegistry(registry)
+	srv := server.New(database, syncer, nil, "/", nil, server.ServerOptions{})
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		require.NoError(srv.Shutdown(ctx))
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/archive/pacing", http.NoBody)
+	req.Host = "forge.test"
+	rr := httptest.NewRecorder()
+	srv.ServeHTTP(rr, req)
+	require.Equal(http.StatusOK, rr.Code, rr.Body.String())
+	var rows []struct {
+		Known     bool `json:"known"`
+		Limit     int  `json:"limit"`
+		Remaining int  `json:"remaining"`
+		Reserve   int  `json:"reserve"`
+		Available int  `json:"available"`
+	}
+	require.NoError(json.Unmarshal(rr.Body.Bytes(), &rows))
+	require.Len(rows, 1)
+	row := rows[0]
+	assert.True(row.Known)
+	// The binding pool is REST (least headroom): every reported number comes
+	// from that one pool so limit, remaining, and reserve are consistent.
+	assert.Equal(15000, row.Limit)
+	assert.Equal(3000, row.Remaining)
+	assert.Equal(3000, row.Reserve)
+	assert.Zero(row.Available)
+}

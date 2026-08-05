@@ -204,11 +204,60 @@ type QuotaAvailability struct {
 	ResetAt   *time.Time
 }
 
+// QuotaPacingResource is one resource pool's view inside a pacing window.
+type QuotaPacingResource struct {
+	Limit     int
+	Remaining int
+	// Headroom is remaining minus this pool's own archive reserve
+	// (`ArchiveProviderReserve` of this pool's limit). Negative when the
+	// pool sits below its reserve.
+	Headroom int
+	ResetAt  time.Time
+}
+
 type QuotaPacingWindow struct {
-	Limit          int
-	Remaining      int
-	ResetAt        time.Time
-	ResourceResets map[QuotaResource]time.Time
+	Limit     int
+	Remaining int
+	// ArchiveHeadroom is the archive spend this credential may admit: the
+	// minimum across required resources of remaining minus that pool's own
+	// archive reserve. Reserves are per pool — applying the smallest pool's
+	// reserve to a larger pool would admit spend below the larger pool's
+	// floor. Negative when the binding pool sits below its reserve.
+	ArchiveHeadroom int
+	ResetAt         time.Time
+	Resources       map[QuotaResource]QuotaPacingResource
+}
+
+// ArchiveRetryAt returns the latest reset among pools whose headroom is below
+// cost: the earliest time every deficient pool can have recovered. Waiting for
+// the window-wide latest reset would leave archives paused after the exhausted
+// pool has already reset. Zero when no pool is deficient.
+func (w QuotaPacingWindow) ArchiveRetryAt(cost int) time.Time {
+	var retry time.Time
+	for _, resource := range w.Resources {
+		if resource.Headroom < cost && resource.ResetAt.After(retry) {
+			retry = resource.ResetAt
+		}
+	}
+	return retry
+}
+
+// ArchiveBindingResource returns the pool with the least archive headroom —
+// the constraint that currently limits archive admission — with a
+// lexicographic tie-break for determinism.
+func (w QuotaPacingWindow) ArchiveBindingResource() (QuotaResource, QuotaPacingResource) {
+	var bindingName QuotaResource
+	var binding QuotaPacingResource
+	first := true
+	for name, resource := range w.Resources {
+		if first || resource.Headroom < binding.Headroom ||
+			(resource.Headroom == binding.Headroom && name < bindingName) {
+			bindingName = name
+			binding = resource
+			first = false
+		}
+	}
+	return bindingName, binding
 }
 
 func (r *QuotaRegistry) PacingWindow(
@@ -222,7 +271,7 @@ func (r *QuotaRegistry) PacingWindow(
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	window := QuotaPacingWindow{
-		ResourceResets: make(map[QuotaResource]time.Time, len(resources)),
+		Resources: make(map[QuotaResource]QuotaPacingResource, len(resources)),
 	}
 	for index, resource := range resources {
 		key := newQuotaKey(identity, resource)
@@ -238,10 +287,19 @@ func (r *QuotaRegistry) PacingWindow(
 		if index == 0 || remaining < window.Remaining {
 			window.Remaining = remaining
 		}
+		headroom := remaining - ArchiveProviderReserve(pool.Limit)
+		if index == 0 || headroom < window.ArchiveHeadroom {
+			window.ArchiveHeadroom = headroom
+		}
 		if pool.ResetAt.After(window.ResetAt) {
 			window.ResetAt = pool.ResetAt
 		}
-		window.ResourceResets[resource] = pool.ResetAt
+		window.Resources[resource] = QuotaPacingResource{
+			Limit:     pool.Limit,
+			Remaining: remaining,
+			Headroom:  headroom,
+			ResetAt:   pool.ResetAt,
+		}
 	}
 	return window, true
 }
@@ -284,11 +342,14 @@ func (r *QuotaRegistry) CheckReserve(
 	return availability
 }
 
+// reserveArchiveAttempt reserves one wire attempt's cost against the target
+// resource pool. Every required pool must stay above its own archive reserve
+// (`ArchiveProviderReserve` of that pool's limit) — reserves are per pool, so
+// a larger pool keeps its proportionally larger floor.
 func (r *QuotaRegistry) reserveArchiveAttempt(
 	identity IdentityKey,
 	resources []QuotaResource,
 	resource QuotaResource,
-	reserve int,
 ) (quotaReservation, bool) {
 	if r == nil || identity.Principal == "" {
 		return quotaReservation{}, false
@@ -311,7 +372,7 @@ func (r *QuotaRegistry) reserveArchiveAttempt(
 			target = pool
 			continue
 		}
-		if remaining <= reserve {
+		if remaining <= ArchiveProviderReserve(pool.Limit) {
 			return quotaReservation{}, false
 		}
 	}
@@ -319,7 +380,7 @@ func (r *QuotaRegistry) reserveArchiveAttempt(
 		return quotaReservation{}, false
 	}
 	cost := max(target.AttemptCost, 1)
-	if r.effectiveRemainingLocked(targetKey, target)-cost < reserve {
+	if r.effectiveRemainingLocked(targetKey, target)-cost < ArchiveProviderReserve(target.Limit) {
 		return quotaReservation{}, false
 	}
 	key := quotaReservationKey{quotaKey: targetKey, resetAt: target.ResetAt.UTC()}
@@ -483,7 +544,7 @@ func (t *quotaTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 	var header http.Header
 	if resp == nil || t.registry == nil || t.identity.Principal == "" {
-		reconcileArchiveProviderAttempt(reservation, t.registry, resource, header)
+		reconcileArchiveProviderAttempt(reservation, t.registry, header)
 		return resp, err
 	}
 	header = resp.Header
@@ -492,6 +553,6 @@ func (t *quotaTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		resource,
 		header,
 	)
-	reconcileArchiveProviderAttempt(reservation, t.registry, resource, header)
+	reconcileArchiveProviderAttempt(reservation, t.registry, header)
 	return resp, err
 }
