@@ -47,13 +47,18 @@ describe("WorkspaceCreateSplitButton", () => {
     cleanup();
   });
 
-  it("keeps the primary action create-only", async () => {
+  it("composes kit-ui buttons and keeps the primary action create-only", async () => {
     const onCreate = vi.fn();
     render(WorkspaceCreateSplitButton, {
       props: { label: "Create Workspace", launchTargets: targets, onCreate },
     });
 
-    await fireEvent.click(screen.getByRole("button", { name: "Create Workspace" }));
+    const primary = screen.getByRole("button", { name: "Create Workspace" });
+    const options = screen.getByRole("button", { name: "Create Workspace options" });
+    expect(primary.classList.contains("kit-button")).toBe(true);
+    expect(options.classList.contains("kit-button")).toBe(true);
+
+    await fireEvent.click(primary);
 
     expect(onCreate).toHaveBeenCalledWith(undefined);
   });
@@ -79,7 +84,7 @@ describe("WorkspaceCreateSplitButton", () => {
     expect(screen.getByRole("menuitem", { name: "Codex" }).getAttribute("aria-describedby")).toBeNull();
   });
 
-  it("offers only agents and passes the chosen target", async () => {
+  it("offers only agents without a redundant visible heading and passes the chosen target", async () => {
     const onCreate = vi.fn();
     render(WorkspaceCreateSplitButton, {
       props: { label: "Create Workspace", launchTargets: targets, onCreate },
@@ -87,6 +92,7 @@ describe("WorkspaceCreateSplitButton", () => {
 
     await fireEvent.click(screen.getByRole("button", { name: "Create Workspace options" }));
 
+    expect(screen.queryByText("Create and launch")).toBeNull();
     expect(screen.queryByRole("menuitem", { name: "Shell" })).toBeNull();
 
     await fireEvent.click(screen.getByRole("menuitem", { name: "Codex" }));
