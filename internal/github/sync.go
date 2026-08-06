@@ -241,6 +241,14 @@ type RepoRef struct {
 	WebURL             string
 	CloneURL           string
 	DefaultBranch      string
+	// Archived marks a provider-archived repository: configured for archive
+	// collection only, skipped by live sync.
+	Archived bool
+	// ConfiguredRepoPath is the config-entry path this ref was resolved
+	// from. It correlates a tracked repository with its config entry after
+	// a provider-side rename, so a transient resolve failure falls back to
+	// the tracked ref instead of synthesizing an identity-less duplicate.
+	ConfiguredRepoPath string
 }
 
 // PartialSyncError reports a repo sync cycle whose index scan completed but
@@ -602,7 +610,7 @@ type archiveRunner interface {
 }
 
 type archiveRepositoryLifecycle interface {
-	EnsureConfigured(context.Context, []platform.RepoRef) error
+	EnsureConfigured(context.Context, []platform.RepoRef) ([]platform.RepoRef, error)
 	RetryAuthentication(context.Context, []platform.RepoRef) error
 }
 
@@ -3790,11 +3798,14 @@ func (s *Syncer) SetReposWithContext(ctx context.Context, repos []RepoRef, retry
 		refs = append(refs, platformRepoRef(repo))
 	}
 	if s.archiveLifecycle != nil {
-		if err := s.archiveLifecycle.EnsureConfigured(ctx, refs); err != nil {
+		seeded, err := s.archiveLifecycle.EnsureConfigured(ctx, refs)
+		if err != nil {
 			return fmt.Errorf("seed archive discovery: %w", err)
 		}
 		if retryAuthentication {
-			if err := s.archiveLifecycle.RetryAuthentication(ctx, refs); err != nil {
+			// Only refs that seeded can resolve; a ref skipped by seeding
+			// must not fail the retry pass (and with it the config reload).
+			if err := s.archiveLifecycle.RetryAuthentication(ctx, seeded); err != nil {
 				return fmt.Errorf("retry archive authentication: %w", err)
 			}
 		}
@@ -4339,7 +4350,38 @@ func (s *Syncer) watchedMRsForFastSync(ctx context.Context, now time.Time) []Wat
 	for _, mr := range s.hotAndWarmOpenMRs(ctx, now, activeWindow, watchInt) {
 		watched.add(mr)
 	}
-	return watched.slice()
+	items := watched.slice()
+	archived := s.archivedRepoKeys()
+	if len(archived) == 0 {
+		return items
+	}
+	live := make([]WatchedMR, 0, len(items))
+	for _, mr := range items {
+		key := detailRepoKey(
+			watchedMRPlatform(mr), watchedMRHost(mr), mr.Owner, mr.Name,
+		)
+		if _, ok := archived[key]; ok {
+			continue
+		}
+		live = append(live, mr)
+	}
+	return live
+}
+
+// archivedRepoKeys returns detailRepoKey identities for tracked archived
+// repositories so live lanes (fast sync, notifications) can skip them.
+func (s *Syncer) archivedRepoKeys() map[string]struct{} {
+	s.reposMu.Lock()
+	defer s.reposMu.Unlock()
+	keys := make(map[string]struct{})
+	for _, repo := range s.repos {
+		if repo.Archived {
+			keys[detailRepoKey(
+				repoPlatform(repo), repo.PlatformHost, repo.Owner, repo.Name,
+			)] = struct{}{}
+		}
+	}
+	return keys
 }
 
 func (s *Syncer) watchSettingsLocked() (time.Duration, time.Duration) {
@@ -5119,6 +5161,15 @@ func (s *Syncer) runOnce(
 	if onlyRepos != nil {
 		repos = selectRepos(repos, onlyRepos)
 	}
+	nextAfter := s.nextSyncAfter
+	if bypassNextSyncAfter {
+		nextAfter = nil
+	}
+	// Computed over the selected set before still-archived refs drop
+	// out, so buckets holding only archived repositories keep an entry
+	// for the cadence advance below.
+	archivedEligibility := s.repoEligibility(repos, nextAfter)
+	repos = s.reconcileArchivedRepos(ctx, repos, archivedEligibility)
 	repos = prioritizeRepos(repos, priorityRepos)
 
 	total := len(repos)
@@ -5146,10 +5197,6 @@ func (s *Syncer) runOnce(
 		}
 	}
 
-	nextAfter := s.nextSyncAfter
-	if bypassNextSyncAfter {
-		nextAfter = nil
-	}
 	if rateLimitSnapshotCtx.Err() == nil {
 		refreshed := s.refreshRateLimitSnapshots(rateLimitSnapshotCtx)
 		s.clearRecoveredRateLimitGates(refreshed, nextAfter, s.interval)
@@ -5264,9 +5311,15 @@ dispatch:
 		s.RefreshRateLimitSnapshots(rateLimitSnapshotCtx)
 	}
 	if onlyRepos == nil {
-		s.advanceNextSync(
-			eligibleBuckets, s.nextSyncAfter, s.interval,
-		)
+		// Archived-only buckets are absent from eligibleBuckets — their
+		// refs dropped out before it was computed — but an attempted
+		// archived refresh must advance the bucket's cadence gate too,
+		// or the refresh would rerun every base interval regardless of
+		// throttle factor. The post-reconciliation value wins for
+		// buckets present in both maps.
+		advance := maps.Clone(archivedEligibility)
+		maps.Copy(advance, eligibleBuckets)
+		s.advanceNextSync(advance, s.nextSyncAfter, s.interval)
 	}
 
 	slog.Info("sync complete", "repos", total)
@@ -5320,6 +5373,83 @@ func prioritizeRepos(repos, priorityRepos []RepoRef) []RepoRef {
 		}
 	})
 	return out
+}
+
+// excludeArchivedRepos drops provider-archived repositories from a live sync
+// pass. Archived repos stay tracked in s.repos for archive collection and
+// API surfaces; only live polling skips them.
+// reconcileArchivedRepos refreshes provider metadata for archived
+// tracked refs so an upstream unarchive is observed during normal
+// sync passes. Refs the provider still reports archived (or whose
+// metadata refresh fails) stay excluded from the pass; refs that
+// resolved unarchived rejoin it with fresh metadata. Refs in
+// credential buckets the pass would not dispatch — throttled,
+// reserve-exhausted, or deferred by next-sync-after — are deferred
+// without a provider call: the refresh must not spend sync budget a
+// live repository's dispatch would be denied. Eligibility is read
+// before the pass refreshes rate-limit snapshots, so a gate that has
+// recovered upstream defers the refresh by at most one pass.
+func (s *Syncer) reconcileArchivedRepos(
+	ctx context.Context, repos []RepoRef, eligibility map[string]bool,
+) []RepoRef {
+	live := make([]RepoRef, 0, len(repos))
+	skipped := make([]string, 0)
+	for _, repo := range repos {
+		if !repo.Archived {
+			live = append(live, repo)
+			continue
+		}
+		if ctx.Err() != nil {
+			skipped = append(skipped, repo.Owner+"/"+repo.Name)
+			continue
+		}
+		bucket, err := s.bucketKeyForRepo(repo, false)
+		if err != nil || !eligibility[bucket] {
+			skipped = append(skipped, repo.Owner+"/"+repo.Name)
+			continue
+		}
+		// Register provider work so an admitted archive request on the
+		// same credential is preempted instead of overlapping the
+		// refresh, matching the coordination live repo syncs get.
+		release := s.beginProviderWork(bucket, archive.PriorityNormalIndex)
+		resolved, _, _, err := s.reconcileRepoIdentity(ctx, repo)
+		release()
+		if err != nil {
+			slog.Debug("archived repo metadata refresh failed",
+				"repo", repo.Owner+"/"+repo.Name, "err", err,
+			)
+			skipped = append(skipped, repo.Owner+"/"+repo.Name)
+			continue
+		}
+		if resolved.Archived {
+			skipped = append(skipped, repo.Owner+"/"+repo.Name)
+			continue
+		}
+		slog.Info("repo unarchived upstream; resuming live sync",
+			"repo", resolved.Owner+"/"+resolved.Name,
+		)
+		live = append(live, resolved)
+	}
+	if len(skipped) > 0 {
+		slog.Debug("skipping archived repos in live sync", "repos", skipped)
+	}
+	return live
+}
+
+func excludeArchivedRepos(repos []RepoRef) []RepoRef {
+	live := make([]RepoRef, 0, len(repos))
+	skipped := make([]string, 0)
+	for _, repo := range repos {
+		if repo.Archived {
+			skipped = append(skipped, repo.Owner+"/"+repo.Name)
+			continue
+		}
+		live = append(live, repo)
+	}
+	if len(skipped) > 0 {
+		slog.Debug("skipping archived repos in live sync", "repos", skipped)
+	}
+	return live
 }
 
 func selectRepos(repos, selectedRepos []RepoRef) []RepoRef {
@@ -5419,7 +5549,14 @@ func (s *Syncer) reconcileRepoIdentity(
 		}
 	}
 	authoritative := repoRefFromCatalog(repo, entry.Repository, resolved)
-	s.publishResolvedRepository(repo, authoritative)
+	if published, ok := s.publishResolvedRepository(
+		repo, authoritative, resolved != nil,
+	); ok {
+		// The publication may have kept a newer tracked archived flip
+		// over this snapshot's metadata; callers deciding whether to
+		// keep syncing must see the value that was actually published.
+		authoritative = published
+	}
 	if err := s.reconcileArchiveRepositoryIfNeeded(
 		ctx, previousID, entry.Repository.ID,
 	); err != nil {
@@ -5454,7 +5591,7 @@ func (s *Syncer) reconcileArchiveRepositoryIfNeeded(
 	for _, trackedRepo := range tracked {
 		refs = append(refs, platformRepoRef(trackedRepo))
 	}
-	if err := s.archiveLifecycle.EnsureConfigured(ctx, refs); err != nil {
+	if _, err := s.archiveLifecycle.EnsureConfigured(ctx, refs); err != nil {
 		return fmt.Errorf("reconcile archive repository replacement: %w", err)
 	}
 	s.WakeArchive()
@@ -5473,6 +5610,11 @@ func repoRefFromCatalog(previous RepoRef, stored db.Repo, resolved *platform.Rep
 		WebURL:             stored.WebURL,
 		CloneURL:           stored.CloneURL,
 		DefaultBranch:      stored.DefaultBranch,
+		// The repo catalog does not record archived state or config-entry
+		// provenance; without a fresh provider resolve, the previously
+		// tracked values stand.
+		Archived:           previous.Archived,
+		ConfiguredRepoPath: previous.ConfiguredRepoPath,
 	}
 	if repo.PlatformRepoID == 0 {
 		repo.PlatformRepoID = previous.PlatformRepoID
@@ -5489,6 +5631,7 @@ func repoRefFromCatalog(previous RepoRef, stored db.Repo, resolved *platform.Rep
 	if resolved == nil {
 		return repo
 	}
+	repo.Archived = resolved.Archived
 	repo.PlatformRepoID = resolved.PlatformID
 	if repo.PlatformRepoID == 0 {
 		repo.PlatformRepoID = resolved.Ref.PlatformID
@@ -5511,17 +5654,95 @@ func repoRefFromCatalog(previous RepoRef, stored db.Repo, resolved *platform.Rep
 	return repo
 }
 
-func (s *Syncer) publishResolvedRepository(previous, resolved RepoRef) {
+func (s *Syncer) publishResolvedRepository(
+	previous, resolved RepoRef, archivedAuthoritative bool,
+) (RepoRef, bool) {
 	s.clearDisplacedCredentialAlias(resolved)
 	s.aliasRenamedCredentialRoute(previous, resolved)
 	s.reposMu.Lock()
 	defer s.reposMu.Unlock()
-	for i := range s.repos {
-		if repoPriorityKey(s.repos[i]) == repoPriorityKey(previous) {
-			s.repos[i] = resolved
-			return
+	i, ok := s.trackedRepoSlotLocked(previous, resolved)
+	if !ok {
+		return resolved, false
+	}
+	// The snapshot comparison below only means anything when the
+	// publication concerns the repository the snapshot named: differing
+	// snapshot and resolved ids mean the data belongs to a route
+	// successor — whether it landed on the successor's own entry or is
+	// displacing the snapshot's — and the snapshot's archived flag says
+	// nothing about it. A conflicting slot id is cross-identity even
+	// when the snapshot carries no id: the slot's occupant is not the
+	// repository the provider response describes.
+	slotID := strings.TrimSpace(s.repos[i].PlatformExternalID)
+	previousID := strings.TrimSpace(previous.PlatformExternalID)
+	resolvedID := strings.TrimSpace(resolved.PlatformExternalID)
+	crossIdentity := resolvedID != "" &&
+		((previousID != "" && resolvedID != previousID) ||
+			(slotID != "" && resolvedID != slotID))
+	sameIdentity := !crossIdentity &&
+		(slotID == "" || previousID == "" || slotID == previousID)
+	if sameIdentity && s.repos[i].Archived != previous.Archived {
+		// A concurrent resolution flipped archived state after this
+		// operation snapshotted the ref. The in-flight provider
+		// response cannot be ordered against that flip, so the newer
+		// tracked value stands even over fresh provider metadata.
+		resolved.Archived = s.repos[i].Archived
+	} else if !archivedAuthoritative {
+		// Without fresh provider metadata the archived flag was
+		// reconstructed from the operation's snapshot, which may
+		// predate a newer flip on the tracked ref. The current
+		// tracked state stays authoritative.
+		resolved.Archived = s.repos[i].Archived
+	}
+	// Config-entry provenance is authored only by configuration
+	// resolution; a publication built from an older snapshot must
+	// not overwrite a value a concurrent reload just updated.
+	resolved.ConfiguredRepoPath = s.repos[i].ConfiguredRepoPath
+	s.repos[i] = resolved
+	return resolved, true
+}
+
+// trackedRepoSlotLocked locates the tracked entry a publication should land
+// on: stable provider identity first — a renamed route must still find its
+// repository — then the route key, rejected when the ids conflict because
+// that means the route was reused by another repository whose tracked state
+// a stale publication must not overwrite. The resolved id outranks the
+// snapshot id: the provider response says whose data this is, so a lookup
+// keyed by a reused route lands on the successor, never on the repository
+// the snapshot named. Callers hold reposMu.
+func (s *Syncer) trackedRepoSlotLocked(previous, resolved RepoRef) (int, bool) {
+	previousID := strings.TrimSpace(previous.PlatformExternalID)
+	resolvedID := strings.TrimSpace(resolved.PlatformExternalID)
+	lookupID := resolvedID
+	if lookupID == "" {
+		lookupID = previousID
+	}
+	if lookupID != "" {
+		for i := range s.repos {
+			if repoPlatform(s.repos[i]) == repoPlatform(previous) &&
+				strings.EqualFold(repoHost(s.repos[i]), repoHost(previous)) &&
+				strings.TrimSpace(s.repos[i].PlatformExternalID) == lookupID {
+				return i, true
+			}
 		}
 	}
+	// Route fallback: landing on the entry this operation snapshotted is
+	// legitimate even under a new resolved identity — a configured route
+	// reused by a replacement repository displaces its tracked occupant,
+	// and the archive lifecycle pauses the old repository. Landing on an
+	// entry whose id conflicts with the snapshot is not: that entry is a
+	// different repository this publication knows nothing about.
+	for i := range s.repos {
+		if repoPriorityKey(s.repos[i]) != repoPriorityKey(previous) {
+			continue
+		}
+		trackedID := strings.TrimSpace(s.repos[i].PlatformExternalID)
+		if trackedID != "" && previousID != "" && trackedID != previousID {
+			continue
+		}
+		return i, true
+	}
+	return 0, false
 }
 
 // aliasRenamedCredentialRoute keeps GitHub credential selection on the
@@ -5597,6 +5818,15 @@ func (s *Syncer) syncRepo(ctx context.Context, repo RepoRef) error {
 		return fmt.Errorf("resolve repo identity %s/%s: %w", repo.Owner, repo.Name, err)
 	}
 	repo = resolvedRef
+	if repo.Archived {
+		// Identity resolution already published the archived flag, so
+		// the repo drops out of future passes; stop before any live
+		// clone, overview, or item syncing touches the archived repo.
+		slog.Info("repo archived upstream; skipping live sync",
+			"repo", repo.Owner+"/"+repo.Name,
+		)
+		return nil
+	}
 
 	s.refreshRepoSettings(ctx, repo, repoID, resolvedRepo)
 
@@ -10341,6 +10571,13 @@ func (s *Syncer) drainDetailQueue(
 			repo.Name = qi.RepoName
 			repo.PlatformHost = host
 		}
+		// The queue was built before the pass ran, so it can hold items
+		// for a repository the pass just published as archived. Detail
+		// work is live syncing; archived repos hydrate through the
+		// archive budget path instead.
+		if repo.Archived {
+			continue
+		}
 		// Resolve the credential bucket from the tracked repository. Routing
 		// keys off the owner and host that survive tracking, not the raw
 		// queue row, so this must follow the lookup above.
@@ -10409,6 +10646,13 @@ func (s *Syncer) drainDetailQueue(
 			repoID = resolvedRepoID
 			verifiedRepos[repoKey] = repo
 			verifiedRepoIDs[repoKey] = repoID
+		}
+		if repo.Archived {
+			// Identity verification just discovered the archived flip;
+			// the publication already dropped the repo from live sync.
+			probe.abandon()
+			rejectedRepos[repoKey] = true
+			continue
 		}
 		if repoID == 0 {
 			probe.abandon()
@@ -10764,6 +11008,14 @@ func (s *Syncer) syncMRForRepo(
 		return fmt.Errorf("resolve repo identity %s/%s: %w", owner, name, err)
 	}
 	repo = resolvedRef
+	if repo.Archived && !IsArchiveSyncBudgetContext(ctx) {
+		// Live detail syncing stops on an archived repo; only archive
+		// hydration, which runs under the archive budget, proceeds.
+		slog.Debug("skipping MR detail sync for archived repo",
+			"repo", owner+"/"+name, "number", number,
+		)
+		return nil
+	}
 
 	// Preserve derived fields that provider detail doesn't populate. CI is
 	// refreshed later in this sync path; keeping the previous values here
@@ -11332,6 +11584,14 @@ func (s *Syncer) syncIssueForRepo(
 		)
 	}
 	repo = resolvedRef
+	if repo.Archived && !IsArchiveSyncBudgetContext(ctx) {
+		// Live detail syncing stops on an archived repo; only archive
+		// hydration, which runs under the archive budget, proceeds.
+		slog.Debug("skipping issue detail sync for archived repo",
+			"repo", repo.Owner+"/"+repo.Name, "number", number,
+		)
+		return nil
+	}
 
 	providerCalls, err := s.fetchIssueDetail(ctx, repo, repoID, number)
 	if providerAttempted != nil && providerCalls > 0 {

@@ -22,6 +22,7 @@ import (
 	"github.com/shurcooL/githubv4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/forge/internal/archive"
 	"go.kenn.io/forge/internal/db"
 	"go.kenn.io/forge/internal/gitclone"
 	"go.kenn.io/forge/internal/platform"
@@ -2178,6 +2179,75 @@ func TestSyncNotificationsContinuesAfterRepoErrorOnSameHost(t *testing.T) {
 	require.NotNil(widgetWatermark,
 		"a healthy repository must advance its watermark despite a failing sibling on the host")
 	assert.False(widgetWatermark.LastSuccessfulSyncAt.IsZero())
+}
+
+func TestSyncNotificationsSkipsArchivedRepos(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	database := openTestDB(t)
+	for _, name := range []string{"frozen", "widget"} {
+		_, err := database.UpsertRepo(
+			t.Context(), verifiedGitHubRepoIdentity("github.com", "acme", name),
+		)
+		require.NoError(err)
+	}
+	var listedRepos sync.Map
+	client := &mockClient{
+		listNotificationsFn: func(
+			_ context.Context, opts NotificationListOptions,
+		) ([]NotificationThread, bool, error) {
+			if opts.RepoName != "" {
+				listedRepos.Store(opts.RepoName, true)
+			}
+			return nil, false, nil
+		},
+	}
+	syncer := NewSyncer(
+		map[string]Client{"github.com": client}, database, nil,
+		[]RepoRef{
+			{Owner: "acme", Name: "frozen", PlatformHost: "github.com", Archived: true},
+			{Owner: "acme", Name: "widget", PlatformHost: "github.com"},
+		},
+		time.Minute, nil, nil,
+	)
+
+	require.NoError(syncer.SyncNotifications(t.Context()))
+	_, listedWidget := listedRepos.Load("widget")
+	assert.True(listedWidget, "live repo notifications should sync")
+	_, listedFrozen := listedRepos.Load("frozen")
+	assert.False(listedFrozen,
+		"archived repo must not receive notification polling")
+}
+
+func TestAckRepoBucketsIncludesArchivedTrackedRepos(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	database := openTestDB(t)
+	syncer := NewSyncer(
+		map[string]Client{"github.com": &mockClient{}}, database, nil,
+		[]RepoRef{
+			{Owner: "acme", Name: "frozen", PlatformHost: "github.com", Archived: true},
+			{Owner: "acme", Name: "widget", PlatformHost: "github.com"},
+		},
+		time.Minute, nil, nil,
+	)
+	queued := []db.Notification{{
+		ID: 1, RepoOwner: "acme", RepoName: "widget",
+	}}
+
+	byBucket, byNotification := syncer.ackRepoBuckets(
+		platform.KindGitHub, "github.com", queued,
+	)
+
+	bucket, ok := byNotification[1]
+	require.True(ok)
+	names := make([]string, 0, len(byBucket[bucket]))
+	for _, repo := range byBucket[bucket] {
+		names = append(names, repo.Name)
+	}
+	assert.Contains(names, "frozen",
+		"archived repos must stay in ack deferral buckets: their queued "+
+			"acknowledgements share the credential's rate limit")
 }
 
 func TestSyncNotificationsSkipsUnroutedRepoAndAdvancesRoutedSibling(t *testing.T) {
@@ -4906,7 +4976,7 @@ func TestSyncerOwnsConstructorRepositorySlice(t *testing.T) {
 	syncer.publishResolvedRepository(repos[0], RepoRef{
 		Platform: platform.KindGitHub, PlatformHost: "github.com",
 		Owner: "org-a", Name: "new-name", RepoPath: "org-a/new-name",
-	})
+	}, true)
 
 	assert.Equal("old-name", repos[0].Name)
 	assert.Equal("org-a/old-name", repos[0].RepoPath)
@@ -4985,8 +5055,8 @@ func TestIsTrackedRepoConcurrentPublishResolvedRepository(t *testing.T) {
 	wg.Go(func() {
 		<-start
 		for range iterations {
-			syncer.publishResolvedRepository(orig, renamed)
-			syncer.publishResolvedRepository(renamed, orig)
+			syncer.publishResolvedRepository(orig, renamed, true)
+			syncer.publishResolvedRepository(renamed, orig, true)
 		}
 	})
 	for range 4 {
@@ -9556,6 +9626,53 @@ func TestSetWatchedMRsReplacesList(t *testing.T) {
 		"PR #1 should stop being synced after watch list replacement")
 }
 
+func TestWatchedMRsForFastSyncSkipsArchivedRepos(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	d := openTestDB(t)
+	ctx := t.Context()
+	now := time.Date(2026, 6, 24, 12, 0, 0, 0, time.UTC)
+
+	liveID, err := d.UpsertRepo(ctx, db.RepoIdentity{
+		Platform: "github", PlatformHost: "github.com",
+		PlatformRepoID: "repo-acme-live", Owner: "acme", Name: "live",
+	})
+	require.NoError(err)
+	frozenID, err := d.UpsertRepo(ctx, db.RepoIdentity{
+		Platform: "github", PlatformHost: "github.com",
+		PlatformRepoID: "repo-acme-frozen", Owner: "acme", Name: "frozen",
+	})
+	require.NoError(err)
+	seedMR := func(repoID int64, number int) {
+		_, upsertErr := d.UpsertMergeRequest(ctx, &db.MergeRequest{
+			RepoID: repoID, PlatformID: int64(number), Number: number,
+			Title: "PR", Author: "octo", State: db.MergeRequestStateOpen,
+			HeadBranch: "feature", BaseBranch: "main",
+			CreatedAt: now.Add(-24 * time.Hour),
+			UpdatedAt: now.Add(-30 * time.Minute), LastActivityAt: now.Add(-30 * time.Minute),
+		})
+		require.NoError(upsertErr)
+	}
+	seedMR(liveID, 1)
+	seedMR(frozenID, 2)
+
+	syncer := NewSyncer(
+		map[string]Client{}, d, nil,
+		[]RepoRef{
+			{Platform: platform.KindGitHub, PlatformHost: "github.com", Owner: "acme", Name: "live"},
+			{Platform: platform.KindGitHub, PlatformHost: "github.com", Owner: "acme", Name: "frozen", Archived: true},
+		},
+		time.Hour, nil, nil,
+	)
+	syncer.SetActiveMRWindow(4 * time.Hour)
+
+	got := syncer.watchedMRsForFastSync(ctx, now)
+	assert.ElementsMatch([]WatchedMR{{
+		Platform: platform.KindGitHub, PlatformHost: "github.com",
+		Owner: "acme", Name: "live", Number: 1,
+	}}, got, "open MRs on archived repos must not enter fast sync")
+}
+
 func TestWatchedMRsIncludeRecentlyActiveOpenPRs(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
@@ -10130,6 +10247,791 @@ func TestRunOnceSkipsThrottledHosts(t *testing.T) {
 		"github.com client should have been called")
 	assert.False(gheMock.listOpenPRsCalled.Load(),
 		"ghe.corp.com client should NOT have been called")
+}
+
+func TestRunOnceSkipsArchivedRepos(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	d := openTestDB(t)
+
+	ghMock := &mockClient{
+		openPRs:  []*gh.PullRequest{},
+		comments: []*gh.IssueComment{},
+		reviews:  []*gh.PullRequestReview{},
+		commits:  []*gh.RepositoryCommit{},
+		getRepositoryFn: func(
+			_ context.Context, owner, repo string,
+		) (*gh.Repository, error) {
+			id := int64(1)
+			nodeID := "repo-" + owner + "-" + repo
+			archived := repo == "frozen"
+			return &gh.Repository{
+				ID:       &id,
+				NodeID:   &nodeID,
+				Name:     &repo,
+				Owner:    &gh.User{Login: &owner},
+				Archived: &archived,
+			}, nil
+		},
+	}
+	repos := []RepoRef{
+		{Owner: "acme", Name: "live", PlatformHost: "github.com"},
+		{Owner: "acme", Name: "frozen", PlatformHost: "github.com", Archived: true},
+	}
+
+	syncer := NewSyncer(
+		map[string]Client{"github.com": ghMock}, d, nil, repos,
+		time.Minute, nil, nil,
+	)
+
+	var gotResults []RepoSyncResult
+	syncer.SetOnSyncCompleted(func(results []RepoSyncResult) {
+		gotResults = results
+	})
+
+	syncer.RunOnce(t.Context())
+
+	require.Len(gotResults, 1,
+		"archived repo should not produce a live sync result")
+	assert.Equal("live", gotResults[0].Name)
+	assert.True(ghMock.listOpenPRsCalled.Load())
+}
+
+func TestRunOnceRestoresLiveSyncForUnarchivedRepo(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	d := openTestDB(t)
+
+	// The default mockClient GetRepository reports the repo unarchived,
+	// so the tracked archived flag is stale.
+	ghMock := &mockClient{
+		openPRs:  []*gh.PullRequest{},
+		comments: []*gh.IssueComment{},
+		reviews:  []*gh.PullRequestReview{},
+		commits:  []*gh.RepositoryCommit{},
+	}
+	repos := []RepoRef{
+		{Owner: "acme", Name: "thawed", PlatformHost: "github.com", Archived: true},
+	}
+
+	syncer := NewSyncer(
+		map[string]Client{"github.com": ghMock}, d, nil, repos,
+		time.Minute, nil, nil,
+	)
+
+	var gotResults []RepoSyncResult
+	syncer.SetOnSyncCompleted(func(results []RepoSyncResult) {
+		gotResults = results
+	})
+
+	syncer.RunOnce(t.Context())
+
+	require.Len(gotResults, 1,
+		"provider-unarchived repo should rejoin the live pass")
+	assert.Equal("thawed", gotResults[0].Name)
+	assert.True(ghMock.listOpenPRsCalled.Load())
+	tracked := syncer.TrackedRepos()
+	require.Len(tracked, 1)
+	assert.False(tracked[0].Archived,
+		"tracked ref should be live again after the provider unarchives")
+}
+
+func TestRunOnceDefersArchivedRefreshForThrottledBucket(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	d := openTestDB(t)
+
+	var getRepositoryCalled atomic.Bool
+	gheMock := &mockClient{
+		openPRs:  []*gh.PullRequest{},
+		comments: []*gh.IssueComment{},
+		reviews:  []*gh.PullRequestReview{},
+		commits:  []*gh.RepositoryCommit{},
+		getRepositoryFn: func(
+			_ context.Context, owner, repo string,
+		) (*gh.Repository, error) {
+			getRepositoryCalled.Store(true)
+			id := int64(1)
+			nodeID := "repo-" + owner + "-" + repo
+			archived := false
+			return &gh.Repository{
+				ID:       &id,
+				NodeID:   &nodeID,
+				Name:     &repo,
+				Owner:    &gh.User{Login: &owner},
+				Archived: &archived,
+			}, nil
+		},
+	}
+
+	gheTracker := NewRateTracker(d, "ghe.corp.com", "host", "rest")
+	gheTracker.UpdateFromRate(Rate{
+		Limit:     5000,
+		Remaining: 100, // below RateReserveBuffer (200)
+		Reset:     time.Now().Add(30 * time.Minute),
+	})
+
+	repos := []RepoRef{
+		{Owner: "corp", Name: "frozen", PlatformHost: "ghe.corp.com", Archived: true},
+	}
+	syncer := NewSyncer(
+		map[string]Client{"ghe.corp.com": gheMock}, d, nil, repos,
+		time.Minute, map[string]*RateTracker{"ghe.corp.com": gheTracker}, nil,
+	)
+
+	syncer.RunOnce(t.Context())
+
+	assert.False(getRepositoryCalled.Load(),
+		"archived metadata refresh must not spend budget on a throttled bucket")
+	tracked := syncer.TrackedRepos()
+	require.Len(tracked, 1)
+	assert.True(tracked[0].Archived,
+		"deferred archived ref must keep its archived flag")
+}
+
+func TestRunOnceAdvancesCadenceForArchivedOnlyBucket(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	d := openTestDB(t)
+
+	var getRepositoryCalls atomic.Int32
+	gheMock := &mockClient{
+		openPRs:  []*gh.PullRequest{},
+		comments: []*gh.IssueComment{},
+		reviews:  []*gh.PullRequestReview{},
+		commits:  []*gh.RepositoryCommit{},
+		getRepositoryFn: func(
+			_ context.Context, owner, repo string,
+		) (*gh.Repository, error) {
+			getRepositoryCalls.Add(1)
+			id := int64(1)
+			nodeID := "repo-" + owner + "-" + repo
+			archived := true
+			return &gh.Repository{
+				ID:       &id,
+				NodeID:   &nodeID,
+				Name:     &repo,
+				Owner:    &gh.User{Login: &owner},
+				Archived: &archived,
+			}, nil
+		},
+	}
+
+	gheTracker := NewRateTracker(d, "ghe.corp.com", "host", "rest")
+	gheTracker.UpdateFromRate(Rate{
+		Limit:     5000,
+		Remaining: 4000,
+		Reset:     time.Now().Add(30 * time.Minute),
+	})
+
+	repos := []RepoRef{
+		{Owner: "corp", Name: "frozen", PlatformHost: "ghe.corp.com", Archived: true},
+	}
+	syncer := NewSyncer(
+		map[string]Client{"ghe.corp.com": gheMock}, d, nil, repos,
+		time.Minute, map[string]*RateTracker{"ghe.corp.com": gheTracker}, nil,
+	)
+
+	syncer.RunOnce(t.Context())
+	require.Equal(int32(1), getRepositoryCalls.Load(),
+		"first pass refreshes the archived ref")
+
+	syncer.RunOnce(t.Context())
+	assert.Equal(int32(1), getRepositoryCalls.Load(),
+		"second pass inside the cadence gate must defer the archived refresh")
+}
+
+func TestRunOnceRegistersProviderWorkForArchivedRefresh(t *testing.T) {
+	require := require.New(t)
+	d := openTestDB(t)
+
+	var syncer *Syncer
+	var workActive atomic.Bool
+	ghMock := &mockClient{
+		openPRs:  []*gh.PullRequest{},
+		comments: []*gh.IssueComment{},
+		reviews:  []*gh.PullRequestReview{},
+		commits:  []*gh.RepositoryCommit{},
+		getRepositoryFn: func(
+			_ context.Context, owner, repo string,
+		) (*gh.Repository, error) {
+			workActive.Store(syncer.higherPriorityProviderWorkActive(
+				"github.com", archive.PriorityFullArchive,
+			))
+			id := int64(1)
+			nodeID := "repo-" + owner + "-" + repo
+			archived := true
+			return &gh.Repository{
+				ID:       &id,
+				NodeID:   &nodeID,
+				Name:     &repo,
+				Owner:    &gh.User{Login: &owner},
+				Archived: &archived,
+			}, nil
+		},
+	}
+	repos := []RepoRef{
+		{Owner: "acme", Name: "frozen", PlatformHost: "github.com", Archived: true},
+	}
+	syncer = NewSyncer(
+		map[string]Client{"github.com": ghMock}, d, nil, repos,
+		time.Minute, nil, nil,
+	)
+
+	syncer.RunOnce(t.Context())
+
+	require.True(workActive.Load(),
+		"archived metadata refresh must register provider work so an "+
+			"admitted archive lease on the credential is preempted")
+}
+
+func TestReconcileRepoIdentityReturnsMidflightArchivedFlip(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	d := openTestDB(t)
+
+	// The default mockClient GetRepository reports the repo unarchived.
+	ghMock := &mockClient{
+		openPRs:  []*gh.PullRequest{},
+		comments: []*gh.IssueComment{},
+		reviews:  []*gh.PullRequestReview{},
+		commits:  []*gh.RepositoryCommit{},
+	}
+	// The tracked ref was flipped archived by a concurrent resolution
+	// after this operation snapshotted it as live.
+	repos := []RepoRef{
+		{Owner: "acme", Name: "widget", PlatformHost: "github.com", Archived: true},
+	}
+	syncer := NewSyncer(
+		map[string]Client{"github.com": ghMock}, d, nil, repos,
+		time.Minute, nil, nil,
+	)
+
+	snapshot := RepoRef{Owner: "acme", Name: "widget", PlatformHost: "github.com"}
+	authoritative, _, _, err := syncer.reconcileRepoIdentity(t.Context(), snapshot)
+	require.NoError(err)
+
+	assert.True(authoritative.Archived,
+		"returned ref must carry the newer tracked archived flip the publication preserved")
+	tracked := syncer.TrackedRepos()
+	require.Len(tracked, 1)
+	assert.True(tracked[0].Archived)
+}
+
+func TestPublishResolvedRepositoryEmptySnapshotIDKeepsSuccessorArchivedState(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	d := openTestDB(t)
+
+	syncer := NewSyncer(nil, d, nil, []RepoRef{
+		{
+			Owner: "acme", Name: "widget", PlatformHost: "github.com",
+			PlatformExternalID: "repo-x", Archived: true,
+		},
+	}, time.Minute, nil, nil)
+
+	// The operation's snapshot predates identity resolution and carries no
+	// provider id; fresh metadata resolves the route to a different
+	// repository. The displaced occupant's archived flag must not stamp
+	// the successor.
+	previous := RepoRef{Owner: "acme", Name: "widget", PlatformHost: "github.com"}
+	resolved := RepoRef{
+		Owner: "acme", Name: "widget", PlatformHost: "github.com",
+		PlatformExternalID: "repo-y",
+	}
+	syncer.publishResolvedRepository(previous, resolved, true)
+
+	tracked := syncer.TrackedRepos()
+	require.Len(tracked, 1)
+	assert.Equal("repo-y", tracked[0].PlatformExternalID)
+	assert.False(tracked[0].Archived,
+		"authoritative resolved metadata must apply across identities even "+
+			"when the snapshot id is empty")
+}
+
+func TestDetailDrainSkipsRepoArchivedMidPass(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	ctx := t.Context()
+	d := openTestDB(t)
+
+	// A stale open item queued before the repository archived.
+	repoID, err := d.UpsertRepo(ctx, verifiedGitHubRepoIdentity(
+		"github.com", "owner", "repo",
+	))
+	require.NoError(err)
+	seededAt := time.Date(2024, 6, 1, 10, 0, 0, 0, time.UTC)
+	_, err = d.UpsertMergeRequest(ctx, &db.MergeRequest{
+		RepoID:          repoID,
+		PlatformID:      1000,
+		Number:          1,
+		URL:             "https://github.com/owner/repo/pull/1",
+		Title:           "stale PR",
+		Author:          "alice",
+		State:           "open",
+		HeadBranch:      "feature",
+		BaseBranch:      "main",
+		PlatformHeadSHA: "abc123",
+		CreatedAt:       seededAt,
+		UpdatedAt:       seededAt,
+		LastActivityAt:  seededAt,
+	})
+	require.NoError(err)
+
+	mc := &detailTrackingClient{}
+	mc.openPRs = []*gh.PullRequest{}
+	mc.comments = []*gh.IssueComment{}
+	mc.reviews = []*gh.PullRequestReview{}
+	mc.commits = []*gh.RepositoryCommit{}
+	archived := true
+	mc.getRepositoryFn = func(
+		_ context.Context, owner, repo string,
+	) (*gh.Repository, error) {
+		id := int64(1)
+		nodeID := "repo-" + owner + "-" + repo
+		return &gh.Repository{
+			ID:       &id,
+			NodeID:   &nodeID,
+			Name:     &repo,
+			Owner:    &gh.User{Login: &owner},
+			Archived: &archived,
+		}, nil
+	}
+
+	syncer := NewSyncer(
+		map[string]Client{"github.com": mc}, d, nil,
+		[]RepoRef{{Owner: "owner", Name: "repo", PlatformHost: "github.com"}},
+		time.Minute, nil, testBudget(500),
+	)
+
+	syncer.RunOnce(ctx)
+
+	assert.Zero(int(mc.getPRCalls.Load()),
+		"detail drain must not fetch details for a repo that archived mid-pass")
+	tracked := syncer.TrackedRepos()
+	require.Len(tracked, 1)
+	assert.True(tracked[0].Archived)
+}
+
+func TestSyncWatchedMRsSkipsRepoArchivedMidPass(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	ctx := t.Context()
+	d := openTestDB(t)
+
+	now := time.Date(2024, 6, 1, 12, 0, 0, 0, time.UTC)
+	archived := true
+	mc := &mockClient{
+		openPRs:  []*gh.PullRequest{},
+		singlePR: buildOpenPR(7, now),
+		comments: []*gh.IssueComment{},
+		reviews:  []*gh.PullRequestReview{},
+		commits:  []*gh.RepositoryCommit{},
+		getRepositoryFn: func(
+			_ context.Context, owner, repo string,
+		) (*gh.Repository, error) {
+			id := int64(1)
+			nodeID := "repo-" + owner + "-" + repo
+			return &gh.Repository{
+				ID:       &id,
+				NodeID:   &nodeID,
+				Name:     &repo,
+				Owner:    &gh.User{Login: &owner},
+				Archived: &archived,
+			}, nil
+		},
+	}
+
+	syncer := NewSyncer(
+		map[string]Client{"github.com": mc}, d, nil,
+		[]RepoRef{{Owner: "acme", Name: "app", PlatformHost: "github.com"}},
+		time.Hour, nil, nil,
+	)
+	hookCalls := 0
+	syncer.SetOnMRSynced(func(_ string, _ string, _ *db.MergeRequest) {
+		hookCalls++
+	})
+	syncer.SetWatchedMRs([]WatchedMR{{Owner: "acme", Name: "app", Number: 7}})
+
+	syncer.syncWatchedMRs(ctx)
+
+	assert.Zero(hookCalls,
+		"watched-MR sync must stop when resolution reports the repo archived")
+	mr, err := d.GetMergeRequest(ctx, "github", "github.com", "acme", "app", 7)
+	require.NoError(err)
+	assert.Nil(mr, "no MR detail should be persisted for the archived repo")
+	tracked := syncer.TrackedRepos()
+	require.Len(tracked, 1)
+	assert.True(tracked[0].Archived)
+}
+
+func TestSyncMRForRepoHydratesArchivedRepoUnderArchiveBudget(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	ctx := t.Context()
+	d := openTestDB(t)
+
+	now := time.Date(2024, 6, 1, 12, 0, 0, 0, time.UTC)
+	archived := true
+	mc := &mockClient{
+		openPRs:  []*gh.PullRequest{},
+		singlePR: buildOpenPR(7, now),
+		comments: []*gh.IssueComment{},
+		reviews:  []*gh.PullRequestReview{},
+		commits:  []*gh.RepositoryCommit{},
+		getRepositoryFn: func(
+			_ context.Context, owner, repo string,
+		) (*gh.Repository, error) {
+			id := int64(1)
+			nodeID := "repo-" + owner + "-" + repo
+			return &gh.Repository{
+				ID:       &id,
+				NodeID:   &nodeID,
+				Name:     &repo,
+				Owner:    &gh.User{Login: &owner},
+				Archived: &archived,
+			}, nil
+		},
+	}
+	repo := RepoRef{
+		Owner: "acme", Name: "frozen", PlatformHost: "github.com", Archived: true,
+	}
+	syncer := NewSyncer(
+		map[string]Client{"github.com": mc}, d, nil, []RepoRef{repo},
+		time.Hour, nil, nil,
+	)
+
+	err := syncer.syncMRForRepo(WithArchiveSyncBudget(ctx), repo, 7, false, nil)
+	require.NoError(err)
+
+	mr, err := d.GetMergeRequest(ctx, "github", "github.com", "acme", "frozen", 7)
+	require.NoError(err)
+	require.NotNil(mr,
+		"archive hydration must still sync an archived repo's items")
+	assert.Equal(7, mr.Number)
+}
+
+func TestRunOnceStopsLiveSyncWhenRepoArchivesMidPass(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	d := openTestDB(t)
+
+	archived := true
+	ghMock := &mockClient{
+		openPRs:  []*gh.PullRequest{},
+		comments: []*gh.IssueComment{},
+		reviews:  []*gh.PullRequestReview{},
+		commits:  []*gh.RepositoryCommit{},
+		getRepositoryFn: func(
+			_ context.Context, owner, repo string,
+		) (*gh.Repository, error) {
+			id := int64(1)
+			nodeID := "repo-" + owner + "-" + repo
+			return &gh.Repository{
+				ID:       &id,
+				NodeID:   &nodeID,
+				Name:     &repo,
+				Owner:    &gh.User{Login: &owner},
+				Archived: &archived,
+			}, nil
+		},
+	}
+	repos := []RepoRef{
+		{Owner: "acme", Name: "closing", PlatformHost: "github.com"},
+	}
+
+	syncer := NewSyncer(
+		map[string]Client{"github.com": ghMock}, d, nil, repos,
+		time.Minute, nil, nil,
+	)
+
+	syncer.RunOnce(t.Context())
+
+	assert.False(ghMock.listOpenPRsCalled.Load(),
+		"live item sync must stop once resolution reports the repo archived")
+	tracked := syncer.TrackedRepos()
+	require.Len(tracked, 1)
+	assert.True(tracked[0].Archived)
+}
+
+func TestRepoRefFromCatalogKeepsArchived(t *testing.T) {
+	assert := assert.New(t)
+	previous := RepoRef{
+		Owner: "acme", Name: "frozen",
+		PlatformHost: "github.com", Archived: true,
+	}
+	stored := db.Repo{
+		ID: 7, Platform: "github", PlatformHost: "github.com",
+		Owner: "acme", Name: "frozen",
+	}
+
+	// Catalog republication without a fresh provider resolve keeps the
+	// previously known archived flag.
+	assert.True(repoRefFromCatalog(previous, stored, nil).Archived)
+
+	// A fresh provider resolve is authoritative in both directions.
+	assert.True(repoRefFromCatalog(previous, stored, &platform.Repository{
+		Archived: true,
+	}).Archived)
+	assert.False(repoRefFromCatalog(previous, stored, &platform.Repository{
+		Archived: false,
+	}).Archived)
+}
+
+func TestRepoRefFromCatalogKeepsConfiguredRepoPath(t *testing.T) {
+	assert := assert.New(t)
+	previous := RepoRef{
+		Owner: "acme", Name: "tools-new",
+		PlatformHost:       "github.com",
+		ConfiguredRepoPath: "acme/tools",
+	}
+	stored := db.Repo{
+		ID: 7, Platform: "github", PlatformHost: "github.com",
+		Owner: "acme", Name: "tools-new",
+	}
+
+	// Catalog republication must not erase the config-entry provenance
+	// that correlates a renamed route with its config entry on reload.
+	assert.Equal("acme/tools",
+		repoRefFromCatalog(previous, stored, nil).ConfiguredRepoPath)
+	assert.Equal("acme/tools",
+		repoRefFromCatalog(previous, stored, &platform.Repository{}).ConfiguredRepoPath)
+}
+
+func TestPublishResolvedRepositoryPreservesNewerArchivedState(t *testing.T) {
+	assert := assert.New(t)
+	d := openTestDB(t)
+	tracked := RepoRef{
+		Owner: "acme", Name: "frozen", PlatformHost: "github.com",
+		RepoPath: "acme/frozen", Archived: true,
+	}
+	syncer := NewSyncer(
+		map[string]Client{}, d, nil, []RepoRef{tracked}, time.Hour, nil, nil,
+	)
+
+	// A sync that began before the repo was marked archived publishes a
+	// catalog identity built from its stale snapshot. Without fresh
+	// provider metadata the currently tracked archived flag must survive.
+	stale := tracked
+	stale.Archived = false
+	syncer.publishResolvedRepository(stale, stale, false)
+	assert.True(syncer.TrackedRepos()[0].Archived,
+		"a stale catalog republication must not clear archived state")
+
+	// Fresh provider metadata is authoritative in both directions.
+	unarchived := tracked
+	unarchived.Archived = false
+	syncer.publishResolvedRepository(tracked, unarchived, true)
+	assert.False(syncer.TrackedRepos()[0].Archived)
+}
+
+func TestPublishResolvedRepositoryPreservesMidflightArchivedFlip(t *testing.T) {
+	assert := assert.New(t)
+	d := openTestDB(t)
+	tracked := RepoRef{
+		Owner: "acme", Name: "frozen", PlatformHost: "github.com",
+		RepoPath: "acme/frozen", Archived: true,
+	}
+	syncer := NewSyncer(
+		map[string]Client{}, d, nil, []RepoRef{tracked}, time.Hour, nil, nil,
+	)
+
+	// The operation snapshotted the ref before a concurrent resolution
+	// flipped the tracked archived flag. Its own provider response cannot
+	// be ordered against that flip, so the newer tracked value survives
+	// even a publication carrying fresh provider metadata.
+	stale := tracked
+	stale.Archived = false
+	syncer.publishResolvedRepository(stale, stale, true)
+	assert.True(syncer.TrackedRepos()[0].Archived,
+		"a mid-flight archived flip must not be clobbered by an older publication")
+}
+
+func TestPublishResolvedRepositoryMatchesByStableIdentityFirst(t *testing.T) {
+	assert := assert.New(t)
+	d := openTestDB(t)
+	tracked := RepoRef{
+		Owner: "acme", Name: "tools-new", PlatformHost: "github.com",
+		RepoPath: "acme/tools-new", PlatformExternalID: "repo-x",
+	}
+	syncer := NewSyncer(
+		map[string]Client{}, d, nil, []RepoRef{tracked}, time.Hour, nil, nil,
+	)
+
+	// A slower operation publishes with a snapshot bearing the old route
+	// after the tracked ref already moved to the renamed one. The stable
+	// provider id still locates the tracked entry.
+	previous := RepoRef{
+		Owner: "acme", Name: "tools", PlatformHost: "github.com",
+		RepoPath: "acme/tools", PlatformExternalID: "repo-x",
+	}
+	resolved := tracked
+	resolved.DefaultBranch = "main"
+	syncer.publishResolvedRepository(previous, resolved, true)
+	assert.Equal("main", syncer.TrackedRepos()[0].DefaultBranch,
+		"identity match must publish onto the renamed tracked entry")
+}
+
+func TestPublishResolvedRepositoryDoesNotOverwriteRouteSuccessor(t *testing.T) {
+	assert := assert.New(t)
+	d := openTestDB(t)
+	successor := RepoRef{
+		Owner: "acme", Name: "tools", PlatformHost: "github.com",
+		RepoPath: "acme/tools", PlatformExternalID: "repo-y",
+	}
+	syncer := NewSyncer(
+		map[string]Client{}, d, nil, []RepoRef{successor}, time.Hour, nil, nil,
+	)
+
+	// A stale sync of the renamed-away repository publishes with the old
+	// route while a different repository now occupies it. Conflicting
+	// stable ids mean the route match is reuse, not a rename: the
+	// successor's tracked state must survive.
+	previous := RepoRef{
+		Owner: "acme", Name: "tools", PlatformHost: "github.com",
+		RepoPath: "acme/tools", PlatformExternalID: "repo-x",
+	}
+	resolved := previous
+	resolved.Archived = true
+	syncer.publishResolvedRepository(previous, resolved, true)
+	got := syncer.TrackedRepos()[0]
+	assert.Equal("repo-y", got.PlatformExternalID,
+		"a stale publication must not overwrite the route successor")
+	assert.False(got.Archived)
+}
+
+func TestPublishResolvedRepositoryLandsCrossIdentityLookupOnSuccessor(t *testing.T) {
+	assert := assert.New(t)
+	d := openTestDB(t)
+	renamed := RepoRef{
+		Owner: "acme", Name: "tools-new", PlatformHost: "github.com",
+		RepoPath: "acme/tools-new", PlatformExternalID: "repo-x",
+	}
+	successor := RepoRef{
+		Owner: "acme", Name: "tools", PlatformHost: "github.com",
+		RepoPath: "acme/tools", PlatformExternalID: "repo-y",
+	}
+	syncer := NewSyncer(
+		map[string]Client{}, d, nil,
+		[]RepoRef{renamed, successor}, time.Hour, nil, nil,
+	)
+
+	// An in-flight lookup keyed by the old route resolved the successor:
+	// the snapshot carries the renamed repo's id, the response the
+	// successor's. The publication belongs to the successor — it must not
+	// overwrite the renamed repository's entry.
+	previous := RepoRef{
+		Owner: "acme", Name: "tools", PlatformHost: "github.com",
+		RepoPath: "acme/tools", PlatformExternalID: "repo-x",
+	}
+	resolved := successor
+	resolved.DefaultBranch = "main"
+	syncer.publishResolvedRepository(previous, resolved, true)
+
+	byID := make(map[string]RepoRef)
+	for _, repo := range syncer.TrackedRepos() {
+		byID[repo.PlatformExternalID] = repo
+	}
+	assert.Len(byID, 2, "the renamed repository must not be overwritten")
+	assert.Equal("tools-new", byID["repo-x"].Name)
+	assert.Equal("main", byID["repo-y"].DefaultBranch,
+		"the publication lands on the repository the provider identified")
+}
+
+func TestPublishResolvedRepositoryCrossIdentityUsesAuthoritativeArchived(t *testing.T) {
+	assert := assert.New(t)
+	d := openTestDB(t)
+	renamed := RepoRef{
+		Owner: "acme", Name: "tools-new", PlatformHost: "github.com",
+		RepoPath: "acme/tools-new", PlatformExternalID: "repo-x",
+	}
+	successor := RepoRef{
+		Owner: "acme", Name: "tools", PlatformHost: "github.com",
+		RepoPath: "acme/tools", PlatformExternalID: "repo-y", Archived: true,
+	}
+	syncer := NewSyncer(
+		map[string]Client{}, d, nil,
+		[]RepoRef{renamed, successor}, time.Hour, nil, nil,
+	)
+
+	// The publication lands on the successor, but the snapshot belongs to
+	// the renamed repository — its archived flag says nothing about the
+	// successor, so authoritative resolved metadata applies.
+	previous := RepoRef{
+		Owner: "acme", Name: "tools", PlatformHost: "github.com",
+		RepoPath: "acme/tools", PlatformExternalID: "repo-x",
+	}
+	resolved := successor
+	resolved.Archived = false
+	syncer.publishResolvedRepository(previous, resolved, true)
+	for _, repo := range syncer.TrackedRepos() {
+		if repo.PlatformExternalID == "repo-y" {
+			assert.False(repo.Archived,
+				"authoritative metadata must apply on a cross-identity landing")
+		}
+	}
+
+	// Without fresh provider metadata the successor's tracked flag stands.
+	stale := resolved
+	stale.Archived = true
+	syncer.publishResolvedRepository(previous, stale, false)
+	for _, repo := range syncer.TrackedRepos() {
+		if repo.PlatformExternalID == "repo-y" {
+			assert.False(repo.Archived,
+				"non-authoritative publication must preserve the successor's state")
+		}
+	}
+}
+
+func TestPublishResolvedRepositoryReplacementIgnoresDisplacedArchivedFlip(t *testing.T) {
+	assert := assert.New(t)
+	d := openTestDB(t)
+	// The configured route's occupant was archived after this operation
+	// snapshotted it; meanwhile the route now resolves to an untracked
+	// replacement repository. The displaced repo's archived flip says
+	// nothing about the replacement — authoritative metadata applies.
+	displaced := RepoRef{
+		Owner: "acme", Name: "tools", PlatformHost: "github.com",
+		RepoPath: "acme/tools", PlatformExternalID: "repo-x", Archived: true,
+	}
+	syncer := NewSyncer(
+		map[string]Client{}, d, nil, []RepoRef{displaced}, time.Hour, nil, nil,
+	)
+
+	previous := displaced
+	previous.Archived = false
+	replacement := RepoRef{
+		Owner: "acme", Name: "tools", PlatformHost: "github.com",
+		RepoPath: "acme/tools", PlatformExternalID: "repo-y", Archived: false,
+	}
+	syncer.publishResolvedRepository(previous, replacement, true)
+
+	got := syncer.TrackedRepos()[0]
+	assert.Equal("repo-y", got.PlatformExternalID)
+	assert.False(got.Archived,
+		"the displaced repo's archived flip must not stamp the replacement")
+}
+
+func TestPublishResolvedRepositoryPreservesNewerConfiguredRepoPath(t *testing.T) {
+	assert := assert.New(t)
+	d := openTestDB(t)
+	tracked := RepoRef{
+		Owner: "acme", Name: "frozen", PlatformHost: "github.com",
+		RepoPath: "acme/frozen", ConfiguredRepoPath: "acme/frozen",
+	}
+	syncer := NewSyncer(
+		map[string]Client{}, d, nil, []RepoRef{tracked}, time.Hour, nil, nil,
+	)
+
+	// A sync snapshot taken before a config reload rewired the entry
+	// carries stale provenance. Provider resolution never authors
+	// config-entry provenance, so the currently tracked value survives
+	// even a publication with fresh provider metadata.
+	stale := tracked
+	stale.ConfiguredRepoPath = ""
+	syncer.publishResolvedRepository(stale, stale, true)
+	assert.Equal("acme/frozen", syncer.TrackedRepos()[0].ConfiguredRepoPath,
+		"a stale republication must not erase config-entry provenance")
 }
 
 func TestRunOnceScopesGitHubProviderReserveToRepoCredential(t *testing.T) {
@@ -17863,7 +18765,7 @@ func TestPublishResolvedRepositoryAliasesCredentialRoute(t *testing.T) {
 	renamed := configured
 	renamed.Name = "gadget"
 	renamed.RepoPath = "acme/gadget"
-	syncer.publishResolvedRepository(configured, renamed)
+	syncer.publishResolvedRepository(configured, renamed, true)
 
 	identity, ok := syncer.ReadIdentityForRepo(renamed)
 	require.True(ok)

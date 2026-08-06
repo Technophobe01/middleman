@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -36,9 +37,9 @@ type reloadArchiveLifecycleRecorder struct {
 
 func (*reloadArchiveLifecycleRecorder) RunEligible(context.Context) error { return nil }
 
-func (r *reloadArchiveLifecycleRecorder) EnsureConfigured(_ context.Context, refs []platform.RepoRef) error {
+func (r *reloadArchiveLifecycleRecorder) EnsureConfigured(_ context.Context, refs []platform.RepoRef) ([]platform.RepoRef, error) {
 	r.ensured = append([]platform.RepoRef(nil), refs...)
-	return nil
+	return refs, nil
 }
 
 func (r *reloadArchiveLifecycleRecorder) RetryAuthentication(_ context.Context, refs []platform.RepoRef) error {
@@ -266,6 +267,40 @@ port = 8091
 [[repos]]
 owner = "acme"
 name = "widget-*"
+`
+
+const validReloadConfigExactPlusGlob = `
+sync_interval = "5m"
+github_token_env = "KENN_FORGE_GITHUB_TOKEN"
+host = "127.0.0.1"
+port = 8091
+
+[[repos]]
+owner = "acme"
+name = "widget"
+
+[[repos]]
+owner = "acme"
+name = "*"
+`
+
+const validReloadConfigExactPlusGlobChangedActivity = `
+sync_interval = "5m"
+github_token_env = "KENN_FORGE_GITHUB_TOKEN"
+host = "127.0.0.1"
+port = 8091
+
+[[repos]]
+owner = "acme"
+name = "widget"
+
+[[repos]]
+owner = "acme"
+name = "*"
+
+[activity]
+view_mode = "flat"
+time_range = "30d"
 `
 
 const validReloadConfigChangedActivity = `
@@ -1747,6 +1782,198 @@ func TestConfigReload_NewRepoEntersSyncerTrackedSet(t *testing.T) {
 	assert.Equal(archiveLifecycle.ensured, archiveLifecycle.retried)
 	assert.Equal("acme/widget", archiveLifecycle.ensured[0].RepoPath)
 	assert.Equal("globex/engine", archiveLifecycle.ensured[1].RepoPath)
+}
+
+func TestConfigReload_ResolvedArchivedStateReplacesFallbackDuplicate(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+
+	var listedRepos sync.Map
+	srv, database, cfgPath := setupTestServerWithConfigContent(
+		t, validReloadConfig, &mockGH{
+			// The exact entry cannot resolve, so it falls back to the
+			// previously tracked (stale, live) ref.
+			getRepositoryFn: func(
+				context.Context, string, string,
+			) (*gh.Repository, error) {
+				return nil, errors.New("temporary repo lookup failure")
+			},
+			// The overlapping glob resolves the same repo as archived.
+			listReposByOwnerFn: func(
+				_ context.Context, owner string,
+			) ([]*gh.Repository, error) {
+				return []*gh.Repository{{
+					NodeID:   new("repo-acme-widget"),
+					Name:     new("widget"),
+					Owner:    &gh.User{Login: new(owner)},
+					Archived: new(true),
+				}}, nil
+			},
+			listNotificationsFn: func(
+				_ context.Context, opts ghclient.NotificationListOptions,
+			) ([]ghclient.NotificationThread, bool, error) {
+				if opts.RepoName != "" {
+					listedRepos.Store(opts.RepoName, true)
+				}
+				return nil, false, nil
+			},
+		},
+	)
+	_, err := database.UpsertRepo(t.Context(), db.RepoIdentity{
+		Platform: "github", PlatformHost: "github.com",
+		PlatformRepoID: "repo-acme-widget", Owner: "acme", Name: "widget",
+	})
+	require.NoError(err)
+	waitForConfigWatcher(t, srv, 2*time.Second)
+	stream := streamConfigEvents(t, srv)
+	defer stream.Close()
+
+	srv.syncer.SetRepos([]ghclient.RepoRef{{
+		Owner:        "acme",
+		Name:         "widget",
+		PlatformHost: "github.com",
+		RepoPath:     "acme/widget",
+	}})
+
+	writeConfigToml(t, cfgPath, validReloadConfigExactPlusGlob)
+
+	ev := waitForConfigEvent(t, stream, 2*time.Second)
+	require.True(ev.Valid)
+
+	require.True(trackedRepoArchived(srv, "acme", "widget"),
+		"resolved archived metadata must replace the fallback duplicate")
+
+	require.NoError(srv.syncer.SyncNotifications(t.Context()))
+	_, listedWidget := listedRepos.Load("widget")
+	assert.False(listedWidget,
+		"repo resolved as archived must be excluded from notification polling")
+}
+
+func TestConfigReload_FallbackKeepsRenamedArchivedTrackedRepo(t *testing.T) {
+	require := require.New(t)
+
+	srv, _, cfgPath := setupTestServerWithConfigContent(
+		t, validReloadConfig, &mockGH{
+			// The exact entry cannot resolve during the reload; the
+			// previously tracked repo was renamed provider-side, so its
+			// route no longer matches the configured path.
+			getRepositoryFn: func(
+				context.Context, string, string,
+			) (*gh.Repository, error) {
+				return nil, errors.New("temporary repo lookup failure")
+			},
+		},
+	)
+	waitForConfigWatcher(t, srv, 2*time.Second)
+	stream := streamConfigEvents(t, srv)
+	defer stream.Close()
+
+	srv.syncer.SetRepos([]ghclient.RepoRef{{
+		Owner:              "acme",
+		Name:               "widget-next",
+		PlatformHost:       "github.com",
+		RepoPath:           "acme/widget-next",
+		PlatformExternalID: "repo-acme-widget",
+		ConfiguredRepoPath: "acme/widget",
+		Archived:           true,
+	}})
+
+	writeConfigToml(t, cfgPath, validReloadConfigChangedActivity)
+
+	ev := waitForConfigEvent(t, stream, 2*time.Second)
+	require.True(ev.Valid)
+
+	require.True(trackedRepoArchived(srv, "acme", "widget-next"),
+		"fallback must keep the renamed archived tracked repo, not"+
+			" synthesize a live duplicate under the stale configured route")
+	for _, repo := range srv.syncer.TrackedRepos() {
+		require.NotEqual("widget", repo.Name,
+			"stale configured route must not be tracked as a duplicate")
+	}
+}
+
+func TestConfigReload_RouteReuseRefreshThenFailedReloadTracksRenamedRepoOnce(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+
+	// Phase 0: acme/widget resolves normally. Phase 1: the provider renamed
+	// widget to widget-next and a different repository reused the old route;
+	// exact lookups fail transiently while the glob still lists both.
+	renamed := atomic.Bool{}
+	mock := &mockGH{
+		getRepositoryFn: func(
+			_ context.Context, owner, repo string,
+		) (*gh.Repository, error) {
+			if renamed.Load() {
+				return nil, errors.New("temporary repo lookup failure")
+			}
+			return &gh.Repository{
+				NodeID:   new("repo-x"),
+				Name:     new(repo),
+				Owner:    &gh.User{Login: new(owner)},
+				Archived: new(false),
+			}, nil
+		},
+		listReposByOwnerFn: func(
+			_ context.Context, owner string,
+		) ([]*gh.Repository, error) {
+			if !renamed.Load() {
+				return []*gh.Repository{{
+					NodeID:   new("repo-x"),
+					Name:     new("widget"),
+					Owner:    &gh.User{Login: new(owner)},
+					Archived: new(false),
+				}}, nil
+			}
+			return []*gh.Repository{
+				{
+					NodeID:   new("repo-x"),
+					Name:     new("widget-next"),
+					Owner:    &gh.User{Login: new(owner)},
+					Archived: new(false),
+				},
+				{
+					NodeID:   new("repo-y"),
+					Name:     new("widget"),
+					Owner:    &gh.User{Login: new(owner)},
+					Archived: new(false),
+				},
+			}, nil
+		},
+	}
+	srv, _, cfgPath := setupTestServerWithConfigContent(
+		t, validReloadConfigExactPlusGlob, mock,
+	)
+	require.True(srv.syncer.IsTrackedRepo("acme", "widget"))
+	waitForConfigWatcher(t, srv, 2*time.Second)
+	stream := streamConfigEvents(t, srv)
+	defer stream.Close()
+
+	renamed.Store(true)
+	rr := doJSON(
+		t, srv, http.MethodPost,
+		"/api/v1/repo/gh/acme/*/refresh", nil,
+	)
+	require.Equal(http.StatusOK, rr.Code, rr.Body.String())
+
+	writeConfigToml(t, cfgPath, validReloadConfigExactPlusGlobChangedActivity)
+	ev := waitForConfigEvent(t, stream, 2*time.Second)
+	require.True(ev.Valid)
+
+	tracked := srv.syncer.TrackedRepos()
+	require.Len(tracked, 2,
+		"renamed repo and route successor, no synthetic duplicate")
+	byName := make(map[string]ghclient.RepoRef, len(tracked))
+	for _, repo := range tracked {
+		byName[repo.Name] = repo
+	}
+	assert.Equal("repo-x", byName["widget-next"].PlatformExternalID)
+	assert.Equal("acme/widget", byName["widget-next"].ConfiguredRepoPath,
+		"the renamed repo keeps the exact entry's provenance through the"+
+			" API refresh and the failed reload")
+	assert.Equal("repo-y", byName["widget"].PlatformExternalID)
+	assert.Empty(byName["widget"].ConfiguredRepoPath,
+		"the route successor must not claim the exact entry")
 }
 
 func TestConfigReload_GlobFailureKeepsPreviouslyTrackedMatches(t *testing.T) {

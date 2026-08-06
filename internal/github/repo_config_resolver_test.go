@@ -12,7 +12,7 @@ import (
 	"go.kenn.io/forge/internal/platform"
 )
 
-func TestResolveConfiguredRepos_ExpandsGlobAndSkipsArchived(t *testing.T) {
+func TestResolveConfiguredRepos_ExpandsGlobIncludingArchived(t *testing.T) {
 	assert := assert.New(t)
 	client := &mockClient{
 		listReposByOwnerFn: func(_ context.Context, owner string) ([]*gh.Repository, error) {
@@ -43,14 +43,159 @@ func TestResolveConfiguredRepos_ExpandsGlobAndSkipsArchived(t *testing.T) {
 	)
 
 	require.Len(t, result.Configured, 1)
+	assert.Equal(2, result.Configured[0].MatchedRepoCount)
+	assert.Equal([]RepoRef{
+		{
+			Platform:     platform.KindGitHub,
+			Owner:        "acme",
+			Name:         "widgets-api",
+			PlatformHost: "github.com",
+			RepoPath:     "acme/widgets-api",
+		},
+		{
+			Platform:     platform.KindGitHub,
+			Owner:        "acme",
+			Name:         "widgets-legacy",
+			PlatformHost: "github.com",
+			RepoPath:     "acme/widgets-legacy",
+			Archived:     true,
+		},
+	}, result.Expanded)
+}
+
+func TestResolveConfiguredRepos_AcceptsArchivedRepoAsArchiveOnly(t *testing.T) {
+	assert := assert.New(t)
+	client := &mockClient{
+		getRepositoryFn: func(
+			_ context.Context, owner, repo string,
+		) (*gh.Repository, error) {
+			return &gh.Repository{
+				Name:     new(repo),
+				Owner:    &gh.User{Login: new(owner)},
+				Archived: new(true),
+			}, nil
+		},
+	}
+
+	result := ResolveConfiguredRepos(
+		t.Context(),
+		map[string]Client{"github.com": client},
+		[]config.Repo{{Owner: "acme", Name: "widgets-legacy"}},
+	)
+
+	assert.Empty(result.Warnings)
+	require.Len(t, result.Configured, 1)
 	assert.Equal(1, result.Configured[0].MatchedRepoCount)
 	assert.Equal([]RepoRef{{
-		Platform:     platform.KindGitHub,
-		Owner:        "acme",
-		Name:         "widgets-api",
-		PlatformHost: "github.com",
-		RepoPath:     "acme/widgets-api",
+		Platform:           platform.KindGitHub,
+		Owner:              "acme",
+		Name:               "widgets-legacy",
+		PlatformHost:       "github.com",
+		RepoPath:           "acme/widgets-legacy",
+		Archived:           true,
+		ConfiguredRepoPath: "acme/widgets-legacy",
 	}}, result.Expanded)
+}
+
+func TestExpandedRepoSetPrefersResolvedOverFallbackDuplicates(t *testing.T) {
+	assert := assert.New(t)
+	fallback := RepoRef{
+		Platform: platform.KindGitHub, Owner: "acme", Name: "frozen",
+		PlatformHost: "github.com", RepoPath: "acme/frozen",
+	}
+	resolved := RepoRef{
+		Platform: platform.KindGitHub, Owner: "acme", Name: "frozen",
+		PlatformHost: "github.com", RepoPath: "acme/frozen",
+		PlatformExternalID: "repo-acme-frozen", Archived: true,
+	}
+
+	set := NewExpandedRepoSet()
+	set.Add(fallback, false)
+	set.Add(resolved, true)
+	assert.Equal([]RepoRef{resolved}, set.Refs(),
+		"a provider-resolved duplicate must replace fallback metadata")
+
+	// The reverse order keeps the resolved ref: fallback metadata never
+	// overwrites a successful resolution.
+	set = NewExpandedRepoSet()
+	set.Add(resolved, true)
+	set.Add(fallback, false)
+	assert.Equal([]RepoRef{resolved}, set.Refs())
+
+	// Same-class duplicates keep the first entry.
+	set = NewExpandedRepoSet()
+	set.Add(resolved, true)
+	other := resolved
+	other.Archived = false
+	set.Add(other, true)
+	assert.Equal([]RepoRef{resolved}, set.Refs())
+}
+
+func TestExpandedRepoSetReconcilesRenamedRouteByProviderIdentity(t *testing.T) {
+	assert := assert.New(t)
+	// A fallback ref keeps the old route of a renamed repo; the resolved
+	// duplicate arrives under the new route with the same stable provider
+	// id. Route-keyed dedup alone would track both and sync them twice.
+	fallback := RepoRef{
+		Platform: platform.KindGitHub, Owner: "acme", Name: "old-name",
+		PlatformHost: "github.com", RepoPath: "acme/old-name",
+		PlatformExternalID: "repo-x",
+	}
+	resolved := RepoRef{
+		Platform: platform.KindGitHub, Owner: "acme", Name: "new-name",
+		PlatformHost: "github.com", RepoPath: "acme/new-name",
+		PlatformExternalID: "repo-x", Archived: true,
+	}
+
+	set := NewExpandedRepoSet()
+	set.Add(fallback, false)
+	set.Add(resolved, true)
+	assert.Equal([]RepoRef{resolved}, set.Refs())
+
+	// The resolved route survives a later fallback under the old route.
+	set = NewExpandedRepoSet()
+	set.Add(resolved, true)
+	set.Add(fallback, false)
+	assert.Equal([]RepoRef{resolved}, set.Refs())
+}
+
+func TestExpandedRepoSetMergesExactProvenanceAcrossDuplicates(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	// The exact entry's fallback preserved a renamed tracked ref with its
+	// config-entry provenance; the overlapping glob resolves the same
+	// provider id without any (glob refs carry none). Whichever ref wins
+	// the slot, losing the exact provenance would leave the next failed
+	// reload unable to correlate the entry and synthesize a duplicate.
+	exactFallback := RepoRef{
+		Platform: platform.KindGitHub, Owner: "acme", Name: "tools-new",
+		PlatformHost: "github.com", RepoPath: "acme/tools-new",
+		PlatformExternalID: "repo-acme-tools",
+		ConfiguredRepoPath: "acme/tools", Archived: true,
+	}
+	resolvedGlob := RepoRef{
+		Platform: platform.KindGitHub, Owner: "acme", Name: "tools-new",
+		PlatformHost: "github.com", RepoPath: "acme/tools-new",
+		PlatformExternalID: "repo-acme-tools",
+		WebURL:             "https://github.com/acme/tools-new",
+		Archived:           true,
+	}
+
+	set := NewExpandedRepoSet()
+	set.Add(exactFallback, false)
+	set.Add(resolvedGlob, true)
+	refs := set.Refs()
+	require.Len(refs, 1)
+	assert.Equal("https://github.com/acme/tools-new", refs[0].WebURL)
+	assert.Equal("acme/tools", refs[0].ConfiguredRepoPath)
+
+	set = NewExpandedRepoSet()
+	set.Add(resolvedGlob, true)
+	set.Add(exactFallback, false)
+	refs = set.Refs()
+	require.Len(refs, 1)
+	assert.Equal("https://github.com/acme/tools-new", refs[0].WebURL)
+	assert.Equal("acme/tools", refs[0].ConfiguredRepoPath)
 }
 
 func TestResolveConfiguredRepos_DeduplicatesExactAndGlobMatches(t *testing.T) {
@@ -92,7 +237,7 @@ func TestResolveConfiguredRepos_DeduplicatesExactAndGlobMatches(t *testing.T) {
 
 	assert.Len(result.Expanded, 2)
 	assert.ElementsMatch([]RepoRef{
-		{Platform: platform.KindGitHub, Owner: "acme", Name: "widgets", PlatformHost: "github.com", RepoPath: "acme/widgets"},
+		{Platform: platform.KindGitHub, Owner: "acme", Name: "widgets", PlatformHost: "github.com", RepoPath: "acme/widgets", ConfiguredRepoPath: "acme/widgets"},
 		{Platform: platform.KindGitHub, Owner: "acme", Name: "widgets-api", PlatformHost: "github.com", RepoPath: "acme/widgets-api"},
 	}, result.Expanded)
 }
@@ -130,11 +275,12 @@ func TestResolveConfiguredRepos_DeduplicatesOwnerCase(t *testing.T) {
 	)
 
 	assert.Equal([]RepoRef{{
-		Platform:     platform.KindGitHub,
-		Owner:        "acme",
-		Name:         "widgets",
-		PlatformHost: "github.com",
-		RepoPath:     "acme/widgets",
+		Platform:           platform.KindGitHub,
+		Owner:              "acme",
+		Name:               "widgets",
+		PlatformHost:       "github.com",
+		RepoPath:           "acme/widgets",
+		ConfiguredRepoPath: "Acme/widgets",
 	}}, result.Expanded)
 }
 
@@ -159,11 +305,12 @@ func TestResolveConfiguredReposCasefoldsResolvedRepoRefs(t *testing.T) {
 	)
 
 	assert.Equal([]RepoRef{{
-		Platform:     platform.KindGitHub,
-		Owner:        "org",
-		Name:         "foo",
-		PlatformHost: "github.com",
-		RepoPath:     "org/foo",
+		Platform:           platform.KindGitHub,
+		Owner:              "org",
+		Name:               "foo",
+		PlatformHost:       "github.com",
+		RepoPath:           "org/foo",
+		ConfiguredRepoPath: "org/foo",
 	}}, result.Expanded)
 }
 
@@ -303,18 +450,20 @@ func TestResolveConfiguredReposKeepsDuplicateOwnerNameOnDifferentPlatforms(t *te
 	require.Empty(t, result.Warnings)
 	assert.ElementsMatch(t, []RepoRef{
 		{
-			Platform:     platform.KindGitHub,
-			PlatformHost: "code.example.com",
-			Owner:        "acme",
-			Name:         "widget",
-			RepoPath:     "acme/widget",
+			Platform:           platform.KindGitHub,
+			PlatformHost:       "code.example.com",
+			Owner:              "acme",
+			Name:               "widget",
+			RepoPath:           "acme/widget",
+			ConfiguredRepoPath: "acme/widget",
 		},
 		{
-			Platform:     platform.KindGitLab,
-			PlatformHost: "code.example.com",
-			Owner:        "acme",
-			Name:         "widget",
-			RepoPath:     "acme/widget",
+			Platform:           platform.KindGitLab,
+			PlatformHost:       "code.example.com",
+			Owner:              "acme",
+			Name:               "widget",
+			RepoPath:           "acme/widget",
+			ConfiguredRepoPath: "acme/widget",
 		},
 	}, result.Expanded)
 }
@@ -330,11 +479,12 @@ func TestFallbackConfiguredRepoRefsSynthesizesGitHubProvider(t *testing.T) {
 	})
 
 	assert.Equal([]RepoRef{{
-		Platform:     platform.KindGitHub,
-		PlatformHost: "code.example.com",
-		Owner:        "acme",
-		Name:         "widget",
-		RepoPath:     "Acme/Widget",
+		Platform:           platform.KindGitHub,
+		PlatformHost:       "code.example.com",
+		Owner:              "acme",
+		Name:               "widget",
+		RepoPath:           "Acme/Widget",
+		ConfiguredRepoPath: "Acme/Widget",
 	}}, got)
 }
 
@@ -370,6 +520,45 @@ func TestFallbackConfiguredRepoRefsPreservesProviderIdentity(t *testing.T) {
 	}}, got)
 }
 
+func TestRepoRefFromRepositoryStampsConfiguredRepoPath(t *testing.T) {
+	assert := assert.New(t)
+
+	ref := repoRefFromRepository(
+		config.Repo{Owner: "acme", Name: "tools"},
+		platform.KindGitHub, "github.com",
+		platform.Repository{
+			Ref: platform.RepoRef{
+				Owner: "acme", Name: "tools-new",
+				RepoPath: "acme/tools-new",
+			},
+			PlatformExternalID: "repo-acme-tools",
+		},
+	)
+
+	assert.Equal("acme/tools", ref.ConfiguredRepoPath)
+}
+
+func TestFallbackConfiguredRepoRefsMatchesRenamedRouteByConfiguredPath(t *testing.T) {
+	assert := assert.New(t)
+	renamed := RepoRef{
+		Platform:           platform.KindGitHub,
+		PlatformHost:       "github.com",
+		Owner:              "acme",
+		Name:               "tools-new",
+		RepoPath:           "acme/tools-new",
+		PlatformExternalID: "repo-acme-tools",
+		ConfiguredRepoPath: "acme/tools",
+		Archived:           true,
+	}
+
+	got := FallbackConfiguredRepoRefs([]RepoRef{renamed}, config.Repo{
+		Owner: "acme",
+		Name:  "tools",
+	})
+
+	assert.Equal([]RepoRef{renamed}, got)
+}
+
 func TestFallbackConfiguredRepoRefsSynthesizesNonGitHubProvider(t *testing.T) {
 	assert := assert.New(t)
 
@@ -380,11 +569,12 @@ func TestFallbackConfiguredRepoRefsSynthesizesNonGitHubProvider(t *testing.T) {
 	})
 
 	assert.Equal([]RepoRef{{
-		Platform:     platform.KindGitLab,
-		PlatformHost: "gitlab.com",
-		Owner:        "Acme/SubGroup",
-		Name:         "Widget",
-		RepoPath:     "Acme/SubGroup/Widget",
+		Platform:           platform.KindGitLab,
+		PlatformHost:       "gitlab.com",
+		Owner:              "Acme/SubGroup",
+		Name:               "Widget",
+		RepoPath:           "Acme/SubGroup/Widget",
+		ConfiguredRepoPath: "Acme/SubGroup/Widget",
 	}}, got)
 }
 
@@ -439,11 +629,12 @@ func TestResolveConfiguredReposWithRegistryUsesNonGitHubProvider(t *testing.T) {
 
 	require.Empty(t, result.Warnings)
 	assert.Equal(t, []RepoRef{{
-		Platform:     platform.KindGitLab,
-		PlatformHost: "gitlab.com",
-		Owner:        "acme/subgroup",
-		Name:         "widget",
-		RepoPath:     "acme/subgroup/widget",
+		Platform:           platform.KindGitLab,
+		PlatformHost:       "gitlab.com",
+		Owner:              "acme/subgroup",
+		Name:               "widget",
+		RepoPath:           "acme/subgroup/widget",
+		ConfiguredRepoPath: "acme/subgroup/widget",
 	}}, result.Expanded)
 }
 

@@ -261,6 +261,145 @@ fallback repository listing.
 ## Historical Archive Rules
 
 - The legacy closed-item backfill is retired; configured repositories seed durable archive discovery before sync cutover, with no cursor translation. (`internal/github/sync.go::SetReposWithContext`)
+- Provider-archived repositories are configurable and archive-only: resolution
+  accepts them (exact and glob) with `RepoRef.Archived` set, live sync skips
+  them — the bulk sync pass, notification polling, and watched-MR fast sync
+  alike — and archive discovery/hydration treat them like any configured repo.
+  Settings add/refresh merges apply freshly resolved metadata to
+  already-tracked refs, so an archived flip (either direction) takes effect
+  without a daemon restart even when exact and glob entries overlap.
+  (`internal/github/notifications_sync.go::SyncNotifications`,
+  `internal/github/sync.go::watchedMRsForFastSync`,
+  `internal/server/settings_handlers.go::mergeTrackedRepos`,
+  `internal/server/settings_handlers.go::replaceGlobRepos`)
+- Tracked-set deduplication reconciles by stable provider id when one is
+  present, falling back to the route key: a renamed route must collapse onto
+  the same tracked entry, never sync or archive-seed the repository twice.
+  Provider-resolved refs replace fallback-derived duplicates; fallback refs
+  never overwrite resolved ones. (`internal/github/repo_config_resolver.go::ExpandedRepoSet`,
+  `internal/server/settings_handlers.go::trackedRepoIndex`)
+- Exact-resolved refs record the config-entry path they came from
+  (`RepoRef.ConfiguredRepoPath`); glob refs carry none — a pattern identifies
+  no single entry, and stamping it would displace exact provenance on
+  deduplicated overlaps. Tracked-set deduplication merges provenance across
+  duplicates in both directions, catalog republication preserves it, and
+  publication never overwrites the currently tracked value: config resolution
+  is the only author. When an exact entry cannot resolve, the fallback matches
+  previously tracked refs by that provenance before the route path: a
+  provider-side rename moves the tracked route away from the configured path,
+  and without the provenance match the fallback would synthesize an
+  identity-less live ref — dropping the archived flag and duplicating the
+  repository next to a resolved overlapping entry. Settings merges preserve
+  tracked provenance the same way (settings-resolved refs never author it),
+  but route-keyed recovery refuses to cross conflicting stable provider ids:
+  a route reused by a different repository must not inherit the displaced
+  repository's provenance, or two refs would claim the same config entry.
+  Startup — which has no tracked set — recovers a failed exact entry's
+  stable identity through catalog route history before synthesizing, and
+  registers the repo credential alias for the recovered route so repo-scoped
+  credentials do not fall through to owner or host routes. Config-entry
+  matching (glob refresh, entry removal) honors provenance the same way — a
+  renamed repo still belongs to its exact entry, scoped to the entry's
+  provider and host since the same path can be configured on several — and
+  removal clears provenance whose entry no longer exists, so a stale claim
+  cannot bind a future entry with the same path to the wrong repository.
+  Publications locate their tracked slot by stable identity first, keyed on
+  the resolved id: the provider response says whose data this is, so a
+  lookup through a reused route lands on the tracked successor, never on
+  the repository the snapshot named. The route fallback may displace the
+  snapshot's own entry — configured-route reuse replaces the occupant and
+  the archive lifecycle pauses the old repository — but never an entry
+  whose id conflicts with the snapshot. When the resolved id differs from
+  the snapshot's — or from the landed slot's, which matters when the
+  snapshot carries no id — the data belongs to a different repository than
+  the flags describe, so the snapshot's archived flag is meaningless:
+  authoritative resolved metadata applies, and only a non-authoritative
+  publication preserves tracked state.
+  (`internal/github/repo_config_resolver.go::FallbackConfiguredRepoRefs`,
+  `internal/github/repo_config_resolver.go::ExpandedRepoSet`,
+  `internal/github/sync.go::repoRefFromCatalog`,
+  `internal/github/sync.go::publishResolvedRepository`,
+  `internal/server/settings_handlers.go::trackedRepoProvenance`,
+  `cmd/kenn-forge/main.go::fallbackExactFromDB`)
+- Catalog republication without fresh provider metadata preserves the
+  currently tracked archived flag: a sync that began before a newer archived
+  flip must not clear it when its own snapshot predates the flip. When the
+  tracked flag differs from the operation's snapshot, a concurrent resolution
+  flipped it mid-flight — ordering against the in-flight provider response is
+  unknowable, so the newer tracked value stands even over fresh provider
+  metadata. (`internal/github/sync.go::publishResolvedRepository`)
+  Archived state refreshes wherever resolution already happens (startup,
+  config reload, settings add/refresh) and must survive catalog
+  republication, which cannot read it from the store. Archived inclusion in
+  repository listings is an explicit request
+  (`RepositoryListOptions.IncludeArchived`): configuration expansion sets it
+  so GitLab globs match archived projects like GitHub globs do, while
+  default listings — import previews and the repo-import handler — keep
+  GitLab's server-side `archived=false` filter, which runs before any
+  listing limit so archived projects cannot crowd live ones out of a
+  bounded preview. (`internal/github/repo_config_resolver.go::resolveConfiguredRepo`,
+  `internal/platform/gitlab/client.go::ListRepositories`,
+  `internal/github/sync.go::repoRefFromCatalog`)
+- Archived state transitions are observed during normal sync passes, not
+  only at resolution sites: each pass reconciles archived tracked refs with
+  metadata-only identity resolution, so an upstream unarchive returns the
+  repository to live syncing without a restart or reload, while refs still
+  archived (or whose refresh fails) stay excluded. The refresh honors the
+  same credential-bucket eligibility that gates dispatch — a throttled,
+  reserve-exhausted, or next-sync-deferred bucket defers its archived
+  refreshes without a provider call, so they cannot spend essential sync
+  budget a live repository's dispatch would be denied. An attempted archived
+  refresh also advances the bucket's next-sync cadence gate — including for
+  buckets holding only archived repositories, which drop out of the pass
+  before dispatch eligibility is computed — so the refresh honors the
+  bucket's throttle factor instead of rerunning every base interval. The
+  refresh registers provider work like a live repo sync, so an admitted
+  archive request on the same credential is preempted rather than
+  overlapping it. In the other direction, a live repository whose in-pass
+  identity resolution reports archived stops before any clone, overview,
+  label, or item syncing — the publication has already flipped the tracked
+  flag, and the pass must not sync an archived repository's content on the
+  way out. Identity resolution returns the ref the publication actually
+  stored, not its own snapshot: when the publication kept a newer tracked
+  archived flip over the operation's metadata, the caller deciding whether
+  to keep syncing must see the published value. Follow-on detail work
+  honors the flip too: the detail drain skips queue items whose tracked or
+  freshly resolved ref is archived — the queue was built before the pass
+  observed the transition — and per-item MR/issue syncing stops on an
+  archived resolve except under the archive sync budget, which is exactly
+  the hydration path archived repositories rely on.
+  (`internal/github/sync.go::reconcileArchivedRepos`,
+  `internal/github/sync.go::syncRepo`,
+  `internal/github/sync.go::reconcileRepoIdentity`,
+  `internal/github/sync.go::drainDetailQueue`,
+  `internal/github/sync.go::syncMRForRepo`,
+  `internal/github/sync.go::syncIssueForRepo`)
+- Archive seeding degrades per repository: a ref that fails validation,
+  provider resolution, or catalog reconciliation is logged with its identity
+  and skipped, never fatal — one bad configured entry must not crash-loop the
+  daemon at startup. Only batch reconciliation errors (a broken store)
+  propagate. Refs skipped by seeding are excluded from authentication retry
+  so they cannot fail a config reload.
+  (`internal/archive/service.go::EnsureConfigured`,
+  `internal/github/sync.go::SetReposWithContext`)
+- Removal pausing (`configuration_removed`) requires a complete picture: when
+  any configured ref fails seeding without a known repository row, the pass
+  ensures discovery archives but defers the pausing side entirely — an
+  incomplete protection list could pause the wrong repository's archive
+  (renamed owners resolve to rows under other identities). A ref that failed
+  after its row was identified stays protected without deferring the pass.
+  While an unresolvable ref persists in config, genuinely removed repos keep
+  collecting; the recurring deferral warning is the operator signal.
+  (`internal/archive/service.go::EnsureConfigured`)
+- The archive worker poll resolves configured repositories tolerantly: a ref
+  that seeding skipped stays in the syncer's tracked set, so an all-or-nothing
+  resolve would fail every one-second pass and starve archive work for all
+  healthy repositories. Only provider-classified failures (invalid ref,
+  provider not configured, missing capability) are dropped as
+  repository-scoped (debug-logged; seeding already warned); a broken store or
+  any other infrastructure error still surfaces — an empty pass reported as
+  success would hide a dead worker. (`internal/archive/scheduler.go::RunEligible`,
+  `internal/archive/service.go::resolveRepositoriesTolerant`)
 - Initial issue and pull-request inventory includes all states in stable created-time ascending order; issue enumeration excludes PR-shaped rows. (`internal/github/pages.go::ListIssuesPage`, `internal/github/pages.go::ListMergeRequestsPage`)
 - Every issue-only GitHub lookup rejects a PR-shaped Issues API response before normalization; `SyncItemByNumber` is the kind-dispatching exception. (`internal/github/pages.go::gitHubClientProvider.issuePullRequestOutcomeError`, `internal/github/sync.go::SyncItemByNumber`)
 - Updated issue scans query one second before the durable watermark while keeping cursor identity bound to the original boundary. Updated pull-request scans run newest-first across the same overlap. (`internal/github/pages.go::ListIssuesPage`, `internal/github/pages.go::ListMergeRequestsPage`)

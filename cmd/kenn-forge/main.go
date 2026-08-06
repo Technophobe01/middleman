@@ -748,8 +748,7 @@ func resolveStartupRepos(
 	database *db.DB,
 	githubRouters map[string]*ghclient.HostRouter,
 ) []ghclient.RepoRef {
-	seen := make(map[string]struct{})
-	repos := make([]ghclient.RepoRef, 0, len(cfg.Repos))
+	set := ghclient.NewExpandedRepoSet()
 	for _, raw := range cfg.Repos {
 		_, expanded, err := ghclient.ResolveConfiguredRepoWithRegistry(
 			ctx, registry, raw,
@@ -761,7 +760,18 @@ func resolveStartupRepos(
 					ctx, database, raw,
 				)
 			} else {
-				expanded = ghclient.FallbackConfiguredRepoRefs(nil, raw)
+				expanded = fallbackExactFromDB(ctx, database, raw)
+				if len(expanded) == 0 {
+					expanded = ghclient.FallbackConfiguredRepoRefs(nil, raw)
+				} else {
+					// The catalog recovered a stable identity on a renamed
+					// route; without the alias, repo-scoped credentials for
+					// the configured route would fall through to owner or
+					// host credentials.
+					ghclient.RegisterConfiguredRepoCredentialAliases(
+						githubRouters, raw, expanded,
+					)
+				}
 			}
 		} else {
 			ghclient.RegisterConfiguredRepoCredentialAliases(
@@ -769,18 +779,10 @@ func resolveStartupRepos(
 			)
 		}
 		for _, repo := range expanded {
-			key := string(repoPlatform(repo)) + "\x00" +
-				strings.ToLower(repoHost(repo)) + "\x00" +
-				strings.ToLower(repo.Owner) + "\x00" +
-				strings.ToLower(repo.Name)
-			if _, ok := seen[key]; ok {
-				continue
-			}
-			seen[key] = struct{}{}
-			repos = append(repos, repo)
+			set.Add(repo, err == nil)
 		}
 	}
-	return repos
+	return set.Refs()
 }
 
 func providerHostKey(platformName, host string) string {
@@ -795,21 +797,69 @@ func splitProviderHostKey(key string) (string, string) {
 	return platformName, host
 }
 
-func repoPlatform(repo ghclient.RepoRef) platform.Kind {
-	if repo.Platform != "" {
-		return repo.Platform
+// fallbackExactFromDB recovers the stored identity for an exact config
+// entry whose provider resolution failed at startup. Catalog route history
+// follows a provider-side rename, so the fallback keeps the stable provider
+// id — deduplicating against overlapping resolved entries — instead of
+// synthesizing an identity-less ref under the stale configured route.
+func fallbackExactFromDB(
+	ctx context.Context,
+	database *db.DB,
+	raw config.Repo,
+) []ghclient.RepoRef {
+	if database == nil {
+		return nil
 	}
-	return platform.KindGitHub
+	repoPath := strings.TrimSpace(raw.RepoPath)
+	if repoPath == "" {
+		repoPath = raw.Owner + "/" + raw.Name
+	}
+	entries, err := database.ListRepositoryCatalog(ctx, db.RepositoryCatalogFilter{
+		Platform:     raw.PlatformOrDefault(),
+		PlatformHost: raw.PlatformHostOrDefault(),
+		RepoPath:     repoPath,
+		Lifecycle:    db.RepositoryLifecycleActive,
+	})
+	if err != nil {
+		slog.Warn("fallback exact from db", "err", err)
+		return nil
+	}
+	entry := catalogEntryForConfiguredRoute(entries, repoPath)
+	if entry == nil {
+		return nil
+	}
+	return []ghclient.RepoRef{{
+		Platform:           platform.Kind(raw.PlatformOrDefault()),
+		Owner:              entry.Repository.Owner,
+		Name:               entry.Repository.Name,
+		PlatformHost:       entry.Repository.PlatformHost,
+		RepoPath:           entry.Repository.RepoPath,
+		PlatformExternalID: entry.Repository.PlatformRepoID,
+		WebURL:             entry.Repository.WebURL,
+		CloneURL:           entry.Repository.CloneURL,
+		DefaultBranch:      entry.Repository.DefaultBranch,
+		ConfiguredRepoPath: repoPath,
+	}}
 }
 
-func repoHost(repo ghclient.RepoRef) string {
-	if repo.PlatformHost != "" {
-		return strings.ToLower(repo.PlatformHost)
+// catalogEntryForConfiguredRoute prefers the repository currently occupying
+// the configured route; a reused route may also historically match the
+// renamed repository that held it before. Multiple historical matches with
+// no current occupant cannot be attributed safely.
+func catalogEntryForConfiguredRoute(
+	entries []db.RepositoryCatalogEntry, repoPath string,
+) *db.RepositoryCatalogEntry {
+	for i := range entries {
+		for _, route := range entries[i].Routes {
+			if route.Current && strings.EqualFold(route.RepoPath, repoPath) {
+				return &entries[i]
+			}
+		}
 	}
-	if host, ok := platform.DefaultHost(repoPlatform(repo)); ok {
-		return host
+	if len(entries) == 1 {
+		return &entries[0]
 	}
-	return platform.DefaultGitHubHost
+	return nil
 }
 
 // fallbackGlobFromDB returns repos from the database that match

@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -450,7 +451,11 @@ func TestHandleUpdateSettingsPublishesPullConfigOnlyAfterPersistence(t *testing.
 	require.Equal(http.StatusOK, rr.Code, rr.Body.String())
 	require.True(srv.pullAPI.ConfigSnapshot().AllowMidStackMerges)
 
+	// Swapped under the reload lock: the config watcher goroutine reads
+	// cfgPath under configReloadMu.
+	srv.configReloadMu.Lock()
 	srv.cfgPath = t.TempDir()
+	srv.configReloadMu.Unlock()
 	disabled := config.PullRequests{AllowMidStackMerges: false}
 	rr = doJSON(t, srv, http.MethodPut, "/api/v1/settings", updateSettingsRequest{
 		PullRequests: &disabled,
@@ -794,6 +799,433 @@ func TestHandleAddRepo(t *testing.T) {
 	require.Len(t, cfg2.Repos, 2)
 }
 
+func TestHandleAddRepoAcceptsArchivedRepo(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	mock := &mockGH{
+		getRepositoryFn: func(
+			_ context.Context, owner, repo string,
+		) (*gh.Repository, error) {
+			return &gh.Repository{
+				Name:     new(repo),
+				Owner:    &gh.User{Login: new(owner)},
+				Archived: new(true),
+			}, nil
+		},
+	}
+	srv, _, cfgPath := setupTestServerWithConfigContent(t, `
+sync_interval = "5m"
+github_token_env = "KENN_FORGE_GITHUB_TOKEN"
+host = "127.0.0.1"
+port = 8091
+
+[[repos]]
+owner = "acme"
+name = "widget"
+`, mock)
+
+	rr := doJSON(t, srv, http.MethodPost, "/api/v1/repos", map[string]string{
+		"provider": "github",
+		"host":     "github.com",
+		"owner":    "other-org",
+		"name":     "frozen",
+	})
+	require.Equal(http.StatusCreated, rr.Code, rr.Body.String())
+
+	cfg2, err := config.Load(cfgPath)
+	require.NoError(err)
+	require.Len(cfg2.Repos, 2)
+	assert.True(srv.syncer.IsTrackedRepo("other-org", "frozen"),
+		"archived repo is tracked archive-only after add")
+}
+
+func TestHandleAddRepoRefreshesArchivedStateForTrackedRepo(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	archivedNow := atomic.Bool{}
+	mock := &mockGH{
+		getRepositoryFn: func(
+			_ context.Context, owner, repo string,
+		) (*gh.Repository, error) {
+			return &gh.Repository{
+				Name:     new(repo),
+				Owner:    &gh.User{Login: new(owner)},
+				Archived: new(archivedNow.Load()),
+			}, nil
+		},
+		listReposByOwnerFn: func(
+			_ context.Context, owner string,
+		) ([]*gh.Repository, error) {
+			return []*gh.Repository{{
+				Name:     new("widget"),
+				Owner:    &gh.User{Login: new(owner)},
+				Archived: new(archivedNow.Load()),
+			}}, nil
+		},
+	}
+	srv, _, _ := setupTestServerWithConfigContent(t, `
+sync_interval = "5m"
+github_token_env = "KENN_FORGE_GITHUB_TOKEN"
+host = "127.0.0.1"
+port = 8091
+
+[[repos]]
+owner = "acme"
+name = "*"
+`, mock)
+	require.True(srv.syncer.IsTrackedRepo("acme", "widget"))
+
+	// The repo gets archived on the provider; adding an overlapping exact
+	// entry must refresh the tracked ref, not keep the stale live one.
+	archivedNow.Store(true)
+	rr := doJSON(t, srv, http.MethodPost, "/api/v1/repos", map[string]string{
+		"provider": "github",
+		"host":     "github.com",
+		"owner":    "acme",
+		"name":     "widget",
+	})
+	require.Equal(http.StatusCreated, rr.Code, rr.Body.String())
+
+	assert.True(trackedRepoArchived(srv, "acme", "widget"),
+		"overlapping add must apply fresh archived state")
+}
+
+func TestHandleRefreshRepoUpdatesArchivedStateForOverlappingEntries(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	archivedNow := atomic.Bool{}
+	mock := &mockGH{
+		getRepositoryFn: func(
+			_ context.Context, owner, repo string,
+		) (*gh.Repository, error) {
+			return &gh.Repository{
+				Name:     new(repo),
+				Owner:    &gh.User{Login: new(owner)},
+				Archived: new(archivedNow.Load()),
+			}, nil
+		},
+		listReposByOwnerFn: func(
+			_ context.Context, owner string,
+		) ([]*gh.Repository, error) {
+			return []*gh.Repository{{
+				Name:     new("widget"),
+				Owner:    &gh.User{Login: new(owner)},
+				Archived: new(archivedNow.Load()),
+			}}, nil
+		},
+	}
+	srv, _, _ := setupTestServerWithConfigContent(t, `
+sync_interval = "5m"
+github_token_env = "KENN_FORGE_GITHUB_TOKEN"
+host = "127.0.0.1"
+port = 8091
+
+[[repos]]
+owner = "acme"
+name = "widget"
+
+[[repos]]
+owner = "acme"
+name = "*"
+`, mock)
+	require.True(srv.syncer.IsTrackedRepo("acme", "widget"))
+	require.False(trackedRepoArchived(srv, "acme", "widget"))
+
+	// widget matches both the exact entry and the glob; a refresh after the
+	// provider archives it must update the tracked ref even though the
+	// exact entry keeps it in the tracked set.
+	archivedNow.Store(true)
+	rr := doJSON(
+		t, srv, http.MethodPost,
+		"/api/v1/repo/gh/acme/*/refresh", nil,
+	)
+	require.Equal(http.StatusOK, rr.Code, rr.Body.String())
+
+	assert.True(trackedRepoArchived(srv, "acme", "widget"),
+		"glob refresh must apply fresh archived state to overlapping repos")
+	assert.Equal("acme/widget", trackedRepoProvenancePath(srv, "acme", "widget"),
+		"glob refresh through the API must keep the exact entry's provenance")
+}
+
+func trackedRepoProvenancePath(srv *Server, owner, name string) string {
+	for _, repo := range srv.syncer.TrackedRepos() {
+		if strings.EqualFold(repo.Owner, owner) && strings.EqualFold(repo.Name, name) {
+			return repo.ConfiguredRepoPath
+		}
+	}
+	return ""
+}
+
+func TestHandleRefreshRepoStopsLiveLanesForArchivedRepo(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	archivedNow := atomic.Bool{}
+	var listedRepos sync.Map
+	var detailRepos sync.Map
+	detailErr := errors.New("detail fetch short-circuited")
+	mock := &mockGH{
+		getPullRequestIfChangedFn: func(
+			_ context.Context, _, repo string, _ int, _ string,
+		) (*gh.PullRequest, string, bool, error) {
+			detailRepos.Store(repo, true)
+			return nil, "", false, detailErr
+		},
+		getPullRequestFn: func(
+			_ context.Context, _, repo string, _ int,
+		) (*gh.PullRequest, error) {
+			detailRepos.Store(repo, true)
+			return nil, detailErr
+		},
+		getRepositoryFn: func(
+			_ context.Context, owner, repo string,
+		) (*gh.Repository, error) {
+			return &gh.Repository{
+				NodeID:   new("repo-acme-" + repo),
+				Name:     new(repo),
+				Owner:    &gh.User{Login: new(owner)},
+				Archived: new(repo == "widget" && archivedNow.Load()),
+			}, nil
+		},
+		listReposByOwnerFn: func(
+			_ context.Context, owner string,
+		) ([]*gh.Repository, error) {
+			return []*gh.Repository{
+				{
+					NodeID:   new("repo-acme-widget"),
+					Name:     new("widget"),
+					Owner:    &gh.User{Login: new(owner)},
+					Archived: new(archivedNow.Load()),
+				},
+				{
+					NodeID:   new("repo-acme-tools"),
+					Name:     new("tools"),
+					Owner:    &gh.User{Login: new(owner)},
+					Archived: new(false),
+				},
+			}, nil
+		},
+		listNotificationsFn: func(
+			_ context.Context, opts ghclient.NotificationListOptions,
+		) ([]ghclient.NotificationThread, bool, error) {
+			if opts.RepoName != "" {
+				listedRepos.Store(opts.RepoName, true)
+			}
+			return nil, false, nil
+		},
+	}
+	srv, database, _ := setupTestServerWithConfigContent(t, `
+sync_interval = "5m"
+github_token_env = "KENN_FORGE_GITHUB_TOKEN"
+host = "127.0.0.1"
+port = 8091
+
+[[repos]]
+owner = "acme"
+name = "widget"
+
+[[repos]]
+owner = "acme"
+name = "*"
+`, mock)
+	recentActivity := time.Now().UTC().Add(-10 * time.Minute)
+	for i, name := range []string{"widget", "tools"} {
+		repoID, err := database.UpsertRepo(t.Context(), db.RepoIdentity{
+			Platform: "github", PlatformHost: "github.com",
+			PlatformRepoID: "repo-acme-" + name, Owner: "acme", Name: name,
+		})
+		require.NoError(err)
+		_, err = database.UpsertMergeRequest(t.Context(), &db.MergeRequest{
+			RepoID: repoID, PlatformID: int64(i + 1), Number: i + 1,
+			Title: "PR", Author: "octo", State: db.MergeRequestStateOpen,
+			HeadBranch: "feature", BaseBranch: "main",
+			CreatedAt: recentActivity.Add(-24 * time.Hour),
+			UpdatedAt: recentActivity, LastActivityAt: recentActivity,
+		})
+		require.NoError(err)
+	}
+	srv.syncer.SetActiveMRWindow(4 * time.Hour)
+	require.True(srv.syncer.IsTrackedRepo("acme", "widget"))
+	// Stop background sync loops so the refresh-triggered async full sync
+	// cannot populate the lane recorders; each lane runs synchronously below.
+	srv.syncer.Stop()
+
+	// The provider archives widget; the refresh applies the transition and
+	// the live lanes must stop touching it while the live sibling keeps
+	// syncing.
+	archivedNow.Store(true)
+	rr := doJSON(
+		t, srv, http.MethodPost,
+		"/api/v1/repo/gh/acme/*/refresh", nil,
+	)
+	require.Equal(http.StatusOK, rr.Code, rr.Body.String())
+	require.True(trackedRepoArchived(srv, "acme", "widget"))
+
+	require.NoError(srv.syncer.SyncNotifications(t.Context()))
+	_, listedTools := listedRepos.Load("tools")
+	assert.True(listedTools, "live repo notifications should sync")
+	_, listedWidget := listedRepos.Load("widget")
+	assert.False(listedWidget,
+		"archived repo must not receive notification polling after refresh")
+
+	// Clear anything recorded by earlier phases so the assertions below
+	// reflect the watched-MR lane exclusively.
+	detailRepos.Range(func(key, _ any) bool {
+		detailRepos.Delete(key)
+		return true
+	})
+	srv.syncer.SyncWatchedMRs(t.Context())
+	_, detailTools := detailRepos.Load("tools")
+	assert.True(detailTools, "live repo open MR should fast-sync")
+	_, detailWidget := detailRepos.Load("widget")
+	assert.False(detailWidget,
+		"archived repo open MRs must not enter fast sync after refresh")
+}
+
+func TestMergeTrackedReposReconcilesRenamedRouteByProviderIdentity(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	srv, _, _ := setupTestServerWithConfig(t)
+	srv.syncer.SetRepos([]ghclient.RepoRef{{
+		Platform: platform.KindGitHub, Owner: "acme", Name: "old-name",
+		PlatformHost: "github.com", RepoPath: "acme/old-name",
+		PlatformExternalID: "repo-x",
+	}})
+
+	// The same stable provider id resolves under a renamed route: the
+	// tracked set must reconcile to one entry, not sync both routes.
+	srv.mergeTrackedRepos([]ghclient.RepoRef{{
+		Platform: platform.KindGitHub, Owner: "acme", Name: "new-name",
+		PlatformHost: "github.com", RepoPath: "acme/new-name",
+		PlatformExternalID: "repo-x", Archived: true,
+	}})
+
+	tracked := srv.syncer.TrackedRepos()
+	require.Len(tracked, 1)
+	assert.Equal("new-name", tracked[0].Name)
+	assert.True(tracked[0].Archived)
+}
+
+func TestMergeTrackedReposPreservesExactEntryProvenance(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	srv, _, _ := setupTestServerWithConfig(t)
+	srv.syncer.SetRepos([]ghclient.RepoRef{{
+		Platform: platform.KindGitHub, Owner: "acme", Name: "tools-new",
+		PlatformHost: "github.com", RepoPath: "acme/tools-new",
+		PlatformExternalID: "repo-x", ConfiguredRepoPath: "acme/tools",
+	}})
+
+	// A settings-resolved duplicate (glob refresh, API add) carries no
+	// config-entry provenance; replacing the tracked ref must not erase
+	// the correlation the exact entry needs on the next failed reload.
+	srv.mergeTrackedRepos([]ghclient.RepoRef{{
+		Platform: platform.KindGitHub, Owner: "acme", Name: "tools-new",
+		PlatformHost: "github.com", RepoPath: "acme/tools-new",
+		PlatformExternalID: "repo-x", Archived: true,
+	}})
+
+	tracked := srv.syncer.TrackedRepos()
+	require.Len(tracked, 1)
+	assert.True(tracked[0].Archived)
+	assert.Equal("acme/tools", tracked[0].ConfiguredRepoPath)
+}
+
+func TestMergeTrackedReposDoesNotTransferProvenanceAcrossProviderIdentities(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	srv, _, _ := setupTestServerWithConfig(t)
+	srv.syncer.SetRepos([]ghclient.RepoRef{{
+		Platform: platform.KindGitHub, Owner: "acme", Name: "tools",
+		PlatformHost: "github.com", RepoPath: "acme/tools",
+		PlatformExternalID: "repo-x", ConfiguredRepoPath: "acme/tools",
+	}})
+
+	// The tracked repo was renamed away and its old route reused by a
+	// different repository. The renamed repo keeps its provenance through
+	// stable identity; the route successor must not inherit it — two refs
+	// claiming the same config entry would make a later fallback pick
+	// whichever it sees first.
+	srv.mergeTrackedRepos([]ghclient.RepoRef{
+		{
+			Platform: platform.KindGitHub, Owner: "acme", Name: "tools-new",
+			PlatformHost: "github.com", RepoPath: "acme/tools-new",
+			PlatformExternalID: "repo-x",
+		},
+		{
+			Platform: platform.KindGitHub, Owner: "acme", Name: "tools",
+			PlatformHost: "github.com", RepoPath: "acme/tools",
+			PlatformExternalID: "repo-y",
+		},
+	})
+
+	tracked := srv.syncer.TrackedRepos()
+	require.Len(tracked, 2)
+	byName := make(map[string]ghclient.RepoRef, len(tracked))
+	for _, repo := range tracked {
+		byName[repo.Name] = repo
+	}
+	assert.Equal("acme/tools", byName["tools-new"].ConfiguredRepoPath,
+		"stable identity carries provenance through the rename")
+	assert.Empty(byName["tools"].ConfiguredRepoPath,
+		"a different repository reusing the route must not inherit provenance")
+}
+
+func TestMergeTrackedReposTreatsCaseDifferingProviderIdsAsDistinct(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	srv, _, _ := setupTestServerWithConfig(t)
+	srv.syncer.SetRepos([]ghclient.RepoRef{{
+		Platform: platform.KindGitHub, Owner: "acme", Name: "tools",
+		PlatformHost: "github.com", RepoPath: "acme/tools",
+		PlatformExternalID: "repo-X", ConfiguredRepoPath: "acme/tools",
+	}})
+
+	// Provider ids are opaque, case-sensitive identities (identity keys
+	// compare them exactly); a case-only difference is a different
+	// repository and must not inherit route provenance.
+	srv.mergeTrackedRepos([]ghclient.RepoRef{{
+		Platform: platform.KindGitHub, Owner: "acme", Name: "tools",
+		PlatformHost: "github.com", RepoPath: "acme/tools",
+		PlatformExternalID: "repo-x",
+	}})
+
+	tracked := srv.syncer.TrackedRepos()
+	require.Len(tracked, 1)
+	assert.Empty(tracked[0].ConfiguredRepoPath)
+}
+
+func TestReplaceGlobReposPreservesExactEntryProvenance(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	srv, _, _ := setupTestServerWithConfig(t)
+	srv.syncer.SetRepos([]ghclient.RepoRef{{
+		Platform: platform.KindGitHub, Owner: "acme", Name: "tools-new",
+		PlatformHost: "github.com", RepoPath: "acme/tools-new",
+		PlatformExternalID: "repo-x", ConfiguredRepoPath: "acme/tools",
+	}})
+
+	glob := config.Repo{Owner: "acme", Name: "*"}
+	srv.replaceGlobRepos(glob, []ghclient.RepoRef{{
+		Platform: platform.KindGitHub, Owner: "acme", Name: "tools-new",
+		PlatformHost: "github.com", RepoPath: "acme/tools-new",
+		PlatformExternalID: "repo-x", Archived: true,
+	}}, []config.Repo{{Owner: "acme", Name: "tools"}, glob})
+
+	tracked := srv.syncer.TrackedRepos()
+	require.Len(tracked, 1)
+	assert.True(tracked[0].Archived)
+	assert.Equal("acme/tools", tracked[0].ConfiguredRepoPath)
+}
+
+func trackedRepoArchived(srv *Server, owner, name string) bool {
+	for _, repo := range srv.syncer.TrackedRepos() {
+		if strings.EqualFold(repo.Owner, owner) && strings.EqualFold(repo.Name, name) {
+			return repo.Archived
+		}
+	}
+	return false
+}
+
 func TestHandleAddRepoTriggersImmediateSyncDuringCooldown(t *testing.T) {
 	require := require.New(t)
 
@@ -1085,7 +1517,8 @@ name = "*"
 	assert.Equal("roborev-dev", resp.Repos[0].Owner)
 	assert.Equal("*", resp.Repos[0].Name)
 	assert.True(resp.Repos[0].IsGlob)
-	assert.Equal(2, resp.Repos[0].MatchedRepoCount)
+	assert.Equal(3, resp.Repos[0].MatchedRepoCount,
+		"archived repos count as archive-only glob matches")
 }
 
 func TestHandleRefreshRepoRebuildsExpandedSyncSet(t *testing.T) {
@@ -1133,10 +1566,11 @@ name = "*"
 
 	var resp settingsResponse
 	require.NoError(json.NewDecoder(rr.Body).Decode(&resp))
-	require.Equal(2, resp.Repos[0].MatchedRepoCount)
+	require.Equal(3, resp.Repos[0].MatchedRepoCount)
 	assert.True(srv.syncer.IsTrackedRepo("roborev-dev", "kenn-forge"))
 	assert.True(srv.syncer.IsTrackedRepo("roborev-dev", "globber"))
-	assert.False(srv.syncer.IsTrackedRepo("roborev-dev", "archived"))
+	assert.True(srv.syncer.IsTrackedRepo("roborev-dev", "archived"),
+		"archived repos stay tracked as archive-only")
 }
 
 func TestHandleRefreshRepoPersistsExpandedReposBeforeAsyncSync(t *testing.T) {
@@ -1202,7 +1636,7 @@ name = "*"
 			names = append(names, repo.Name)
 		}
 	}
-	assert.ElementsMatch([]string{"kenn-forge", "review-bot"}, names)
+	assert.ElementsMatch([]string{"kenn-forge", "archived", "review-bot"}, names)
 }
 
 func TestHandleRefreshRepoKeepsReposMatchedByOtherConfigEntries(t *testing.T) {
@@ -1303,6 +1737,235 @@ name = "tools"
 	require.Equal(t, http.StatusNoContent, rr.Code, rr.Body.String())
 	assert.True(t, srv.syncer.IsTrackedRepo("roborev-dev", "tools"))
 	assert.False(t, srv.syncer.IsTrackedRepo("roborev-dev", "kenn-forge"))
+}
+
+func TestHandleDeleteGlobKeepsRenamedExactEntryRepo(t *testing.T) {
+	mock := &mockGH{
+		getRepositoryFn: func(
+			_ context.Context, owner, repo string,
+		) (*gh.Repository, error) {
+			return &gh.Repository{
+				Name:  new(repo),
+				Owner: &gh.User{Login: new(owner)},
+			}, nil
+		},
+		listReposByOwnerFn: func(
+			_ context.Context, owner string,
+		) ([]*gh.Repository, error) {
+			return []*gh.Repository{{
+				Name:  new("tools"),
+				Owner: &gh.User{Login: new(owner)},
+			}}, nil
+		},
+	}
+	srv, _, _ := setupTestServerWithConfigContent(t, `
+sync_interval = "5m"
+github_token_env = "KENN_FORGE_GITHUB_TOKEN"
+host = "127.0.0.1"
+port = 8091
+
+[[repos]]
+owner = "acme"
+name = "tools"
+
+[[repos]]
+owner = "acme"
+name = "*"
+`, mock)
+
+	// The exact entry's repo was renamed provider-side; only provenance
+	// still ties the tracked ref to the entry. A second repo matches only
+	// the glob.
+	srv.syncer.SetRepos([]ghclient.RepoRef{
+		{
+			Platform: platform.KindGitHub, Owner: "acme", Name: "tools-new",
+			PlatformHost: "github.com", RepoPath: "acme/tools-new",
+			PlatformExternalID: "repo-x", ConfiguredRepoPath: "acme/tools",
+		},
+		{
+			Platform: platform.KindGitHub, Owner: "acme", Name: "widgets",
+			PlatformHost: "github.com", RepoPath: "acme/widgets",
+			PlatformExternalID: "repo-w",
+		},
+	})
+
+	rr := doJSON(
+		t, srv, http.MethodDelete,
+		"/api/v1/repo/gh/acme/*", nil,
+	)
+	require.Equal(t, http.StatusNoContent, rr.Code, rr.Body.String())
+	assert.True(t, srv.syncer.IsTrackedRepo("acme", "tools-new"),
+		"deleting the glob must keep the renamed repo its exact entry still claims")
+	assert.False(t, srv.syncer.IsTrackedRepo("acme", "widgets"))
+}
+
+func TestHandleDeleteExactEntryClearsProvenanceOnGlobKeptRepo(t *testing.T) {
+	mock := &mockGH{
+		getRepositoryFn: func(
+			_ context.Context, owner, repo string,
+		) (*gh.Repository, error) {
+			return &gh.Repository{
+				Name:  new(repo),
+				Owner: &gh.User{Login: new(owner)},
+			}, nil
+		},
+		listReposByOwnerFn: func(
+			_ context.Context, owner string,
+		) ([]*gh.Repository, error) {
+			return []*gh.Repository{{
+				Name:  new("tools-new"),
+				Owner: &gh.User{Login: new(owner)},
+			}}, nil
+		},
+	}
+	srv, _, _ := setupTestServerWithConfigContent(t, `
+sync_interval = "5m"
+github_token_env = "KENN_FORGE_GITHUB_TOKEN"
+host = "127.0.0.1"
+port = 8091
+
+[[repos]]
+owner = "acme"
+name = "tools"
+
+[[repos]]
+owner = "acme"
+name = "*"
+`, mock)
+
+	srv.syncer.SetRepos([]ghclient.RepoRef{{
+		Platform: platform.KindGitHub, Owner: "acme", Name: "tools-new",
+		PlatformHost: "github.com", RepoPath: "acme/tools-new",
+		PlatformExternalID: "repo-x", ConfiguredRepoPath: "acme/tools",
+	}})
+
+	// Removing the exact entry keeps the repo through the glob, but its
+	// provenance now points at a config entry that no longer exists and
+	// must not survive to claim a future entry with the same path.
+	rr := doJSON(
+		t, srv, http.MethodDelete,
+		"/api/v1/repo/gh/acme/tools", nil,
+	)
+	require.Equal(t, http.StatusNoContent, rr.Code, rr.Body.String())
+	require.True(t, srv.syncer.IsTrackedRepo("acme", "tools-new"))
+	assert.Empty(t, trackedRepoProvenancePath(srv, "acme", "tools-new"),
+		"provenance must clear when its exact entry is removed")
+}
+
+func TestHandleDeleteExactEntryIgnoresSamePathOnOtherHost(t *testing.T) {
+	mock := &mockGH{
+		getRepositoryFn: func(
+			_ context.Context, owner, repo string,
+		) (*gh.Repository, error) {
+			return &gh.Repository{
+				Name:  new(repo),
+				Owner: &gh.User{Login: new(owner)},
+			}, nil
+		},
+		listReposByOwnerFn: func(
+			_ context.Context, owner string,
+		) ([]*gh.Repository, error) {
+			return []*gh.Repository{{
+				Name:  new("tools-new"),
+				Owner: &gh.User{Login: new(owner)},
+			}}, nil
+		},
+	}
+	srv, _, _ := setupTestServerWithConfigContent(t, `
+sync_interval = "5m"
+github_token_env = "KENN_FORGE_GITHUB_TOKEN"
+host = "127.0.0.1"
+port = 8091
+
+[[repos]]
+owner = "acme"
+name = "tools"
+
+[[repos]]
+owner = "acme"
+name = "*"
+
+[[repos]]
+owner = "acme"
+name = "tools"
+platform_host = "ghe.example.com"
+`, mock)
+
+	srv.syncer.SetRepos([]ghclient.RepoRef{{
+		Platform: platform.KindGitHub, Owner: "acme", Name: "tools-new",
+		PlatformHost: "github.com", RepoPath: "acme/tools-new",
+		PlatformExternalID: "repo-x", ConfiguredRepoPath: "acme/tools",
+	}})
+
+	// The remaining acme/tools entry lives on a different host; it cannot
+	// keep the deleted github.com entry's provenance alive.
+	rr := doJSON(
+		t, srv, http.MethodDelete,
+		"/api/v1/repo/gh/acme/tools", nil,
+	)
+	require.Equal(t, http.StatusNoContent, rr.Code, rr.Body.String())
+	require.True(t, srv.syncer.IsTrackedRepo("acme", "tools-new"))
+	assert.Empty(t, trackedRepoProvenancePath(srv, "acme", "tools-new"),
+		"an entry with the same path on another host must not retain provenance")
+}
+
+func TestHandleDeleteExactEntryIgnoresSamePathOnOtherProvider(t *testing.T) {
+	mock := &mockGH{
+		getRepositoryFn: func(
+			_ context.Context, owner, repo string,
+		) (*gh.Repository, error) {
+			return &gh.Repository{
+				Name:  new(repo),
+				Owner: &gh.User{Login: new(owner)},
+			}, nil
+		},
+		listReposByOwnerFn: func(
+			_ context.Context, owner string,
+		) ([]*gh.Repository, error) {
+			return []*gh.Repository{{
+				Name:  new("tools-new"),
+				Owner: &gh.User{Login: new(owner)},
+			}}, nil
+		},
+	}
+	srv, _, _ := setupTestServerWithConfigContent(t, `
+sync_interval = "5m"
+github_token_env = "KENN_FORGE_GITHUB_TOKEN"
+host = "127.0.0.1"
+port = 8091
+
+[[repos]]
+owner = "acme"
+name = "tools"
+
+[[repos]]
+owner = "acme"
+name = "*"
+
+[[repos]]
+platform = "gitlab"
+platform_host = "github.com"
+owner = "acme"
+name = "tools"
+`, mock)
+
+	srv.syncer.SetRepos([]ghclient.RepoRef{{
+		Platform: platform.KindGitHub, Owner: "acme", Name: "tools-new",
+		PlatformHost: "github.com", RepoPath: "acme/tools-new",
+		PlatformExternalID: "repo-x", ConfiguredRepoPath: "acme/tools",
+	}})
+
+	// The remaining acme/tools entry shares the host but belongs to a
+	// different provider; it cannot keep the deleted GitHub entry's
+	// provenance alive.
+	rr := doJSON(
+		t, srv, http.MethodDelete,
+		"/api/v1/repo/gh/acme/tools", nil,
+	)
+	require.Equal(t, http.StatusNoContent, rr.Code, rr.Body.String())
+	require.True(t, srv.syncer.IsTrackedRepo("acme", "tools-new"))
+	assert.Empty(t, trackedRepoProvenancePath(srv, "acme", "tools-new"),
+		"an entry with the same path on another provider must not retain provenance")
 }
 
 func TestHandleDeleteRepoUsesProviderHostQuery(t *testing.T) {

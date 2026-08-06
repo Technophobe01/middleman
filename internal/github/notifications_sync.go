@@ -130,7 +130,7 @@ func (s *Syncer) NotificationSyncStatus() NotificationSyncStatus {
 
 func (s *Syncer) SyncNotifications(ctx context.Context) error {
 	ctx = WithSyncBudget(ctx)
-	repos := s.TrackedRepos()
+	repos := excludeArchivedRepos(s.TrackedRepos())
 	tracked := make(map[string]RepoRef, len(repos))
 	for _, repo := range repos {
 		platformName := string(repoPlatform(repo))
@@ -776,6 +776,9 @@ func (s *Syncer) ackRepoBuckets(
 		byNotification[notification.ID] = bucket
 		add(bucket, notification.RepoOwner, notification.RepoName)
 	}
+	// Archived repos stay in the grouping: their queued acknowledgements
+	// (from before archiving) must still be covered by credential-wide
+	// rate-limit deferral. Only polling skips archived repos.
 	for _, repo := range s.TrackedRepos() {
 		if repoPlatform(repo) != kind || repoHost(repo) != host {
 			continue

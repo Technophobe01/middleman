@@ -230,12 +230,74 @@ func TestResolveStartupReposExpandsConfiguredGlobs(t *testing.T) {
 		nil,
 	)
 
+	assert.Equal([]ghclient.RepoRef{
+		{
+			Platform:     "github",
+			Owner:        "roborev-dev",
+			Name:         "kenn-forge",
+			PlatformHost: "github.com",
+			RepoPath:     "roborev-dev/kenn-forge",
+		},
+		{
+			Platform:     "github",
+			Owner:        "roborev-dev",
+			Name:         "archived",
+			PlatformHost: "github.com",
+			RepoPath:     "roborev-dev/archived",
+			Archived:     true,
+		},
+	}, repos)
+}
+
+type getRepoFailingClient struct {
+	*testutil.FixtureClient
+}
+
+func (getRepoFailingClient) GetRepository(
+	context.Context, string, string,
+) (*gh.Repository, error) {
+	return nil, errors.New("transient resolve failure")
+}
+
+func TestResolveStartupReposPrefersResolvedOverFallbackDuplicates(t *testing.T) {
+	assert := assert.New(t)
+	// The exact entry fails resolution and falls back to a synthetic ref;
+	// the overlapping glob resolves the same repo as archived. The resolved
+	// metadata must win or the archived repo would be polled as live.
+	cfg := &config.Config{
+		Repos: []config.Repo{
+			{Owner: "acme", Name: "archived"},
+			{Owner: "acme", Name: "*"},
+		},
+	}
+	client := getRepoFailingClient{&testutil.FixtureClient{
+		ReposByOwner: map[string][]*gh.Repository{
+			"acme": {{
+				NodeID:   new("repo-acme-archived"),
+				Name:     new("archived"),
+				Owner:    &gh.User{Login: new("acme")},
+				Archived: new(true),
+			}},
+		},
+	}}
+
+	repos := resolveStartupRepos(
+		t.Context(),
+		cfg,
+		mustProviderRegistry(t, map[string]ghclient.Client{"github.com": client}),
+		nil,
+		nil,
+	)
+
 	assert.Equal([]ghclient.RepoRef{{
-		Platform:     "github",
-		Owner:        "roborev-dev",
-		Name:         "kenn-forge",
-		PlatformHost: "github.com",
-		RepoPath:     "roborev-dev/kenn-forge",
+		Platform:           "github",
+		Owner:              "acme",
+		Name:               "archived",
+		PlatformHost:       "github.com",
+		RepoPath:           "acme/archived",
+		PlatformExternalID: "repo-acme-archived",
+		Archived:           true,
+		ConfiguredRepoPath: "acme/archived",
 	}}, repos)
 }
 
@@ -254,12 +316,104 @@ func TestResolveStartupReposKeepsExactReposWhenResolutionFails(t *testing.T) {
 	)
 
 	assert.Equal([]ghclient.RepoRef{{
-		Platform:     "github",
-		Owner:        "roborev-dev",
-		Name:         "kenn-forge",
-		PlatformHost: "github.com",
-		RepoPath:     "roborev-dev/kenn-forge",
+		Platform:           "github",
+		Owner:              "roborev-dev",
+		Name:               "kenn-forge",
+		PlatformHost:       "github.com",
+		RepoPath:           "roborev-dev/kenn-forge",
+		ConfiguredRepoPath: "roborev-dev/kenn-forge",
 	}}, repos)
+}
+
+func TestResolveStartupReposRecoversRenamedExactEntryFromCatalog(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	database := dbtest.Open(t)
+	now := time.Now().UTC()
+	before := db.GitHubRepoIdentity("github.com", "acme", "tools")
+	before.PlatformRepoID = "repo-acme-tools"
+	_, _, err := database.ReconcileRepositoryObservation(
+		t.Context(), before, now.Add(-time.Hour),
+	)
+	require.NoError(err)
+	after := db.GitHubRepoIdentity("github.com", "acme", "tools-new")
+	after.PlatformRepoID = "repo-acme-tools"
+	_, _, err = database.ReconcileRepositoryObservation(t.Context(), after, now)
+	require.NoError(err)
+
+	// The renamed repository resolves through the glob; the exact entry
+	// still lists the old path and fails transiently. Catalog route
+	// history recovers the stable identity so the fallback deduplicates
+	// instead of tracking an identity-less duplicate on the stale route.
+	cfg := &config.Config{Repos: []config.Repo{
+		{Owner: "acme", Name: "tools"},
+		{Owner: "acme", Name: "*"},
+	}}
+	client := getRepoFailingClient{&testutil.FixtureClient{
+		ReposByOwner: map[string][]*gh.Repository{
+			"acme": {{
+				NodeID:   new("repo-acme-tools"),
+				Name:     new("tools-new"),
+				Owner:    &gh.User{Login: new("acme")},
+				Archived: new(true),
+			}},
+		},
+	}}
+
+	repos := resolveStartupRepos(
+		t.Context(),
+		cfg,
+		mustProviderRegistry(t, map[string]ghclient.Client{"github.com": client}),
+		database,
+		nil,
+	)
+
+	require.Len(repos, 1)
+	assert.Equal("tools-new", repos[0].Name)
+	assert.Equal("repo-acme-tools", repos[0].PlatformExternalID)
+	assert.True(repos[0].Archived)
+	assert.Equal("acme/tools", repos[0].ConfiguredRepoPath)
+}
+
+func TestResolveStartupReposRegistersCredentialAliasForCatalogFallback(t *testing.T) {
+	require := require.New(t)
+	database := dbtest.Open(t)
+	now := time.Now().UTC()
+	before := db.GitHubRepoIdentity("github.com", "acme", "tools")
+	before.PlatformRepoID = "repo-acme-tools"
+	_, _, err := database.ReconcileRepositoryObservation(
+		t.Context(), before, now.Add(-time.Hour),
+	)
+	require.NoError(err)
+	after := db.GitHubRepoIdentity("github.com", "acme", "tools-new")
+	after.PlatformRepoID = "repo-acme-tools"
+	_, _, err = database.ReconcileRepositoryObservation(t.Context(), after, now)
+	require.NoError(err)
+
+	client := getRepoFailingClient{&testutil.FixtureClient{}}
+	router, err := ghclient.NewHostRouter("github.com", &ghclient.Route{
+		Key:    ghclient.RouteKey{Host: "github.com", Owner: "acme", Name: "tools"},
+		Client: client,
+	})
+	require.NoError(err)
+	cfg := &config.Config{Repos: []config.Repo{{Owner: "acme", Name: "tools"}}}
+
+	repos := resolveStartupRepos(
+		t.Context(),
+		cfg,
+		mustProviderRegistry(t, map[string]ghclient.Client{"github.com": client}),
+		database,
+		map[string]*ghclient.HostRouter{"github.com": router},
+	)
+
+	require.Len(repos, 1)
+	require.Equal("tools-new", repos[0].Name)
+	// The recovered renamed route must keep resolving to the exact entry's
+	// repo-scoped credential instead of falling through to owner or host
+	// routes.
+	route, err := router.RouteForRepo("acme", "tools-new")
+	require.NoError(err)
+	require.Equal("tools", route.Key.Name)
 }
 
 func TestResolveStartupReposFallsBackToDBForOfflineGlobs(t *testing.T) {
@@ -320,11 +474,12 @@ func TestResolveStartupReposUsesProviderRegistryForGitLab(t *testing.T) {
 	repos := resolveStartupRepos(t.Context(), cfg, registry, nil, nil)
 
 	assert.Equal([]ghclient.RepoRef{{
-		Platform:     platform.KindGitLab,
-		PlatformHost: "gitlab.com",
-		Owner:        "group/subgroup",
-		Name:         "project",
-		RepoPath:     "group/subgroup/project",
+		Platform:           platform.KindGitLab,
+		PlatformHost:       "gitlab.com",
+		Owner:              "group/subgroup",
+		Name:               "project",
+		RepoPath:           "group/subgroup/project",
+		ConfiguredRepoPath: "group/subgroup/project",
 	}}, repos)
 }
 

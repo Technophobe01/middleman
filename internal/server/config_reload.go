@@ -310,11 +310,13 @@ func (s *Server) startConfigWatcher() {
 // event. The daemon stays running on the previous in-memory config when
 // the reload fails so an editor mid-save cannot crash the process.
 func (s *Server) handleConfigFileChanged() {
+	s.configReloadMu.Lock()
+	defer s.configReloadMu.Unlock()
+	// Checked under the reload lock: cfgPath is settled at construction,
+	// but tests swap it to exercise persistence failures.
 	if s.cfgPath == "" {
 		return
 	}
-	s.configReloadMu.Lock()
-	defer s.configReloadMu.Unlock()
 
 	event := s.applyConfigChange(s.bgCtx)
 	s.hub.Broadcast(Event{
@@ -655,8 +657,7 @@ func (s *Server) resolveReposForReload(
 	if s.syncer == nil {
 		return nil, nil
 	}
-	resolved := make([]ghclient.RepoRef, 0, len(repos))
-	seen := make(map[string]struct{}, len(repos))
+	set := ghclient.NewExpandedRepoSet()
 	skipped := make([]string, 0)
 
 	for _, raw := range repos {
@@ -687,35 +688,10 @@ func (s *Server) resolveReposForReload(
 			expanded = ghclient.FallbackConfiguredRepoRefs(previous, raw)
 		}
 		for _, repo := range expanded {
-			key := strings.ToLower(string(repoPlatformOrDefault(repo))) + "\x00" +
-				strings.ToLower(canonicalReloadHost(repo)) + "\x00" +
-				strings.ToLower(repo.Owner) + "\x00" +
-				strings.ToLower(repo.Name)
-			if _, ok := seen[key]; ok {
-				continue
-			}
-			seen[key] = struct{}{}
-			resolved = append(resolved, repo)
+			set.Add(repo, err == nil)
 		}
 	}
-	return resolved, skipped
-}
-
-func repoPlatformOrDefault(repo ghclient.RepoRef) platform.Kind {
-	if repo.Platform != "" {
-		return repo.Platform
-	}
-	return platform.KindGitHub
-}
-
-func canonicalReloadHost(repo ghclient.RepoRef) string {
-	if repo.PlatformHost != "" {
-		return repo.PlatformHost
-	}
-	if host, ok := platform.DefaultHost(repoPlatformOrDefault(repo)); ok {
-		return host
-	}
-	return platform.DefaultGitHubHost
+	return set.Refs(), skipped
 }
 
 // sanitizeConfigError trims internal path prefixes from the error so the

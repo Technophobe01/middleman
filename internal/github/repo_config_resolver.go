@@ -2,7 +2,6 @@ package github
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"path"
 	"strings"
@@ -10,8 +9,6 @@ import (
 	"go.kenn.io/forge/internal/config"
 	"go.kenn.io/forge/internal/platform"
 )
-
-var ErrConfiguredRepoArchived = errors.New("configured repo archived")
 
 func canonicalRepoName(name string) string {
 	return strings.ToLower(name)
@@ -41,6 +38,8 @@ func canonicalRepoRef(repo RepoRef) RepoRef {
 		WebURL:             strings.TrimSpace(repo.WebURL),
 		CloneURL:           strings.TrimSpace(repo.CloneURL),
 		DefaultBranch:      strings.TrimSpace(repo.DefaultBranch),
+		Archived:           repo.Archived,
+		ConfiguredRepoPath: strings.TrimSpace(repo.ConfiguredRepoPath),
 	}
 	if kind == platform.KindGitHub {
 		out.Owner = canonicalRepoOwner(out.Owner)
@@ -84,6 +83,18 @@ func FallbackConfiguredRepoRefs(
 	host := raw.PlatformHostOrDefault()
 	repoPath := configuredRepoPath(raw)
 	if !raw.HasNameGlob() {
+		// Provenance first: a provider-side rename moves the tracked route
+		// away from the configured path, but the tracked ref still records
+		// which config entry it was resolved from. Falling back to it keeps
+		// the provider identity and archived state instead of synthesizing
+		// an identity-less live duplicate under the stale route.
+		for _, repo := range previous {
+			if repoPlatform(repo) == kind &&
+				sameConfiguredRepoHost(repoHost(repo), host) &&
+				strings.EqualFold(repo.ConfiguredRepoPath, repoPath) {
+				return []RepoRef{repo}
+			}
+		}
 		for _, repo := range previous {
 			if repoPlatform(repo) == kind &&
 				sameConfiguredRepoHost(repoHost(repo), host) &&
@@ -115,11 +126,12 @@ func FallbackConfiguredRepoRefs(
 
 func fallbackRepoRef(raw config.Repo, kind platform.Kind, host string) RepoRef {
 	repo := RepoRef{
-		Platform:     kind,
-		Owner:        strings.TrimSpace(raw.Owner),
-		Name:         strings.TrimSpace(raw.Name),
-		PlatformHost: strings.ToLower(strings.TrimSpace(host)),
-		RepoPath:     strings.TrimSpace(configuredRepoPath(raw)),
+		Platform:           kind,
+		Owner:              strings.TrimSpace(raw.Owner),
+		Name:               strings.TrimSpace(raw.Name),
+		PlatformHost:       strings.ToLower(strings.TrimSpace(host)),
+		RepoPath:           strings.TrimSpace(configuredRepoPath(raw)),
+		ConfiguredRepoPath: configuredRepoPath(raw),
 	}
 	if kind == "" {
 		kind = platform.KindGitHub
@@ -226,17 +238,13 @@ func resolveConfiguredRepo(
 				raw.Owner, raw.Name, err,
 			)
 		}
-		if repo.Archived {
-			return status, nil, fmt.Errorf(
-				"%w: %s/%s",
-				ErrConfiguredRepoArchived, raw.Owner, raw.Name,
-			)
-		}
 		status.MatchedRepoCount = 1
 		return status, []RepoRef{repoRefFromRepository(raw, kind, host, repo)}, nil
 	}
 
-	repos, err := reader.ListRepositories(ctx, raw.Owner, platform.RepositoryListOptions{})
+	repos, err := reader.ListRepositories(ctx, raw.Owner, platform.RepositoryListOptions{
+		IncludeArchived: true,
+	})
 	if err != nil {
 		return status, nil, fmt.Errorf(
 			"resolve configured repo glob %s/%s: %w",
@@ -246,9 +254,6 @@ func resolveConfiguredRepo(
 
 	matches := make([]RepoRef, 0, len(repos))
 	for _, repo := range repos {
-		if repo.Archived {
-			continue
-		}
 		repoName := repo.Ref.Name
 		if repoName == "" {
 			repoName = repo.Ref.DisplayName()
@@ -277,6 +282,17 @@ func configuredRepoPath(raw config.Repo) string {
 		return strings.TrimSpace(raw.RepoPath)
 	}
 	return raw.Owner + "/" + raw.Name
+}
+
+// exactConfiguredRepoPath is the provenance stamped on resolved refs: only
+// exact entries author it — a glob pattern identifies no single entry to
+// correlate with, and stamping it would displace exact provenance on
+// deduplicated overlaps.
+func exactConfiguredRepoPath(raw config.Repo) string {
+	if raw.HasNameGlob() {
+		return ""
+	}
+	return configuredRepoPath(raw)
 }
 
 func repoPathOrFullName(repo RepoRef) string {
@@ -311,6 +327,8 @@ func repoRefFromRepository(
 		WebURL:             repo.WebURL,
 		CloneURL:           repo.CloneURL,
 		DefaultBranch:      repo.DefaultBranch,
+		Archived:           repo.Archived,
+		ConfiguredRepoPath: exactConfiguredRepoPath(raw),
 	}
 	if ref.PlatformRepoID == 0 {
 		ref.PlatformRepoID = repo.Ref.PlatformID
@@ -350,6 +368,99 @@ func appendExpandedRepo(
 	}
 	seen[key] = struct{}{}
 	*dst = append(*dst, repo)
+}
+
+// ExpandedRepoSet accumulates configured-repo expansions across config
+// entries, deduplicating by platform/host/owner/name and — when a stable
+// provider id is present — by platform/host/provider-id, so a renamed route
+// cannot track the same repository twice. A provider-resolved ref replaces a
+// fallback-derived duplicate from an earlier entry, so a transient resolve
+// failure on one entry cannot freeze stale metadata (an archived flip, a
+// rename) when an overlapping entry resolved successfully. Fallback refs
+// never overwrite resolved ones; same-class duplicates keep the first entry.
+type ExpandedRepoSet struct {
+	refs       []RepoRef
+	resolved   []bool
+	byRoute    map[string]int
+	byIdentity map[string]int
+}
+
+func NewExpandedRepoSet() *ExpandedRepoSet {
+	return &ExpandedRepoSet{
+		byRoute:    make(map[string]int),
+		byIdentity: make(map[string]int),
+	}
+}
+
+func expandedRepoRouteKey(repo RepoRef) string {
+	canonical := canonicalRepoRef(repo)
+	return string(repoPlatform(canonical)) + "\x00" + canonical.PlatformHost +
+		"\x00" + canonical.Owner + "\x00" + canonical.Name
+}
+
+func expandedRepoIdentityKey(repo RepoRef) string {
+	if strings.TrimSpace(repo.PlatformExternalID) == "" {
+		return ""
+	}
+	canonical := canonicalRepoRef(repo)
+	return string(repoPlatform(canonical)) + "\x00" + canonical.PlatformHost +
+		"\x00" + canonical.PlatformExternalID
+}
+
+func (s *ExpandedRepoSet) Add(repo RepoRef, providerResolved bool) {
+	routeKey := expandedRepoRouteKey(repo)
+	identityKey := expandedRepoIdentityKey(repo)
+	slot, ok := -1, false
+	if identityKey != "" {
+		slot, ok = lookupSlot(s.byIdentity, identityKey)
+	}
+	if !ok {
+		slot, ok = lookupSlot(s.byRoute, routeKey)
+	}
+	if ok {
+		// Config-entry provenance is authored only by exact entries; glob
+		// refs carry none. Merge it across duplicates in both directions so
+		// whichever ref wins the slot, the exact entry stays correlatable
+		// on the next reload.
+		if providerResolved && !s.resolved[slot] {
+			old := s.refs[slot]
+			if repo.ConfiguredRepoPath == "" {
+				repo.ConfiguredRepoPath = old.ConfiguredRepoPath
+			}
+			delete(s.byRoute, expandedRepoRouteKey(old))
+			if oldIdentity := expandedRepoIdentityKey(old); oldIdentity != "" {
+				delete(s.byIdentity, oldIdentity)
+			}
+			s.refs[slot] = repo
+			s.resolved[slot] = true
+			s.byRoute[routeKey] = slot
+			if identityKey != "" {
+				s.byIdentity[identityKey] = slot
+			}
+		} else if s.refs[slot].ConfiguredRepoPath == "" {
+			s.refs[slot].ConfiguredRepoPath = repo.ConfiguredRepoPath
+		}
+		return
+	}
+	slot = len(s.refs)
+	s.refs = append(s.refs, repo)
+	s.resolved = append(s.resolved, providerResolved)
+	s.byRoute[routeKey] = slot
+	if identityKey != "" {
+		s.byIdentity[identityKey] = slot
+	}
+}
+
+func lookupSlot(index map[string]int, key string) (int, bool) {
+	i, ok := index[key]
+	if !ok {
+		return -1, false
+	}
+	return i, true
+}
+
+func (s *ExpandedRepoSet) Refs() []RepoRef {
+	return s.refs
 }
 
 func sameConfiguredRepoHost(left, right string) bool {

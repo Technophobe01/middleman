@@ -155,20 +155,27 @@ func matchedRepoCount(
 	return count
 }
 
-// mergeTrackedRepos adds repos to the syncer's tracked set,
-// deduplicating by host/owner/name.
+// mergeTrackedRepos adds repos to the syncer's tracked set, deduplicating by
+// stable provider id when present and host/owner/name otherwise. An
+// already-tracked repo takes the freshly resolved metadata so provider state
+// transitions (renames, archived flips) apply without a daemon restart.
 func (s *Server) mergeTrackedRepos(add []ghclient.RepoRef) {
 	current := s.syncer.TrackedRepos()
-	seen := make(map[string]struct{}, len(current))
-	for _, r := range current {
-		seen[trackedRepoKey(r)] = struct{}{}
+	provenance := trackedRepoProvenance(current)
+	byRoute := make(map[string]int, len(current))
+	byIdentity := make(map[string]int, len(current))
+	for i, r := range current {
+		indexTrackedRepo(byRoute, byIdentity, r, i)
 	}
 	for _, r := range add {
-		key := trackedRepoKey(r)
-		if _, ok := seen[key]; ok {
+		r = withTrackedProvenance(provenance, r)
+		if i, ok := trackedRepoIndex(byRoute, byIdentity, r); ok {
+			unindexTrackedRepo(byRoute, byIdentity, current[i])
+			current[i] = r
+			indexTrackedRepo(byRoute, byIdentity, r, i)
 			continue
 		}
-		seen[key] = struct{}{}
+		indexTrackedRepo(byRoute, byIdentity, r, len(current))
 		current = append(current, r)
 	}
 	s.syncer.SetRepos(current)
@@ -183,35 +190,63 @@ func (s *Server) replaceGlobRepos(
 	configured []config.Repo,
 ) {
 	current := s.syncer.TrackedRepos()
+	provenance := trackedRepoProvenance(current)
 	kept := make([]ghclient.RepoRef, 0, len(current))
-	seen := make(map[string]struct{}, len(current)+len(expanded))
+	byRoute := make(map[string]int, len(current)+len(expanded))
+	byIdentity := make(map[string]int, len(current)+len(expanded))
 	for _, repo := range current {
 		if repoMatchesConfig(repo, raw) &&
 			!repoMatchesOtherConfig(repo, raw, configured) {
 			continue
 		}
-		appendTrackedRepo(&kept, seen, repo)
+		if _, ok := trackedRepoIndex(byRoute, byIdentity, repo); ok {
+			continue
+		}
+		indexTrackedRepo(byRoute, byIdentity, repo, len(kept))
+		kept = append(kept, repo)
 	}
+	// Freshly resolved matches overwrite refs kept for overlapping config
+	// entries so provider state transitions (renames, archived flips) apply.
 	for _, repo := range expanded {
-		appendTrackedRepo(&kept, seen, repo)
+		repo = withTrackedProvenance(provenance, repo)
+		if i, ok := trackedRepoIndex(byRoute, byIdentity, repo); ok {
+			unindexTrackedRepo(byRoute, byIdentity, kept[i])
+			kept[i] = repo
+			indexTrackedRepo(byRoute, byIdentity, repo, i)
+			continue
+		}
+		indexTrackedRepo(byRoute, byIdentity, repo, len(kept))
+		kept = append(kept, repo)
 	}
 	s.syncer.SetRepos(kept)
 }
 
 // removeConfigRepos keeps only tracked repos that match at
-// least one of the remaining config entries.
+// least one of the remaining config entries. A kept repo whose exact-entry
+// provenance no longer names a remaining entry loses it: a stale claim
+// would bind a future entry with the same path to the wrong repository.
 func (s *Server) removeConfigRepos(
 	remaining []config.Repo,
 ) {
 	current := s.syncer.TrackedRepos()
 	kept := make([]ghclient.RepoRef, 0, len(current))
 	for _, repo := range current {
+		matched, provenanceRemains := false, false
 		for _, raw := range remaining {
 			if repoMatchesConfig(repo, raw) {
-				kept = append(kept, repo)
-				break
+				matched = true
+			}
+			if repoMatchesConfigProvenance(repo, raw) {
+				provenanceRemains = true
 			}
 		}
+		if !matched {
+			continue
+		}
+		if !provenanceRemains {
+			repo.ConfiguredRepoPath = ""
+		}
+		kept = append(kept, repo)
 	}
 	s.syncer.SetRepos(kept)
 }
@@ -301,8 +336,16 @@ func repoMatchesConfig(
 ) bool {
 	host := raw.PlatformHostOrDefault()
 	if !strings.EqualFold(repoProvider(repo), raw.PlatformOrDefault()) ||
-		!samePlatformHost(repo.PlatformHost, host) ||
-		!strings.EqualFold(repo.Owner, raw.Owner) {
+		!samePlatformHost(repo.PlatformHost, host) {
+		return false
+	}
+	// A provider-side rename moves the tracked route (possibly across
+	// owners) away from the configured path; provenance still ties the
+	// repo to its exact entry.
+	if repoConfiguredPathMatches(repo, raw) {
+		return true
+	}
+	if !strings.EqualFold(repo.Owner, raw.Owner) {
 		return false
 	}
 	if raw.HasNameGlob() {
@@ -314,6 +357,24 @@ func repoMatchesConfig(
 	}
 	return strings.EqualFold(trackedRepoPath(repo), configRepoPath(raw)) ||
 		strings.EqualFold(repo.Name, raw.Name)
+}
+
+// repoMatchesConfigProvenance reports whether raw is the exact entry the
+// tracked repo's provenance names — provider- and host-scoped, since the
+// same path can be configured on multiple providers or hosts.
+func repoMatchesConfigProvenance(
+	repo ghclient.RepoRef, raw config.Repo,
+) bool {
+	return strings.EqualFold(repoProvider(repo), raw.PlatformOrDefault()) &&
+		samePlatformHost(repo.PlatformHost, raw.PlatformHostOrDefault()) &&
+		repoConfiguredPathMatches(repo, raw)
+}
+
+func repoConfiguredPathMatches(
+	repo ghclient.RepoRef, raw config.Repo,
+) bool {
+	return !raw.HasNameGlob() && repo.ConfiguredRepoPath != "" &&
+		strings.EqualFold(repo.ConfiguredRepoPath, configRepoPath(raw))
 }
 
 func configRepoPath(raw config.Repo) string {
@@ -328,19 +389,6 @@ func trackedRepoPath(repo ghclient.RepoRef) string {
 		return strings.TrimSpace(repo.RepoPath)
 	}
 	return repo.Owner + "/" + repo.Name
-}
-
-func appendTrackedRepo(
-	dst *[]ghclient.RepoRef,
-	seen map[string]struct{},
-	repo ghclient.RepoRef,
-) {
-	key := trackedRepoKey(repo)
-	if _, ok := seen[key]; ok {
-		return
-	}
-	seen[key] = struct{}{}
-	*dst = append(*dst, repo)
 }
 
 func repoProvider(repo ghclient.RepoRef) string {
@@ -366,6 +414,109 @@ func trackedRepoKey(repo ghclient.RepoRef) string {
 	return repoProvider(repo) + "\x00" +
 		trackedRepoHost(repo) + "\x00" +
 		strings.ToLower(strings.Trim(trackedRepoPath(repo), "/ "))
+}
+
+// trackedRepoIdentityKey keys a tracked repo by its stable provider id, so a
+// renamed route reconciles onto the same entry instead of tracking the
+// repository twice. Empty when the ref carries no provider id.
+// trackedProvenanceEntry records where a tracked ref's config-entry
+// provenance came from, so route-keyed recovery can refuse to hand it to a
+// different repository that merely reuses the route.
+type trackedProvenanceEntry struct {
+	path       string
+	providerID string
+}
+
+// trackedRepoProvenance captures config-entry provenance from the tracked
+// set before a settings merge rebuilds it. Settings-resolved refs never
+// author provenance — only config resolution does — so a merge or glob
+// refresh must not erase the correlation an exact entry needs to reclaim
+// its repository on the next failed reload.
+func trackedRepoProvenance(refs []ghclient.RepoRef) map[string]trackedProvenanceEntry {
+	provenance := make(map[string]trackedProvenanceEntry)
+	for _, repo := range refs {
+		if repo.ConfiguredRepoPath == "" {
+			continue
+		}
+		entry := trackedProvenanceEntry{
+			path:       repo.ConfiguredRepoPath,
+			providerID: strings.TrimSpace(repo.PlatformExternalID),
+		}
+		if key := trackedRepoIdentityKey(repo); key != "" {
+			provenance["id\x00"+key] = entry
+		}
+		provenance["route\x00"+trackedRepoKey(repo)] = entry
+	}
+	return provenance
+}
+
+func withTrackedProvenance(
+	provenance map[string]trackedProvenanceEntry, repo ghclient.RepoRef,
+) ghclient.RepoRef {
+	if repo.ConfiguredRepoPath != "" {
+		return repo
+	}
+	if key := trackedRepoIdentityKey(repo); key != "" {
+		if entry, ok := provenance["id\x00"+key]; ok {
+			repo.ConfiguredRepoPath = entry.path
+			return repo
+		}
+	}
+	entry, ok := provenance["route\x00"+trackedRepoKey(repo)]
+	if !ok {
+		return repo
+	}
+	// A route match with two different stable provider ids is route reuse
+	// by another repository, not a rename of the same one: provenance stays
+	// with the identity it was resolved for. Provider ids are opaque and
+	// case-sensitive — compared exactly, like identity keys.
+	incomingID := strings.TrimSpace(repo.PlatformExternalID)
+	if entry.providerID != "" && incomingID != "" &&
+		entry.providerID != incomingID {
+		return repo
+	}
+	repo.ConfiguredRepoPath = entry.path
+	return repo
+}
+
+func trackedRepoIdentityKey(repo ghclient.RepoRef) string {
+	if strings.TrimSpace(repo.PlatformExternalID) == "" {
+		return ""
+	}
+	return repoProvider(repo) + "\x00" +
+		trackedRepoHost(repo) + "\x00" + repo.PlatformExternalID
+}
+
+// trackedRepoIndex locates repo in current, matching by stable provider id
+// first and falling back to the route key.
+func trackedRepoIndex(
+	byRoute, byIdentity map[string]int, repo ghclient.RepoRef,
+) (int, bool) {
+	if key := trackedRepoIdentityKey(repo); key != "" {
+		if i, ok := byIdentity[key]; ok {
+			return i, true
+		}
+	}
+	i, ok := byRoute[trackedRepoKey(repo)]
+	return i, ok
+}
+
+func indexTrackedRepo(
+	byRoute, byIdentity map[string]int, repo ghclient.RepoRef, slot int,
+) {
+	byRoute[trackedRepoKey(repo)] = slot
+	if key := trackedRepoIdentityKey(repo); key != "" {
+		byIdentity[key] = slot
+	}
+}
+
+func unindexTrackedRepo(
+	byRoute, byIdentity map[string]int, repo ghclient.RepoRef,
+) {
+	delete(byRoute, trackedRepoKey(repo))
+	if key := trackedRepoIdentityKey(repo); key != "" {
+		delete(byIdentity, key)
+	}
 }
 
 func (s *Server) persistResolvedRepos(
@@ -416,14 +567,10 @@ func (s *Server) defaultPlatformHost() string {
 }
 
 // classifyResolveProblem maps a configured-repo resolve error to its wire
-// problem. Archived repos are caller-side validation; everything else goes
-// through the shared provider mapping so a missing token during token-file
-// rotation surfaces as 400 badRequest like the sync and runtime paths,
-// not a 502 upstream error.
+// problem through the shared provider mapping so a missing token during
+// token-file rotation surfaces as 400 badRequest like the sync and runtime
+// paths, not a 502 upstream error.
 func classifyResolveProblem(err error) huma.StatusError {
-	if errors.Is(err, ghclient.ErrConfiguredRepoArchived) {
-		return httpapi.BadRequest(httpapi.CodeBadRequest, err.Error(), nil)
-	}
 	return httpapi.ProviderCallProblem(err, "github", "")
 }
 
