@@ -3,6 +3,7 @@ package fleetapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -28,16 +29,206 @@ import (
 	"go.kenn.io/forge/internal/fleet"
 	"go.kenn.io/forge/internal/server/workspaceapi"
 	"go.kenn.io/forge/internal/sshfleet"
+	"go.kenn.io/kit/openssh"
 )
 
 // fakeSSHExec scripts the remote api -i verb: requests are recorded
 // (method+path plus stdin body) and answered from the routes map by
-// "METHOD path" key. The fake connection RunSSH creates socket files
-// so Connect succeeds without a real master.
+// "METHOD path" key.
 type fakeSSHExec struct {
 	calls  []string
 	bodies [][]byte
 	routes map[string]string // "METHOD /path" -> framed output
+}
+
+const testSSHControlPath = "/tmp/forge-test-control.sock"
+
+type fakePersistentConnections struct {
+	mu         sync.Mutex
+	state      string
+	connectErr error
+}
+
+func (f *fakePersistentConnections) Connect(
+	context.Context,
+	string,
+	openssh.Target,
+) (openssh.Generation, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.connectErr != nil {
+		return 0, f.connectErr
+	}
+	f.state = openssh.StateConnected
+	return 1, nil
+}
+
+func TestSSHFleetRelayFallsBackToMasterlessSSH(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	connections := &fakePersistentConnections{
+		connectErr: openssh.ErrPersistentUnsupported,
+	}
+	var argv []string
+	exec := func(
+		_ context.Context,
+		arguments []string,
+		_ []byte,
+	) ([]byte, []byte, int, error) {
+		argv = append([]string(nil), arguments...)
+		return []byte(framedJSON(200, `{"ok":true}`)), nil, 0, nil
+	}
+	transport := &sshFleetTransport{
+		conns:  connections,
+		runner: sshfleet.NewRunnerWithExec(connections, exec),
+	}
+
+	result, err := transport.relay(
+		context.Background(),
+		config.FleetSSHPeer{Key: "build", Destination: "maintainer@build.example"},
+		http.MethodGet,
+		"/api/v1/snapshot/raw",
+		nil,
+	)
+
+	require.NoError(err)
+	assert.Equal(http.StatusOK, result.response.Status)
+	assert.False(result.connection.Persistent)
+	assert.Contains(argv, "none")
+}
+
+func TestFleetSnapshotReportsMasterlessSSHState(t *testing.T) {
+	tests := []struct {
+		name          string
+		relayErr      error
+		wantState     string
+		wantReachable bool
+		wantEvents    []string
+	}{
+		{
+			name:          "successful relay is online",
+			wantState:     "online",
+			wantReachable: true,
+			wantEvents: []string{
+				openssh.StateConnecting,
+				openssh.StateConnected,
+			},
+		},
+		{
+			name:      "failed relay is offline",
+			relayErr:  errors.New("ssh unavailable"),
+			wantState: "offline",
+			wantEvents: []string{
+				openssh.StateConnecting,
+				openssh.StateError,
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
+			connections := &fakePersistentConnections{
+				connectErr: openssh.ErrPersistentUnsupported,
+			}
+			exec := func(
+				context.Context,
+				[]string,
+				[]byte,
+			) ([]byte, []byte, int, error) {
+				if tt.relayErr != nil {
+					return nil, nil, -1, tt.relayErr
+				}
+				raw := `{"schemaVersion":2,"host":{"hostname":"build","platform":"linux"}}`
+				return []byte(framedJSON(http.StatusOK, raw)), nil, 0, nil
+			}
+			var eventMu sync.Mutex
+			var eventStates []string
+			transport := &sshFleetTransport{
+				conns:  connections,
+				runner: sshfleet.NewRunnerWithExec(connections, exec),
+				peers: []config.FleetSSHPeer{{
+					Key: "build", Destination: "maintainer@build.example",
+				}},
+				broadcast: func(event Event) uint64 {
+					stateEvent, ok := event.Data.(sshFleetConnectionEvent)
+					if event.Type == "fleet_host_state" && ok {
+						eventMu.Lock()
+						eventStates = append(eventStates, stateEvent.State)
+						eventMu.Unlock()
+					}
+					return 0
+				},
+			}
+
+			srv, _ := setupTestServer(t)
+			setTestFleetConfig(srv, func(cfg *config.Config) {
+				cfg.Fleet.Enabled = true
+				cfg.Fleet.Key = "studio"
+			})
+			srv.sshFleet = transport
+			ts := httptest.NewServer(srv.localHandler())
+			defer ts.Close()
+
+			resp := httpDo(
+				t, ts, http.MethodGet,
+				"/api/v1/snapshot?include_peers=true", nil,
+			)
+			require.Equal(http.StatusOK, resp.StatusCode)
+			var snapshot struct {
+				Hosts []struct {
+					ConfigKey       string  `json:"configKey"`
+					Reachable       bool    `json:"reachable"`
+					ConnectionState *string `json:"connectionState"`
+				} `json:"hosts"`
+			}
+			require.NoError(json.NewDecoder(resp.Body).Decode(&snapshot))
+			resp.Body.Close()
+
+			var buildHost *struct {
+				ConfigKey       string  `json:"configKey"`
+				Reachable       bool    `json:"reachable"`
+				ConnectionState *string `json:"connectionState"`
+			}
+			for i := range snapshot.Hosts {
+				if snapshot.Hosts[i].ConfigKey == "build" {
+					buildHost = &snapshot.Hosts[i]
+				}
+			}
+			require.NotNil(buildHost)
+			require.NotNil(buildHost.ConnectionState)
+			assert.Equal(tt.wantState, *buildHost.ConnectionState)
+			assert.Equal(tt.wantReachable, buildHost.Reachable)
+			eventMu.Lock()
+			assert.Equal(tt.wantEvents, eventStates)
+			eventMu.Unlock()
+		})
+	}
+}
+
+func (f *fakePersistentConnections) State(string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.state == "" {
+		return openssh.StateDisconnected
+	}
+	return f.state
+}
+
+func (*fakePersistentConnections) StartIdleMonitor(context.Context) {}
+
+func (*fakePersistentConnections) ConnectionArguments(
+	string,
+	openssh.Generation,
+) ([]string, error) {
+	return openssh.ClientArguments(testSSHControlPath)
+}
+
+func (*fakePersistentConnections) TouchActivity(
+	string,
+	openssh.Generation,
+) bool {
+	return true
 }
 
 func (f *fakeSSHExec) exec(
@@ -76,19 +267,7 @@ func newSSHTestTransportWithExec(
 	peers ...config.FleetSSHPeer,
 ) *sshFleetTransport {
 	t.Helper()
-	conns := sshfleet.NewConnectionManager(t.TempDir(), sshfleet.Config{
-		RunSSH: func(args []string) (int, error) {
-			for i, a := range args {
-				if a == "-o" && strings.HasPrefix(args[i+1], "ControlPath=") {
-					_ = os.WriteFile(
-						strings.TrimPrefix(args[i+1], "ControlPath="),
-						nil, 0o600,
-					)
-				}
-			}
-			return 0, nil
-		},
-	})
+	conns := &fakePersistentConnections{}
 	return &sshFleetTransport{
 		conns:  conns,
 		runner: sshfleet.NewRunnerWithExec(conns, exec),
@@ -378,11 +557,9 @@ func TestSSHFleetDiffWatchCancellationReachesRemoteRelay(t *testing.T) {
 	require.ErrorIs(<-done, context.Canceled)
 }
 
-// TestSSHFleetAttachSpecWrapped pins the attach contract: a peer's
-// attach-spec comes back wrapped in the hub's ControlMaster ssh
-// invocation and drops requires_local_host, so a client runs it from
-// the hub host. The hub is the single ControlMaster owner — the
-// socket path in the command is the hub's.
+// TestSSHFleetAttachSpecWrapped pins the attach contract: a peer's attach-spec
+// comes back wrapped in the hub's generation-bound ssh invocation and drops
+// requires_local_host, so a client runs it from the hub host.
 func TestSSHFleetAttachSpecWrapped(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
@@ -417,8 +594,9 @@ func TestSSHFleetAttachSpecWrapped(t *testing.T) {
 	require.NotEmpty(spec.Command)
 	assert.Equal("ssh", spec.Command[0])
 	joined := strings.Join(spec.Command, " ")
-	assert.Contains(joined, "ControlPath="+srv.sshFleet.conns.SocketPath("epyc"))
-	assert.Contains(joined, "-t wes@epyc.local")
+	assert.Contains(joined, testSSHControlPath)
+	assert.Contains(spec.Command, "-t")
+	assert.Contains(spec.Command, "wes@epyc.local")
 	assert.Contains(joined, "tmux -u attach-session -t mm-s1")
 	assert.False(spec.RequiresLocalHost,
 		"the wrapped spec runs from the hub host")
@@ -449,19 +627,7 @@ func TestSSHFleetSnapshotDegradesColdPeerFast(t *testing.T) {
 		return []byte(framedJSON(200, raw)), nil, 0, nil
 	}
 
-	conns := sshfleet.NewConnectionManager(t.TempDir(), sshfleet.Config{
-		RunSSH: func(args []string) (int, error) {
-			for i, a := range args {
-				if a == "-o" && strings.HasPrefix(args[i+1], "ControlPath=") {
-					_ = os.WriteFile(
-						strings.TrimPrefix(args[i+1], "ControlPath="),
-						nil, 0o600,
-					)
-				}
-			}
-			return 0, nil
-		},
-	})
+	conns := &fakePersistentConnections{}
 	srv, _ := setupTestServer(t)
 	setTestFleetConfig(srv, func(cfg *config.Config) {
 		cfg.Fleet.Enabled = true
@@ -558,16 +724,7 @@ func TestSSHFleetWarmupIsCanceledAndDrainedByShutdown(t *testing.T) {
 		<-release
 		return nil, nil, 1, ctx.Err()
 	}
-	conns := sshfleet.NewConnectionManager(t.TempDir(), sshfleet.Config{
-		RunSSH: func(args []string) (int, error) {
-			for i, arg := range args {
-				if arg == "-o" && strings.HasPrefix(args[i+1], "ControlPath=") {
-					_ = os.WriteFile(strings.TrimPrefix(args[i+1], "ControlPath="), nil, 0o600)
-				}
-			}
-			return 0, nil
-		},
-	})
+	conns := &fakePersistentConnections{}
 	h := New(Deps{})
 	transport := &sshFleetTransport{
 		conns: conns, runner: sshfleet.NewRunnerWithExec(conns, exec),
@@ -906,18 +1063,24 @@ while [ "$#" -gt 0 ]; do
     -o)
       shift 2
       ;;
+    -S|-p)
+      shift 2
+      ;;
     -t)
       shift
-      if [ "$#" -gt 0 ]; then
-        shift
-      fi
+      ;;
+    --)
+      shift
       break
       ;;
     *)
-      shift
+      break
       ;;
   esac
 done
+if [ "$#" -gt 0 ]; then
+  shift
+fi
 exec "$@"
 `
 	require.NoError(t, os.WriteFile(path, []byte(script), 0o755))

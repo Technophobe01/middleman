@@ -77,6 +77,13 @@ Fleet in the post-drain dependency stage (`internal/server/server.go::Server.Shu
 If any stage times out, shutdown must not advance; a later call resumes at the
 blocked stage (`internal/server/workspace_dependency_shutdown.go::workspaceDependencyShutdown`).
 
+Fleet SSH persistence belongs to `go.kenn.io/kit/openssh`; Forge consumes a
+generation-bound connection and falls back to explicit masterless SSH when mux
+is unavailable, rather than owning socket adoption or teardown policy
+(`internal/sshfleet/connection.go::Connection`).
+Masterless mode has no persistent lifecycle state, so Forge derives its host
+state and events from relay outcomes (`internal/server/fleetapi/fleet_ssh.go::sshFleetTransport.setMasterlessState`).
+
 ## Tmux Persistence Rules
 
 Persisted tmux-backed runtime rows are only valid while the backing tmux session
