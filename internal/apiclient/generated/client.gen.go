@@ -2637,20 +2637,22 @@ type LocalSyncCeilingStatus struct {
 // MergePRBody defines model for MergePRBody.
 type MergePRBody struct {
 	// Schema A URL to the JSON Schema for this object.
-	Schema  *string `json:"$schema,omitempty"`
-	Merged  bool    `json:"merged"`
-	Message string  `json:"message"`
-	Sha     string  `json:"sha"`
+	Schema                  *string `json:"$schema,omitempty"`
+	Merged                  bool    `json:"merged"`
+	Message                 string  `json:"message"`
+	Sha                     string  `json:"sha"`
+	WorkspaceCleanupWarning *string `json:"workspace_cleanup_warning,omitempty"`
 }
 
 // MergePRInputBody defines model for MergePRInputBody.
 type MergePRInputBody struct {
 	// Schema A URL to the JSON Schema for this object.
-	Schema          *string `json:"$schema,omitempty"`
-	CommitMessage   string  `json:"commit_message"`
-	CommitTitle     string  `json:"commit_title"`
-	ExpectedHeadSha *string `json:"expected_head_sha,omitempty"`
-	Method          string  `json:"method"`
+	Schema            *string `json:"$schema,omitempty"`
+	CommitMessage     string  `json:"commit_message"`
+	CommitTitle       string  `json:"commit_title"`
+	DeleteWorkspaceId *string `json:"delete_workspace_id,omitempty"`
+	ExpectedHeadSha   *string `json:"expected_head_sha,omitempty"`
+	Method            string  `json:"method"`
 }
 
 // MergeRequest defines model for MergeRequest.

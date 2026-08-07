@@ -972,6 +972,7 @@
     {client}
     roborevBaseUrl="/api/roborev"
     onError={(msg) => showFlash(msg, { tone: "danger" })}
+    onWarning={(msg) => showFlash(msg, { tone: "warning" })}
     onNotification={showFlash}
     onNavigate={(e, options) => {
       const path = typeof e === "string" ? e : e.path;

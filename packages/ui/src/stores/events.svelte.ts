@@ -97,6 +97,7 @@ export interface DeferredMergeCompletedEvent {
   message?: string;
   error?: string;
   completed_at: string;
+  workspace_cleanup_warning?: string;
 }
 
 export interface EventsStoreOptions {

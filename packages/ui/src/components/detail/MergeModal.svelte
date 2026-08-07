@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { Button, Modal } from "@kenn-io/kit-ui";
+  import { Button, Checkbox, Modal } from "@kenn-io/kit-ui";
   import { onMount, untrack } from "svelte";
 
   import {
@@ -44,10 +44,12 @@
      * queue) and the modal offers an immediate merge instead.
      */
     alreadyQueued?: boolean;
+    /** Exact workspace to delete after a successful merge. */
+    workspaceId?: string | undefined;
     /** Warning shown when the configured override permits a mid-stack merge. */
     midStackWarning?: string | undefined;
     onclose: () => void;
-    onmerged: () => void;
+    onmerged: (cleanupWarning?: string) => void;
     /** Called when a deferred merge was accepted and now waits on CI. */
     onqueued: () => void;
     onstateconflict?: ((
@@ -66,7 +68,7 @@
     allowSquash, allowMerge, allowRebase,
     expectedHeadSha, requireHeadPin = false, routeGeneration = 0,
     deferUntilChecksPass = false,
-    alreadyQueued = false, midStackWarning,
+    alreadyQueued = false, workspaceId, midStackWarning,
     onclose, onmerged, onqueued, onstateconflict,
   }: Props = $props();
 
@@ -91,6 +93,7 @@
     commit_message: string;
     method: Method;
     expected_head_sha?: string;
+    delete_workspace_id?: string;
   };
 
   function buildMethods(): MethodOption[] {
@@ -131,6 +134,7 @@
   let selectedMethod = $state<Method>(methods[0]?.value ?? "squash");
   let commitTitle = $state(initialCommitTitle());
   let commitMessage = $state(initialCommitMessage());
+  let deleteWorkspaceAfterMerge = $state(true);
 
   let activeMergeSubmission = $state<"deferred" | "immediate" | null>(null);
   let error = $state<string | null>(null);
@@ -141,6 +145,7 @@
       commit_title: commitTitle,
       commit_message: commitMessage,
       method: selectedMethod,
+      ...(workspaceId && deleteWorkspaceAfterMerge && { delete_workspace_id: workspaceId }),
       ...(pinnedHeadShaAtOpen !== "" && { expected_head_sha: pinnedHeadShaAtOpen }),
     };
   }
@@ -178,21 +183,24 @@
       // the request when the synced head has moved past it.
       const params = mergeParams();
       const ref = { provider, platformHost, owner, name, repoPath };
-      const { error } = await client.POST(providerItemPath("pulls", ref, deferred ? "/merge/deferred" : "/merge"), {
-        params: { path: { ...providerRouteParams(ref), number } },
-        body: params,
-      });
-      if (error) {
+      if (deferred) {
+        const { error } = await client.POST(providerItemPath("pulls", ref, "/merge/deferred"), {
+          params: { path: { ...providerRouteParams(ref), number } },
+          body: params,
+        });
         // Head-pinning conflicts close the modal: the user must
         // re-review the refreshed detail before retrying, so an
         // inline retry from this stale form would be wrong.
-        if (handleMergeError(error)) return;
-      }
-      if (deferred) {
+        if (error && handleMergeError(error)) return;
         onqueued();
         return;
       }
-      onmerged();
+      const { data, error } = await client.POST(providerItemPath("pulls", ref, "/merge"), {
+        params: { path: { ...providerRouteParams(ref), number } },
+        body: params,
+      });
+      if (error && handleMergeError(error)) return;
+      onmerged(data?.workspace_cleanup_warning);
     } catch (err) {
       showFlash(err instanceof Error ? err.message : String(err), { tone: "danger" });
     } finally {
@@ -288,6 +296,16 @@
           rows={8}
         ></textarea>
       </div>
+
+      {#if workspaceId}
+        <Checkbox
+          checked={deleteWorkspaceAfterMerge}
+          label="Delete workspace after merge"
+          onchange={(checked) => {
+            deleteWorkspaceAfterMerge = checked;
+          }}
+        />
+      {/if}
 
       {#if error}
         <p class="merge-error">{error}</p>

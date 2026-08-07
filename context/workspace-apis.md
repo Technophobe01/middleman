@@ -150,7 +150,7 @@ embedder protocol for arbitrary host state.
     deletion queues and replays only if every concurrent deletion fails — one
     success closes admission permanently, and a dropped replay would strand an
     accepted retry in "creating"
-    (`internal/server/workspaceapi/routes_handlers.go::Handler.deleteWorkspace`).
+    (`internal/server/workspaceapi/routes_handlers.go::Handler.DeleteWorkspace`).
   - Setup rejects occupied destinations before clone/fetch and again under the
     repo lock before mutation. Branch creation and failed-add cleanup use ref
     compare-and-swap so changed branches survive (`internal/workspace/manager.go::createBranchAndAddWorktree`).

@@ -6109,6 +6109,7 @@ export interface components {
             merged: boolean;
             message: string;
             sha: string;
+            workspace_cleanup_warning?: string;
         };
         MergePRInputBody: {
             /**
@@ -6119,6 +6120,7 @@ export interface components {
             readonly $schema?: string;
             commit_message: string;
             commit_title: string;
+            delete_workspace_id?: string;
             expected_head_sha?: string;
             method: string;
         };

@@ -26985,12 +26985,57 @@ func TestWorkspaceDeleteDirtyKeepsRuntimeSessionsE2E(t *testing.T) {
 	assert.Len(srv.runtime.ListSessions(ws.Id), 2)
 }
 
-// TestWorkspaceListReportsCommitsAheadBehindE2E verifies that the
-// /api/v1/workspaces list response includes commits_ahead /
-// commits_behind for ready workspaces, computed against the worktree's
-// `@{upstream}` tracking branch. The sidebar's push-state pills depend
-// on these fields, so a regression here would silently turn the pills
-// off without any test failure at the unit-test layer.
+func pinWorkspaceMergeRequestForReview(
+	t *testing.T,
+	ctx context.Context,
+	database *db.DB,
+	ws *generated.WorkspaceResponse,
+) string {
+	t.Helper()
+	headSHA := gitOutput(t, ws.WorktreePath, "rev-parse", "HEAD")
+	baseSHA := gitOutput(t, ws.WorktreePath, "rev-parse", "refs/heads/main")
+	mr, err := database.GetMergeRequest(
+		ctx, "github", "github.com", "acme", "widget", 1,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, mr)
+	require.NoError(t, database.UpdatePlatformSHAs(
+		ctx, mr.RepoID, mr.Number, headSHA, baseSHA,
+	))
+	require.NoError(t, database.UpdateDiffSHAs(
+		ctx, mr.RepoID, mr.Number, headSHA, baseSHA, baseSHA,
+	))
+	return headSHA
+}
+
+func TestMergeWorkspaceCleanupDeletesWorkspaceAfterConfirmedMerge(t *testing.T) {
+	client, database, _, _, srv := setupTestServerWithWorkspacesServer(t, nil)
+	ctx := t.Context()
+	ws := createReadyWorkspace(t, ctx, client)
+	headSHA := pinWorkspaceMergeRequestForReview(t, ctx, database, ws)
+
+	rr := doJSON(t, srv, http.MethodPost, "/api/v1/pulls/github/acme/widget/1/merge", map[string]any{
+		"commit_title":        "merge title",
+		"commit_message":      "merge body",
+		"method":              "squash",
+		"expected_head_sha":   headSHA,
+		"delete_workspace_id": ws.Id,
+	})
+
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	var response struct {
+		Merged                  bool   `json:"merged"`
+		WorkspaceCleanupWarning string `json:"workspace_cleanup_warning"`
+	}
+	require.NoError(t, json.NewDecoder(rr.Body).Decode(&response))
+	assert.True(t, response.Merged)
+	assert.Empty(t, response.WorkspaceCleanupWarning)
+	stored, err := database.GetWorkspace(ctx, ws.Id)
+	require.NoError(t, err)
+	assert.Nil(t, stored)
+	_, err = os.Stat(ws.WorktreePath)
+	assert.ErrorIs(t, err, os.ErrNotExist)
+}
 
 func TestWorkspaceDiffCacheHitReturnsWhileGitCapacityIsHeldE2E(t *testing.T) {
 	require := require.New(t)

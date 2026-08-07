@@ -24,3 +24,6 @@ supersession, completion events, or pending-state presentation.
 - Closing the pull request is the user's only cancel for a queued deferred
   merge; queueing a second one returns 409 `already_pending`, so the UI must
   not offer deferred actions while `deferred_merge_pending` is true.
+- Deferred merge requests retain the selected workspace ID; only a successful
+  provider merge reaches non-force deletion
+  (`internal/server/pullapi/deferred_merge.go::completeDeferredMerge`).

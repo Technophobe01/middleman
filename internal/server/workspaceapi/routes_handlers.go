@@ -151,7 +151,7 @@ type getWorkspaceRuntimeSessionAttachSpecInput struct {
 	SessionKey string `path:"session_key"`
 }
 
-type deleteWorkspaceInput struct {
+type DeleteWorkspaceInput struct {
 	ID    string `path:"id"`
 	Force bool   `query:"force"`
 }
@@ -2442,12 +2442,9 @@ func workspaceRuntimeLaunchError(err error) error {
 	return httpapi.Internal("launch session: " + msg)
 }
 
-// deleteWorkspace tears down a kenn-forge-managed workspace.
-//
-// This exists to remove the persisted workspace entry plus its managed local
-// resources. It is not intended to delete arbitrary worktrees on disk.
-func (s *Handler) deleteWorkspace(
-	ctx context.Context, input *deleteWorkspaceInput,
+// DeleteWorkspace tears down a kenn-forge-managed workspace.
+func (s *Handler) DeleteWorkspace(
+	ctx context.Context, input *DeleteWorkspaceInput,
 ) (*struct{}, error) {
 	if s.workspaces == nil {
 		return nil, httpapi.ServiceUnavailable("workspace manager not configured")

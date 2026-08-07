@@ -3889,6 +3889,8 @@ components:
           type: string
         sha:
           type: string
+        workspace_cleanup_warning:
+          type: string
       required:
         - merged
         - sha
@@ -3907,6 +3909,8 @@ components:
         commit_message:
           type: string
         commit_title:
+          type: string
+        delete_workspace_id:
           type: string
         expected_head_sha:
           type: string

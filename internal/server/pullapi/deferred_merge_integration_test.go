@@ -182,6 +182,7 @@ func (p *deferredMergeTestProvider) MergeMergeRequest(
 
 type deferredMergeTestOptions struct {
 	deferredMergeMaxWait time.Duration
+	deleteWorkspace      func(context.Context, string) error
 }
 
 type deferredMergeTestRecordedEvent struct {
@@ -214,8 +215,16 @@ func newDeferredMergeHTTPFixture(
 	syncer *ghclient.Syncer,
 	now time.Time,
 	maxWait time.Duration,
+	options ...deferredMergeTestOptions,
 ) (*deferredMergeRouteServer, *apiclient.Client) {
 	t.Helper()
+	opts := deferredMergeTestOptions{deferredMergeMaxWait: maxWait}
+	if len(options) > 0 {
+		opts = options[0]
+		if opts.deferredMergeMaxWait <= 0 {
+			opts.deferredMergeMaxWait = maxWait
+		}
+	}
 
 	events := make(chan deferredMergeTestRecordedEvent, 64)
 	resolver := httpapi.NewRepositoryResolver(httpapi.RepositoryResolverDeps{
@@ -228,8 +237,9 @@ func newDeferredMergeHTTPFixture(
 		DB:                   database,
 		Resolver:             resolver,
 		Syncer:               syncer,
+		DeleteWorkspace:      opts.deleteWorkspace,
 		Now:                  func() time.Time { return now },
-		DeferredMergeMaxWait: maxWait,
+		DeferredMergeMaxWait: opts.deferredMergeMaxWait,
 		Broadcast: func(event Event) uint64 {
 			events <- deferredMergeTestRecordedEvent{Event: event}
 			return 0
@@ -320,6 +330,7 @@ func newDeferredMergeRouteServer(
 		syncer,
 		now,
 		opts.deferredMergeMaxWait,
+		opts,
 	)
 	return srv, database, repoID, client
 }
@@ -415,9 +426,23 @@ func TestDeferMergeEndpointQueuesMergeAndBroadcastsCompletion(t *testing.T) {
 		},
 	)
 	t.Cleanup(syncer.Stop)
-	srv, client := newDeferredMergeHTTPFixture(t, database, syncer, now, 0)
+	var deletedID string
+	srv, client := newDeferredMergeHTTPFixture(
+		t,
+		database,
+		syncer,
+		now,
+		0,
+		deferredMergeTestOptions{
+			deleteWorkspace: func(_ context.Context, id string) error {
+				deletedID = id
+				return errors.New("workspace has uncommitted changes: notes.txt")
+			},
+		},
+	)
 	events, _ := srv.Hub().Subscribe(ctx, false)
 	expectedHeadSHA := "head-sha"
+	workspaceID := "ws-1"
 
 	resp, err := client.HTTP.DeferMergePullOnHostWithResponse(
 		ctx,
@@ -427,10 +452,11 @@ func TestDeferMergeEndpointQueuesMergeAndBroadcastsCompletion(t *testing.T) {
 		ref.Name,
 		7,
 		generated.MergePRInputBody{
-			CommitTitle:     "Merge title",
-			CommitMessage:   "Merge body",
-			Method:          "squash",
-			ExpectedHeadSha: &expectedHeadSHA,
+			CommitTitle:       "Merge title",
+			CommitMessage:     "Merge body",
+			Method:            "squash",
+			ExpectedHeadSha:   &expectedHeadSHA,
+			DeleteWorkspaceId: &workspaceID,
 		},
 	)
 	require.NoError(err)
@@ -470,6 +496,8 @@ func TestDeferMergeEndpointQueuesMergeAndBroadcastsCompletion(t *testing.T) {
 	require.True(completed.Merged)
 	require.Equal("merge-sha", completed.SHA)
 	require.Equal("2026-06-15T12:00:00Z", completed.CompletedAt)
+	require.Equal("workspace has uncommitted changes: notes.txt", completed.Warning)
+	require.Equal("ws-1", deletedID)
 
 	stored, err := database.GetMergeRequestByRepoIDAndNumber(ctx, repoID, 7)
 	require.NoError(err)

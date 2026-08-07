@@ -97,6 +97,7 @@
     getActivitySelection?: () => RoutedItemRef | null;
     roborevBaseUrl?: string;
     onError?: (msg: string) => void;
+    onWarning?: (msg: string) => void;
     onNotification?: (msg: string) => void;
     stores?: StoreInstances | undefined;
     children?: import("svelte").Snippet;
@@ -120,6 +121,7 @@
     getActivitySelection = () => null,
     roborevBaseUrl = undefined,
     onError = undefined,
+    onWarning = undefined,
     onNotification = undefined,
     stores = $bindable(),
     children,
@@ -142,6 +144,7 @@
     getSelectedActivity: () => RoutedItemRef | null,
     roborevBase: string | undefined,
     errorCb: ((msg: string) => void) | undefined,
+    warningCb: ((msg: string) => void) | undefined,
     notificationCb: ((msg: string) => void) | undefined,
   ): StoreInstances {
     const grouping = createGroupingStore();
@@ -378,7 +381,13 @@
           );
         }
         if (event.status === "merged") {
-          notificationCb?.(`${event.owner}/${event.name}#${event.number} merged after CI passed.`);
+          if (event.workspace_cleanup_warning) {
+            warningCb?.(
+              `${event.owner}/${event.name}#${event.number} merged, but the workspace was not pruned: ${event.workspace_cleanup_warning}`,
+            );
+          } else {
+            notificationCb?.(`${event.owner}/${event.name}#${event.number} merged after CI passed.`);
+          }
         } else {
           errorCb?.(
             `Deferred merge for ${event.owner}/${event.name}#${event.number} failed: ${event.error ?? "checks did not pass"}`,
@@ -480,7 +489,7 @@
     onNavigate, onEvent, prepareRoute,
     onWorkspaceCommand,
     sidebar, getPage, getActivitySelection,
-    roborevBaseUrl, onError, onNotification,
+    roborevBaseUrl, onError, onWarning, onNotification,
   );
 
   onDestroy(() => {

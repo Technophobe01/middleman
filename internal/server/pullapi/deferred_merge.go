@@ -73,6 +73,7 @@ type DeferredMergeCompletedPayload struct {
 	Message      string `json:"message,omitempty"`
 	Error        string `json:"error,omitempty"`
 	CompletedAt  string `json:"completed_at"`
+	Warning      string `json:"workspace_cleanup_warning,omitempty"`
 }
 
 func (s *Handler) deferMergePR(
@@ -422,6 +423,7 @@ func (s *Handler) completeDeferredMerge(
 			SHA:          result.SHA,
 			Message:      result.Message,
 			CompletedAt:  formatUTCRFC3339(s.now().UTC()),
+			Warning:      result.WorkspaceCleanupWarning,
 		},
 	})
 }

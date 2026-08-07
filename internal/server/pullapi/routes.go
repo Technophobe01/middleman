@@ -295,13 +295,15 @@ type mergePRInputBody struct {
 	// ExpectedHeadSHA is the reviewed diff head the client rendered.
 	// For head-binding providers, merge rejects missing, stale, or
 	// mismatched reviewed-head assertions before provider mutation.
-	ExpectedHeadSHA string `json:"expected_head_sha,omitempty"`
+	ExpectedHeadSHA   string `json:"expected_head_sha,omitempty"`
+	DeleteWorkspaceID string `json:"delete_workspace_id,omitempty"`
 }
 
 type mergePRBody struct {
-	Merged  bool   `json:"merged"`
-	SHA     string `json:"sha"`
-	Message string `json:"message"`
+	Merged                  bool   `json:"merged"`
+	SHA                     string `json:"sha"`
+	Message                 string `json:"message"`
+	WorkspaceCleanupWarning string `json:"workspace_cleanup_warning,omitempty"`
 }
 
 type mergePROutput = httpapi.BodyOutput[mergePRBody]
@@ -1684,6 +1686,10 @@ func (s *Handler) mergePRWithBody(
 	// (A deferred worker completing through this same path supersedes its
 	// own handle, which is a no-op by the time it broadcasts completion.)
 	s.supersedeDeferredMerge(deferredMergeKey(*repo, number))
+	workspaceCleanupWarning := ""
+	if result.Merged {
+		workspaceCleanupWarning = s.cleanupMergedWorkspace(ctx, body.DeleteWorkspaceID)
+	}
 
 	// The eager state write above suppresses the sync-side open->closed
 	// transition — the path that records who merged. Backfill the authored
@@ -1732,9 +1738,10 @@ func (s *Handler) mergePRWithBody(
 	})
 
 	return mergePRBody{
-		Merged:  result.Merged,
-		SHA:     result.SHA,
-		Message: result.Message,
+		Merged:                  result.Merged,
+		SHA:                     result.SHA,
+		Message:                 result.Message,
+		WorkspaceCleanupWarning: workspaceCleanupWarning,
 	}, nil
 }
 

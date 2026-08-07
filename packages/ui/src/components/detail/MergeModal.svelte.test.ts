@@ -202,6 +202,7 @@ describe("MergeModal head pinning", () => {
     const onqueued = vi.fn();
     renderModal(post, {
       deferUntilChecksPass: true,
+      workspaceId: "ws-1",
       onclose,
       onqueued,
     });
@@ -212,6 +213,7 @@ describe("MergeModal head pinning", () => {
     const [path, init] = post.mock.calls[0];
     expect(path).toBe("/pulls/{provider}/{owner}/{name}/{number}/merge/deferred");
     expect(init.body.method).toBe("squash");
+    expect(init.body.delete_workspace_id).toBe("ws-1");
     expect(onqueued).toHaveBeenCalledTimes(1);
     expect(onclose).not.toHaveBeenCalled();
   });
@@ -286,5 +288,43 @@ describe("MergeModal head pinning", () => {
     const [path] = post.mock.calls[0];
     expect(path).toBe("/pulls/{provider}/{owner}/{name}/{number}/merge/deferred");
     expect(onqueued).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows a checked cleanup option only when the pull request has a workspace", () => {
+    const post = vi.fn();
+    const withoutWorkspace = renderModal(post);
+
+    expect(screen.queryByRole("checkbox", { name: "Delete workspace after merge" })).toBeNull();
+    withoutWorkspace.unmount();
+
+    renderModal(post, { workspaceId: "ws-1" });
+    const checkbox = screen.getByRole<HTMLInputElement>("checkbox", { name: "Delete workspace after merge" });
+    expect(checkbox.checked).toBe(true);
+  });
+
+  it("omits the workspace ID when cleanup is unchecked", async () => {
+    const post = vi.fn().mockResolvedValue({ data: {}, error: undefined, response: new Response("{}") });
+    renderModal(post, { workspaceId: "ws-1" });
+    await fireEvent.click(screen.getByRole("checkbox", { name: "Delete workspace after merge" }));
+
+    await confirmMerge();
+
+    await waitFor(() => expect(post).toHaveBeenCalledTimes(1));
+    const [, init] = post.mock.calls[0];
+    expect(init.body).not.toHaveProperty("delete_workspace_id");
+  });
+
+  it("passes an immediate cleanup warning to the merged callback", async () => {
+    const post = vi.fn().mockResolvedValue({
+      data: { workspace_cleanup_warning: "workspace has uncommitted changes" },
+      error: undefined,
+      response: new Response("{}"),
+    });
+    const onmerged = vi.fn();
+    renderModal(post, { workspaceId: "ws-1", onmerged });
+
+    await confirmMerge();
+
+    await waitFor(() => expect(onmerged).toHaveBeenCalledWith("workspace has uncommitted changes"));
   });
 });

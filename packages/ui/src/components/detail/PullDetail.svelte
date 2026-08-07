@@ -2683,6 +2683,7 @@
           routeGeneration={mutationRouteGeneration}
           deferUntilChecksPass={shouldDeferMergeForCI(p.CIStatus, p.CIChecksJSON)}
           alreadyQueued={deferredMergePending}
+          workspaceId={d.workspace?.id}
           midStackWarning={midStackBlocker
             ? `This is stack position ${d.stack?.position ?? "?"} of ${d.stack?.size ?? "?"}. Branch #${midStackBlocker.number} below it has not been merged.`
             : undefined}
@@ -2698,8 +2699,14 @@
               repoPath,
             });
           }}
-          onmerged={() => {
+          onmerged={(cleanupWarning: string | undefined) => {
             showMergeModal = false;
+            if (cleanupWarning) {
+              showFlash(
+                `Pull request merged, but the workspace was not pruned: ${cleanupWarning}`,
+                { tone: "warning" },
+              );
+            }
             void detailStore.loadDetail(owner, name, number, {
               provider,
               platformHost,
