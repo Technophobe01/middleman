@@ -21,7 +21,7 @@ import {
 import { getStackDepth } from "@kenn-forge/ui/stores/keyboard/modal-stack";
 import { getPaneLayoutStore, resetPaneLayoutStoresForTest } from "@kenn-forge/ui/stores/paneLayout";
 import { clearSessionFocusRequest, getSessionSlotElement, requestSessionFocus } from "./session-host.svelte.ts";
-import { forgetWorkspaceRoute, getRoute, navigate } from "./router.svelte.ts";
+import { forgetWorkspaceRoute, getRoute, navigate, replaceUrl } from "./router.svelte.ts";
 
 export type HostedWorkspaceKey = { workspaceId: string; hostKey: string | undefined };
 export type HostSlot = "tab" | InlineWorkspaceSurface;
@@ -476,6 +476,10 @@ export function notifyWorkspaceDeleted(workspaceId: string, hostKey?: string, id
   // The Workspaces tab restores the last /terminal route; it must not
   // restore one whose workspace was just deleted.
   forgetWorkspaceRoute(workspaceId, hostKey);
+  const route = getRoute();
+  if (route.page === "terminal" && route.workspaceId === workspaceId && route.hostKey === hostKey) {
+    replaceUrl("/workspaces");
+  }
 }
 
 /**

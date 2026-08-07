@@ -478,6 +478,24 @@ describe("workspace host store", () => {
     expect(getLastWorkspaceRoute()).toBe("/workspaces");
   });
 
+  it("leaves a deleted active workspace route for the Workspaces list", () => {
+    navigate("/terminal/ws-a");
+    const historyLength = history.length;
+
+    notifyWorkspaceDeleted("ws-a");
+
+    expect(history.length).toBe(historyLength);
+    expect(desiredKey()).toEqual({ workspaceId: "", hostKey: undefined });
+  });
+
+  it("keeps an unrelated active workspace route after deletion", () => {
+    navigate("/terminal/ws-b");
+
+    notifyWorkspaceDeleted("ws-a");
+
+    expect(desiredKey()).toEqual({ workspaceId: "ws-b", hostKey: undefined });
+  });
+
   it("fleet deletion matches the host key and leaves local claims alone", () => {
     const prs = getInlineWorkspaceController("prs");
     prs.claim(identityA, refA); // local ws-a claim
