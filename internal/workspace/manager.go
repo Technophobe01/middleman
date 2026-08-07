@@ -54,6 +54,10 @@ type Manager struct {
 	deletedSummaryIDs         map[string]bool
 	worktreeBaseResolver      WorktreeBasePathResolver
 	afterHeadRepoSnapshotRead func()
+	// beforeExistingWorktreeRepoLock runs after reuse pre-validation and right
+	// before acquiring the repository lock; tests use it to coordinate a path
+	// replacement while lock acquisition is blocked.
+	beforeExistingWorktreeRepoLock func()
 	// beforeSetupRouteRevalidation runs right before setup's final route
 	// re-validation; tests use it to interleave a route replacement.
 	beforeSetupRouteRevalidation func()
@@ -1332,6 +1336,9 @@ func (m *Manager) reuseExistingWorkspaceWorktree(
 	}
 	if !reusable {
 		return "", false, nil
+	}
+	if m.beforeExistingWorktreeRepoLock != nil {
+		m.beforeExistingWorktreeRepoLock()
 	}
 	var branch string
 	if err := m.withRepoLockForGitDir(ctx, commonDir, func() error {
@@ -3748,8 +3755,9 @@ func filterDeletedWorkspaceSummaries(
 }
 
 // ReapOrphanTmuxSessions kills kenn-forge-managed tmux sessions that no longer
-// correspond to any workspace row. This is a conservative startup cleanup for
-// stale sessions left behind by crashes or previous bugs.
+// correspond to any durable workspace, host, or project-worktree row. This is
+// a conservative startup cleanup for stale sessions left behind by crashes or
+// previous bugs.
 func (m *Manager) ReapOrphanTmuxSessions(ctx context.Context) error {
 	workspaces, err := m.db.ListWorkspaces(ctx)
 	if err != nil {
@@ -3771,6 +3779,24 @@ func (m *Manager) ReapOrphanTmuxSessions(ctx context.Context) error {
 			live[stored.TmuxSession] = true
 		}
 	}
+	hostSessions, err := m.db.ListHostRuntimeTmuxSessions(ctx)
+	if err != nil {
+		return err
+	}
+	for _, stored := range hostSessions {
+		if stored.SessionName != "" {
+			live[stored.SessionName] = true
+		}
+	}
+	projectSessions, err := m.db.ListAllProjectWorktreeTmuxSessions(ctx)
+	if err != nil {
+		return err
+	}
+	for _, stored := range projectSessions {
+		if stored.SessionName != "" {
+			live[stored.SessionName] = true
+		}
+	}
 
 	sessions, err := m.listTmuxSessionInfos(ctx)
 	if err != nil {
@@ -3780,7 +3806,7 @@ func (m *Manager) ReapOrphanTmuxSessions(ctx context.Context) error {
 		return err
 	}
 	for _, session := range sessions {
-		if !isForgeWorkspaceTmuxSessionName(session.name) {
+		if !isForgeOwnedTmuxSessionName(session.name) {
 			continue
 		}
 		if live[session.name] {
@@ -3885,16 +3911,18 @@ func isWorkspaceTmuxSessionName(session string) bool {
 	return false
 }
 
-func isForgeWorkspaceTmuxSessionName(session string) bool {
+func isForgeOwnedTmuxSessionName(session string) bool {
 	if isWorkspaceTmuxSessionName(session) {
 		return true
 	}
 	for _, prefix := range []string{"forge-", "middleman-"} {
-		if len(session) == len(prefix)+16+1+16 &&
-			strings.HasPrefix(session, prefix) &&
-			session[len(prefix)+16] == '-' &&
-			isLowerHex(session[len(prefix):len(prefix)+16]) &&
-			isLowerHex(session[len(prefix)+17:]) {
+		if !strings.HasPrefix(session, prefix) {
+			continue
+		}
+		scopeAndKey := session[len(prefix):]
+		separator := len(scopeAndKey) - 17
+		if separator > 0 && scopeAndKey[separator] == '-' &&
+			isLowerHex(scopeAndKey[separator+1:]) {
 			return true
 		}
 	}

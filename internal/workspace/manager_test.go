@@ -1628,6 +1628,77 @@ func TestSetupReusesExistingWorkspaceWorktree(t *testing.T) {
 	assert.Contains(argvs[0], ws.WorktreePath)
 }
 
+func TestReuseExistingWorkspaceWorktreeRechecksSymlinkAfterLock(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	d := openTestDB(t)
+	wtDir := t.TempDir()
+
+	localRepo, _, platformHost := setupHTTPWorktreeBaseForWorkspaceGitTest(
+		t, "feature/thing",
+	)
+	repoID := seedRepo(t, d, platformHost, "acme", "widget")
+	seedMR(t, d, repoID, 42, "feature/thing")
+
+	mgr := NewManager(d, wtDir)
+	mgr.SetWorktreeBasePathResolver(staticBaseResolver(localRepo))
+	readyForRepoLock := make(chan struct{})
+	mgr.beforeExistingWorktreeRepoLock = func() {
+		close(readyForRepoLock)
+	}
+	ws, err := mgr.Create(t.Context(), "github", platformHost, "acme", "widget", 42)
+	require.NoError(err)
+	existingBranch := syntheticPRWorktreeBranch(42)
+	runWorkspaceTestGit(
+		t, localRepo,
+		"worktree", "add", ws.WorktreePath, "-b", existingBranch, "HEAD",
+	)
+	metadataDir, err := worktreeGitDir(t.Context(), ws.WorktreePath)
+	require.NoError(err)
+
+	lockRoot := mgr.localWorktreeBaseLockRoot(localRepo)
+	require.NoError(os.MkdirAll(lockRoot, 0o755))
+	held, err := mgr.locks.Acquire(t.Context(), lockRoot)
+	require.NoError(err)
+	type reuseResult struct {
+		reused bool
+		err    error
+	}
+	done := make(chan reuseResult, 1)
+	go func() {
+		_, reused, reuseErr := mgr.reuseExistingWorkspaceWorktree(t.Context(), ws)
+		done <- reuseResult{reused: reused, err: reuseErr}
+	}()
+
+	select {
+	case <-readyForRepoLock:
+	case result := <-done:
+		require.FailNowf(
+			"worktree reuse completed before repository lock acquisition",
+			"reused=%t err=%v", result.reused, result.err,
+		)
+	case <-time.After(5 * time.Second):
+		require.FailNow("worktree reuse did not reach repository lock acquisition")
+	}
+	targetPath := filepath.Join(wtDir, "replacement-target")
+	require.NoError(os.Rename(ws.WorktreePath, targetPath))
+	require.NoError(os.Symlink(targetPath, ws.WorktreePath))
+	require.NoError(held.Unlock())
+
+	select {
+	case result := <-done:
+		require.Error(result.err)
+		assert.False(result.reused)
+	case <-time.After(5 * time.Second):
+		require.FailNow("worktree reuse did not finish after lock release")
+	}
+	pathInfo, err := os.Lstat(ws.WorktreePath)
+	require.NoError(err)
+	assert.NotZero(pathInfo.Mode() & os.ModeSymlink)
+	_, err = os.Lstat(filepath.Join(metadataDir, workspaceOwnershipMarkerFile))
+	assert.ErrorIs(err, os.ErrNotExist)
+}
+
 // A retried setup must recognize the uniquified synthetic branch as its own,
 // otherwise the workspace whose first attempt hit a name collision can never be
 // set up again.
@@ -5087,6 +5158,10 @@ func TestManagerReapOrphanTmuxSessionsKeepsStoredRuntimeSessions(
 		`  if [ "$a" = "list-sessions" ]; then` + "\n" +
 		`    printf 'middleman-0000000000000001:%s\n' "$KENN_FORGE_TMUX_OWNER"` + "\n" +
 		`    printf 'middleman-0000000000000001-57de4cf40144bdf7:%s\n' "$KENN_FORGE_TMUX_OWNER"` + "\n" +
+		`    printf '%s:%s\n' "$STORED_HOST_SESSION" "$KENN_FORGE_TMUX_OWNER"` + "\n" +
+		`    printf '%s:%s\n' "$STORED_PROJECT_SESSION" "$KENN_FORGE_TMUX_OWNER"` + "\n" +
+		`    printf '%s:%s\n' "$ORPHAN_HOST_SESSION" "$KENN_FORGE_TMUX_OWNER"` + "\n" +
+		`    printf '%s:%s\n' "$ORPHAN_PROJECT_SESSION" "$KENN_FORGE_TMUX_OWNER"` + "\n" +
 		`    printf 'forge-aaaaaaaaaaaaaaaa-c857d09db23e6822:%s\n' "$KENN_FORGE_TMUX_OWNER"` + "\n" +
 		`    exit 0` + "\n" +
 		`  fi` + "\n" +
@@ -5099,6 +5174,10 @@ func TestManagerReapOrphanTmuxSessionsKeepsStoredRuntimeSessions(
 	mgr := NewManager(d, t.TempDir())
 	mgr.SetTmuxCommand([]string{script, "wrap"})
 	t.Setenv("KENN_FORGE_TMUX_OWNER", mgr.tmuxOwnerMarker())
+	storedHostSession := "forge-host-1111111111111111"
+	orphanHostSession := "forge-host-2222222222222222"
+	t.Setenv("STORED_HOST_SESSION", storedHostSession)
+	t.Setenv("ORPHAN_HOST_SESSION", orphanHostSession)
 
 	require.NoError(d.InsertWorkspace(context.Background(), &Workspace{
 		ID:           "0000000000000001",
@@ -5117,6 +5196,37 @@ func TestManagerReapOrphanTmuxSessionsKeepsStoredRuntimeSessions(
 		"codex", "middleman-0000000000000001-57de4cf40144bdf7",
 		time.Time{},
 	)
+	require.NoError(d.UpsertHostRuntimeTmuxSession(
+		context.Background(), &db.HostRuntimeTmuxSession{
+			SessionKey:  "host-live",
+			SessionName: storedHostSession,
+		},
+	))
+	project, err := d.CreateProject(context.Background(), db.CreateProjectInput{
+		DisplayName: "runtime-project",
+		LocalPath:   filepath.Join(t.TempDir(), "project"),
+	})
+	require.NoError(err)
+	worktree, err := d.CreateProjectWorktree(
+		context.Background(), db.CreateProjectWorktreeInput{
+			ProjectID: project.ID,
+			Branch:    "feature/runtime",
+			Path:      filepath.Join(t.TempDir(), "worktree"),
+		},
+	)
+	require.NoError(err)
+	storedProjectSession := "forge-project-worktree-" + worktree.ID +
+		"-3333333333333333"
+	orphanProjectSession := "forge-project-worktree-unrecorded-4444444444444444"
+	t.Setenv("STORED_PROJECT_SESSION", storedProjectSession)
+	t.Setenv("ORPHAN_PROJECT_SESSION", orphanProjectSession)
+	require.NoError(d.UpsertProjectWorktreeTmuxSession(
+		context.Background(), &db.ProjectWorktreeTmuxSession{
+			WorktreeID:  worktree.ID,
+			SessionKey:  "project-live",
+			SessionName: storedProjectSession,
+		},
+	))
 
 	require.NoError(mgr.ReapOrphanTmuxSessions(context.Background()))
 
@@ -5125,9 +5235,21 @@ func TestManagerReapOrphanTmuxSessionsKeepsStoredRuntimeSessions(
 		"wrap", "kill-session", "-t",
 		"forge-aaaaaaaaaaaaaaaa-c857d09db23e6822",
 	})
+	assert.Contains(argvs, []string{
+		"wrap", "kill-session", "-t", orphanHostSession,
+	})
+	assert.Contains(argvs, []string{
+		"wrap", "kill-session", "-t", orphanProjectSession,
+	})
 	assert.NotContains(argvs, []string{
 		"wrap", "kill-session", "-t",
 		"middleman-0000000000000001-57de4cf40144bdf7",
+	})
+	assert.NotContains(argvs, []string{
+		"wrap", "kill-session", "-t", storedHostSession,
+	})
+	assert.NotContains(argvs, []string{
+		"wrap", "kill-session", "-t", storedProjectSession,
 	})
 }
 
