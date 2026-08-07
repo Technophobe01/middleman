@@ -3,6 +3,23 @@
 Use this document for changes to user-facing documentation, workflow
 screenshots, or the Zensical site.
 
+## Documentation Ownership
+
+- `context/` owns current internal architecture, cross-cutting invariants, and
+  maintainer constraints; update or remove each rule with its implementation.
+- Staged Zensical pages under `docs/`, including `docs/workflows/`, own current
+  user and maintainer workflows, not internal architecture or API detail.
+- Promote rationale to an ADR only when it explains a constraint that still
+  binds current code and is not derivable from it; reports retain reproducible
+  outcomes.
+- Do not retain completed plans or design specs, superseded proposals, review
+  notes, prototype comparisons, or rollout narratives after extracting current
+  contracts.
+- Verify candidate documentation against implementation and tests before
+  promoting it into living documentation.
+
+## Authoring Conventions
+
 - Keep user guidance concise and workflow-oriented: describe UI capabilities
   and maintainer workflows without overexplaining internals. Treat the HTTP API
   as an internal or thin-client concern rather than regular user guidance.
