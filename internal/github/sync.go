@@ -1,7 +1,9 @@
 package github
 
 import (
+	"container/list"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -48,6 +50,36 @@ func withCommitOrderMetadata(metadataJSON string, listOrder int, stableOrder int
 		return metadataJSON
 	}
 	return string(encoded)
+}
+
+// withObsoleteMetadata records whether a commit event's commit is still
+// reachable from the merge request head. Unchanged input returns the original
+// JSON so callers can skip rewriting untouched rows.
+func withObsoleteMetadata(metadataJSON string, obsolete bool) (string, bool) {
+	metadata := map[string]any{}
+	if metadataJSON != "" {
+		var existing map[string]any
+		if err := json.Unmarshal([]byte(metadataJSON), &existing); err == nil && existing != nil {
+			metadata = existing
+		}
+	}
+	value, present := metadata["obsolete"]
+	if obsolete {
+		if value == true {
+			return metadataJSON, false
+		}
+		metadata["obsolete"] = true
+	} else {
+		if !present {
+			return metadataJSON, false
+		}
+		delete(metadata, "obsolete")
+	}
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		return metadataJSON, false
+	}
+	return string(encoded), true
 }
 
 func commitMetadataOrder(metadataJSON string) int {
@@ -131,6 +163,275 @@ func (s *Syncer) commitOrderAssigner(ctx context.Context, mrID int64) (commitOrd
 		return commitOrderAssigner{}, err
 	}
 	return newCommitOrderAssigner(events), nil
+}
+
+// commitEventSHA returns the event's full commit SHA, or "" when neither
+// provider field contains one. PlatformExternalID covers Gitealike events,
+// whose Summary contains the commit message instead of the SHA.
+func commitEventSHA(event db.MREvent) string {
+	candidates := []string{
+		strings.ToLower(event.PlatformExternalID),
+		commitOrderSHA(event.Summary),
+	}
+	for _, sha := range candidates {
+		if len(sha) != 40 && len(sha) != 64 {
+			continue
+		}
+		valid := true
+		for _, r := range sha {
+			if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+				valid = false
+				break
+			}
+		}
+		if valid {
+			return sha
+		}
+	}
+	return ""
+}
+
+// stampableCommitEvent reports whether liveness computation may touch this
+// event: it must be a commit event with a representable full SHA and, when
+// metadata is present, that metadata must parse to a JSON object (corrupt
+// metadata is left untouched rather than clobbered).
+func stampableCommitEvent(event db.MREvent) (string, bool) {
+	if event.EventType != "commit" {
+		return "", false
+	}
+	sha := commitEventSHA(event)
+	if sha == "" {
+		return "", false
+	}
+	if event.MetadataJSON != "" {
+		var metadata map[string]any
+		if err := json.Unmarshal([]byte(event.MetadataJSON), &metadata); err != nil || metadata == nil {
+			return "", false
+		}
+	}
+	return sha, true
+}
+
+// commitLivenessMemo caches one verified reachability answer per MR.
+// Reachability from a fixed head over a fixed candidate set is a pure
+// function of immutable git history, so an entry never needs invalidation:
+// a changed head or candidate set simply misses the key and recomputes, and
+// concurrent rounds writing the same key write the same value. Only verified
+// walks are memoized — an unverifiable head proves nothing durable.
+type commitLivenessMemo struct {
+	key  string
+	live map[string]bool
+}
+
+// commitLivenessMemoEntry is the LRU list payload for one MR's memo.
+type commitLivenessMemoEntry struct {
+	mrID int64
+	memo commitLivenessMemo
+}
+
+// The memo retains provider-controlled input (candidate sets grow with every
+// force push), so it is bounded on both axes: at most defaultLivenessMemoLimit
+// MR entries with least-recently-used eviction, and results for candidate
+// sets larger than defaultLivenessCandidateLimit are computed normally but
+// never memoized. Neither bound affects flag correctness — a miss or an
+// unmemoized round only costs one budget-capped walk.
+const (
+	defaultLivenessCandidateLimit = 4096
+	defaultLivenessMemoLimit      = 1024
+)
+
+// computeCommitLiveness derives commit-obsolescence metadata for a sync round
+// BEFORE the round commits, so the results ride the round's own
+// revision-guarded snapshot write and a stale round is inert by construction.
+// It mutates the incoming batch's commit events in place (their flags travel
+// inside the normal upsert) and returns metadata updates for stored commit
+// events the round does not re-list. Unverifiable heads return no updates and
+// the affected events keep their last verified flags.
+//
+// A memo hit replaces only the ancestry walk: the verdicts still flow through
+// the same injection code, so a hit can never skip a needed write — re-listed
+// incoming events always receive their flags, and stored rows that drifted
+// are repaired.
+func (s *Syncer) computeCommitLiveness(
+	ctx context.Context,
+	repo RepoRef,
+	mrID int64,
+	headSHA string,
+	incoming []db.MREvent,
+) map[string]string {
+	if s.clones == nil || headSHA == "" {
+		return nil
+	}
+	stored, err := s.db.ListMREvents(ctx, mrID)
+	if err != nil {
+		slog.Warn("commit liveness: list events failed",
+			"repo", repo.Owner+"/"+repo.Name, "mr", mrID, "err", err)
+		return nil
+	}
+	return s.computeCommitLivenessForEvents(ctx, repo, mrID, headSHA, incoming, stored)
+}
+
+// computeCommitLivenessForEvents is the computation core behind
+// computeCommitLiveness for callers that already hold the stored events —
+// in particular the terminal-transition finalizer, which receives them from
+// the parent snapshot's own transaction so the walk runs on tx-consistent
+// data.
+func (s *Syncer) computeCommitLivenessForEvents(
+	ctx context.Context,
+	repo RepoRef,
+	mrID int64,
+	headSHA string,
+	incoming []db.MREvent,
+	stored []db.MREvent,
+) map[string]string {
+	if s.clones == nil || headSHA == "" {
+		return nil
+	}
+	headSHA = strings.ToLower(headSHA)
+
+	candidateSHAs := make([]string, 0, len(stored)+len(incoming))
+	seen := make(map[string]bool, len(stored)+len(incoming))
+	addCandidate := func(sha string) {
+		if !seen[sha] {
+			seen[sha] = true
+			candidateSHAs = append(candidateSHAs, sha)
+		}
+	}
+	for _, event := range stored {
+		if sha, ok := stampableCommitEvent(event); ok {
+			addCandidate(sha)
+		}
+	}
+	for i := range incoming {
+		if sha, ok := stampableCommitEvent(incoming[i]); ok {
+			addCandidate(sha)
+		}
+	}
+	if len(candidateSHAs) == 0 {
+		return nil
+	}
+	candidateLimit := s.livenessCandidateLimit
+	if candidateLimit <= 0 {
+		candidateLimit = defaultLivenessCandidateLimit
+	}
+	memoizable := len(candidateSHAs) <= candidateLimit
+
+	memoKey := livenessMemoKey(headSHA, candidateSHAs)
+	live, hit := s.livenessMemoLookup(mrID, memoKey)
+	if !hit {
+		reach, err := s.clones.CommitsReachableFrom(
+			ctx, string(repoPlatform(repo)), repoHost(repo),
+			repo.Owner, repo.Name, headSHA, candidateSHAs,
+		)
+		if err != nil {
+			slog.Warn("commit liveness: reachability failed",
+				"repo", repo.Owner+"/"+repo.Name, "mr", mrID, "err", err)
+			return nil
+		}
+		if !reach.HeadVerified {
+			return nil
+		}
+		live = reach.Live
+		if memoizable {
+			s.livenessMemoStore(mrID, memoKey, live)
+		}
+	}
+
+	incomingKeys := make(map[string]bool, len(incoming))
+	for i := range incoming {
+		sha, ok := stampableCommitEvent(incoming[i])
+		if !ok {
+			continue
+		}
+		incomingKeys[incoming[i].DedupeKey] = true
+		isLive, evaluated := live[sha]
+		if !evaluated {
+			continue
+		}
+		if metadataJSON, changed := withObsoleteMetadata(
+			incoming[i].MetadataJSON, !isLive,
+		); changed {
+			incoming[i].MetadataJSON = metadataJSON
+		}
+	}
+
+	updates := make(map[string]string)
+	for _, event := range stored {
+		sha, ok := stampableCommitEvent(event)
+		if !ok || incomingKeys[event.DedupeKey] {
+			continue
+		}
+		isLive, evaluated := live[sha]
+		if !evaluated {
+			continue
+		}
+		if metadataJSON, changed := withObsoleteMetadata(
+			event.MetadataJSON, !isLive,
+		); changed {
+			updates[event.DedupeKey] = metadataJSON
+		}
+	}
+	return updates
+}
+
+// livenessMemoKey hashes the walk's exact inputs: the head plus the sorted,
+// deduplicated candidate set. Any change to either produces a different key.
+func livenessMemoKey(headSHA string, candidateSHAs []string) string {
+	sorted := make([]string, len(candidateSHAs))
+	copy(sorted, candidateSHAs)
+	slices.Sort(sorted)
+	digest := sha256.New()
+	digest.Write([]byte(headSHA))
+	for _, sha := range sorted {
+		digest.Write([]byte{0})
+		digest.Write([]byte(sha))
+	}
+	return string(digest.Sum(nil))
+}
+
+func (s *Syncer) livenessMemoLookup(mrID int64, key string) (map[string]bool, bool) {
+	s.livenessMemoMu.Lock()
+	defer s.livenessMemoMu.Unlock()
+	elem, ok := s.livenessMemos[mrID]
+	if !ok {
+		return nil, false
+	}
+	entry := elem.Value.(*commitLivenessMemoEntry)
+	if entry.memo.key != key {
+		return nil, false
+	}
+	s.livenessMemoLRU.MoveToFront(elem)
+	return entry.memo.live, true
+}
+
+func (s *Syncer) livenessMemoStore(mrID int64, key string, live map[string]bool) {
+	s.livenessMemoMu.Lock()
+	defer s.livenessMemoMu.Unlock()
+	if s.livenessMemos == nil {
+		s.livenessMemos = make(map[int64]*list.Element)
+		s.livenessMemoLRU = list.New()
+	}
+	memo := commitLivenessMemo{key: key, live: live}
+	if elem, exists := s.livenessMemos[mrID]; exists {
+		elem.Value.(*commitLivenessMemoEntry).memo = memo
+		s.livenessMemoLRU.MoveToFront(elem)
+		return
+	}
+	limit := s.livenessMemoLimit
+	if limit <= 0 {
+		limit = defaultLivenessMemoLimit
+	}
+	for s.livenessMemoLRU.Len() >= limit {
+		oldest := s.livenessMemoLRU.Back()
+		if oldest == nil {
+			break
+		}
+		s.livenessMemoLRU.Remove(oldest)
+		delete(s.livenessMemos, oldest.Value.(*commitLivenessMemoEntry).mrID)
+	}
+	s.livenessMemos[mrID] = s.livenessMemoLRU.PushFront(
+		&commitLivenessMemoEntry{mrID: mrID, memo: memo},
+	)
 }
 
 func commitOrderSHA(summary string) string {
@@ -481,6 +782,11 @@ type Syncer struct {
 	archivePollInterval      time.Duration
 	now                      func() time.Time
 	clones                   *gitclone.Manager
+	livenessMemoMu           sync.Mutex
+	livenessMemos            map[int64]*list.Element // memoized verified reachability (LRU); see computeCommitLiveness
+	livenessMemoLRU          *list.List              // recency order for livenessMemos; front = most recent
+	livenessMemoLimit        int                     // max memo entries; 0 = defaultLivenessMemoLimit
+	livenessCandidateLimit   int                     // max memoizable candidate SHAs; 0 = defaultLivenessCandidateLimit
 	rateTrackers             map[string]*RateTracker // provider/host bucket -> tracker
 	writeRateTrackers        map[string]*RateTracker // provider/host bucket -> mutation-credential REST tracker
 	writeGQLRateTrackers     map[string]*RateTracker // provider/host bucket -> mutation-credential GraphQL tracker
@@ -1245,6 +1551,13 @@ func (s *Syncer) commitIssueParentSnapshot(
 // here guarantees every path that can change an MR's head_repo_clone_url fans
 // that change out to a tracking workspace's mr_head_repo — see
 // reclassifyWorkspaceHeadRepoTrust.
+// CommitMergeRequestParentSnapshot applies a provider parent snapshot. When
+// the accepted snapshot takes the merge request out of the open state, the
+// db layer detects that transition inside the snapshot transaction and runs
+// the terminal commit-liveness computation there, against the transaction's
+// own view of the stored events — finalization is intrinsic to the choke
+// point, so no caller can commit a terminal transition without it and no
+// concurrent round can shift the data between compute and commit.
 func (s *Syncer) CommitMergeRequestParentSnapshot(
 	ctx context.Context,
 	repo RepoRef,
@@ -1263,7 +1576,7 @@ func (s *Syncer) CommitMergeRequestParentSnapshot(
 	}
 	mrID, revision, accepted, err :=
 		s.db.UpsertMergeRequestSnapshotWithLabelsUnderRepositoryReconciliationRead(
-			ctx, mr,
+			ctx, mr, s.terminalLivenessComputer(ctx, repo, mr),
 		)
 	if err != nil || !accepted {
 		return mrID, revision, accepted, err
@@ -1310,9 +1623,17 @@ func (s *Syncer) commitIssueCommentsSnapshot(
 // commitMergeRequestDatasets binds the child snapshot to the parent MR ID the
 // caller fetched for — see commitIssueCommentsSnapshot for why the route must
 // not resolve the parent.
+//
+// livenessHeadSHA, when non-empty, is the open MR's current head for this
+// round: commit-obsolescence flags are computed against it and ride this same
+// revision-guarded snapshot (incoming commit events carry flags in their
+// metadata; stored events the round does not re-list are updated in the same
+// transaction). Rounds without a verifiable head commit their events without
+// liveness changes. Callers pass "" for closed MRs and for batches that carry
+// no commit events.
 func (s *Syncer) commitMergeRequestDatasets(
 	ctx context.Context,
-	_ RepoRef,
+	repo RepoRef,
 	mrID int64,
 	number int,
 	expectedRevision int64,
@@ -1324,22 +1645,71 @@ func (s *Syncer) commitMergeRequestDatasets(
 	inlineComplete bool,
 	otherEvents []db.MREvent,
 	derived *db.MRDerivedFields,
+	livenessHeadSHA string,
 ) (bool, error) {
 	for _, events := range [][]db.MREvent{comments, reviews, inline, otherEvents} {
 		for i := range events {
 			events[i].MergeRequestID = mrID
 		}
 	}
+	metadataUpdates := s.computeCommitLiveness(
+		ctx, repo, mrID, livenessHeadSHA, otherEvents,
+	)
 	applied, err := s.db.CommitMergeRequestChildSnapshot(ctx, db.MergeRequestChildSnapshot{
 		MergeRequestID: mrID, ExpectedRevision: expectedRevision,
 		Comments: comments, CommentsComplete: commentsComplete, Reviews: reviews,
 		InlineComments: inline, ReviewThreads: threads, InlineCommentsComplete: inlineComplete,
 		OtherEvents: otherEvents, DerivedFields: derived,
+		EventMetadataUpdates: metadataUpdates,
 	})
 	if err != nil {
 		return false, fmt.Errorf("commit child snapshot for MR #%d: %w", number, err)
 	}
 	return applied, nil
+}
+
+// terminalLivenessComputer returns the in-transaction finalizer for a parent
+// snapshot that may take the merge request out of the open state. The db
+// layer invokes it only when the accepted upsert is that transition, with the
+// transaction's own view of the stored events: the transition round is the
+// last round that will ever compute this MR's flags, so they are computed
+// from data no concurrent round can shift and land atomically with the
+// terminal state. Snapshots that cannot be such a transition return nil —
+// open rounds' flags travel with the dataset commit, and any lost race there
+// is repaired by the next round, which terminal MRs never get.
+func (s *Syncer) terminalLivenessComputer(
+	ctx context.Context,
+	repo RepoRef,
+	mr *db.MergeRequest,
+) db.MREventMetadataComputer {
+	if mr == nil || mr.State == db.MergeRequestStateOpen ||
+		mr.PlatformHeadSHA == "" || s.clones == nil {
+		return nil
+	}
+	return func(mrID int64, events []db.MREvent) map[string]string {
+		return s.computeCommitLivenessForEvents(
+			ctx, repo, mrID, mr.PlatformHeadSHA, nil, events,
+		)
+	}
+}
+
+// livenessHeadForRound picks the head against which a round computes commit
+// liveness. Open MRs always compute against their current head. A round that
+// takes an MR out of the open state computes once against the final head, so
+// the flags it persists become the terminal record; rounds for
+// already-terminal MRs return "" — merged and closed history is never
+// refetched or recomputed.
+func livenessHeadForRound(normalized, existing *db.MergeRequest) string {
+	if normalized == nil {
+		return ""
+	}
+	if normalized.State == db.MergeRequestStateOpen {
+		return normalized.PlatformHeadSHA
+	}
+	if existing != nil && existing.State == db.MergeRequestStateOpen {
+		return normalized.PlatformHeadSHA
+	}
+	return ""
 }
 
 type gitHubClientProvider struct {
@@ -7181,7 +7551,7 @@ func (s *Syncer) BackfillMergedActorEventOnProvider(
 		}
 		repo = routed
 	}
-	repo = repoRefForMergedActorBackfill(repo, *stored)
+	repo = repoRefFromStoredIdentity(repo, *stored)
 	bucket, err := s.bucketKeyForRepo(repo, false)
 	if err != nil {
 		return false, fmt.Errorf(
@@ -7194,9 +7564,9 @@ func (s *Syncer) BackfillMergedActorEventOnProvider(
 	return s.backfillMergedActorEvent(ctx, repo, repoID, number)
 }
 
-// repoRefForMergedActorBackfill preserves the current provider-verified route
+// repoRefFromStoredIdentity preserves the current provider-verified route
 // while attaching stable identity and non-routing metadata from persistence.
-func repoRefForMergedActorBackfill(tracked RepoRef, stored db.Repo) RepoRef {
+func repoRefFromStoredIdentity(tracked RepoRef, stored db.Repo) RepoRef {
 	repo := tracked
 	repo.Platform = platform.Kind(stored.Platform)
 	repo.PlatformHost = stored.PlatformHost
@@ -8378,6 +8748,7 @@ func (s *Syncer) syncOpenMRFromBulk(
 			comments, bulk.CommentsComplete,
 			reviews,
 			nil, nil, false, events, derived,
+			livenessHeadForRound(normalized, nil),
 		)
 		if err != nil {
 			return fmt.Errorf("commit archival events for MR #%d: %w", number, err)
@@ -8422,7 +8793,7 @@ func (s *Syncer) syncOpenMRFromBulk(
 	// their complete mirrored datasets above.
 	if allComplete {
 		pending := ciHasPending(string(ciJSON))
-		detailApplied, err := s.db.MarkMergeRequestDetailFetchedSnapshot(ctx, mrID, revision, pending)
+		detailApplied, err := s.db.MarkMergeRequestDetailFetchedSnapshot(ctx, mrID, revision, pending, nil)
 		if err != nil {
 			slog.Warn("mark GraphQL detail fetched failed",
 				"repo", repo.Owner+"/"+repo.Name,
@@ -8636,7 +9007,8 @@ func (s *Syncer) fetchMRDetail(
 	}
 
 	if err := s.refreshTimeline(
-		ctx, repo, repoID, mrID, revision, fullPR,
+		ctx, repo, mrID, revision, fullPR,
+		livenessHeadForRound(normalized, existing),
 	); err != nil {
 		// Timeline = 4 base calls (comments + reviews + commits + force-push);
 		// provider review-thread sync is handled inside refreshTimeline.
@@ -8693,7 +9065,7 @@ func (s *Syncer) fetchMRDetail(
 		pending = ciHasPending(freshMR.CIChecksJSON)
 	}
 
-	detailApplied, err := s.db.MarkMergeRequestDetailFetchedSnapshot(ctx, mrID, revision, pending)
+	detailApplied, err := s.db.MarkMergeRequestDetailFetchedSnapshot(ctx, mrID, revision, pending, nil)
 	if err != nil {
 		return calls, fmt.Errorf(
 			"mark detail fetched for MR #%d: %w", number, err,
@@ -8791,8 +9163,15 @@ func (s *Syncer) markUnchangedMRDetailFetched(
 			pending = ciHasPending(fresh.CIChecksJSON)
 		}
 	}
+	// Unchanged rounds have no dataset commit of their own, so commit
+	// liveness travels with the detail-fetched marker under the same
+	// revision guard instead. The round is unchanged, so no state
+	// transition is possible here.
+	metadataUpdates := s.computeCommitLiveness(
+		ctx, repo, existing.ID, livenessHeadForRound(existing, existing), nil,
+	)
 	detailApplied, err := s.db.MarkMergeRequestDetailFetchedSnapshot(
-		ctx, existing.ID, existing.SnapshotRevision, pending,
+		ctx, existing.ID, existing.SnapshotRevision, pending, metadataUpdates,
 	)
 	if err != nil {
 		return calls, fmt.Errorf("mark unchanged detail fetched for MR #%d: %w", number, err)
@@ -8862,7 +9241,8 @@ func (s *Syncer) fetchProviderMRDetail(
 	}
 
 	detailCalls, pending, err := s.syncProviderMRDetailExtras(
-		ctx, reader, repo, repoID, mrID, number, revision, normalized.PlatformHeadSHA,
+		ctx, reader, repo, mrID, number, revision, normalized.PlatformHeadSHA,
+		livenessHeadForRound(normalized, existing),
 	)
 	calls += detailCalls
 	if err != nil {
@@ -8875,7 +9255,7 @@ func (s *Syncer) fetchProviderMRDetail(
 		return calls, fmt.Errorf("persist merged lifecycle event for MR #%d: %w", number, err)
 	}
 
-	detailApplied, err := s.db.MarkMergeRequestDetailFetchedSnapshot(ctx, mrID, revision, pending)
+	detailApplied, err := s.db.MarkMergeRequestDetailFetchedSnapshot(ctx, mrID, revision, pending, nil)
 	if err != nil {
 		return calls, fmt.Errorf("mark detail fetched for MR #%d: %w", number, err)
 	}
@@ -8902,11 +9282,11 @@ func (s *Syncer) syncProviderMRDetailExtras(
 	ctx context.Context,
 	reader platform.MergeRequestReader,
 	repo RepoRef,
-	repoID int64,
 	mrID int64,
 	number int,
 	expectedRevision int64,
 	headSHA string,
+	livenessHeadSHA string,
 ) (int, bool, error) {
 	calls := 0
 	events, err := reader.ListMergeRequestEvents(ctx, platformRepoRef(repo), number)
@@ -8947,6 +9327,7 @@ func (s *Syncer) syncProviderMRDetailExtras(
 			comments, true,
 			reviews,
 			nil, nil, false, dbEvents, nil,
+			livenessHeadSHA,
 		)
 		if commitErr != nil {
 			return calls, false, fmt.Errorf("replace provider MR events for #%d: %w", number, commitErr)
@@ -9034,7 +9415,7 @@ func (s *Syncer) syncProviderMRReviewThreads(
 	}
 	events, dbThreads := platform.DBReviewThreads(threads)
 	applied, err := s.commitMergeRequestDatasets(
-		ctx, repo, mrID, number, expectedRevision, nil, false, nil, events, dbThreads, true, nil, nil,
+		ctx, repo, mrID, number, expectedRevision, nil, false, nil, events, dbThreads, true, nil, nil, "",
 	)
 	if err != nil {
 		return calls, err
@@ -9305,10 +9686,10 @@ func (s *Syncer) classifyProviderItemLookupError(
 func (s *Syncer) refreshTimeline(
 	ctx context.Context,
 	repo RepoRef,
-	repoID int64,
 	mrID int64,
 	expectedRevision int64,
 	ghPR *gh.PullRequest,
+	livenessHeadSHA string,
 ) error {
 	if ghPR == nil {
 		return fmt.Errorf("nil pull request")
@@ -9403,6 +9784,7 @@ func (s *Syncer) refreshTimeline(
 		commentEvents, true,
 		reviewEvents,
 		nil, nil, false, events, &derived,
+		livenessHeadSHA,
 	)
 	if err != nil {
 		return fmt.Errorf("commit comments and reviews for MR #%d: %w", number, err)
@@ -9797,7 +10179,7 @@ func (s *Syncer) replacePRCommentEvents(
 		events = append(events, event)
 	}
 	applied, err := s.commitMergeRequestDatasets(
-		ctx, repo, mrID, number, expectedRevision, events, true, nil, nil, nil, false, nil, derived,
+		ctx, repo, mrID, number, expectedRevision, events, true, nil, nil, nil, false, nil, derived, "",
 	)
 	return applied, err
 }
@@ -10890,6 +11272,63 @@ func (s *Syncer) SyncMR(ctx context.Context, owner, name string, number int) err
 
 // SyncMROnProvider fetches fresh data for a single MR from a specific
 // configured provider host.
+// SyncClosedMROnProvider records a merge request the provider now reports as
+// closed or merged, through the same close-detection flow the periodic sync
+// uses. UI-driven terminal mutations call this instead of writing local state
+// eagerly, so every terminal transition — user-initiated or detected — flows
+// through the one parent-snapshot choke point, which finalizes commit
+// liveness inside the transition's own transaction, and local rows always
+// carry provider timestamps instead of eager local ones that would leave
+// later resyncs rejected as stale. The provider target is resolved from the
+// stable repository row for repoID — the same discipline the merged-actor
+// backfill used — so a rename or route reuse between the mutation and this
+// resync cannot fetch from a different repository than the row being updated.
+func (s *Syncer) SyncClosedMROnProvider(
+	ctx context.Context,
+	repoID int64,
+	number int,
+) error {
+	stored, err := s.db.GetRepoByID(ctx, repoID)
+	if err != nil {
+		return fmt.Errorf("get repo %d for closed-MR resync: %w", repoID, err)
+	}
+	if stored == nil {
+		return fmt.Errorf("repo %d is not known for closed-MR resync", repoID)
+	}
+	kind := platform.Kind(stored.Platform)
+	repo, ok := s.trackedRepoByProviderID(
+		kind, stored.PlatformHost, strings.TrimSpace(stored.PlatformRepoID),
+	)
+	if !ok {
+		routed, routeOK := s.trackedRepoByIdentity(
+			kind, stored.Owner, stored.Name, stored.PlatformHost,
+		)
+		if !routeOK {
+			return fmt.Errorf(
+				"repo %s/%s on %s/%s is not tracked",
+				stored.Owner, stored.Name, stored.Platform, stored.PlatformHost,
+			)
+		}
+		if routedID := strings.TrimSpace(routed.PlatformExternalID); routedID != "" &&
+			routedID != strings.TrimSpace(stored.PlatformRepoID) {
+			return fmt.Errorf(
+				"tracked repo %s/%s provider ID %q does not match stored provider ID %q",
+				stored.Owner, stored.Name, routedID, stored.PlatformRepoID,
+			)
+		}
+		repo = routed
+	}
+	repo = repoRefFromStoredIdentity(repo, *stored)
+	reader, err := s.mergeRequestReaderFor(repo)
+	if err != nil {
+		return fmt.Errorf(
+			"resolve merge request reader for %s/%s: %w",
+			stored.Owner, stored.Name, err,
+		)
+	}
+	return s.fetchAndUpdateClosedMergeRequest(ctx, reader, repo, repoID, number, true)
+}
+
 func (s *Syncer) SyncMROnProvider(
 	ctx context.Context,
 	kind platform.Kind,
@@ -11158,7 +11597,10 @@ func (s *Syncer) syncMRForRepo(
 			return nil
 		}
 
-		if err := s.refreshTimeline(ctx, repo, repoID, mrID, revision, ghPR); err != nil {
+		if err := s.refreshTimeline(
+			ctx, repo, mrID, revision, ghPR,
+			livenessHeadForRound(normalized, existing),
+		); err != nil {
 			if errors.Is(err, errParentSnapshotAdvanced) {
 				return nil
 			}
@@ -11200,7 +11642,7 @@ func (s *Syncer) syncMRForRepo(
 		if freshErr == nil && fresh != nil {
 			pending := ciHasPending(fresh.CIChecksJSON)
 			detailApplied, detailErr := s.db.MarkMergeRequestDetailFetchedSnapshot(
-				ctx, mrID, revision, pending,
+				ctx, mrID, revision, pending, nil,
 			)
 			if detailErr != nil {
 				return fmt.Errorf("mark detail fetched for MR #%d: %w", number, detailErr)
@@ -11222,7 +11664,8 @@ func (s *Syncer) syncMRForRepo(
 
 		pending := false
 		_, pending, err = s.syncProviderMRDetailExtras(
-			ctx, mrReader, repo, repoID, mrID, number, revision, normalized.PlatformHeadSHA,
+			ctx, mrReader, repo, mrID, number, revision, normalized.PlatformHeadSHA,
+			livenessHeadForRound(normalized, existing),
 		)
 		if err != nil {
 			if errors.Is(err, errParentSnapshotAdvanced) {
@@ -11234,7 +11677,7 @@ func (s *Syncer) syncMRForRepo(
 			return fmt.Errorf("persist merged lifecycle event for MR #%d: %w", number, err)
 		}
 		detailApplied, err := s.db.MarkMergeRequestDetailFetchedSnapshot(
-			ctx, mrID, revision, pending,
+			ctx, mrID, revision, pending, nil,
 		)
 		if err != nil {
 			return fmt.Errorf("mark detail fetched for MR #%d: %w", number, err)
@@ -11729,6 +12172,27 @@ func (s *Syncer) SyncItemByNumber(
 	return "issue", nil
 }
 
+// CarryMergeRequestDerivedFields copies sync-derived columns a provider
+// snapshot cannot represent — comment count, review decision, and CI state —
+// from the stored row onto normalized, so committing a fetched or
+// mutation-returned snapshot does not erase them. CI status and checks are
+// head-derived and carried only while the head is unchanged (see the
+// SHA-sensitive sync rules). The ci_had_pending flag and the detail-fetched
+// marker are owned by the snapshot upsert itself (the stored flag always
+// wins, and a set marker is never cleared by a snapshot), so this helper
+// deliberately leaves them alone.
+func CarryMergeRequestDerivedFields(normalized, existing *db.MergeRequest) {
+	if normalized == nil || existing == nil {
+		return
+	}
+	normalized.CommentCount = existing.CommentCount
+	normalized.ReviewDecision = existing.ReviewDecision
+	if strings.EqualFold(normalized.PlatformHeadSHA, existing.PlatformHeadSHA) {
+		normalized.CIStatus = existing.CIStatus
+		normalized.CIChecksJSON = existing.CIChecksJSON
+	}
+}
+
 // fetchAndUpdateClosed retrieves the final state of a now-closed PR from GitHub.
 func (s *Syncer) fetchAndUpdateClosed(ctx context.Context, repo RepoRef, repoID int64, number int, cloneFetchOK bool) error {
 	client, err := s.clientFor(repo)
@@ -11756,16 +12220,11 @@ func (s *Syncer) fetchAndUpdateClosed(ctx context.Context, repo RepoRef, repoID 
 	if err != nil {
 		return fmt.Errorf("normalize closed PR #%d: %w", number, err)
 	}
-	if existing, getErr := s.db.GetMergeRequestByRepoIDAndNumber(ctx, repoID, number); getErr != nil {
-		return fmt.Errorf("get closed MR #%d: %w", number, getErr)
-	} else if existing != nil {
-		normalized.CommentCount = existing.CommentCount
-		normalized.ReviewDecision = existing.ReviewDecision
-		normalized.CIStatus = existing.CIStatus
-		normalized.CIChecksJSON = existing.CIChecksJSON
-		normalized.CIHadPending = existing.CIHadPending
-		normalized.DetailFetchedAt = existing.DetailFetchedAt
+	existing, err := s.db.GetMergeRequestByRepoIDAndNumber(ctx, repoID, number)
+	if err != nil {
+		return fmt.Errorf("get closed MR #%d: %w", number, err)
 	}
+	CarryMergeRequestDerivedFields(normalized, existing)
 	mrID, revision, accepted, err := s.CommitMergeRequestParentSnapshot(ctx, repo, normalized)
 	if err != nil {
 		return fmt.Errorf("commit closed MR #%d: %w", number, err)
@@ -11932,6 +12391,11 @@ func (s *Syncer) fetchAndUpdateClosedMergeRequest(
 		return fmt.Errorf("get closed MR #%d: %w", number, err)
 	}
 	normalized := platform.DBMergeRequest(repoID, mr)
+	existing, err := s.db.GetMergeRequestByRepoIDAndNumber(ctx, repoID, number)
+	if err != nil {
+		return fmt.Errorf("get stored closed MR #%d: %w", number, err)
+	}
+	CarryMergeRequestDerivedFields(normalized, existing)
 	mrID, revision, accepted, err := s.CommitMergeRequestParentSnapshot(ctx, repo, normalized)
 	if err != nil {
 		return fmt.Errorf("upsert closed MR #%d: %w", number, err)

@@ -139,6 +139,29 @@ Some PR-derived state is only valid for one head commit.
 
 - Never carry CI status, check runs, or similar head-derived summaries forward
   when the PR head SHA changed underneath the refresh.
+- Commit-event `obsolete` metadata has exactly one transition rule: only
+  clone-verified head ancestry may set the flag, a provider relisting on an
+  unverifiable head may provisionally clear it (showing a commit is the safe
+  direction), and events a round neither verifies nor relists keep their
+  last-verified flag. The frontend never infers obsolescence. Liveness must ride
+  the sync round's own revision-guarded snapshot write — never a separate
+  post-persistence writer — so a round that loses the revision CAS writes no
+  liveness state at all; the only cache allowed is a memo of the pure
+  (head, candidate-set) reachability function, which can never substitute for a
+  write. The open-to-terminal transition is detected and finalized inside the
+  parent snapshot transaction itself, so every state change funnels through
+  that one choke point and no terminal MR is ever recomputed. UI mutations
+  never write local state eagerly: merge re-reads the provider through the
+  periodic close-detection flow (a merge result is not an MR snapshot), while
+  state edits commit the mutator's returned MR — provider adapters must return
+  the complete updated MR with authoritative timestamps from an edit. Local
+  ancestry reads run
+  in-process via go-git with a bounded visit budget, never git subprocesses;
+  SHA-256 (64-hex) repositories are out of scope and their commit events are
+  never flagged
+  (`internal/github/sync.go::computeCommitLiveness`,
+  `internal/db/queries.go::UpsertMergeRequestSnapshotWithLabelsUnderRepositoryReconciliationRead`,
+  `internal/gitclone/reachability.go::CommitsReachableFrom`).
 - Workflow-approval decisions must be tied to the correct PR identity, not just
   the head SHA. Shared SHAs across forks or sibling PRs must not leak approval
   state between items.

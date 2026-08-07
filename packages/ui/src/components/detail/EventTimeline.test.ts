@@ -1738,6 +1738,7 @@ describe("EventTimeline", () => {
         Summary: oldHead,
         Body: "old C3 before rebase",
         CreatedAt: "2024-06-01T10:02:00Z",
+        MetadataJSON: JSON.stringify({ obsolete: true }),
       }),
       makeEvent({
         ID: 2,
@@ -1745,6 +1746,7 @@ describe("EventTimeline", () => {
         Summary: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         Body: "old C2 before rebase",
         CreatedAt: "2024-06-01T10:01:00Z",
+        MetadataJSON: JSON.stringify({ obsolete: true }),
       }),
     ];
 
@@ -1765,6 +1767,85 @@ describe("EventTimeline", () => {
     expect(text).toContain("2 commits replaced by a later force push");
     expect(text).not.toContain("old C3 before rebase");
     expect(text).not.toContain("old C2 before rebase");
+  });
+
+  it("collapses commit events flagged obsolete in strict date order", () => {
+    const { container } = render(EventTimeline, {
+      props: {
+        events: [
+          makeEvent({
+            ID: 3,
+            EventType: "commit",
+            Summary: "3333333333333333333333333333333333333333",
+            Body: "commit three current",
+            CreatedAt: "2024-06-01T10:03:00Z",
+          }),
+          makeEvent({
+            ID: 2,
+            EventType: "commit",
+            Summary: "2222222222222222222222222222222222222222",
+            Body: "commit two obsolete",
+            CreatedAt: "2024-06-01T10:02:00Z",
+            MetadataJSON: JSON.stringify({ commit_order_key: 2, obsolete: true }),
+          }),
+          makeEvent({
+            ID: 1,
+            EventType: "commit",
+            Summary: "1111111111111111111111111111111111111111",
+            Body: "commit one obsolete",
+            CreatedAt: "2024-06-01T10:01:00Z",
+            MetadataJSON: JSON.stringify({ commit_order_key: 1, obsolete: true }),
+          }),
+        ],
+        timelineOrder: "chronological",
+      },
+    });
+
+    const text = container.textContent ?? "";
+    expect(text).toContain("commit three current");
+    expect(text).not.toContain("commit two obsolete");
+    expect(text).not.toContain("commit one obsolete");
+    expect(text).toContain("2 commits replaced by a later force push");
+  });
+
+  it("ignores the obsolete flag outside commit events and non-boolean values", () => {
+    const { container } = render(EventTimeline, {
+      props: {
+        events: [
+          makeEvent({
+            ID: 3,
+            EventType: "commit",
+            Summary: "3333333333333333333333333333333333333333",
+            Body: "commit with boolean obsolete value",
+            CreatedAt: "2024-06-01T10:03:00Z",
+            MetadataJSON: JSON.stringify({ obsolete: true }),
+          }),
+          makeEvent({
+            ID: 2,
+            EventType: "issue_comment",
+            Summary: "",
+            Body: "a plain comment claiming to be obsolete",
+            CreatedAt: "2024-06-01T10:02:00Z",
+            MetadataJSON: JSON.stringify({ obsolete: true }),
+          }),
+          makeEvent({
+            ID: 1,
+            EventType: "commit",
+            Summary: "1111111111111111111111111111111111111111",
+            Body: "commit with non-boolean obsolete value",
+            CreatedAt: "2024-06-01T10:01:00Z",
+            MetadataJSON: JSON.stringify({ obsolete: "yes" }),
+          }),
+        ],
+        timelineOrder: "chronological",
+      },
+    });
+
+    const text = container.textContent ?? "";
+    expect(text).not.toContain("commit with boolean obsolete value");
+    expect(text).toContain("1 commit replaced by a later force push");
+    expect(text).toContain("a plain comment claiming to be obsolete");
+    expect(text).toContain("commit with non-boolean obsolete value");
   });
 
   it("expands collapsed obsolete commits on demand in strict date order", async () => {
@@ -1797,6 +1878,7 @@ describe("EventTimeline", () => {
             Summary: oldHead,
             Body: "old C3 before rebase",
             CreatedAt: "2024-06-01T10:02:00Z",
+            MetadataJSON: JSON.stringify({ obsolete: true }),
           }),
           makeEvent({
             ID: 2,
@@ -1804,6 +1886,7 @@ describe("EventTimeline", () => {
             Summary: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             Body: "old C2 before rebase",
             CreatedAt: "2024-06-01T10:01:00Z",
+            MetadataJSON: JSON.stringify({ obsolete: true }),
           }),
         ],
         timelineOrder: "chronological",
@@ -1860,6 +1943,7 @@ describe("EventTimeline", () => {
             Summary: oldHead,
             Body: "old C3 before rebase",
             CreatedAt: "2024-06-01T10:02:00Z",
+            MetadataJSON: JSON.stringify({ obsolete: true }),
           }),
         ],
         activityViewMode: "compact",

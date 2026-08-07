@@ -601,27 +601,17 @@
     return orderEventsForForcePushBoundaries(sourceEvents, orderingSourceEvents);
   }
 
-  // A commit is obsolete once a later force push replaced the lineage it
-  // belongs to; the cutoff is the newest commit any force-push generation
-  // starts after. Grouped mode already communicates this by sorting those
-  // commits below their force-push row, so the cutoff only drives the
-  // collapsed runs in strict date order.
-  function obsoleteCommitCutoff(orderingSourceEvents: Array<PREvent | IssueEvent>): number {
-    const generations = buildForcePushGenerations(buildForcePushBoundaries(orderingSourceEvents));
-    return generations.reduce(
-      (cutoff, generation) => Math.max(cutoff, generation.effectiveStartAfterCommitID),
-      0,
-    );
+  // The backend stamps `obsolete: true` into commit-event metadata when the
+  // commit is no longer reachable from the PR head in clone ancestry, and
+  // clears it when reachable again. The frontend only renders that flag.
+  function isObsoleteCommit(event: PREvent | IssueEvent): boolean {
+    return event.EventType === "commit" && parseMetadata(event).obsolete === true;
   }
 
   function collapseObsoleteCommitEntries(
     entries: TimelineEntry[],
-    orderingSourceEvents: Array<PREvent | IssueEvent>,
     keyPrefix: string,
   ): TimelineEntry[] {
-    const cutoff = obsoleteCommitCutoff(orderingSourceEvents);
-    if (cutoff <= 0) return entries;
-
     const collapsed: TimelineEntry[] = [];
     let run: Array<PREvent | IssueEvent> = [];
     const flushRun = (): void => {
@@ -637,7 +627,7 @@
     };
 
     for (const entry of entries) {
-      if (entry.event.EventType === "commit" && commitOrder(entry.event) <= cutoff) {
+      if (isObsoleteCommit(entry.event)) {
         run = [...run, entry.event];
         continue;
       }
@@ -710,7 +700,7 @@
     }
 
     return timelineOrder === "chronological"
-      ? collapseObsoleteCommitEntries(entries, orderingSourceEvents, "")
+      ? collapseObsoleteCommitEntries(entries, "")
       : entries;
   }
 
@@ -733,7 +723,7 @@
       replies: [],
     }));
     return timelineOrder === "chronological"
-      ? collapseObsoleteCommitEntries(entries, orderingSourceEvents, "compact-")
+      ? collapseObsoleteCommitEntries(entries, "compact-")
       : entries;
   }
 

@@ -1478,15 +1478,30 @@ func (d *DB) UpsertMergeRequestSnapshotWithLabels(
 	}
 	defer release()
 	return d.UpsertMergeRequestSnapshotWithLabelsUnderRepositoryReconciliationRead(
-		ctx, mr,
+		ctx, mr, nil,
 	)
 }
 
+// MREventMetadataComputer derives metadata_json replacements (keyed by event
+// dedupe key) from a transaction's own view of a merge request's stored
+// events. The parent snapshot upsert invokes it inside the snapshot
+// transaction, so the computation runs against event rows no concurrent
+// round can shift and its results land atomically with the snapshot.
+type MREventMetadataComputer func(mergeRequestID int64, events []MREvent) map[string]string
+
 // UpsertMergeRequestSnapshotWithLabelsUnderRepositoryReconciliationRead applies
 // a parent snapshot while its caller holds LockRepositoryReconciliationRead.
+// terminalEventMetadata, when non-nil, runs inside the snapshot transaction on
+// the accepted round that takes the merge request out of the open state (the
+// stored row was open, the incoming snapshot is not): it receives the
+// transaction's view of the stored events and its returned metadata lands with
+// the terminal state — together or not at all, computed from data no
+// concurrent writer can change underneath it. Non-transition rounds and
+// rejected snapshots never invoke it.
 func (d *DB) UpsertMergeRequestSnapshotWithLabelsUnderRepositoryReconciliationRead(
 	ctx context.Context,
 	mr *MergeRequest,
+	terminalEventMetadata MREventMetadataComputer,
 ) (int64, int64, bool, error) {
 	release, err := d.lockMergeRequestSnapshotUnderRepositoryReconciliationRead(
 		ctx, mr.RepoID, mr.Number,
@@ -1500,9 +1515,32 @@ func (d *DB) UpsertMergeRequestSnapshotWithLabelsUnderRepositoryReconciliationRe
 	var revision int64
 	var accepted bool
 	err = d.Tx(ctx, func(tx *sql.Tx) error {
+		terminalTransition := false
+		if terminalEventMetadata != nil && mr.State != MergeRequestStateOpen {
+			var priorState string
+			err := tx.QueryRowContext(ctx,
+				`SELECT state FROM forge_merge_requests
+				 WHERE repo_id = ? AND number = ?`,
+				mr.RepoID, mr.Number,
+			).Scan(&priorState)
+			switch {
+			case errors.Is(err, sql.ErrNoRows):
+			case err != nil:
+				return fmt.Errorf("read prior mr state: %w", err)
+			default:
+				terminalTransition = priorState == string(MergeRequestStateOpen)
+			}
+		}
 		var err error
 		id, revision, accepted, err = commitMergeRequestParentSnapshotTx(ctx, tx, mr, mr.Labels)
-		return err
+		if err != nil || !accepted || !terminalTransition {
+			return err
+		}
+		events, err := listMREvents(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		return updateMREventMetadataTx(ctx, tx, id, terminalEventMetadata(id, events))
 	})
 	return id, revision, accepted, err
 }
@@ -1976,6 +2014,41 @@ func (d *DB) UpsertMREvents(ctx context.Context, events []MREvent) error {
 	})
 }
 
+// updateMREventMetadataTx rewrites only metadata_json for the matching event
+// dedupe keys. Derived-state writers (commit liveness) ride this inside the
+// same revision-guarded transaction as the rest of their round's snapshot, so
+// a stale round can never land metadata and newer full-row event fields are
+// never overwritten by an older read.
+func updateMREventMetadataTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	mergeRequestID int64,
+	metadataByDedupeKey map[string]string,
+) error {
+	if len(metadataByDedupeKey) == 0 {
+		return nil
+	}
+	stmt, err := tx.PrepareContext(ctx, `
+		UPDATE forge_mr_events
+		SET metadata_json = ?
+		WHERE merge_request_id = ? AND dedupe_key = ?`)
+	if err != nil {
+		return fmt.Errorf("prepare update mr event metadata: %w", err)
+	}
+	defer stmt.Close()
+	for dedupeKey, metadataJSON := range metadataByDedupeKey {
+		if _, err := stmt.ExecContext(
+			ctx, metadataJSON, mergeRequestID, dedupeKey,
+		); err != nil {
+			return fmt.Errorf(
+				"update mr event metadata (dedupe_key=%s): %w",
+				dedupeKey, err,
+			)
+		}
+	}
+	return nil
+}
+
 func upsertMREventsTx(ctx context.Context, tx *sql.Tx, events []MREvent) error {
 	if len(events) == 0 {
 		return nil
@@ -2269,7 +2342,18 @@ func (d *DB) GetMRLatestNonCommentEventTime(ctx context.Context, mrID int64) (ti
 
 // ListMREvents returns all events for a merge request ordered by created_at DESC.
 func (d *DB) ListMREvents(ctx context.Context, mrID int64) ([]MREvent, error) {
-	rows, err := d.ro.QueryContext(ctx, `
+	return listMREvents(ctx, d.ro, mrID)
+}
+
+type mrEventQueryer interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
+// listMREvents reads a merge request's events through the supplied queryer, so
+// in-transaction callers (terminal liveness finalization) see the same rows
+// their transaction will update.
+func listMREvents(ctx context.Context, q mrEventQueryer, mrID int64) ([]MREvent, error) {
+	rows, err := q.QueryContext(ctx, `
 		SELECT id, merge_request_id, platform_id, platform_external_id, event_type, author, summary, body,
 		       metadata_json, created_at, dedupe_key, direct_url, thread_id, position_json, resolvable, resolved
 		FROM forge_mr_events

@@ -192,7 +192,7 @@ func TestNormalSyncRejectsAllMergeRequestChildrenAfterParentAdvances(t *testing.
 		[]db.MREvent{{EventType: "review", DedupeKey: "stale-review", CreatedAt: oldUpdatedAt}},
 		[]db.MREvent{{EventType: "review_comment", DedupeKey: "stale-inline", CreatedAt: oldUpdatedAt}},
 		[]db.MRReviewThread{{ProviderThreadID: "stale-thread", CreatedAt: oldUpdatedAt, UpdatedAt: oldUpdatedAt}},
-		true, nil, nil,
+		true, nil, nil, "",
 	)
 	require.NoError(err)
 	assert.False(applied)
@@ -4394,8 +4394,8 @@ func TestRefreshTimelineUsesForcePushForLastActivity(t *testing.T) {
 	}
 
 	syncer := NewSyncer(map[string]Client{"github.com": mc}, d, nil, []RepoRef{repo}, time.Minute, nil, testBudget(500))
-	require.NoError(syncer.refreshTimeline(ctx, repo, repoID, mrID,
-		mergeRequestSnapshotRevision(t, d, repoID, 1), buildOpenPR(1, now.Add(-2*time.Hour))))
+	require.NoError(syncer.refreshTimeline(ctx, repo, mrID,
+		mergeRequestSnapshotRevision(t, d, repoID, 1), buildOpenPR(1, now.Add(-2*time.Hour)), ""))
 
 	pr, err := d.GetMergeRequestByRepoIDAndNumber(ctx, repoID, 1)
 	require.NoError(err)
@@ -4455,8 +4455,8 @@ func TestRefreshTimelineFetchFailurePreservesStoredForcePushActivity(t *testing.
 	}
 
 	syncer := NewSyncer(map[string]Client{"github.com": mc}, d, nil, []RepoRef{repo}, time.Minute, nil, testBudget(500))
-	require.NoError(syncer.refreshTimeline(ctx, repo, repoID, mrID,
-		mergeRequestSnapshotRevision(t, d, repoID, 1), buildOpenPR(1, now.Add(-2*time.Hour))))
+	require.NoError(syncer.refreshTimeline(ctx, repo, mrID,
+		mergeRequestSnapshotRevision(t, d, repoID, 1), buildOpenPR(1, now.Add(-2*time.Hour)), ""))
 
 	pr, err := d.GetMergeRequestByRepoIDAndNumber(ctx, repoID, 1)
 	require.NoError(err)
@@ -4541,8 +4541,8 @@ func TestSyncAssignsStableCommitOrderKeysAcrossForcePushReplacement(t *testing.T
 	}))
 
 	syncer := NewSyncer(map[string]Client{"github.com": mc}, d, nil, []RepoRef{repo}, time.Minute, nil, testBudget(500))
-	require.NoError(syncer.refreshTimeline(ctx, repo, repoID, mrID,
-		mergeRequestSnapshotRevision(t, d, repoID, 1), buildOpenPR(1, now)))
+	require.NoError(syncer.refreshTimeline(ctx, repo, mrID,
+		mergeRequestSnapshotRevision(t, d, repoID, 1), buildOpenPR(1, now), ""))
 
 	events, err := d.ListMREvents(ctx, mrID)
 	require.NoError(err)
@@ -8197,8 +8197,8 @@ func TestRefreshTimelineSkipsMergedEventWhenAuthoredMergedEventAlreadyExists(t *
 		nil,
 	)
 
-	require.NoError(syncer.refreshTimeline(ctx, repo, repoID, mrID,
-		mergeRequestSnapshotRevision(t, d, repoID, 7), pr))
+	require.NoError(syncer.refreshTimeline(ctx, repo, mrID,
+		mergeRequestSnapshotRevision(t, d, repoID, 7), pr, ""))
 
 	events, err := d.ListMREvents(ctx, mrID)
 	require.NoError(err)
@@ -19002,7 +19002,7 @@ func TestCommitMergeRequestDatasetsBindsToParentID(t *testing.T) {
 			MergeRequestID: oldMRID, EventType: "comment", Author: "ada",
 			Body: "stale comment", CreatedAt: now, DedupeKey: "comment-1",
 		}},
-		true, nil, nil, nil, false, nil, nil,
+		true, nil, nil, nil, false, nil, nil, "",
 	)
 	require.NoError(err)
 	require.True(applied)
@@ -19441,4 +19441,32 @@ func TestReconcileMergedActorEventsCoolsDownAfterSweepExhaustion(t *testing.T) {
 	clock = clock.Add(time.Minute)
 	syncer.reconcileMergedActorEvents(ctx, repo, repoID)
 	require.Equal(2, providerCalls, "a new sweep must start after the bounded cooldown")
+}
+
+func TestWithObsoleteMetadata(t *testing.T) {
+	cases := []struct {
+		name     string
+		in       string
+		obsolete bool
+		want     string
+		changed  bool
+	}{
+		{"set on existing metadata", `{"commit_order_key":3}`, true, `{"commit_order_key":3,"obsolete":true}`, true},
+		{"set on empty metadata", ``, true, `{"obsolete":true}`, true},
+		{"already set", `{"commit_order_key":3,"obsolete":true}`, true, `{"commit_order_key":3,"obsolete":true}`, false},
+		{"clear removes key", `{"commit_order_key":3,"obsolete":true}`, false, `{"commit_order_key":3}`, true},
+		{"clear when absent", `{"commit_order_key":3}`, false, `{"commit_order_key":3}`, false},
+		{"clear normalizes non-bool garbage", `{"obsolete":"yes"}`, false, `{}`, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, changed := withObsoleteMetadata(tc.in, tc.obsolete)
+			assert.Equal(t, tc.changed, changed)
+			if changed {
+				assert.JSONEq(t, tc.want, got)
+			} else {
+				assert.Equal(t, tc.in, got)
+			}
+		})
+	}
 }
