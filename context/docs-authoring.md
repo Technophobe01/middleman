@@ -29,6 +29,9 @@ screenshots, or the Zensical site.
   docs build and must not be tracked in Git. Playwright captures in
   `docs/screenshots/` use the real seeded e2e backend, not mocked API fixtures
   or a developer daemon.
+- Generated workflow screenshots must use native SVG geometry, not XHTML in
+  `foreignObject`; WebKit clips responsive `foreignObject` images.
+  (`docs/screenshots/docs-screenshots.spec.ts::nativeSVGSnapshot`)
 - Static Codex terminal overlays reproduce a one-off real Codex TUI capture,
   including its composer and model/path status; sanitize local paths to the
   public synthetic repository. (`docs/screenshots/docs-screenshots.spec.ts::embedSyntheticCodexTranscript`)
@@ -37,6 +40,9 @@ screenshots, or the Zensical site.
   copied into `internal/web/dist`, then pass the prebuilt binary through
   `PLAYWRIGHT_E2E_SERVER_BINARY` so screenshot readiness excludes Go compile
   time. (`scripts/vercel-build-docs.sh`)
+- Vercel restricts rendered-site checks to Chromium because its runtime lacks
+  Playwright WebKit dependencies; the browser-image docs CI lane runs Chromium
+  and WebKit. (`scripts/vercel-build-docs.sh`, `.github/workflows/ci.yml::docs`)
 - Production docs use a default-branch `workflow_run`; the released SHA must be
   on `main` and latest before build and before/after promotion. A stale attempt
   dispatches trusted latest-release reconciliation. No Vercel Git app or GitHub environment. (`.github/workflows/deploy-docs.yml`)

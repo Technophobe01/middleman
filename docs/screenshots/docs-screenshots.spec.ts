@@ -1,6 +1,9 @@
 import { expect, test, type Locator, type Page } from "@playwright/test";
-import { mkdir, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 
 import {
   startIsolatedE2EServerWithOptions,
@@ -8,6 +11,7 @@ import {
 } from "../../frontend/tests/e2e-full/support/e2eServer";
 
 const outputDir = process.env.KENN_FORGE_DOCS_SCREENSHOT_DIR;
+const execFileAsync = promisify(execFile);
 
 type ThemeName = "light" | "dark";
 
@@ -24,6 +28,31 @@ const syntheticCodexTranscript = [
   "",
   "Test result: node --test — 3 passed, 0 failed.",
 ].join("\n");
+
+const syntheticCodexPalettes = {
+  light: {
+    background: "oklch(97.5% 0.008 250)",
+    foreground: "oklch(30% 0.025 255)",
+    promptBackground: "oklch(93.5% 0.012 250)",
+    promptBorder: "oklch(83% 0.02 250)",
+    promptMarker: "oklch(27% 0.025 255)",
+    promptText: "oklch(52% 0.025 250)",
+    model: "oklch(47% 0.105 80)",
+    separator: "oklch(63% 0.02 250)",
+    workingDirectory: "oklch(48% 0.085 150)",
+  },
+  dark: {
+    background: "#0d1117",
+    foreground: "#c9d1d9",
+    promptBackground: "#343941",
+    promptBorder: "#444b55",
+    promptMarker: "#f0f3f6",
+    promptText: "#9da4ad",
+    model: "#f6e2b7",
+    separator: "#6e7681",
+    workingDirectory: "#abdfa7",
+  },
+} as const;
 
 type CaptureCase = {
   name:
@@ -42,7 +71,7 @@ type CaptureCase = {
   loadingText?: RegExp;
   waitForSync?: boolean;
   prepare?: (page: Page, baseURL: string) => Promise<void>;
-  afterReady?: (page: Page) => Promise<void>;
+  afterReady?: (page: Page, theme: ThemeName) => Promise<void>;
   description: string;
 };
 
@@ -51,10 +80,10 @@ async function openCodexLaunchMenu(page: Page): Promise<void> {
   await expect(page.getByRole("menuitem", { name: "Codex" })).toBeVisible();
 }
 
-async function embedSyntheticCodexTranscript(workspace: Locator): Promise<void> {
+async function embedSyntheticCodexTranscript(workspace: Locator, theme: ThemeName): Promise<void> {
   const terminal = workspace.locator(".terminal-container:visible").first();
   await expect(terminal).toBeVisible();
-  await terminal.evaluate((element, transcript) => {
+  await terminal.evaluate((element, { transcript, palette }) => {
     const existing = element.querySelector(".docs-codex-transcript");
     if (existing) existing.remove();
 
@@ -67,8 +96,8 @@ async function embedSyntheticCodexTranscript(workspace: Locator): Promise<void> 
       "z-index: 3",
       "box-sizing: border-box",
       "overflow: hidden",
-      "background: #0d1117",
-      "color: #c9d1d9",
+      `background: ${palette.background}`,
+      `color: ${palette.foreground}`,
       'font-family: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace',
       "font-size: 12.5px",
       "line-height: 1.4",
@@ -102,17 +131,17 @@ async function embedSyntheticCodexTranscript(workspace: Locator): Promise<void> 
       "gap: 10px",
       "min-height: 44px",
       "padding: 10px 14px",
-      "border: 1px solid #444b55",
-      "background: #343941",
+      `border: 1px solid ${palette.promptBorder}`,
+      `background: ${palette.promptBackground}`,
     ].join("; ");
 
     const promptMarker = document.createElement("span");
     promptMarker.textContent = "›";
-    promptMarker.style.cssText = "color: #f0f3f6; font-weight: 700";
+    promptMarker.style.cssText = `color: ${palette.promptMarker}; font-weight: 700`;
 
     const promptText = document.createElement("span");
     promptText.textContent = "Summarize recent commits";
-    promptText.style.cssText = "color: #9da4ad";
+    promptText.style.cssText = `color: ${palette.promptText}`;
     prompt.append(promptMarker, promptText);
 
     const status = document.createElement("div");
@@ -128,24 +157,24 @@ async function embedSyntheticCodexTranscript(workspace: Locator): Promise<void> 
 
     const model = document.createElement("span");
     model.textContent = "gpt-5.6-sol high";
-    model.style.cssText = "color: #f6e2b7";
+    model.style.cssText = `color: ${palette.model}`;
 
     const separator = document.createElement("span");
     separator.textContent = "·";
-    separator.style.cssText = "color: #6e7681";
+    separator.style.cssText = `color: ${palette.separator}`;
 
     const workingDirectory = document.createElement("span");
     workingDirectory.textContent = "~/src/kenn-io/forge";
-    workingDirectory.style.cssText = "color: #abdfa7";
+    workingDirectory.style.cssText = `color: ${palette.workingDirectory}`;
     status.append(model, separator, workingDirectory);
 
     composer.append(prompt, status);
     content.append(output, composer);
     element.appendChild(content);
-  }, syntheticCodexTranscript);
+  }, { transcript: syntheticCodexTranscript, palette: syntheticCodexPalettes[theme] });
 }
 
-async function showCodexWorkspace(page: Page): Promise<void> {
+async function showCodexWorkspace(page: Page, theme: ThemeName): Promise<void> {
   const row = page.locator(".workspace-list-sidebar .ws-row", { hasText: "Add widget caching layer" });
   await row.click();
   await expect(row).toHaveClass(/\bselected\b/);
@@ -154,7 +183,7 @@ async function showCodexWorkspace(page: Page): Promise<void> {
   await expect(codexTab).toBeVisible();
   await codexTab.click();
   await expect(codexTab).toHaveAttribute("aria-selected", "true");
-  await embedSyntheticCodexTranscript(workspace);
+  await embedSyntheticCodexTranscript(workspace, theme);
 
   const syntheticPath = "/worktrees/github/github.com/acme/widgets/pr-1";
   await page.locator(".meta-chip.mono.path").evaluate((element, replacement) => {
@@ -165,7 +194,7 @@ async function showCodexWorkspace(page: Page): Promise<void> {
   }, syntheticPath);
 }
 
-async function showActivityCodexWorkspace(page: Page): Promise<void> {
+async function showActivityCodexWorkspace(page: Page, theme: ThemeName): Promise<void> {
   const prRow = page
     .locator(".activity-row")
     .filter({ has: page.locator(".badge", { hasText: "PR" }) })
@@ -185,7 +214,7 @@ async function showActivityCodexWorkspace(page: Page): Promise<void> {
   await codexTab.click();
   await expect(codexTab).toHaveAttribute("aria-selected", "true");
   await expect(workspace.locator(".terminal-view")).toBeVisible();
-  await embedSyntheticCodexTranscript(workspace);
+  await embedSyntheticCodexTranscript(workspace, theme);
   await waitForIdleSync(page);
 }
 
@@ -534,7 +563,61 @@ async function prepareFirstRunPage(page: Page, baseURL: string): Promise<void> {
   });
 }
 
-async function svgDOMSnapshot(
+function escapeXMLText(value: string): string {
+  return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+}
+
+function normalizeNativeSVG(
+  svg: string,
+  input: {
+    title: string;
+    description: string;
+    width: number;
+    height: number;
+  },
+): string {
+  const svgStart = svg.indexOf("<svg");
+  const openingTagEnd = svg.indexOf(">", svgStart);
+  if (svgStart < 0 || openingTagEnd < 0) {
+    throw new Error("pdftocairo output did not contain an SVG root element");
+  }
+
+  const openingTag = svg
+    .slice(svgStart, openingTagEnd + 1)
+    .replace(/\swidth="[^"]*"/, ` width="${input.width}"`)
+    .replace(/\sheight="[^"]*"/, ` height="${input.height}"`)
+    .replace(/>$/, ' role="img" aria-labelledby="title desc">');
+  const metadata =
+    `<title id="title">${escapeXMLText(input.title)}</title>` +
+    `<desc id="desc">${escapeXMLText(input.description)}</desc>`;
+
+  return `${svg.slice(0, svgStart)}${openingTag}${metadata}${svg.slice(openingTagEnd + 1).trimEnd()}\n`;
+}
+
+async function validateCaptureDOM(page: Page): Promise<void> {
+  const captureText = await page.evaluate(() => {
+    const attributeNames = ["aria-label", "title", "alt", "placeholder"];
+    const attributes = Array.from(document.querySelectorAll("*"), (element) =>
+      attributeNames.flatMap((name) => {
+        const value = element.getAttribute(name);
+        return value ? [value] : [];
+      }),
+    ).flat();
+    const inputValues = Array.from(document.querySelectorAll("input, textarea"), (element) =>
+      element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement ? element.value : "",
+    ).filter(Boolean);
+    return [document.body.innerText, ...attributes, ...inputValues].join("\n");
+  });
+
+  if (/\/var\/folders|kenn-forge-e2e-\d+/i.test(captureText)) {
+    throw new Error("Documentation screenshot contains a private path");
+  }
+  if (/\bsyncing\b/i.test(captureText)) {
+    throw new Error("Documentation screenshot contains a transient syncing state");
+  }
+}
+
+async function nativeSVGSnapshot(
   page: Page,
   input: {
     title: string;
@@ -543,140 +626,59 @@ async function svgDOMSnapshot(
     height: number;
   },
 ): Promise<string> {
-  return page.evaluate(async ({ title, description, width, height }) => {
-    const svgNS = "http://www.w3.org/2000/svg";
-    const xhtmlNS = "http://www.w3.org/1999/xhtml";
+  const temporaryDir = await mkdtemp(path.join(os.tmpdir(), "kenn-forge-docs-svg-"));
+  const pdfPath = path.join(temporaryDir, "capture.pdf");
+  const svgPath = path.join(temporaryDir, "capture.svg");
 
-    const styles = Array.from(document.styleSheets)
-      .map((sheet) => {
-        try {
-          return Array.from(sheet.cssRules)
-            .map((rule) => rule.cssText)
-            .join("\n");
-        } catch {
-          return "";
-        }
-      })
-      .filter(Boolean)
-      .join("\n\n");
-    const normalizedStyles = styles.replace(/[ \t]+$/gm, "");
-    const rootStyle = getComputedStyle(document.documentElement);
-    const rootCustomProperties = Array.from(rootStyle)
-      .filter((name) => name.startsWith("--"))
-      .map((name) => `${name}: ${rootStyle.getPropertyValue(name).trim()};`)
-      .join(" ");
-
-    const svgDoc = document.implementation.createDocument(svgNS, "svg", null);
-    const svg = svgDoc.documentElement;
-    svg.setAttribute("xmlns", svgNS);
-    svg.setAttribute("width", String(width));
-    svg.setAttribute("height", String(height));
-    svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
-    svg.setAttribute("role", "img");
-    svg.setAttribute("aria-labelledby", "title desc");
-
-    const titleNode = svgDoc.createElementNS(svgNS, "title");
-    titleNode.setAttribute("id", "title");
-    titleNode.textContent = title;
-    svg.appendChild(titleNode);
-
-    const descNode = svgDoc.createElementNS(svgNS, "desc");
-    descNode.setAttribute("id", "desc");
-    descNode.textContent = description;
-    svg.appendChild(descNode);
-
-    const foreignObject = svgDoc.createElementNS(svgNS, "foreignObject");
-    foreignObject.setAttribute("x", "0");
-    foreignObject.setAttribute("y", "0");
-    foreignObject.setAttribute("width", String(width));
-    foreignObject.setAttribute("height", String(height));
-
-    const htmlDoc = document.implementation.createDocument(xhtmlNS, "html", null);
-    const html = htmlDoc.documentElement;
-    for (const attr of Array.from(document.documentElement.attributes)) {
-      if (attr.name === "xmlns") continue;
-      html.setAttribute(attr.name, attr.value);
+  try {
+    await validateCaptureDOM(page);
+    await page.emulateMedia({ media: "screen" });
+    await page.pdf({
+      path: pdfPath,
+      width: `${input.width}px`,
+      height: `${input.height}px`,
+      printBackground: true,
+      margin: { top: "0", right: "0", bottom: "0", left: "0" },
+      pageRanges: "1",
+    });
+    try {
+      await execFileAsync("pdftocairo", ["-svg", "-f", "1", "-l", "1", pdfPath, svgPath]);
+    } catch (error) {
+      throw new Error("pdftocairo failed; install Poppler to generate documentation screenshots", { cause: error });
     }
-    html.setAttribute("xmlns", xhtmlNS);
-    html.setAttribute(
-      "style",
-      [
-        document.documentElement.getAttribute("style") ?? "",
-        rootCustomProperties,
-        `width: ${width}px`,
-        `height: ${height}px`,
-        "margin: 0",
-        "padding: 0",
-        "overflow: hidden",
-      ]
-        .filter(Boolean)
-        .join("; "),
-    );
-
-    const head = htmlDoc.createElementNS(xhtmlNS, "head");
-    const style = htmlDoc.createElementNS(xhtmlNS, "style");
-    style.textContent = `
-${normalizedStyles}
-
-html,
-body {
-  width: ${width}px !important;
-  height: ${height}px !important;
-  margin: 0 !important;
-  overflow: hidden !important;
+    return normalizeNativeSVG(await readFile(svgPath, "utf8"), input);
+  } finally {
+    await rm(temporaryDir, { recursive: true, force: true });
+  }
 }
 
-*,
-*::before,
-*::after {
-  animation: none !important;
-  transition: none !important;
-  caret-color: transparent !important;
-}
-`;
-    head.appendChild(style);
-    html.appendChild(head);
+test.describe("docs screenshot export safety", () => {
+  test("rejects private paths before text becomes SVG glyphs", async ({ page }) => {
+    await page.setContent("<main>Workspace: /var/folders/private/kenn-forge-e2e-123</main>");
 
-    const body = htmlDoc.createElementNS(xhtmlNS, "body");
-    for (const attr of Array.from(document.body.attributes)) {
-      body.setAttribute(attr.name, attr.value);
-    }
-    body.setAttribute(
-      "style",
-      `${document.body.getAttribute("style") ?? ""}; width: ${width}px; height: ${height}px; margin: 0; overflow: hidden;`,
-    );
-    for (const child of Array.from(document.body.childNodes)) {
-      body.appendChild(htmlDoc.importNode(child.cloneNode(true), true));
-    }
-    for (const script of Array.from(body.querySelectorAll("script"))) {
-      script.remove();
-    }
-
-    const liveImages = Array.from(document.body.querySelectorAll("img"));
-    const clonedImages = Array.from(body.querySelectorAll("img"));
-    await Promise.all(
-      liveImages.map(async (liveImage, index) => {
-        const clonedImage = clonedImages[index];
-        const source = liveImage.currentSrc || liveImage.src;
-        if (!clonedImage || !source || source.startsWith("data:")) return;
-
-        const sourceURL = new URL(source, document.baseURI);
-        if (!sourceURL.pathname.toLowerCase().endsWith(".svg")) return;
-
-        const response = await fetch(sourceURL);
-        const svgImage = await response.text();
-        clonedImage.setAttribute("src", `data:image/svg+xml,${encodeURIComponent(svgImage)}`);
-        clonedImage.removeAttribute("srcset");
+    await expect(
+      nativeSVGSnapshot(page, {
+        title: "unsafe path",
+        description: "unsafe path fixture",
+        width: 1280,
+        height: 820,
       }),
-    );
-    html.appendChild(body);
+    ).rejects.toThrow(/private path/i);
+  });
 
-    foreignObject.appendChild(svgDoc.importNode(html, true));
-    svg.appendChild(foreignObject);
+  test("rejects transient syncing attributes before export", async ({ page }) => {
+    await page.setContent('<main><span aria-label="Syncing">Repository activity</span></main>');
 
-    return `${new XMLSerializer().serializeToString(svg).replace(/[ \t]+$/gm, "")}\n`;
-  }, input);
-}
+    await expect(
+      nativeSVGSnapshot(page, {
+        title: "unsafe sync state",
+        description: "unsafe sync state fixture",
+        width: 1280,
+        height: 820,
+      }),
+    ).rejects.toThrow(/syncing/i);
+  });
+});
 
 async function captureCase(page: Page, baseURL: string, capture: CaptureCase): Promise<void> {
   await preparePage(page, capture.theme);
@@ -699,7 +701,7 @@ async function captureCase(page: Page, baseURL: string, capture: CaptureCase): P
   if (capture.waitForSync) {
     await waitForIdleSync(page);
   }
-  await capture.afterReady?.(page);
+  await capture.afterReady?.(page, capture.theme);
   await expect
     .poll(() => page.evaluate(() => document.documentElement.classList.contains("dark")))
     .toBe(capture.theme === "dark");
@@ -720,32 +722,48 @@ async function captureCase(page: Page, baseURL: string, capture: CaptureCase): P
     expect(statusBox).not.toBeNull();
     expect(composerBox!.y + composerBox!.height).toBeLessThanOrEqual(terminalBox!.y + terminalBox!.height);
     expect(statusBox!.y + statusBox!.height).toBeLessThanOrEqual(terminalBox!.y + terminalBox!.height);
+
+    const [terminalLightness, composerLightness] = await terminal.evaluate((element) => {
+      const sample = (target: Element): number => {
+        const canvas = document.createElement("canvas");
+        canvas.width = 1;
+        canvas.height = 1;
+        const context = canvas.getContext("2d");
+        if (!context) throw new Error("2D canvas context is unavailable");
+        context.fillStyle = getComputedStyle(target).backgroundColor;
+        context.fillRect(0, 0, 1, 1);
+        return Array.from(context.getImageData(0, 0, 1, 1).data.slice(0, 3)).reduce(
+          (sum, channel) => sum + channel,
+          0,
+        );
+      };
+      const prompt = element.querySelector('[aria-label="Codex prompt composer"] > div');
+      if (!prompt) throw new Error("Codex prompt surface was not found");
+      return [sample(element), sample(prompt)];
+    });
+    if (capture.theme === "light") {
+      expect(terminalLightness).toBeGreaterThan(650);
+      expect(composerLightness).toBeGreaterThan(600);
+    } else {
+      expect(terminalLightness).toBeLessThan(100);
+      expect(composerLightness).toBeLessThan(250);
+    }
   }
 
-  const svg = await svgDOMSnapshot(page, {
+  const svg = await nativeSVGSnapshot(page, {
     title: `${capture.name} ${capture.theme}`,
     description: capture.description,
     width: page.viewportSize()?.width ?? 1280,
     height: page.viewportSize()?.height ?? 820,
   });
-  if (capture.theme === "dark") {
-    expect(svg).toMatch(/<html[^>]*class="[^"]*\bdark\b[^"]*"/);
-  } else {
-    expect(svg).not.toMatch(/<html[^>]*class="[^"]*\bdark\b[^"]*"/);
-  }
-  expect(svg).not.toMatch(/>\s*Syncing(?:\.\.\.)?\s*</i);
-  expect(svg).not.toMatch(/>\s*syncing(?:\u2026|\s*\([^<]*\))?\s*</i);
-  expect(svg).not.toMatch(/\b(?:aria-label|title)="Syncing"/);
-  expect(svg).not.toMatch(/<img[^>]+src="(?:https?:|\/)/i);
-  expect(svg).not.toMatch(/data:image\/(?:avif|gif|jpe?g|png|webp)/i);
+  expect(svg).not.toMatch(/<foreignObject\b/);
+  expect(svg).not.toMatch(/<script\b/i);
+  expect(svg).not.toMatch(/\b(?:href|xlink:href)="https?:/i);
   expect(svg).not.toMatch(/\/var\/folders|kenn-forge-e2e-\d+/i);
-  if (capture.name === "workspace-codex-session" || capture.name === "maintainer-overview") {
-    expect(svg).toContain("Implemented in-flight request coalescing.");
-    expect(svg).toContain("3 passed, 0 failed.");
-    expect(svg).toContain("Summarize recent commits");
-    expect(svg).toContain("gpt-5.6-sol high");
-    expect(svg).toContain("~/src/kenn-io/forge");
-  }
+  expect(svg).toContain(`width="${page.viewportSize()?.width ?? 1280}"`);
+  expect(svg).toContain(`height="${page.viewportSize()?.height ?? 820}"`);
+  expect(svg).toContain(`<title id="title">${capture.name} ${capture.theme}</title>`);
+  expect(svg).toMatch(/<path\b/);
   await writeFile(path.join(outputDir!, `${capture.name}-${capture.theme}.svg`), svg);
 }
 
