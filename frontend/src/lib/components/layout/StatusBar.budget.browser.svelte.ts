@@ -40,6 +40,13 @@ function rateLimits(
   };
 }
 
+function syncStatus(status: Record<string, unknown>): MockRouteOverride {
+  return (req) => {
+    if (req.method !== "GET" || req.url.pathname !== "/api/v1/sync/status") return null;
+    return jsonResponse(status);
+  };
+}
+
 function credentialAwareRateLimits(): MockRouteOverride {
   return (req) => {
     if (req.method !== "GET" || req.url.pathname !== "/api/v1/rate-limits") return null;
@@ -272,6 +279,95 @@ describe("budget display", () => {
     expect(spent?.textContent).toBe("500");
     expect(spent?.style.color).toBe("var(--budget-red)");
     expect(popover.textContent).toContain("Local sync ceiling");
+  });
+
+  it("identifies a local ceiling failure while provider quota remains healthy", async () => {
+    const failedAt = new Date(Date.now() - 5 * 60_000).toISOString();
+    const failedResetAt = new Date(Date.now() + 30 * 60_000).toISOString();
+    const unrelatedResetAt = new Date(Date.now() + 5 * 60_000).toISOString();
+    await mountStatusBar([
+      rateLimits(
+        { "github.com": knownHost },
+        {
+          "github:github.com:user:7": {
+            provider: "github",
+            platform_host: "github.com",
+            rate_principal: "user:7",
+            principal_label: "GitHub user maintainer",
+            limit: 500,
+            spent: 450,
+            remaining: 50,
+            reset_at: failedResetAt,
+          },
+          "gitlab:gitlab.example.com": {
+            provider: "gitlab",
+            platform_host: "gitlab.example.com",
+            rate_principal: "host",
+            principal_label: "Unrelated host credential",
+            limit: 900,
+            spent: 900,
+            remaining: 0,
+            reset_at: unrelatedResetAt,
+          },
+        },
+      ),
+      syncStatus({
+        running: false,
+        last_run_at: failedAt,
+        last_error: "list open PRs: local sync emergency ceiling exhausted",
+        last_error_code: "localSyncCeilingExhausted",
+        last_error_ceiling_key: "github:github.com:user:7",
+        last_error_ceiling_reset_at: failedResetAt,
+      }),
+    ]);
+
+    const failure = document.querySelector<HTMLElement>(".status-item--local-ceiling");
+    expect(failure).not.toBeNull();
+    expect(failure?.textContent).toContain("local sync ceiling reached");
+    expect(failure?.textContent).toContain("450 / 500");
+    expect(failure?.textContent).not.toContain("900 / 900");
+    expect(failure?.title).toContain("resets in 30m");
+    expect(failure?.title).not.toContain("resets in 5m");
+
+    const restFill = document.querySelector<HTMLElement>(".budget-fill");
+    expect(restFill?.style.background).toBe("var(--budget-green)");
+  });
+
+  it("does not pair a long-running prior-window failure with the next live ceiling", async () => {
+    const failedResetAt = new Date(Date.now() - 5 * 60_000).toISOString();
+    const completedAt = new Date(Date.now()).toISOString();
+    const liveResetAt = new Date(Date.now() + 55 * 60_000).toISOString();
+    await mountStatusBar([
+      rateLimits(
+        { "github.com": knownHost },
+        {
+          "github:github.com:user:7": {
+            provider: "github",
+            platform_host: "github.com",
+            rate_principal: "user:7",
+            principal_label: "GitHub user maintainer",
+            limit: 500,
+            spent: 0,
+            remaining: 500,
+            reset_at: liveResetAt,
+          },
+        },
+      ),
+      syncStatus({
+        running: false,
+        last_run_at: completedAt,
+        last_error: "list open PRs: local sync emergency ceiling exhausted",
+        last_error_code: "localSyncCeilingExhausted",
+        last_error_ceiling_key: "github:github.com:user:7",
+        last_error_ceiling_reset_at: failedResetAt,
+      }),
+    ]);
+
+    const failure = document.querySelector<HTMLElement>(".status-item--local-ceiling");
+    expect(failure).not.toBeNull();
+    expect(failure?.textContent).toBe("local sync ceiling reached");
+    expect(failure?.textContent).not.toContain("0 / 500");
+    expect(failure?.title).not.toContain("resets in");
   });
 
   it("popover dismisses on Escape and restores focus to the trigger", async () => {

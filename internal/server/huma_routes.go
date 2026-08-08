@@ -971,6 +971,7 @@ func (s *Server) getRateLimits(
 			Limit:          budget.Limit(),
 			Spent:          budget.Spent(),
 			Remaining:      budget.Remaining(),
+			ResetAt:        formatUTCRFC3339(budget.ResetAt()),
 		}
 	}
 	return &rateLimitsOutput{
@@ -986,10 +987,7 @@ func rateLimitStatusKey(rt *ratelimit.RateTracker) string {
 // response. Tracker-derived rows and registry-derived pools must agree on it
 // or the same principal would appear twice.
 func rateLimitStatusKeyFor(providerName, host, principal string) string {
-	if principal == "" || principal == "host" {
-		return ghclient.RateBucketKey(providerName, host, "host")
-	}
-	return strings.Join([]string{providerName, host, principal}, ":")
+	return ghclient.RateStatusKey(providerName, host, principal)
 }
 
 func ratePrincipalLabel(providerName, principal string) string {

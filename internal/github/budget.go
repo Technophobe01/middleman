@@ -153,6 +153,33 @@ func (b *SyncBudget) TrySpend(n int) (BudgetWindow, bool) {
 	return b.window, true
 }
 
+// trySpendForTransport reserves one wire attempt and returns the reset of the
+// window examined by that reservation. Keeping the reset snapshot under the
+// same lock as the refusal prevents a rollover between those two observations
+// from assigning an exhausted request to the next window.
+func (b *SyncBudget) trySpendForTransport(
+	n int,
+	archive bool,
+	essential bool,
+) (BudgetWindow, bool, time.Time) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.rollLocked()
+	resetAt := b.windowStart.Add(time.Hour)
+	limit := b.optionalLimitLocked()
+	if essential {
+		limit = b.limit
+	}
+	if n < 0 || b.spent+n > limit {
+		return 0, false, resetAt
+	}
+	b.spent += n
+	if archive {
+		b.archiveSpent += n
+	}
+	return b.window, true, resetAt
+}
+
 func (b *SyncBudget) Spend(n int) {
 	b.TrySpend(n)
 }
@@ -193,6 +220,14 @@ func (b *SyncBudget) Spent() int {
 
 func (b *SyncBudget) Limit() int {
 	return b.limit
+}
+
+// ResetAt returns the end of the budget's current local hourly window.
+func (b *SyncBudget) ResetAt() time.Time {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.rollLocked()
+	return b.windowStart.Add(time.Hour)
 }
 
 func (b *SyncBudget) ArchiveSpendCeiling(now time.Time, resetAt *time.Time, liveFloor int) int {

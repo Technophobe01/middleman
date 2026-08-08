@@ -5,6 +5,7 @@
   import { isActivityItemTypeEnabled } from "@kenn-forge/ui/stores/activity";
   import BudgetBars from "./BudgetBars.svelte";
   import BudgetPopover from "./BudgetPopover.svelte";
+  import { formatCompact } from "./budget-utils";
   import { client } from "../../api/runtime.js";
   import { getPage } from "../../stores/router.svelte.ts";
 
@@ -162,6 +163,43 @@
 	Object.keys(rateLimits.provider_pools).length > 0
 	|| Object.keys(rateLimits.local_ceilings).length > 0,
   );
+
+  let hasLocalCeilingFailure = $derived(
+    sync.getSyncState()?.last_error_code === "localSyncCeilingExhausted",
+  );
+  let localCeilingFailure = $derived.by(() => {
+    const status = sync.getSyncState();
+    if (!status || !hasLocalCeilingFailure) return null;
+    const ceiling = status.last_error_ceiling_key
+      ? rateLimits.local_ceilings[status.last_error_ceiling_key]
+      : undefined;
+    if (!ceiling) return null;
+    if (
+      !status.last_error_ceiling_reset_at
+      || ceiling.reset_at !== status.last_error_ceiling_reset_at
+    ) return null;
+    return {
+      spent: ceiling.spent,
+      limit: ceiling.limit,
+      resetAt: ceiling.reset_at,
+    };
+  });
+
+  function localCeilingFailureText(): string {
+    if (localCeilingFailure === null || localCeilingFailure.limit <= 0) {
+      return "local sync ceiling reached";
+    }
+    return `local sync ceiling reached (${formatCompact(localCeilingFailure.spent)} / ${formatCompact(localCeilingFailure.limit)})`;
+  }
+
+  function localCeilingFailureTitle(): string {
+    void tick;
+    const error = sync.getSyncState()?.last_error ?? "Local sync ceiling reached";
+    if (localCeilingFailure === null || localCeilingFailure.resetAt === "") return error;
+    const resetMs = new Date(localCeilingFailure.resetAt).getTime() - Date.now();
+    if (!Number.isFinite(resetMs) || resetMs <= 0) return error;
+    return `${error}; local ceiling resets in ${Math.ceil(resetMs / 60_000)}m`;
+  }
 </script>
 
 <!-- overflow="visible": the budget popover anchors inside the right section;
@@ -189,7 +227,13 @@
       </span>
       <span class="status-sep">&middot;</span>
     {/if}
-    {#if sync.getSyncState()?.last_error}
+    {#if hasLocalCeilingFailure}
+      <span
+        class="status-item status-item--error status-item--local-ceiling"
+        title={localCeilingFailureTitle()}
+      >{localCeilingFailureText()}</span>
+      <span class="status-sep">&middot;</span>
+    {:else if sync.getSyncState()?.last_error}
       <span class="status-item status-item--error" title={sync.getSyncState()?.last_error}>sync error</span>
       <span class="status-sep">&middot;</span>
     {/if}

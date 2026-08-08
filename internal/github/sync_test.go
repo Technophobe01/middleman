@@ -1111,6 +1111,38 @@ type syncTestMergeRequestOnlyProvider struct {
 	listMRCalls   atomic.Int32
 }
 
+type syncTestBudgetThenBrokenIssueProvider struct {
+	syncTestProvider
+	getMRErr error
+}
+
+func (p *syncTestBudgetThenBrokenIssueProvider) Capabilities() platform.Capabilities {
+	return platform.Capabilities{ReadMergeRequests: true, ReadIssues: true}
+}
+
+func (p *syncTestBudgetThenBrokenIssueProvider) ListOpenMergeRequests(
+	context.Context,
+	platform.RepoRef,
+) ([]platform.MergeRequest, error) {
+	return nil, nil
+}
+
+func (p *syncTestBudgetThenBrokenIssueProvider) GetMergeRequest(
+	context.Context,
+	platform.RepoRef,
+	int,
+) (platform.MergeRequest, error) {
+	return platform.MergeRequest{}, p.getMRErr
+}
+
+func (p *syncTestBudgetThenBrokenIssueProvider) ListMergeRequestEvents(
+	context.Context,
+	platform.RepoRef,
+	int,
+) ([]platform.MergeRequestEvent, error) {
+	return nil, nil
+}
+
 func (p *syncTestMergeRequestOnlyProvider) Capabilities() platform.Capabilities {
 	return platform.Capabilities{ReadMergeRequests: true}
 }
@@ -7242,6 +7274,100 @@ func TestSyncStatusUpdated(t *testing.T) {
 		return !status.LastRunAt.Before(before) && !status.LastRunAt.After(after)
 	}, "status.LastRunAt %v should be between %v and %v", status.LastRunAt, before, after)
 	assert.Empty(status.LastError)
+}
+
+func TestRunOncePreservesLocalCeilingStatusAcrossLaterRepoFailure(t *testing.T) {
+	assert := assert.New(t)
+	database := openTestDB(t)
+	ceilingRecorded := make(chan struct{})
+
+	client := &mockClient{
+		listOpenPRsFn: func(ctx context.Context, _, repo string) ([]*gh.PullRequest, error) {
+			if repo == "budget-limited" {
+				return nil, fmt.Errorf(
+					"budget-limited list failure: %w", platform.ErrSyncBudgetExhausted,
+				)
+			}
+			select {
+			case <-ceilingRecorded:
+				return nil, errors.New("unrelated repository failure")
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		},
+	}
+	syncer := NewSyncer(
+		map[string]Client{"github.com": client}, database, nil,
+		[]RepoRef{
+			{Owner: "owner", Name: "budget-limited", PlatformHost: "github.com"},
+			{Owner: "owner", Name: "other", PlatformHost: "github.com"},
+		},
+		time.Minute, nil, nil,
+	)
+	syncer.SetParallelism(2)
+	var closeOnce sync.Once
+	syncer.SetOnStatusChange(func(status *SyncStatus) {
+		if status.Progress == "1/2" {
+			closeOnce.Do(func() { close(ceilingRecorded) })
+		}
+	})
+
+	syncer.RunOnce(t.Context())
+
+	status := syncer.Status()
+	assert.Contains(status.LastError, "budget-limited list failure")
+	assert.NotContains(status.LastError, "unrelated repository failure")
+	assert.Equal(SyncErrorCodeLocalCeilingExhausted, status.LastErrorCode)
+	assert.Equal("github.com", status.LastErrorCeilingKey)
+}
+
+func TestRunOncePreservesItemCeilingStatusAcrossLaterHardRepoFailure(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	database := openTestDB(t)
+	now := time.Date(2026, 8, 8, 12, 0, 0, 0, time.UTC)
+	resetAt := now.Add(35 * time.Minute)
+	repo := RepoRef{
+		Platform:           platform.KindGitHub,
+		PlatformHost:       "github.com",
+		Owner:              "acme",
+		Name:               "widget",
+		PlatformExternalID: "repo-acme-widget",
+	}
+	repoID, err := database.UpsertRepo(t.Context(), verifiedDBRepoIdentity(platformRepoRef(repo)))
+	require.NoError(err)
+	_, err = database.UpsertMergeRequest(t.Context(), platform.DBMergeRequest(repoID, platform.MergeRequest{
+		PlatformID:     700,
+		Number:         7,
+		URL:            "https://github.com/acme/widget/pull/7",
+		Title:          "Previously open",
+		State:          "open",
+		HeadSHA:        "abc123",
+		BaseSHA:        "def456",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		LastActivityAt: now,
+	}))
+	require.NoError(err)
+
+	provider := &syncTestBudgetThenBrokenIssueProvider{
+		syncTestProvider: syncTestProvider{kind: platform.KindGitHub, host: "github.com"},
+		getMRErr:         newSyncBudgetExhaustedError(resetAt),
+	}
+	registry, err := platform.NewRegistry(provider)
+	require.NoError(err)
+	syncer := NewSyncerWithRegistry(
+		registry, database, nil, []RepoRef{repo}, time.Minute, nil, nil,
+	)
+
+	syncer.RunOnce(t.Context())
+
+	status := syncer.Status()
+	assert.Contains(status.LastError, "one or more merge request sync items failed")
+	assert.Contains(status.LastError, "resolve issue reader")
+	assert.Equal(SyncErrorCodeLocalCeilingExhausted, status.LastErrorCode)
+	assert.Equal("github.com", status.LastErrorCeilingKey)
+	assert.Equal(resetAt.Format(time.RFC3339), status.LastErrorCeilingResetAt)
 }
 
 func TestSyncStatusUpdatedUsesUTC(t *testing.T) {
@@ -15521,6 +15647,8 @@ func TestSyncerBudgetRefusedPRListSkipsETagEviction(t *testing.T) {
 		"budget refusal must not mark the repo for ETag eviction")
 	assert.Contains(syncer.Status().LastError, "list open PRs",
 		"budget refusal must still surface as a sync error")
+	assert.Equal(SyncErrorCodeLocalCeilingExhausted, syncer.Status().LastErrorCode,
+		"budget refusal must identify the local ceiling independently of provider quota")
 
 	// Cycle 3: budget available again. The list must go through the
 	// conditional path (warm cache → 304), not an eviction-forced refetch.
@@ -15531,6 +15659,42 @@ func TestSyncerBudgetRefusedPRListSkipsETagEviction(t *testing.T) {
 	assert.Equal(invalidateBefore, mc.invalidateCalls.Load(),
 		"recovery cycle must not invalidate list ETags")
 	assert.True(mc.prsCached, "cached PR list validator must stay warm")
+}
+
+func TestSyncerBudgetCauseSurvivesLaterIssueListFailure(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	ctx := t.Context()
+	database := openTestDB(t)
+
+	now := time.Date(2024, 6, 1, 12, 0, 0, 0, time.UTC)
+	repos := []RepoRef{{Owner: "owner", Name: "repo", PlatformHost: "github.com"}}
+	repoID, err := database.UpsertRepo(
+		ctx, verifiedGitHubRepoIdentity("github.com", "owner", "repo"),
+	)
+	require.NoError(err)
+	normalized, err := NormalizePR(repoID, buildOpenPR(1, now))
+	require.NoError(err)
+	_, err = database.UpsertMergeRequest(ctx, normalized)
+	require.NoError(err)
+
+	client := &partialFailureMock{}
+	client.openPRs = []*gh.PullRequest{}
+	client.getPullRequestFn = func(context.Context, string, string, int) (*gh.PullRequest, error) {
+		return nil, fmt.Errorf("get closed merge request: %w", platform.ErrSyncBudgetExhausted)
+	}
+	client.listOpenIssuesFn = func(context.Context, string, string) ([]*gh.Issue, error) {
+		return nil, errors.New("issue list unavailable")
+	}
+
+	syncer := NewSyncer(
+		map[string]Client{"github.com": client}, database, nil,
+		repos, time.Minute, nil, nil,
+	)
+	syncer.RunOnce(ctx)
+
+	assert.Equal(SyncErrorCodeLocalCeilingExhausted, syncer.Status().LastErrorCode,
+		"a later non-budget failure must not mask the earlier local-ceiling cause")
 }
 
 // TestSyncerBudgetRefusedIssueListSkipsETagEviction verifies the same

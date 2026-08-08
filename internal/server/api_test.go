@@ -21205,6 +21205,7 @@ func TestAPIRateLimitsSeparatesCredentialPoolsFromLocalCeilings(t *testing.T) {
 	)
 	budget := ghclient.NewSyncBudget(50000)
 	budget.Spend(42)
+	expectedCeilingResetAt := budget.ResetAt().UTC().Format(time.RFC3339)
 	syncer := ghclient.NewSyncer(
 		map[string]ghclient.Client{"github.com": &mockGH{}},
 		database, nil,
@@ -21238,6 +21239,7 @@ func TestAPIRateLimitsSeparatesCredentialPoolsFromLocalCeilings(t *testing.T) {
 	assert.Equal(50000, ceiling.Limit)
 	assert.Equal(42, ceiling.Spent)
 	assert.Equal(49958, ceiling.Remaining)
+	assert.Equal(expectedCeilingResetAt, ceiling.ResetAt)
 }
 
 func TestAPISyncPRIncrementsRequestCount(t *testing.T) {
@@ -28694,29 +28696,57 @@ func TestWorkspaceRuntimeSessionTerminalTmuxBackedWebSocketE2E(
 	require.NoError(err)
 	defer conn.Close(websocket.StatusNormalClosure, "done")
 
-	writeResize := func() error {
-		t.Helper()
-		resize, err := json.Marshal(map[string]any{
-			"type": "resize",
-			"cols": 177,
-			"rows": 41,
-		})
-		require.NoError(err)
-		return conn.Write(ctx, websocket.MessageText, resize)
+	resize, err := json.Marshal(map[string]any{
+		"type": "resize",
+		"cols": 177,
+		"rows": 41,
+	})
+	require.NoError(err)
+	writeResize := func(writeCtx context.Context) error {
+		return conn.Write(writeCtx, websocket.MessageText, resize)
 	}
-	probeSize := func() error {
-		if err := writeResize(); err != nil {
+	probeSize := func(writeCtx context.Context) error {
+		if err := writeResize(writeCtx); err != nil {
 			return err
 		}
-		return conn.Write(ctx, websocket.MessageBinary, []byte("probe\n"))
+		return conn.Write(writeCtx, websocket.MessageBinary, []byte("probe\n"))
 	}
-	require.NoError(probeSize())
+	require.NoError(probeSize(ctx))
+	probeCtx, stopProbes := context.WithCancel(ctx)
+	probeDone := make(chan struct{})
+	probeWriteErr := make(chan error, 1)
+	// Tmux applies the attach client's PTY resize asynchronously. Retry on a
+	// bounded wall-clock cadence: coupling each retry to a repaint creates a
+	// feedback loop that can fill the runtime subscriber buffer and detach an
+	// otherwise healthy websocket before the resize settles.
+	go func() {
+		defer close(probeDone)
+		ticker := time.NewTicker(250 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-probeCtx.Done():
+				return
+			case <-ticker.C:
+				if err := probeSize(probeCtx); err != nil {
+					probeWriteErr <- err
+					return
+				}
+			}
+		}
+	}()
+	defer func() {
+		stopProbes()
+		<-probeDone
+	}()
 	readCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
 	var got strings.Builder
+	var terminalReadErr error
 	for {
 		typ, data, readErr := conn.Read(readCtx)
 		if readErr != nil {
+			terminalReadErr = readErr
 			break
 		}
 		if typ != websocket.MessageBinary {
@@ -28729,11 +28759,30 @@ func TestWorkspaceRuntimeSessionTerminalTmuxBackedWebSocketE2E(
 		if strings.Contains(got.String(), "size:40:177:probe") {
 			return
 		}
-		if err := probeSize(); err != nil {
-			break
-		}
 	}
-	require.Contains(got.String(), "size:40:177:probe")
+	if !strings.Contains(got.String(), "size:40:177:probe") {
+		var terminalWriteErr error
+		select {
+		case terminalWriteErr = <-probeWriteErr:
+		default:
+		}
+		terminalOutput := got.String()
+		if len(terminalOutput) > 4096 {
+			terminalOutput = terminalOutput[len(terminalOutput)-4096:]
+		}
+		diagnostic := fmt.Sprintf(
+			"tmux terminal never observed the resized probe: "+
+				"read_err_base64=%s write_err_base64=%s output_base64=%s",
+			base64.StdEncoding.EncodeToString(
+				fmt.Append(nil, terminalReadErr),
+			),
+			base64.StdEncoding.EncodeToString(
+				fmt.Append(nil, terminalWriteErr),
+			),
+			base64.StdEncoding.EncodeToString([]byte(terminalOutput)),
+		)
+		require.NoError(errors.New(diagnostic))
+	}
 }
 
 func createReadyWorkspace(

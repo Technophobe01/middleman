@@ -2,6 +2,7 @@ package e2etest
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -16,6 +17,7 @@ import (
 	ghclient "go.kenn.io/forge/internal/github"
 	"go.kenn.io/forge/internal/platform"
 	platformgithub "go.kenn.io/forge/internal/platform/github"
+	platformgitlab "go.kenn.io/forge/internal/platform/gitlab"
 	"go.kenn.io/forge/internal/server"
 	"go.kenn.io/forge/internal/testutil/dbtest"
 	"go.kenn.io/forge/internal/testutil/servertest"
@@ -72,9 +74,13 @@ func TestSyncListNotModifiedDoesNotChangeRateLimitBudgetE2E(t *testing.T) {
 
 	var pulls304 atomic.Int32
 	var issues304 atomic.Int32
+	var forcePullRefresh atomic.Bool
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v3/repos/acme/widget/pulls", func(w http.ResponseWriter, r *http.Request) {
+		if forcePullRefresh.Swap(false) {
+			r.Header.Del("If-None-Match")
+		}
 		writeGitHubListResponse(w, r, `"pulls-v1"`, &pulls304)
 	})
 	mux.HandleFunc("/api/v3/repos/acme/widget/issues", func(w http.ResponseWriter, r *http.Request) {
@@ -178,6 +184,194 @@ func TestSyncListNotModifiedDoesNotChangeRateLimitBudgetE2E(t *testing.T) {
 	assert.Equal(int32(1), pulls304.Load())
 	assert.Equal(int32(1), issues304.Load())
 	assert.Equal(firstSpent, budgetSpent())
+
+	// Make the PR list consume the final budget unit so the following issue
+	// list request is the one refused by the local ceiling.
+	forcePullRefresh.Store(true)
+	triggerSync()
+	status, err := api.HTTP.GetSyncStatusWithResponse(t.Context())
+	require.NoError(err)
+	require.Equal(http.StatusOK, status.StatusCode(), string(status.Body))
+	require.NotNil(status.JSON200)
+	require.NotNil(status.JSON200.LastErrorCode)
+	assert.Equal(generated.LocalSyncCeilingExhausted, *status.JSON200.LastErrorCode)
+
+	rates, err := api.HTTP.GetRateLimitsWithResponse(t.Context())
+	require.NoError(err)
+	require.Equal(http.StatusOK, rates.StatusCode(), string(rates.Body))
+	require.NotNil(rates.JSON200)
+	ceiling, ok := rates.JSON200.LocalCeilings["github.com"]
+	require.True(ok)
+	resetAt, err := time.Parse(time.RFC3339, ceiling.ResetAt)
+	require.NoError(err)
+	assert.True(resetAt.After(time.Now().UTC()))
+}
+
+func TestSyncItemBudgetExhaustionIdentifiesLocalCeilingE2E(t *testing.T) {
+	require := require.New(t)
+
+	var commentRequests atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v3/repos/acme/widget/pulls", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[]`))
+	})
+	mux.HandleFunc("/api/v3/repos/acme/widget/issues", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{
+			"id": 7,
+			"number": 7,
+			"title": "Budget regression",
+			"state": "open",
+			"html_url": "https://example.com/acme/widget/issues/7",
+			"body": "",
+			"created_at": "2026-08-07T20:00:00Z",
+			"updated_at": "2026-08-07T20:00:00Z"
+		}]`))
+	})
+	mux.HandleFunc("/api/v3/repos/acme/widget/issues/7/comments", func(w http.ResponseWriter, _ *http.Request) {
+		commentRequests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[]`))
+	})
+	githubAPI := httptest.NewServer(mux)
+	defer githubAPI.Close()
+
+	database := dbtest.Open(t)
+	restTracker := ghclient.NewRateTracker(database, "github.com", "host", "rest")
+	budget := ghclient.NewSyncBudget(2)
+	client, err := ghclient.NewClient(
+		staticTokenSource("token"),
+		"github.com",
+		restTracker,
+		budget,
+		ghclient.WithBaseURLForTesting(githubAPI.URL),
+	)
+	require.NoError(err)
+
+	registry, err := platform.NewRegistry(gitHubIndexListProvider{
+		host:   "github.com",
+		client: client,
+	})
+	require.NoError(err)
+	syncer := ghclient.NewSyncerWithRegistry(
+		registry,
+		database,
+		nil,
+		[]ghclient.RepoRef{{
+			Owner: "acme", Name: "widget",
+			PlatformHost:       "github.com",
+			PlatformRepoID:     101,
+			PlatformExternalID: "R_101",
+		}},
+		time.Minute,
+		map[string]*ghclient.RateTracker{"github.com": restTracker},
+		map[string]*ghclient.SyncBudget{"github.com": budget},
+	)
+	t.Cleanup(syncer.Stop)
+
+	srv := servertest.New(t, database, syncer, nil, "/", nil, server.ServerOptions{
+		HostCheckAllowLoopbackAnyPort: true,
+	})
+	forge := httptest.NewServer(srv)
+	defer forge.Close()
+
+	trigger, err := http.NewRequestWithContext(
+		t.Context(), http.MethodPost, forge.URL+"/api/v1/sync", nil,
+	)
+	require.NoError(err)
+	trigger.Header.Set("Content-Type", "application/json")
+	triggerResponse, err := forge.Client().Do(trigger)
+	require.NoError(err)
+	defer triggerResponse.Body.Close()
+	require.Equal(http.StatusAccepted, triggerResponse.StatusCode)
+
+	require.Eventually(func() bool {
+		return !syncer.Status().Running && !syncer.Status().LastRunAt.IsZero()
+	}, 5*time.Second, 10*time.Millisecond)
+
+	statusResponse, err := forge.Client().Get(forge.URL + "/api/v1/sync/status")
+	require.NoError(err)
+	defer statusResponse.Body.Close()
+	require.Equal(http.StatusOK, statusResponse.StatusCode)
+	var status struct {
+		LastErrorCode           string `json:"last_error_code"`
+		LastErrorCeilingKey     string `json:"last_error_ceiling_key"`
+		LastErrorCeilingResetAt string `json:"last_error_ceiling_reset_at"`
+	}
+	require.NoError(json.NewDecoder(statusResponse.Body).Decode(&status))
+	require.Equal("localSyncCeilingExhausted", status.LastErrorCode)
+	require.Equal("github.com", status.LastErrorCeilingKey)
+	require.Equal(budget.ResetAt().UTC().Format(time.RFC3339), status.LastErrorCeilingResetAt)
+	require.Zero(commentRequests.Load(), "the refused request must not reach the provider")
+}
+
+func TestGitLabSyncBudgetExhaustionIncludesWindowE2E(t *testing.T) {
+	require := require.New(t)
+	var requests atomic.Int32
+	gitlabAPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	t.Cleanup(gitlabAPI.Close)
+
+	budget := ghclient.NewSyncBudget(1)
+	budget.Spend(1)
+	client, err := platformgitlab.NewClient(
+		"gitlab.example.com",
+		staticTokenSource("token"),
+		platformgitlab.WithBaseURLForTesting(gitlabAPI.URL+"/api/v4"),
+		platformgitlab.WithoutRetriesForTesting(),
+		platformgitlab.WithSyncBudget(budget),
+	)
+	require.NoError(err)
+	registry, err := ghclient.NewProviderRegistry(nil, client)
+	require.NoError(err)
+	database := dbtest.Open(t)
+	syncer := ghclient.NewSyncerWithRegistry(
+		registry,
+		database,
+		nil,
+		[]ghclient.RepoRef{{
+			Platform:           platform.KindGitLab,
+			PlatformHost:       "gitlab.example.com",
+			PlatformRepoID:     42,
+			PlatformExternalID: "42",
+			Owner:              "group",
+			Name:               "project",
+			RepoPath:           "group/project",
+		}},
+		time.Minute,
+		nil,
+		map[string]*ghclient.SyncBudget{
+			ghclient.RateBucketKey("gitlab", "gitlab.example.com", "host"): budget,
+		},
+	)
+	t.Cleanup(syncer.Stop)
+	syncer.RunOnce(t.Context())
+
+	srv := servertest.New(t, database, syncer, nil, "/", nil, server.ServerOptions{
+		HostCheckAllowLoopbackAnyPort: true,
+	})
+	forge := httptest.NewServer(srv)
+	t.Cleanup(forge.Close)
+	api, err := apiclient.NewWithHTTPClient(forge.URL, forge.Client())
+	require.NoError(err)
+	status, err := api.HTTP.GetSyncStatusWithResponse(t.Context())
+	require.NoError(err)
+	require.Equal(http.StatusOK, status.StatusCode(), string(status.Body))
+	require.NotNil(status.JSON200)
+	require.NotNil(status.JSON200.LastErrorCode)
+	require.Equal(generated.LocalSyncCeilingExhausted, *status.JSON200.LastErrorCode)
+	require.NotNil(status.JSON200.LastErrorCeilingKey)
+	require.Equal("gitlab:gitlab.example.com", *status.JSON200.LastErrorCeilingKey)
+	require.NotNil(status.JSON200.LastErrorCeilingResetAt)
+	require.Equal(
+		budget.ResetAt().UTC().Format(time.RFC3339),
+		status.JSON200.LastErrorCeilingResetAt.UTC().Format(time.RFC3339),
+	)
+	require.Zero(requests.Load(), "the refused request must not reach GitLab")
 }
 
 type gitHubIndexListProvider struct {
@@ -275,15 +469,12 @@ func (p gitHubIndexListProvider) GetIssue(
 }
 
 func (p gitHubIndexListProvider) ListIssueEvents(
-	context.Context,
-	platform.RepoRef,
-	int,
+	ctx context.Context,
+	ref platform.RepoRef,
+	number int,
 ) ([]platform.IssueEvent, error) {
-	return nil, platform.UnsupportedCapability(
-		platform.KindGitHub,
-		p.host,
-		"read_issue_events",
-	)
+	_, err := p.client.ListIssueComments(ctx, ref.Owner, ref.Name, number)
+	return nil, err
 }
 
 func writeGitHubListResponse(
