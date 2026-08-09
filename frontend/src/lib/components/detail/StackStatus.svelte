@@ -281,8 +281,7 @@
         <span class="stack-chip-label">Stacked: {data.position}/{data.size}</span>
         {#if downstackBlockerCount > 0}
           <span class="stack-chip-failure" aria-hidden="true">
-            <XIcon size={12} strokeWidth={2.8} />
-            <span>{downstackBlockerCount}</span>
+            <XIcon size={14} strokeWidth={2.8} /><span class="stack-chip-failure-count">{downstackBlockerCount}</span>
           </span>
         {/if}
         {#snippet trailing()}
@@ -364,7 +363,7 @@
     display: inline-flex;
     align-items: center;
     vertical-align: middle;
-    gap: 1px;
+    gap: var(--space-1);
     color: var(--accent-red);
     font-variant-numeric: tabular-nums;
     font-weight: 700;
@@ -373,6 +372,11 @@
 
   .stack-chip-failure :global(svg) {
     display: block;
+  }
+
+  .stack-chip-failure-count {
+    font-size: 0.9em;
+    line-height: 1;
   }
 
   :global(.chip-chevron) {
