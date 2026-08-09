@@ -1,7 +1,6 @@
 import { Effect, Result } from "effect";
 import type { AppExecution, AppRuntime } from "../app/runtime.js";
-import { TransientTransportError } from "../api/effect-errors.js";
-import type { ApiProblemError } from "../api/effect-errors.js";
+import { ApiProblemError, TransientTransportError } from "../api/effect-errors.js";
 import { executeGeneratedApiRequest, type GeneratedApi } from "../api/generated-api.js";
 import { retryIdempotentRead } from "../api/retry-policy.js";
 import type {
@@ -19,6 +18,7 @@ import type {
 import type { ApplySuggestionRequest } from "../utils/markdown-suggestions.js";
 import {
   isProblem,
+  ProblemCodes,
   problemConflictContext,
   problemConflictReason,
   problemRetryAfter,
@@ -92,6 +92,14 @@ export interface DetailStoreOptions {
 export interface ProviderActionCallbacks extends MutationCallbacks {
   readonly onProblem?: (problem: ProblemBody) => void;
 }
+
+export type MergePullOutcome =
+  | { readonly _tag: "Queued" }
+  | { readonly _tag: "Merged"; readonly cleanupWarning?: string };
+
+export type MergePullCallbacks = Omit<ProviderActionCallbacks, "onSuccess"> & {
+  readonly onSuccess?: (outcome: MergePullOutcome) => void;
+};
 
 export interface DetailRefreshCallbacks extends MutationCallbacks {}
 
@@ -752,8 +760,9 @@ export function createDetailStore(opts: DetailStoreOptions) {
     number: number,
     input: MergeParams,
     deferred: boolean,
-    callbacks: ProviderActionCallbacks = {},
+    callbacks: MergePullCallbacks = {},
   ): void {
+    let workspaceCleanupWarning: string | undefined;
     const commit = (ref: DetailRequestRef) =>
       deferred
         ? executeGeneratedApiRequest("POST deferred pull request merge", (client, signal) =>
@@ -769,8 +778,46 @@ export function createDetailStore(opts: DetailStoreOptions) {
               body: input,
               signal,
             }),
-          ).pipe(Effect.asVoid);
-    runPullAction(ref, number, deferred ? "schedule pull request merge" : "merge pull request", commit, callbacks);
+          ).pipe(
+            Effect.flatMap((result) => {
+              if (!result.merged) {
+                return Effect.fail(
+                  new ApiProblemError({
+                    operation: "POST pull request merge",
+                    problem: {
+                      code: ProblemCodes.conflict,
+                      detail: result.message || "The pull request could not be merged.",
+                      details: { reason: "conflict" },
+                      status: 409,
+                      title: "Merge did not complete",
+                      type: "about:blank",
+                    },
+                  }),
+                );
+              }
+              return Effect.sync(() => {
+                workspaceCleanupWarning = result.workspace_cleanup_warning;
+              });
+            }),
+            Effect.asVoid,
+          );
+    runPullAction(ref, number, deferred ? "schedule pull request merge" : "merge pull request", commit, {
+      ...callbacks,
+      onSuccess: () => {
+        if (workspaceCleanupWarning) {
+          showFlash(`Pull request merged, but the workspace was not pruned: ${workspaceCleanupWarning}`, {
+            tone: "warning",
+          });
+        }
+        callbacks.onSuccess?.(
+          deferred
+            ? { _tag: "Queued" }
+            : workspaceCleanupWarning === undefined
+              ? { _tag: "Merged" }
+              : { _tag: "Merged", cleanupWarning: workspaceCleanupWarning },
+        );
+      },
+    });
   }
 
   // A refreshed payload whose content matches the displayed detail must

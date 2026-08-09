@@ -60,20 +60,21 @@ type deferredMergeTargetSnapshot struct {
 }
 
 type DeferredMergeCompletedPayload struct {
-	Provider     string `json:"provider"`
-	PlatformHost string `json:"platform_host"`
-	RepoPath     string `json:"repo_path"`
-	Owner        string `json:"owner"`
-	Name         string `json:"name"`
-	Number       int    `json:"number"`
-	HeadSHA      string `json:"head_sha"`
-	Status       string `json:"status"`
-	Merged       bool   `json:"merged,omitempty"`
-	SHA          string `json:"sha,omitempty"`
-	Message      string `json:"message,omitempty"`
-	Error        string `json:"error,omitempty"`
-	CompletedAt  string `json:"completed_at"`
-	Warning      string `json:"workspace_cleanup_warning,omitempty"`
+	Provider           string `json:"provider"`
+	PlatformHost       string `json:"platform_host"`
+	RepoPath           string `json:"repo_path"`
+	Owner              string `json:"owner"`
+	Name               string `json:"name"`
+	Number             int    `json:"number"`
+	HeadSHA            string `json:"head_sha"`
+	Status             string `json:"status"`
+	Merged             bool   `json:"merged,omitempty"`
+	SHA                string `json:"sha,omitempty"`
+	Message            string `json:"message,omitempty"`
+	Error              string `json:"error,omitempty"`
+	CompletedAt        string `json:"completed_at"`
+	Warning            string `json:"workspace_cleanup_warning,omitempty"`
+	DeletedWorkspaceID string `json:"deleted_workspace_id,omitempty"`
 }
 
 func (s *Handler) deferMergePR(
@@ -403,6 +404,14 @@ func (s *Handler) completeDeferredMerge(
 		s.broadcastDeferredMergeFailure(repo, number, deferredMergeHeadSHA(body, queuedTarget.HeadSHA), err.Error(), handle)
 		return
 	}
+	if !result.Merged {
+		message := strings.TrimSpace(result.Message)
+		if message == "" {
+			message = "provider did not merge the pull request"
+		}
+		s.broadcastDeferredMergeFailure(repo, number, deferredMergeHeadSHA(body, queuedTarget.HeadSHA), message, handle)
+		return
+	}
 	// Clear pending before announcing completion: clients refresh detail the
 	// moment they see deferred_merge_completed, and that refresh must not
 	// read a stale deferred_merge_pending=true.
@@ -424,8 +433,20 @@ func (s *Handler) completeDeferredMerge(
 			Message:      result.Message,
 			CompletedAt:  formatUTCRFC3339(s.now().UTC()),
 			Warning:      result.WorkspaceCleanupWarning,
+			DeletedWorkspaceID: deferredMergeDeletedWorkspaceID(
+				result.Merged,
+				body.DeleteWorkspaceID,
+				result.WorkspaceCleanupWarning,
+			),
 		},
 	})
+}
+
+func deferredMergeDeletedWorkspaceID(merged bool, requestedID, cleanupWarning string) string {
+	if !merged || requestedID == "" || cleanupWarning != "" {
+		return ""
+	}
+	return requestedID
 }
 
 func (s *Handler) ensureDeferredMergeTargetUnchanged(ctx context.Context, repo db.Repo, number int, queuedTarget deferredMergeTargetSnapshot) error {

@@ -12,7 +12,11 @@ supersession, completion events, or pending-state presentation.
   queued merge.
 - A successful immediate merge supersedes the queued worker silently (per-key
   handle): pending clears with the merge response and the worker emits no event.
-  A failed immediate merge leaves the queued merge untouched.
+  An immediate provider response with `merged: false` leaves the queued merge and
+  all merge-completion side effects untouched.
+- A deferred worker response with `merged: false` is a terminal failure: clear pending and publish the provider message,
+  but never publish merged status or run merge-completion side effects
+  (`internal/server/pullapi/deferred_merge.go::Handler.completeDeferredMerge`).
 - The worker also stands down silently whenever it observes the target already
   merged (`errDeferredMergeTargetMerged`); the supersede handle alone cannot
   cover this because the worker syncs provider state independently and can see
@@ -27,3 +31,9 @@ supersession, completion events, or pending-state presentation.
 - Deferred merge requests retain the selected workspace ID; only a successful
   provider merge reaches non-force deletion
   (`internal/server/pullapi/deferred_merge.go::completeDeferredMerge`).
+- A successful completion event carries `deleted_workspace_id` only when cleanup removed the requested workspace.
+  Cleanup warnings preserve the workspace and omit that field; clients publish confirmed deletion before view refreshes
+  (`internal/server/pullapi/deferred_merge.go::DeferredMergeCompletedPayload`).
+- Frontend callbacks distinguish queue acknowledgement from provider merge
+  completion. A queued outcome closes the modal and refreshes pending state; it
+  never publishes workspace deletion (`frontend/src/lib/stores/detail.svelte.ts::MergePullOutcome`).

@@ -33,6 +33,8 @@ import { beginTerminalSettingsHydration } from "./stores/terminal-settings-persi
 import { applySettingsHydration } from "./stores/settings-hydration.js";
 import { createEventsStore } from "./stores/events.svelte.js";
 import type { RoutedItemRef } from "./routes.js";
+import { KataWorkspaceCreationWorkflow } from "./features/kata/kata-workspace-creation-workflow.js";
+import { notifyWorkspaceDeleted } from "./stores/workspace-host.svelte.js";
 
 export interface AppStoreOptions {
   runtime: AppRuntime;
@@ -43,6 +45,7 @@ export interface AppStoreOptions {
   getActivitySelection?: () => RoutedItemRef | null;
   roborevBaseUrl?: string;
   onError?: (msg: string) => void;
+  onWarning?: (msg: string) => void;
   onNotification?: (msg: string) => void;
 }
 
@@ -61,6 +64,7 @@ export function createAppStores(options: AppStoreOptions): AppStoreComposition {
     getActivitySelection = () => null,
     roborevBaseUrl,
     onError,
+    onWarning,
     onNotification,
   } = options;
   const appRuntime = runtime;
@@ -71,6 +75,7 @@ export function createAppStores(options: AppStoreOptions): AppStoreComposition {
   const getSelectedActivity = getActivitySelection;
   const roborevBase = roborevBaseUrl;
   const errorCb = onError;
+  const warningCb = onWarning;
   const notificationCb = onNotification;
   const grouping = createGroupingStore();
   const detailActivityView = createDetailActivityViewStore();
@@ -220,6 +225,16 @@ export function createAppStores(options: AppStoreOptions): AppStoreComposition {
     onDataChanged: refreshVisibleData,
     onSyncStatus: (status) => Effect.sync(() => syncStore.setSyncStatus(status)),
     onConfigChanged: handleConfigChanged,
+    onWorkspaceCreated: (event) =>
+      KataWorkspaceCreationWorkflow.pipe(
+        Effect.flatMap((workflow) => workflow.workspaceCreated(event.id, event.created)),
+      ),
+    onWorkspaceStatus: (event) => {
+      const workspaceID = event.id;
+      return workspaceID === undefined
+        ? Effect.void
+        : KataWorkspaceCreationWorkflow.pipe(Effect.flatMap((workflow) => workflow.workspaceStatus(workspaceID)));
+    },
     ...(errorCb !== undefined && { onTerminalFailure: errorCb, onRecoverableFailure: errorCb }),
     onPRDetailRefreshed: (ref) => {
       const detail = detailStore.getDetail();
@@ -259,6 +274,10 @@ export function createAppStores(options: AppStoreOptions): AppStoreComposition {
     },
     onDeferredMergeCompleted: (event) =>
       Effect.gen(function* () {
+        const deletedWorkspaceID = event.deleted_workspace_id;
+        if (deletedWorkspaceID) {
+          yield* Effect.sync(() => notifyWorkspaceDeleted(deletedWorkspaceID));
+        }
         const refreshes: Array<Effect.Effect<void, ProviderEventsError, AppServices>> = [
           pullsStore.reconcilePullsEffect(),
           activityStore.reconcileActivityEffect(),
@@ -283,7 +302,13 @@ export function createAppStores(options: AppStoreOptions): AppStoreComposition {
         yield* Effect.all(refreshes, { concurrency: "unbounded", discard: true });
         yield* Effect.sync(() => {
           if (event.status === "merged") {
-            notificationCb?.(`${event.owner}/${event.name}#${event.number} merged after CI passed.`);
+            if (event.workspace_cleanup_warning) {
+              warningCb?.(
+                `${event.owner}/${event.name}#${event.number} merged, but the workspace was not pruned: ${event.workspace_cleanup_warning}`,
+              );
+            } else {
+              notificationCb?.(`${event.owner}/${event.name}#${event.number} merged after CI passed.`);
+            }
           } else {
             errorCb?.(
               `Deferred merge for ${event.owner}/${event.name}#${event.number} failed: ${event.error ?? "checks did not pass"}`,
@@ -305,6 +330,7 @@ export function createAppStores(options: AppStoreOptions): AppStoreComposition {
             activityStore.reconcileActivityEffect(),
             refreshSelectedActivityDetail(),
             syncStore.reconcileSyncStatusEffect,
+            KataWorkspaceCreationWorkflow.pipe(Effect.flatMap((workflow) => workflow.reconcile)),
           ],
           { concurrency: "unbounded", discard: true },
         );

@@ -62,6 +62,9 @@ Workspace deletion is intentionally conservative.
 - Only after a clean preflight may runtime sessions and shells be stopped.
 - Only after runtime shutdown succeeds should destructive worktree and DB
   teardown continue.
+- A confirmed delete publishes workspace absence from the application workflow before presenter-specific navigation
+  or failure UI; releasing the initiating presenter must not suppress tombstones, hosted-session cleanup, or route invalidation
+  (`frontend/src/lib/components/terminal/workspace-runtime-workflow.ts::executeMutation`).
 
 This ordering prevents a rejected delete from silently killing the user's live
 workspace sessions.
@@ -151,6 +154,9 @@ stale tabs.
 
 - Runtime lists returned by `/workspaces/{id}/runtime` are the authoritative
   backend view of live launched sessions.
+- Application workflow launch settlement precedes presenter delivery. Accept confirmed sessions immediately, reject only
+  definite failures, and leave uncertain launches unsettled until reconciliation decides them
+  (`frontend/src/lib/components/terminal/workspace-runtime-workflow.ts::storeAndPresentMutation`).
 - Workspace terminals use xterm.js exclusively; there is no renderer setting
   or alternate renderer path (`frontend/src/lib/components/terminal/TerminalPane.svelte`).
 - Treat terminal processes as native-terminal-equivalent, but accept bounded, write-only OSC 52 writes only after one
@@ -175,6 +181,9 @@ stale tabs.
 - During active tmux SGR drags outside xterm bounds, add only clamped edge wheel, drag, and release reports; forward
   all other mouse reports unchanged, and never retain unsent drag state across a WebSocket boundary
   (`frontend/src/lib/components/terminal/XtermTerminalPane.svelte::connect`).
+- Agent TUIs in the normal buffer with no local scrollback receive vertical wheel gestures as cursor input; xterm/tmux
+  keep ownership when scrollback, the alternate buffer, mouse tracking, or browser Ctrl-wheel zoom is active
+  (`frontend/src/lib/components/terminal/XtermTerminalPane.svelte::handleTerminalWheel`).
 - macOS loopback clipboard fallback must run `pbcopy` with `LC_ALL=en_US.UTF-8`; service launchers may omit
   a UTF-8 locale and make `pbcopy` reinterpret unchanged UTF-8 input
   (`internal/systemclipboard/systemclipboard.go::nativeWriter.WriteText`).

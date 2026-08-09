@@ -119,6 +119,7 @@ type deferredMergeTestProvider struct {
 	deferredMergeProviderBase
 	mergeCh       chan deferredMergeTestMergeCall
 	mergeErr      error
+	mergeResults  []platform.MergeResult
 	ciStarted     chan struct{}
 	ciStartedOnce sync.Once
 	ciRelease     chan struct{}
@@ -177,25 +178,32 @@ func (p *deferredMergeTestProvider) MergeMergeRequest(
 	if p.mergeErr != nil {
 		return platform.MergeResult{}, p.mergeErr
 	}
+	result := platform.MergeResult{Merged: true, SHA: "merge-sha", Message: "merged"}
 	// Reflect the merge the way the real provider does: the handler's
 	// canonical post-merge resync reads the MR back to record the terminal
 	// transition, and an unchanged state or stale updated_at would leave
 	// the local row open.
 	p.mu.Lock()
-	for i := range p.mergeRequests {
-		if p.mergeRequests[i].Number != number ||
-			p.mergeRequests[i].State != "open" {
-			continue
+	if len(p.mergeResults) > 0 {
+		result = p.mergeResults[0]
+		p.mergeResults = p.mergeResults[1:]
+	}
+	if result.Merged {
+		for i := range p.mergeRequests {
+			if p.mergeRequests[i].Number != number ||
+				p.mergeRequests[i].State != "open" {
+				continue
+			}
+			mergedAt := p.mergeRequests[i].UpdatedAt.Add(time.Minute)
+			p.mergeRequests[i].State = "merged"
+			p.mergeRequests[i].MergedAt = &mergedAt
+			p.mergeRequests[i].MergedBy = "ada"
+			p.mergeRequests[i].UpdatedAt = mergedAt
+			p.mergeRequests[i].LastActivityAt = mergedAt
 		}
-		mergedAt := p.mergeRequests[i].UpdatedAt.Add(time.Minute)
-		p.mergeRequests[i].State = "merged"
-		p.mergeRequests[i].MergedAt = &mergedAt
-		p.mergeRequests[i].MergedBy = "ada"
-		p.mergeRequests[i].UpdatedAt = mergedAt
-		p.mergeRequests[i].LastActivityAt = mergedAt
 	}
 	p.mu.Unlock()
-	return platform.MergeResult{Merged: true, SHA: "merge-sha", Message: "merged"}, nil
+	return result, nil
 }
 
 type deferredMergeTestOptions struct {
@@ -515,6 +523,7 @@ func TestDeferMergeEndpointQueuesMergeAndBroadcastsCompletion(t *testing.T) {
 	require.Equal("merge-sha", completed.SHA)
 	require.Equal("2026-06-15T12:00:00Z", completed.CompletedAt)
 	require.Equal("workspace has uncommitted changes: notes.txt", completed.Warning)
+	require.Empty(completed.DeletedWorkspaceID)
 	require.Equal("ws-1", deletedID)
 
 	stored, err := database.GetMergeRequestByRepoIDAndNumber(ctx, repoID, 7)
@@ -708,6 +717,142 @@ func TestImmediateMergeSupersedesQueuedDeferredMerge(t *testing.T) {
 			return
 		}
 	}
+}
+
+func TestImmediateUnmergedResponsePreservesQueueUntilDeferredProviderRejects(t *testing.T) {
+	require := require.New(t)
+	ctx := t.Context()
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	ref := platform.RepoRef{
+		Platform:           platform.KindGitLab,
+		Host:               "gitlab.example.com",
+		Owner:              "group",
+		Name:               "project",
+		RepoPath:           "group/project",
+		PlatformID:         4242,
+		PlatformExternalID: "gid://gitlab/Project/4242",
+		DefaultBranch:      "main",
+	}
+	ciStarted := make(chan struct{})
+	ciRelease := make(chan struct{})
+	provider := &deferredMergeTestProvider{
+		deferredMergeProviderBase: deferredMergeProviderBase{
+			ref: ref,
+			mergeRequests: []platform.MergeRequest{{
+				Repo:           ref,
+				PlatformID:     7001,
+				Number:         7,
+				URL:            "https://gitlab.example.com/group/project/-/merge_requests/7",
+				Title:          "Defer merge",
+				Author:         "ada",
+				State:          "open",
+				HeadBranch:     "feature",
+				BaseBranch:     "main",
+				HeadSHA:        "head-sha",
+				BaseSHA:        "base-sha",
+				CIStatus:       "pending",
+				CreatedAt:      now,
+				UpdatedAt:      now,
+				LastActivityAt: now,
+			}},
+			ciChecks: map[string][]platform.CICheck{
+				"head-sha": {{
+					App:        "GitLab",
+					Name:       "pipeline",
+					Status:     "completed",
+					Conclusion: "success",
+				}},
+			},
+		},
+		mergeCh: make(chan deferredMergeTestMergeCall, 2),
+		mergeResults: []platform.MergeResult{
+			{
+				Merged:  false,
+				Message: "immediate provider response did not merge the pull request",
+			},
+			{
+				Merged:  false,
+				Message: "deferred provider response did not merge the pull request",
+			},
+		},
+		ciStarted: ciStarted,
+		ciRelease: ciRelease,
+	}
+	srv, _, _, client := newDeferredMergeRouteServer(
+		t,
+		provider,
+		ref,
+		now,
+		[]db.CICheck{{App: "GitLab", Name: "pipeline", Status: "in_progress"}},
+	)
+	events, _ := srv.Hub().Subscribe(ctx, false)
+	expectedHeadSHA := "head-sha"
+
+	deferResp, err := client.HTTP.DeferMergePullOnHostWithResponse(
+		ctx,
+		ref.Host,
+		"gitlab",
+		ref.Owner,
+		ref.Name,
+		7,
+		generated.MergePRInputBody{Method: "squash", ExpectedHeadSha: &expectedHeadSHA},
+	)
+	require.NoError(err)
+	require.Equal(202, deferResp.StatusCode(), string(deferResp.Body))
+	select {
+	case <-ciStarted:
+	case <-time.After(time.Second):
+		require.FailNow("timed out waiting for deferred CI refresh")
+	}
+
+	mergeResp, err := client.HTTP.MergePullOnHostWithResponse(
+		ctx,
+		ref.Host,
+		"gitlab",
+		ref.Owner,
+		ref.Name,
+		7,
+		generated.MergePRInputBody{Method: "squash", ExpectedHeadSha: &expectedHeadSHA},
+	)
+	require.NoError(err)
+	require.Equal(200, mergeResp.StatusCode(), string(mergeResp.Body))
+	require.NotNil(mergeResp.JSON200)
+	require.False(mergeResp.JSON200.Merged)
+
+	detailResp, err := client.HTTP.GetPullOnHostWithResponse(
+		ctx, ref.Host, "gitlab", ref.Owner, ref.Name, 7,
+	)
+	require.NoError(err)
+	require.Equal(200, detailResp.StatusCode(), string(detailResp.Body))
+	require.NotNil(detailResp.JSON200)
+	require.True(detailResp.JSON200.DeferredMergePending)
+
+	close(ciRelease)
+	var completed DeferredMergeCompletedPayload
+	for completed.Status == "" {
+		select {
+		case event := <-events:
+			if event.Event.Type != "deferred_merge_completed" {
+				continue
+			}
+			var ok bool
+			completed, ok = event.Event.Data.(DeferredMergeCompletedPayload)
+			require.True(ok)
+		case <-time.After(time.Second):
+			require.FailNow("timed out waiting for deferred merge completion")
+		}
+	}
+	require.Equal("failed", completed.Status)
+	require.False(completed.Merged)
+	require.Equal("deferred provider response did not merge the pull request", completed.Error)
+
+	detailResp, err = client.HTTP.GetPullOnHostWithResponse(
+		ctx, ref.Host, "gitlab", ref.Owner, ref.Name, 7,
+	)
+	require.NoError(err)
+	require.Equal(200, detailResp.StatusCode(), string(detailResp.Body))
+	require.NotNil(detailResp.JSON200)
+	require.False(detailResp.JSON200.DeferredMergePending)
 }
 
 func TestDeferMergeEndpointRejectsInvalidMergeMethodBeforeQueueing(t *testing.T) {

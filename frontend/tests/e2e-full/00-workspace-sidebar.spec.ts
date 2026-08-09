@@ -142,6 +142,31 @@ test.describe("workspace sidebar full-stack", () => {
     }
   });
 
+  test("refreshes the real workspace list after a backend-created workspace appears", async ({ page }) => {
+    let isolatedServer: IsolatedE2EServer | null = null;
+    let api: APIRequestContext | null = null;
+    try {
+      isolatedServer = await startIsolatedWorkspaceE2EServer();
+      api = await playwrightRequest.newContext({
+        baseURL: isolatedServer.info.base_url,
+      });
+
+      await page.goto(`${isolatedServer.info.base_url}/workspaces`);
+      await expect(page.getByText("No workspaces yet.")).toBeVisible();
+
+      await createIssueWorkspace(api, 10);
+
+      await expect(
+        page.locator(".workspace-list-sidebar .ws-row").filter({
+          hasText: "Widget rendering broken on Safari",
+        }),
+      ).toHaveCount(1, { timeout: 7_000 });
+    } finally {
+      await api?.dispose();
+      await isolatedServer?.stop();
+    }
+  });
+
   test("shows provider icons in group headers when workspaces span multiple providers", async ({ page }) => {
     let isolatedServer: IsolatedE2EServer | null = null;
     let api: APIRequestContext | null = null;
@@ -408,6 +433,13 @@ test.describe("workspace sidebar full-stack", () => {
       await expect(dialog).toBeVisible();
       await expect(dialog).toContainText("Widget rendering broken on Safari");
 
+      const requestOrder: string[] = [];
+      page.on("request", (request) => {
+        const pathname = new URL(request.url()).pathname;
+        if (pathname === "/api/v1/workspaces" || pathname === `/api/v1/workspaces/${deletedWorkspace.id}`) {
+          requestOrder.push(`${request.method()} ${pathname}`);
+        }
+      });
       const deleteResponse = page.waitForResponse(
         (response) =>
           response.request().method() === "DELETE" &&
@@ -420,6 +452,11 @@ test.describe("workspace sidebar full-stack", () => {
       await expect(rows).toHaveCount(1);
       await expect(rows).not.toContainText("Widget rendering broken on Safari");
       await expect(rows).toContainText("Add dark mode support");
+
+      const deleteRequestIndex = requestOrder.indexOf(`DELETE /api/v1/workspaces/${deletedWorkspace.id}`);
+      const listRefreshIndex = requestOrder.indexOf("GET /api/v1/workspaces", deleteRequestIndex + 1);
+      expect(deleteRequestIndex).toBeGreaterThanOrEqual(0);
+      expect(listRefreshIndex).toBeGreaterThan(deleteRequestIndex);
 
       const workspacesResponse = await api.get("/api/v1/workspaces");
       expect(workspacesResponse.ok()).toBe(true);
@@ -631,6 +668,120 @@ test.describe("workspace sidebar full-stack", () => {
       await isolatedServer?.stop();
     }
   });
+
+  test("completed workspace deletion remains observable after its terminal presenter is gone", async ({ page }) => {
+    let isolatedServer: IsolatedE2EServer | null = null;
+    let api: APIRequestContext | null = null;
+    let releaseDelete = (): void => {};
+    try {
+      isolatedServer = await startIsolatedWorkspaceE2EServer();
+      api = await playwrightRequest.newContext({ baseURL: isolatedServer.info.base_url });
+      const deletingWorkspace = await createIssueWorkspace(api, 10);
+      const remainingWorkspace = await createIssueWorkspace(api, 13);
+      const deleteStarted = Promise.withResolvers<void>();
+      const deleteMayContinue = Promise.withResolvers<void>();
+      releaseDelete = () => deleteMayContinue.resolve();
+
+      await page.route(`**/api/v1/workspaces/${deletingWorkspace.id}`, async (route) => {
+        if (route.request().method() !== "DELETE") {
+          await route.continue();
+          return;
+        }
+        deleteStarted.resolve();
+        await deleteMayContinue.promise;
+        await route.continue();
+      });
+
+      await page.goto(`${isolatedServer.info.base_url}/terminal/${deletingWorkspace.id}`);
+      await expect(page.locator(".workspace-list-sidebar .ws-row")).toHaveCount(2);
+      await page.locator(".header-bar").getByRole("button", { name: "Delete" }).click();
+      await page
+        .getByRole("dialog", { name: "Delete workspace?" })
+        .getByRole("button", { name: "Delete workspace" })
+        .click();
+      await deleteStarted.promise;
+
+      await page.locator(".workspace-list-sidebar .ws-row:not(.selected)").click();
+      await expect(page).toHaveURL(new RegExp(`/terminal/${remainingWorkspace.id}$`));
+
+      releaseDelete();
+      await expect.poll(async () => (await api!.get(`/api/v1/workspaces/${deletingWorkspace.id}`)).status()).toBe(404);
+      await expect(page).toHaveURL(new RegExp(`/terminal/${remainingWorkspace.id}$`));
+      const rows = page.locator(".workspace-list-sidebar .ws-row");
+      await expect(rows).toHaveCount(1);
+      await expect(rows).not.toContainText("Widget rendering broken on Safari");
+    } finally {
+      releaseDelete();
+      await page.unrouteAll({ behavior: "ignoreErrors" });
+      await api?.dispose();
+      await isolatedServer?.stop();
+    }
+  });
+
+  test("uncertain workspace delete feedback survives a real route round-trip", async ({ page }) => {
+    let isolatedServer: IsolatedE2EServer | null = null;
+    let api: APIRequestContext | null = null;
+    try {
+      isolatedServer = await startIsolatedWorkspaceE2EServer();
+      api = await playwrightRequest.newContext({ baseURL: isolatedServer.info.base_url });
+      const deletingWorkspace = await createIssueWorkspace(api, 10);
+      const otherWorkspace = await createIssueWorkspace(api, 13);
+
+      let releaseDelete!: () => void;
+      const deleteMayFail = new Promise<void>((resolve) => {
+        releaseDelete = resolve;
+      });
+      let markDeleteStarted!: () => void;
+      const deleteStarted = new Promise<void>((resolve) => {
+        markDeleteStarted = resolve;
+      });
+      let markAuthorityReadStarted!: () => void;
+      const authorityReadStarted = new Promise<void>((resolve) => {
+        markAuthorityReadStarted = resolve;
+      });
+      let authorityUnavailable = false;
+      await page.route(`**/api/v1/workspaces/${deletingWorkspace.id}`, async (route) => {
+        if (route.request().method() === "DELETE") {
+          markDeleteStarted();
+          await deleteMayFail;
+          await route.abort("connectionfailed");
+          return;
+        }
+        if (route.request().method() === "GET" && authorityUnavailable) {
+          markAuthorityReadStarted();
+          await route.abort("connectionfailed");
+          return;
+        }
+        await route.continue();
+      });
+
+      await page.goto(`${isolatedServer.info.base_url}/terminal/${deletingWorkspace.id}`);
+      await page.locator(".header-bar").getByRole("button", { name: "Delete" }).click();
+      await page
+        .getByRole("dialog", { name: "Delete workspace?" })
+        .getByRole("button", { name: "Delete workspace" })
+        .click();
+      await deleteStarted;
+
+      await page.locator(".workspace-list-sidebar .ws-row:not(.selected)").click();
+      await expect(page).toHaveURL(new RegExp(`/terminal/${otherWorkspace.id}$`));
+      authorityUnavailable = true;
+      releaseDelete();
+      await authorityReadStarted;
+      const uncertainty = "Could not confirm whether the delete completed";
+      await expect(page.getByText(uncertainty, { exact: false })).toHaveCount(0);
+
+      authorityUnavailable = false;
+      await page.locator(".workspace-list-sidebar .ws-row:not(.selected)").click();
+      await expect(page).toHaveURL(new RegExp(`/terminal/${deletingWorkspace.id}$`));
+      await expect(page.getByText(uncertainty, { exact: false })).toBeVisible();
+      expect((await api.get(`/api/v1/workspaces/${deletingWorkspace.id}`)).status()).toBe(200);
+      await expect(page.locator(".header-bar").getByRole("button", { name: "Delete" })).toBeEnabled();
+    } finally {
+      await api?.dispose();
+      await isolatedServer?.stop();
+    }
+  });
 });
 
 test.describe("workspace Kata sidebar live integration", () => {
@@ -815,6 +966,8 @@ test.describe("workspace Kata sidebar live integration", () => {
       await pane.getByRole("textbox", { name: "Comment" }).fill(comment);
       await pane.getByRole("button", { name: "Add comment" }).click();
       await expect(pane.getByRole("button", { name: "Retry Kata snapshot" })).toBeVisible();
+      const editPriority = pane.getByRole("button", { name: "Edit priority" });
+      await expect(editPriority).toBeDisabled();
 
       await test.step("remount and reconcile the retained fence", async () => {
         await page.getByRole("button", { name: "Diff", exact: true }).click();

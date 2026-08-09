@@ -1,5 +1,6 @@
+import { execFileSync } from "node:child_process";
 import { expect, test, type Locator, type Page } from "@playwright/test";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -218,6 +219,37 @@ test.describe("docs workspace", () => {
     }
   });
 
+  test("reconciles a created file when the server commits before the response is lost", async ({ page }) => {
+    const server = await startDocsServer(page);
+    let createCommitted = false;
+    try {
+      await page.route("**/api/v1/docs/folders/notes/file**", async (route) => {
+        if (route.request().method() !== "POST" || createCommitted) {
+          await route.continue();
+          return;
+        }
+        const response = await route.fetch();
+        expect(response.status()).toBe(201);
+        createCommitted = true;
+        await route.abort("connectionfailed");
+      });
+      await page.goto(`${server.info.base_url}/docs`);
+      await expect(page).toHaveURL(/doc=README\.md/);
+      const docs = new DocsPane(page);
+
+      await docs.createFile("recovered-create.md");
+
+      expect(createCommitted).toBe(true);
+      await expect(page).toHaveURL(/doc=recovered-create\.md/);
+      await expect(docs.treeRow("recovered-create.md")).toBeVisible();
+      await page.reload();
+      await expect(docs.treeRow("recovered-create.md")).toBeVisible();
+    } finally {
+      await page.unrouteAll({ behavior: "ignoreErrors" });
+      await server.stop();
+    }
+  });
+
   test("saves edited markdown and renders the updated document", async ({ page }) => {
     const server = await startDocsServer(page);
     try {
@@ -243,6 +275,38 @@ test.describe("docs workspace", () => {
       await expect(page.getByRole("heading", { name: "Updated Notes", level: 1 })).toBeVisible();
       await expect(page.getByText("Saved through the docs editor.")).toBeVisible();
     } finally {
+      await server.stop();
+    }
+  });
+
+  test("reconciles an edited document when the server commits before the response is lost", async ({ page }) => {
+    const server = await startDocsServer(page);
+    let saveCommitted = false;
+    try {
+      await page.route("**/api/v1/docs/folders/notes/file**", async (route) => {
+        if (route.request().method() !== "PUT" || saveCommitted) {
+          await route.continue();
+          return;
+        }
+        const response = await route.fetch();
+        expect(response.ok()).toBe(true);
+        saveCommitted = true;
+        await route.abort("connectionfailed");
+      });
+      await page.goto(`${server.info.base_url}/docs?folder=notes&doc=README.md`);
+      await expect(page.getByRole("heading", { name: "Welcome to Notes" })).toBeVisible();
+      const editor = await openDocsEditor(page);
+      await replaceEditorText(page, editor, "# Recovered Save\n\nConfirmed from the authoritative file read.\n");
+
+      await page.getByRole("button", { name: "Save", exact: true }).click();
+
+      await expect.poll(() => saveCommitted).toBe(true);
+      await expect(page.getByRole("heading", { name: "Recovered Save", level: 1 })).toBeVisible();
+      await expect(page.getByText("Confirmed from the authoritative file read.")).toBeVisible();
+      await page.reload();
+      await expect(page.getByRole("heading", { name: "Recovered Save", level: 1 })).toBeVisible();
+    } finally {
+      await page.unrouteAll({ behavior: "ignoreErrors" });
       await server.stop();
     }
   });
@@ -293,6 +357,85 @@ test.describe("docs workspace", () => {
       await expect(cleanDialog.getByText("No changed Markdown files to publish.")).toBeVisible();
       await expect(cleanDialog.getByRole("button", { name: "Commit & Push" })).toBeDisabled();
     } finally {
+      await fixture.stop();
+    }
+  });
+
+  test("keeps a real git pull successful when its tree refresh fails", async ({ page }) => {
+    const fixture = await startDocsPublishServer(page);
+    const updaterDir = await mkdtemp(path.join(os.tmpdir(), "kenn-forge-docs-pull-updater-"));
+    let pullConfirmed = false;
+    try {
+      execFileSync("git", ["clone", "--quiet", "--branch", "main", fixture.remoteDir, updaterDir], {
+        env: fixture.gitEnv,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      await writeFile(path.join(updaterDir, "README.md"), "# Pulled Docs\n\nUpdated by the remote fixture.\n");
+      execFileSync("git", ["add", "README.md"], {
+        cwd: updaterDir,
+        env: fixture.gitEnv,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      execFileSync(
+        "git",
+        [
+          "-c",
+          "user.name=Kenn Forge E2E",
+          "-c",
+          "user.email=kenn-forge-e2e@example.invalid",
+          "commit",
+          "-m",
+          "docs: update pull fixture",
+        ],
+        { cwd: updaterDir, env: fixture.gitEnv, stdio: ["ignore", "pipe", "pipe"] },
+      );
+      execFileSync("git", ["push", "--quiet", "origin", "HEAD:main"], {
+        cwd: updaterDir,
+        env: fixture.gitEnv,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      const expectedShortCommit = execFileSync("git", ["rev-parse", "--short", "HEAD"], {
+        cwd: updaterDir,
+        env: fixture.gitEnv,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      }).trim();
+
+      await page.route("**/api/v1/docs/folders/publish/git/pull", async (route) => {
+        const response = await route.fetch();
+        expect(response.ok(), await response.text()).toBe(true);
+        pullConfirmed = true;
+        await route.fulfill({ response });
+      });
+      await page.route("**/api/v1/docs/folders/publish/tree", async (route) => {
+        if (!pullConfirmed) {
+          await route.continue();
+          return;
+        }
+        await route.fulfill({
+          status: 502,
+          contentType: "application/problem+json",
+          body: JSON.stringify({
+            title: "Docs tree unavailable",
+            status: 502,
+            detail: "tree refresh unavailable",
+            code: "upstreamError",
+          }),
+        });
+      });
+
+      await page.goto(`${fixture.server.info.base_url}/docs?folder=publish&doc=README.md`);
+      await expect(page.getByRole("heading", { name: "Publish Fixture", level: 1 })).toBeVisible();
+      await page.getByRole("button", { name: "Pull from git" }).click();
+
+      const notice = page.getByRole("status").filter({ hasText: `Pulled to ${expectedShortCommit}.` });
+      await expect(notice).toBeVisible();
+      await expect(notice).toContainText("tree");
+      await expect(notice).not.toContainText("Pull failed");
+      await expect(page.getByRole("heading", { name: "Pulled Docs", level: 1 })).toBeVisible();
+    } finally {
+      await page.unrouteAll({ behavior: "ignoreErrors" });
+      await rm(updaterDir, { recursive: true, force: true });
       await fixture.stop();
     }
   });
