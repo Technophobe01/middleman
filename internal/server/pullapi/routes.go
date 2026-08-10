@@ -866,9 +866,16 @@ func (s *Handler) editPRContent(
 	} else if input.Body.Body != nil {
 		newBody = *input.Body.Body
 	}
-	updatedAt := s.now().UTC()
-	if !updatedMR.UpdatedAt.IsZero() {
-		updatedAt = updatedMR.UpdatedAt.UTC()
+	updatedAt := updatedMR.UpdatedAt.UTC()
+	if updatedAt.IsZero() {
+		updatedAt, err = s.providerMergeRequestUpdatedAt(ctx, *repo, input.Number)
+		if err != nil {
+			return nil, httpapi.ProviderCallProblemWithDetail(
+				err,
+				string(repoProviderKind(*repo)), repoProviderHost(*repo),
+				"provider omitted merge request updated time and refresh failed",
+			)
+		}
 	}
 	if err := s.db.UpdateMRTitleBody(
 		ctx, mr.ID, newTitle, newBody, updatedAt,
@@ -1001,6 +1008,19 @@ func (s *Handler) editComment(ctx context.Context, input *editCommentInput) (*ed
 	platformEvent.MergeRequestNumber = input.Number
 
 	event := platform.DBMREvent(mrID, platformEvent)
+	existingEvents, err := s.db.ListMREvents(ctx, mrID)
+	if err != nil {
+		return nil, httpapi.Internal("load existing comment metadata failed")
+	}
+	for _, existing := range existingEvents {
+		if existing.EventType == "issue_comment" && existing.PlatformID != nil &&
+			*existing.PlatformID == input.CommentID {
+			event.MetadataJSON = platform.PreserveProviderHiddenMetadata(
+				existing.MetadataJSON, event.MetadataJSON,
+			)
+			break
+		}
+	}
 	if err := s.db.UpsertMREvents(ctx, []db.MREvent{event}); err != nil {
 		return nil, httpapi.Internal("persist edited comment failed")
 	}
@@ -1145,10 +1165,31 @@ func (s *Handler) replyToDiscussion(ctx context.Context, input *replyToDiscussio
 	}
 
 	event := platform.DBMREvent(mr.ID, platformEvent)
-	if err := s.db.UpsertMREvents(ctx, []db.MREvent{event}); err != nil {
+	providerUpdatedAt, activityErr := s.providerMergeRequestUpdatedAt(ctx, *repo, input.Number)
+	if activityErr != nil {
+		slog.WarnContext(ctx, "failed to refresh pull request activity after discussion reply",
+			"mr_id", mr.ID, "discussion_id", input.DiscussionID, "error", activityErr)
+		if err := s.db.UpsertMREvents(ctx, []db.MREvent{event}); err != nil {
+			slog.ErrorContext(ctx, "failed to persist discussion reply event",
+				"mr_id", mr.ID, "discussion_id", input.DiscussionID, "error", err)
+			return nil, httpapi.Internal("failed to persist reply event")
+		}
+		s.syncAfterReviewDraftPublish(*repo, input.Number)
+		return &replyToDiscussionOutput{Status: http.StatusCreated, Body: mergeRequestEventResponseFromDB(event)}, nil
+	}
+	applied, err := s.db.CommitMergeRequestChildSnapshot(ctx, db.MergeRequestChildSnapshot{
+		MergeRequestID:    mr.ID,
+		ExpectedRevision:  mr.SnapshotRevision,
+		ProviderUpdatedAt: &providerUpdatedAt,
+		OtherEvents:       []db.MREvent{event},
+	})
+	if err != nil {
 		slog.ErrorContext(ctx, "failed to persist discussion reply event",
 			"mr_id", mr.ID, "discussion_id", input.DiscussionID, "error", err)
 		return nil, httpapi.Internal("failed to persist reply event")
+	}
+	if !applied {
+		s.syncAfterReviewDraftPublish(*repo, input.Number)
 	}
 
 	return &replyToDiscussionOutput{Status: http.StatusCreated, Body: mergeRequestEventResponseFromDB(event)}, nil
@@ -1331,7 +1372,7 @@ func (s *Handler) requestChangesPR(ctx context.Context, input *requestChangesPRI
 	err = mutator.RequestChanges(ctx, platformRepoRefFromDB(*repo), input.Number, body, expectedHeadSHA)
 	if err != nil {
 		if errors.Is(err, platform.ErrStaleState) {
-			s.syncAfterStaleReviewDraftPublish(*repo, input.Number)
+			s.syncAfterReviewDraftPublish(*repo, input.Number)
 		}
 		return nil, httpapi.ProviderCallProblemWithDetail(
 			err,
@@ -1988,16 +2029,19 @@ func (s *Handler) setPRGitHubState(
 		if err != nil {
 			return nil, unsupportedCapabilityProblem(*repo, capabilityDraftMutation)
 		}
-		if err := mutator.ConvertMergeRequestToDraft(
+		providerUpdatedAt, err := mutator.ConvertMergeRequestToDraft(
 			ctx, platformRepoRefFromDB(*repo), input.Number,
-		); err != nil {
+		)
+		if err != nil {
 			return nil, httpapi.ProviderCallProblemWithDetail(
 				err,
 				string(repoProviderKind(*repo)), repoProviderHost(*repo),
 				"Provider API error: "+err.Error(),
 			)
 		}
-		if err := s.db.UpdateMRDraftState(ctx, repo.ID, input.Number, true); err != nil {
+		if err := s.db.UpdateMRDraftState(
+			ctx, repo.ID, input.Number, true, providerUpdatedAt,
+		); err != nil {
 			return nil, httpapi.Internal("update mr draft state: " + err.Error())
 		}
 		out := &githubStateOutput{}

@@ -2938,15 +2938,18 @@ func (p *gitHubClientProvider) ConvertMergeRequestToDraft(
 	ctx context.Context,
 	ref platform.RepoRef,
 	number int,
-) error {
+) (time.Time, error) {
 	pr, err := p.client.ConvertPullRequestToDraft(ctx, ref.Owner, ref.Name, number)
 	if err != nil {
-		return err
+		return time.Time{}, err
 	}
 	if pr == nil {
-		return fmt.Errorf("provider returned no pull request")
+		return time.Time{}, fmt.Errorf("provider returned no pull request")
 	}
-	return nil
+	if pr.UpdatedAt == nil || pr.UpdatedAt.IsZero() {
+		return time.Time{}, fmt.Errorf("provider returned pull request without updated time")
+	}
+	return pr.UpdatedAt.UTC(), nil
 }
 
 func (p *gitHubClientProvider) CreateIssue(
@@ -3205,8 +3208,11 @@ func githubReviewThreadComment(
 		DirectURL:         comment.URL,
 		Range:             githubReviewLineRange(thread, comment),
 		Resolved:          thread.IsResolved,
-		CreatedAt:         createdAt,
-		UpdatedAt:         updatedAt,
+		MetadataJSON: normalizeCommentVisibilityMetadata(CommentVisibility{
+			Hidden: comment.IsMinimized, Reason: comment.MinimizedReason,
+		}),
+		CreatedAt: createdAt,
+		UpdatedAt: updatedAt,
 	}
 }
 
@@ -4736,27 +4742,11 @@ func (s *Syncer) advanceNextSync(
 	}
 }
 
-// bulkGraphQLAllowed reports whether a bulk GraphQL fetch may run for repo.
-//
-// In quota-registry mode the decision reads the repository credential's own
-// GraphQL pool: the fetcher's tracker is host-wide, so one credential reaching
-// zero would otherwise suppress bulk fetches for a healthy credential and push
-// that work onto REST.
-//
-// This is the only place the GraphQL reserve is enforced. Background admission
-// deliberately gates on REST alone, because bulk GraphQL is optional and falls
-// back to REST — so the reserve has to be applied here or background work would
-// spend the GraphQL headroom held for foreground requests. Foreground syncs are
-// explicit user work and keep the legacy exhaustion threshold, where only a
-// genuinely empty pool sends them down the REST path.
-// bulkGraphQLAllowed reports whether this repository's bulk fetch may run.
-// It consults the same cadence-cached reserve check as everything else, on the
-// GraphQL pool because that is where a bulk fetch spends. Background
-// eligibility itself gates on REST alone -- bulk GraphQL is an optimization
-// with a REST fallback -- so this is where the GraphQL reserve is applied.
-// Foreground syncs are explicit user work and only stop on a genuinely
-// backed-off tracker.
-func (s *Syncer) bulkGraphQLAllowed(
+// graphQLReadAllowed reports whether optional GraphQL sync work may run for a
+// repository. It reads the routed credential's pool so one exhausted identity
+// cannot suppress a healthy identity sharing the same host tracker. Background
+// work holds the GraphQL reserve; foreground work stops only on hard backoff.
+func (s *Syncer) graphQLReadAllowed(
 	ctx context.Context, repo RepoRef, fetcher *GraphQLFetcher,
 ) bool {
 	verdict := s.reserveVerdictFor(
@@ -7537,7 +7527,7 @@ func (s *Syncer) indexSyncRepo(
 			graphQLDone := false
 			if fetcher := s.fetcherFor(repo); fetcher != nil &&
 				s.shouldUseBulkGraphQLForMRs(ctx, repo, repoID, len(openMRs)) {
-				if s.bulkGraphQLAllowed(ctx, repo, fetcher) {
+				if s.graphQLReadAllowed(ctx, repo, fetcher) {
 					result, gqlErr := fetcher.FetchRepoPRs(
 						ctx, repo.Owner, repo.Name, preferNativeStacks,
 					)
@@ -7691,7 +7681,7 @@ func (s *Syncer) indexSyncRepo(
 			graphQLIssuesDone := false
 			if fetcher := s.fetcherFor(repo); fetcher != nil &&
 				s.shouldUseBulkGraphQLForIssues(ctx, repo, repoID, len(openIssues)+len(ghIssues)) {
-				if s.bulkGraphQLAllowed(ctx, repo, fetcher) {
+				if s.graphQLReadAllowed(ctx, repo, fetcher) {
 					issueResult, gqlErr := fetcher.FetchRepoIssues(
 						ctx, repo.Owner, repo.Name,
 					)
@@ -9033,6 +9023,7 @@ func (s *Syncer) syncOpenIssueFromBulk(
 		applied, err := s.replaceIssueCommentEvents(
 			ctx, repo, number, issueID, revision, bulk.Comments,
 			normalizeIssueTimelineEvents(issueID, bulk.TimelineEvents), &derived,
+			bulk.CommentVisibility,
 		)
 		if err != nil {
 			return fmt.Errorf(
@@ -9057,7 +9048,7 @@ func (s *Syncer) syncOpenIssueFromBulk(
 	} else {
 		// Timeline data truncated — fall back to detail fetch.
 		if err := s.refreshIssueTimeline(
-			ctx, repo, issueID, revision, bulk.Issue,
+			ctx, repo, issueID, revision, bulk.Issue, bulk.CommentVisibility,
 		); err != nil {
 			if errors.Is(err, errParentSnapshotAdvanced) {
 				return nil
@@ -9166,6 +9157,17 @@ func (s *Syncer) syncOpenMRFromBulk(
 	if !accepted {
 		return nil
 	}
+	if !bulk.CommentsComplete || !bulk.ReviewsComplete ||
+		!bulk.ReviewThreadsComplete || !bulk.CommitsComplete ||
+		!bulk.TimelineComplete || !bulk.CIComplete {
+		detailCleared, err := s.db.ClearMRDetailFetchedSnapshot(ctx, mrID, revision)
+		if err != nil {
+			return fmt.Errorf("clear detail fetch marker for MR #%d: %w", number, err)
+		}
+		if !detailCleared {
+			return nil
+		}
+	}
 
 	// UpsertMergeRequest preserves ci_had_pending across upserts, so
 	// the head-changed reset above doesn't actually persist that field
@@ -9235,7 +9237,9 @@ func (s *Syncer) syncOpenMRFromBulk(
 		return fmt.Errorf("load commit order for MR #%d: %w", number, err)
 	}
 	for _, c := range bulk.Comments {
-		comments = append(comments, NormalizeCommentEvent(mrID, c))
+		comments = append(comments, NormalizeCommentEventWithVisibility(
+			mrID, c, bulk.CommentVisibility[c.GetID()],
+		))
 	}
 	for _, r := range bulk.Reviews {
 		reviews = append(reviews, NormalizeReviewEvent(mrID, r))
@@ -9254,8 +9258,9 @@ func (s *Syncer) syncOpenMRFromBulk(
 	if err != nil {
 		return fmt.Errorf("dedupe merged lifecycle events for MR #%d: %w", number, err)
 	}
-	allComplete := bulk.CommentsComplete &&
+	bulkAllComplete := bulk.CommentsComplete &&
 		bulk.ReviewsComplete &&
+		bulk.ReviewThreadsComplete &&
 		bulk.CommitsComplete &&
 		bulk.TimelineComplete &&
 		bulk.CIComplete
@@ -9264,30 +9269,20 @@ func (s *Syncer) syncOpenMRFromBulk(
 		fields := db.MRDerivedFields{
 			ReviewDecision: normalized.ReviewDecision,
 			CommentCount:   len(bulk.Comments),
-			LastActivityAt: computeLastActivity(bulk.PR, bulk.Comments, nil, nil, nil),
-		}
-		// ReviewDecision is already resolved on normalized (and carried into
-		// fields above) independent of nested-connection completeness.
-		if allComplete {
-			fields.LastActivityAt = computeLastActivity(
-				bulk.PR, bulk.Comments, bulk.Reviews, bulk.Commits, bulk.TimelineEvents,
-			)
-		} else if nonCommentLatest, nErr := s.db.GetMRLatestNonCommentEventTime(ctx, mrID); nErr != nil {
-			slog.Warn("latest non-comment event lookup failed",
-				"repo", repo.Owner+"/"+repo.Name,
-				"number", number, "err", nErr,
-			)
-		} else if nonCommentLatest.After(fields.LastActivityAt) {
-			fields.LastActivityAt = nonCommentLatest
 		}
 		derived = &fields
 	}
-	if bulk.CommentsComplete || bulk.ReviewsComplete || len(events) > 0 {
+	var inline []db.MREvent
+	var reviewThreads []db.MRReviewThread
+	if bulk.ReviewThreadsComplete {
+		inline, reviewThreads = platform.DBReviewThreads(bulk.ReviewThreads)
+	}
+	if bulk.CommentsComplete || bulk.ReviewsComplete || bulk.ReviewThreadsComplete || len(events) > 0 {
 		applied, err := s.commitMergeRequestDatasets(
 			ctx, repo, mrID, number, revision,
 			comments, bulk.CommentsComplete,
 			reviews,
-			nil, nil, false, events, derived,
+			inline, reviewThreads, bulk.ReviewThreadsComplete, events, derived,
 			livenessHeadForRound(normalized, nil),
 		)
 		if err != nil {
@@ -9297,6 +9292,7 @@ func (s *Syncer) syncOpenMRFromBulk(
 			return nil
 		}
 	}
+	allComplete := bulkAllComplete
 	if _, err := s.persistMergedTransitionEvent(ctx, mrID, revision, bulk.PR, normalized.MergedAt); err != nil {
 		return fmt.Errorf("persist merged lifecycle event for MR #%d: %w", number, err)
 	}
@@ -9729,6 +9725,27 @@ func (s *Syncer) markUnchangedMRDetailFetched(
 	ctx = s.db.WithRepositoryRouteFence(
 		ctx, platform.DBRepoIdentity(platformRepoRef(repo)), routeFence,
 	)
+	if err := s.refreshStoredPRCommentVisibility(
+		ctx, repo, existing.ID, existing.SnapshotRevision, number,
+	); err != nil {
+		if errors.Is(err, errParentSnapshotAdvanced) ||
+			errors.Is(err, db.ErrRepositoryRouteFenceChanged) {
+			return calls, nil
+		}
+		return calls, err
+	}
+	if fetcher := s.fetcherFor(repo); fetcher != nil && s.graphQLReadAllowed(ctx, repo, fetcher) {
+		threadCalls, err := s.syncProviderMRReviewThreads(
+			ctx, repo, existing.ID, number, existing.SnapshotRevision, true,
+		)
+		calls += threadCalls
+		if err != nil {
+			if errors.Is(err, errParentSnapshotAdvanced) {
+				return calls, nil
+			}
+			return calls, err
+		}
+	}
 	pending := existing.CIHadPending
 	if existing.CIHadPending && existing.PlatformHeadSHA != "" {
 		ciApplied, err := s.refreshCIStatusSnapshot(
@@ -9934,7 +9951,7 @@ func (s *Syncer) syncProviderMRDetailExtras(
 		}
 	}
 
-	reviewThreadCalls, err := s.syncProviderMRReviewThreads(ctx, repo, mrID, number, expectedRevision)
+	reviewThreadCalls, err := s.syncProviderMRReviewThreads(ctx, repo, mrID, number, expectedRevision, false)
 	calls += reviewThreadCalls
 	if err != nil {
 		return calls, false, fmt.Errorf("sync review threads for MR #%d: %w", number, err)
@@ -9984,6 +10001,7 @@ func (s *Syncer) syncProviderMRReviewThreads(
 	mrID int64,
 	number int,
 	expectedRevision int64,
+	preserveOnReadFailure bool,
 ) (int, error) {
 	caps, err := s.clients.Capabilities(repoPlatform(repo), repoHost(repo))
 	if err != nil {
@@ -10002,17 +10020,21 @@ func (s *Syncer) syncProviderMRReviewThreads(
 	threads, err := reader.ListMergeRequestReviewThreads(ctx, platformRepoRef(repo), number)
 	calls := 1
 	if err != nil {
+		if preserveOnReadFailure {
+			slog.Warn("current PR review-thread visibility fetch failed; preserving stored state",
+				"repo", repo.Owner+"/"+repo.Name,
+				"number", number,
+				"err", err,
+			)
+			return calls, nil
+		}
 		return calls, err
 	}
 
-	for i := range threads {
-		if threads[i].CreatedAt.IsZero() {
-			threads[i].CreatedAt = time.Now().UTC()
-		}
-	}
 	events, dbThreads := platform.DBReviewThreads(threads)
 	applied, err := s.commitMergeRequestDatasets(
-		ctx, repo, mrID, number, expectedRevision, nil, false, nil, events, dbThreads, true, nil, nil, "",
+		ctx, repo, mrID, number, expectedRevision,
+		nil, false, nil, events, dbThreads, true, nil, nil, "",
 	)
 	if err != nil {
 		return calls, err
@@ -10084,18 +10106,9 @@ func (s *Syncer) fetchIssueDetail(
 			if existing == nil {
 				return calls, fmt.Errorf("mark unchanged detail fetched for issue #%d: issue is missing", number)
 			}
-			detailApplied, markErr := s.markIssueDetailFetchedIfRouteFence(
-				ctx, repo, routeFence, existing.ID, existing.SnapshotRevision,
+			return s.markUnchangedIssueDetailFetched(
+				ctx, repo, number, existing, routeFence, calls,
 			)
-			if markErr != nil {
-				return calls, fmt.Errorf(
-					"mark unchanged detail fetched for issue #%d: %w", number, markErr,
-				)
-			}
-			if !detailApplied {
-				return calls, nil
-			}
-			return calls, nil
 		}
 		err = fmt.Errorf("client returned nil issue")
 	}
@@ -10124,7 +10137,7 @@ func (s *Syncer) fetchIssueDetail(
 	)
 
 	if err := s.refreshIssueTimeline(
-		ctx, repo, issueID, revision, ghIssue,
+		ctx, repo, issueID, revision, ghIssue, nil,
 	); err != nil {
 		calls++ // comments
 		if errors.Is(err, errParentSnapshotAdvanced) {
@@ -10162,6 +10175,47 @@ func (s *Syncer) fetchIssueDetail(
 		}
 	}
 
+	return calls, nil
+}
+
+func (s *Syncer) markUnchangedIssueDetailFetched(
+	ctx context.Context,
+	repo RepoRef,
+	number int,
+	existing *db.Issue,
+	routeFence db.RepositoryRouteFence,
+	calls int,
+) (int, error) {
+	matches, err := s.repositoryRouteFenceMatches(ctx, repo, routeFence)
+	if err != nil {
+		return calls, err
+	}
+	if !matches {
+		return calls, nil
+	}
+	ctx = s.db.WithRepositoryRouteFence(
+		ctx, platform.DBRepoIdentity(platformRepoRef(repo)), routeFence,
+	)
+	if err := s.refreshStoredIssueCommentVisibility(
+		ctx, repo, existing.ID, existing.SnapshotRevision, number,
+	); err != nil {
+		if errors.Is(err, errParentSnapshotAdvanced) ||
+			errors.Is(err, db.ErrRepositoryRouteFenceChanged) {
+			return calls, nil
+		}
+		return calls, err
+	}
+	detailApplied, err := s.markIssueDetailFetchedIfRouteFence(
+		ctx, repo, routeFence, existing.ID, existing.SnapshotRevision,
+	)
+	if err != nil {
+		return calls, fmt.Errorf(
+			"mark unchanged detail fetched for issue #%d: %w", number, err,
+		)
+	}
+	if !detailApplied {
+		return calls, nil
+	}
 	return calls, nil
 }
 
@@ -10341,7 +10395,6 @@ func (s *Syncer) refreshTimeline(
 		return fmt.Errorf("list commits for MR #%d: %w", number, err)
 	}
 
-	timelineEventsFetched := true
 	timelineEvents, err := client.ListPullRequestTimelineEvents(ctx, repo.Owner, repo.Name, number)
 	if err != nil {
 		if disabledErr := repositoryFeatureDisabledError(
@@ -10354,7 +10407,6 @@ func (s *Syncer) refreshTimeline(
 			"number", number,
 			"err", err,
 		)
-		timelineEventsFetched = false
 		timelineEvents = nil
 	}
 
@@ -10365,8 +10417,17 @@ func (s *Syncer) refreshTimeline(
 	if err != nil {
 		return fmt.Errorf("load commit order for MR #%d: %w", number, err)
 	}
+	commentVisibility, err := s.storedPRCommentVisibility(ctx, mrID)
+	if err != nil {
+		return fmt.Errorf("load stored comment visibility for MR #%d: %w", number, err)
+	}
+	if observed, ok := s.currentPRCommentVisibility(ctx, repo, number); ok {
+		commentVisibility = observed
+	}
 	for _, c := range comments {
-		commentEvents = append(commentEvents, NormalizeCommentEvent(mrID, c))
+		commentEvents = append(commentEvents, NormalizeCommentEventWithVisibility(
+			mrID, c, commentVisibility[c.GetID()],
+		))
 	}
 	for _, r := range reviews {
 		reviewEvents = append(reviewEvents, NormalizeReviewEvent(mrID, r))
@@ -10389,21 +10450,9 @@ func (s *Syncer) refreshTimeline(
 	}
 
 	reviewDecision := DeriveReviewDecision(reviews)
-	lastActivityAt := computeLastActivity(ghPR, comments, reviews, commits, timelineEvents)
-	if !timelineEventsFetched {
-		nonCommentLatest, err := s.db.GetMRLatestNonCommentEventTime(ctx, mrID)
-		if err != nil {
-			return fmt.Errorf("load stored non-comment activity for MR #%d: %w", number, err)
-		}
-		if nonCommentLatest.After(lastActivityAt) {
-			lastActivityAt = nonCommentLatest
-		}
-	}
-
 	derived := db.MRDerivedFields{
 		ReviewDecision: reviewDecision,
 		CommentCount:   len(comments),
-		LastActivityAt: lastActivityAt,
 	}
 	applied, err := s.commitMergeRequestDatasets(
 		ctx, repo, mrID, number, expectedRevision,
@@ -10418,7 +10467,7 @@ func (s *Syncer) refreshTimeline(
 	if !applied {
 		return errParentSnapshotAdvanced
 	}
-	if _, err := s.syncProviderMRReviewThreads(ctx, repo, mrID, number, expectedRevision); err != nil {
+	if _, err := s.syncProviderMRReviewThreads(ctx, repo, mrID, number, expectedRevision, false); err != nil {
 		return fmt.Errorf("sync review threads for MR #%d: %w", number, err)
 	}
 	return nil
@@ -10694,72 +10743,6 @@ func ciHasPending(ciChecksJSON string) bool {
 	return false
 }
 
-// computeLastActivity returns the most recent timestamp across the PR and its events.
-func computeLastActivity(
-	ghPR *gh.PullRequest,
-	comments []*gh.IssueComment,
-	reviews []*gh.PullRequestReview,
-	commits []*gh.RepositoryCommit,
-	timelineEvents []PullRequestTimelineEvent,
-) time.Time {
-	latest := time.Time{}
-	if ghPR.UpdatedAt != nil {
-		latest = ghPR.UpdatedAt.Time
-	}
-
-	for _, c := range comments {
-		if c.UpdatedAt != nil && c.UpdatedAt.After(latest) {
-			latest = c.UpdatedAt.Time
-		}
-	}
-	for _, r := range reviews {
-		if r.SubmittedAt != nil && r.SubmittedAt.After(latest) {
-			latest = r.SubmittedAt.Time
-		}
-	}
-	for _, c := range commits {
-		if c.GetCommit() != nil && c.GetCommit().Author != nil &&
-			c.GetCommit().Author.Date != nil &&
-			c.GetCommit().Author.Date.After(latest) {
-			latest = c.GetCommit().Author.Date.Time
-		}
-	}
-	for _, event := range timelineEvents {
-		if event.CreatedAt.After(latest) {
-			latest = event.CreatedAt
-		}
-	}
-	return latest
-}
-
-// computePRCommentRefreshLastActivity derives last_activity_at for a
-// comment-only refresh. nonCommentLatest should be the most recent
-// timestamp among stored review/commit/force-push events so a refresh
-// that only sees comments can't regress activity captured by those
-// events when GitHub's PR.UpdatedAt is stale.
-func computePRCommentRefreshLastActivity(
-	pr *db.MergeRequest,
-	comments []*gh.IssueComment,
-	nonCommentLatest time.Time,
-) time.Time {
-	latest := pr.UpdatedAt
-	if latest.IsZero() || pr.CreatedAt.After(latest) {
-		latest = pr.CreatedAt
-	}
-	if nonCommentLatest.After(latest) {
-		latest = nonCommentLatest
-	}
-	for _, c := range comments {
-		switch {
-		case c.UpdatedAt != nil && c.UpdatedAt.After(latest):
-			latest = c.UpdatedAt.Time
-		case c.CreatedAt != nil && c.CreatedAt.After(latest):
-			latest = c.CreatedAt.Time
-		}
-	}
-	return latest
-}
-
 func computeIssueCommentLastActivity(
 	ghIssue *gh.Issue,
 	comments []*gh.IssueComment,
@@ -10802,10 +10785,18 @@ func (s *Syncer) replacePRCommentEvents(
 	expectedRevision int64,
 	comments []*gh.IssueComment,
 	derived *db.MRDerivedFields,
+	visibility map[int64]CommentVisibility,
 ) (bool, error) {
+	if visibility == nil {
+		var err error
+		visibility, err = s.storedPRCommentVisibility(ctx, mrID)
+		if err != nil {
+			return false, err
+		}
+	}
 	events := make([]db.MREvent, 0, len(comments))
 	for _, c := range comments {
-		event := NormalizeCommentEvent(mrID, c)
+		event := NormalizeCommentEventWithVisibility(mrID, c, visibility[c.GetID()])
 		events = append(events, event)
 	}
 	applied, err := s.commitMergeRequestDatasets(
@@ -10823,13 +10814,179 @@ func (s *Syncer) replaceIssueCommentEvents(
 	comments []*gh.IssueComment,
 	otherEvents []db.IssueEvent,
 	derived *db.IssueDerivedFields,
+	visibility map[int64]CommentVisibility,
 ) (bool, error) {
+	if visibility == nil {
+		var err error
+		visibility, err = s.storedIssueCommentVisibility(ctx, issueID)
+		if err != nil {
+			return false, err
+		}
+	}
 	events := make([]db.IssueEvent, 0, len(comments))
 	for _, c := range comments {
-		event := NormalizeIssueCommentEvent(issueID, c)
+		event := NormalizeIssueCommentEventWithVisibility(issueID, c, visibility[c.GetID()])
 		events = append(events, event)
 	}
 	return s.commitIssueCommentsSnapshot(ctx, repo, issueID, number, expectedRevision, events, otherEvents, derived)
+}
+
+func (s *Syncer) currentPRCommentVisibility(
+	ctx context.Context,
+	repo RepoRef,
+	number int,
+) (map[int64]CommentVisibility, bool) {
+	fetcher := s.fetcherFor(repo)
+	if fetcher == nil || !s.graphQLReadAllowed(ctx, repo, fetcher) {
+		return nil, false
+	}
+	visibility, err := fetcher.FetchPullRequestCommentVisibility(
+		ctx, repo.Owner, repo.Name, number,
+	)
+	if err != nil {
+		slog.Warn("current PR comment visibility fetch failed; preserving stored state",
+			"repo", repo.Owner+"/"+repo.Name,
+			"number", number,
+			"err", err,
+		)
+		return nil, false
+	}
+	return visibility, true
+}
+
+func (s *Syncer) currentIssueCommentVisibility(
+	ctx context.Context,
+	repo RepoRef,
+	number int,
+) (map[int64]CommentVisibility, bool) {
+	fetcher := s.fetcherFor(repo)
+	if fetcher == nil || !s.graphQLReadAllowed(ctx, repo, fetcher) {
+		return nil, false
+	}
+	visibility, err := fetcher.FetchIssueCommentVisibility(
+		ctx, repo.Owner, repo.Name, number,
+	)
+	if err != nil {
+		slog.Warn("current issue comment visibility fetch failed; preserving stored state",
+			"repo", repo.Owner+"/"+repo.Name,
+			"number", number,
+			"err", err,
+		)
+		return nil, false
+	}
+	return visibility, true
+}
+
+func commentMetadataUpdates(
+	visibility map[int64]CommentVisibility,
+) []db.CommentMetadataUpdate {
+	updates := make([]db.CommentMetadataUpdate, 0, len(visibility))
+	for platformID, state := range visibility {
+		updates = append(updates, db.CommentMetadataUpdate{
+			PlatformID: platformID, MetadataJSON: normalizeCommentVisibilityMetadata(state),
+		})
+	}
+	return updates
+}
+
+func (s *Syncer) refreshStoredPRCommentVisibility(
+	ctx context.Context,
+	repo RepoRef,
+	mrID int64,
+	expectedRevision int64,
+	number int,
+) error {
+	visibility, ok := s.currentPRCommentVisibility(ctx, repo, number)
+	if !ok {
+		return nil
+	}
+	applied, err := s.db.UpdateMergeRequestCommentMetadataSnapshot(
+		ctx, mrID, expectedRevision, commentMetadataUpdates(visibility),
+	)
+	if err != nil {
+		return fmt.Errorf("update current PR comment visibility for #%d: %w", number, err)
+	}
+	if !applied {
+		return errParentSnapshotAdvanced
+	}
+	return nil
+}
+
+func (s *Syncer) refreshStoredIssueCommentVisibility(
+	ctx context.Context,
+	repo RepoRef,
+	issueID int64,
+	expectedRevision int64,
+	number int,
+) error {
+	visibility, ok := s.currentIssueCommentVisibility(ctx, repo, number)
+	if !ok {
+		return nil
+	}
+	applied, err := s.db.UpdateIssueCommentMetadataSnapshot(
+		ctx, issueID, expectedRevision, commentMetadataUpdates(visibility),
+	)
+	if err != nil {
+		return fmt.Errorf("update current issue comment visibility for #%d: %w", number, err)
+	}
+	if !applied {
+		return errParentSnapshotAdvanced
+	}
+	return nil
+}
+
+func (s *Syncer) storedPRCommentVisibility(
+	ctx context.Context,
+	mrID int64,
+) (map[int64]CommentVisibility, error) {
+	visibility := make(map[int64]CommentVisibility)
+	existing, err := s.db.ListMREvents(ctx, mrID)
+	if err != nil {
+		return nil, fmt.Errorf("list existing PR comments before visibility-preserving replacement: %w", err)
+	}
+	for _, event := range existing {
+		if event.EventType != "issue_comment" || event.PlatformID == nil {
+			continue
+		}
+		if state, ok := commentVisibilityFromMetadata(event.MetadataJSON); ok {
+			visibility[*event.PlatformID] = state
+		}
+	}
+	return visibility, nil
+}
+
+func (s *Syncer) storedIssueCommentVisibility(
+	ctx context.Context,
+	issueID int64,
+) (map[int64]CommentVisibility, error) {
+	visibility := make(map[int64]CommentVisibility)
+	existing, err := s.db.ListIssueEvents(ctx, issueID)
+	if err != nil {
+		return nil, fmt.Errorf("list existing issue comments before visibility-preserving replacement: %w", err)
+	}
+	for _, event := range existing {
+		if event.EventType != "issue_comment" || event.PlatformID == nil {
+			continue
+		}
+		if state, ok := commentVisibilityFromMetadata(event.MetadataJSON); ok {
+			visibility[*event.PlatformID] = state
+		}
+	}
+	return visibility, nil
+}
+
+func commentVisibilityFromMetadata(metadataJSON string) (CommentVisibility, bool) {
+	if metadataJSON == "" {
+		return CommentVisibility{}, false
+	}
+	var metadata struct {
+		Hidden bool   `json:"provider_hidden"`
+		Reason string `json:"provider_hidden_reason"`
+	}
+	if err := json.Unmarshal([]byte(metadataJSON), &metadata); err != nil || !metadata.Hidden {
+		return CommentVisibility{}, false
+	}
+	return CommentVisibility{Hidden: true, Reason: metadata.Reason}, true
 }
 
 // resolveDisplayName returns the GitHub display name for a
@@ -11163,7 +11320,7 @@ func (s *Syncer) syncOpenIssue(
 		return nil
 	}
 
-	if err := s.refreshIssueTimeline(ctx, repo, issueID, revision, ghIssue); err != nil {
+	if err := s.refreshIssueTimeline(ctx, repo, issueID, revision, ghIssue, nil); err != nil {
 		if errors.Is(err, errParentSnapshotAdvanced) {
 			return nil
 		}
@@ -11178,6 +11335,7 @@ func (s *Syncer) refreshIssueTimeline(
 	issueID int64,
 	expectedRevision int64,
 	ghIssue *gh.Issue,
+	visibility map[int64]CommentVisibility,
 ) error {
 	if ghIssue == nil {
 		return fmt.Errorf("nil issue")
@@ -11195,6 +11353,26 @@ func (s *Syncer) refreshIssueTimeline(
 		return fmt.Errorf(
 			"list comments for issue #%d: %w", number, err,
 		)
+	}
+	if visibility == nil {
+		visibility, err = s.storedIssueCommentVisibility(ctx, issueID)
+		if err != nil {
+			return fmt.Errorf(
+				"load stored comment visibility for issue #%d: %w", number, err,
+			)
+		}
+		if observed, ok := s.currentIssueCommentVisibility(ctx, repo, number); ok {
+			visibility = observed
+		}
+	} else {
+		storedVisibility, err := s.storedIssueCommentVisibility(ctx, issueID)
+		if err != nil {
+			return fmt.Errorf(
+				"load stored comment visibility for issue #%d: %w", number, err,
+			)
+		}
+		maps.Copy(storedVisibility, visibility)
+		visibility = storedVisibility
 	}
 
 	derived := db.IssueDerivedFields{
@@ -11227,7 +11405,7 @@ func (s *Syncer) refreshIssueTimeline(
 		}
 	}
 	applied, err := s.replaceIssueCommentEvents(
-		ctx, repo, number, issueID, expectedRevision, comments, otherEvents, &derived,
+		ctx, repo, number, issueID, expectedRevision, comments, otherEvents, &derived, visibility,
 	)
 	if err != nil {
 		return fmt.Errorf(
@@ -11380,17 +11558,8 @@ func (s *Syncer) persistPRComments(
 	pr *db.MergeRequest,
 	comments []*gh.IssueComment,
 ) error {
-	nonCommentLatest, err := s.db.GetMRLatestNonCommentEventTime(ctx, pr.ID)
-	if err != nil {
-		return fmt.Errorf("latest non-comment event for PR #%d: %w", pr.Number, err)
-	}
-	derived := db.MRDerivedFields{
-		ReviewDecision: pr.ReviewDecision,
-		CommentCount:   len(comments),
-		LastActivityAt: computePRCommentRefreshLastActivity(pr, comments, nonCommentLatest),
-	}
 	applied, err := s.replacePRCommentEvents(
-		ctx, repo, pr.Number, pr.ID, pr.SnapshotRevision, comments, &derived,
+		ctx, repo, pr.Number, pr.ID, pr.SnapshotRevision, comments, nil, nil,
 	)
 	if err != nil {
 		return fmt.Errorf("replace PR comment events: %w", err)
@@ -11412,7 +11581,7 @@ func (s *Syncer) persistIssueComments(
 		LastActivityAt: computeIssueCommentRefreshLastActivity(issue, comments),
 	}
 	applied, err := s.replaceIssueCommentEvents(
-		ctx, repo, issue.Number, issue.ID, issue.SnapshotRevision, comments, nil, &derived,
+		ctx, repo, issue.Number, issue.ID, issue.SnapshotRevision, comments, nil, &derived, nil,
 	)
 	if err != nil {
 		return fmt.Errorf("replace issue comment events: %w", err)

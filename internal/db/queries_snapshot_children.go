@@ -18,6 +18,7 @@ type IssueChildSnapshot struct {
 type MergeRequestChildSnapshot struct {
 	MergeRequestID         int64
 	ExpectedRevision       int64
+	ProviderUpdatedAt      *time.Time
 	Comments               []MREvent
 	CommentsComplete       bool
 	Reviews                []MREvent
@@ -31,6 +32,11 @@ type MergeRequestChildSnapshot struct {
 	// the rest of the snapshot. Derived state such as commit liveness rides
 	// here so a round that loses the revision CAS writes nothing at all.
 	EventMetadataUpdates map[string]string
+}
+
+type CommentMetadataUpdate struct {
+	PlatformID   int64
+	MetadataJSON string
 }
 
 func domainParentSnapshotCurrentTx(
@@ -95,13 +101,29 @@ func (d *DB) CommitMergeRequestChildSnapshot(
 		if err != nil || !current {
 			return err
 		}
-		var lastActivityAt *time.Time
-		if snapshot.DerivedFields != nil {
-			lastActivityAt = &snapshot.DerivedFields.LastActivityAt
+		if snapshot.ProviderUpdatedAt != nil {
+			result, err := tx.ExecContext(ctx, `
+				UPDATE forge_merge_requests
+				SET updated_at = ?, last_activity_at = ?,
+				    snapshot_revision = snapshot_revision + 1
+				WHERE id = ? AND snapshot_revision = ?`,
+				snapshot.ProviderUpdatedAt, snapshot.ProviderUpdatedAt,
+				snapshot.MergeRequestID, snapshot.ExpectedRevision,
+			)
+			if err != nil {
+				return fmt.Errorf("update provider merge-request activity: %w", err)
+			}
+			rows, err := result.RowsAffected()
+			if err != nil {
+				return fmt.Errorf("read provider merge-request activity result: %w", err)
+			}
+			if rows == 0 {
+				return nil
+			}
 		}
 		if snapshot.CommentsComplete {
 			if err := replaceMRCommentEventsTx(
-				ctx, tx, snapshot.MergeRequestID, snapshot.Comments, lastActivityAt,
+				ctx, tx, snapshot.MergeRequestID, snapshot.Comments,
 			); err != nil {
 				return err
 			}
@@ -141,9 +163,9 @@ func (d *DB) CommitMergeRequestChildSnapshot(
 		if snapshot.DerivedFields != nil {
 			if _, err := tx.ExecContext(ctx, `
 				UPDATE forge_merge_requests
-				SET review_decision = ?, last_activity_at = ?
+				SET review_decision = ?
 				WHERE id = ?`, snapshot.DerivedFields.ReviewDecision,
-				snapshot.DerivedFields.LastActivityAt, snapshot.MergeRequestID,
+				snapshot.MergeRequestID,
 			); err != nil {
 				return fmt.Errorf("update mr review activity: %w", err)
 			}
@@ -155,6 +177,66 @@ func (d *DB) CommitMergeRequestChildSnapshot(
 			ctx, tx, snapshot.MergeRequestID, snapshot.EventMetadataUpdates,
 		); err != nil {
 			return err
+		}
+		applied = true
+		return nil
+	})
+	return applied, err
+}
+
+func (d *DB) UpdateMergeRequestCommentMetadataSnapshot(
+	ctx context.Context,
+	mergeRequestID int64,
+	expectedRevision int64,
+	updates []CommentMetadataUpdate,
+) (bool, error) {
+	return d.updateCommentMetadataSnapshot(
+		ctx, "forge_merge_requests", "forge_mr_events", "merge_request_id",
+		mergeRequestID, expectedRevision, updates,
+	)
+}
+
+func (d *DB) UpdateIssueCommentMetadataSnapshot(
+	ctx context.Context,
+	issueID int64,
+	expectedRevision int64,
+	updates []CommentMetadataUpdate,
+) (bool, error) {
+	return d.updateCommentMetadataSnapshot(
+		ctx, "forge_issues", "forge_issue_events", "issue_id",
+		issueID, expectedRevision, updates,
+	)
+}
+
+func (d *DB) updateCommentMetadataSnapshot(
+	ctx context.Context,
+	parentTable string,
+	eventTable string,
+	parentColumn string,
+	parentID int64,
+	expectedRevision int64,
+	updates []CommentMetadataUpdate,
+) (bool, error) {
+	applied := false
+	err := d.Tx(ctx, func(tx *sql.Tx) error {
+		current, err := domainParentSnapshotCurrentTx(
+			ctx, tx, parentTable, parentID, expectedRevision,
+		)
+		if err != nil || !current {
+			return err
+		}
+		query := fmt.Sprintf(`
+			UPDATE %s
+			SET metadata_json = ?
+			WHERE %s = ? AND event_type = 'issue_comment' AND platform_id = ?`,
+			eventTable, parentColumn,
+		)
+		for _, update := range updates {
+			if _, err := tx.ExecContext(
+				ctx, query, update.MetadataJSON, parentID, update.PlatformID,
+			); err != nil {
+				return fmt.Errorf("update comment metadata for platform id %d: %w", update.PlatformID, err)
+			}
 		}
 		applied = true
 		return nil

@@ -3,6 +3,7 @@ package github
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -1798,6 +1799,8 @@ func TestGitHubProviderListMergeRequestReviewThreadsMapsGraphQLThreads(t *testin
 				URL:              "https://github.com/acme/widget/pull/7#discussion_r101",
 				CommitID:         "head-sha",
 				OriginalCommitID: "original-sha",
+				IsMinimized:      true,
+				MinimizedReason:  "OFF_TOPIC",
 				CreatedAt:        createdAt,
 				UpdatedAt:        updatedAt,
 			}, {
@@ -1808,6 +1811,8 @@ func TestGitHubProviderListMergeRequestReviewThreadsMapsGraphQLThreads(t *testin
 				AuthorLogin:      "maintainer",
 				CommitID:         "head-sha",
 				OriginalCommitID: "original-sha",
+				IsMinimized:      true,
+				MinimizedReason:  "ABUSE",
 				CreatedAt:        createdAt.Add(time.Minute),
 				UpdatedAt:        updatedAt.Add(time.Minute),
 			}},
@@ -1844,10 +1849,12 @@ func TestGitHubProviderListMergeRequestReviewThreadsMapsGraphQLThreads(t *testin
 	assert.Equal("add", thread.Range.LineType)
 	assert.Equal("head-sha", thread.Range.DiffHeadSHA)
 	assert.Equal("head-sha", thread.Range.CommitSHA)
+	assert.JSONEq(`{"provider_hidden":true,"provider_hidden_reason":"OFF_TOPIC"}`, thread.MetadataJSON)
 	assert.Equal("PRRT_1", threads[1].ProviderThreadID)
 	assert.Equal("102", threads[1].ProviderCommentID)
 	assert.Equal("reply note", threads[1].Body)
 	assert.Equal("maintainer", threads[1].AuthorLogin)
+	assert.JSONEq(`{"provider_hidden":true,"provider_hidden_reason":"ABUSE"}`, threads[1].MetadataJSON)
 }
 
 func TestGitHubProviderListMergeRequestReviewThreadsMapsFileSubject(t *testing.T) {
@@ -5223,12 +5230,13 @@ func TestSyncStoresForcePushEvent(t *testing.T) {
 	assert.Contains(commit.MetadataJSON, `"commit_order":1`)
 }
 
-func TestRefreshTimelineUsesForcePushForLastActivity(t *testing.T) {
+func TestRefreshTimelineDoesNotRewriteProviderPullRequestActivity(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 	ctx := t.Context()
 	d := openTestDB(t)
 	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	providerActivity := now.Add(-2 * time.Hour)
 	forcePushAt := now.Add(30 * time.Minute)
 	commitSHA := "abc123def456"
 	commitMsg := "fix: tighten validation"
@@ -5247,8 +5255,8 @@ func TestRefreshTimelineUsesForcePushForLastActivity(t *testing.T) {
 		HeadBranch:     "feature",
 		BaseBranch:     "main",
 		CreatedAt:      now.Add(-3 * time.Hour),
-		UpdatedAt:      now.Add(-2 * time.Hour),
-		LastActivityAt: now.Add(-2 * time.Hour),
+		UpdatedAt:      providerActivity,
+		LastActivityAt: providerActivity,
 	})
 	require.NoError(err)
 
@@ -5274,15 +5282,15 @@ func TestRefreshTimelineUsesForcePushForLastActivity(t *testing.T) {
 
 	syncer := NewSyncer(map[string]Client{"github.com": mc}, d, nil, []RepoRef{repo}, time.Minute, nil, testBudget(500))
 	require.NoError(syncer.refreshTimeline(ctx, repo, mrID,
-		mergeRequestSnapshotRevision(t, d, repoID, 1), buildOpenPR(1, now.Add(-2*time.Hour)), ""))
+		mergeRequestSnapshotRevision(t, d, repoID, 1), buildOpenPR(1, now), ""))
 
 	pr, err := d.GetMergeRequestByRepoIDAndNumber(ctx, repoID, 1)
 	require.NoError(err)
 	require.NotNil(pr)
-	assert.Equal(forcePushAt, pr.LastActivityAt)
+	assert.Equal(providerActivity, pr.LastActivityAt)
 }
 
-func TestRefreshTimelineFetchFailurePreservesStoredForcePushActivity(t *testing.T) {
+func TestRefreshTimelineFetchFailureDoesNotRewriteProviderPullRequestActivity(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 	ctx := t.Context()
@@ -5335,7 +5343,7 @@ func TestRefreshTimelineFetchFailurePreservesStoredForcePushActivity(t *testing.
 
 	syncer := NewSyncer(map[string]Client{"github.com": mc}, d, nil, []RepoRef{repo}, time.Minute, nil, testBudget(500))
 	require.NoError(syncer.refreshTimeline(ctx, repo, mrID,
-		mergeRequestSnapshotRevision(t, d, repoID, 1), buildOpenPR(1, now.Add(-2*time.Hour)), ""))
+		mergeRequestSnapshotRevision(t, d, repoID, 1), buildOpenPR(1, now), ""))
 
 	pr, err := d.GetMergeRequestByRepoIDAndNumber(ctx, repoID, 1)
 	require.NoError(err)
@@ -9298,12 +9306,13 @@ func TestSyncOpenMRFromBulkPersistsMergedActorEventFromPullRequest(t *testing.T)
 	)
 
 	err = syncer.syncOpenMRFromBulk(ctx, repo, repoID, &BulkPR{
-		PR:               pr,
-		CommentsComplete: true,
-		ReviewsComplete:  true,
-		CommitsComplete:  true,
-		TimelineComplete: true,
-		CIComplete:       true,
+		PR:                    pr,
+		CommentsComplete:      true,
+		ReviewsComplete:       true,
+		ReviewThreadsComplete: true,
+		CommitsComplete:       true,
+		TimelineComplete:      true,
+		CIComplete:            true,
 	}, true)
 	require.NoError(err)
 
@@ -12526,7 +12535,7 @@ func TestRunOnceDetailDrain(t *testing.T) {
 		"detail_fetched_at should be set after detail drain")
 }
 
-func TestFetchMRDetailUsesPersistedPullRequestETag(t *testing.T) {
+func TestFetchMRDetailRefreshesCommentVisibilityOnParent304(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 	ctx := t.Context()
@@ -12537,7 +12546,7 @@ func TestFetchMRDetailUsesPersistedPullRequestETag(t *testing.T) {
 	require.NoError(err)
 	updatedAt := time.Date(2024, 6, 1, 10, 0, 0, 0, time.UTC)
 	detailFetchedAt := time.Date(2024, 6, 1, 9, 0, 0, 0, time.UTC)
-	_, err = d.UpsertMergeRequest(ctx, &db.MergeRequest{
+	mrID, err := d.UpsertMergeRequest(ctx, &db.MergeRequest{
 		RepoID:          repoID,
 		PlatformID:      1000,
 		Number:          1,
@@ -12554,6 +12563,15 @@ func TestFetchMRDetailUsesPersistedPullRequestETag(t *testing.T) {
 		DetailFetchedAt: &detailFetchedAt,
 	})
 	require.NoError(err)
+	commentID := int64(10401)
+	require.NoError(d.UpsertMREvents(ctx, []db.MREvent{{
+		MergeRequestID: mrID,
+		PlatformID:     &commentID,
+		EventType:      "issue_comment",
+		Body:           "moderated without changing the parent",
+		CreatedAt:      updatedAt,
+		DedupeKey:      "comment-10401",
+	}}))
 	require.NoError(d.UpsertHTTPEtag(
 		ctx, "github", "github.com", "owner", "repo",
 		"pull_request", 1, `"etag-v1"`,
@@ -12563,16 +12581,79 @@ func TestFetchMRDetailUsesPersistedPullRequestETag(t *testing.T) {
 	mc.comments = []*gh.IssueComment{{ID: new(int64)}}
 	mc.reviews = []*gh.PullRequestReview{{ID: new(int64)}}
 	mc.commits = []*gh.RepositoryCommit{{SHA: new(string)}}
+	inlineCommentID := int64(10402)
+	inlineLine := 12
+	mc.reviewThreads = []PullRequestReviewThread{{
+		NodeID: "PRRT_10402",
+		Path:   "src/main.go",
+		Side:   "RIGHT",
+		Line:   inlineLine,
+		Comments: []PullRequestReviewThreadComment{{
+			NodeID:          "PRRC_10402",
+			DatabaseID:      inlineCommentID,
+			Body:            "inline moderation changed without changing the parent",
+			AuthorLogin:     "reviewer",
+			CommitID:        "abc123def456",
+			IsMinimized:     true,
+			MinimizedReason: "ABUSE",
+			CreatedAt:       updatedAt,
+			UpdatedAt:       updatedAt,
+		}},
+	}}
 	syncer := NewSyncer(
 		map[string]Client{"github.com": mc}, d, nil,
 		[]RepoRef{repo},
 		time.Minute, nil, testBudget(1000),
 	)
+	gqlSrv := currentCommentVisibilityServer(
+		t, "pullRequest", commentID,
+		CommentVisibility{Hidden: true, Reason: "ABUSE"},
+		CommentVisibility{},
+	)
+	defer gqlSrv.Close()
+	syncer.SetFetchers(map[string]*GraphQLFetcher{
+		"github.com": NewGraphQLFetcherWithClient(
+			githubv4.NewEnterpriseClient(gqlSrv.URL, gqlSrv.Client()), nil,
+		),
+	})
 
 	_, err = syncer.fetchMRDetail(ctx, repo, repoID, 1, false)
 	require.NoError(err)
+	events, err := d.ListMREvents(ctx, mrID)
+	require.NoError(err)
+	require.Len(events, 2)
+	metadataByType := make(map[string]string, len(events))
+	for _, event := range events {
+		metadataByType[event.EventType] = event.MetadataJSON
+	}
+	assert.JSONEq(`{"provider_hidden":true,"provider_hidden_reason":"ABUSE"}`, metadataByType["issue_comment"])
+	assert.JSONEq(`{"provider_hidden":true,"provider_hidden_reason":"ABUSE"}`, metadataByType["review_comment"])
+	threads, err := d.ListMRReviewThreads(ctx, mrID)
+	require.NoError(err)
+	require.Len(threads, 1)
+	assert.JSONEq(`{"provider_hidden":true,"provider_hidden_reason":"ABUSE"}`, threads[0].MetadataJSON)
 
-	assert.Equal(int32(1), mc.conditionalCalls.Load())
+	mc.reviewThreads[0].Comments[0].IsMinimized = false
+	mc.reviewThreads[0].Comments[0].MinimizedReason = ""
+	_, err = syncer.fetchMRDetail(ctx, repo, repoID, 1, false)
+	require.NoError(err)
+	events, err = d.ListMREvents(ctx, mrID)
+	require.NoError(err)
+	require.Len(events, 2)
+	for _, event := range events {
+		assert.Empty(event.MetadataJSON)
+	}
+	threads, err = d.ListMRReviewThreads(ctx, mrID)
+	require.NoError(err)
+	require.Len(threads, 1)
+	assert.Empty(threads[0].MetadataJSON)
+	for _, event := range events {
+		if event.EventType == "issue_comment" {
+			assert.Equal("moderated without changing the parent", event.Body)
+		}
+	}
+
+	assert.Equal(int32(2), mc.conditionalCalls.Load())
 	assert.Equal(`"etag-v1"`, mc.receivedETag)
 	assert.Zero(int(mc.getPRCalls.Load()),
 		"304 should skip the unconditional PR detail fetch")
@@ -12897,7 +12978,7 @@ func TestFetchMRDetailDoesNotPersistPullRequestETagWhenDetailRefreshFails(t *tes
 	assert.Equal(`"etag-v1"`, etag)
 }
 
-func TestFetchIssueDetailUsesPersistedIssueETag(t *testing.T) {
+func TestFetchIssueDetailRefreshesCommentVisibilityOnParent304(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 	ctx := t.Context()
@@ -12908,7 +12989,7 @@ func TestFetchIssueDetailUsesPersistedIssueETag(t *testing.T) {
 	require.NoError(err)
 	updatedAt := time.Date(2024, 6, 1, 10, 0, 0, 0, time.UTC)
 	detailFetchedAt := time.Date(2024, 6, 1, 9, 0, 0, 0, time.UTC)
-	_, err = d.UpsertIssue(ctx, &db.Issue{
+	issueID, err := d.UpsertIssue(ctx, &db.Issue{
 		RepoID:          repoID,
 		PlatformID:      1000,
 		Number:          1,
@@ -12922,6 +13003,15 @@ func TestFetchIssueDetailUsesPersistedIssueETag(t *testing.T) {
 		DetailFetchedAt: &detailFetchedAt,
 	})
 	require.NoError(err)
+	commentID := int64(10801)
+	require.NoError(d.UpsertIssueEvents(ctx, []db.IssueEvent{{
+		IssueID:    issueID,
+		PlatformID: &commentID,
+		EventType:  "issue_comment",
+		Body:       "moderated without changing the parent",
+		CreatedAt:  updatedAt,
+		DedupeKey:  "issue-comment-10801",
+	}}))
 	require.NoError(d.UpsertHTTPEtag(
 		ctx, "github", "github.com", "owner", "repo",
 		"issue", 1, `"issue-etag-v1"`,
@@ -12934,11 +13024,34 @@ func TestFetchIssueDetailUsesPersistedIssueETag(t *testing.T) {
 		[]RepoRef{repo},
 		time.Minute, nil, testBudget(1000),
 	)
+	gqlSrv := currentCommentVisibilityServer(
+		t, "issue", commentID,
+		CommentVisibility{Hidden: true, Reason: "ABUSE"},
+		CommentVisibility{},
+	)
+	defer gqlSrv.Close()
+	syncer.SetFetchers(map[string]*GraphQLFetcher{
+		"github.com": NewGraphQLFetcherWithClient(
+			githubv4.NewEnterpriseClient(gqlSrv.URL, gqlSrv.Client()), nil,
+		),
+	})
 
 	_, err = syncer.fetchIssueDetail(ctx, repo, repoID, 1)
 	require.NoError(err)
+	events, err := d.ListIssueEvents(ctx, issueID)
+	require.NoError(err)
+	require.Len(events, 1)
+	assert.JSONEq(`{"provider_hidden":true,"provider_hidden_reason":"ABUSE"}`, events[0].MetadataJSON)
 
-	assert.Equal(int32(1), mc.conditionalCalls.Load())
+	_, err = syncer.fetchIssueDetail(ctx, repo, repoID, 1)
+	require.NoError(err)
+	events, err = d.ListIssueEvents(ctx, issueID)
+	require.NoError(err)
+	require.Len(events, 1)
+	assert.Empty(events[0].MetadataJSON)
+	assert.Equal("moderated without changing the parent", events[0].Body)
+
+	assert.Equal(int32(2), mc.conditionalCalls.Load())
 	assert.Equal(`"issue-etag-v1"`, mc.receivedETag)
 	assert.Zero(int(mc.listIssueCommentsCalled.Load()),
 		"304 should skip issue comment refresh")
@@ -16105,8 +16218,8 @@ func TestFetchMRDetailRemovesDeletedCommentDuringFullRefresh(t *testing.T) {
 	require.NoError(err)
 
 	now := time.Date(2024, 6, 2, 12, 0, 0, 0, time.UTC)
-	firstUpdatedAt := now
-	secondUpdatedAt := now.Add(time.Minute)
+	firstUpdatedAt := now.Add(3 * time.Minute)
+	secondUpdatedAt := now.Add(4 * time.Minute)
 	commentID := int64(7101)
 	commentAuthor := "reviewer"
 	commentBody := "full refresh comment"
@@ -16146,7 +16259,7 @@ func TestFetchMRDetailRemovesDeletedCommentDuringFullRefresh(t *testing.T) {
 	require.NoError(err)
 	require.NotNil(mr)
 	require.Equal(1, mr.CommentCount)
-	assert.Equal(commentTime.UTC(), mr.LastActivityAt.UTC())
+	assert.Equal(firstUpdatedAt.UTC(), mr.LastActivityAt.UTC())
 
 	events, err := d.ListMREvents(ctx, mr.ID)
 	require.NoError(err)
@@ -16979,6 +17092,139 @@ func TestSyncClosedMROnProviderDropsSnapshotAcrossABARouteReuse(t *testing.T) {
 	assert.Equal(db.MergeRequestStateOpen, stored.State)
 }
 
+func currentCommentVisibilityServer(
+	t *testing.T,
+	item string,
+	commentID int64,
+	states ...CommentVisibility,
+) *httptest.Server {
+	t.Helper()
+	require.NotEmpty(t, states)
+	var calls atomic.Int32
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if !strings.Contains(string(body), item+"(number:") {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"errors":[{"message":"unexpected GraphQL query"}]}`))
+			return
+		}
+		index := int(calls.Add(1)) - 1
+		if index >= len(states) {
+			index = len(states) - 1
+		}
+		state := states[index]
+		reasonJSON := "null"
+		if state.Reason != "" {
+			encoded, _ := json.Marshal(state.Reason)
+			reasonJSON = string(encoded)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"data":{"repository":{"%s":{"comments":{"nodes":[{"databaseId":%d,"isMinimized":%t,"minimizedReason":%s}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`, item, commentID, state.Hidden, reasonJSON)
+	}))
+}
+
+func TestFetchMRDetailUsesCurrentCommentVisibility(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	ctx := t.Context()
+	d := openTestDB(t)
+	repo := RepoRef{Owner: "owner", Name: "repo", PlatformHost: "github.com"}
+	repoID, err := d.UpsertRepo(ctx, verifiedGitHubRepoIdentity(repo.PlatformHost, repo.Owner, repo.Name))
+	require.NoError(err)
+
+	now := time.Date(2026, 8, 4, 12, 0, 0, 0, time.UTC)
+	commentID := int64(18201)
+	commentBody := "hidden after the REST detail refresh"
+	commentAuthor := "reviewer"
+	mock := &mockClient{
+		comments: []*gh.IssueComment{{
+			ID: &commentID, Body: &commentBody, User: &gh.User{Login: &commentAuthor},
+			CreatedAt: makeTimestamp(now), UpdatedAt: makeTimestamp(now),
+		}},
+		getPullRequestFn: func(_ context.Context, _, _ string, number int) (*gh.PullRequest, error) {
+			require.Equal(1, number)
+			return buildOpenPR(1, now), nil
+		},
+	}
+	gqlSrv := currentCommentVisibilityServer(
+		t, "pullRequest", commentID, CommentVisibility{Hidden: true, Reason: "ABUSE"},
+	)
+	defer gqlSrv.Close()
+	syncer := NewSyncer(
+		map[string]Client{"github.com": mock}, d, nil, []RepoRef{repo},
+		time.Minute, nil, nil,
+	)
+	syncer.SetFetchers(map[string]*GraphQLFetcher{
+		"github.com": NewGraphQLFetcherWithClient(
+			githubv4.NewEnterpriseClient(gqlSrv.URL, gqlSrv.Client()), nil,
+		),
+	})
+
+	_, err = syncer.fetchMRDetail(ctx, repo, repoID, 1, false)
+	require.NoError(err)
+
+	mr, err := d.GetMergeRequestByRepoIDAndNumber(ctx, repoID, 1)
+	require.NoError(err)
+	require.NotNil(mr)
+	events, err := d.ListMREvents(ctx, mr.ID)
+	require.NoError(err)
+	require.Len(events, 1)
+	assert.JSONEq(`{"provider_hidden":true,"provider_hidden_reason":"ABUSE"}`, events[0].MetadataJSON)
+}
+
+func TestFetchIssueDetailUsesCurrentCommentVisibility(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	ctx := t.Context()
+	d := openTestDB(t)
+	repo := RepoRef{Owner: "owner", Name: "repo", PlatformHost: "github.com"}
+	repoID, err := d.UpsertRepo(ctx, verifiedGitHubRepoIdentity(repo.PlatformHost, repo.Owner, repo.Name))
+	require.NoError(err)
+
+	now := time.Date(2026, 8, 4, 12, 0, 0, 0, time.UTC)
+	issueID := int64(18300)
+	issueNumber := 8
+	commentID := int64(18301)
+	commentBody := "hidden after the REST detail refresh"
+	commentAuthor := "reviewer"
+	mock := &mockClient{
+		comments: []*gh.IssueComment{{
+			ID: &commentID, Body: &commentBody, User: &gh.User{Login: &commentAuthor},
+			CreatedAt: makeTimestamp(now), UpdatedAt: makeTimestamp(now),
+		}},
+		getIssueFn: func(_ context.Context, _, _ string, number int) (*gh.Issue, error) {
+			require.Equal(issueNumber, number)
+			issue := buildOpenIssue(issueNumber, now)
+			issue.ID = &issueID
+			return issue, nil
+		},
+	}
+	gqlSrv := currentCommentVisibilityServer(
+		t, "issue", commentID, CommentVisibility{Hidden: true, Reason: "ABUSE"},
+	)
+	defer gqlSrv.Close()
+	syncer := NewSyncer(
+		map[string]Client{"github.com": mock}, d, nil, []RepoRef{repo},
+		time.Minute, nil, nil,
+	)
+	syncer.SetFetchers(map[string]*GraphQLFetcher{
+		"github.com": NewGraphQLFetcherWithClient(
+			githubv4.NewEnterpriseClient(gqlSrv.URL, gqlSrv.Client()), nil,
+		),
+	})
+
+	_, err = syncer.fetchIssueDetail(ctx, repo, repoID, issueNumber)
+	require.NoError(err)
+
+	issue, err := d.GetIssue(ctx, "github", "github.com", repo.Owner, repo.Name, issueNumber)
+	require.NoError(err)
+	require.NotNil(issue)
+	events, err := d.ListIssueEvents(ctx, issue.ID)
+	require.NoError(err)
+	require.Len(events, 1)
+	assert.JSONEq(`{"provider_hidden":true,"provider_hidden_reason":"ABUSE"}`, events[0].MetadataJSON)
+}
+
 func TestSyncOpenMRFromBulkRemovesDeletedCommentsWhenCommentsAreComplete(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
@@ -16989,8 +17235,8 @@ func TestSyncOpenMRFromBulkRemovesDeletedCommentsWhenCommentsAreComplete(t *test
 	require.NoError(err)
 
 	now := time.Date(2024, 6, 3, 12, 0, 0, 0, time.UTC)
-	firstUpdatedAt := now
-	secondUpdatedAt := now.Add(time.Minute)
+	firstUpdatedAt := now.Add(3 * time.Minute)
+	secondUpdatedAt := now.Add(4 * time.Minute)
 	commentID := int64(9101)
 	commentAuthor := "reviewer"
 	commentBody := "bulk PR comment"
@@ -17027,7 +17273,7 @@ func TestSyncOpenMRFromBulkRemovesDeletedCommentsWhenCommentsAreComplete(t *test
 	require.NoError(err)
 	require.NotNil(mr)
 	require.Equal(1, mr.CommentCount)
-	assert.Equal(commentTime.UTC(), mr.LastActivityAt.UTC())
+	assert.Equal(firstUpdatedAt.UTC(), mr.LastActivityAt.UTC())
 
 	events, err := d.ListMREvents(ctx, mr.ID)
 	require.NoError(err)
@@ -17035,13 +17281,14 @@ func TestSyncOpenMRFromBulkRemovesDeletedCommentsWhenCommentsAreComplete(t *test
 	assert.Equal(commentURL, events[0].DirectURL)
 
 	err = syncer.syncOpenMRFromBulk(ctx, repo, repoID, &BulkPR{
-		PR:               buildOpenPR(1, secondUpdatedAt),
-		Comments:         []*gh.IssueComment{},
-		CommentsComplete: true,
-		ReviewsComplete:  true,
-		CommitsComplete:  true,
-		TimelineComplete: true,
-		CIComplete:       true,
+		PR:                    buildOpenPR(1, secondUpdatedAt),
+		Comments:              []*gh.IssueComment{},
+		CommentsComplete:      true,
+		ReviewsComplete:       true,
+		ReviewThreadsComplete: true,
+		CommitsComplete:       true,
+		TimelineComplete:      true,
+		CIComplete:            true,
 	}, false)
 	require.NoError(err)
 
@@ -17055,6 +17302,67 @@ func TestSyncOpenMRFromBulkRemovesDeletedCommentsWhenCommentsAreComplete(t *test
 	require.NoError(err)
 	assert.Empty(events)
 	_ = commentTotal
+}
+
+func TestSyncOpenMRFromBulkLeavesDetailStaleWhenReviewThreadsAreIncomplete(t *testing.T) {
+	ctx := t.Context()
+	database := openTestDB(t)
+	repo := RepoRef{Owner: "owner", Name: "repo", PlatformHost: "github.com"}
+	repoID, err := database.UpsertRepo(ctx, verifiedGitHubRepoIdentity("github.com", repo.Owner, repo.Name))
+	require.NoError(t, err)
+
+	now := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
+	line := 12
+	client := &mockClient{}
+	syncer := NewSyncer(
+		map[string]Client{"github.com": client}, database, nil, []RepoRef{repo},
+		time.Minute, nil, nil,
+	)
+
+	err = syncer.syncOpenMRFromBulk(ctx, repo, repoID, &BulkPR{
+		PR:                    buildOpenPR(1, now),
+		CommentsComplete:      true,
+		ReviewsComplete:       true,
+		ReviewThreadsComplete: true,
+		ReviewThreads: []platform.MergeRequestReviewThread{{
+			ProviderThreadID: "thread-1", ProviderCommentID: "comment-1",
+			Body: "stored inline comment", AuthorLogin: "reviewer",
+			Range: platform.DiffReviewLineRange{
+				Path: "src/main.go", Side: "right", Line: line, NewLine: &line,
+			},
+			CreatedAt: now, UpdatedAt: now,
+		}},
+		CommitsComplete:  true,
+		TimelineComplete: true,
+		CIComplete:       true,
+	}, false)
+	require.NoError(t, err)
+
+	mr, err := database.GetMergeRequest(ctx, "github", "github.com", repo.Owner, repo.Name, 1)
+	require.NoError(t, err)
+	require.NotNil(t, mr)
+	require.NotNil(t, mr.DetailFetchedAt)
+
+	err = syncer.syncOpenMRFromBulk(ctx, repo, repoID, &BulkPR{
+		PR:                    buildOpenPR(1, now),
+		CommentsComplete:      true,
+		ReviewsComplete:       true,
+		ReviewThreadsComplete: false,
+		CommitsComplete:       true,
+		TimelineComplete:      true,
+		CIComplete:            true,
+	}, false)
+	require.NoError(t, err)
+
+	mr, err = database.GetMergeRequest(ctx, "github", "github.com", repo.Owner, repo.Name, 1)
+	require.NoError(t, err)
+	require.NotNil(t, mr)
+	assert.Nil(t, mr.DetailFetchedAt)
+	threads, err := database.ListMRReviewThreads(ctx, mr.ID)
+	require.NoError(t, err)
+	require.Len(t, threads, 1)
+	assert.Equal(t, "thread-1", threads[0].ProviderThreadID)
+	assert.Zero(t, client.listIssueCommentsCalled.Load())
 }
 
 // TestSyncOpenMRFromBulkPersistsWorkflowApproval verifies the GraphQL
@@ -17095,13 +17403,14 @@ func TestSyncOpenMRFromBulkPersistsWorkflowApproval(t *testing.T) {
 	repo := RepoRef{Owner: "owner", Name: "repo", PlatformHost: "github.com"}
 
 	err = syncer.syncOpenMRFromBulk(ctx, repo, repoID, &BulkPR{
-		PR:               pr,
-		Comments:         []*gh.IssueComment{},
-		CommentsComplete: true,
-		ReviewsComplete:  true,
-		CommitsComplete:  true,
-		TimelineComplete: true,
-		CIComplete:       true,
+		PR:                    pr,
+		Comments:              []*gh.IssueComment{},
+		CommentsComplete:      true,
+		ReviewsComplete:       true,
+		ReviewThreadsComplete: true,
+		CommitsComplete:       true,
+		TimelineComplete:      true,
+		CIComplete:            true,
 	}, false)
 	require.NoError(err)
 
@@ -17234,8 +17543,8 @@ func TestSyncOpenMRFromBulkUpdatesCommentFieldsWhenOnlyCommentsAreComplete(t *te
 	require.NoError(err)
 
 	now := time.Date(2024, 6, 3, 13, 0, 0, 0, time.UTC)
-	firstUpdatedAt := now
-	secondUpdatedAt := now.Add(time.Minute)
+	firstUpdatedAt := now.Add(3 * time.Minute)
+	secondUpdatedAt := now.Add(4 * time.Minute)
 	commentID := int64(9301)
 	commentAuthor := "reviewer"
 	commentBody := "partial bulk PR comment"
@@ -17268,7 +17577,7 @@ func TestSyncOpenMRFromBulkUpdatesCommentFieldsWhenOnlyCommentsAreComplete(t *te
 	require.NoError(err)
 	require.NotNil(mr)
 	assert.Equal(1, mr.CommentCount)
-	assert.Equal(commentTime.UTC(), mr.LastActivityAt.UTC())
+	assert.Equal(firstUpdatedAt.UTC(), mr.LastActivityAt.UTC())
 
 	events, err := d.ListMREvents(ctx, mr.ID)
 	require.NoError(err)
@@ -17306,6 +17615,7 @@ func TestSyncOpenMRFromBulkStoresTimelineEvents(t *testing.T) {
 
 	now := time.Date(2024, 6, 3, 14, 0, 0, 0, time.UTC)
 	timelineAt := now.Add(3 * time.Minute)
+	providerUpdatedAt := timelineAt.Add(2 * time.Minute)
 	commitSHA := "abc123def456"
 	commitMsg := "fix: preserve timeline commit order"
 	syncer := NewSyncer(
@@ -17316,7 +17626,7 @@ func TestSyncOpenMRFromBulkStoresTimelineEvents(t *testing.T) {
 	repo := RepoRef{Owner: "owner", Name: "repo", PlatformHost: "github.com"}
 
 	err = syncer.syncOpenMRFromBulk(ctx, repo, repoID, &BulkPR{
-		PR: buildOpenPR(1, now),
+		PR: buildOpenPR(1, providerUpdatedAt),
 		Commits: []*gh.RepositoryCommit{{
 			SHA: &commitSHA,
 			Commit: &gh.Commit{
@@ -17341,11 +17651,12 @@ func TestSyncOpenMRFromBulkStoresTimelineEvents(t *testing.T) {
 			DeletedCommentAuthor: "reviewer",
 			CreatedAt:            timelineAt.Add(time.Minute),
 		}},
-		CommentsComplete: true,
-		ReviewsComplete:  true,
-		CommitsComplete:  true,
-		TimelineComplete: true,
-		CIComplete:       true,
+		CommentsComplete:      true,
+		ReviewsComplete:       true,
+		ReviewThreadsComplete: true,
+		CommitsComplete:       true,
+		TimelineComplete:      true,
+		CIComplete:            true,
 	}, false)
 	require.NoError(err)
 
@@ -17353,7 +17664,7 @@ func TestSyncOpenMRFromBulkStoresTimelineEvents(t *testing.T) {
 	require.NoError(err)
 	require.NotNil(mr)
 	require.NotNil(mr.DetailFetchedAt)
-	assert.Equal(timelineAt.Add(time.Minute).UTC(), mr.LastActivityAt.UTC())
+	assert.Equal(providerUpdatedAt.UTC(), mr.LastActivityAt.UTC())
 
 	events, err := d.ListMREvents(ctx, mr.ID)
 	require.NoError(err)
@@ -17597,6 +17908,105 @@ func TestSyncOpenIssueFromBulkRemovesDeletedCommentsWhenCommentsAreComplete(t *t
 	events, err = d.ListIssueEvents(ctx, issue.ID)
 	require.NoError(err)
 	assert.Empty(events)
+}
+
+func TestSyncOpenIssueFromBulkMergesPartialCommentVisibilityWithStoredState(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	ctx := t.Context()
+	d := openTestDB(t)
+
+	repoID, err := d.UpsertRepo(ctx, verifiedGitHubRepoIdentity("github.com", "owner", "repo"))
+	require.NoError(err)
+
+	now := time.Date(2024, 6, 3, 12, 0, 0, 0, time.UTC)
+	issueID := int64(9251)
+	issueNumber := 9
+	issueTitle := "partial comment visibility"
+	issueState := "open"
+	issueURL := "https://github.com/owner/repo/issues/9"
+	issueAuthor := "alice"
+	updatedAt := gh.Timestamp{Time: now}
+	commentAuthor := "reviewer"
+	firstCommentID := int64(9252)
+	secondCommentID := int64(9253)
+	firstCommentBody := "observed by GraphQL"
+	secondCommentBody := "outside the partial GraphQL page"
+	firstCommentURL := issueURL + "#issuecomment-9252"
+	secondCommentURL := issueURL + "#issuecomment-9253"
+	firstCommentTime := gh.Timestamp{Time: now.Add(time.Minute)}
+	secondCommentTime := gh.Timestamp{Time: now.Add(2 * time.Minute)}
+	commentTotal := 2
+	comments := []*gh.IssueComment{
+		{
+			ID:        &firstCommentID,
+			Body:      &firstCommentBody,
+			HTMLURL:   &firstCommentURL,
+			User:      &gh.User{Login: &commentAuthor},
+			CreatedAt: &firstCommentTime,
+			UpdatedAt: &firstCommentTime,
+		},
+		{
+			ID:        &secondCommentID,
+			Body:      &secondCommentBody,
+			HTMLURL:   &secondCommentURL,
+			User:      &gh.User{Login: &commentAuthor},
+			CreatedAt: &secondCommentTime,
+			UpdatedAt: &secondCommentTime,
+		},
+	}
+	issue := &gh.Issue{
+		ID:        &issueID,
+		Number:    &issueNumber,
+		Title:     &issueTitle,
+		State:     &issueState,
+		HTMLURL:   &issueURL,
+		Comments:  &commentTotal,
+		User:      &gh.User{Login: &issueAuthor},
+		CreatedAt: &updatedAt,
+		UpdatedAt: &updatedAt,
+	}
+
+	mock := &mockClient{comments: comments}
+	syncer := NewSyncer(
+		map[string]Client{"github.com": mock},
+		d, nil, []RepoRef{{Owner: "owner", Name: "repo", PlatformHost: "github.com"}},
+		time.Minute, nil, nil,
+	)
+	repo := RepoRef{Owner: "owner", Name: "repo", PlatformHost: "github.com"}
+
+	err = syncer.syncOpenIssueFromBulk(ctx, repo, repoID, &BulkIssue{
+		Issue:             issue,
+		Comments:          comments,
+		CommentVisibility: map[int64]CommentVisibility{firstCommentID: {Hidden: true}, secondCommentID: {Hidden: true}},
+		CommentsComplete:  true,
+		TimelineComplete:  true,
+	})
+	require.NoError(err)
+
+	err = syncer.syncOpenIssueFromBulk(ctx, repo, repoID, &BulkIssue{
+		Issue:             issue,
+		Comments:          comments[:1],
+		CommentVisibility: map[int64]CommentVisibility{firstCommentID: {}},
+		CommentsComplete:  false,
+		TimelineComplete:  true,
+	})
+	require.NoError(err)
+
+	storedIssue, err := d.GetIssue(ctx, "github", "github.com", "owner", "repo", issueNumber)
+	require.NoError(err)
+	require.NotNil(storedIssue)
+	events, err := d.ListIssueEvents(ctx, storedIssue.ID)
+	require.NoError(err)
+	require.Len(events, 2)
+
+	metadataByCommentID := make(map[int64]string, len(events))
+	for _, event := range events {
+		require.NotNil(event.PlatformID)
+		metadataByCommentID[*event.PlatformID] = event.MetadataJSON
+	}
+	assert.NotContains(metadataByCommentID[firstCommentID], `"provider_hidden":true`)
+	assert.Contains(metadataByCommentID[secondCommentID], `"provider_hidden":true`)
 }
 
 func TestSyncOpenIssueFromBulkStoresTimelineEvents(t *testing.T) {
@@ -18499,37 +18909,6 @@ func TestSyncRepoGraphQLIssuesFullFlow(t *testing.T) {
 
 	// GraphQL path skipped REST ListIssueComments.
 	assert.Equal(int32(0), mock.listIssueCommentsCalled.Load())
-}
-
-// TestComputePRCommentRefreshLastActivity_PreservesNonCommentEvents
-// guards the comment-only refresh path against regressing a PR whose
-// latest activity came from a review, commit, or force push — data
-// the comment list can't see. The non-comment timestamp is supplied
-// by the caller from the DB's stored events.
-func TestComputePRCommentRefreshLastActivity_PreservesNonCommentEvents(t *testing.T) {
-	assert := assert.New(t)
-
-	created := time.Date(2026, 4, 20, 10, 0, 0, 0, time.UTC)
-	updated := created.Add(1 * time.Hour)
-	commentAt := created.Add(2 * time.Hour)
-	reviewAt := created.Add(3 * time.Hour)
-
-	pr := &db.MergeRequest{CreatedAt: created, UpdatedAt: updated}
-	comments := []*gh.IssueComment{{
-		CreatedAt: &gh.Timestamp{Time: commentAt},
-		UpdatedAt: &gh.Timestamp{Time: commentAt},
-	}}
-
-	assert.Equal(reviewAt, computePRCommentRefreshLastActivity(pr, comments, reviewAt),
-		"stored non-comment event activity must win over comment timestamp")
-
-	newerComment := reviewAt.Add(30 * time.Minute)
-	comments[0].UpdatedAt = &gh.Timestamp{Time: newerComment}
-	assert.Equal(newerComment, computePRCommentRefreshLastActivity(pr, comments, reviewAt),
-		"a strictly newer comment should advance activity past stored events")
-
-	assert.Equal(updated, computePRCommentRefreshLastActivity(pr, nil, time.Time{}),
-		"no comments and no stored events should fall back to PR UpdatedAt")
 }
 
 func TestPersistGitHubCommentsRollsBackRecoveryWrites(t *testing.T) {
@@ -20292,7 +20671,7 @@ func TestProcessQueuedNotificationReadsRequiresWorstCaseHeadroom(t *testing.T) {
 // decision must read the repository credential's own pool, so an App
 // installation sitting at zero cannot suppress bulk GraphQL for a PAT-backed
 // repository on the same host (or the reverse).
-func TestBulkGraphQLAllowedIsolatesCredentialGraphQLPools(t *testing.T) {
+func TestGraphQLReadAllowedIsolatesCredentialGraphQLPools(t *testing.T) {
 	assert := assert.New(t)
 	d := openTestDB(t)
 	appRepo := RepoRef{Owner: "acme", Name: "widget", PlatformHost: "github.com"}
@@ -20336,9 +20715,9 @@ func TestBulkGraphQLAllowedIsolatesCredentialGraphQLPools(t *testing.T) {
 	backoff, _ := fetcher.ShouldBackoff()
 	assert.True(backoff, "host-wide tracker should report exhaustion")
 
-	assert.False(syncer.bulkGraphQLAllowed(t.Context(), appRepo, fetcher),
+	assert.False(syncer.graphQLReadAllowed(t.Context(), appRepo, fetcher),
 		"exhausted App credential must back off")
-	assert.True(syncer.bulkGraphQLAllowed(t.Context(), userRepo, fetcher),
+	assert.True(syncer.graphQLReadAllowed(t.Context(), userRepo, fetcher),
 		"healthy user credential must not inherit the App pool's exhaustion")
 }
 
@@ -20414,12 +20793,12 @@ func TestRepoEligibilityStopsOnExhaustedRESTWithUnobservedGraphQL(t *testing.T) 
 		"an exhausted REST reserve must stop scheduling regardless of GraphQL")
 }
 
-// Background admission gates on REST alone, so bulkGraphQLAllowed is the only
-// place the GraphQL reserve is applied. A background sync holding GraphQL
+// Background admission gates on REST alone, so graphQLReadAllowed is where the
+// GraphQL reserve is applied. A background sync holding GraphQL
 // headroom inside the reserve must fall back to REST rather than spend the
 // capacity held for foreground work, while the same pool stays usable for an
 // explicit foreground sync.
-func TestBulkGraphQLAllowedAppliesReserveOnlyToBackgroundSyncs(t *testing.T) {
+func TestGraphQLReadAllowedAppliesReserveOnlyToBackgroundSyncs(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 	d := openTestDB(t)
@@ -20446,11 +20825,54 @@ func TestBulkGraphQLAllowedAppliesReserveOnlyToBackgroundSyncs(t *testing.T) {
 	fetcher := &GraphQLFetcher{}
 
 	assert.False(
-		syncer.bulkGraphQLAllowed(WithSyncBudget(t.Context()), repo, fetcher),
+		syncer.graphQLReadAllowed(WithSyncBudget(t.Context()), repo, fetcher),
 		"background bulk GraphQL must not spend the foreground reserve")
 	assert.True(
-		syncer.bulkGraphQLAllowed(t.Context(), repo, fetcher),
+		syncer.graphQLReadAllowed(t.Context(), repo, fetcher),
 		"an explicit foreground sync may use GraphQL headroom inside the reserve")
+}
+
+func TestCurrentCommentVisibilitySkipsGraphQLInsideBackgroundReserve(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	d := openTestDB(t)
+	repo := RepoRef{Owner: "acme", Name: "widget", PlatformHost: "github.com"}
+	client := &credentialRateLimitSnapshotMockClient{mockClient: &mockClient{}}
+	identity := IdentityKey{Host: "github.com", Principal: "user:7"}
+	var requests atomic.Int32
+	gqlSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"errors":[{"message":"query should not run"}]}`))
+	}))
+	defer gqlSrv.Close()
+	fetcher := NewGraphQLFetcherWithClient(
+		githubv4.NewEnterpriseClient(gqlSrv.URL, gqlSrv.Client()), nil,
+	)
+	syncer := NewSyncer(
+		map[string]Client{"github.com": client}, d, nil, []RepoRef{repo},
+		time.Minute, nil, nil,
+	)
+	router, err := NewHostRouter("github.com", &Route{
+		Key: RouteKey{Host: "github.com", Owner: "acme"}, Client: client,
+		Fetcher: fetcher, ReadIdentity: identity, WriteIdentity: identity,
+	})
+	require.NoError(err)
+	syncer.SetGitHubRouters(map[string]*HostRouter{"github.com": router})
+	registry := NewQuotaRegistry()
+	registry.UpdateSnapshot(identity, QuotaResourceGraphQL, Rate{
+		Limit: 5000, Remaining: RateReserveBuffer / 2,
+		Reset: time.Now().UTC().Add(time.Hour),
+	})
+	syncer.SetQuotaRegistry(registry)
+	ctx := WithSyncBudget(t.Context())
+
+	_, prObserved := syncer.currentPRCommentVisibility(ctx, repo, 7)
+	_, issueObserved := syncer.currentIssueCommentVisibility(ctx, repo, 8)
+
+	assert.False(prObserved)
+	assert.False(issueObserved)
+	assert.Zero(requests.Load())
 }
 
 // End-to-end through the syncer and SQLite: a credential whose GraphQL pool is
@@ -20643,7 +21065,7 @@ func TestRunOnceSkipsSyncWhenRESTPoolExhausted(t *testing.T) {
 }
 
 // Without a registry the host-wide tracker remains authoritative.
-func TestBulkGraphQLAllowedFallsBackToHostTracker(t *testing.T) {
+func TestGraphQLReadAllowedFallsBackToHostTracker(t *testing.T) {
 	assert := assert.New(t)
 	d := openTestDB(t)
 	repo := RepoRef{Owner: "acme", Name: "widget", PlatformHost: "github.com"}
@@ -20656,8 +21078,8 @@ func TestBulkGraphQLAllowedFallsBackToHostTracker(t *testing.T) {
 		Limit: 5000, Remaining: 0, Reset: time.Now().UTC().Add(time.Hour),
 	})
 
-	assert.False(syncer.bulkGraphQLAllowed(t.Context(), repo, &GraphQLFetcher{rateTracker: exhausted}))
-	assert.True(syncer.bulkGraphQLAllowed(t.Context(), repo, &GraphQLFetcher{}))
+	assert.False(syncer.graphQLReadAllowed(t.Context(), repo, &GraphQLFetcher{rateTracker: exhausted}))
+	assert.True(syncer.graphQLReadAllowed(t.Context(), repo, &GraphQLFetcher{}))
 }
 
 func TestPublishResolvedRepositoryAliasesCredentialRoute(t *testing.T) {
