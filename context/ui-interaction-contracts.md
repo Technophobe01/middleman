@@ -90,18 +90,16 @@ Interactive surfaces must agree on which item is selected.
   begun controller-less must surface on an inline surface after a layout
   switch, where no recordCreated override ever ran
   (`frontend/src/lib/stores/workspace-host.svelte.ts::effectiveRef`).
-- An explicit create-and-launch intent is keyed by `(workspaceHostKey, workspaceId)`
-  and must be published before presentation liveness checks; ID-only state collides
-  local and fleet workspaces, while layout churn must not discard the command
-  (`frontend/src/lib/components/workspace/WorkspaceCreateSplitButton.svelte::selectTarget`,
-  `frontend/src/lib/stores/workspace-create-pending.svelte.ts::queueWorkspaceLaunch`,
-  `frontend/src/lib/components/terminal/WorkspaceTerminalView.svelte::handleLaunch`).
+- Explicit create-and-launch intent starts under canonical item identity, promotes to `(workspaceHostKey, workspaceId)` before workspace publication or create cleanup, and gates automatic launcher rendering in either form; promotion queues the workspace form before clearing the item form so no render observes a gap
+  (`frontend/src/lib/stores/workspace-create-pending.svelte.ts::promoteWorkspaceCreateLaunch`,
+  `frontend/src/lib/components/terminal/WorkspaceTerminalView.svelte::automaticLauncherBlocked`).
   A successful claim stays pending until the exact session appears or bounded reconciliation expires;
   reconciliation runs on the application runtime, survives the initiating view's teardown, treats transient
   runtime reads as observations rather than terminal failures, and releases its read owner on exact-session
   evidence or timeout. The window ends 15 seconds after launch acknowledgement; expiry clears only the launch
   intent and reports that the session was not observed. A session that appears later remains authoritative and
-  is discovered by subsequent runtime reads rather than stopped or relaunched. Sibling views suppress their empty fallback and may discard only unclaimed intents
+  is discovered by subsequent runtime reads rather than stopped or relaunched. Sibling views suppress or retract
+  their automatically opened empty fallback while the launch intent is pending and may discard only unclaimed intents
   (`frontend/src/lib/stores/workspace-create-pending.svelte.ts::acceptWorkspaceLaunch`,
   `frontend/src/lib/components/terminal/workspace-runtime-workflow.ts::reconcileAcceptedLaunch`).
 - Inline surface claims come only from live selection effects (the list

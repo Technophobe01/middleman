@@ -8,13 +8,16 @@ import { clearActiveTabbedPanelDrag, startTabbedPanelTabDrag } from "../shared/t
 import { getPaneLayoutStore, resetPaneLayoutStoresForTest } from "../../stores/paneLayout.svelte.js";
 import { sessionPaneKey } from "../../stores/session-pane-key.js";
 import {
+  beginWorkspaceCreate,
   beginWorkspaceDeletion,
   discardWorkspaceLaunch,
   endWorkspaceDeletion,
   pendingWorkspaceLaunch,
+  promoteWorkspaceCreateLaunch,
   queueWorkspaceLaunch,
   resetWorkspaceCreatePendingForTest,
 } from "../../stores/workspace-create-pending.svelte.js";
+import type { WorkspaceItemIdentity } from "../../workspace-inline.js";
 import { STORES_KEY } from "../../context.js";
 
 const mocks = vi.hoisted(() => ({
@@ -321,6 +324,16 @@ const workspaceResponse = {
   enrichment_status: "fresh",
   created_at: "2026-04-29T00:00:00Z",
   mr_head_repo_kind: "same_repo",
+};
+
+const workspaceItemIdentity: WorkspaceItemIdentity = {
+  provider: workspaceResponse.repo.provider,
+  platformHost: workspaceResponse.repo.platform_host,
+  owner: workspaceResponse.repo.owner,
+  name: workspaceResponse.repo.name,
+  repoPath: workspaceResponse.repo.repo_path,
+  number: workspaceResponse.item_number,
+  itemType: workspaceResponse.item_type,
 };
 
 /**
@@ -3617,6 +3630,45 @@ describe("WorkspaceTerminalView", () => {
       // strip.
       await waitFor(() => expect(screen.getByRole("dialog", { name: /Launch a session/ })).toBeTruthy());
       expect(screen.queryByRole("tab", { name: "Home" })).toBeNull();
+    });
+
+    it("removes the automatic launcher at item intent and never remounts it during promotion", async () => {
+      const launchRequest = deferred<typeof runningSession>();
+      mocks.getWorkspaceRuntime.mockResolvedValue(runtimeWithLaunchTargetsOnly());
+      mocks.launchWorkspaceSession.mockReturnValue(launchRequest.promise);
+      claimForPrs();
+
+      render(WorkspaceTerminalView, {
+        props: { workspaceId: "ws-1", paneSurface: "prs" as const },
+      });
+
+      await screen.findByRole("dialog", { name: "Launch a session" });
+      beginWorkspaceCreate(workspaceItemIdentity, "helper");
+
+      await waitFor(() => expect(screen.queryByRole("dialog", { name: "Launch a session" })).toBeNull());
+
+      const launcherAppearances: Element[] = [];
+      const selector = '[role="dialog"][aria-label="Launch a session"]';
+      const observer = new MutationObserver((records) => {
+        for (const record of records) {
+          for (const node of record.addedNodes) {
+            if (!(node instanceof Element)) continue;
+            if (node.matches(selector)) launcherAppearances.push(node);
+            launcherAppearances.push(...node.querySelectorAll(selector));
+          }
+        }
+      });
+      observer.observe(document.body, { childList: true, subtree: true });
+
+      try {
+        promoteWorkspaceCreateLaunch(workspaceItemIdentity, "ws-1", undefined);
+
+        await waitFor(() => expect(mocks.launchWorkspaceSession).toHaveBeenCalledTimes(1));
+        expect(screen.queryByRole("dialog", { name: "Launch a session" })).toBeNull();
+        expect(launcherAppearances).toHaveLength(0);
+      } finally {
+        observer.disconnect();
+      }
     });
 
     it("leaves a broken workspace's error on screen instead of covering it with the launcher", async () => {
