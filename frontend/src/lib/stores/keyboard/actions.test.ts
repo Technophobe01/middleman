@@ -132,6 +132,16 @@ describe("defaultActions", () => {
     expect(ids).not.toContain("nav.pulls.board");
   });
 
+  it("keeps the Pull requests list command palette-only", () => {
+    window.history.replaceState(null, "", "/issues");
+    const action = command("nav.pulls.list");
+
+    expect(action.binding).toBeNull();
+    action.handler(ctx("issues"));
+
+    expect(locationPath()).toBe("/pulls");
+  });
+
   it("palette.open binds the terminal-safe shifted K chord and the existing palette chords", () => {
     const palette = defaultActions.find((a) => a.id === "palette.open");
     expect(palette).toBeDefined();
@@ -289,14 +299,6 @@ describe("defaultActions", () => {
         }),
       ),
     ).toBe(true);
-  });
-
-  it("does not enable pull request number navigation on Kata", () => {
-    const list = defaultActions.find((a) => a.id === "nav.pulls.list");
-
-    expect(list).toBeDefined();
-    expect(list!.when(ctx("kata"))).toBe(false);
-    expect(list!.when(ctx("pulls"))).toBe(true);
   });
 
   it("opens the repo browser from a selected pull request", () => {

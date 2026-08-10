@@ -329,9 +329,9 @@ function repoBrowserPreview(ctx: Context): PreviewBlock {
   };
 }
 
-// Mirrors App.svelte's pre-migration page exclusions for `1`/`2`/`f`/etc.:
-// settings, design-system, repos, reviews, workspaces, activity all returned
-// early before the global shortcut switch ran.
+// Keep the Pull requests list command scoped to the pages where the former
+// number shortcut was available. The command remains palette-accessible but
+// no longer reserves a bare digit key.
 const onNumberNavPages = (ctx: Context): boolean => {
   switch (ctx.page) {
     case "settings":
@@ -551,7 +551,7 @@ export const defaultActions: Action[] = [
     id: "nav.pulls.list",
     label: "Pull requests (list)",
     scope: "global",
-    binding: { key: "1" },
+    binding: null,
     priority: 0,
     when: onNumberNavPages,
     handler: () => navigate("/pulls"),
