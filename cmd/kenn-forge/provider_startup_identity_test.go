@@ -60,6 +60,40 @@ func (r fakeGitHubIdentityResolver) ResolvePAT(
 	)
 }
 
+func TestRegisterProviderTokenSourcesDefersGitHubAppMinting(t *testing.T) {
+	require := require.New(t)
+	var mints atomic.Int32
+	cfg := &config.Config{
+		SyncInterval: "5m", Host: "127.0.0.1", Port: 8091, BasePath: "/",
+		Activity: config.Activity{ViewMode: "flat", TimeRange: "7d"},
+		Repos:    []config.Repo{{Owner: "acme", Name: "widget"}},
+		GitHubApps: []config.GitHubAppConfig{{
+			Host: "github.com", AppID: 7, PrivateKeyPath: "/keys/app.pem",
+			InstallationID: 789, InstallationAccount: "acme",
+			RepositorySelection: "all",
+		}},
+	}
+	require.NoError(cfg.Validate())
+	set := tokenauth.NewSourceSet(tokenauth.Options{
+		GitHubApp: func(context.Context, tokenauth.Candidate) (string, time.Time, error) {
+			mints.Add(1)
+			return "installation-token", time.Now().Add(time.Hour), nil
+		},
+	})
+
+	sources, err := registerProviderTokenSources(cfg, set)
+	require.NoError(err)
+	require.NotEmpty(sources)
+	require.Zero(mints.Load(), "disabled startup must not mint provider credentials")
+
+	_, err = buildProviderStartup(
+		t.Context(), dbtest.Open(t), cfg, set, sources,
+		defaultProviderFactories(), nil,
+	)
+	require.NoError(err)
+	require.Zero(mints.Load(), "provider construction must remain lazy")
+}
+
 func TestBuildProviderStartupRetainsVerifiedPATForExactRoutes(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)

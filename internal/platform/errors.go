@@ -65,6 +65,10 @@ var ErrArchiveAttemptBudget = errors.New("archive wire-attempt allowance exhaust
 // emergency ceiling cannot reserve another background wire attempt.
 var ErrSyncBudgetExhausted = errors.New("local sync emergency ceiling exhausted")
 
+// ErrSyncDisabled is returned before provider I/O when synchronization is
+// disabled for this process.
+var ErrSyncDisabled = errors.New("provider sync is disabled")
+
 // ErrLookupInaccessible marks a single-item lookup that the provider has
 // explicitly classified as inaccessible rather than a generic authentication
 // or permission failure.

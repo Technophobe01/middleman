@@ -671,7 +671,7 @@ func (s *Server) resolveReposForReload(
 			continue
 		}
 		_, expanded, err := ghclient.ResolveConfiguredRepoWithRegistry(
-			ctx, s.syncer.Registry(), raw,
+			ctx, s.syncer.SyncRegistry(), raw,
 		)
 		if err != nil {
 			// Network failure or transient API error: fall back to a

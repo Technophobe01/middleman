@@ -90,6 +90,13 @@ GitHub may additionally define exact-repository and owner authorization routes.
 
 - Self-hosted hosts are hostnames with optional ports, not URL paths.
 - A missing token should fail only the provider host that needs it.
+- Disabled startup registers credential descriptors without resolving them, so
+  provider tokens stay lazy (`cmd/kenn-forge/provider_startup.go::registerProviderTokenSources`).
+- Refresh access uses the gated registry; only explicit foreground provider
+  operations use direct access (`internal/github/sync.go::Syncer.SyncRegistry`).
+- Refresh interfaces that may be retained across policy setup must recheck the
+  gate when invoked, not only when resolved
+  (`internal/github/sync.go::Syncer.MergeRequestReviewThreadReader`).
 
 Provider clients must be registered by `(platform, platform_host)`. GitHub rate
 trackers and sync budgets are keyed by `(host, authenticated identity)`: PATs

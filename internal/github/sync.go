@@ -789,6 +789,7 @@ func (p *listFetchProgressLogger) log(message string) {
 // Syncer periodically pulls PR data from GitHub into SQLite.
 type Syncer struct {
 	clients                  *platform.Registry
+	directClients            *platform.Registry
 	db                       *db.DB
 	archiveRunner            archiveRunner
 	archiveLifecycle         archiveRepositoryLifecycle
@@ -827,6 +828,7 @@ type Syncer struct {
 	branchActivityRetention  time.Duration
 	branchActivityMaxCommits int
 	preferGitHubNativeStacks atomic.Bool
+	syncDisabled             atomic.Bool
 	parallelism              atomic.Int32
 	runMu                    sync.Mutex
 	running                  atomic.Bool
@@ -921,6 +923,25 @@ type Syncer struct {
 	afterHeadRepoSnapshotRead               func()
 	afterNotificationRepoIdentityReconciled func()
 	beforeCloneRouteValidation              func()
+}
+
+// DisableSync permanently prevents this Syncer from starting provider refresh
+// work. It must be called during startup, before the Syncer is exposed.
+func (s *Syncer) DisableSync() {
+	if s != nil {
+		s.syncDisabled.Store(true)
+	}
+}
+
+func (s *Syncer) SyncEnabled() bool {
+	return s != nil && !s.syncDisabled.Load()
+}
+
+func (s *Syncer) syncDisabledError() error {
+	if !s.SyncEnabled() {
+		return platform.ErrSyncDisabled
+	}
+	return nil
 }
 
 type archiveProviderRequest struct {
@@ -1163,7 +1184,6 @@ func NewSyncerWithRegistry(
 	}
 
 	s := &Syncer{
-		clients:                  registry,
 		db:                       database,
 		clones:                   clones,
 		rateTrackers:             rateTrackers,
@@ -1186,6 +1206,8 @@ func NewSyncerWithRegistry(
 			displayNameFailureTTL,
 		),
 	}
+	s.directClients = registry
+	s.clients = registry.WithProviderGate(s.syncDisabledError)
 	s.parallelism.Store(defaultParallelism)
 	s.status.Store(&SyncStatus{})
 
@@ -1220,6 +1242,9 @@ func (s *Syncer) SetArchiveService(runner archiveRunner) {
 }
 
 func (s *Syncer) WakeArchive() {
+	if !s.SyncEnabled() {
+		return
+	}
 	select {
 	case s.archiveWake <- struct{}{}:
 	default:
@@ -3694,6 +3719,9 @@ func (s *Syncer) triggerRunWithCadence(
 	priorityRepos []RepoRef,
 	onlyRepos []RepoRef,
 ) {
+	if !s.SyncEnabled() {
+		return
+	}
 	s.lifecycleMu.Lock()
 	if s.stopped {
 		s.lifecycleMu.Unlock()
@@ -3972,10 +4000,13 @@ func (s *Syncer) optionalGitHubClientFor(repo RepoRef) (Client, bool) {
 
 // clientFor returns the legacy GitHub Client for the given repo's host.
 // Repos with an empty host default to "github.com".
-func (s *Syncer) clientFor(repo RepoRef) (Client, error) {
+func clientForRegistry(registry *platform.Registry, repo RepoRef) (Client, error) {
 	host := repoHost(repo)
-	provider, err := s.clients.Provider(repoPlatform(repo), host)
+	provider, err := registry.Provider(repoPlatform(repo), host)
 	if err != nil {
+		if errors.Is(err, platform.ErrSyncDisabled) {
+			return nil, err
+		}
 		return nil, fmt.Errorf("no client configured for host %s", host)
 	}
 	legacy, ok := provider.(interface{ GitHubClient() Client })
@@ -3983,6 +4014,10 @@ func (s *Syncer) clientFor(repo RepoRef) (Client, error) {
 		return nil, fmt.Errorf("no GitHub client configured for host %s", host)
 	}
 	return legacy.GitHubClient(), nil
+}
+
+func (s *Syncer) clientFor(repo RepoRef) (Client, error) {
+	return clientForRegistry(s.clients, repo)
 }
 
 func (s *Syncer) mergeRequestReaderFor(repo RepoRef) (platform.MergeRequestReader, error) {
@@ -4035,6 +4070,12 @@ func (s *Syncer) ClientForHost(
 	return s.clientFor(RepoRef{PlatformHost: host})
 }
 
+// DirectClientForHost returns a legacy GitHub client for an explicit
+// foreground provider operation.
+func (s *Syncer) DirectClientForHost(host string) (Client, error) {
+	return clientForRegistry(s.directClients, RepoRef{PlatformHost: host})
+}
+
 func (s *Syncer) ProviderCapabilities(
 	kind platform.Kind,
 	host string,
@@ -4049,20 +4090,24 @@ func (s *Syncer) ProviderCapabilities(
 		}
 		host = defaultHost
 	}
-	return s.clients.Capabilities(kind, canonicalRepoHost(host))
+	return s.directClients.Capabilities(kind, canonicalRepoHost(host))
 }
 
 func (s *Syncer) RepositoryReader(
 	kind platform.Kind,
 	host string,
 ) (platform.RepositoryReader, error) {
-	return s.clients.RepositoryReader(kind, canonicalRepoHost(host))
+	return s.directClients.RepositoryReader(kind, canonicalRepoHost(host))
 }
 
-// Registry returns the boot-time platform registry. Callers must not
-// mutate the returned registry; it is shared by every sync codepath and
-// rebuilt only on daemon restart.
+// Registry returns the boot-time provider registry for explicit foreground
+// operations. Callers must not mutate it.
 func (s *Syncer) Registry() *platform.Registry {
+	return s.directClients
+}
+
+// SyncRegistry returns the provider-gated registry used by refresh work.
+func (s *Syncer) SyncRegistry() *platform.Registry {
 	return s.clients
 }
 
@@ -4070,136 +4115,163 @@ func (s *Syncer) LabelReader(
 	kind platform.Kind,
 	host string,
 ) (platform.LabelReader, error) {
-	return s.clients.LabelReader(kind, canonicalRepoHost(host))
+	return s.directClients.LabelReader(kind, canonicalRepoHost(host))
 }
 
 func (s *Syncer) CommentMutator(
 	kind platform.Kind,
 	host string,
 ) (platform.CommentMutator, error) {
-	return s.clients.CommentMutator(kind, canonicalRepoHost(host))
+	return s.directClients.CommentMutator(kind, canonicalRepoHost(host))
 }
 
 func (s *Syncer) StateMutator(
 	kind platform.Kind,
 	host string,
 ) (platform.StateMutator, error) {
-	return s.clients.StateMutator(kind, canonicalRepoHost(host))
+	return s.directClients.StateMutator(kind, canonicalRepoHost(host))
 }
 
 func (s *Syncer) MergeMutator(
 	kind platform.Kind,
 	host string,
 ) (platform.MergeMutator, error) {
-	return s.clients.MergeMutator(kind, canonicalRepoHost(host))
+	return s.directClients.MergeMutator(kind, canonicalRepoHost(host))
 }
 
 func (s *Syncer) WorkflowApprovalMutator(
 	kind platform.Kind,
 	host string,
 ) (platform.WorkflowApprovalMutator, error) {
-	return s.clients.WorkflowApprovalMutator(kind, canonicalRepoHost(host))
+	return s.directClients.WorkflowApprovalMutator(kind, canonicalRepoHost(host))
 }
 
 func (s *Syncer) ReadyForReviewMutator(
 	kind platform.Kind,
 	host string,
 ) (platform.ReadyForReviewMutator, error) {
-	return s.clients.ReadyForReviewMutator(kind, canonicalRepoHost(host))
+	return s.directClients.ReadyForReviewMutator(kind, canonicalRepoHost(host))
 }
 
 func (s *Syncer) DraftMutator(
 	kind platform.Kind,
 	host string,
 ) (platform.DraftMutator, error) {
-	return s.clients.DraftMutator(kind, canonicalRepoHost(host))
+	return s.directClients.DraftMutator(kind, canonicalRepoHost(host))
 }
 
 func (s *Syncer) IssueMutator(
 	kind platform.Kind,
 	host string,
 ) (platform.IssueMutator, error) {
-	return s.clients.IssueMutator(kind, canonicalRepoHost(host))
+	return s.directClients.IssueMutator(kind, canonicalRepoHost(host))
 }
 
 func (s *Syncer) LabelMutator(
 	kind platform.Kind,
 	host string,
 ) (platform.LabelMutator, error) {
-	return s.clients.LabelMutator(kind, canonicalRepoHost(host))
+	return s.directClients.LabelMutator(kind, canonicalRepoHost(host))
 }
 
 func (s *Syncer) ReviewMutator(
 	kind platform.Kind,
 	host string,
 ) (platform.ReviewMutator, error) {
-	return s.clients.ReviewMutator(kind, canonicalRepoHost(host))
+	return s.directClients.ReviewMutator(kind, canonicalRepoHost(host))
 }
 
 func (s *Syncer) RequestChangesMutator(
 	kind platform.Kind,
 	host string,
 ) (platform.RequestChangesMutator, error) {
-	return s.clients.RequestChangesMutator(kind, canonicalRepoHost(host))
+	return s.directClients.RequestChangesMutator(kind, canonicalRepoHost(host))
 }
 
 func (s *Syncer) AssigneeMutator(
 	kind platform.Kind,
 	host string,
 ) (platform.AssigneeMutator, error) {
-	return s.clients.AssigneeMutator(kind, canonicalRepoHost(host))
+	return s.directClients.AssigneeMutator(kind, canonicalRepoHost(host))
 }
 
 func (s *Syncer) ReviewerMutator(
 	kind platform.Kind,
 	host string,
 ) (platform.ReviewerMutator, error) {
-	return s.clients.ReviewerMutator(kind, canonicalRepoHost(host))
+	return s.directClients.ReviewerMutator(kind, canonicalRepoHost(host))
 }
 
 func (s *Syncer) DiffReviewDraftMutator(
 	kind platform.Kind,
 	host string,
 ) (platform.DiffReviewDraftMutator, error) {
-	return s.clients.DiffReviewDraftMutator(kind, canonicalRepoHost(host))
+	return s.directClients.DiffReviewDraftMutator(kind, canonicalRepoHost(host))
 }
 
 func (s *Syncer) ReviewSuggestionApplier(
 	kind platform.Kind,
 	host string,
 ) (platform.ReviewSuggestionApplier, error) {
-	return s.clients.ReviewSuggestionApplier(kind, canonicalRepoHost(host))
+	return s.directClients.ReviewSuggestionApplier(kind, canonicalRepoHost(host))
 }
 
 func (s *Syncer) DiffReviewThreadResolver(
 	kind platform.Kind,
 	host string,
 ) (platform.DiffReviewThreadResolver, error) {
-	return s.clients.DiffReviewThreadResolver(kind, canonicalRepoHost(host))
+	return s.directClients.DiffReviewThreadResolver(kind, canonicalRepoHost(host))
 }
 
 func (s *Syncer) MergeRequestReviewThreadReader(
 	kind platform.Kind,
 	host string,
 ) (platform.MergeRequestReviewThreadReader, error) {
-	return s.clients.MergeRequestReviewThreadReader(kind, canonicalRepoHost(host))
+	reader, err := s.directClients.MergeRequestReviewThreadReader(kind, canonicalRepoHost(host))
+	if err != nil {
+		return nil, err
+	}
+	return syncGatedReviewThreadReader{syncer: s, reader: reader}, nil
+}
+
+type syncGatedReviewThreadReader struct {
+	syncer *Syncer
+	reader platform.MergeRequestReviewThreadReader
+}
+
+func (r syncGatedReviewThreadReader) ListMergeRequestReviewThreads(
+	ctx context.Context,
+	ref platform.RepoRef,
+	number int,
+) ([]platform.MergeRequestReviewThread, error) {
+	if err := r.syncer.syncDisabledError(); err != nil {
+		return nil, err
+	}
+	return r.reader.ListMergeRequestReviewThreads(ctx, ref, number)
 }
 
 func (s *Syncer) MergeRequestContentMutator(
 	kind platform.Kind,
 	host string,
 ) (platform.MergeRequestContentMutator, error) {
-	return s.clients.MergeRequestContentMutator(kind, canonicalRepoHost(host))
+	return s.directClients.MergeRequestContentMutator(kind, canonicalRepoHost(host))
 }
 
 func (s *Syncer) IssueContentMutator(
 	kind platform.Kind,
 	host string,
 ) (platform.IssueContentMutator, error) {
-	return s.clients.IssueContentMutator(kind, canonicalRepoHost(host))
+	return s.directClients.IssueContentMutator(kind, canonicalRepoHost(host))
 }
 
 func (s *Syncer) ResolveConfiguredRepo(
+	ctx context.Context,
+	repo config.Repo,
+) (ConfiguredRepoStatus, []RepoRef, error) {
+	return ResolveConfiguredRepoWithRegistry(ctx, s.directClients, repo)
+}
+
+func (s *Syncer) ResolveConfiguredRepoForSync(
 	ctx context.Context,
 	repo config.Repo,
 ) (ConfiguredRepoStatus, []RepoRef, error) {
@@ -4377,7 +4449,7 @@ func (s *Syncer) SetReposWithContext(ctx context.Context, repos []RepoRef, retry
 	for _, repo := range repos {
 		refs = append(refs, platformRepoRef(repo))
 	}
-	if s.archiveLifecycle != nil {
+	if s.SyncEnabled() && s.archiveLifecycle != nil {
 		seeded, err := s.archiveLifecycle.EnsureConfigured(ctx, refs)
 		if err != nil {
 			return fmt.Errorf("seed archive discovery: %w", err)
@@ -4404,6 +4476,9 @@ func (s *Syncer) SetReposWithContext(ctx context.Context, repos []RepoRef, retry
 // The caller's ctx and the syncer's internal lifetime ctx (canceled
 // by Stop) are both honored: either one unblocks any in-flight work.
 func (s *Syncer) Start(ctx context.Context) {
+	if !s.SyncEnabled() {
+		return
+	}
 	s.lifecycleMu.Lock()
 	if s.stopped {
 		s.lifecycleMu.Unlock()
@@ -4771,6 +4846,9 @@ func (s *Syncer) SyncWatchedMRs(ctx context.Context) {
 }
 
 func (s *Syncer) syncWatchedMRs(ctx context.Context) {
+	if !s.SyncEnabled() {
+		return
+	}
 	s.watchSyncMu.Lock()
 	defer s.watchSyncMu.Unlock()
 
@@ -5235,7 +5313,7 @@ func (s *Syncer) RefreshRateLimitSnapshots(ctx context.Context) {
 
 func (s *Syncer) refreshRateLimitSnapshots(ctx context.Context) map[string]struct{} {
 	refreshed := make(map[string]struct{})
-	if s == nil || s.clients == nil {
+	if !s.SyncEnabled() || s.clients == nil {
 		return refreshed
 	}
 	type snapshotCandidate struct {
@@ -5715,6 +5793,9 @@ func (s *Syncer) runOnce(
 	priorityRepos []RepoRef,
 	onlyRepos []RepoRef,
 ) {
+	if !s.SyncEnabled() {
+		return
+	}
 	s.runMu.Lock()
 	if s.running.Load() {
 		if !bypassNextSyncAfter && onlyRepos == nil && s.exclusiveRun {
@@ -7402,7 +7483,7 @@ func (s *Syncer) indexSyncRepo(
 	repoID int64,
 	cloneFetchOK bool,
 ) error {
-	caps, err := s.ProviderCapabilities(repoPlatform(repo), repoHost(repo))
+	caps, err := s.clients.Capabilities(repoPlatform(repo), repoHost(repo))
 	if err != nil {
 		return fmt.Errorf("resolve provider capabilities for %s/%s: %w", repo.Owner, repo.Name, err)
 	}

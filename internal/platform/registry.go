@@ -4,6 +4,7 @@ import "fmt"
 
 type Registry struct {
 	providers map[providerKey]Provider
+	gate      func() error
 }
 
 type providerKey struct {
@@ -39,7 +40,22 @@ func (r *Registry) Register(provider Provider) error {
 	return nil
 }
 
+// WithProviderGate returns a registry view that rejects provider access when
+// gate returns an error. The original registry remains available for explicit
+// foreground provider operations.
+func (r *Registry) WithProviderGate(gate func() error) *Registry {
+	if r == nil {
+		return &Registry{gate: gate}
+	}
+	return &Registry{providers: r.providers, gate: gate}
+}
+
 func (r *Registry) Provider(kind Kind, host string) (Provider, error) {
+	if r.gate != nil {
+		if err := r.gate(); err != nil {
+			return nil, err
+		}
+	}
 	provider, ok := r.providers[providerKey{platform: kind, host: host}]
 	if !ok {
 		return nil, ProviderNotConfigured(kind, host)

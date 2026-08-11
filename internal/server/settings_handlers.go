@@ -57,7 +57,7 @@ func (s *Server) configuredClients(
 		if _, ok := clients[host]; ok {
 			continue
 		}
-		client, err := s.syncer.ClientForHost(host)
+		client, err := s.syncer.DirectClientForHost(host)
 		if err != nil {
 			continue
 		}
@@ -873,9 +873,7 @@ func (s *Server) refreshConfiguredRepo(
 			"refresh is only supported for glob patterns", nil)
 	}
 
-	_, expanded, err := ghclient.ResolveConfiguredRepo(
-		ctx, s.configuredClients(repos), *target,
-	)
+	_, expanded, err := s.syncer.ResolveConfiguredRepoForSync(ctx, *target)
 	if err != nil {
 		return nil, classifyResolveProblem(err)
 	}

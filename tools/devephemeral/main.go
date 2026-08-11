@@ -108,6 +108,7 @@ func run(ctx context.Context, args []string) error {
 	backendPort := fs.Int("backend-port", 0, "backend port (0 selects a free port)")
 	frontendPort := fs.Int("frontend-port", 0, "frontend port (0 selects a free port)")
 	freshDB := fs.Bool("fresh-db", false, "start with an empty ephemeral database instead of copying the source database")
+	syncEnabled := fs.Bool("sync", false, "enable provider synchronization")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -184,7 +185,7 @@ func run(ctx context.Context, args []string) error {
 		return err
 	}
 
-	specs := buildCommandSpecs(prepared, fs.Args())
+	specs := buildCommandSpecs(prepared, *syncEnabled, fs.Args())
 	backend, err := startCommand(ctx, specs.backend)
 	if err != nil {
 		return fmt.Errorf("start backend: %w", err)
@@ -316,9 +317,14 @@ func prepareEphemeralConfig(opts ephemeralOptions) (ephemeralRun, error) {
 	}, nil
 }
 
-func buildCommandSpecs(run ephemeralRun, frontendArgs []string) commandSpecs {
+func buildCommandSpecs(run ephemeralRun, syncEnabled bool, frontendArgs []string) commandSpecs {
 	baseEnv := os.Environ()
+	backendArgs := strings.TrimSpace(os.Getenv("BACKEND_ARGS"))
+	if !syncEnabled {
+		backendArgs = strings.TrimSpace(backendArgs + " --disable-sync")
+	}
 	backendEnv := overlayEnv(baseEnv, map[string]string{
+		"BACKEND_ARGS":                backendArgs,
 		"KENN_FORGE_CONFIG":           run.configPath,
 		"KENN_FORGE_LOG_LEVEL":        envDefault("KENN_FORGE_LOG_LEVEL", "debug"),
 		"KENN_FORGE_LOG_FILE":         filepath.Join(run.logDir, "backend-dev.log"),

@@ -1465,7 +1465,7 @@ func (s *Handler) approveWorkflows(ctx context.Context, input *repoNumberInput) 
 		return nil, httpapi.NotFound(httpapi.CodePullNotFound, "pull request not found", nil)
 	}
 
-	client, err := s.syncer.ClientForHost(repo.PlatformHost)
+	client, err := s.syncer.DirectClientForHost(repo.PlatformHost)
 	if err != nil {
 		return nil, unsupportedCapabilityProblem(*repo, capabilityWorkflowApproval)
 	}
@@ -2096,7 +2096,10 @@ func (s *Handler) setPRGitHubState(
 			{
 				client, clientErr := s.syncer.ClientForHost(repo.PlatformHost)
 				if clientErr != nil {
-					return nil, unsupportedCapabilityProblem(*repo, capabilityStateMutation)
+					return nil, httpapi.ProviderCallProblemWithDetail(
+						clientErr, string(repoProviderKind(*repo)), repoProviderHost(*repo),
+						"GitHub API error: "+err.Error(),
+					)
 				}
 				ghPR, fetchErr := client.GetPullRequest(
 					ctx, input.Owner, input.Name, input.Number,

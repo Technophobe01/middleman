@@ -530,14 +530,23 @@ func run(opts serve.Options) error {
 			)
 		},
 	})
-	providerSources, err := collectProviderTokenSources(ctx, cfg, tokenSources)
+	var providerSources map[string]tokenauth.Source
+	if opts.DisableSync {
+		providerSources, err = registerProviderTokenSources(cfg, tokenSources)
+	} else {
+		providerSources, err = collectProviderTokenSources(ctx, cfg, tokenSources)
+	}
 	if err != nil {
 		return err
+	}
+	var identityResolver ghclient.IdentityResolver
+	if !opts.DisableSync {
+		identityResolver = ghclient.HTTPIdentityResolver{}
 	}
 
 	startup, err := buildProviderStartup(
 		ctx, database, cfg, tokenSources, providerSources,
-		defaultProviderFactories(), ghclient.HTTPIdentityResolver{},
+		defaultProviderFactories(), identityResolver,
 	)
 	if err != nil {
 		if ctx.Err() != nil && errors.Is(err, context.Canceled) {
@@ -546,11 +555,6 @@ func run(opts serve.Options) error {
 		}
 		return err
 	}
-
-	repos := resolveStartupRepos(
-		ctx, cfg, startup.registry, database, startup.githubRouters,
-	)
-	slog.Debug("startup repos resolved", "count", len(repos))
 
 	if ctx.Err() != nil {
 		slog.Info("shutting down")
@@ -562,9 +566,16 @@ func run(opts serve.Options) error {
 	)
 
 	syncer = ghclient.NewSyncerWithRegistry(
-		startup.registry, database, cloneMgr, repos,
+		startup.registry, database, cloneMgr, nil,
 		cfg.SyncDuration(), startup.rateTrackers, startup.budgets,
 	)
+	if opts.DisableSync {
+		syncer.DisableSync()
+	}
+	repos := resolveStartupRepos(
+		ctx, cfg, syncer.SyncRegistry(), database, startup.githubRouters,
+	)
+	slog.Debug("startup repos resolved", "count", len(repos))
 	syncer.SetBranchActivityLimits(
 		cfg.BranchActivityRetention(),
 		cfg.Activity.DefaultBranchMaxCommits,
@@ -668,7 +679,7 @@ func run(opts serve.Options) error {
 		),
 	)
 	syncer.Start(ctx)
-	if cfg.NotificationsEnabled() {
+	if !opts.DisableSync && cfg.NotificationsEnabled() {
 		notificationLoops = startNotificationLoops(ctx, syncer, cfg)
 	}
 

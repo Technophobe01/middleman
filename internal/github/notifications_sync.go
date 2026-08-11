@@ -87,6 +87,9 @@ func notificationThreadGetterFor(client notificationClient) (notificationThreadG
 }
 
 func (s *Syncer) RunNotificationSync(ctx context.Context) error {
+	if !s.SyncEnabled() {
+		return platform.ErrSyncDisabled
+	}
 	if !s.BeginNotificationSync() {
 		return nil
 	}

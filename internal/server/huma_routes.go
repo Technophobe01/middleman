@@ -700,8 +700,8 @@ func (s *Server) triggerSync(
 	ctx context.Context,
 	input *triggerSyncInput,
 ) (*acceptedOutput, error) {
-	if s.syncer == nil {
-		return nil, httpapi.ServiceUnavailable("syncer not configured")
+	if err := s.requireSync(); err != nil {
+		return nil, err
 	}
 	if len(input.OnlyRepos) > 0 {
 		repos, err := s.onlyReposFromFilter(input.OnlyRepos)
@@ -723,6 +723,16 @@ func (s *Server) triggerSync(
 		})
 	}
 	return &acceptedOutput{Status: http.StatusAccepted}, nil
+}
+
+func (s *Server) requireSync() error {
+	if s.syncer == nil {
+		return httpapi.ServiceUnavailable("syncer not configured")
+	}
+	if !s.syncer.SyncEnabled() {
+		return httpapi.ServiceUnavailable(platform.ErrSyncDisabled.Error())
+	}
+	return nil
 }
 
 func (s *Server) onlyReposFromFilter(filters []string) ([]ghclient.RepoRef, error) {
