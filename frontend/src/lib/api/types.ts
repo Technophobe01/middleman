@@ -85,7 +85,6 @@ export const DEFAULT_TERMINAL_SETTINGS: TerminalSettings = {
 export const DEFAULT_MODE_VISIBILITY: ModeVisibility = {
   activity: true,
   repos: true,
-  kata: false,
   docs: false,
   pulls: true,
   issues: true,
