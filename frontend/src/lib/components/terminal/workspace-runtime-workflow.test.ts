@@ -777,6 +777,129 @@ describe("WorkspaceRuntimeWorkflow", () => {
     ),
   );
 
+  it.effect("reconciles a stop when the transport never returns", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const stopStarted = yield* Deferred.make<void>();
+        const stopInterrupted = yield* Deferred.make<void>();
+        const stopSettled = yield* Deferred.make<void>();
+        const states: WorkspaceRuntimeMutationState[] = [];
+        const port: WorkspaceRuntimePort = {
+          read: () => Effect.succeed(emptyRuntime),
+          launch: unusedPortMethod,
+          rename: unusedPortMethod,
+          stop: () =>
+            Deferred.succeed(stopStarted, undefined).pipe(
+              Effect.andThen(Effect.never),
+              Effect.onInterrupt(() => Deferred.succeed(stopInterrupted, undefined)),
+            ),
+          refresh: unusedPortMethod,
+          retry: unusedPortMethod,
+          delete: unusedPortMethod,
+        };
+        const workflow = yield* makeWorkspaceRuntimeWorkflow(port);
+        const target = { workspaceId: "ws-1" };
+        yield* workflow.claimPresenter(target, "route", (state) =>
+          Effect.gen(function* () {
+            states.push(state);
+            if (state.kind !== "succeeded" || state.operation !== "Stop") return false;
+            yield* Deferred.succeed(stopSettled, undefined);
+            return true;
+          }),
+        );
+
+        yield* workflow.stop(target, "ws-1:helper");
+        yield* Deferred.await(stopStarted);
+        yield* TestClock.adjust("30 seconds");
+        yield* Effect.yieldNow;
+
+        assert.isTrue(yield* Deferred.isDone(stopSettled));
+        assert.isTrue(yield* Deferred.isDone(stopInterrupted));
+        assert.deepStrictEqual(
+          states.map((state) => state.kind),
+          ["pending", "succeeded"],
+        );
+      }),
+    ),
+  );
+
+  it.effect("bounds stop reconciliation when runtime authority never returns", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const readStarted = yield* Deferred.make<void>();
+        const readInterrupted = yield* Deferred.make<void>();
+        const states: WorkspaceRuntimeMutationState[] = [];
+        const port: WorkspaceRuntimePort = {
+          read: () =>
+            Deferred.succeed(readStarted, undefined).pipe(
+              Effect.andThen(Effect.never),
+              Effect.onInterrupt(() => Deferred.succeed(readInterrupted, undefined)),
+            ),
+          launch: unusedPortMethod,
+          rename: unusedPortMethod,
+          stop: () =>
+            Effect.fail(TransientTransportError.make({ operation: "stop workspace session", cause: "response lost" })),
+          refresh: unusedPortMethod,
+          retry: unusedPortMethod,
+          delete: unusedPortMethod,
+        };
+        const workflow = yield* makeWorkspaceRuntimeWorkflow(port);
+        const target = { workspaceId: "ws-1" };
+        yield* workflow.claimPresenter(target, "route", (state) =>
+          Effect.sync(() => {
+            states.push(state);
+            return state.kind !== "pending";
+          }),
+        );
+
+        yield* workflow.stop(target, "ws-1:helper");
+        yield* Deferred.await(readStarted);
+        yield* TestClock.adjust("10 seconds");
+        yield* Effect.yieldNow;
+
+        assert.isTrue(yield* Deferred.isDone(readInterrupted));
+        assert.deepStrictEqual(
+          states.map((state) => state.kind),
+          ["pending", "uncertain"],
+        );
+      }),
+    ),
+  );
+
+  it.effect("bounds successful stop presentation when its observer never returns", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const presentationStarted = yield* Deferred.make<void>();
+        const presentationInterrupted = yield* Deferred.make<void>();
+        const port: WorkspaceRuntimePort = {
+          read: () => Effect.succeed(emptyRuntime),
+          launch: unusedPortMethod,
+          rename: unusedPortMethod,
+          stop: () => Effect.void,
+          refresh: unusedPortMethod,
+          retry: unusedPortMethod,
+          delete: unusedPortMethod,
+        };
+        const workflow = yield* makeWorkspaceRuntimeWorkflow(port);
+        const target = { workspaceId: "ws-1" };
+        yield* workflow.claimPresenter(target, "route", (state) => {
+          if (state.kind !== "succeeded" || state.operation !== "Stop") return Effect.succeed(false);
+          return Deferred.succeed(presentationStarted, undefined).pipe(
+            Effect.andThen(Effect.never),
+            Effect.onInterrupt(() => Deferred.succeed(presentationInterrupted, undefined)),
+          );
+        });
+
+        yield* workflow.stop(target, "ws-1:helper");
+        yield* Deferred.await(presentationStarted);
+        yield* TestClock.adjust("10 seconds");
+        yield* Effect.yieldNow;
+
+        assert.isTrue(yield* Deferred.isDone(presentationInterrupted));
+      }),
+    ),
+  );
+
   it.effect("delivers a completed rename only to the replacement presenter", () =>
     Effect.scoped(
       Effect.gen(function* () {

@@ -31,6 +31,7 @@ import type { WorkflowPreset } from "./workflow-presets.js";
 import { decodeWorkspaceDetail, type WorkspaceDetail } from "./workspace-detail.js";
 
 const acceptedLaunchReconciliationWindowMillis = 15_000;
+const workspaceRuntimeStopTimeout = Duration.seconds(10);
 
 export interface WorkspaceRuntimeTarget {
   readonly workspaceId: string;
@@ -561,7 +562,15 @@ export function makeWorkspaceRuntimeWorkflow(
                 return;
               }
 
-              const acknowledged = yield* presenter.observe(state);
+              const observation = presenter.observe(state);
+              const acknowledged = yield* state.kind === "succeeded" && state.operation === "Stop"
+                ? observation.pipe(
+                    Effect.timeoutOrElse({
+                      duration: workspaceRuntimeStopTimeout,
+                      orElse: () => Effect.succeed(true),
+                    }),
+                  )
+                : observation;
               if (!acknowledged) return;
               yield* mutationLock.withPermit(
                 Effect.gen(function* () {
@@ -696,7 +705,16 @@ export function makeWorkspaceRuntimeWorkflow(
         return session === undefined || session.status === "exited"
           ? { _tag: "Applied", state: { kind: "succeeded", operation: "Stop", request } }
           : { _tag: "NotApplied" };
-      });
+      }).pipe(
+        Effect.timeoutOrElse({
+          duration: workspaceRuntimeStopTimeout,
+          orElse: () =>
+            Effect.succeed({
+              _tag: "Unknown",
+              cause: new Error("timed out waiting for runtime authority after stopping the session"),
+            } satisfies WorkspaceRuntimeReconciliation),
+        }),
+      );
 
     const reconcileDelete = (
       request: AcceptedWorkspaceRuntimeDeleteRequest,
@@ -972,9 +990,22 @@ export function makeWorkspaceRuntimeWorkflow(
           return;
         }
         case "Stop": {
+          const operation =
+            request.target.hostKey === undefined ? "stop workspace session" : "stop fleet workspace session";
           yield* runRecoverableMutation(
             request,
-            port.stop(request.target, request.sessionKey),
+            port.stop(request.target, request.sessionKey).pipe(
+              Effect.timeoutOrElse({
+                duration: workspaceRuntimeStopTimeout,
+                orElse: () =>
+                  Effect.fail(
+                    TransientTransportError.make({
+                      operation,
+                      cause: new Error("timed out waiting for the session to stop"),
+                    }),
+                  ),
+              }),
+            ),
             reconcileStop(request),
             () => ({ kind: "succeeded", operation: "Stop", request }),
           );
