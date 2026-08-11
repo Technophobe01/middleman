@@ -9,6 +9,7 @@ const POINTER_RELEASE_GRACE_MS = 1_000;
 
 export interface TerminalClipboardPort {
   beginDeferredWrite(text: Promise<string>): Promise<void>;
+  writeCopyEventText(text: string): boolean;
   writeLocalText(text: string): Promise<void>;
   writeText(text: string): Promise<void>;
 }
@@ -38,6 +39,27 @@ interface PendingClipboardWrite {
   source: "keyboard" | "pointer-confirmed" | "pointer-prepared";
 }
 
+function writeTextThroughCopyEvent(text: string): boolean {
+  if (typeof document.execCommand !== "function") return false;
+
+  let handled = false;
+  const handleCopy = (event: ClipboardEvent): void => {
+    if (!event.clipboardData) return;
+    // kit-ui-check-ignore: gesture-authorized OSC 52 fallback for insecure HTTP origins.
+    event.clipboardData.setData("text/plain", text);
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    handled = true;
+  };
+  document.addEventListener("copy", handleCopy, true);
+  try {
+    // kit-ui-check-ignore: gesture-authorized OSC 52 fallback for insecure HTTP origins.
+    return document.execCommand("copy") && handled;
+  } finally {
+    document.removeEventListener("copy", handleCopy, true);
+  }
+}
+
 export function createBrowserTerminalClipboardPort(): TerminalClipboardPort {
   return {
     beginDeferredWrite(text) {
@@ -54,11 +76,14 @@ export function createBrowserTerminalClipboardPort(): TerminalClipboardPort {
     writeLocalText(text) {
       return writeTerminalClipboardThroughServer(text);
     },
+    writeCopyEventText(text) {
+      return writeTextThroughCopyEvent(text);
+    },
     writeText(text) {
       if (!navigator.clipboard?.writeText) {
         return Promise.reject(new DOMException("Clipboard writes are unavailable", "NotSupportedError"));
       }
-      // kit-ui-check-ignore: OSC 52 is Clipboard API-only; do not fall back to legacy DOM copy.
+      // kit-ui-check-ignore: gesture-authorized OSC 52 browser clipboard write.
       return navigator.clipboard.writeText(text);
     },
   };
@@ -273,6 +298,14 @@ export function makeTerminalClipboardWriter(
             const directWritten = yield* writeDirect(text);
             if (disposed || writeGeneration !== revocationGeneration) return "unauthorized";
             if (directWritten) return "written";
+            let copyEventWritten = false;
+            try {
+              copyEventWritten = port.writeCopyEventText(text);
+            } catch {
+              // Continue to the local fallback when the browser rejects legacy copy.
+            }
+            if (disposed || writeGeneration !== revocationGeneration) return "unauthorized";
+            if (copyEventWritten) return "written";
             const localWritten = yield* writeLocal(text);
             if (disposed || writeGeneration !== revocationGeneration) return "unauthorized";
             return localWritten ? "written" : "blocked";
