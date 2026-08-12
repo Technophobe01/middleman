@@ -23588,6 +23588,19 @@ func TestAPIListActivity(t *testing.T) {
 	assert.Equal("comment", (*filtered.JSON200.Items)[0].ActivityType)
 	assert.Equal("reviewer", (*filtered.JSON200.Items)[0].Author)
 
+	itemNumber := "#1"
+	byNumber, err := client.HTTP.ListActivityWithResponse(
+		ctx, &generated.ListActivityParams{Since: &since, Search: &itemNumber},
+	)
+	require.NoError(err)
+	require.Equal(http.StatusOK, byNumber.StatusCode())
+	require.NotNil(byNumber.JSON200)
+	require.NotNil(byNumber.JSON200.Items)
+	require.Len(*byNumber.JSON200.Items, 2)
+	for _, item := range *byNumber.JSON200.Items {
+		assert.Equal(int64(1), item.ItemNumber)
+	}
+
 	whitespace := " \t "
 	unfiltered, err := client.HTTP.ListActivityWithResponse(
 		ctx, &generated.ListActivityParams{Since: &since, Search: &whitespace},
