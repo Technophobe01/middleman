@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"path"
 	"slices"
 	"strings"
@@ -66,9 +67,12 @@ func (s *Server) configuredClients(
 	return clients
 }
 
-// buildLocalSettingsResponse builds the settings response from
-// in-memory state (syncer tracked repos) without calling GitHub.
-func (s *Server) buildLocalSettingsResponse() settingsResponse {
+// buildLocalSettingsResponse builds the settings response from in-memory
+// state (syncer tracked repos) plus the hidden-from-UI preferences persisted
+// in SQLite, without calling the provider.
+func (s *Server) buildLocalSettingsResponse(
+	ctx context.Context,
+) (settingsResponse, error) {
 	s.cfgMu.Lock()
 	repos := slices.Clone(s.cfg.Repos)
 	activity := s.cfg.Activity
@@ -93,20 +97,33 @@ func (s *Server) buildLocalSettingsResponse() settingsResponse {
 		launchTargets = []localruntime.LaunchTarget{}
 	}
 
-	tracked := s.syncer.TrackedRepos()
+	hiddenSet, err := s.hiddenRepoCorrelationSet(ctx)
+	if err != nil {
+		return settingsResponse{}, err
+	}
+	var tracked []ghclient.RepoRef
+	if s.syncer != nil {
+		tracked = s.syncer.TrackedRepos()
+	}
 	configured := make(
 		[]ghclient.ConfiguredRepoStatus, len(repos),
 	)
 	for i, raw := range repos {
+		hiddenFromUI, err := s.configEntryHidden(ctx, raw, tracked, hiddenSet)
+		if err != nil {
+			return settingsResponse{}, err
+		}
 		configured[i] = ghclient.ConfiguredRepoStatus{
 			Provider:         raw.PlatformOrDefault(),
 			PlatformHost:     raw.PlatformHostOrDefault(),
 			Owner:            raw.Owner,
 			Name:             raw.Name,
 			RepoPath:         configRepoPath(raw),
+			TrackedRepoPath:  trackedPathForConfig(raw, tracked),
 			WorktreeBasePath: raw.WorktreeBasePath,
 			IsGlob:           raw.HasNameGlob(),
 			MatchedRepoCount: matchedRepoCount(raw, tracked),
+			HiddenFromUI:     hiddenFromUI,
 		}
 	}
 	return settingsResponse{
@@ -124,7 +141,111 @@ func (s *Server) buildLocalSettingsResponse() settingsResponse {
 		KataProjects:  kataProjects,
 		LaunchTargets: launchTargets,
 		Fleet:         fleetSettings,
+	}, nil
+}
+
+// hiddenRepoCorrelation carries the two addresses of every catalog row with a
+// hidden-from-UI preference: stable provider identity keys for correlating
+// tracked refs, and catalog row ids for entries whose tracked stable identity
+// is unavailable.
+type hiddenRepoCorrelation struct {
+	keys map[string]struct{}
+	ids  map[int64]struct{}
+}
+
+// hiddenRepoCorrelationSet returns the identity keys and catalog row ids of
+// repositories with a hidden-from-UI preference, for correlating configured
+// entries with their tracked repositories. Routes are mutable and reusable, so
+// correlation must never key on them: a displaced row keeps its old display
+// route, and a replacement repository at that route is a different repository.
+func (s *Server) hiddenRepoCorrelationSet(
+	ctx context.Context,
+) (hiddenRepoCorrelation, error) {
+	if s.db == nil {
+		return hiddenRepoCorrelation{}, nil
 	}
+	hidden, err := s.db.HiddenRepos(ctx)
+	if err != nil {
+		return hiddenRepoCorrelation{}, fmt.Errorf("list hidden repos: %w", err)
+	}
+	set := hiddenRepoCorrelation{
+		keys: make(map[string]struct{}, len(hidden)),
+		ids:  make(map[int64]struct{}, len(hidden)),
+	}
+	for _, repo := range hidden {
+		set.ids[repo.ID] = struct{}{}
+		key := trackedRepoIdentityKey(ghclient.RepoRef{
+			Platform:           httpapi.ProviderKind(repo),
+			PlatformHost:       httpapi.ProviderHost(repo),
+			PlatformExternalID: repo.PlatformRepoID,
+		})
+		if key == "" {
+			continue
+		}
+		set.keys[key] = struct{}{}
+	}
+	return set, nil
+}
+
+// configEntryHidden reports whether the exact configured entry's repository
+// carries a hidden-from-UI preference. Glob entries have no visibility of
+// their own: the preference belongs to exact repositories. Tracked refs with
+// a stable provider identity answer directly; without one (a route-only ref
+// or a server without a syncer), the entry resolves to its catalog row the
+// same way the mutation path does.
+func (s *Server) configEntryHidden(
+	ctx context.Context,
+	raw config.Repo,
+	tracked []ghclient.RepoRef,
+	hidden hiddenRepoCorrelation,
+) (bool, error) {
+	if raw.HasNameGlob() || len(hidden.ids) == 0 {
+		return false, nil
+	}
+	for _, repo := range tracked {
+		if !repoMatchesConfig(repo, raw) {
+			continue
+		}
+		key := trackedRepoIdentityKey(repo)
+		if key == "" {
+			continue
+		}
+		_, ok := hidden.keys[key]
+		return ok, nil
+	}
+	repo, err := s.lookupRepoForVisibilityRelease(
+		ctx, s.visibilityLookupIdentity(raw),
+	)
+	if err != nil {
+		return false, fmt.Errorf(
+			"resolve configured repo %s for hidden state: %w",
+			configRepoPath(raw), err,
+		)
+	}
+	if repo == nil {
+		return false, nil
+	}
+	_, ok := hidden.ids[repo.ID]
+	return ok, nil
+}
+
+// trackedPathForConfig returns the provider-verified current route of the
+// tracked repository backing an exact configured entry, or empty for globs
+// and untracked entries. Renames move the route while the entry keeps its
+// configured address, and clients release route-keyed state through this
+// value.
+func trackedPathForConfig(
+	raw config.Repo, tracked []ghclient.RepoRef,
+) string {
+	if raw.HasNameGlob() {
+		return ""
+	}
+	for _, repo := range tracked {
+		if repoMatchesConfig(repo, raw) {
+			return trackedRepoPath(repo)
+		}
+	}
+	return ""
 }
 
 func matchedRepoCount(
@@ -575,13 +696,25 @@ func classifyResolveProblem(err error) huma.StatusError {
 }
 
 func (s *Server) getSettings(
-	_ context.Context, _ *struct{},
+	ctx context.Context, _ *struct{},
 ) (*getSettingsOutput, error) {
 	if s.cfg == nil {
 		return nil, httpapi.NotFound(httpapi.CodeSettingsUnavailable, "settings not available", nil)
 	}
 
-	return &getSettingsOutput{Body: s.buildLocalSettingsResponse()}, nil
+	return s.settingsOutputResponse(ctx)
+}
+
+// settingsOutputResponse wraps buildLocalSettingsResponse for handlers that
+// answer with the full settings payload.
+func (s *Server) settingsOutputResponse(
+	ctx context.Context,
+) (*settingsOutput, error) {
+	body, err := s.buildLocalSettingsResponse(ctx)
+	if err != nil {
+		return nil, httpapi.Internal(err.Error())
+	}
+	return &settingsOutput{Body: body}, nil
 }
 
 func (s *Server) updateSettings(
@@ -669,7 +802,7 @@ func (s *Server) updateSettings(
 	s.cfgMu.Unlock()
 	s.reconcileGitHubNativeStackProjection(nativeStacksPrevious, nativeStacksEnabled)
 
-	return &settingsOutput{Body: s.buildLocalSettingsResponse()}, nil
+	return s.settingsOutputResponse(ctx)
 }
 
 func cloneModeVisibility(modes config.ModeVisibility) config.ModeVisibility {
@@ -827,7 +960,7 @@ func (s *Server) addConfiguredRepo(
 	s.cfgMu.Unlock()
 
 	s.syncer.TriggerRun(context.WithoutCancel(ctx))
-	return &settingsOutput{Body: s.buildLocalSettingsResponse()}, nil
+	return s.settingsOutputResponse(ctx)
 }
 
 func (s *Server) refreshConfiguredRepo(
@@ -908,7 +1041,7 @@ func (s *Server) refreshConfiguredRepo(
 	s.cfgMu.Unlock()
 
 	s.syncer.TriggerRun(context.WithoutCancel(ctx))
-	return &settingsOutput{Body: s.buildLocalSettingsResponse()}, nil
+	return s.settingsOutputResponse(ctx)
 }
 
 func (s *Server) refreshConfiguredRepoOnHost(
@@ -1010,11 +1143,183 @@ func (s *Server) updateConfiguredRepoWorktreeBasePath(
 	}
 	s.cfgMu.Unlock()
 
-	return &settingsOutput{Body: s.buildLocalSettingsResponse()}, nil
+	return s.settingsOutputResponse(ctx)
+}
+
+func (s *Server) updateConfiguredRepoUIVisibility(
+	ctx context.Context, input *repoUIVisibilityInput,
+) (*settingsOutput, error) {
+	return s.updateConfiguredRepoUIVisibilityState(ctx, repoConfigInput{
+		Provider:     input.Provider,
+		PlatformHost: input.PlatformHost,
+		Owner:        input.Owner,
+		Name:         input.Name,
+	}, input.Body.Hidden)
+}
+
+func (s *Server) updateConfiguredRepoUIVisibilityOnHost(
+	ctx context.Context, input *repoUIVisibilityHostInput,
+) (*settingsOutput, error) {
+	return s.updateConfiguredRepoUIVisibilityState(ctx, repoConfigInput{
+		Provider:     input.Provider,
+		PlatformHost: input.PlatformHost,
+		Owner:        input.Owner,
+		Name:         input.Name,
+	}, input.Body.Hidden)
+}
+
+// updateConfiguredRepoUIVisibilityState persists the hidden-from-UI
+// preference for the exact configured repository named by ref. The preference
+// attaches to the catalog row's stable identity, so the entry must resolve to
+// a provider-verified repository before it can be hidden.
+func (s *Server) updateConfiguredRepoUIVisibilityState(
+	ctx context.Context, ref repoConfigInput, hidden bool,
+) (*settingsOutput, error) {
+	if s.cfg == nil || s.db == nil {
+		return nil, httpapi.NotFound(httpapi.CodeSettingsUnavailable, "settings not available", nil)
+	}
+
+	provider, err := normalizeRouteProvider(ref.Provider)
+	if err != nil {
+		return nil, httpapi.Validation("path.provider", err.Error())
+	}
+	targetRef := config.Repo{
+		Platform:     provider,
+		PlatformHost: ref.PlatformHost,
+		Owner:        ref.Owner,
+		Name:         ref.Name,
+	}
+
+	// Membership is validated and the preference written under the same
+	// visibility lock the orphan sweep takes: a concurrent exact-entry
+	// removal either completes first (the check below then rejects the
+	// mutation) or waits for the write and sweeps it, so the preference can
+	// never outlive its exact entry unreachable behind a glob.
+	s.repoVisibilityMu.Lock()
+	defer s.repoVisibilityMu.Unlock()
+
+	s.cfgMu.Lock()
+	var target *config.Repo
+	for i := range s.cfg.Repos {
+		if sameConfiguredRepo(s.cfg.Repos[i], targetRef) {
+			raw := s.cfg.Repos[i]
+			target = &raw
+			break
+		}
+	}
+	s.cfgMu.Unlock()
+	if target == nil {
+		return nil, httpapi.NotFound(httpapi.CodeRepoNotFound,
+			ref.Owner+"/"+ref.Name+" is not configured", nil)
+	}
+	if target.HasNameGlob() {
+		return nil, httpapi.BadRequest(
+			httpapi.CodeBadRequest,
+			"UI visibility is only supported for exact repositories",
+			nil,
+		)
+	}
+
+	repo, err := s.applyVisibilityUnderReconciliationRead(
+		ctx, s.visibilityLookupIdentity(*target), hidden,
+	)
+	if err != nil {
+		return nil, httpapi.Internal("save visibility: " + err.Error())
+	}
+	if repo == nil {
+		return nil, httpapi.Conflict(httpapi.CodeConflict,
+			ref.Owner+"/"+ref.Name+
+				" does not resolve to an active provider-verified repository yet; retry after sync",
+			nil)
+	}
+
+	return s.settingsOutputResponse(ctx)
+}
+
+// applyVisibilityUnderReconciliationRead resolves the target catalog row and
+// writes the preference in one critical section under the
+// repository-reconciliation read lock, so reconciliation cannot displace the
+// row between lifecycle validation and the write. Returns nil without error
+// when no active provider-verified row resolves.
+func (s *Server) applyVisibilityUnderReconciliationRead(
+	ctx context.Context, identity db.RepoIdentity, hidden bool,
+) (*db.Repo, error) {
+	release, err := s.db.LockRepositoryReconciliationRead(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	repo, err := s.resolveVisibilityRepoLocked(ctx, identity)
+	if err != nil || repo == nil {
+		return repo, err
+	}
+	if err := s.db.SetRepoHiddenFromUI(ctx, repo.ID, hidden); err != nil {
+		return nil, err
+	}
+	return repo, nil
+}
+
+// resolveVisibilityRepoLocked resolves the catalog row a visibility mutation
+// targets; the caller must hold the repository-reconciliation read lock. The
+// stable provider id wins when the tracked ref carries one: route resolution
+// would hand the mutation to whichever repository currently occupies the
+// route, which after route reuse is a different repository. Inactive rows are
+// rejected the same as unresolved ones — a tracked snapshot that lags
+// reconciliation still names a displaced repository, and hiding it would
+// leave the active replacement visible while consuming the request.
+func (s *Server) resolveVisibilityRepoLocked(
+	ctx context.Context, identity db.RepoIdentity,
+) (*db.Repo, error) {
+	if strings.TrimSpace(identity.PlatformRepoID) == "" {
+		return s.db.GetRepoByIdentityUnderRepositoryReconciliationRead(ctx, identity)
+	}
+	entry, err := s.db.GetRepositoryByProviderIDUnderRepositoryReconciliationRead(
+		ctx, identity.Platform, identity.PlatformHost, identity.PlatformRepoID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if entry == nil || entry.Lifecycle != db.RepositoryLifecycleActive {
+		return nil, nil
+	}
+	repo := entry.Repository
+	return &repo, nil
+}
+
+// visibilityLookupIdentity names the catalog repository an exact configured
+// entry currently resolves to. A tracked ref carries the provider-verified
+// stable id and the current route after renames; without one (including on
+// servers constructed without a syncer), the configured route itself is the
+// only address.
+func (s *Server) visibilityLookupIdentity(raw config.Repo) db.RepoIdentity {
+	var tracked []ghclient.RepoRef
+	if s.syncer != nil {
+		tracked = s.syncer.TrackedRepos()
+	}
+	for _, repo := range tracked {
+		if !repoMatchesConfig(repo, raw) {
+			continue
+		}
+		return db.RepoIdentity{
+			Platform:       repoProvider(repo),
+			PlatformHost:   trackedRepoHost(repo),
+			PlatformRepoID: repo.PlatformExternalID,
+			Owner:          repo.Owner,
+			Name:           repo.Name,
+			RepoPath:       repo.RepoPath,
+		}
+	}
+	return db.RepoIdentity{
+		Platform:     raw.PlatformOrDefault(),
+		PlatformHost: raw.PlatformHostOrDefault(),
+		Owner:        raw.Owner,
+		Name:         raw.Name,
+		RepoPath:     raw.RepoPath,
+	}
 }
 
 func (s *Server) deleteConfiguredRepo(
-	_ context.Context, input *repoConfigInput,
+	ctx context.Context, input *repoConfigInput,
 ) (*struct{}, error) {
 	if s.cfgPath == "" {
 		return nil, httpapi.NotFound(httpapi.CodeSettingsUnavailable, "settings not available", nil)
@@ -1051,6 +1356,7 @@ func (s *Server) deleteConfiguredRepo(
 	}
 
 	prevRepos := slices.Clone(s.cfg.Repos)
+	removed := prevRepos[idx]
 	s.cfg.Repos = append(
 		s.cfg.Repos[:idx], s.cfg.Repos[idx+1:]...,
 	)
@@ -1063,7 +1369,98 @@ func (s *Server) deleteConfiguredRepo(
 	s.applyWorkspaceConfigLocked()
 	s.cfgMu.Unlock()
 
+	// The hidden-from-UI preference belongs to an exact entry. Without one, a
+	// glob can keep the repository tracked and filtered while glob rows expose
+	// no visibility controls, so the preference would be unreachable. The
+	// config change already committed and clients may abandon the request, so
+	// the sweep runs detached from request cancellation; a failed sweep is
+	// reported without failing the delete and heals on the next reload or
+	// startup.
+	if err := s.reconcileOrphanedRepoVisibility(
+		context.WithoutCancel(ctx),
+	); err != nil {
+		slog.Warn("release hidden-from-UI preference on repo removal",
+			"repo", configRepoPath(removed), "err", err)
+	}
+
 	return nil, nil
+}
+
+// reconcileOrphanedRepoVisibility clears every hidden-from-UI preference whose
+// repository no longer resolves from an exact configured entry. It runs
+// whenever the effective repository configuration changes: server startup,
+// config hot reload, and exact-entry deletion. Inactive rows are accepted on
+// the keep side and cleared like any other orphan: clearing a preference on a
+// displaced row is safe and keeps it from lingering unreachable. Resolution
+// errors abort the sweep without clearing anything.
+func (s *Server) reconcileOrphanedRepoVisibility(ctx context.Context) error {
+	if s.db == nil {
+		return nil
+	}
+	s.repoVisibilityMu.Lock()
+	defer s.repoVisibilityMu.Unlock()
+	hidden, err := s.db.HiddenRepos(ctx)
+	if err != nil {
+		return err
+	}
+	if len(hidden) == 0 {
+		return nil
+	}
+	var exact []config.Repo
+	s.cfgMu.Lock()
+	hasConfig := s.cfg != nil
+	if hasConfig {
+		for _, raw := range s.cfg.Repos {
+			if raw.HasNameGlob() {
+				continue
+			}
+			exact = append(exact, raw)
+		}
+	}
+	s.cfgMu.Unlock()
+	if !hasConfig {
+		return nil
+	}
+	keep := make(map[int64]struct{}, len(exact))
+	for _, raw := range exact {
+		repo, err := s.lookupRepoForVisibilityRelease(
+			ctx, s.visibilityLookupIdentity(raw),
+		)
+		if err != nil {
+			return err
+		}
+		if repo != nil {
+			keep[repo.ID] = struct{}{}
+		}
+	}
+	for _, repo := range hidden {
+		if _, kept := keep[repo.ID]; kept {
+			continue
+		}
+		if err := s.db.SetRepoHiddenFromUI(ctx, repo.ID, false); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Server) lookupRepoForVisibilityRelease(
+	ctx context.Context, identity db.RepoIdentity,
+) (*db.Repo, error) {
+	if strings.TrimSpace(identity.PlatformRepoID) == "" {
+		return s.db.GetRepoByIdentity(ctx, identity)
+	}
+	entry, err := s.db.GetRepositoryByProviderID(
+		ctx, identity.Platform, identity.PlatformHost, identity.PlatformRepoID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if entry == nil {
+		return nil, nil
+	}
+	repo := entry.Repository
+	return &repo, nil
 }
 
 func normalizeRouteProvider(raw string) (string, error) {

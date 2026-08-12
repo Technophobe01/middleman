@@ -171,6 +171,10 @@ type Server struct {
 	tokenSources   *tokenauth.SourceSet
 	cfgMu          sync.Mutex
 	configReloadMu sync.Mutex
+	// repoVisibilityMu serializes hidden-from-UI mutations with the orphan
+	// sweep so a visibility write cannot interleave with a concurrent
+	// exact-entry removal and recreate an orphaned preference.
+	repoVisibilityMu sync.Mutex
 	// bootCfgSnapshot freezes the subset of config fields that are
 	// bound at startup (registry, listeners, clone manager, etc.) so a
 	// config-file watcher reload can detect when those changed and
@@ -1132,6 +1136,17 @@ func newServer(
 	s.handler = otelhttp.NewHandler(assembled, "forge.http",
 		otelhttp.WithFilter(otelTraceable(basePath)),
 		otelhttp.WithSpanNameFormatter(otelSpanName))
+
+	// Exact entries removed from the TOML file while the daemon was stopped
+	// must release their hidden-from-UI preferences; boot restores tracked
+	// refs from provider snapshots before the server is constructed, so
+	// exact-owned preferences resolve and survive the sweep.
+	if err := s.reconcileOrphanedRepoVisibility(s.bgCtx); err != nil {
+		slog.Warn(
+			"release orphaned hidden-from-UI preferences at startup",
+			"err", err,
+		)
+	}
 
 	return s
 }
