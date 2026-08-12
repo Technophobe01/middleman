@@ -920,6 +920,7 @@ type Syncer struct {
 	pendingIssueCommentSyncs []queuedIssueCommentSync
 
 	afterMergeRequestParentSnapshotCommit   func()
+	afterMergedMRMetricsRepair              func()
 	afterHeadRepoSnapshotRead               func()
 	afterNotificationRepoIdentityReconciled func()
 	beforeCloneRouteValidation              func()
@@ -12339,6 +12340,37 @@ func (s *Syncer) syncMRForRepo(
 	useConditionalPRDetail bool,
 	providerAttempted *bool,
 ) error {
+	return s.syncMRForRepoResolved(
+		ctx, repo, number, useConditionalPRDetail, providerAttempted, nil, nil, nil,
+	)
+}
+
+type mergeRequestFetchEvidence struct {
+	merged         bool
+	headSHA        string
+	mergeCommitSHA string
+	filesChanged   *int
+}
+
+func (s *Syncer) syncMRForRepoResolved(
+	ctx context.Context,
+	repo RepoRef,
+	number int,
+	useConditionalPRDetail bool,
+	providerAttempted *bool,
+	resolvedRepoID *int64,
+	fetchedEvidence *mergeRequestFetchEvidence,
+	lifecyclePersisted *bool,
+) error {
+	if resolvedRepoID != nil {
+		*resolvedRepoID = 0
+	}
+	if fetchedEvidence != nil {
+		*fetchedEvidence = mergeRequestFetchEvidence{}
+	}
+	if lifecyclePersisted != nil {
+		*lifecyclePersisted = false
+	}
 	if !IsArchiveSyncBudgetContext(ctx) {
 		bucket, err := s.bucketKeyForRepo(repo, false)
 		if err != nil {
@@ -12364,6 +12396,9 @@ func (s *Syncer) syncMRForRepo(
 	}
 	if !found {
 		return nil
+	}
+	if resolvedRepoID != nil {
+		*resolvedRepoID = repoID
 	}
 	repo = resolvedRef
 	if repo.Archived && !IsArchiveSyncBudgetContext(ctx) {
@@ -12452,12 +12487,21 @@ func (s *Syncer) syncMRForRepo(
 	if normalized == nil {
 		return fmt.Errorf("get MR %s/%s#%d: provider returned no merge request", owner, name, number)
 	}
+	if fetchedEvidence != nil {
+		*fetchedEvidence = mergeRequestFetchEvidence{
+			merged:         normalized.State == db.MergeRequestStateMerged || normalized.MergedAt != nil,
+			headSHA:        normalized.PlatformHeadSHA,
+			mergeCommitSHA: normalized.MergeCommitSHA,
+			filesChanged:   normalized.FilesChanged,
+		}
+	}
 	headChanged := existing != nil &&
 		existing.PlatformHeadSHA != normalized.PlatformHeadSHA
 	if existing != nil {
 		normalized.CommentCount = existing.CommentCount
 		normalized.ReviewDecision = existing.ReviewDecision
 		preserveMergeableStateIfOmitted(normalized, existing)
+		preserveMergedAtIfOmitted(normalized, existing)
 		// CI is tied to the head SHA. If the head moved we must clear the
 		// previous values; otherwise a failed CI refresh would leave stale
 		// checks attached to the new commit.
@@ -12492,6 +12536,67 @@ func (s *Syncer) syncMRForRepo(
 		return fmt.Errorf("upsert MR #%d: %w", number, err)
 	}
 	if !accepted {
+		if ghPR != nil && pullRequestWasMerged(ghPR) {
+			abandonRepair := func() {
+				if resolvedRepoID != nil {
+					*resolvedRepoID = 0
+				}
+			}
+			repairCtx := s.db.WithRepositoryRouteFence(
+				ctx, platform.DBRepoIdentity(platformRepoRef(repo)), routeFence,
+			)
+			repairCtx, releaseRepair, lockErr :=
+				s.db.LockRepositoryReconciliationReadForWrite(repairCtx)
+			if errors.Is(lockErr, db.ErrRepositoryRouteFenceChanged) {
+				abandonRepair()
+				return nil
+			}
+			if lockErr != nil {
+				return fmt.Errorf("lock merged MR #%d repair: %w", number, lockErr)
+			}
+			defer releaseRepair()
+			_, repairErr := s.db.FillMissingMergedMRMetrics(
+				repairCtx,
+				db.MergeRequestMergeMetrics{
+					RepoID: repoID, Number: number,
+					HeadSHA:        normalized.PlatformHeadSHA,
+					MergeCommitSHA: &normalized.MergeCommitSHA,
+					FilesChanged:   normalized.FilesChanged,
+					MergedAt:       normalized.MergedAt,
+				},
+			)
+			if errors.Is(repairErr, db.ErrRepositoryRouteFenceChanged) {
+				abandonRepair()
+				return nil
+			}
+			if repairErr != nil {
+				return fmt.Errorf("repair merged MR #%d metrics: %w", number, repairErr)
+			}
+			if s.afterMergedMRMetricsRepair != nil {
+				s.afterMergedMRMetricsRepair()
+			}
+			current, currentErr := s.db.GetMergeRequestByRepoIDAndNumber(
+				repairCtx, repoID, number,
+			)
+			if currentErr != nil {
+				return fmt.Errorf("read merged MR #%d after repair: %w", number, currentErr)
+			}
+			var currentMergedAt *time.Time
+			if current != nil {
+				currentMergedAt = current.MergedAt
+			}
+			if _, actorErr := s.persistMergedTransitionEvent(
+				repairCtx, mrID, revision, ghPR, currentMergedAt,
+			); errors.Is(actorErr, db.ErrRepositoryRouteFenceChanged) {
+				abandonRepair()
+				return nil
+			} else if actorErr != nil {
+				return fmt.Errorf("repair merged MR #%d actor: %w", number, actorErr)
+			}
+			if lifecyclePersisted != nil {
+				*lifecyclePersisted = true
+			}
+		}
 		return nil
 	}
 	ctx = s.db.WithRepositoryRouteFence(
@@ -12545,6 +12650,9 @@ func (s *Syncer) syncMRForRepo(
 		}
 		if _, err := s.persistMergedTransitionEvent(ctx, mrID, revision, ghPR, normalized.MergedAt); err != nil {
 			return fmt.Errorf("persist merged lifecycle event for MR #%d: %w", number, err)
+		}
+		if lifecyclePersisted != nil {
+			*lifecyclePersisted = true
 		}
 
 		syncMRHeadSHA := ""
@@ -12615,6 +12723,9 @@ func (s *Syncer) syncMRForRepo(
 		}
 		if _, err := s.persistMergedActorEvent(ctx, mrID, revision, platformMR.MergedBy, normalized.MergedAt); err != nil {
 			return fmt.Errorf("persist merged lifecycle event for MR #%d: %w", number, err)
+		}
+		if lifecyclePersisted != nil {
+			*lifecyclePersisted = true
 		}
 		detailApplied, err := s.markMergeRequestDetailFetchedIfRouteFence(
 			ctx, repo, routeFence, mrID, revision, pending, nil,
@@ -12708,6 +12819,17 @@ func preserveMergeableStateIfOmitted(
 	if normalized.MergeableState == "" ||
 		(normalized.MergeableState == "unknown" && existing.MergeableState != "") {
 		normalized.MergeableState = existing.MergeableState
+	}
+}
+
+func preserveMergedAtIfOmitted(
+	normalized *db.MergeRequest,
+	existing *db.MergeRequest,
+) {
+	if normalized.State == db.MergeRequestStateMerged &&
+		normalized.MergedAt == nil && existing.MergedAt != nil {
+		mergedAt := *existing.MergedAt
+		normalized.MergedAt = &mergedAt
 	}
 }
 
@@ -13007,10 +13129,11 @@ func (s *Syncer) SyncArchiveItem(
 	ref platform.RepoRef,
 	itemType db.ArchiveItemType,
 	number int,
-) (bool, error) {
+) (archive.ItemSyncResult, error) {
+	result := archive.ItemSyncResult{}
 	repo, ok := s.trackedRepoByIdentity(ref.Platform, ref.Owner, ref.Name, ref.Host)
 	if !ok {
-		return false, fmt.Errorf(
+		return result, fmt.Errorf(
 			"repo %s/%s on %s/%s is not tracked",
 			ref.Owner, ref.Name, ref.Platform, ref.Host,
 		)
@@ -13022,17 +13145,114 @@ func (s *Syncer) SyncArchiveItem(
 	case db.ArchiveItemTypeIssue:
 		providerAttempted := false
 		err := s.syncIssueForRepo(ctx, repo, number, &providerAttempted)
-		return providerAttempted, err
+		result.ProviderAttempted = providerAttempted
+		return result, err
 	case db.ArchiveItemTypeMergeRequest:
 		providerAttempted := false
-		err := s.syncMRForRepo(ctx, repo, number, false, &providerAttempted)
+		var resolvedRepoID int64
+		var fetchedEvidence mergeRequestFetchEvidence
+		var lifecyclePersisted bool
+		err := s.syncMRForRepoResolved(
+			ctx, repo, number, false, &providerAttempted, &resolvedRepoID, &fetchedEvidence,
+			&lifecyclePersisted,
+		)
 		if _, onlyDiffFailed := err.(*DiffSyncError); onlyDiffFailed { //nolint:errorlint // joined hard failures must propagate
-			return providerAttempted, nil
+			err = nil
 		}
-		return providerAttempted, err
+		if err == nil && repoPlatform(repo) == platform.KindGitHub {
+			err = s.requireGitHubArchiveMergedMRMetrics(
+				ctx, resolvedRepoID, number, fetchedEvidence, lifecyclePersisted,
+			)
+			if err == nil {
+				var filesChanged *int
+				if fetchedEvidence.filesChanged != nil {
+					value := *fetchedEvidence.filesChanged
+					filesChanged = &value
+				}
+				result.MergeRequestEvidence = &db.ArchiveMergeRequestEvidence{
+					Merged: fetchedEvidence.merged, HeadSHA: fetchedEvidence.headSHA,
+					MergeCommitSHA: fetchedEvidence.mergeCommitSHA,
+					FilesChanged:   filesChanged,
+				}
+			}
+		}
+		result.ProviderAttempted = providerAttempted
+		return result, err
 	default:
-		return false, fmt.Errorf("sync archive item: invalid item type %q", itemType)
+		return result, fmt.Errorf("sync archive item: invalid item type %q", itemType)
 	}
+}
+
+func (s *Syncer) requireGitHubArchiveMergedMRMetrics(
+	ctx context.Context,
+	repoID int64,
+	number int,
+	fetched mergeRequestFetchEvidence,
+	lifecyclePersisted bool,
+) error {
+	if repoID == 0 {
+		return fmt.Errorf("verify GitHub archive MR #%d: repository was not resolved", number)
+	}
+	storedRepo, err := s.db.GetRepoByID(ctx, repoID)
+	if err != nil {
+		return fmt.Errorf("verify GitHub archive MR #%d repository: %w", number, err)
+	}
+	if storedRepo == nil {
+		return fmt.Errorf("verify GitHub archive MR #%d: repository is not stored", number)
+	}
+	if fetched.merged && !lifecyclePersisted {
+		return fmt.Errorf(
+			"verify GitHub archive MR %s/%s#%d: lifecycle persistence incomplete",
+			storedRepo.Owner, storedRepo.Name, number,
+		)
+	}
+	mr, err := s.db.GetMergeRequestByRepoIDAndNumber(ctx, repoID, number)
+	if err != nil {
+		return fmt.Errorf("verify GitHub archive MR #%d metrics: %w", number, err)
+	}
+	if mr == nil {
+		return fmt.Errorf("verify GitHub archive MR #%d metrics: pull request is not stored", number)
+	}
+	storedMerged := mr.State == db.MergeRequestStateMerged || mr.MergedAt != nil
+	if fetched.merged != storedMerged {
+		return fmt.Errorf(
+			"verify GitHub archive MR %s/%s#%d metrics: incomplete or mismatched merge_state",
+			storedRepo.Owner, storedRepo.Name, number,
+		)
+	}
+	if !fetched.merged {
+		return nil
+	}
+	incomplete := make([]string, 0, 4)
+	if mr.MergedAt == nil {
+		incomplete = append(incomplete, "merged_at")
+	}
+	if fetched.merged {
+		if fetched.headSHA == "" || mr.PlatformHeadSHA != fetched.headSHA {
+			incomplete = append(incomplete, "platform_head_sha")
+		}
+		if fetched.mergeCommitSHA == "" || mr.MergeCommitSHA != fetched.mergeCommitSHA {
+			incomplete = append(incomplete, "merge_commit_sha")
+		}
+		if fetched.filesChanged == nil || mr.FilesChanged == nil ||
+			*mr.FilesChanged != *fetched.filesChanged {
+			incomplete = append(incomplete, "files_changed")
+		}
+	} else {
+		if mr.MergeCommitSHA == "" {
+			incomplete = append(incomplete, "merge_commit_sha")
+		}
+		if mr.FilesChanged == nil {
+			incomplete = append(incomplete, "files_changed")
+		}
+	}
+	if len(incomplete) > 0 {
+		return fmt.Errorf(
+			"verify GitHub archive MR %s/%s#%d metrics: incomplete or mismatched %s",
+			storedRepo.Owner, storedRepo.Name, number, strings.Join(incomplete, ", "),
+		)
+	}
+	return nil
 }
 
 // SyncItemByNumber fetches an item by number from GitHub, determines

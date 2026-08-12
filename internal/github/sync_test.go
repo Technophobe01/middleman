@@ -13101,7 +13101,7 @@ func TestSyncArchiveIssueBypassesPersistedETagForLifecycleBackfill(t *testing.T)
 		[]RepoRef{repo}, time.Minute, nil, testBudget(1000),
 	)
 
-	providerAttempted, err := syncer.SyncArchiveItem(
+	result, err := syncer.SyncArchiveItem(
 		WithArchiveSyncBudget(ctx),
 		platform.RepoRef{
 			Platform: platform.KindGitHub, Host: "github.com",
@@ -13110,7 +13110,7 @@ func TestSyncArchiveIssueBypassesPersistedETagForLifecycleBackfill(t *testing.T)
 		db.ArchiveItemTypeIssue, 7,
 	)
 	require.NoError(err)
-	assert.True(providerAttempted)
+	assert.True(result.ProviderAttempted)
 	assert.Zero(int(client.conditionalCalls.Load()))
 	assert.Equal(int32(1), client.unconditionalCalls.Load())
 	assert.Equal(int32(1), client.timelineCalls.Load())
@@ -13123,6 +13123,700 @@ func TestSyncArchiveIssueBypassesPersistedETagForLifecycleBackfill(t *testing.T)
 	require.Len(events, 1)
 	assert.Equal("closed", events[0].EventType)
 	assert.Equal("closer", events[0].Author)
+}
+
+func TestSyncArchiveMRRepairsMetricsFromMergedAtOnlyRejectedSnapshot(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	ctx := t.Context()
+	database := openTestDB(t)
+	repo := RepoRef{
+		Platform: platform.KindGitHub, Owner: "owner", Name: "repo",
+		PlatformHost: "github.com",
+	}
+	repoID, err := database.UpsertRepo(
+		ctx, verifiedGitHubRepoIdentity("github.com", repo.Owner, repo.Name),
+	)
+	require.NoError(err)
+	canonicalUpdatedAt := time.Date(2026, 7, 28, 0, 41, 21, 0, time.UTC)
+	localUpdatedAt := canonicalUpdatedAt.Add(835 * time.Millisecond)
+	mergedAt := canonicalUpdatedAt.Add(-time.Second)
+	_, err = database.UpsertMergeRequest(ctx, &db.MergeRequest{
+		RepoID: repoID, PlatformID: 7000, Number: 7, Title: "newer local title",
+		State: db.MergeRequestStateMerged, PlatformHeadSHA: "head-sha",
+		MergeCommitSHA: "pre-merge-test-sha",
+		CreatedAt:      canonicalUpdatedAt.Add(-time.Hour), UpdatedAt: localUpdatedAt,
+		LastActivityAt: localUpdatedAt, MergedAt: &mergedAt, ClosedAt: &mergedAt,
+	})
+	require.NoError(err)
+	before, err := database.GetMergeRequestByRepoIDAndNumber(ctx, repoID, 7)
+	require.NoError(err)
+	require.NotNil(before)
+
+	canonical := buildOpenPR(7, canonicalUpdatedAt)
+	closed := "closed"
+	mergeSHA := "merge-sha"
+	filesChanged := 4
+	canonical.State = &closed
+	canonical.Merged = nil
+	canonical.MergedAt = makeTimestamp(mergedAt)
+	canonical.ClosedAt = makeTimestamp(mergedAt)
+	canonical.MergeCommitSHA = &mergeSHA
+	canonical.ChangedFiles = &filesChanged
+	canonical.Head.SHA = new("head-sha")
+	canonical.MergedBy = &gh.User{Login: new("merge-admin")}
+	client := &mockClient{singlePR: canonical}
+	syncer := NewSyncer(
+		map[string]Client{"github.com": client}, database, nil,
+		[]RepoRef{repo}, time.Minute, nil, testBudget(1000),
+	)
+	var raceStarted atomic.Bool
+	writeLockAttempted := make(chan struct{})
+	var writeLockAttemptedOnce sync.Once
+	restoreWriteLockHook := database.SetBeforeRepositoryReconciliationWriteLockForTest(func() {
+		if raceStarted.Load() {
+			writeLockAttemptedOnce.Do(func() { close(writeLockAttempted) })
+		}
+	})
+	t.Cleanup(restoreWriteLockHook)
+	reconciliationDone := make(chan error, 1)
+	syncer.afterMergedMRMetricsRepair = func() {
+		raceStarted.Store(true)
+		go func() {
+			_, _, reconcileErr := database.ReconcileRepositoryObservation(ctx, db.RepoIdentity{
+				Platform: "github", PlatformHost: "github.com",
+				PlatformRepoID: "repo-owner-repo", Owner: "owner", Name: "renamed",
+				RepoPath: "owner/renamed",
+			}, time.Now().UTC().Add(time.Hour))
+			reconciliationDone <- reconcileErr
+		}()
+		<-writeLockAttempted
+	}
+
+	require.NoError(syncer.syncMRForRepo(
+		WithArchiveSyncBudget(ctx), repo, 7, false, nil,
+	))
+	require.NoError(<-reconciliationDone)
+	after, err := database.GetMergeRequestByRepoIDAndNumber(ctx, repoID, 7)
+	require.NoError(err)
+	require.NotNil(after)
+	assert.Equal("merge-sha", after.MergeCommitSHA)
+	require.NotNil(after.FilesChanged)
+	assert.Equal(4, *after.FilesChanged)
+	assert.Equal("newer local title", after.Title)
+	assert.Equal(before.UpdatedAt, after.UpdatedAt)
+	assert.Equal(before.SnapshotRevision, after.SnapshotRevision)
+	events, err := database.ListMREvents(ctx, after.ID)
+	require.NoError(err)
+	require.Len(events, 1)
+	assert.Equal("merge-admin", events[0].Author)
+}
+
+func TestSyncArchiveMRRetriesWhenMergedResponseCannotRepairNewerOpenSnapshot(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	ctx := t.Context()
+	database := openTestDB(t)
+	repo := RepoRef{
+		Platform: platform.KindGitHub, Owner: "owner", Name: "repo",
+		PlatformHost: "github.com",
+	}
+	repoID, err := database.UpsertRepo(
+		ctx, verifiedGitHubRepoIdentity("github.com", repo.Owner, repo.Name),
+	)
+	require.NoError(err)
+	providerUpdatedAt := time.Date(2026, 7, 28, 0, 41, 21, 0, time.UTC)
+	localUpdatedAt := providerUpdatedAt.Add(835 * time.Millisecond)
+	mergedAt := providerUpdatedAt.Add(-time.Second)
+	_, err = database.UpsertMergeRequest(ctx, &db.MergeRequest{
+		RepoID: repoID, PlatformID: 7000, Number: 7,
+		State: db.MergeRequestStateOpen, PlatformHeadSHA: "head-sha",
+		MergeCommitSHA: "pre-merge-test-sha",
+		CreatedAt:      providerUpdatedAt.Add(-time.Hour), UpdatedAt: localUpdatedAt,
+		LastActivityAt: localUpdatedAt,
+	})
+	require.NoError(err)
+
+	canonical := buildOpenPR(7, providerUpdatedAt)
+	canonical.State = new("closed")
+	canonical.Merged = new(true)
+	canonical.MergedAt = makeTimestamp(mergedAt)
+	canonical.ClosedAt = makeTimestamp(mergedAt)
+	canonical.MergeCommitSHA = new("merge-sha")
+	canonical.ChangedFiles = new(4)
+	canonical.Head.SHA = new("head-sha")
+	syncer := NewSyncer(
+		map[string]Client{"github.com": &mockClient{singlePR: canonical}},
+		database, nil, []RepoRef{repo}, time.Minute, nil, testBudget(1000),
+	)
+
+	result, err := syncer.SyncArchiveItem(
+		WithArchiveSyncBudget(ctx), platform.RepoRef{
+			Platform: platform.KindGitHub, Host: "github.com",
+			Owner: repo.Owner, Name: repo.Name,
+		}, db.ArchiveItemTypeMergeRequest, 7,
+	)
+	require.True(result.ProviderAttempted)
+	require.ErrorContains(err, "merge_state")
+
+	after, err := database.GetMergeRequestByRepoIDAndNumber(ctx, repoID, 7)
+	require.NoError(err)
+	require.NotNil(after)
+	assert.Equal(db.MergeRequestStateOpen, after.State)
+	assert.Nil(after.MergedAt)
+	assert.Equal("pre-merge-test-sha", after.MergeCommitSHA)
+	assert.Nil(after.FilesChanged)
+	events, err := database.ListMREvents(ctx, after.ID)
+	require.NoError(err)
+	assert.Empty(events)
+}
+
+func TestSyncArchiveMRChecksMetricsByResolvedRepositoryIDAfterRename(t *testing.T) {
+	require := require.New(t)
+	ctx := t.Context()
+	database := openTestDB(t)
+	repo := RepoRef{
+		Platform: platform.KindGitHub, PlatformHost: "github.com",
+		Owner: "acme", Name: "widget", RepoPath: "acme/widget",
+		PlatformExternalID: "repo-a",
+	}
+	entry, accepted, err := database.ReconcileRepositoryObservation(
+		ctx,
+		db.RepoIdentity{
+			Platform: "github", PlatformHost: "github.com",
+			PlatformRepoID: "repo-a", Owner: "acme", Name: "widget",
+			RepoPath: "acme/widget",
+		},
+		time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC),
+	)
+	require.NoError(err)
+	require.True(accepted)
+
+	now := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
+	canonical := buildOpenPR(7, now)
+	canonical.State = new("closed")
+	canonical.Merged = new(true)
+	canonical.MergedAt = makeTimestamp(now)
+	canonical.ClosedAt = makeTimestamp(now)
+	canonical.MergeCommitSHA = new("merge-sha")
+	canonical.ChangedFiles = new(4)
+	client := &mockClient{
+		singlePR: canonical,
+		getRepositoryFn: func(
+			context.Context, string, string,
+		) (*gh.Repository, error) {
+			return &gh.Repository{
+				ID: new(int64(1)), NodeID: new("repo-a"), Name: new("renamed"),
+				Owner: &gh.User{Login: new("acme")}, Archived: new(false),
+			}, nil
+		},
+	}
+	syncer := NewSyncer(
+		map[string]Client{"github.com": client}, database, nil,
+		[]RepoRef{repo}, time.Minute, nil, testBudget(1000),
+	)
+
+	_, err = syncer.SyncArchiveItem(
+		WithArchiveSyncBudget(ctx), platformRepoRef(repo),
+		db.ArchiveItemTypeMergeRequest, 7,
+	)
+	require.NoError(err)
+
+	mr, err := database.GetMergeRequestByRepoIDAndNumber(
+		ctx, entry.Repository.ID, 7,
+	)
+	require.NoError(err)
+	require.NotNil(mr)
+	require.Equal("merge-sha", mr.MergeCommitSHA)
+	require.Equal(4, *mr.FilesChanged)
+}
+
+func TestSyncArchiveMRPreservesStoredMergedAtWhenAcceptedResponseOmitsIt(t *testing.T) {
+	require := require.New(t)
+	ctx := t.Context()
+	database := openTestDB(t)
+	repo := RepoRef{
+		Platform: platform.KindGitHub, PlatformHost: "github.com",
+		Owner: "acme", Name: "widget", RepoPath: "acme/widget",
+		PlatformExternalID: "repo-a",
+	}
+	entry, accepted, err := database.ReconcileRepositoryObservation(
+		ctx,
+		db.RepoIdentity{
+			Platform: "github", PlatformHost: "github.com",
+			PlatformRepoID: "repo-a", Owner: "acme", Name: "widget",
+			RepoPath: "acme/widget",
+		},
+		time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC),
+	)
+	require.NoError(err)
+	require.True(accepted)
+
+	mergedAt := time.Date(2026, 8, 2, 11, 59, 59, 0, time.UTC)
+	_, err = database.UpsertMergeRequest(ctx, &db.MergeRequest{
+		RepoID: entry.Repository.ID, PlatformID: 7, Number: 7,
+		State: db.MergeRequestStateMerged, PlatformHeadSHA: "head-sha",
+		MergeCommitSHA: "merge-sha", FilesChanged: new(4),
+		CreatedAt: mergedAt.Add(-time.Hour), UpdatedAt: mergedAt,
+		LastActivityAt: mergedAt, MergedAt: &mergedAt, ClosedAt: &mergedAt,
+	})
+	require.NoError(err)
+
+	providerUpdatedAt := mergedAt.Add(time.Minute)
+	canonical := buildOpenPR(7, providerUpdatedAt)
+	canonical.State = new("closed")
+	canonical.Merged = new(true)
+	canonical.MergedAt = nil
+	canonical.ClosedAt = makeTimestamp(mergedAt)
+	canonical.MergeCommitSHA = new("merge-sha")
+	canonical.ChangedFiles = new(4)
+	canonical.Head.SHA = new("head-sha")
+	canonical.MergedBy = &gh.User{Login: new("merge-admin")}
+	client := &mockClient{
+		singlePR: canonical,
+		getRepositoryFn: func(
+			context.Context, string, string,
+		) (*gh.Repository, error) {
+			return &gh.Repository{
+				ID: new(int64(1)), NodeID: new("repo-a"), Name: new("widget"),
+				Owner: &gh.User{Login: new("acme")}, Archived: new(false),
+			}, nil
+		},
+	}
+	syncer := NewSyncer(
+		map[string]Client{"github.com": client},
+		database, nil, []RepoRef{repo}, time.Minute, nil, testBudget(1000),
+	)
+
+	result, err := syncer.SyncArchiveItem(
+		WithArchiveSyncBudget(ctx), platformRepoRef(repo),
+		db.ArchiveItemTypeMergeRequest, 7,
+	)
+	require.True(result.ProviderAttempted)
+	require.NoError(err)
+
+	mr, err := database.GetMergeRequestByRepoIDAndNumber(ctx, entry.Repository.ID, 7)
+	require.NoError(err)
+	require.NotNil(mr)
+	require.NotNil(mr.MergedAt)
+	require.Equal(mergedAt, *mr.MergedAt)
+	events, err := database.ListMREvents(ctx, mr.ID)
+	require.NoError(err)
+	require.Len(events, 1)
+	require.Equal("merge-admin", events[0].Author)
+}
+
+func TestSyncArchiveMRRetriesWhenAcceptedSnapshotLosesRouteFenceBeforeActor(t *testing.T) {
+	require := require.New(t)
+	ctx := t.Context()
+	database := openTestDB(t)
+	repo := RepoRef{
+		Platform: platform.KindGitHub, PlatformHost: "github.com",
+		Owner: "acme", Name: "widget", RepoPath: "acme/widget",
+		PlatformExternalID: "repo-a",
+	}
+	entry, accepted, err := database.ReconcileRepositoryObservation(
+		ctx,
+		db.RepoIdentity{
+			Platform: "github", PlatformHost: "github.com",
+			PlatformRepoID: "repo-a", Owner: "acme", Name: "widget",
+			RepoPath: "acme/widget",
+		},
+		time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC),
+	)
+	require.NoError(err)
+	require.True(accepted)
+
+	mergedAt := time.Date(2026, 8, 2, 11, 59, 59, 0, time.UTC)
+	_, err = database.UpsertMergeRequest(ctx, &db.MergeRequest{
+		RepoID: entry.Repository.ID, PlatformID: 7, Number: 7,
+		State: db.MergeRequestStateMerged, PlatformHeadSHA: "head-sha",
+		MergeCommitSHA: "merge-sha", FilesChanged: new(4),
+		CreatedAt: mergedAt.Add(-time.Hour), UpdatedAt: mergedAt,
+		LastActivityAt: mergedAt, MergedAt: &mergedAt, ClosedAt: &mergedAt,
+	})
+	require.NoError(err)
+
+	providerUpdatedAt := mergedAt.Add(time.Minute)
+	canonical := buildOpenPR(7, providerUpdatedAt)
+	canonical.State = new("closed")
+	canonical.Merged = new(true)
+	canonical.MergedAt = makeTimestamp(mergedAt)
+	canonical.ClosedAt = makeTimestamp(mergedAt)
+	canonical.MergeCommitSHA = new("merge-sha")
+	canonical.ChangedFiles = new(4)
+	canonical.Head.SHA = new("head-sha")
+	canonical.MergedBy = &gh.User{Login: new("merge-admin")}
+	client := &mockClient{
+		singlePR: canonical,
+		getRepositoryFn: func(
+			context.Context, string, string,
+		) (*gh.Repository, error) {
+			return &gh.Repository{
+				ID: new(int64(1)), NodeID: new("repo-a"), Name: new("widget"),
+				Owner: &gh.User{Login: new("acme")}, Archived: new(false),
+			}, nil
+		},
+	}
+	syncer := NewSyncer(
+		map[string]Client{"github.com": client},
+		database, nil, []RepoRef{repo}, time.Minute, nil, testBudget(1000),
+	)
+
+	var raceStarted atomic.Bool
+	writeLockAttempted := make(chan struct{})
+	var writeLockAttemptedOnce sync.Once
+	restoreWriteLockHook := database.SetBeforeRepositoryReconciliationWriteLockForTest(func() {
+		if raceStarted.Load() {
+			writeLockAttemptedOnce.Do(func() { close(writeLockAttempted) })
+		}
+	})
+	t.Cleanup(restoreWriteLockHook)
+	reconciliationDone := make(chan error, 1)
+	syncer.afterMergeRequestParentSnapshotCommit = func() {
+		raceStarted.Store(true)
+		go func() {
+			_, _, reconcileErr := database.ReconcileRepositoryObservation(
+				ctx,
+				db.RepoIdentity{
+					Platform: "github", PlatformHost: "github.com",
+					PlatformRepoID: "repo-a", Owner: "acme", Name: "renamed",
+					RepoPath: "acme/renamed",
+				},
+				time.Now().UTC().Add(time.Hour),
+			)
+			reconciliationDone <- reconcileErr
+		}()
+		<-writeLockAttempted
+	}
+
+	result, err := syncer.SyncArchiveItem(
+		WithArchiveSyncBudget(ctx), platformRepoRef(repo),
+		db.ArchiveItemTypeMergeRequest, 7,
+	)
+	require.True(result.ProviderAttempted)
+	require.ErrorContains(err, "lifecycle persistence")
+	require.NoError(<-reconciliationDone)
+
+	mr, err := database.GetMergeRequestByRepoIDAndNumber(ctx, entry.Repository.ID, 7)
+	require.NoError(err)
+	require.NotNil(mr)
+	events, err := database.ListMREvents(ctx, mr.ID)
+	require.NoError(err)
+	require.Empty(events)
+}
+
+func TestSyncArchiveMRRetriesWhenRejectedRepairLosesRouteFence(t *testing.T) {
+	require := require.New(t)
+	ctx := t.Context()
+	database := openTestDB(t)
+	repo := RepoRef{
+		Platform: platform.KindGitHub, PlatformHost: "github.com",
+		Owner: "acme", Name: "widget", RepoPath: "acme/widget",
+		PlatformExternalID: "repo-a",
+	}
+	entry, accepted, err := database.ReconcileRepositoryObservation(
+		ctx,
+		db.RepoIdentity{
+			Platform: "github", PlatformHost: "github.com",
+			PlatformRepoID: "repo-a", Owner: "acme", Name: "widget",
+			RepoPath: "acme/widget",
+		},
+		time.Now().UTC().Add(-time.Hour),
+	)
+	require.NoError(err)
+	require.True(accepted)
+
+	providerUpdatedAt := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
+	localUpdatedAt := providerUpdatedAt.Add(835 * time.Millisecond)
+	mergedAt := providerUpdatedAt.Add(-time.Second)
+	_, err = database.UpsertMergeRequest(ctx, &db.MergeRequest{
+		RepoID: entry.Repository.ID, PlatformID: 7, Number: 7,
+		State: db.MergeRequestStateMerged, PlatformHeadSHA: "head-sha",
+		MergeCommitSHA: "merge-sha", FilesChanged: new(4),
+		CreatedAt: providerUpdatedAt.Add(-time.Hour), UpdatedAt: localUpdatedAt,
+		LastActivityAt: localUpdatedAt, MergedAt: &mergedAt, ClosedAt: &mergedAt,
+	})
+	require.NoError(err)
+
+	canonical := buildOpenPR(7, providerUpdatedAt)
+	canonical.State = new("closed")
+	canonical.Merged = new(true)
+	canonical.MergedAt = makeTimestamp(mergedAt)
+	canonical.ClosedAt = makeTimestamp(mergedAt)
+	canonical.MergeCommitSHA = new("merge-sha")
+	canonical.ChangedFiles = nil
+	canonical.Head.SHA = new("head-sha")
+	canonical.MergedBy = &gh.User{Login: new("merge-admin")}
+	client := &mockClient{
+		getRepositoryFn: func(
+			context.Context, string, string,
+		) (*gh.Repository, error) {
+			return &gh.Repository{
+				ID: new(int64(1)), NodeID: new("repo-a"), Name: new("widget"),
+				Owner: &gh.User{Login: new("acme")}, Archived: new(false),
+			}, nil
+		},
+		getPullRequestFn: func(
+			context.Context, string, string, int,
+		) (*gh.PullRequest, error) {
+			_, accepted, reconcileErr := database.ReconcileRepositoryObservation(
+				ctx,
+				db.RepoIdentity{
+					Platform: "github", PlatformHost: "github.com",
+					PlatformRepoID: "repo-a", Owner: "acme", Name: "renamed",
+					RepoPath: "acme/renamed",
+				},
+				time.Now().UTC().Add(time.Hour),
+			)
+			require.NoError(reconcileErr)
+			require.True(accepted)
+			return canonical, nil
+		},
+	}
+	syncer := NewSyncer(
+		map[string]Client{"github.com": client}, database, nil,
+		[]RepoRef{repo}, time.Minute, nil, testBudget(1000),
+	)
+
+	result, err := syncer.SyncArchiveItem(
+		WithArchiveSyncBudget(ctx), platformRepoRef(repo),
+		db.ArchiveItemTypeMergeRequest, 7,
+	)
+	require.True(result.ProviderAttempted)
+	require.ErrorContains(err, "repository was not resolved")
+
+	mr, err := database.GetMergeRequestByRepoIDAndNumber(ctx, entry.Repository.ID, 7)
+	require.NoError(err)
+	require.NotNil(mr)
+	events, err := database.ListMREvents(ctx, mr.ID)
+	require.NoError(err)
+	require.Empty(events)
+}
+
+func TestSyncArchiveMRRejectsMissingMergedMetrics(t *testing.T) {
+	tests := []struct {
+		name              string
+		storedMergeSHA    string
+		storedFiles       *int
+		storedHeadSHA     string
+		providerMergeSHA  string
+		providerFiles     *int
+		providerHeadSHA   string
+		missingMergedAt   bool
+		missingFieldLabel string
+	}{
+		{
+			name: "canonical merge commit SHA", storedMergeSHA: "pre-merge-test-sha",
+			storedFiles: new(4), providerFiles: new(4),
+			missingFieldLabel: "merge_commit_sha",
+		},
+		{
+			name: "files changed", storedMergeSHA: "merge-sha",
+			providerMergeSHA: "merge-sha", missingFieldLabel: "files_changed",
+		},
+		{
+			name: "merged timestamp", storedMergeSHA: "merge-sha", storedFiles: new(4),
+			providerMergeSHA: "merge-sha", providerFiles: new(4), missingMergedAt: true,
+			missingFieldLabel: "merged_at",
+		},
+		{
+			name: "canonical head SHA", storedMergeSHA: "pre-merge-test-sha",
+			storedFiles: new(4), storedHeadSHA: "newer-head-sha",
+			providerMergeSHA: "merge-sha", providerFiles: new(4),
+			providerHeadSHA: "canonical-head-sha", missingFieldLabel: "platform_head_sha",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require := require.New(t)
+			ctx := t.Context()
+			database := openTestDB(t)
+			repo := RepoRef{
+				Platform: platform.KindGitHub, Owner: "owner", Name: "repo",
+				PlatformHost: "github.com",
+			}
+			repoID, err := database.UpsertRepo(
+				ctx, verifiedGitHubRepoIdentity("github.com", repo.Owner, repo.Name),
+			)
+			require.NoError(err)
+			providerUpdatedAt := time.Date(2026, 7, 28, 0, 41, 21, 0, time.UTC)
+			localUpdatedAt := providerUpdatedAt.Add(835 * time.Millisecond)
+			mergedAt := providerUpdatedAt.Add(-time.Second)
+			var storedMergedAt *time.Time
+			if !tt.missingMergedAt {
+				storedMergedAt = &mergedAt
+			}
+			storedHeadSHA := tt.storedHeadSHA
+			if storedHeadSHA == "" {
+				storedHeadSHA = "head-sha"
+			}
+			_, err = database.UpsertMergeRequest(ctx, &db.MergeRequest{
+				RepoID: repoID, PlatformID: 7000, Number: 7,
+				State: db.MergeRequestStateMerged, PlatformHeadSHA: storedHeadSHA,
+				MergeCommitSHA: tt.storedMergeSHA, FilesChanged: tt.storedFiles,
+				CreatedAt: providerUpdatedAt.Add(-time.Hour), UpdatedAt: localUpdatedAt,
+				LastActivityAt: localUpdatedAt, MergedAt: storedMergedAt, ClosedAt: &mergedAt,
+			})
+			require.NoError(err)
+
+			canonical := buildOpenPR(7, providerUpdatedAt)
+			canonical.State = new("closed")
+			canonical.Merged = new(true)
+			if !tt.missingMergedAt {
+				canonical.MergedAt = makeTimestamp(mergedAt)
+			}
+			canonical.ClosedAt = makeTimestamp(mergedAt)
+			canonical.MergeCommitSHA = &tt.providerMergeSHA
+			canonical.ChangedFiles = tt.providerFiles
+			providerHeadSHA := tt.providerHeadSHA
+			if providerHeadSHA == "" {
+				providerHeadSHA = "head-sha"
+			}
+			canonical.Head.SHA = &providerHeadSHA
+			syncer := NewSyncer(
+				map[string]Client{"github.com": &mockClient{singlePR: canonical}},
+				database, nil, []RepoRef{repo}, time.Minute, nil, testBudget(1000),
+			)
+
+			result, err := syncer.SyncArchiveItem(
+				WithArchiveSyncBudget(ctx),
+				platform.RepoRef{
+					Platform: platform.KindGitHub, Host: "github.com",
+					Owner: repo.Owner, Name: repo.Name,
+				},
+				db.ArchiveItemTypeMergeRequest, 7,
+			)
+			require.ErrorContains(err, tt.missingFieldLabel)
+			require.True(result.ProviderAttempted)
+		})
+	}
+}
+
+func TestSyncArchiveMRRejectsCanonicalUnmergedStoredMergedDisagreement(t *testing.T) {
+	require := require.New(t)
+	ctx := t.Context()
+	database := openTestDB(t)
+	repo := RepoRef{
+		Platform: platform.KindGitHub, Owner: "owner", Name: "repo",
+		PlatformHost: "github.com",
+	}
+	repoID, err := database.UpsertRepo(
+		ctx, verifiedGitHubRepoIdentity("github.com", repo.Owner, repo.Name),
+	)
+	require.NoError(err)
+	providerUpdatedAt := time.Date(2026, 7, 28, 0, 41, 21, 0, time.UTC)
+	localUpdatedAt := providerUpdatedAt.Add(time.Second)
+	mergedAt := providerUpdatedAt.Add(-time.Minute)
+	_, err = database.UpsertMergeRequest(ctx, &db.MergeRequest{
+		RepoID: repoID, PlatformID: 7000, Number: 7,
+		State: db.MergeRequestStateMerged, PlatformHeadSHA: "head-sha",
+		MergeCommitSHA: "merge-sha", FilesChanged: new(4),
+		CreatedAt: providerUpdatedAt.Add(-time.Hour), UpdatedAt: localUpdatedAt,
+		LastActivityAt: localUpdatedAt, MergedAt: &mergedAt, ClosedAt: &mergedAt,
+	})
+	require.NoError(err)
+
+	canonical := buildOpenPR(7, providerUpdatedAt)
+	canonical.State = new("closed")
+	canonical.Merged = new(false)
+	canonical.MergedAt = nil
+	canonical.ClosedAt = makeTimestamp(providerUpdatedAt.Add(-time.Minute))
+	canonical.MergeCommitSHA = nil
+	canonical.Head.SHA = new("head-sha")
+	syncer := NewSyncer(
+		map[string]Client{"github.com": &mockClient{singlePR: canonical}},
+		database, nil, []RepoRef{repo}, time.Minute, nil, testBudget(1000),
+	)
+
+	result, err := syncer.SyncArchiveItem(
+		WithArchiveSyncBudget(ctx),
+		platform.RepoRef{
+			Platform: platform.KindGitHub, Host: "github.com",
+			Owner: repo.Owner, Name: repo.Name,
+		},
+		db.ArchiveItemTypeMergeRequest, 7,
+	)
+	require.ErrorContains(err, "merge_state")
+	require.True(result.ProviderAttempted)
+
+	stored, err := database.GetMergeRequestByRepoIDAndNumber(ctx, repoID, 7)
+	require.NoError(err)
+	require.NotNil(stored)
+	require.Equal(db.MergeRequestStateMerged, stored.State)
+	require.NotNil(stored.MergedAt)
+	require.Equal(mergedAt, *stored.MergedAt)
+	require.Equal("merge-sha", stored.MergeCommitSHA)
+	require.NotNil(stored.FilesChanged)
+	require.Equal(4, *stored.FilesChanged)
+}
+
+func TestRequireGitHubArchiveMergedMRMetricsRejectsMismatchedFilesChanged(t *testing.T) {
+	require := require.New(t)
+	ctx := t.Context()
+	database := openTestDB(t)
+	repoID, err := database.UpsertRepo(
+		ctx, verifiedGitHubRepoIdentity("github.com", "acme", "widget"),
+	)
+	require.NoError(err)
+	mergedAt := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
+	_, err = database.UpsertMergeRequest(ctx, &db.MergeRequest{
+		RepoID: repoID, PlatformID: 7, Number: 7,
+		State: db.MergeRequestStateMerged, PlatformHeadSHA: "head-sha",
+		MergeCommitSHA: "merge-sha", FilesChanged: new(9),
+		CreatedAt: mergedAt.Add(-time.Hour), UpdatedAt: mergedAt,
+		LastActivityAt: mergedAt, MergedAt: &mergedAt, ClosedAt: &mergedAt,
+	})
+	require.NoError(err)
+
+	err = (&Syncer{db: database}).requireGitHubArchiveMergedMRMetrics(
+		ctx, repoID, 7, mergeRequestFetchEvidence{
+			merged: true, headSHA: "head-sha", mergeCommitSHA: "merge-sha",
+			filesChanged: new(4),
+		}, true,
+	)
+	require.ErrorContains(err, "files_changed")
+}
+
+func TestSyncArchiveMROpenPullRequestDoesNotRequireMergeMetrics(t *testing.T) {
+	require := require.New(t)
+	ctx := t.Context()
+	database := openTestDB(t)
+	repo := RepoRef{
+		Platform: platform.KindGitHub, Owner: "owner", Name: "repo",
+		PlatformHost: "github.com",
+	}
+	repoID, err := database.UpsertRepo(
+		ctx, verifiedGitHubRepoIdentity("github.com", repo.Owner, repo.Name),
+	)
+	require.NoError(err)
+	providerUpdatedAt := time.Date(2026, 7, 28, 0, 41, 21, 0, time.UTC)
+	localUpdatedAt := providerUpdatedAt.Add(time.Second)
+	_, err = database.UpsertMergeRequest(ctx, &db.MergeRequest{
+		RepoID: repoID, PlatformID: 7000, Number: 7,
+		State: db.MergeRequestStateOpen, PlatformHeadSHA: "head-sha",
+		CreatedAt: providerUpdatedAt.Add(-time.Hour), UpdatedAt: localUpdatedAt,
+		LastActivityAt: localUpdatedAt,
+	})
+	require.NoError(err)
+	canonical := buildOpenPR(7, providerUpdatedAt)
+	canonical.Head.SHA = new("head-sha")
+	syncer := NewSyncer(
+		map[string]Client{"github.com": &mockClient{singlePR: canonical}},
+		database, nil, []RepoRef{repo}, time.Minute, nil, testBudget(1000),
+	)
+
+	result, err := syncer.SyncArchiveItem(
+		WithArchiveSyncBudget(ctx),
+		platform.RepoRef{
+			Platform: platform.KindGitHub, Host: "github.com",
+			Owner: repo.Owner, Name: repo.Name,
+		},
+		db.ArchiveItemTypeMergeRequest, 7,
+	)
+	require.NoError(err)
+	require.True(result.ProviderAttempted)
 }
 
 func TestSyncArchiveIssuePropagatesTimelineFailure(t *testing.T) {
@@ -13147,7 +13841,7 @@ func TestSyncArchiveIssuePropagatesTimelineFailure(t *testing.T) {
 		[]RepoRef{repo}, time.Minute, nil, testBudget(1000),
 	)
 
-	providerAttempted, err := syncer.SyncArchiveItem(
+	result, err := syncer.SyncArchiveItem(
 		WithArchiveSyncBudget(ctx),
 		platform.RepoRef{
 			Platform: platform.KindGitHub, Host: "github.com",
@@ -13157,7 +13851,7 @@ func TestSyncArchiveIssuePropagatesTimelineFailure(t *testing.T) {
 	)
 
 	require.ErrorIs(err, timelineErr)
-	assert.True(providerAttempted)
+	assert.True(result.ProviderAttempted)
 	assert.Equal(int32(1), client.issueTimelineCalls.Load())
 }
 

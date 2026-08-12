@@ -674,6 +674,54 @@ func TestArchivePromptRediscoveryMakesTerminalItemClaimable(t *testing.T) {
 	assert.Equal(item.Number, claim.ItemNumber)
 }
 
+func TestCommitArchiveItemSyncRejectsMismatchedMergeEvidence(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	database := openTestDB(t)
+	ctx := t.Context()
+	now := archiveTestTime()
+	repoID := insertTestRepo(t, database, "acme", "verified-merge")
+	require.NoError(database.EnsureDiscoveryArchives(ctx, []int64{repoID}, now))
+	require.NoError(database.StartFullArchives(ctx, []int64{repoID}, now))
+	mergedAt := now.Add(-time.Hour)
+	_, err := database.UpsertMergeRequest(ctx, &MergeRequest{
+		RepoID: repoID, PlatformID: 7, Number: 7,
+		State: MergeRequestStateMerged, PlatformHeadSHA: "head-sha",
+		MergeCommitSHA: "replacement-merge-sha", FilesChanged: new(9),
+		CreatedAt: mergedAt.Add(-time.Hour), UpdatedAt: mergedAt,
+		LastActivityAt: mergedAt, MergedAt: &mergedAt, ClosedAt: &mergedAt,
+	})
+	require.NoError(err)
+	insertArchiveItemForTest(
+		t, database, repoID, ArchiveItemTypeMergeRequest, 7, mergedAt,
+	)
+	insertArchiveProgressForTest(
+		t, database, repoID, ArchiveItemTypeMergeRequest, 7,
+		ArchiveDatasetLookup, ArchiveDatasetProgressPending,
+	)
+	progress, err := database.GetDatasetProgress(
+		ctx, repoID, ArchiveItemTypeMergeRequest, 7, ArchiveDatasetLookup,
+	)
+	require.NoError(err)
+
+	err = database.CommitArchiveItemSync(ctx, ArchiveItemSyncCommit{
+		RepoID: repoID, ItemType: ArchiveItemTypeMergeRequest, ItemNumber: 7,
+		ScanGeneration: progress.ScanGeneration, Outcome: ArchiveLookupPresent,
+		MergeRequestEvidence: &ArchiveMergeRequestEvidence{
+			Merged: true, HeadSHA: "head-sha", MergeCommitSHA: "canonical-merge-sha",
+			FilesChanged: new(4),
+		},
+		Now: now,
+	})
+	require.ErrorIs(err, ErrArchiveItemEvidenceChanged)
+	assert.Equal(
+		ArchiveDatasetProgressPending,
+		archiveProgressStatusForTest(
+			t, database, repoID, ArchiveItemTypeMergeRequest, 7, ArchiveDatasetLookup,
+		),
+	)
+}
+
 func TestRequeueArchiveLifecycleDetailsOnlyReopensIncompleteGitHubRows(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
@@ -696,6 +744,12 @@ func TestRequeueArchiveLifecycleDetailsOnlyReopensIncompleteGitHubRows(t *testin
 		t, database, repoID, ArchiveItemTypeMergeRequest, 7,
 		ArchiveDatasetLookup, ArchiveDatasetProgressComplete,
 	)
+	_, err = database.WriteDB().ExecContext(ctx, `
+		UPDATE forge_archive_dataset_progress
+		SET scan_generation = ?
+		WHERE repo_id = ? AND item_type = 'merge_request'
+		  AND item_number = 7 AND dataset = 'lookup'`, int64(1<<32), repoID)
+	require.NoError(err)
 	issueID := insertArchiveReportIssue(
 		t, database, repoID, 8, "issue-8", "Closed issue", "author", mergedAt.Add(-time.Hour),
 	)

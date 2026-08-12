@@ -450,6 +450,27 @@ fallback repository listing.
 - Archive REST and GraphQL failures must preserve typed authentication and reset-aware rate-limit errors so scheduling defers rather than hot-looping generic retries. (`internal/github/pages.go::archiveTransportError`)
 - GitHub archive code owns historical identity inventory only; hydration must invoke ordinary item sync instead of adding archive-specific lookup, normalization, or persistence. (`internal/github/pages.go::ListIssuesPage`, `internal/github/sync.go::SyncArchiveItem`)
 - Archive item hydration bypasses persisted parent-detail ETags; an unchanged parent representation does not prove that legacy lifecycle timelines are complete. (`internal/github/sync.go::SyncArchiveItem`)
+- Every older-generation active merged GitHub lookup is requeued once; its new
+  generation proves canonical merged detail passed the current verification.
+  (`internal/db/queries_archive.go::RequeueArchiveLifecycleDetails`)
+- A GitHub archive lookup requires fetched and stored merge state to agree;
+  merged lookups also require completed lifecycle persistence, merge time, and
+  matching canonical SHAs and file count. (`internal/github/sync.go::requireGitHubArchiveMergedMRMetrics`)
+- Archive completion atomically revalidates fetched merge evidence against the
+  transaction-current row; a mismatch remains retryable, never complete.
+  (`internal/db/queries_dataset_progress.go::validateArchiveMergeRequestEvidenceTx`)
+- An accepted merged snapshot preserves the stored immutable merge time when
+  the provider omits it; partial detail must not erase durable lifecycle data.
+  (`internal/github/sync.go::preserveMergedAtIfOmitted`)
+- Under repository, number, merged-row, and head-SHA guards, canonical merged
+  detail replaces stored merge SHA and file count while filling missing merge
+  time without weakening snapshot ordering. (`internal/db/queries_merge_lifecycle.go::FillMissingMergedMRMetrics`)
+- Rejected canonical merged snapshots repair each available lifecycle field and
+  the merger event under one route-fence lease; stored parent timing remains
+  authoritative when GitHub omits it, and a rejected fence stays retryable. (`internal/github/sync.go::syncMRForRepoResolved`)
+- Post-hydration completeness queries the repository ID resolved by that sync;
+  never re-resolve the caller's mutable route after reconciliation.
+  (`internal/github/sync.go::SyncArchiveItem`)
 - Archive issue hydration treats timeline failures as hard errors; ordinary issue refresh remains best-effort for that optional dataset. (`internal/github/sync.go::refreshIssueTimeline`)
 - GitHub archive admission with a known registry pacing window paces off
   provider quota alone: availability is the minimum across required resources
