@@ -3648,6 +3648,9 @@ components:
     LocalSyncCeilingStatus:
       additionalProperties: false
       properties:
+        background_limit:
+          format: int64
+          type: integer
         limit:
           format: int64
           type: integer
@@ -3673,6 +3676,7 @@ components:
         - rate_principal
         - principal_label
         - limit
+        - background_limit
         - spent
         - remaining
         - reset_at
