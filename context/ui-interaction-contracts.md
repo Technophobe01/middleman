@@ -475,12 +475,32 @@ Keyboard handlers must have one clear owner for each key press.
   tmux pane to one row — the measurement IS the check. Record a size as sent
   only once the socket carried it, or a resize computed before the socket opened
   is suppressed forever and the PTY keeps its launch default. Synchronize
-  authority on every measurement because geometry changes independently of
-  painted state; reclaiming authority must push even an unchanged size. The
-  preflight measurement establishes authority only: send xterm's dimensions
-  after `fit()`, which measures again and may cross a cell boundary
+  resize eligibility on every measurement, but passive lifecycle or geometry
+  changes never transfer ownership among equal-priority attachments. The latest
+  deliberate terminal action wins within a priority; activating a higher-priority
+  local attachment may preempt an HTTP Fleet attachment. Effective pointer or
+  arrow-key split/dock divider changes are deliberate for terminals whose fitted
+  cells change; each affected session claims only its first cell change per gesture,
+  while later changes remain ordinary live resizes. Zero-motion and passive reflow
+  are not deliberate. Claims apply fitted dimensions and
+  direct/HTTP Fleet streams close rather than forward following input when tmux
+  settlement fails. Single-attachment workspace terminals apply claims as resizes
+  because they have no competing attachment. Ordinary
+  resizes apply for the current owner, only retain fallback dimensions for
+  non-owners, and owner loss restores the most-recent eligible claimant. The
+  preflight measurement establishes eligibility only:
+  send xterm's dimensions after
+  `fit()`, which measures again and may cross a cell boundary
   (`frontend/src/lib/components/terminal/TerminalSplitTree.svelte::terminal-leaf-body`,
-  `frontend/src/lib/components/terminal/XtermTerminalPane.svelte::resizeVisibleTerminal`).
+  `frontend/src/lib/components/terminal/XtermTerminalPane.svelte::resizeVisibleTerminal`,
+  `internal/workspace/localruntime/manager.go::session.resizeAttachment`).
+- Terminal input stays immediate during reconnect replay: resize readiness must
+  never queue or suppress keystrokes, because trapped input is worse than the
+  brief stale-geometry window (`frontend/src/lib/components/terminal/XtermTerminalPane.svelte::handleTerminalMessage`).
+- Only trusted user gestures, including xterm mouse-tracking button/wheel input
+  and input-method composition, transfer terminal resize ownership; automatic
+  protocol replies are transport traffic and must not claim for passive views
+  (`frontend/src/lib/components/terminal/XtermTerminalPane.svelte::handleTerminalWheel`).
 - A promoted session is recorded ONCE, in the detail surface's stored pane tree.
   Containers mask it out of what they render (derived, not an effect) and never
   prune their own stored trees, so demoting restores the tab order, split, and
