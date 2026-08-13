@@ -23,6 +23,14 @@ fixtures, or changing shell-script coverage.
 - Shell-script tests must execute the script against controlled inputs and
   assert observable output, side effects, or exit status. Do not grep scripts,
   workflows, config, or docs for expected implementation text.
+- Private tmux tests retain markers on gate, read, validation, or identity errors;
+  one deadline covers gate closure and startup draining, and cleanup never addresses
+  the default server. (`internal/testutil/testtmux/owner.go::Owner`)
+- Tmux recovery reaps only definitely absent identities and preserves state when
+  lookup is indeterminate; real tmux ownership is supported only on Darwin and
+  Linux, which provide high-resolution process starts. (`internal/testutil/testtmux/process_identity.go::processIdentityStatus`)
+- Orphan recovery accepts explicit or exact server-title socket paths only when
+  contained by the dedicated root. (`internal/testutil/testtmux/owner.go::reapStaleProcesses`)
 - Use provider live or container fixtures only when fake transports cannot
   catch endpoint or authentication drift. GitHub GraphQL validation is gated by
   `KENN_FORGE_LIVE_GITHUB_TESTS=1`.
