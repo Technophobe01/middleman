@@ -195,6 +195,11 @@ Persisted controls must state their scope clearly.
 - `Involves me` is three independent browser-local preferences for Pulls, Issues, and
   Activity; each enabled view sends the server query so filtering happens before limits,
   never through URL or config state (`frontend/src/lib/stores/involves-me-filter.ts`, `internal/db/queries_involvement.go`).
+- Named repository preset definitions follow server settings, while the active
+  repository selection and preset affinity remain browser-local; `Global` clears both
+  (`frontend/src/lib/stores/filter.svelte.ts::setGlobalRepoPresetSelection`).
+- Editing a preset-derived selection retains its overwrite target; an exact saved-set match supplies the label, and deleting the active preset keeps its repositories selected as an ad hoc scope (`frontend/src/lib/stores/repo-presets.ts::findMatchingRepoPreset`).
+- Exact-set matching prefers browser-local preset affinity when multiple immutable preset names contain the same repositories. The selector catalog includes repositories from reachable fleet workspace responses and may prune a Workspaces-route selection only after local, fleet-discovery, and reachable-peer loads all succeed; failures preserve the selection (`frontend/src/lib/stores/workspace-repo-catalog.svelte.ts`, `frontend/src/lib/components/RepoTypeahead.svelte`).
 - The workspace details tab is keyed by host-aware workspace identity; an unsupported
   tab may fall back only for the current live workspace, never rewrite another
   workspace's choice (`frontend/src/lib/components/terminal/WorkspaceTerminalView.svelte::sidebarTabStorageKey`).
@@ -776,8 +781,9 @@ Rows that contain buttons, links, or toggles need clear event ownership.
   was opened for) must never silently fall back to a last-used or first option
   when the seed cannot be resolved — leave the selection empty and require a
   choice (`frontend/src/lib/components/terminal/NewWorkspaceDialog.svelte`).
-- Repository selectors consume server-filtered catalogs; configured-entry
-  consumers gate on the server's `hidden_from_ui` flag and must not reimplement
+- Repository selectors treat the server's `hidden_from_ui` flag as authoritative:
+  once a configured repository is hidden, every matching configured, fetched, or
+  workspace-catalog entry stays out of the selector. Consumers must not reimplement
   visibility matching client-side. Selection normalization must drop hidden
   selections explicitly — general normalization preserves unknown values for
   glob-resolved repositories, so a hidden repo would otherwise keep filtering —
@@ -876,6 +882,7 @@ Not every visibility control means "remove this entity entirely."
   refresh that began before the trigger (`frontend/src/lib/stores/sync.svelte.ts::runTriggeredSync`).
 - Empty states should make it clear when filters, not missing data, are hiding
   results.
+- Workspaces applies the shared repository scope to local and fleet rows by full provider/host/path identity before its text search (`frontend/src/lib/components/terminal/WorkspaceListSidebar.svelte::visibleWorkspaces`).
 
 ## Threaded Comments
 

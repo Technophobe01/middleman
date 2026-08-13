@@ -28,6 +28,14 @@ const codexTarget = {
 
 const settingsPayload = {
   repos: [],
+  repo_presets: [
+    {
+      name: "Review queue",
+      repos: [
+        { provider: "github", platform_host: "github.com", platform_repo_id: "R_widgets", repo_path: "acme/widgets" },
+      ],
+    },
+  ],
   activity: activitySettings,
   issues: { hide_bots: true },
   terminal: DEFAULT_TERMINAL_SETTINGS,
@@ -63,6 +71,11 @@ function hydrate(
 }
 
 describe("applySettingsHydration", () => {
+  it("hydrates repository presets into the settings store", () => {
+    const { settingsStore } = hydrate();
+    expect(settingsStore.getRepoPresets()).toEqual(settingsPayload.repo_presets);
+  });
+
   it("hydrates launch targets into the settings store", () => {
     const { settingsStore } = hydrate();
     expect(settingsStore.getLaunchTargets()).toEqual([codexTarget]);

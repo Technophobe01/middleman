@@ -4058,6 +4058,41 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/settings/repo-presets": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Create repository preset */
+        post: operations["create-repo-preset"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/settings/repo-presets/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Update repository preset */
+        put: operations["update-repo-preset"];
+        post?: never;
+        /** Delete repository preset */
+        delete: operations["delete-repo-preset"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/snapshot": {
         parameters: {
             query?: never;
@@ -5046,6 +5081,7 @@ export interface components {
             name: string;
             owner: string;
             platform_host: string;
+            platform_repo_id?: string;
             provider: string;
             repo_path: string;
             tracked_repo_path?: string;
@@ -7275,6 +7311,22 @@ export interface components {
             submit_review: components["schemas"]["OperationAvailability"];
             update_content: components["schemas"]["OperationAvailability"];
         };
+        RepoPreset: {
+            /**
+             * Format: uri
+             * @description A URL to the JSON Schema for this object.
+             * @example /api/v1/schemas/RepoPreset.json
+             */
+            readonly $schema?: string;
+            name: string;
+            repos: components["schemas"]["RepoPresetRepository"][];
+        };
+        RepoPresetRepository: {
+            platform_host: string;
+            platform_repo_id: string;
+            provider: string;
+            repo_path: string;
+        };
         RepoPreviewRequest: {
             /**
              * Format: uri
@@ -7319,6 +7371,7 @@ export interface components {
             operations?: components["schemas"]["RepoOperations"];
             owner: string;
             platform_host: string;
+            platform_repo_id?: string;
             provider: string;
             repo_path: string;
         };
@@ -7345,6 +7398,7 @@ export interface components {
             Owner: string;
             Platform: string;
             PlatformHost: string;
+            PlatformRepoID: string;
             ViewerCanMerge: boolean;
             capabilities: components["schemas"]["ProviderCapabilitiesResponse"];
             operations: components["schemas"]["RepoOperations"];
@@ -7657,6 +7711,7 @@ export interface components {
             modes?: components["schemas"]["ModeVisibility"];
             notifications: components["schemas"]["NotificationsSettingsResponse"];
             pull_requests: components["schemas"]["PullRequests"];
+            repo_presets: components["schemas"]["RepoPreset"][];
             repos: components["schemas"]["ConfiguredRepoStatus"][];
             terminal: components["schemas"]["Terminal"];
             workspaces: components["schemas"]["Workspaces"];
@@ -7869,6 +7924,15 @@ export interface components {
             peers: components["schemas"]["FleetPeer"][];
             sessions: components["schemas"]["FleetSessions"];
             ssh_peers: components["schemas"]["FleetSSHPeer"][];
+        };
+        UpdateRepoPresetInputBody: {
+            /**
+             * Format: uri
+             * @description A URL to the JSON Schema for this object.
+             * @example /api/v1/schemas/UpdateRepoPresetInputBody.json
+             */
+            readonly $schema?: string;
+            repos: components["schemas"]["RepoPresetRepository"][];
         };
         UpdateSettingsRequest: {
             /**
@@ -17498,6 +17562,105 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["FleetSSHPeersBody"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemError"];
+                };
+            };
+        };
+    };
+    "create-repo-preset": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RepoPreset"];
+            };
+        };
+        responses: {
+            /** @description Created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SettingsResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemError"];
+                };
+            };
+        };
+    };
+    "update-repo-preset": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateRepoPresetInputBody"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SettingsResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemError"];
+                };
+            };
+        };
+    };
+    "delete-repo-preset": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SettingsResponse"];
                 };
             };
             /** @description Error */
