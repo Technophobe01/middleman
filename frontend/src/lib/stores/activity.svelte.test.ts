@@ -640,6 +640,94 @@ describe("activity store author candidates", () => {
   });
 });
 
+describe("activity store projection scope", () => {
+  it("clears a foreground error when same-scope reconciliation succeeds", async () => {
+    const pendingReconciliation = Promise.withResolvers<{
+      data: { items: ActivityItem[]; capped: boolean };
+      error: null;
+    }>();
+    const freshItem = notificationItem("ntf:fresh", "unread");
+    let feedReads = 0;
+    const get = vi.fn((path: string) => {
+      if (path === "/activity/authors") return Promise.resolve({ data: { authors: [] }, error: null });
+      feedReads += 1;
+      if (feedReads === 1) return pendingReconciliation.promise;
+      return Promise.resolve({
+        error: {
+          code: "serviceUnavailable",
+          detail: "activity temporarily unavailable",
+          title: "Service unavailable",
+          type: "about:blank",
+        },
+        response: new Response(null, { status: 503 }),
+      });
+    });
+    const store = createActivityStore({ client: { GET: get } as unknown as GeneratedClient });
+
+    if (runtime === undefined) throw new Error("test runtime was not created");
+    const reconciliation = runtime.runCommand(store.reconcileActivityEffect(), {
+      operation: "reconcile activity in test",
+      safeContext: {},
+      onFailure: () => {},
+    });
+    await vi.waitFor(() => expect(feedReads).toBe(1));
+
+    store.loadActivity();
+    await vi.waitFor(() => expect(store.getActivityError()).toBe("activity temporarily unavailable"));
+
+    pendingReconciliation.resolve({ data: { items: [freshItem], capped: false }, error: null });
+    await reconciliation.exit;
+
+    expect(store.getActivityItems()).toEqual([freshItem]);
+    expect(store.getActivityError()).toBeNull();
+  });
+
+  it("rejects an older unfiltered reconciliation after an Involves me load fails", async () => {
+    const pendingReconciliation = Promise.withResolvers<{
+      data: { items: ActivityItem[]; capped: boolean };
+      error: null;
+    }>();
+    const staleItem = notificationItem("ntf:stale", "unread");
+    let feedReads = 0;
+    const get = vi.fn((path: string, options?: { params?: { query?: { involves_me?: boolean } } }) => {
+      if (path === "/activity/authors") return Promise.resolve({ data: { authors: [] }, error: null });
+      feedReads += 1;
+      if (feedReads === 1) {
+        expect(options?.params?.query?.involves_me).toBeUndefined();
+        return pendingReconciliation.promise;
+      }
+      expect(options?.params?.query?.involves_me).toBe(true);
+      return Promise.resolve({
+        error: {
+          code: "validationError",
+          detail: "filtered activity unavailable",
+          title: "Invalid request",
+          type: "about:blank",
+        },
+        response: new Response(null, { status: 400 }),
+      });
+    });
+    const store = createActivityStore({ client: { GET: get } as unknown as GeneratedClient });
+
+    if (runtime === undefined) throw new Error("test runtime was not created");
+    const reconciliation = runtime.runCommand(store.reconcileActivityEffect(), {
+      operation: "reconcile activity in test",
+      safeContext: {},
+      onFailure: () => {},
+    });
+    await vi.waitFor(() => expect(feedReads).toBe(1));
+
+    store.setInvolvesMe(true);
+    store.loadActivity();
+    await vi.waitFor(() => expect(store.getActivityError()).toBe("filtered activity unavailable"));
+
+    pendingReconciliation.resolve({ data: { items: [staleItem], capped: false }, error: null });
+    await reconciliation.exit;
+
+    expect(store.getActivityItems()).toEqual([]);
+  });
+});
+
 describe("activity store notification visibility", () => {
   it("shows notifications by default and persists hiding them via the notif param", () => {
     const s = makeStore();
@@ -898,6 +986,52 @@ describe("activity store markNotificationSeen", () => {
 });
 
 describe("activity polling recovery", () => {
+  it("clears a foreground error when a replacement poll succeeds afterward", async () => {
+    const pendingPoll = Promise.withResolvers<{
+      data: { items: ActivityItem[]; capped: boolean };
+      error: null;
+    }>();
+    const initial = notificationItem("ntf:initial", "unread");
+    const replacement = notificationItem("ntf:replacement", "unread");
+    let feedReads = 0;
+    const client = {
+      GET: vi.fn((path: string) => {
+        if (path === "/activity/authors") return Promise.resolve({ data: { authors: [] }, error: null });
+        feedReads += 1;
+        if (feedReads === 1) return Promise.resolve({ data: { items: [initial], capped: false }, error: null });
+        if (feedReads === 2) return pendingPoll.promise;
+        if (feedReads === 3) {
+          return Promise.resolve({
+            error: {
+              code: "serviceUnavailable",
+              detail: "activity temporarily unavailable",
+              title: "Service unavailable",
+              type: "about:blank",
+            },
+            response: new Response(null, { status: 503 }),
+          });
+        }
+        if (feedReads === 4) {
+          return Promise.resolve({ data: { items: [replacement], capped: false }, error: null });
+        }
+        throw new Error(`unexpected activity request ${feedReads}`);
+      }),
+    } as unknown as GeneratedClient;
+    const store = createActivityStore({ client });
+    store.loadActivity();
+    await vi.waitFor(() => expect(store.getActivityItems()).toEqual([initial]));
+
+    store.startActivityPolling();
+    await vi.waitFor(() => expect(feedReads).toBe(2));
+    store.loadActivity();
+    await vi.waitFor(() => expect(store.getActivityError()).toBe("activity temporarily unavailable"));
+
+    pendingPoll.resolve({ data: { items: [], capped: true }, error: null });
+
+    await vi.waitFor(() => expect(store.getActivityItems()).toEqual([replacement]));
+    expect(store.getActivityError()).toBeNull();
+  });
+
   it("refreshes author candidates when polling appends new activity", async () => {
     let authors = ["Alice"];
     let feedReads = 0;

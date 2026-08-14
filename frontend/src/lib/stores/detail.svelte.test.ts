@@ -717,6 +717,34 @@ describe("createDetailStore", () => {
     expect(pulls.loadPulls).toHaveBeenCalledTimes(1);
   });
 
+  it("reconciles visible lists when selection closes during an explicit detail sync", async () => {
+    const syncPost = Promise.withResolvers<{ data: PullDetail; error: undefined }>();
+    const post = vi.fn(() => syncPost.promise);
+    const loadPulls = vi.fn();
+    const onDetailSynchronized = vi.fn();
+    const store = createDetailStore({
+      client: mockClient({ POST: post }),
+      getPage: () => "pulls",
+      pulls: { loadPulls },
+      onDetailSynchronized,
+    });
+
+    const syncing = syncDetail(store, "acme", "widget", 7, {
+      provider: "github",
+      platformHost: "github.com",
+      repoPath: "acme/widget",
+    });
+    await vi.waitFor(() => expect(post).toHaveBeenCalledOnce());
+    store.clearDetail();
+
+    syncPost.resolve({ data: pullDetail("fresh-head"), error: undefined });
+
+    await expect(syncing).resolves.toBe(false);
+    expect(loadPulls).toHaveBeenCalledOnce();
+    expect(onDetailSynchronized).toHaveBeenCalledOnce();
+    expect(store.getDetail()).toBeNull();
+  });
+
   it("reports when an explicit detail sync cannot refresh state", async () => {
     const store = createDetailStore({
       client: mockClient({
@@ -761,6 +789,82 @@ describe("createDetailStore", () => {
       },
       signal: expect.any(AbortSignal),
     });
+  });
+
+  it("reconciles visible activity and pull lists after a background detail sync converges", async () => {
+    vi.useFakeTimers();
+    const cached = pullDetail("cached-head");
+    cached.detail_fetched_at = "2026-08-12T21:00:00Z";
+    const fresh = pullDetail("fresh-head");
+    fresh.detail_fetched_at = "2026-08-12T21:03:00Z";
+    const get = vi.fn().mockResolvedValueOnce({ data: cached }).mockResolvedValue({ data: fresh });
+    const loadPulls = vi.fn();
+    const onDetailSynchronized = vi.fn();
+    const store = createDetailStore({
+      client: mockClient({
+        GET: get,
+        POST: vi.fn().mockResolvedValue({ data: undefined, error: undefined }),
+      }),
+      getPage: () => "pulls",
+      pulls: { loadPulls },
+      onDetailSynchronized,
+    });
+
+    await loadDetail(store, "acme", "widget", 7, {
+      provider: "github",
+      platformHost: "github.com",
+      repoPath: "acme/widget",
+      sync: "background",
+    });
+    await vi.advanceTimersByTimeAsync(300);
+
+    await vi.waitFor(() => expect(store.getDetail()?.merge_request.platform_head_sha).toBe("fresh-head"));
+    expect(loadPulls).toHaveBeenCalledOnce();
+    expect(onDetailSynchronized).toHaveBeenCalledOnce();
+  });
+
+  it("reconciles visible lists when selection changes during a background detail sync", async () => {
+    vi.useFakeTimers();
+    const cached = pullDetailFor("widget-a", 7, "cached-head");
+    cached.detail_fetched_at = "2026-08-12T21:00:00Z";
+    const other = pullDetailFor("widget-b", 8, "other-head");
+    const fresh = pullDetailFor("widget-a", 7, "fresh-head");
+    fresh.detail_fetched_at = "2026-08-12T21:03:00Z";
+    const syncPost = Promise.withResolvers<{ data: undefined; error: undefined }>();
+    const get = vi
+      .fn()
+      .mockResolvedValueOnce({ data: cached })
+      .mockResolvedValueOnce({ data: other })
+      .mockResolvedValueOnce({ data: fresh });
+    const loadPulls = vi.fn();
+    const onDetailSynchronized = vi.fn();
+    const store = createDetailStore({
+      client: mockClient({ GET: get, POST: vi.fn(() => syncPost.promise) }),
+      getPage: () => "pulls",
+      pulls: { loadPulls },
+      onDetailSynchronized,
+    });
+
+    await loadDetail(store, "acme", "widget-a", 7, {
+      provider: "github",
+      platformHost: "github.com",
+      repoPath: "acme/widget-a",
+      sync: "background",
+    });
+    await loadDetail(store, "acme", "widget-b", 8, {
+      provider: "github",
+      platformHost: "github.com",
+      repoPath: "acme/widget-b",
+      sync: false,
+    });
+
+    syncPost.resolve({ data: undefined, error: undefined });
+    await vi.advanceTimersByTimeAsync(300);
+
+    await vi.waitFor(() => expect(onDetailSynchronized).toHaveBeenCalledOnce());
+    expect(loadPulls).toHaveBeenCalledOnce();
+    expect(store.getDetail()?.repo_name).toBe("widget-b");
+    expect(store.getDetail()?.merge_request.platform_head_sha).toBe("other-head");
   });
 
   it("does not overlap detail polling iterations", async () => {

@@ -886,6 +886,22 @@ Not every visibility control means "remove this entity entirely."
   the feature explicitly removes that category from the result set.
 - When two data sources race, prefer the source that matches the user's current
   filter/scope rather than a stale but faster preview.
+- Detail sync convergence must directly reconcile visible PR, issue, and Activity
+  lists; Activity's forward cursor cannot surface newly persisted events older than
+  unrelated leading rows. Selection generations gate only detail installation, not
+  successful-sync invalidation (`frontend/src/lib/stores/detail.svelte.ts::reconcileListsAfterDetailSync`, `frontend/src/lib/stores/issues.svelte.ts::reconcileListsAfterDetailSync`).
+- Activity full-snapshot projections are latest-successful-request-wins across
+  foreground and convergence reads. Incremental polling neither claims snapshot
+  authority nor overwrites a later claimed snapshot; replacement polling does
+  claim snapshot authority. Failed reads do not claim
+  projection: convergence failure must not invalidate an in-flight foreground
+  load or suppress an earlier successful convergence read, and foreground failure
+  must not suppress same-scope convergence. Request-start order decides between
+  successful snapshots, and a logical filter-scope change still fences the old result.
+  A later successful snapshot fences older foreground failures; without one, a fenced
+  foreground owner still settles loading (`frontend/src/lib/stores/activity-workflow.ts::ActivityWorkflowLive`).
+  Every authoritative snapshot projection clears an earlier error banner
+  (`frontend/src/lib/stores/activity.svelte.ts::createActivityStore`).
 - After a sync trigger is accepted, retain optimistic running state through the
   pre-trigger idle snapshot; accept completion only after running or a newer `last_run_at`
   (`frontend/src/lib/stores/sync.svelte.ts::applySyncStatus`).

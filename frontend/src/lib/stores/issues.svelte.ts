@@ -64,6 +64,11 @@ type IssueDetailRequestRef = {
   repoPath: string;
 };
 
+interface IssueDetailRefreshResult {
+  readonly applied: boolean;
+  readonly fetchedAt?: string;
+}
+
 interface IssueCommentMutationState {
   readonly event: IssueEvent;
   readonly index: number;
@@ -75,6 +80,7 @@ export interface IssuesStoreOptions {
   getGlobalRepo?: () => string | undefined;
   getGroupByRepo?: () => boolean;
   getPage?: () => string;
+  onDetailSynchronized?: () => void;
   sync?: {
     refreshSyncStatus?: () => void;
   };
@@ -106,12 +112,18 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
   const getGlobalRepo = opts.getGlobalRepo ?? (() => undefined);
   const getGroupByRepo = opts.getGroupByRepo ?? (() => false);
   const getPage = opts.getPage ?? (() => "");
+  const onDetailSynchronized = opts.onDetailSynchronized ?? (() => {});
   const syncDep = opts.sync;
 
   function refreshIssuesIfActive(): void {
-    if (getPage() === "issues") {
+    if (["issues", "mobile-issues", "focus"].includes(getPage())) {
       loadIssues();
     }
+  }
+
+  function reconcileListsAfterDetailSync(): void {
+    refreshIssuesIfActive();
+    onDetailSynchronized();
   }
 
   // --- list state ---
@@ -754,7 +766,14 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
   function refreshIssueDetailProgram(ref: IssueDetailRequestRef, expectedGeneration: number) {
     const envelopeTick = nextWorkspaceLifecycleTick();
     return readIssueDetail(ref, "GET issue detail refresh").pipe(
-      Effect.flatMap((authoritative) => installIssueDetail(ref, authoritative, envelopeTick, expectedGeneration, true)),
+      Effect.flatMap((authoritative) =>
+        installIssueDetail(ref, authoritative, envelopeTick, expectedGeneration, true).pipe(
+          Effect.map((applied) => ({
+            applied,
+            ...(authoritative.detail_fetched_at != null && { fetchedAt: authoritative.detail_fetched_at }),
+          })),
+        ),
+      ),
     );
   }
 
@@ -767,12 +786,15 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
       }),
     ).pipe(
       Effect.map((data): IssueDetail => ({ ...data, events: data.events ?? [] })),
+      Effect.tap(() => Effect.sync(reconcileListsAfterDetailSync)),
       Effect.flatMap((authoritative) =>
         installIssueDetail(ref, authoritative, envelopeTick, expectedGeneration, false),
       ),
       Effect.tap((applied) =>
         Effect.sync(() => {
-          if (applied) detailError = null;
+          if (applied) {
+            detailError = null;
+          }
         }),
       ),
       Effect.catch(() => Effect.succeed(false)),
@@ -785,7 +807,6 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
         Effect.sync(() => {
           if (expectedGeneration === issueSyncGeneration) {
             detailSyncing = false;
-            refreshIssuesIfActive();
           }
           syncDep?.refreshSyncStatus?.();
         }),
@@ -801,11 +822,13 @@ export function createIssuesStore(opts: IssuesStoreOptions) {
     const refreshUntilFresh = Effect.gen(function* () {
       for (const delay of [300, 700, 1_500, 3_000, 5_000]) {
         yield* Effect.sleep(delay);
-        if (expectedGeneration !== issueSyncGeneration) return;
-        yield* refreshIssueDetailProgram(ref, expectedGeneration).pipe(Effect.catch(() => Effect.succeed(false)));
-        if (expectedGeneration !== issueSyncGeneration) return;
-        const fetchedAt = issueDetail?.detail_fetched_at;
-        if (fetchedAt && fetchedAt !== previousFetchedAt) return;
+        const result: IssueDetailRefreshResult = yield* refreshIssueDetailProgram(ref, expectedGeneration).pipe(
+          Effect.catch(() => Effect.succeed({ applied: false })),
+        );
+        if (result.fetchedAt && result.fetchedAt !== previousFetchedAt) {
+          reconcileListsAfterDetailSync();
+          return;
+        }
       }
     });
     const sync = executeGeneratedApiRequest("POST async issue detail sync", (client, signal) =>
