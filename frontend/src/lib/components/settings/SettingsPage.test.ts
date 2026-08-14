@@ -19,6 +19,8 @@ vi.mock("../../context.js", async (importOriginal) => ({
       setRepoPresets,
       setModeVisibility: vi.fn(),
       setPullRequestSettings: vi.fn(),
+      getWorkspaceSettings: () => ({ auto_assign_on_create: false, default_sidebar_view: "diff" as const }),
+      setWorkspaceSettings: vi.fn(),
       setLaunchTargets,
     },
   }),
@@ -90,7 +92,7 @@ function makeSettings(): Settings {
       },
     ],
     pull_requests: { allow_mid_stack_merges: false, prefer_github_native_stacks: false },
-    workspaces: { auto_assign_on_create: false },
+    workspaces: { auto_assign_on_create: false, default_sidebar_view: "diff" },
     issues: { hide_bots: true },
     kata_projects: [],
     fleet: {

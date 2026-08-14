@@ -548,6 +548,41 @@ func TestHandleUpdateSettingsPublishesPullConfigOnlyAfterPersistence(t *testing.
 	)
 }
 
+func TestHandleUpdateSettingsSerializesWithConfigReload(t *testing.T) {
+	require := require.New(t)
+	srv, _, _ := setupTestServerWithConfig(t)
+
+	srv.configReloadMu.Lock()
+	done := make(chan error, 1)
+	started := make(chan struct{})
+	go func() {
+		close(started)
+		_, err := srv.updateSettings(context.Background(), &updateSettingsInput{
+			Body: updateSettingsRequest{
+				Activity: &config.Activity{TimeRange: "30d", ViewMode: "threaded"},
+			},
+		})
+		done <- err
+	}()
+	<-started
+
+	select {
+	case err := <-done:
+		srv.configReloadMu.Unlock()
+		require.NoError(err)
+		require.Fail("settings update completed while config reload lock was held")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	srv.configReloadMu.Unlock()
+	select {
+	case err := <-done:
+		require.NoError(err)
+	case <-time.After(5 * time.Second):
+		require.Fail("settings update did not complete after config reload lock was released")
+	}
+}
+
 func TestHandleUpdateSettingsPersistsKataProjectMappings(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
@@ -602,7 +637,12 @@ func TestHandleUpdateSettings(t *testing.T) {
 		HideBots:   true,
 	}
 	issues := config.Issues{HideBots: true}
-	workspaces := config.Workspaces{AutoAssignOnCreate: true}
+	autoAssign := true
+	defaultSidebarView := "item"
+	workspaces := workspaceSettingsUpdate{
+		AutoAssignOnCreate: &autoAssign,
+		DefaultSidebarView: &defaultSidebarView,
+	}
 	terminal := config.Terminal{
 		FontFamily:       "\"Fira Code\", monospace",
 		FontSize:         16,
@@ -631,6 +671,7 @@ func TestHandleUpdateSettings(t *testing.T) {
 	assert.Equal("30d", cfg2.Activity.TimeRange)
 	assert.True(cfg2.Issues.HideBots)
 	assert.True(cfg2.Workspaces.AutoAssignOnCreate)
+	assert.Equal("item", cfg2.Workspaces.DefaultSidebarView)
 	assert.Equal("\"Fira Code\", monospace", cfg2.Terminal.FontFamily)
 	assert.Equal(16, cfg2.Terminal.FontSize)
 	assert.Equal(5000, cfg2.Terminal.Scrollback)
@@ -639,6 +680,25 @@ func TestHandleUpdateSettings(t *testing.T) {
 	assert.True(cfg2.Terminal.HideTmuxStatus)
 	require.NotNil(t, cfg2.Terminal.RetainedSessions)
 	assert.Equal(4, *cfg2.Terminal.RetainedSessions)
+}
+
+func TestHandleUpdateSettingsMergesWorkspaceFields(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	srv, _, cfgPath := setupTestServerWithConfig(t)
+	srv.cfg.Workspaces.AutoAssignOnCreate = true
+	require.NoError(srv.cfg.Save(cfgPath))
+
+	defaultSidebarView := "item"
+	rr := doJSON(t, srv, http.MethodPut, "/api/v1/settings", updateSettingsRequest{
+		Workspaces: &workspaceSettingsUpdate{DefaultSidebarView: &defaultSidebarView},
+	})
+	require.Equal(http.StatusOK, rr.Code, rr.Body.String())
+
+	cfg2, err := config.Load(cfgPath)
+	require.NoError(err)
+	assert.True(cfg2.Workspaces.AutoAssignOnCreate)
+	assert.Equal("item", cfg2.Workspaces.DefaultSidebarView)
 }
 
 func TestHandleUpdateSettingsDisablesNativeStackProjectionImmediately(t *testing.T) {

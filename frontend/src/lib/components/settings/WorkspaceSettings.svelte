@@ -1,24 +1,32 @@
 <script lang="ts">
+  import { SelectDropdown, type SelectDropdownOption } from "@kenn-io/kit-ui";
   import { Effect } from "effect";
   import type { Settings } from "../../api/types.js";
 
   import { getAppRuntime } from "../../app/runtime-context.js";
+  import { getStores } from "../../context.js";
   import { isEmbedded } from "../../stores/embed-config.svelte.js";
-  import { SettingsWorkflow, settingsErrorMessage } from "../../stores/settings-workflow.js";
+  import { settingsErrorMessage } from "../../stores/settings-workflow.js";
+  import { saveWorkspaceSettings } from "../../stores/workspace-settings-persistence.js";
 
   interface Props {
-    workspaces: Settings["workspaces"];
     onUpdate: (settings: Settings["workspaces"]) => void;
   }
 
-  let { workspaces, onUpdate }: Props = $props();
+  let { onUpdate }: Props = $props();
   const runtime = getAppRuntime();
+  const { settings: settingsStore } = getStores();
+  const workspaces = $derived(settingsStore.getWorkspaceSettings());
   const embedded = isEmbedded();
   let saving = $state(false);
+  const defaultSidebarViewOptions: SelectDropdownOption[] = [
+    { value: "diff", label: "Diff" },
+    { value: "item", label: "PR/Issue" },
+  ];
 
   function toggleAutoAssign(): void {
     if (embedded || saving) return;
-    const previous = workspaces;
+    const baseline = workspaces;
     const pending = {
       ...workspaces,
       auto_assign_on_create: !workspaces.auto_assign_on_create,
@@ -27,16 +35,19 @@
     saving = true;
     runtime.runCommand(
       Effect.gen(function* () {
-        const workflow = yield* SettingsWorkflow;
-        return yield* workflow.persist(() => ({ workspaces: pending }));
+        return yield* saveWorkspaceSettings({
+          baseline,
+          changes: { auto_assign_on_create: pending.auto_assign_on_create },
+          store: settingsStore,
+        });
       }).pipe(
         Effect.matchEffect({
           onFailure: (failure) =>
             Effect.sync(() => {
-              onUpdate(previous);
+              onUpdate(settingsStore.getWorkspaceSettings());
               console.warn("Failed to save workspace settings:", settingsErrorMessage(failure));
             }),
-          onSuccess: (settings) => Effect.sync(() => onUpdate(settings.workspaces)),
+          onSuccess: () => Effect.sync(() => onUpdate(settingsStore.getWorkspaceSettings())),
         }),
         Effect.ensuring(Effect.sync(() => {
           saving = false;
@@ -47,6 +58,34 @@
         safeContext: {},
         onFailure: () => {},
       },
+    );
+  }
+
+  function setDefaultSidebarView(value: string): void {
+    const defaultSidebarView = value as Settings["workspaces"]["default_sidebar_view"];
+    if (embedded || saving || defaultSidebarView === workspaces.default_sidebar_view) return;
+    const baseline = workspaces;
+    const pending = { ...workspaces, default_sidebar_view: defaultSidebarView };
+    onUpdate(pending);
+    saving = true;
+    runtime.runCommand(
+      Effect.gen(function* () {
+        return yield* saveWorkspaceSettings({
+          baseline,
+          changes: { default_sidebar_view: pending.default_sidebar_view },
+          store: settingsStore,
+        });
+      }).pipe(
+        Effect.matchEffect({
+          onFailure: (failure) => Effect.sync(() => {
+            onUpdate(settingsStore.getWorkspaceSettings());
+            console.warn("Failed to save workspace settings:", settingsErrorMessage(failure));
+          }),
+          onSuccess: () => Effect.sync(() => onUpdate(settingsStore.getWorkspaceSettings())),
+        }),
+        Effect.ensuring(Effect.sync(() => { saving = false; })),
+      ),
+      { operation: "save workspace settings", safeContext: {}, onFailure: () => {} },
     );
   }
 </script>
@@ -70,6 +109,20 @@
       <span class="toggle-track"><span class="toggle-thumb"></span></span>
     </button>
   </div>
+  <div class="setting-row">
+    <div class="setting-copy">
+      <span class="setting-label">Default sidebar view</span>
+      <span class="setting-description">Choose the initial details view for workspaces created from a pull request or issue.</span>
+    </div>
+    <SelectDropdown
+      class="sidebar-view-select"
+      title="Default sidebar view"
+      value={workspaces.default_sidebar_view}
+      options={defaultSidebarViewOptions}
+      disabled={embedded || saving}
+      onchange={setDefaultSidebarView}
+    />
+  </div>
 </div>
 
 <style>
@@ -84,4 +137,5 @@
   .toggle-on .toggle-track { background: var(--accent-blue); border-color: var(--accent-blue); }
   .toggle-thumb { display: block; width: 14px; height: 14px; border-radius: 50%; background: white; position: absolute; top: 2px; left: 2px; transition: transform 0.15s; box-shadow: var(--shadow-sm); }
   .toggle-on .toggle-thumb { transform: translateX(16px); }
+  :global(.sidebar-view-select) { min-width: 120px; }
 </style>

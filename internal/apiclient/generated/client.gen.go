@@ -875,6 +875,42 @@ func (e WorkspaceResponseMrHeadRepoKind) Valid() bool {
 	}
 }
 
+// Defines values for WorkspaceSettingsUpdateDefaultSidebarView.
+const (
+	WorkspaceSettingsUpdateDefaultSidebarViewDiff WorkspaceSettingsUpdateDefaultSidebarView = "diff"
+	WorkspaceSettingsUpdateDefaultSidebarViewItem WorkspaceSettingsUpdateDefaultSidebarView = "item"
+)
+
+// Valid indicates whether the value is a known member of the WorkspaceSettingsUpdateDefaultSidebarView enum.
+func (e WorkspaceSettingsUpdateDefaultSidebarView) Valid() bool {
+	switch e {
+	case WorkspaceSettingsUpdateDefaultSidebarViewDiff:
+		return true
+	case WorkspaceSettingsUpdateDefaultSidebarViewItem:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for WorkspacesDefaultSidebarView.
+const (
+	WorkspacesDefaultSidebarViewDiff WorkspacesDefaultSidebarView = "diff"
+	WorkspacesDefaultSidebarViewItem WorkspacesDefaultSidebarView = "item"
+)
+
+// Valid indicates whether the value is a known member of the WorkspacesDefaultSidebarView enum.
+func (e WorkspacesDefaultSidebarView) Valid() bool {
+	switch e {
+	case WorkspacesDefaultSidebarViewDiff:
+		return true
+	case WorkspacesDefaultSidebarViewItem:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for GetPullFilePreviewOnHostParamsSide.
 const (
 	GetPullFilePreviewOnHostParamsSideNew GetPullFilePreviewOnHostParamsSide = "new"
@@ -4376,7 +4412,7 @@ type UpdateSettingsRequest struct {
 	Modes        *ModeVisibility           `json:"modes,omitempty"`
 	PullRequests *PullRequests             `json:"pull_requests,omitempty"`
 	Terminal     *Terminal                 `json:"terminal,omitempty"`
-	Workspaces   *Workspaces               `json:"workspaces,omitempty"`
+	Workspaces   *WorkspaceSettingsUpdate  `json:"workspaces,omitempty"`
 }
 
 // UserRepository defines model for UserRepository.
@@ -4542,10 +4578,23 @@ type WorkspaceRuntimeResponse struct {
 	Sessions      *[]SessionInfo  `json:"sessions"`
 }
 
+// WorkspaceSettingsUpdate defines model for WorkspaceSettingsUpdate.
+type WorkspaceSettingsUpdate struct {
+	AutoAssignOnCreate *bool                                      `json:"auto_assign_on_create,omitempty"`
+	DefaultSidebarView *WorkspaceSettingsUpdateDefaultSidebarView `json:"default_sidebar_view,omitempty"`
+}
+
+// WorkspaceSettingsUpdateDefaultSidebarView defines model for WorkspaceSettingsUpdate.DefaultSidebarView.
+type WorkspaceSettingsUpdateDefaultSidebarView string
+
 // Workspaces defines model for Workspaces.
 type Workspaces struct {
-	AutoAssignOnCreate bool `json:"auto_assign_on_create"`
+	AutoAssignOnCreate bool                         `json:"auto_assign_on_create"`
+	DefaultSidebarView WorkspacesDefaultSidebarView `json:"default_sidebar_view"`
 }
+
+// WorkspacesDefaultSidebarView defines model for Workspaces.DefaultSidebarView.
+type WorkspacesDefaultSidebarView string
 
 // WorktreeFromMergeRequestResponse defines model for WorktreeFromMergeRequestResponse.
 type WorktreeFromMergeRequestResponse struct {

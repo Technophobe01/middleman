@@ -378,7 +378,6 @@ test("dock reclaims focus when its focused session stops", async ({ page }) => {
     expect(sessionKeys).toHaveLength(3);
 
     await page.goto(`${isolatedServer.info.base_url}/issues/github/acme/widgets/10`);
-    await expect(page.locator(".detail-pane-workspace-slot .workspace-host-wrapper")).toBeVisible();
     const panel = await openTerminalPanel(page);
     const focusedTerminal = panel.locator(".terminal-container").first();
     await focusedTerminal.click({ position: { x: 10, y: 10 } });

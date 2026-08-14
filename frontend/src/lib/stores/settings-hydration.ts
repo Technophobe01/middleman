@@ -1,4 +1,5 @@
 import { hydrateTerminalSettings, type TerminalSettingsHydration } from "./terminal-settings-persistence.js";
+import { hydrateWorkspaceSettings, type WorkspaceSettingsHydration } from "./workspace-settings-persistence.js";
 import type { components } from "../api/generated/schema.js";
 
 type SettingsResponse = components["schemas"]["SettingsResponse"];
@@ -12,6 +13,8 @@ export interface SettingsHydrationStore {
   setModeVisibility: (modes: SettingsResponse["modes"]) => void;
   setPullRequestSettings: (pullRequests: SettingsResponse["pull_requests"]) => void;
   setLaunchTargets: (targets: NonNullable<SettingsResponse["launch_targets"]>) => void;
+  setWorkspaceSettings: (workspaces: SettingsResponse["workspaces"]) => void;
+  getWorkspaceSettings: () => SettingsResponse["workspaces"];
 }
 
 export interface ActivityHydrationStore {
@@ -38,6 +41,7 @@ export function applySettingsHydration(
   },
   payload: SettingsHydrationPayload,
   terminalHydration: TerminalSettingsHydration,
+  workspaceHydration: WorkspaceSettingsHydration,
 ): void {
   stores.settings.setConfiguredRepos(payload.repos);
   stores.settings.setRepoPresets(payload.repo_presets);
@@ -45,6 +49,7 @@ export function applySettingsHydration(
   stores.settings.setModeVisibility(payload.modes);
   stores.settings.setPullRequestSettings(payload.pull_requests);
   stores.settings.setLaunchTargets(payload.launch_targets ?? []);
+  hydrateWorkspaceSettings(workspaceHydration, payload.workspaces);
   stores.activity.hydrateDefaults(payload.activity);
   stores.issues.hydrateDefaults(payload.issues);
 }

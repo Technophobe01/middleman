@@ -1,7 +1,7 @@
 import { afterEach, assert, it, vi } from "@effect/vitest";
 import { Deferred, Effect, Fiber, Layer } from "effect";
 import type { StoreInstances } from "../types.js";
-import { DEFAULT_TERMINAL_SETTINGS, type TerminalSettings } from "../api/types.js";
+import { DEFAULT_TERMINAL_SETTINGS, type Settings, type TerminalSettings } from "../api/types.js";
 import { TransientTransportError } from "../api/effect-errors.js";
 import { StartupWorkflow, type StartupSnapshot } from "../app/startup-workflow.js";
 import { appStartupProgram } from "./appStartup.js";
@@ -26,6 +26,10 @@ function makeStores(
 ): StoreInstances {
   let terminalSettings = { ...DEFAULT_TERMINAL_SETTINGS };
   let launchTargets: LaunchTargets = [];
+  let workspaceSettings: Settings["workspaces"] = {
+    auto_assign_on_create: false,
+    default_sidebar_view: "diff",
+  };
   return {
     settings: {
       setConfiguredRepos: vi.fn(),
@@ -36,6 +40,10 @@ function makeStores(
         terminalSettings = settings;
       }),
       setPullRequestSettings: vi.fn(),
+      getWorkspaceSettings: () => workspaceSettings,
+      setWorkspaceSettings: vi.fn((settings) => {
+        workspaceSettings = settings;
+      }),
       setTerminalFontFamily: vi.fn(),
       getLaunchTargets: () => launchTargets,
       setLaunchTargets: vi.fn((targets: LaunchTargets) => {
@@ -66,7 +74,7 @@ const settings = {
   repos: [],
   repo_presets: [],
   pull_requests: { allow_mid_stack_merges: false, prefer_github_native_stacks: false },
-  workspaces: { auto_assign_on_create: false },
+  workspaces: { auto_assign_on_create: false, default_sidebar_view: "diff" },
   issues: { hide_bots: true },
   kata_projects: [],
   fleet: {
