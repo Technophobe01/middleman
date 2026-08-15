@@ -200,7 +200,7 @@ func (s *Handler) applyReviewSuggestions(
 		availability.Code == "rate_limited" {
 		return nil, operationRateLimitedProblem(*repo, availability)
 	}
-	mr, err := s.db.GetMergeRequestByRepoIDAndNumber(ctx, repo.ID, input.Number)
+	mr, err := s.visibleMergeRequest(ctx, repo.ID, input.Number)
 	if err != nil {
 		return nil, huma.Error500InternalServerError("get pull request failed")
 	}
@@ -472,10 +472,29 @@ func (s *Handler) syncAfterReviewSuggestionApply(repo db.Repo, number int) {
 			"source", "review_suggestion_apply",
 		},
 		func(ctx context.Context) error {
-			return s.syncer.SyncMROnProvider(
-				ctx, kind, host, repo.Owner, repo.Name, number,
-			)
+			return s.syncMergeRequestIfVisible(ctx, repo, number)
 		},
+	)
+}
+
+func (s *Handler) syncMergeRequestIfVisible(
+	ctx context.Context,
+	repo db.Repo,
+	number int,
+) error {
+	removed, err := s.db.IsArchiveItemRemovedUpstream(
+		ctx, repo.ID, db.ArchiveItemTypeMergeRequest, number,
+	)
+	if err != nil {
+		return fmt.Errorf("check pull request visibility: %w", err)
+	}
+	if removed {
+		return nil
+	}
+	return s.syncer.SyncMROnProvider(
+		ctx,
+		repoProviderKind(repo), repoProviderHost(repo),
+		repo.Owner, repo.Name, number,
 	)
 }
 
@@ -491,7 +510,7 @@ func (s *Handler) publishDiffReviewDraft(
 	if err != nil {
 		return nil, err
 	}
-	mr, err := s.db.GetMergeRequestByRepoIDAndNumber(ctx, repo.ID, input.Number)
+	mr, err := s.visibleMergeRequest(ctx, repo.ID, input.Number)
 	if err != nil {
 		return nil, huma.Error500InternalServerError("get pull request failed")
 	}
@@ -626,10 +645,8 @@ func (s *Handler) tryIngestPublishedReviewThreads(
 
 func (s *Handler) syncAfterReviewDraftPublish(repo db.Repo, number int) {
 	s.runBackground(func(bgCtx context.Context) {
-		if syncErr := s.syncer.SyncMROnProvider(
-			bgCtx,
-			repoProviderKind(repo), repoProviderHost(repo),
-			repo.Owner, repo.Name, number,
+		if syncErr := s.syncMergeRequestIfVisible(
+			bgCtx, repo, number,
 		); syncErr != nil {
 			slog.Warn("background sync after review draft publish", "err", syncErr)
 		}
@@ -713,7 +730,7 @@ func (s *Handler) setDiffReviewThreadResolved(
 	if err != nil {
 		return nil, err
 	}
-	mr, err := s.db.GetMergeRequestByRepoIDAndNumber(ctx, repo.ID, input.Number)
+	mr, err := s.visibleMergeRequest(ctx, repo.ID, input.Number)
 	if err != nil {
 		return nil, huma.Error500InternalServerError("get pull request failed")
 	}
@@ -768,7 +785,7 @@ func (s *Handler) lookupReviewDraftTarget(
 	if err != nil {
 		return nil, nil, providerRouteLookupError(err)
 	}
-	mr, err := s.db.GetMergeRequestByRepoIDAndNumber(ctx, repo.ID, number)
+	mr, err := s.visibleMergeRequest(ctx, repo.ID, number)
 	if err != nil {
 		return nil, nil, huma.Error500InternalServerError("get pull request failed")
 	}
@@ -791,7 +808,7 @@ func (s *Handler) lookupReviewDraftMutationTarget(
 	if err != nil {
 		return nil, nil, err
 	}
-	mr, err := s.db.GetMergeRequestByRepoIDAndNumber(ctx, repo.ID, number)
+	mr, err := s.visibleMergeRequest(ctx, repo.ID, number)
 	if err != nil {
 		return nil, nil, huma.Error500InternalServerError("get pull request failed")
 	}

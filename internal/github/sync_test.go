@@ -7652,6 +7652,9 @@ type dedupGetUserClient struct {
 	mockClient
 	getUserCount atomic.Int32
 	block        chan struct{}
+	listEntered  chan struct{}
+	listRelease  chan struct{}
+	userEntered  chan struct{}
 	author       string
 	now          time.Time
 }
@@ -7659,6 +7662,8 @@ type dedupGetUserClient struct {
 func (c *dedupGetUserClient) ListOpenPullRequests(
 	_ context.Context, _, repo string,
 ) ([]*gh.PullRequest, error) {
+	c.listEntered <- struct{}{}
+	<-c.listRelease
 	number := 1
 	if repo == "r2" {
 		number = 2
@@ -7672,6 +7677,7 @@ func (c *dedupGetUserClient) GetUser(
 	_ context.Context, login string,
 ) (*gh.User, error) {
 	c.getUserCount.Add(1)
+	c.userEntered <- struct{}{}
 	<-c.block
 	name := "Display " + login
 	return &gh.User{Login: &login, Name: &name}, nil
@@ -7686,9 +7692,12 @@ func TestResolveDisplayNameDedupsConcurrentLookups(t *testing.T) {
 	now := time.Date(2026, 4, 8, 12, 0, 0, 0, time.UTC)
 
 	mc := &dedupGetUserClient{
-		block:  make(chan struct{}),
-		author: author,
-		now:    now,
+		block:       make(chan struct{}),
+		listEntered: make(chan struct{}, 2),
+		listRelease: make(chan struct{}),
+		userEntered: make(chan struct{}, 1),
+		author:      author,
+		now:         now,
 	}
 
 	syncer := NewSyncer(
@@ -7707,14 +7716,26 @@ func TestResolveDisplayNameDedupsConcurrentLookups(t *testing.T) {
 		close(done)
 	}()
 
-	// Wait until at least one worker has entered GetUser. Sleeping
-	// does not prove the second worker has arrived yet, but the
-	// blocked fn holds the singleflight slot open until we release
-	// it, so any arriving worker will be coalesced.
-	require.Eventually(func() bool {
-		return mc.getUserCount.Load() >= 1
-	}, 2*time.Second, 5*time.Millisecond,
-		"no worker reached GetUser")
+	// Hold both repository workers at the PR-list boundary. This keeps the
+	// assertion focused on display-name coalescing instead of imposing a short
+	// wall-clock deadline on the complete repository-sync startup path.
+	startupDeadline := time.NewTimer(30 * time.Second)
+	defer startupDeadline.Stop()
+	for range 2 {
+		select {
+		case <-mc.listEntered:
+		case <-startupDeadline.C:
+			require.Fail("both workers did not reach pull request listing")
+			return
+		}
+	}
+	close(mc.listRelease)
+
+	select {
+	case <-mc.userEntered:
+	case <-time.After(30 * time.Second):
+		require.Fail("no worker reached GetUser")
+	}
 
 	// Give the second worker plenty of time to enter singleflight.
 	time.Sleep(100 * time.Millisecond)
@@ -7723,7 +7744,7 @@ func TestResolveDisplayNameDedupsConcurrentLookups(t *testing.T) {
 
 	select {
 	case <-done:
-	case <-time.After(5 * time.Second):
+	case <-time.After(30 * time.Second):
 		require.Fail("RunOnce did not complete")
 	}
 
@@ -11862,6 +11883,91 @@ func TestDetailDrainSkipsRepoArchivedMidPass(t *testing.T) {
 	assert.True(tracked[0].Archived)
 }
 
+func TestDetailDrainRechecksRemovedUpstreamAfterQueueConstruction(t *testing.T) {
+	for _, itemType := range []db.ArchiveItemType{
+		db.ArchiveItemTypeMergeRequest,
+		db.ArchiveItemTypeIssue,
+	} {
+		t.Run(string(itemType), func(t *testing.T) {
+			require := require.New(t)
+			ctx := t.Context()
+			d := openTestDB(t)
+			now := time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC)
+			repoID, err := d.UpsertRepo(ctx, verifiedGitHubRepoIdentity(
+				"github.com", "owner", "repo",
+			))
+			require.NoError(err)
+			pr := buildOpenPR(7, now)
+			issue := buildOpenIssue(7, now)
+			if itemType == db.ArchiveItemTypeMergeRequest {
+				normalized, normalizeErr := NormalizePR(repoID, pr)
+				require.NoError(normalizeErr)
+				_, err = d.UpsertMergeRequest(ctx, normalized)
+			} else {
+				normalized, normalizeErr := NormalizeIssue(repoID, issue)
+				require.NoError(normalizeErr)
+				_, err = d.UpsertIssue(ctx, normalized)
+			}
+			require.NoError(err)
+
+			var detailCalls atomic.Int32
+			client := &mockClient{
+				getPullRequestFn: func(
+					context.Context, string, string, int,
+				) (*gh.PullRequest, error) {
+					detailCalls.Add(1)
+					return pr, nil
+				},
+				getIssueFn: func(
+					context.Context, string, string, int,
+				) (*gh.Issue, error) {
+					detailCalls.Add(1)
+					return issue, nil
+				},
+			}
+			client.getRepositoryFn = func(
+				_ context.Context, owner, name string,
+			) (*gh.Repository, error) {
+				_, insertErr := d.WriteDB().ExecContext(ctx, `
+					INSERT OR IGNORE INTO forge_archive_items (
+						repo_id, item_type, item_number, provider_item_id,
+						provider_created_at, provider_updated_at, lifecycle_state
+					) VALUES (?, ?, ?, ?, ?, ?, 'removed_upstream')`,
+					repoID, itemType, 7, string(itemType)+"-7", now, now,
+				)
+				require.NoError(insertErr)
+				id := int64(1)
+				nodeID := "repo-" + owner + "-" + name
+				return &gh.Repository{
+					ID: &id, NodeID: &nodeID, Name: &name,
+					Owner: &gh.User{Login: &owner},
+				}, nil
+			}
+			syncer := NewSyncer(
+				map[string]Client{"github.com": client}, d, nil,
+				[]RepoRef{{
+					Platform: platform.KindGitHub, PlatformHost: "github.com",
+					Owner: "owner", Name: "repo",
+				}},
+				time.Minute, nil, testBudget(500),
+			)
+			bucket, err := syncer.bucketKeyForRepo(RepoRef{
+				Platform: platform.KindGitHub, PlatformHost: "github.com",
+				Owner: "owner", Name: "repo",
+			}, false)
+			require.NoError(err)
+
+			syncer.drainDetailQueue(ctx, map[string]bool{bucket: true}, []RepoRef{{
+				Platform: platform.KindGitHub, PlatformHost: "github.com",
+				Owner: "owner", Name: "repo",
+			}})
+
+			require.Zero(detailCalls.Load(),
+				"detail drain must recheck a queued item after repository resolution")
+		})
+	}
+}
+
 func TestSyncWatchedMRsSkipsRepoArchivedMidPass(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
@@ -11912,6 +12018,50 @@ func TestSyncWatchedMRsSkipsRepoArchivedMidPass(t *testing.T) {
 	tracked := syncer.TrackedRepos()
 	require.Len(tracked, 1)
 	assert.True(tracked[0].Archived)
+}
+
+func TestSyncWatchedMRsSkipsRemovedUpstreamPR(t *testing.T) {
+	require := require.New(t)
+	ctx := t.Context()
+	d := openTestDB(t)
+	now := time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC)
+	repoID, err := d.UpsertRepo(ctx, verifiedGitHubRepoIdentity(
+		"github.com", "acme", "app",
+	))
+	require.NoError(err)
+	pr := buildOpenPR(7, now)
+	normalized, err := NormalizePR(repoID, pr)
+	require.NoError(err)
+	_, err = d.UpsertMergeRequest(ctx, normalized)
+	require.NoError(err)
+	_, err = d.WriteDB().ExecContext(ctx, `
+		INSERT INTO forge_archive_items (
+			repo_id, item_type, item_number, provider_item_id,
+			provider_created_at, provider_updated_at, lifecycle_state
+		) VALUES (?, 'merge_request', ?, ?, ?, ?, 'removed_upstream')`,
+		repoID, 7, "pr-7", now, now,
+	)
+	require.NoError(err)
+
+	client := &detailTrackingClient{}
+	client.singlePR = pr
+	syncer := NewSyncer(
+		map[string]Client{"github.com": client}, d, nil,
+		[]RepoRef{{
+			Platform: platform.KindGitHub, PlatformHost: "github.com",
+			Owner: "acme", Name: "app",
+		}},
+		time.Hour, nil, nil,
+	)
+	syncer.SetWatchedMRs([]WatchedMR{{
+		Platform: platform.KindGitHub, PlatformHost: "github.com",
+		Owner: "acme", Name: "app", Number: 7,
+	}})
+
+	syncer.syncWatchedMRs(ctx)
+
+	require.Zero(client.getPRCalls.Load(),
+		"a stale watch entry must not fetch a removed PR")
 }
 
 func TestSyncMRForRepoHydratesArchivedRepoUnderArchiveBudget(t *testing.T) {
@@ -15428,6 +15578,89 @@ func TestSyncerSyncsIssuesOnPRList304(t *testing.T) {
 	assert.Equal(issueTitle, issue.Title)
 }
 
+func TestSyncRepoSkipsRemovedUpstreamPeriodicCandidates(t *testing.T) {
+	require := require.New(t)
+	ctx := t.Context()
+	d := openTestDB(t)
+	now := time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC)
+	repo := RepoRef{
+		Platform: platform.KindGitHub, PlatformHost: "github.com",
+		Owner: "owner", Name: "repo", RepoPath: "owner/repo",
+		PlatformExternalID: "repo-owner-repo",
+	}
+	repoID, err := d.UpsertRepo(ctx, verifiedGitHubRepoIdentity(
+		"github.com", "owner", "repo",
+	))
+	require.NoError(err)
+
+	openPR := buildOpenPR(7, now)
+	normalizedPR, err := NormalizePR(repoID, openPR)
+	require.NoError(err)
+	_, err = d.UpsertMergeRequest(ctx, normalizedPR)
+	require.NoError(err)
+	openIssue := buildOpenIssue(8, now)
+	normalizedIssue, err := NormalizeIssue(repoID, openIssue)
+	require.NoError(err)
+	_, err = d.UpsertIssue(ctx, normalizedIssue)
+	require.NoError(err)
+	mergedPR := buildOpenPR(9, now)
+	normalizedMerged, err := NormalizePR(repoID, mergedPR)
+	require.NoError(err)
+	_, err = d.UpsertMergeRequest(ctx, normalizedMerged)
+	require.NoError(err)
+	mergedAt := now.Add(time.Minute)
+	require.NoError(d.UpdateMRState(
+		ctx, repoID, 9, "merged", &mergedAt, &mergedAt,
+	))
+
+	for _, item := range []struct {
+		itemType db.ArchiveItemType
+		number   int
+	}{
+		{itemType: db.ArchiveItemTypeMergeRequest, number: 7},
+		{itemType: db.ArchiveItemTypeIssue, number: 8},
+		{itemType: db.ArchiveItemTypeMergeRequest, number: 9},
+	} {
+		_, err = d.WriteDB().ExecContext(ctx, `
+			INSERT INTO forge_archive_items (
+				repo_id, item_type, item_number, provider_item_id,
+				provider_created_at, provider_updated_at, lifecycle_state
+			) VALUES (?, ?, ?, ?, ?, ?, 'removed_upstream')`,
+			repoID, item.itemType, item.number,
+			fmt.Sprintf("%s-%d", item.itemType, item.number), now, now,
+		)
+		require.NoError(err)
+	}
+
+	var pullCalls atomic.Int32
+	var issueCalls atomic.Int32
+	client := &mockClient{
+		getPullRequestFn: func(context.Context, string, string, int) (*gh.PullRequest, error) {
+			pullCalls.Add(1)
+			return nil, errors.New("removed pull must not be fetched")
+		},
+		getIssueFn: func(context.Context, string, string, int) (*gh.Issue, error) {
+			issueCalls.Add(1)
+			return nil, errors.New("removed issue must not be fetched")
+		},
+	}
+	syncer := NewSyncer(
+		map[string]Client{"github.com": client}, d, nil,
+		[]RepoRef{repo}, time.Minute, nil, nil,
+	)
+	t.Cleanup(syncer.Stop)
+	syncer.SetClock(func() time.Time { return now.Add(time.Hour) })
+
+	require.NoError(syncer.fetchAndUpdateClosed(ctx, repo, repoID, 7, false))
+	require.NoError(syncer.fetchAndUpdateClosedIssue(ctx, repo, repoID, 8))
+	changed, err := syncer.backfillMergedActorEvent(ctx, repo, repoID, 9)
+	require.NoError(err)
+	require.False(changed)
+	require.NoError(syncer.syncRepo(ctx, repo))
+	require.Zero(pullCalls.Load())
+	require.Zero(issueCalls.Load())
+}
+
 func TestSyncStoresIssueLabels(t *testing.T) {
 	require := require.New(t)
 	ctx := t.Context()
@@ -17523,6 +17756,93 @@ func TestDeferredCommentRefreshRejectsABARoutePayload(t *testing.T) {
 		require.NoError(err)
 		require.Empty(events)
 	})
+}
+
+func TestDeferredCommentRefreshSkipsRemovedUpstreamItems(t *testing.T) {
+	for _, itemType := range []db.ArchiveItemType{
+		db.ArchiveItemTypeMergeRequest,
+		db.ArchiveItemTypeIssue,
+	} {
+		t.Run(string(itemType), func(t *testing.T) {
+			require := require.New(t)
+			ctx := t.Context()
+			database := openTestDB(t)
+			now := time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC)
+			repo := RepoRef{
+				Platform: platform.KindGitHub, PlatformHost: "github.com",
+				Owner: "acme", Name: "widget",
+			}
+			repoID, err := database.UpsertRepo(
+				ctx, verifiedGitHubRepoIdentity("github.com", repo.Owner, repo.Name),
+			)
+			require.NoError(err)
+			detailFetchedAt := now
+			var parentID int64
+			if itemType == db.ArchiveItemTypeMergeRequest {
+				parentID, err = database.UpsertMergeRequest(ctx, &db.MergeRequest{
+					RepoID: repoID, PlatformID: 7007, Number: 7,
+					URL: "https://github.com/acme/widget/pull/7", Title: "queued PR",
+					Author: "ada", State: db.MergeRequestStateOpen,
+					CreatedAt: now, UpdatedAt: now, LastActivityAt: now,
+					DetailFetchedAt: &detailFetchedAt,
+				})
+			} else {
+				parentID, err = database.UpsertIssue(ctx, &db.Issue{
+					RepoID: repoID, PlatformID: 8007, Number: 7,
+					URL: "https://github.com/acme/widget/issues/7", Title: "queued issue",
+					Author: "ada", State: "open",
+					CreatedAt: now, UpdatedAt: now, LastActivityAt: now,
+					DetailFetchedAt: &detailFetchedAt,
+				})
+			}
+			require.NoError(err)
+
+			var providerCalls atomic.Int32
+			commentID, body := int64(91), "must not persist"
+			client := &mockClient{listIssueCommentsIfChangedFn: func(
+				context.Context, string, string, int,
+			) ([]*gh.IssueComment, error) {
+				providerCalls.Add(1)
+				return []*gh.IssueComment{{
+					ID: &commentID, Body: &body,
+					CreatedAt: makeTimestamp(now), UpdatedAt: makeTimestamp(now),
+				}}, nil
+			}}
+			syncer := NewSyncer(
+				map[string]Client{"github.com": client}, database, nil,
+				[]RepoRef{repo}, time.Minute, nil, nil,
+			)
+			if itemType == db.ArchiveItemTypeMergeRequest {
+				syncer.queuePRCommentSync(repo, repoID, 7)
+			} else {
+				syncer.queueIssueCommentSync(repo, repoID, 7)
+			}
+			_, err = database.WriteDB().ExecContext(ctx, `
+				INSERT INTO forge_archive_items (
+					repo_id, item_type, item_number, provider_item_id,
+					provider_created_at, provider_updated_at, lifecycle_state
+				) VALUES (?, ?, ?, ?, ?, ?, 'removed_upstream')`,
+				repoID, itemType, 7, string(itemType)+"-7", now, now,
+			)
+			require.NoError(err)
+
+			syncer.drainPendingCommentSyncs(
+				ctx, map[string]bool{"github.com": true},
+			)
+
+			require.Zero(providerCalls.Load(),
+				"a queued comment refresh must recheck parent visibility")
+			if itemType == db.ArchiveItemTypeMergeRequest {
+				events, listErr := database.ListMREvents(ctx, parentID)
+				require.NoError(listErr)
+				require.Empty(events)
+			} else {
+				events, listErr := database.ListIssueEvents(ctx, parentID)
+				require.NoError(listErr)
+				require.Empty(events)
+			}
+		})
+	}
 }
 
 func TestFetchMRDetailRejectsABAOnNotModified(t *testing.T) {

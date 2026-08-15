@@ -8186,6 +8186,17 @@ func (s *Syncer) backfillMergedActorEvent(
 	repoID int64,
 	number int,
 ) (bool, error) {
+	removed, err := s.db.IsArchiveItemRemovedUpstream(
+		ctx, repoID, db.ArchiveItemTypeMergeRequest, number,
+	)
+	if err != nil {
+		return false, fmt.Errorf(
+			"check MR #%d for merged-actor backfill: %w", number, err,
+		)
+	}
+	if removed {
+		return false, nil
+	}
 	stored, err := s.db.GetMergeRequestByRepoIDAndNumber(ctx, repoID, number)
 	if err != nil {
 		return false, fmt.Errorf("get MR #%d for merged-actor backfill: %w", number, err)
@@ -8496,10 +8507,22 @@ func (s *Syncer) reclassifyWorkspaceHeadRepoTrustUnderRepositoryReconciliationRe
 		}
 		cloneURL := ""
 		var snapshotRevision int64
+		removed, visibilityErr := s.db.IsArchiveItemRemovedUpstream(
+			ctx, repoID, db.ArchiveItemTypeMergeRequest, mrNumber,
+		)
+		if visibilityErr != nil {
+			slog.Error("check workspace merge request visibility for head-repo trust reclassification failed",
+				"repo", repo.Owner+"/"+repo.Name,
+				"number", mrNumber, "err", visibilityErr,
+			)
+			return
+		}
 		if stored != nil {
-			cloneURL = stored.HeadRepoCloneURL
 			snapshotRevision = stored.SnapshotRevision
-			if stored.HeadRepoIdentityStale {
+			if !removed {
+				cloneURL = stored.HeadRepoCloneURL
+			}
+			if !removed && stored.HeadRepoIdentityStale {
 				return
 			}
 		}
@@ -8516,6 +8539,7 @@ func (s *Syncer) reclassifyWorkspaceHeadRepoTrustUnderRepositoryReconciliationRe
 			repoID,
 			mrNumber,
 			snapshotRevision,
+			removed,
 			refreshed,
 		)
 		if updateErr != nil {
@@ -8814,7 +8838,7 @@ func (s *Syncer) drainPendingCommentSyncs(
 			)
 			continue
 		}
-		pr, err := s.db.GetMergeRequestByRepoIDAndNumber(
+		pr, err := s.db.GetVisibleMergeRequestByRepoIDAndNumber(
 			refreshCtx, item.repoID, item.number,
 		)
 		if err != nil {
@@ -8823,6 +8847,9 @@ func (s *Syncer) drainPendingCommentSyncs(
 				"number", item.number,
 				"err", err,
 			)
+			continue
+		}
+		if pr == nil {
 			continue
 		}
 		probe, due := s.beginRepositoryFeatureProbe(
@@ -8879,7 +8906,7 @@ func (s *Syncer) drainPendingCommentSyncs(
 			)
 			continue
 		}
-		issue, err := s.db.GetIssueByRepoIDAndNumber(
+		issue, err := s.db.GetVisibleIssueByRepoIDAndNumber(
 			refreshCtx, item.repoID, item.number,
 		)
 		if err != nil {
@@ -8888,6 +8915,9 @@ func (s *Syncer) drainPendingCommentSyncs(
 				"number", item.number,
 				"err", err,
 			)
+			continue
+		}
+		if issue == nil {
 			continue
 		}
 		probe, due := s.beginRepositoryFeatureProbe(
@@ -9527,6 +9557,15 @@ func (s *Syncer) fetchMRDetail(
 	number int,
 	cloneFetchOK bool,
 ) (int, error) {
+	removed, err := s.removedUpstreamForLiveSync(
+		ctx, repoID, db.ArchiveItemTypeMergeRequest, number,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("check PR #%d visibility: %w", number, err)
+	}
+	if removed {
+		return 0, nil
+	}
 	calls, err := s.fetchMRDetailWithRouteFence(
 		ctx, repo, repoID, number, cloneFetchOK,
 	)
@@ -10158,6 +10197,15 @@ func (s *Syncer) fetchIssueDetail(
 	repoID int64,
 	number int,
 ) (int, error) {
+	removed, err := s.removedUpstreamForLiveSync(
+		ctx, repoID, db.ArchiveItemTypeIssue, number,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("check issue #%d visibility: %w", number, err)
+	}
+	if removed {
+		return 0, nil
+	}
 	calls := 0
 	issueReader, err := s.issueReaderFor(repo)
 	if err != nil {
@@ -11700,6 +11748,15 @@ func (s *Syncer) persistIssueComments(
 func (s *Syncer) fetchAndUpdateClosedIssue(
 	ctx context.Context, repo RepoRef, repoID int64, number int,
 ) error {
+	removed, err := s.db.IsArchiveItemRemovedUpstream(
+		ctx, repoID, db.ArchiveItemTypeIssue, number,
+	)
+	if err != nil {
+		return fmt.Errorf("check closed issue #%d visibility: %w", number, err)
+	}
+	if removed {
+		return nil
+	}
 	client, err := s.clientFor(repo)
 	if err != nil {
 		return fmt.Errorf("resolve client for %s/%s: %w", repo.Owner, repo.Name, err)
@@ -11800,6 +11857,15 @@ func (s *Syncer) fetchAndUpdateClosedPlatformIssue(
 	repoID int64,
 	number int,
 ) error {
+	removed, err := s.db.IsArchiveItemRemovedUpstream(
+		ctx, repoID, db.ArchiveItemTypeIssue, number,
+	)
+	if err != nil {
+		return fmt.Errorf("check closed issue #%d visibility: %w", number, err)
+	}
+	if removed {
+		return nil
+	}
 	issueReader, err := s.issueReaderFor(repo)
 	if err != nil {
 		return fmt.Errorf("resolve issue reader for %s/%s: %w", repo.Owner, repo.Name, err)
@@ -12367,6 +12433,22 @@ func (s *Syncer) syncMRForRepo(
 	)
 }
 
+// removedUpstreamForLiveSync fences delayed live work against an archive
+// tombstone created after the work was queued. Archive hydration deliberately
+// bypasses this check because it must fetch terminal items to repair them when
+// they reappear upstream.
+func (s *Syncer) removedUpstreamForLiveSync(
+	ctx context.Context,
+	repoID int64,
+	itemType db.ArchiveItemType,
+	number int,
+) (bool, error) {
+	if IsArchiveSyncBudgetContext(ctx) {
+		return false, nil
+	}
+	return s.db.IsArchiveItemRemovedUpstream(ctx, repoID, itemType, number)
+}
+
 type mergeRequestFetchEvidence struct {
 	merged         bool
 	headSHA        string
@@ -12429,6 +12511,15 @@ func (s *Syncer) syncMRForRepoResolved(
 		slog.Debug("skipping MR detail sync for archived repo",
 			"repo", owner+"/"+name, "number", number,
 		)
+		return nil
+	}
+	removed, err := s.removedUpstreamForLiveSync(
+		ctx, repoID, db.ArchiveItemTypeMergeRequest, number,
+	)
+	if err != nil {
+		return fmt.Errorf("check MR #%d visibility: %w", number, err)
+	}
+	if removed {
 		return nil
 	}
 	ctx = withCloneRepositoryIdentity(ctx, repo)
@@ -13205,6 +13296,36 @@ func (s *Syncer) SyncArchiveItem(
 	}
 }
 
+// FinalizeArchiveItemSync applies persistence that depends on the archive
+// lifecycle commit. A concurrent terminal observation can land after the item
+// is claimed, so parent-snapshot reclassification may still see the item as
+// removed. The successful archive commit reactivates it before this callback.
+func (s *Syncer) FinalizeArchiveItemSync(
+	ctx context.Context,
+	repoID int64,
+	itemType db.ArchiveItemType,
+	number int,
+) {
+	if itemType != db.ArchiveItemTypeMergeRequest {
+		return
+	}
+	stored, err := s.db.GetRepoByID(ctx, repoID)
+	if err != nil {
+		slog.Error("look up repository for archive item finalization failed",
+			"repo_id", repoID, "number", number, "err", err,
+		)
+		return
+	}
+	if stored == nil {
+		return
+	}
+	s.reclassifyWorkspaceHeadRepoTrust(ctx, RepoRef{
+		Platform: platform.Kind(stored.Platform), PlatformHost: stored.PlatformHost,
+		Owner: stored.Owner, Name: stored.Name, RepoPath: stored.RepoPath,
+		PlatformExternalID: stored.PlatformRepoID,
+	}, repoID, number)
+}
+
 func (s *Syncer) requireGitHubArchiveMergedMRMetrics(
 	ctx context.Context,
 	repoID int64,
@@ -13385,6 +13506,15 @@ func CarryMergeRequestDerivedFields(normalized, existing *db.MergeRequest) {
 
 // fetchAndUpdateClosed retrieves the final state of a now-closed PR from GitHub.
 func (s *Syncer) fetchAndUpdateClosed(ctx context.Context, repo RepoRef, repoID int64, number int, cloneFetchOK bool) error {
+	removed, err := s.db.IsArchiveItemRemovedUpstream(
+		ctx, repoID, db.ArchiveItemTypeMergeRequest, number,
+	)
+	if err != nil {
+		return fmt.Errorf("check closed PR #%d visibility: %w", number, err)
+	}
+	if removed {
+		return nil
+	}
 	client, err := s.clientFor(repo)
 	if err != nil {
 		return fmt.Errorf("resolve client for %s/%s: %w", repo.Owner, repo.Name, err)
@@ -13566,6 +13696,15 @@ func (s *Syncer) fetchAndUpdateClosedMergeRequest(
 	number int,
 	cloneFetchOK bool,
 ) error {
+	removed, err := s.db.IsArchiveItemRemovedUpstream(
+		ctx, repoID, db.ArchiveItemTypeMergeRequest, number,
+	)
+	if err != nil {
+		return fmt.Errorf("check closed MR #%d visibility: %w", number, err)
+	}
+	if removed {
+		return nil
+	}
 	if _, ok := reader.(interface {
 		GetGitHubPullRequest(context.Context, platform.RepoRef, int) (*gh.PullRequest, platform.MergeRequest, error)
 	}); ok {

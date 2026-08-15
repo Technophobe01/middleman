@@ -278,9 +278,14 @@ registry helpers return typed errors for missing providers or capabilities.
 
 - Archive is a scheduling and progress mode over normal sync, not a second sync engine; completeness is repository and item progress scoped by full repository identity. (`internal/db/queries_archive.go::GetArchiveProgress`)
 - Created-order inventory calls require the historical capability; updated-order maintenance traversal does not. Each returns one bounded identity page with an advancing opaque cursor or explicit exhaustion. (`internal/platform/reader_validation.go::pageReaderValidation.prepare`)
-- Hydration admits one item and invokes canonical item sync; only a successful complete sync records an archive outcome. Do not add archive-specific content paths. (`internal/archive/hydrate.go::hydrateItem`)
+- Hydration admits one item and invokes canonical item sync; only a successful complete
+  sync records an archive outcome, and provider finalizers run after that commit so they
+  observe lifecycle reactivation. (`internal/archive/hydrate.go::hydrateItem`)
 - Only parent lookups explicitly classified as removed, moved, or inaccessible are terminal. Generic and child-dataset not-found responses remain retries; a successful non-GitHub feature-metadata confirmation doubles as repository-accessibility evidence and must not be repeated before marking the parent absent. Canonical item content stays untouched. (`internal/archive/hydrate.go::archiveTerminalSyncOutcome`, `internal/platform/gitealike/feature_disabled.go::Provider.repositoryItemLookupError`,
   `internal/platform/gitlab/feature_disabled.go::Client.repositoryItemLookupError`)
+- Removed-upstream parents stay stored for rediscovery but are excluded from public
+  item list/detail reads and archive reports; inaccessible rows remain visible because
+  authorization loss does not prove removal. (`internal/db/queries_archive_report.go::archiveReportActivityQuery`)
 - Maintenance rediscovery reopens terminal item progress for hydration; unsupported and blocked items remain excluded. (`internal/db/queries_dataset_progress.go::reopenArchiveItemProgressTx`)
 - Issue and merge-request inventory coverage is explicit and independent from child-dataset coverage. Exhausted supported scans record `supported`; declared or repository-specific feature absence records `unsupported` and completes only that stream. (`internal/archive/inventory.go::inventoryPage`, `internal/db/queries_archive.go::CommitArchiveInventoryPage`)
 - Repository-specific feature absence also exhausts the current maintenance stream without replacing established historical coverage. (`internal/archive/maintenance.go::promptPages`)
@@ -419,6 +424,27 @@ Repository import requests and route/query shapes should carry
   characters exactly once, via shared provider route helpers.
 - New provider-aware routes should not require ad hoc URL construction in
   stores/components.
+- Archive items marked `removed_upstream` remain stored for sync repair but are
+  hidden from public item reads, resolution, autocomplete, stacks, activity,
+  workspace creation and subject metadata, project worktree imports, Kata
+  links, repository summaries, archive reports, and provider mutations;
+  synchronous and queued public item sync rejects known tombstones before
+  provider access, with queued work rechecking visibility when it executes.
+  Watched fast-sync and priority detail-drain work perform that recheck after
+  stable repository resolution; archive-budget hydration bypasses it so a
+  terminal item can be repaired when it reappears upstream. Deferred PR and
+  issue comment drains recheck their parent before provider access, and
+  workspace setup rechecks its source before any Git or provider access.
+  Periodic repository sync excludes tombstones from closed-item and
+  merged-actor repair candidates, then rechecks before each provider fetch.
+  Secondary workflows such as label validation, automatic assignment,
+  pushed-head refresh, manual workspace refresh, and on-demand worktree sync
+  must check item visibility before item-specific provider access. Workspace and
+  Fleet projections retain local records but omit removed parent metadata;
+  visible stack members are renumbered contiguously after filtering.
+  `inaccessible` items remain visible.
+  (`internal/server/pullapi/helpers.go::visibleMergeRequest`,
+  `internal/server/issueapi/mutation_handlers.go::requireVisibleIssue`)
 - Embedded navigation events for repo-bound routes must publish identity from
   parsed route state, not from global embed config. When a route carries repo
   identity, event payloads should include `provider`, `platform_host`, and

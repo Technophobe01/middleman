@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -3678,6 +3679,52 @@ func TestListCommentAutocompleteUsersScopesByProvider(t *testing.T) {
 	assert.Equal([]string{"alice"}, users)
 }
 
+func TestListCommentAutocompleteUsersHidesOnlyRemovedUpstreamItems(t *testing.T) {
+	require := require.New(t)
+	d := openTestDB(t)
+	ctx := t.Context()
+	now := baseTime()
+	repoID := insertTestRepo(t, d, "acme", "widget")
+	inaccessibleMRID := insertTestMR(t, d, repoID, 1, "inaccessible pull", now)
+	removedMRID := insertTestMR(t, d, repoID, 2, "removed pull", now)
+	inaccessibleIssueID := insertTestIssue(t, d, repoID, 3, "inaccessible issue", now)
+	removedIssueID := insertTestIssue(t, d, repoID, 4, "removed issue", now)
+	_, err := d.WriteDB().ExecContext(ctx, `
+		UPDATE forge_merge_requests SET author = CASE number
+			WHEN 1 THEN 'visible-pull-author' ELSE 'removed-pull-author' END;
+		UPDATE forge_issues SET author = CASE number
+			WHEN 3 THEN 'visible-issue-author' ELSE 'removed-issue-author' END;
+		INSERT INTO forge_archive_items (
+			repo_id, item_type, item_number, provider_item_id,
+			provider_created_at, provider_updated_at, lifecycle_state
+		) VALUES
+			(?, 'merge_request', 1, 'pr-1', ?, ?, 'inaccessible'),
+			(?, 'merge_request', 2, 'pr-2', ?, ?, 'removed_upstream'),
+			(?, 'issue', 3, 'issue-3', ?, ?, 'inaccessible'),
+			(?, 'issue', 4, 'issue-4', ?, ?, 'removed_upstream')`,
+		repoID, now, now, repoID, now, now,
+		repoID, now, now, repoID, now, now,
+	)
+	require.NoError(err)
+	require.NoError(d.UpsertMREvents(ctx, []MREvent{
+		{MergeRequestID: inaccessibleMRID, EventType: "comment", Author: "visible-pull-event", CreatedAt: now, DedupeKey: "visible-pull-event"},
+		{MergeRequestID: removedMRID, EventType: "comment", Author: "removed-pull-event", CreatedAt: now, DedupeKey: "removed-pull-event"},
+	}))
+	require.NoError(d.UpsertIssueEvents(ctx, []IssueEvent{
+		{IssueID: inaccessibleIssueID, EventType: "comment", Author: "visible-issue-event", CreatedAt: now, DedupeKey: "visible-issue-event"},
+		{IssueID: removedIssueID, EventType: "comment", Author: "removed-issue-event", CreatedAt: now, DedupeKey: "removed-issue-event"},
+	}))
+
+	users, err := d.ListCommentAutocompleteUsers(
+		ctx, "github", "github.com", "acme", "widget", "", 20,
+	)
+	require.NoError(err)
+	require.ElementsMatch([]string{
+		"visible-pull-author", "visible-pull-event",
+		"visible-issue-author", "visible-issue-event",
+	}, users)
+}
+
 func TestListCommentAutocompleteReferences(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
@@ -3714,6 +3761,40 @@ func TestListCommentAutocompleteReferences(t *testing.T) {
 	require.NoError(err)
 	assert.Equal([]CommentAutocompleteReference{
 		{Kind: "pull", Number: 12, Title: "Polish mentions", State: "open"},
+	}, refs)
+}
+
+func TestListCommentAutocompleteReferencesHidesOnlyRemovedUpstreamItems(t *testing.T) {
+	require := require.New(t)
+	d := openTestDB(t)
+	ctx := t.Context()
+	now := baseTime()
+	repoID := insertTestRepo(t, d, "acme", "widget")
+	insertTestMR(t, d, repoID, 1, "inaccessible pull", now)
+	insertTestMR(t, d, repoID, 2, "removed pull", now)
+	insertTestIssue(t, d, repoID, 3, "inaccessible issue", now)
+	insertTestIssue(t, d, repoID, 4, "removed issue", now)
+	_, err := d.WriteDB().ExecContext(ctx, `
+		INSERT INTO forge_archive_items (
+			repo_id, item_type, item_number, provider_item_id,
+			provider_created_at, provider_updated_at, lifecycle_state
+		) VALUES
+			(?, 'merge_request', 1, 'pr-1', ?, ?, 'inaccessible'),
+			(?, 'merge_request', 2, 'pr-2', ?, ?, 'removed_upstream'),
+			(?, 'issue', 3, 'issue-3', ?, ?, 'inaccessible'),
+			(?, 'issue', 4, 'issue-4', ?, ?, 'removed_upstream')`,
+		repoID, now, now, repoID, now, now,
+		repoID, now, now, repoID, now, now,
+	)
+	require.NoError(err)
+
+	refs, err := d.ListCommentAutocompleteReferences(
+		ctx, "github", "github.com", "acme", "widget", "", "", 10,
+	)
+	require.NoError(err)
+	require.ElementsMatch([]CommentAutocompleteReference{
+		{Kind: "pull", Number: 1, Title: "inaccessible pull", State: "open"},
+		{Kind: "issue", Number: 3, Title: "inaccessible issue", State: "open"},
 	}, refs)
 }
 
@@ -4335,6 +4416,7 @@ func TestUpdateWorkspaceMRHeadRepoForSnapshotRejectsStaleRevision(t *testing.T) 
 		repoID,
 		mr.Number,
 		stale.SnapshotRevision,
+		false,
 		nil,
 	)
 	require.NoError(err)
@@ -4352,6 +4434,7 @@ func TestUpdateWorkspaceMRHeadRepoForSnapshotRejectsStaleRevision(t *testing.T) 
 		repoID,
 		mr.Number,
 		updated.SnapshotRevision,
+		false,
 		nil,
 	)
 	require.Error(err)
@@ -5192,6 +5275,8 @@ func TestWorkspaceSummaries(t *testing.T) {
 	assert.Nil(noMR.MRDeletions)
 	assert.Nil(noMR.AssociatedPRNumber)
 	assert.Nil(noMR.ItemLastActivityAt)
+	assert.False(noMR.SourceItemVisible)
+	assert.False(noMR.AssociatedPRVisible)
 
 	// Issue workspace keeps issue-owned header metadata and the linked PR number.
 	require.NotNil(issueWithPR.MRTitle)
@@ -5207,6 +5292,8 @@ func TestWorkspaceSummaries(t *testing.T) {
 	assert.Equal(42, *issueWithPR.AssociatedPRNumber)
 	require.NotNil(issueWithPR.ItemLastActivityAt)
 	assert.Equal(issueActivity.UTC(), issueWithPR.ItemLastActivityAt.UTC())
+	assert.True(issueWithPR.SourceItemVisible)
+	assert.True(issueWithPR.AssociatedPRVisible)
 
 	// PR workspace exposes PR metadata in the owner slots.
 	require.NotNil(withMR.MRTitle)
@@ -5226,6 +5313,8 @@ func TestWorkspaceSummaries(t *testing.T) {
 	assert.Nil(withMR.AssociatedPRNumber)
 	require.NotNil(withMR.ItemLastActivityAt)
 	assert.Equal(prActivity.UTC(), withMR.ItemLastActivityAt.UTC())
+	assert.True(withMR.SourceItemVisible)
+	assert.False(withMR.AssociatedPRVisible)
 
 	// GetWorkspaceSummary by ID
 	single, err := d.GetWorkspaceSummary(ctx, "ws-issue-with-pr")
@@ -5238,11 +5327,151 @@ func TestWorkspaceSummaries(t *testing.T) {
 	assert.Equal(42, *single.AssociatedPRNumber)
 	require.NotNil(single.ItemLastActivityAt)
 	assert.Equal(issueActivity.UTC(), single.ItemLastActivityAt.UTC())
+	assert.True(single.SourceItemVisible)
+	assert.True(single.AssociatedPRVisible)
+
+	_, err = d.WriteDB().ExecContext(ctx, `
+		INSERT INTO forge_archive_items (
+			repo_id, item_type, item_number, provider_item_id,
+			provider_created_at, provider_updated_at, lifecycle_state
+		) VALUES (?, 'merge_request', 42, 'pull-42', ?, ?, 'removed_upstream')`,
+		repoID, base, base,
+	)
+	require.NoError(err)
+	single, err = d.GetWorkspaceSummary(ctx, "ws-issue-with-pr")
+	require.NoError(err)
+	require.NotNil(single)
+	assert.True(single.SourceItemVisible)
+	assert.False(single.AssociatedPRVisible)
+	_, err = d.WriteDB().ExecContext(ctx, `
+		UPDATE forge_archive_items
+		SET lifecycle_state = 'inaccessible'
+		WHERE repo_id = ? AND item_type = 'merge_request' AND item_number = 42`,
+		repoID,
+	)
+	require.NoError(err)
+	single, err = d.GetWorkspaceSummary(ctx, "ws-issue-with-pr")
+	require.NoError(err)
+	require.NotNil(single)
+	assert.True(single.SourceItemVisible)
+	assert.True(single.AssociatedPRVisible)
+	_, err = d.WriteDB().ExecContext(ctx, `
+		INSERT INTO forge_archive_items (
+			repo_id, item_type, item_number, provider_item_id,
+			provider_created_at, provider_updated_at, lifecycle_state
+		) VALUES (?, 'issue', 7, 'issue-7', ?, ?, 'removed_upstream')`,
+		repoID, base, base,
+	)
+	require.NoError(err)
+	single, err = d.GetWorkspaceSummary(ctx, "ws-issue-with-pr")
+	require.NoError(err)
+	require.NotNil(single)
+	assert.False(single.SourceItemVisible)
+	assert.True(single.AssociatedPRVisible)
 
 	// GetWorkspaceSummary miss
 	missSum, err := d.GetWorkspaceSummary(ctx, "nonexistent")
 	require.NoError(err)
 	assert.Nil(missSum)
+}
+
+func TestWorkspaceSummariesRetainWorkspaceWithoutRemovedPullMetadata(t *testing.T) {
+	require := require.New(t)
+	d := openTestDB(t)
+	ctx := t.Context()
+	now := baseTime()
+	repoID := insertTestRepo(t, d, "acme", "widget")
+	mr := testMR(repoID, 7, withMRTitle("Removed pull"), withMRBranches("feature", "main"))
+	mr.CIStatus = "failure"
+	mr.ReviewDecision = "changes_requested"
+	mr.Additions = 12
+	mr.Deletions = 3
+	mr.CommentCount = 5
+	mr.MergeableState = "dirty"
+	insertTestMRWithOptions(t, d, mr)
+	require.NoError(d.InsertWorkspace(ctx, &Workspace{
+		ID: "ws-removed-pr", Platform: "github", PlatformHost: "github.com",
+		RepoOwner: "acme", RepoName: "widget",
+		ItemType: WorkspaceItemTypePullRequest, ItemNumber: 7,
+		GitHeadRef: "feature", WorktreePath: "/tmp/ws-removed-pr",
+		TmuxSession: "ws-removed-pr", Status: "ready",
+	}))
+	_, err := d.WriteDB().ExecContext(ctx, `
+		INSERT INTO forge_archive_items (
+			repo_id, item_type, item_number, provider_item_id,
+			provider_created_at, provider_updated_at, lifecycle_state
+		) VALUES (?, 'merge_request', 7, 'pull-7', ?, ?, 'removed_upstream')`,
+		repoID, now, now,
+	)
+	require.NoError(err)
+
+	summary, err := d.GetWorkspaceSummary(ctx, "ws-removed-pr")
+	require.NoError(err)
+	require.NotNil(summary)
+	require.Equal("ws-removed-pr", summary.ID)
+	require.Equal(7, summary.ItemNumber)
+	require.Nil(summary.SourceTitle)
+	require.Nil(summary.SourceState)
+	require.Nil(summary.SourceURL)
+	require.Nil(summary.MRTitle)
+	require.Nil(summary.MRState)
+	require.Nil(summary.MRIsDraft)
+	require.Nil(summary.MRCIStatus)
+	require.Nil(summary.MRReviewDecision)
+	require.Nil(summary.MRAdditions)
+	require.Nil(summary.MRDeletions)
+	require.Nil(summary.MRCommentCount)
+	require.Nil(summary.MRMergeableState)
+	require.Nil(summary.MRHeadBranch)
+	require.Nil(summary.ItemLastActivityAt)
+	require.False(summary.SourceItemVisible)
+	require.False(summary.AssociatedPRVisible)
+
+	summaries, err := d.ListWorkspaceSummaries(ctx)
+	require.NoError(err)
+	require.Len(summaries, 1)
+	require.Equal("ws-removed-pr", summaries[0].ID)
+	require.Nil(summaries[0].MRTitle)
+}
+
+func TestWorkspaceSummariesHideProviderMetadataForReusedRoute(t *testing.T) {
+	require := require.New(t)
+	d := openTestDB(t)
+	observedAt := baseTime()
+	reconcileCatalogRepository(
+		t, d, "provider-original", "org-a", "project-a", observedAt,
+	)
+	associatedPR := 42
+	headRepo := "https://github.com/contributor/project-a.git"
+	require.NoError(d.InsertWorkspace(t.Context(), &Workspace{
+		ID: "ws-reused-route", Platform: "github", PlatformHost: "github.com",
+		RepoOwner: "org-a", RepoName: "project-a",
+		ItemType: WorkspaceItemTypePullRequest, ItemNumber: 7,
+		AssociatedPRNumber: &associatedPR,
+		GitHeadRef:         "feature/stale",
+		MRHeadRepo:         &headRepo,
+		WorktreePath:       "/tmp/ws-reused-route",
+		Status:             "ready",
+	}))
+	reconcileCatalogRepository(
+		t, d, "provider-original", "org-a", "renamed-project", observedAt.Add(time.Minute),
+	)
+	reconcileCatalogRepository(
+		t, d, "provider-replacement", "org-a", "project-a", observedAt.Add(2*time.Minute),
+	)
+
+	summary, err := d.GetWorkspaceSummary(t.Context(), "ws-reused-route")
+	require.NoError(err)
+	require.NotNil(summary)
+	require.Zero(summary.RepoID)
+	require.False(summary.SourceItemVisible)
+	require.False(summary.AssociatedPRVisible)
+
+	summaries, err := d.ListWorkspaceSummaries(t.Context())
+	require.NoError(err)
+	require.Len(summaries, 1)
+	require.False(summaries[0].SourceItemVisible)
+	require.False(summaries[0].AssociatedPRVisible)
 }
 
 func TestSetWorkspaceAssociatedPRNumberIfNull(t *testing.T) {
@@ -5708,6 +5937,64 @@ func TestUpsertIssue_NormalizesEmptyAssigneesJSON(t *testing.T) {
 	issues, err := d.ListIssues(ctx, ListIssuesOpts{Assignee: "anyone", State: "all"})
 	require.NoError(err)
 	assert.Empty(issues)
+}
+
+func TestPeriodicSyncCandidatesExcludeRemovedUpstream(t *testing.T) {
+	require := require.New(t)
+	ctx := t.Context()
+	d := openTestDB(t)
+	repoID := insertTestRepo(t, d, "acme", "widget")
+	base := baseTime()
+
+	insertTestMR(t, d, repoID, 1, "visible pull", base)
+	insertTestMR(t, d, repoID, 2, "removed pull", base)
+	insertTestIssue(t, d, repoID, 3, "visible issue", base)
+	insertTestIssue(t, d, repoID, 4, "removed issue", base)
+	mergedAt := base.Add(time.Hour)
+	insertTestMRWithOptions(t, d, testMR(repoID, 5, func(mr *MergeRequest) {
+		mr.State = MergeRequestStateMerged
+		mr.MergedAt = &mergedAt
+	}))
+	insertTestMRWithOptions(t, d, testMR(repoID, 6, func(mr *MergeRequest) {
+		mr.State = MergeRequestStateMerged
+		mr.MergedAt = &mergedAt
+	}))
+
+	for _, item := range []struct {
+		itemType ArchiveItemType
+		number   int
+	}{
+		{itemType: ArchiveItemTypeMergeRequest, number: 2},
+		{itemType: ArchiveItemTypeIssue, number: 4},
+		{itemType: ArchiveItemTypeMergeRequest, number: 6},
+	} {
+		_, err := d.WriteDB().ExecContext(ctx, `
+			INSERT INTO forge_archive_items (
+				repo_id, item_type, item_number, provider_item_id,
+				provider_created_at, provider_updated_at, lifecycle_state
+			) VALUES (?, ?, ?, ?, ?, ?, 'removed_upstream')`,
+			repoID, item.itemType, item.number,
+			fmt.Sprintf("%s-%d", item.itemType, item.number), base, base,
+		)
+		require.NoError(err)
+	}
+
+	closedMRs, err := d.GetPreviouslyOpenMRNumbers(ctx, repoID, map[int]bool{})
+	require.NoError(err)
+	require.Equal([]int{1}, closedMRs)
+	closedIssues, err := d.GetPreviouslyOpenIssueNumbers(ctx, repoID, map[int]bool{})
+	require.NoError(err)
+	require.Equal([]int{3}, closedIssues)
+	missingActors, err := d.GetMergedMRNumbersMissingMergedActor(
+		ctx, repoID, base,
+		MergedMRMissingActorCursor{
+			MergedAt: mergedAt.Add(time.Hour), MergeRequestID: 1<<63 - 1,
+		},
+		10,
+	)
+	require.NoError(err)
+	require.Len(missingActors, 1)
+	require.Equal(5, missingActors[0].Number)
 }
 
 func TestGetMergedMRNumbersMissingMergedActor(t *testing.T) {

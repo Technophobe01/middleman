@@ -1842,6 +1842,13 @@ func (d *DB) GetMergeRequest(
 		WHERE r.platform = ? AND r.platform_host = ?
 		  AND r.owner_key = ? AND r.name_key = ?
 		  AND r.lifecycle_state = 'active'
+		  AND NOT EXISTS (
+			SELECT 1 FROM forge_archive_items ai
+			WHERE ai.repo_id = p.repo_id
+			  AND ai.item_type = 'merge_request'
+			  AND ai.item_number = p.number
+			  AND ai.lifecycle_state = 'removed_upstream'
+		  )
 		  AND p.number = ?`,
 		platform, platformHost, owner, name, number,
 	).Scan(
@@ -1879,7 +1886,32 @@ func (d *DB) GetMergeRequest(
 
 // GetMergeRequestByRepoIDAndNumber returns a merge request by repo ID and number.
 func (d *DB) GetMergeRequestByRepoIDAndNumber(ctx context.Context, repoID int64, number int) (*MergeRequest, error) {
+	return d.getMergeRequestByRepoIDAndNumber(ctx, repoID, number, true)
+}
+
+// GetVisibleMergeRequestByRepoIDAndNumber returns a merge request unless its
+// archive parent was removed upstream. Internal sync paths use the unfiltered
+// query above so maintenance can reactivate and repair retained canonical data.
+func (d *DB) GetVisibleMergeRequestByRepoIDAndNumber(
+	ctx context.Context, repoID int64, number int,
+) (*MergeRequest, error) {
+	return d.getMergeRequestByRepoIDAndNumber(ctx, repoID, number, false)
+}
+
+func (d *DB) getMergeRequestByRepoIDAndNumber(
+	ctx context.Context, repoID int64, number int, includeRemoved bool,
+) (*MergeRequest, error) {
 	var mr MergeRequest
+	removedFilter := ""
+	if !includeRemoved {
+		removedFilter = ` AND NOT EXISTS (
+			SELECT 1 FROM forge_archive_items ai
+			WHERE ai.repo_id = p.repo_id
+			  AND ai.item_type = 'merge_request'
+			  AND ai.item_number = p.number
+			  AND ai.lifecycle_state = 'removed_upstream'
+		)`
+	}
 	err := d.ro.QueryRowContext(ctx, `
 		SELECT p.id, p.snapshot_revision, p.repo_id, p.platform_id, p.platform_external_id, p.number, p.url, p.title,
 		       p.author, p.author_display_name, p.state, p.is_draft, p.is_locked,
@@ -1903,7 +1935,7 @@ func (d *DB) GetMergeRequestByRepoIDAndNumber(ctx context.Context, repoID int64,
 		    ON k.repo_id = p.repo_id AND k.item_type = 'pr' AND k.item_number = p.number
 		LEFT JOIN forge_starred_items s
 		    ON s.item_type = 'pr' AND s.repo_id = p.repo_id AND s.number = p.number
-		WHERE p.repo_id = ? AND p.number = ?`,
+		WHERE p.repo_id = ? AND p.number = ?`+removedFilter,
 		repoID, number,
 	).Scan(
 		&mr.ID, &mr.SnapshotRevision, &mr.RepoID, &mr.PlatformID, &mr.PlatformExternalID, &mr.Number, &mr.URL, &mr.Title,
@@ -1947,6 +1979,13 @@ func (d *DB) ListMergeRequests(ctx context.Context, opts ListMergeRequestsOpts) 
 	}
 	var conds []string
 	var args []any
+	conds = append(conds, `NOT EXISTS (
+		SELECT 1 FROM forge_archive_items ai
+		WHERE ai.repo_id = p.repo_id
+		  AND ai.item_type = 'merge_request'
+		  AND ai.item_number = p.number
+		  AND ai.lifecycle_state = 'removed_upstream'
+	)`)
 
 	switch state {
 	case "all":
@@ -2537,8 +2576,15 @@ func (d *DB) GetPreviouslyOpenMRNumbers(
 	stillOpen map[int]bool,
 ) ([]int, error) {
 	rows, err := d.ro.QueryContext(ctx,
-		`SELECT number FROM forge_merge_requests
-		 WHERE repo_id = ? AND state = 'open'`,
+		`SELECT mr.number FROM forge_merge_requests mr
+		 WHERE mr.repo_id = ? AND mr.state = 'open'
+		   AND NOT EXISTS (
+		     SELECT 1 FROM forge_archive_items ai
+		     WHERE ai.repo_id = mr.repo_id
+		       AND ai.item_type = 'merge_request'
+		       AND ai.item_number = mr.number
+		       AND ai.lifecycle_state = 'removed_upstream'
+		   )`,
 		repoID,
 	)
 	if err != nil {
@@ -2597,6 +2643,13 @@ func (d *DB) GetMergedMRNumbersMissingMergedActor(
 		 WHERE mr.repo_id = ? AND mr.state = 'merged'
 		   AND mr.merged_at >= ?
 		   AND (mr.merged_at < ? OR (mr.merged_at = ? AND mr.id < ?))
+		   AND NOT EXISTS (
+		     SELECT 1 FROM forge_archive_items ai
+		     WHERE ai.repo_id = mr.repo_id
+		       AND ai.item_type = 'merge_request'
+		       AND ai.item_number = mr.number
+		       AND ai.lifecycle_state = 'removed_upstream'
+		   )
 		   AND NOT EXISTS (
 		     SELECT 1 FROM forge_mr_events e
 		     WHERE e.merge_request_id = mr.id
@@ -3130,6 +3183,13 @@ func (d *DB) GetIssue(
 		WHERE r.platform = ? AND r.platform_host = ?
 		  AND r.owner_key = ? AND r.name_key = ?
 		  AND r.lifecycle_state = 'active'
+		  AND NOT EXISTS (
+			SELECT 1 FROM forge_archive_items ai
+			WHERE ai.repo_id = i.repo_id
+			  AND ai.item_type = 'issue'
+			  AND ai.item_number = i.number
+			  AND ai.lifecycle_state = 'removed_upstream'
+		  )
 		  AND i.number = ?`,
 		platform, platformHost, owner, name, number,
 	).Scan(
@@ -3162,7 +3222,31 @@ func (d *DB) GetIssue(
 
 // GetIssueByRepoIDAndNumber returns an issue by repo ID and number.
 func (d *DB) GetIssueByRepoIDAndNumber(ctx context.Context, repoID int64, number int) (*Issue, error) {
+	return d.getIssueByRepoIDAndNumber(ctx, repoID, number, true)
+}
+
+// GetVisibleIssueByRepoIDAndNumber returns an issue unless its archive parent
+// was removed upstream. Internal sync paths retain access for rediscovery.
+func (d *DB) GetVisibleIssueByRepoIDAndNumber(
+	ctx context.Context, repoID int64, number int,
+) (*Issue, error) {
+	return d.getIssueByRepoIDAndNumber(ctx, repoID, number, false)
+}
+
+func (d *DB) getIssueByRepoIDAndNumber(
+	ctx context.Context, repoID int64, number int, includeRemoved bool,
+) (*Issue, error) {
 	var issue Issue
+	removedFilter := ""
+	if !includeRemoved {
+		removedFilter = ` AND NOT EXISTS (
+			SELECT 1 FROM forge_archive_items ai
+			WHERE ai.repo_id = i.repo_id
+			  AND ai.item_type = 'issue'
+			  AND ai.item_number = i.number
+			  AND ai.lifecycle_state = 'removed_upstream'
+		)`
+	}
 	err := d.ro.QueryRowContext(ctx, `
 		SELECT i.id, i.snapshot_revision, i.repo_id, i.platform_id, i.platform_external_id, i.number, i.url, i.title,
 		       i.author, i.state, i.body, i.comment_count, i.labels_json, i.assignees_json,
@@ -3175,7 +3259,7 @@ func (d *DB) GetIssueByRepoIDAndNumber(ctx context.Context, repoID int64, number
 		    ON s.item_type = 'issue' AND s.repo_id = i.repo_id AND s.number = i.number
 		LEFT JOIN forge_item_workflow_state w
 		    ON w.repo_id = i.repo_id AND w.item_type = 'issue' AND w.item_number = i.number
-		WHERE i.repo_id = ? AND i.number = ?`,
+		WHERE i.repo_id = ? AND i.number = ?`+removedFilter,
 		repoID, number,
 	).Scan(
 		&issue.ID, &issue.SnapshotRevision, &issue.RepoID, &issue.PlatformID, &issue.PlatformExternalID, &issue.Number,
@@ -3215,6 +3299,13 @@ func (d *DB) ListIssues(
 	}
 	var conds []string
 	var args []any
+	conds = append(conds, `NOT EXISTS (
+		SELECT 1 FROM forge_archive_items ai
+		WHERE ai.repo_id = i.repo_id
+		  AND ai.item_type = 'issue'
+		  AND ai.item_number = i.number
+		  AND ai.lifecycle_state = 'removed_upstream'
+	)`)
 
 	switch state {
 	case "all":
@@ -3347,7 +3438,14 @@ func (d *DB) ResolveItemNumber(
 	var exists int
 	err = d.ro.QueryRowContext(ctx,
 		`SELECT 1 FROM forge_merge_requests
-		 WHERE repo_id = ? AND number = ?`,
+		 WHERE repo_id = ? AND number = ?
+		   AND NOT EXISTS (
+		       SELECT 1 FROM forge_archive_items ai
+		       WHERE ai.repo_id = forge_merge_requests.repo_id
+		         AND ai.item_type = 'merge_request'
+		         AND ai.item_number = forge_merge_requests.number
+		         AND ai.lifecycle_state = 'removed_upstream'
+		   )`,
 		repoID, number,
 	).Scan(&exists)
 	if err == nil {
@@ -3359,7 +3457,14 @@ func (d *DB) ResolveItemNumber(
 
 	err = d.ro.QueryRowContext(ctx,
 		`SELECT 1 FROM forge_issues
-		 WHERE repo_id = ? AND number = ?`,
+		 WHERE repo_id = ? AND number = ?
+		   AND NOT EXISTS (
+		       SELECT 1 FROM forge_archive_items ai
+		       WHERE ai.repo_id = forge_issues.repo_id
+		         AND ai.item_type = 'issue'
+		         AND ai.item_number = forge_issues.number
+		         AND ai.lifecycle_state = 'removed_upstream'
+		   )`,
 		repoID, number,
 	).Scan(&exists)
 	if err == nil {
@@ -3380,10 +3485,24 @@ func (d *DB) ResolveItemNumberOfType(
 	switch itemType {
 	case "pr":
 		query = `SELECT 1 FROM forge_merge_requests
-		         WHERE repo_id = ? AND number = ?`
+		         WHERE repo_id = ? AND number = ?
+		           AND NOT EXISTS (
+		               SELECT 1 FROM forge_archive_items ai
+		               WHERE ai.repo_id = forge_merge_requests.repo_id
+		                 AND ai.item_type = 'merge_request'
+		                 AND ai.item_number = forge_merge_requests.number
+		                 AND ai.lifecycle_state = 'removed_upstream'
+		           )`
 	case "issue":
 		query = `SELECT 1 FROM forge_issues
-		         WHERE repo_id = ? AND number = ?`
+		         WHERE repo_id = ? AND number = ?
+		           AND NOT EXISTS (
+		               SELECT 1 FROM forge_archive_items ai
+		               WHERE ai.repo_id = forge_issues.repo_id
+		                 AND ai.item_type = 'issue'
+		                 AND ai.item_number = forge_issues.number
+		                 AND ai.lifecycle_state = 'removed_upstream'
+		           )`
 	default:
 		return "", false, fmt.Errorf("unsupported item type %q", itemType)
 	}
@@ -3428,8 +3547,15 @@ func (d *DB) GetPreviouslyOpenIssueNumbers(
 	stillOpen map[int]bool,
 ) ([]int, error) {
 	rows, err := d.ro.QueryContext(ctx,
-		`SELECT number FROM forge_issues
-		 WHERE repo_id = ? AND state = 'open'`,
+		`SELECT i.number FROM forge_issues i
+		 WHERE i.repo_id = ? AND i.state = 'open'
+		   AND NOT EXISTS (
+		     SELECT 1 FROM forge_archive_items ai
+		     WHERE ai.repo_id = i.repo_id
+		       AND ai.item_type = 'issue'
+		       AND ai.item_number = i.number
+		       AND ai.lifecycle_state = 'removed_upstream'
+		   )`,
 		repoID,
 	)
 	if err != nil {
@@ -3854,20 +3980,48 @@ func (d *DB) ListCommentAutocompleteUsers(
 			SELECT mr.author AS login, mr.last_activity_at AS last_seen
 			FROM forge_merge_requests mr
 			WHERE mr.repo_id = (SELECT id FROM repo)
+			  AND NOT EXISTS (
+				SELECT 1 FROM forge_archive_items a
+				WHERE a.repo_id = mr.repo_id
+				  AND a.item_type = 'merge_request'
+				  AND a.item_number = mr.number
+				  AND a.lifecycle_state = 'removed_upstream'
+			  )
 			UNION ALL
 			SELECT i.author AS login, i.last_activity_at AS last_seen
 			FROM forge_issues i
 			WHERE i.repo_id = (SELECT id FROM repo)
+			  AND NOT EXISTS (
+				SELECT 1 FROM forge_archive_items a
+				WHERE a.repo_id = i.repo_id
+				  AND a.item_type = 'issue'
+				  AND a.item_number = i.number
+				  AND a.lifecycle_state = 'removed_upstream'
+			  )
 			UNION ALL
 			SELECT e.author AS login, e.created_at AS last_seen
 			FROM forge_mr_events e
 			JOIN forge_merge_requests mr ON mr.id = e.merge_request_id
 			WHERE mr.repo_id = (SELECT id FROM repo)
+			  AND NOT EXISTS (
+				SELECT 1 FROM forge_archive_items a
+				WHERE a.repo_id = mr.repo_id
+				  AND a.item_type = 'merge_request'
+				  AND a.item_number = mr.number
+				  AND a.lifecycle_state = 'removed_upstream'
+			  )
 			UNION ALL
 			SELECT e.author AS login, e.created_at AS last_seen
 			FROM forge_issue_events e
 			JOIN forge_issues i ON i.id = e.issue_id
 			WHERE i.repo_id = (SELECT id FROM repo)
+			  AND NOT EXISTS (
+				SELECT 1 FROM forge_archive_items a
+				WHERE a.repo_id = i.repo_id
+				  AND a.item_type = 'issue'
+				  AND a.item_number = i.number
+				  AND a.lifecycle_state = 'removed_upstream'
+			  )
 		), ranked AS (
 			SELECT login, MAX(last_seen) AS last_seen
 			FROM candidates
@@ -3932,10 +4086,24 @@ func (d *DB) ListCommentAutocompleteReferences(
 			SELECT 'pull' AS kind, mr.number, mr.title, mr.state, mr.last_activity_at
 			FROM forge_merge_requests mr
 			WHERE mr.repo_id = (SELECT id FROM repo)
+			  AND NOT EXISTS (
+			      SELECT 1 FROM forge_archive_items ai
+			      WHERE ai.repo_id = mr.repo_id
+			        AND ai.item_type = 'merge_request'
+			        AND ai.item_number = mr.number
+			        AND ai.lifecycle_state = 'removed_upstream'
+			  )
 			UNION ALL
 			SELECT 'issue' AS kind, i.number, i.title, i.state, i.last_activity_at
 			FROM forge_issues i
 			WHERE i.repo_id = (SELECT id FROM repo)
+			  AND NOT EXISTS (
+			      SELECT 1 FROM forge_archive_items ai
+			      WHERE ai.repo_id = i.repo_id
+			        AND ai.item_type = 'issue'
+			        AND ai.item_number = i.number
+			        AND ai.lifecycle_state = 'removed_upstream'
+			  )
 		)
 		SELECT kind, number, title, state
 		FROM candidates
@@ -5041,14 +5209,15 @@ func (d *DB) UpdateWorkspaceMRHeadRepoForMissingRepo(
 }
 
 // UpdateWorkspaceMRHeadRepoForSnapshot persists a classification only while
-// the merge-request revision that produced it remains current. A false result
-// tells the caller to reread and retry against the newer snapshot.
+// the merge-request revision and removed-upstream visibility that produced it
+// remain current. A false result tells the caller to reread and retry.
 func (d *DB) UpdateWorkspaceMRHeadRepoForSnapshot(
 	ctx context.Context,
 	id string,
 	repoID int64,
 	mrNumber int,
 	expectedRevision int64,
+	expectedRemoved bool,
 	mrHeadRepo *string,
 ) (bool, error) {
 	result, err := d.execContext(ctx, `
@@ -5059,12 +5228,23 @@ func (d *DB) UpdateWorkspaceMRHeadRepoForSnapshot(
 		      SELECT snapshot_revision
 		      FROM forge_merge_requests
 		      WHERE repo_id = ? AND number = ?
-		  ), 0) = ?`,
+		  ), 0) = ?
+		  AND EXISTS (
+		      SELECT 1
+		      FROM forge_archive_items
+		      WHERE repo_id = ?
+		        AND item_type = 'merge_request'
+		        AND item_number = ?
+		        AND lifecycle_state = 'removed_upstream'
+		  ) = ?`,
 		mrHeadRepo,
 		id,
 		repoID,
 		mrNumber,
 		expectedRevision,
+		repoID,
+		mrNumber,
+		expectedRemoved,
 	)
 	if err != nil {
 		return false, fmt.Errorf(
@@ -5440,6 +5620,37 @@ const workspaceSummaryColumns = `
 	w.error_message, w.created_at, w.kata_metadata,
 	r.id, r.platform_repo_id,
 	CASE
+	    WHEN r.id IS NULL THEN 0
+	    WHEN w.item_type = 'pull_request' THEN NOT EXISTS (
+	        SELECT 1
+	        FROM forge_archive_items source_a
+	        WHERE source_a.repo_id = r.id
+	          AND source_a.item_type = 'merge_request'
+	          AND source_a.item_number = w.item_number
+	          AND source_a.lifecycle_state = 'removed_upstream'
+	    )
+	    WHEN w.item_type = 'issue' THEN NOT EXISTS (
+	        SELECT 1
+	        FROM forge_archive_items source_a
+	        WHERE source_a.repo_id = r.id
+	          AND source_a.item_type = 'issue'
+	          AND source_a.item_number = w.item_number
+	          AND source_a.lifecycle_state = 'removed_upstream'
+	    )
+	    ELSE 1
+	END,
+	CASE
+	    WHEN r.id IS NULL OR w.associated_pr_number IS NULL THEN 0
+	    ELSE NOT EXISTS (
+	        SELECT 1
+	        FROM forge_archive_items associated_a
+	        WHERE associated_a.repo_id = r.id
+	          AND associated_a.item_type = 'merge_request'
+	          AND associated_a.item_number = w.associated_pr_number
+	          AND associated_a.lifecycle_state = 'removed_upstream'
+	    )
+	END,
+	CASE
 	    WHEN w.item_type = 'issue' THEN i.title
 	    ELSE m.title
 	END,
@@ -5483,10 +5694,26 @@ const workspaceSummaryJoins = `
 	    ON m.repo_id = r.id
 	   AND m.number = w.item_number
 	   AND w.item_type = 'pull_request'
+	   AND NOT EXISTS (
+	       SELECT 1
+	       FROM forge_archive_items a
+	       WHERE a.repo_id = m.repo_id
+	         AND a.item_type = 'merge_request'
+	         AND a.item_number = m.number
+	         AND a.lifecycle_state = 'removed_upstream'
+	   )
 	LEFT JOIN forge_issues i
 	    ON i.repo_id = r.id
 	   AND i.number = w.item_number
-	   AND w.item_type = 'issue'`
+	   AND w.item_type = 'issue'
+	   AND NOT EXISTS (
+	       SELECT 1
+	       FROM forge_archive_items a
+	       WHERE a.repo_id = i.repo_id
+	         AND a.item_type = 'issue'
+	         AND a.item_number = i.number
+	         AND a.lifecycle_state = 'removed_upstream'
+	   )`
 
 func scanWorkspaceSummary(
 	scanner interface{ Scan(...any) error },
@@ -5503,6 +5730,7 @@ func scanWorkspaceSummary(
 		&s.WorktreePath, &s.TmuxSession, &s.TerminalBackend, &s.Status,
 		&s.ErrorMessage, &s.CreatedAt, &kataMetadataJSON,
 		&repoID, &repoPlatformID,
+		&s.SourceItemVisible, &s.AssociatedPRVisible,
 		&s.SourceTitle, &s.SourceState, &s.SourceURL,
 		&s.MRIsDraft, &s.MRCIStatus,
 		&s.MRReviewDecision, &s.MRAdditions, &s.MRDeletions,

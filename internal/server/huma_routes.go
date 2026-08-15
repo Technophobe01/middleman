@@ -1045,7 +1045,7 @@ func (s *Server) syncPRCI(ctx context.Context, input *repoNumberInput) (*syncPRC
 		return nil, httpapi.ProviderRouteLookupError(err)
 	}
 
-	mr, err := s.db.GetMergeRequestByRepoIDAndNumber(ctx, repo.ID, input.Number)
+	mr, err := s.db.GetVisibleMergeRequestByRepoIDAndNumber(ctx, repo.ID, input.Number)
 	if err != nil {
 		return nil, httpapi.Internal("get pull request: " + err.Error())
 	}
@@ -1077,7 +1077,7 @@ func (s *Server) syncPRCI(ctx context.Context, input *repoNumberInput) (*syncPRC
 		)
 	}
 
-	mr, err = s.db.GetMergeRequestByRepoIDAndNumber(ctx, repo.ID, input.Number)
+	mr, err = s.db.GetVisibleMergeRequestByRepoIDAndNumber(ctx, repo.ID, input.Number)
 	if err != nil {
 		return nil, httpapi.Internal("get pull request: " + err.Error())
 	}
@@ -1098,6 +1098,17 @@ func (s *Server) syncPR(ctx context.Context, input *repoNumberInput) (*syncPROut
 	)
 	if err != nil {
 		return nil, httpapi.ProviderRouteLookupError(err)
+	}
+	removed, err := s.db.IsArchiveItemRemovedUpstream(
+		ctx, repo.ID, db.ArchiveItemTypeMergeRequest, input.Number,
+	)
+	if err != nil {
+		return nil, httpapi.Internal("check pull request visibility: " + err.Error())
+	}
+	if removed {
+		return nil, httpapi.NotFound(
+			httpapi.CodePullNotFound, "pull request not found", nil,
+		)
 	}
 	// SyncMR distinguishes a non-fatal diff failure from a hard sync failure
 	// via DiffSyncError. The PR row, timeline, and CI status are all current
@@ -1120,7 +1131,7 @@ func (s *Server) syncPR(ctx context.Context, input *repoNumberInput) (*syncPROut
 		)
 	}
 
-	mr, err := s.db.GetMergeRequestByRepoIDAndNumber(ctx, repo.ID, input.Number)
+	mr, err := s.db.GetVisibleMergeRequestByRepoIDAndNumber(ctx, repo.ID, input.Number)
 	if err != nil {
 		return nil, httpapi.Internal("get pull request: " + err.Error())
 	}
@@ -1156,6 +1167,17 @@ func (s *Server) enqueuePRSync(ctx context.Context, input *repoNumberInput) (*ac
 	if err != nil {
 		return nil, httpapi.ProviderRouteLookupError(err)
 	}
+	removed, err := s.db.IsArchiveItemRemovedUpstream(
+		ctx, repo.ID, db.ArchiveItemTypeMergeRequest, input.Number,
+	)
+	if err != nil {
+		return nil, httpapi.Internal("check pull request visibility: " + err.Error())
+	}
+	if removed {
+		return nil, httpapi.NotFound(
+			httpapi.CodePullNotFound, "pull request not found", nil,
+		)
+	}
 	kind := httpapi.ProviderKind(*repo)
 	host := httpapi.ProviderHost(*repo)
 	key := "pr:" + string(kind) + ":" + host + ":" + repo.RepoPath +
@@ -1172,6 +1194,15 @@ func (s *Server) enqueuePRSync(ctx context.Context, input *repoNumberInput) (*ac
 			"number", input.Number,
 		},
 		func(ctx context.Context) error {
+			removed, err := s.db.IsArchiveItemRemovedUpstream(
+				ctx, repo.ID, db.ArchiveItemTypeMergeRequest, input.Number,
+			)
+			if err != nil {
+				return fmt.Errorf("check pull request visibility: %w", err)
+			}
+			if removed {
+				return nil
+			}
 			return s.syncer.SyncMROnProvider(
 				ctx, kind, host, repo.Owner, repo.Name, input.Number,
 			)
@@ -1186,6 +1217,17 @@ func (s *Server) syncIssue(ctx context.Context, input *issueRepoNumberInput) (*s
 	)
 	if err != nil {
 		return nil, httpapi.ProviderRouteLookupError(err)
+	}
+	removed, err := s.db.IsArchiveItemRemovedUpstream(
+		ctx, repo.ID, db.ArchiveItemTypeIssue, input.Number,
+	)
+	if err != nil {
+		return nil, httpapi.Internal("check issue visibility: " + err.Error())
+	}
+	if removed {
+		return nil, httpapi.NotFound(
+			httpapi.CodeIssueNotFound, "issue not found", nil,
+		)
 	}
 	err = s.syncer.SyncIssueOnProvider(
 		ctx, httpapi.ProviderKind(*repo), httpapi.ProviderHost(*repo),
@@ -1202,7 +1244,7 @@ func (s *Server) syncIssue(ctx context.Context, input *issueRepoNumberInput) (*s
 		)
 	}
 
-	issue, err := s.db.GetIssueByRepoIDAndNumber(ctx, repo.ID, input.Number)
+	issue, err := s.db.GetVisibleIssueByRepoIDAndNumber(ctx, repo.ID, input.Number)
 	if err != nil {
 		return nil, httpapi.Internal("get issue: " + err.Error())
 	}
@@ -1224,6 +1266,17 @@ func (s *Server) enqueueIssueSync(ctx context.Context, input *issueRepoNumberInp
 	if err != nil {
 		return nil, httpapi.ProviderRouteLookupError(err)
 	}
+	removed, err := s.db.IsArchiveItemRemovedUpstream(
+		ctx, repo.ID, db.ArchiveItemTypeIssue, input.Number,
+	)
+	if err != nil {
+		return nil, httpapi.Internal("check issue visibility: " + err.Error())
+	}
+	if removed {
+		return nil, httpapi.NotFound(
+			httpapi.CodeIssueNotFound, "issue not found", nil,
+		)
+	}
 	kind := httpapi.ProviderKind(*repo)
 	host := httpapi.ProviderHost(*repo)
 	key := "issue:" + string(kind) + ":" + host + ":" + repo.RepoPath +
@@ -1240,6 +1293,15 @@ func (s *Server) enqueueIssueSync(ctx context.Context, input *issueRepoNumberInp
 			"number", input.Number,
 		},
 		func(ctx context.Context) error {
+			removed, err := s.db.IsArchiveItemRemovedUpstream(
+				ctx, repo.ID, db.ArchiveItemTypeIssue, input.Number,
+			)
+			if err != nil {
+				return fmt.Errorf("check issue visibility: %w", err)
+			}
+			if removed {
+				return nil
+			}
 			return s.syncer.SyncIssueOnProvider(
 				ctx, kind, host, repo.Owner, repo.Name, input.Number,
 			)
@@ -1809,6 +1871,27 @@ func (s *Server) resolveItem(
 			},
 		}, nil
 	}
+	archiveTypes := []db.ArchiveItemType{
+		db.ArchiveItemTypeMergeRequest,
+		db.ArchiveItemTypeIssue,
+	}
+	switch itemTypeHint {
+	case "pr":
+		archiveTypes = []db.ArchiveItemType{db.ArchiveItemTypeMergeRequest}
+	case "issue":
+		archiveTypes = []db.ArchiveItemType{db.ArchiveItemTypeIssue}
+	}
+	for _, archiveType := range archiveTypes {
+		removed, removedErr := s.db.IsArchiveItemRemovedUpstream(
+			ctx, repo.ID, archiveType, number,
+		)
+		if removedErr != nil {
+			return nil, httpapi.Internal("resolve item: " + removedErr.Error())
+		}
+		if removed {
+			return nil, httpapi.NotFound(httpapi.CodeNotFound, "item not found", nil)
+		}
+	}
 
 	if providerKind == platform.KindGitLab && itemTypeHint != "" {
 		var syncErr error
@@ -1905,6 +1988,14 @@ func (s *Server) resolveItem(
 			"err", err,
 		)
 	}
+	resolvedType, visible, resolveErr := s.db.ResolveItemNumber(ctx, repo.ID, number)
+	if resolveErr != nil {
+		return nil, httpapi.Internal("resolve item: " + resolveErr.Error())
+	}
+	if !visible {
+		return nil, httpapi.NotFound(httpapi.CodeNotFound, "item not found", nil)
+	}
+	itemType = resolvedType
 
 	return &resolveItemOutput{
 		Body: resolveItemResponse{

@@ -8,6 +8,7 @@ import (
 
 	"go.kenn.io/forge/internal/db"
 	"go.kenn.io/forge/internal/platform"
+	"go.kenn.io/forge/internal/server/httpapi"
 )
 
 type repoNumberPathRef struct {
@@ -37,9 +38,58 @@ func (s *Handler) lookupRepoMap(ctx context.Context) (map[int64]db.Repo, error) 
 	return buildRepoLookup(repos), nil
 }
 
+// visibleMergeRequest is the public pull API's read boundary. Provider sync
+// paths deliberately use the unfiltered getter so retained archive evidence
+// can still be repaired.
+func (s *Handler) visibleMergeRequest(
+	ctx context.Context, repoID int64, number int,
+) (*db.MergeRequest, error) {
+	return s.db.GetVisibleMergeRequestByRepoIDAndNumber(ctx, repoID, number)
+}
+
+// requireVisibleMergeRequest is the public pull mutation boundary. It must run
+// before provider access so a retained removed-upstream row cannot cause an
+// external side effect.
+func (s *Handler) requireVisibleMergeRequest(
+	ctx context.Context, repo *db.Repo, number int,
+) (*db.MergeRequest, error) {
+	mr, err := s.visibleMergeRequest(ctx, repo.ID, number)
+	if err != nil {
+		return nil, httpapi.Internal("get pull request failed: " + err.Error())
+	}
+	if mr == nil {
+		return nil, httpapi.NotFound(
+			httpapi.CodePullNotFound,
+			fmt.Sprintf(
+				"pull request %s/%s#%d on %s not found",
+				repo.Owner, repo.Name, number, repo.PlatformHost,
+			),
+			nil,
+		)
+	}
+	return mr, nil
+}
+
+func (s *Handler) visibleDiffSHAs(
+	ctx context.Context, repoID int64, number int,
+) (*db.DiffSHAs, error) {
+	mr, err := s.visibleMergeRequest(ctx, repoID, number)
+	if err != nil || mr == nil {
+		return nil, err
+	}
+	return &db.DiffSHAs{
+		PlatformHeadSHA: mr.PlatformHeadSHA,
+		PlatformBaseSHA: mr.PlatformBaseSHA,
+		DiffHeadSHA:     mr.DiffHeadSHA,
+		DiffBaseSHA:     mr.DiffBaseSHA,
+		MergeBaseSHA:    mr.MergeBaseSHA,
+		State:           string(mr.State),
+	}, nil
+}
+
 // filterConfiguredRepos returns only repos that are currently tracked.
 func (s *Handler) lookupMRID(ctx context.Context, ref repoNumberPathRef) (int64, error) {
-	mr, err := s.db.GetMergeRequestByRepoIDAndNumber(
+	mr, err := s.visibleMergeRequest(
 		ctx, ref.repoID, ref.number,
 	)
 	if err != nil {

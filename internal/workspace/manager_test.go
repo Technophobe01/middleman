@@ -696,6 +696,65 @@ func TestRefreshWorkspaceHeadRepoSnapshotRetriesAfterRevisionChange(t *testing.T
 	assert.Equal("https://github.com/forker/widget.git", *stored.MRHeadRepo)
 }
 
+func TestRefreshWorkspaceHeadRepoSnapshotRetriesAfterRemoval(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	d := openTestDB(t)
+	ctx := t.Context()
+	repoID := seedRepo(t, d, "github.com", "acme", "widget")
+	seedMRWithHeadRepo(
+		t,
+		d,
+		repoID,
+		42,
+		"feature/thing",
+		"https://github.com/acme/widget.git",
+	)
+	ws := &Workspace{
+		ID:           "ws-refresh-head-repo-removal-race",
+		Platform:     "github",
+		PlatformHost: "github.com",
+		RepoOwner:    "acme",
+		RepoName:     "widget",
+		ItemType:     db.WorkspaceItemTypePullRequest,
+		ItemNumber:   42,
+		GitHeadRef:   "feature/thing",
+		WorktreePath: t.TempDir(),
+		Status:       "ready",
+	}
+	require.NoError(d.InsertWorkspace(ctx, ws))
+
+	mgr := NewManager(d, t.TempDir())
+	var removed bool
+	mgr.afterHeadRepoSnapshotRead = func() {
+		if removed {
+			return
+		}
+		removed = true
+		now := time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC)
+		_, err := d.WriteDB().ExecContext(ctx, `
+			INSERT INTO forge_archive_items (
+				repo_id, item_type, item_number, provider_item_id,
+				provider_created_at, provider_updated_at, lifecycle_state
+			) VALUES (?, 'merge_request', 42, 'pull-42', ?, ?, 'removed_upstream')`,
+			repoID, now, now,
+		)
+		require.NoError(err)
+	}
+
+	snapshot, err := mgr.RefreshWorkspaceHeadRepoSnapshot(ctx, ws)
+
+	require.NoError(err)
+	require.NotNil(snapshot)
+	require.NotNil(snapshot.MRHeadRepo)
+	assert.Empty(*snapshot.MRHeadRepo)
+	stored, err := d.GetWorkspace(ctx, ws.ID)
+	require.NoError(err)
+	require.NotNil(stored)
+	require.NotNil(stored.MRHeadRepo)
+	assert.Empty(*stored.MRHeadRepo)
+}
+
 func TestCreateIssueDefaultBranchSluggified(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -1643,8 +1702,15 @@ func TestReuseExistingWorkspaceWorktreeRechecksSymlinkAfterLock(t *testing.T) {
 	mgr := NewManager(d, wtDir)
 	mgr.SetWorktreeBasePathResolver(staticBaseResolver(localRepo))
 	readyForRepoLock := make(chan struct{})
+	continueToRepoLock := make(chan struct{})
+	var continueOnce sync.Once
+	continueReuse := func() {
+		continueOnce.Do(func() { close(continueToRepoLock) })
+	}
+	defer continueReuse()
 	mgr.beforeExistingWorktreeRepoLock = func() {
 		close(readyForRepoLock)
+		<-continueToRepoLock
 	}
 	ws, err := mgr.Create(t.Context(), "github", platformHost, "acme", "widget", 42)
 	require.NoError(err)
@@ -1656,10 +1722,6 @@ func TestReuseExistingWorkspaceWorktreeRechecksSymlinkAfterLock(t *testing.T) {
 	metadataDir, err := worktreeGitDir(t.Context(), ws.WorktreePath)
 	require.NoError(err)
 
-	lockRoot := mgr.localWorktreeBaseLockRoot(localRepo)
-	require.NoError(os.MkdirAll(lockRoot, 0o755))
-	held, err := mgr.locks.Acquire(t.Context(), lockRoot)
-	require.NoError(err)
 	type reuseResult struct {
 		reused bool
 		err    error
@@ -1683,7 +1745,7 @@ func TestReuseExistingWorkspaceWorktreeRechecksSymlinkAfterLock(t *testing.T) {
 	targetPath := filepath.Join(wtDir, "replacement-target")
 	require.NoError(os.Rename(ws.WorktreePath, targetPath))
 	require.NoError(os.Symlink(targetPath, ws.WorktreePath))
-	require.NoError(held.Unlock())
+	continueReuse()
 
 	select {
 	case result := <-done:
@@ -7062,6 +7124,72 @@ func TestSetupFailsClosedWhenRepositoryRouteReused(t *testing.T) {
 	require.NoError(getErr)
 	require.NotNil(stored)
 	assert.Equal("error", stored.Status)
+}
+
+func TestSetupFailsBeforeGitWhenSourceItemWasRemovedUpstream(t *testing.T) {
+	for _, itemType := range []string{
+		db.WorkspaceItemTypePullRequest,
+		db.WorkspaceItemTypeIssue,
+	} {
+		t.Run(string(itemType), func(t *testing.T) {
+			require := require.New(t)
+			d := openTestDB(t)
+			repoID := seedRepo(t, d, "github.com", "acme", "widget")
+			if itemType == db.WorkspaceItemTypePullRequest {
+				seedMR(t, d, repoID, 7, "feature/removed")
+			} else {
+				seedIssue(t, d, repoID, 7, "Removed issue")
+			}
+
+			mgr := NewManager(d, t.TempDir())
+			var resolverCalls atomic.Int32
+			var ws *Workspace
+			var err error
+			if itemType == db.WorkspaceItemTypePullRequest {
+				ws, err = mgr.Create(
+					t.Context(), "github", "github.com", "acme", "widget", 7,
+				)
+			} else {
+				ws, err = mgr.CreateIssue(
+					t.Context(), "github.com", "acme", "widget", 7,
+					CreateIssueOptions{Provider: "github"},
+				)
+			}
+			require.NoError(err)
+			require.NotNil(ws)
+			mgr.SetWorktreeBasePathResolver(func(
+				context.Context, string, string, string, string,
+			) (string, bool, error) {
+				resolverCalls.Add(1)
+				return "", false, errors.New("git setup must not start")
+			})
+
+			archiveType := db.ArchiveItemTypeIssue
+			if itemType == db.WorkspaceItemTypePullRequest {
+				archiveType = db.ArchiveItemTypeMergeRequest
+			}
+			now := time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC)
+			_, err = d.WriteDB().ExecContext(t.Context(), `
+				INSERT INTO forge_archive_items (
+					repo_id, item_type, item_number, provider_item_id,
+					provider_created_at, provider_updated_at, lifecycle_state
+				) VALUES (?, ?, ?, ?, ?, ?, 'removed_upstream')`,
+				repoID, archiveType, 7, string(archiveType)+"-7", now, now,
+			)
+			require.NoError(err)
+
+			err = mgr.Setup(t.Context(), ws)
+
+			require.ErrorContains(err, "source item")
+			require.Zero(resolverCalls.Load(),
+				"workspace setup must stop before resolving a Git base")
+			require.NoDirExists(ws.WorktreePath)
+			stored, getErr := d.GetWorkspace(t.Context(), ws.ID)
+			require.NoError(getErr)
+			require.NotNil(stored)
+			require.Equal("error", stored.Status)
+		})
+	}
 }
 
 func TestRefreshWorkspaceHeadRepoSnapshotSurvivesQueuedReconciliation(t *testing.T) {

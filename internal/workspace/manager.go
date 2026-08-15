@@ -337,7 +337,7 @@ func (m *Manager) Create(
 		return nil, fmt.Errorf("%w: repository not tracked", ErrWorkspaceNotFound)
 	}
 
-	mr, err := m.db.GetMergeRequestByRepoIDAndNumber(
+	mr, err := m.db.GetVisibleMergeRequestByRepoIDAndNumber(
 		ctx, repo.ID, mrNumber,
 	)
 	if err != nil {
@@ -405,7 +405,7 @@ func (m *Manager) CreateIssue(
 		return nil, fmt.Errorf("repository not tracked")
 	}
 
-	issue, err := m.db.GetIssueByRepoIDAndNumber(
+	issue, err := m.db.GetVisibleIssueByRepoIDAndNumber(
 		ctx, repo.ID, issueNumber,
 	)
 	if err != nil {
@@ -942,6 +942,42 @@ func (m *Manager) verifyWorkspaceRouteUnoccupied(
 	)
 }
 
+func (m *Manager) verifyWorkspaceSourceVisible(
+	ctx context.Context, ws *Workspace,
+) error {
+	if ws == nil {
+		return ErrWorkspaceNotFound
+	}
+	if m.db == nil ||
+		(ws.ItemType != db.WorkspaceItemTypePullRequest &&
+			ws.ItemType != db.WorkspaceItemTypeIssue) {
+		return nil
+	}
+	repo, err := m.workspaceRepo(
+		ctx, ws.Platform, ws.PlatformHost, ws.RepoOwner, ws.RepoName,
+	)
+	if err != nil {
+		return fmt.Errorf("look up workspace source repository: %w", err)
+	}
+	if repo == nil {
+		return fmt.Errorf("workspace source repository is not available")
+	}
+	itemType := db.ArchiveItemTypeIssue
+	if ws.ItemType == db.WorkspaceItemTypePullRequest {
+		itemType = db.ArchiveItemTypeMergeRequest
+	}
+	removed, err := m.db.IsArchiveItemRemovedUpstream(
+		ctx, repo.ID, itemType, ws.ItemNumber,
+	)
+	if err != nil {
+		return fmt.Errorf("check workspace source item visibility: %w", err)
+	}
+	if removed {
+		return fmt.Errorf("workspace source item was removed upstream")
+	}
+	return nil
+}
+
 // verifyRepoRouteUnoccupied fails closed on routes with contested history so
 // network git operations cannot exchange data with a route's new occupant.
 // Managers without a database (unmanaged local checkouts) skip the check.
@@ -978,6 +1014,12 @@ func (m *Manager) SetupWithWorktreeBasePath(
 		ws.ID, workspaceSetupStageSetup, "started",
 		"starting workspace setup",
 	)
+	// Admission and execution are separate for initial setup, retries, and
+	// recovery. Recheck the source at execution time before any Git or provider
+	// access so a retained tombstone cannot materialize a workspace.
+	if err := m.verifyWorkspaceSourceVisible(ctx, ws); err != nil {
+		return m.failSetup(ctx, ws.ID, workspaceSetupStageSetup, err)
+	}
 	// Setup is the chokepoint for every path that fetches code — initial
 	// creation, retries, and recovery — so it re-checks the same route
 	// fail-closed condition InsertWorkspace enforced at creation time.
@@ -1248,10 +1290,20 @@ func (m *Manager) RefreshWorkspaceHeadRepoSnapshot(
 		}
 		cloneURL := ""
 		var snapshotRevision int64
+		removed, visibilityErr := m.db.IsArchiveItemRemovedUpstream(
+			ctx, repo.ID, db.ArchiveItemTypeMergeRequest, ws.ItemNumber,
+		)
+		if visibilityErr != nil {
+			return nil, fmt.Errorf(
+				"check workspace merge request visibility: %w", visibilityErr,
+			)
+		}
 		if mr != nil {
-			cloneURL = mr.HeadRepoCloneURL
 			snapshotRevision = mr.SnapshotRevision
-			if mr.HeadRepoIdentityStale {
+			if !removed {
+				cloneURL = mr.HeadRepoCloneURL
+			}
+			if !removed && mr.HeadRepoIdentityStale {
 				return &WorkspaceHeadRepoSnapshot{
 					SnapshotRevision: snapshotRevision,
 					MRHeadRepo:       ws.MRHeadRepo,
@@ -1277,6 +1329,7 @@ func (m *Manager) RefreshWorkspaceHeadRepoSnapshot(
 			repo.ID,
 			ws.ItemNumber,
 			snapshotRevision,
+			removed,
 			refreshed,
 		)
 		if updateErr != nil {
