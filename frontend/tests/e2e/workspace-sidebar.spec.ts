@@ -1,6 +1,7 @@
 import { expect, test } from "@playwright/test";
 
 import type { components } from "../../src/lib/api/generated/schema.js";
+import { createMockApiHandler } from "../../src/test/mockApiFetch.js";
 import { mockApi } from "./support/mockApi";
 
 type ProblemBody = components["schemas"]["ProblemError"];
@@ -192,6 +193,35 @@ type WorkspaceCommitFixture = {
   author_name: string;
   authored_at: string;
 };
+
+async function installLinkedItemWorkspaceDetail(
+  page: import("@playwright/test").Page,
+  itemType: "pull_request" | "issue",
+  workspace: WorkspaceFixture,
+): Promise<void> {
+  const api = createMockApiHandler();
+  const routePrefix = itemType === "pull_request" ? "/api/v1/pulls/" : "/api/v1/issues/";
+  await page.route(
+    (url) => url.pathname.startsWith(routePrefix) && url.pathname.endsWith(`/${workspace.item_number}`),
+    async (route) => {
+      const request = route.request();
+      const response = api.handle({
+        method: request.method().toUpperCase(),
+        url: new URL(request.url()),
+        bodyText: request.postData() ?? "",
+      });
+      const body = (await response.json()) as Record<string, unknown>;
+      await route.fulfill({
+        status: response.status,
+        contentType: response.headers.get("Content-Type") ?? "application/json",
+        body: JSON.stringify({
+          ...body,
+          workspace: { id: workspace.id, status: workspace.status },
+        }),
+      });
+    },
+  );
+}
 
 async function setupTerminalMocks(
   page: import("@playwright/test").Page,
@@ -573,6 +603,86 @@ async function setupTerminalMocks(
   return { runtime };
 }
 
+async function installControllableTerminalWebSockets(page: import("@playwright/test").Page): Promise<void> {
+  await page.addInitScript(() => {
+    class ControllableTerminalWebSocket extends EventTarget {
+      static CONNECTING = 0;
+      static OPEN = 1;
+      static CLOSING = 2;
+      static CLOSED = 3;
+
+      binaryType = "arraybuffer";
+      extensions = "";
+      onclose: ((event: CloseEvent) => void) | null = null;
+      onerror: ((event: Event) => void) | null = null;
+      onmessage: ((event: MessageEvent) => void) | null = null;
+      onopen: ((event: Event) => void) | null = null;
+      protocol = "";
+      readyState = ControllableTerminalWebSocket.OPEN;
+      readonly url: string;
+
+      constructor(url: string | URL) {
+        super();
+        this.url = String(url);
+        const sockets = (
+          window as unknown as { __kenn_forgeControllableTerminalSockets: ControllableTerminalWebSocket[] }
+        ).__kenn_forgeControllableTerminalSockets;
+        sockets.push(this);
+        queueMicrotask(() => {
+          const opened = new Event("open");
+          this.dispatchEvent(opened);
+          this.onopen?.(opened);
+          this.emitControl({ type: "replay_ready" });
+        });
+      }
+
+      emitControl(message: Record<string, unknown>): void {
+        const event = new MessageEvent("message", { data: JSON.stringify(message) });
+        this.dispatchEvent(event);
+        this.onmessage?.(event);
+      }
+
+      close(): void {
+        this.readyState = ControllableTerminalWebSocket.CLOSED;
+        const closed = new CloseEvent("close");
+        this.dispatchEvent(closed);
+        this.onclose?.(closed);
+      }
+
+      send(): void {}
+    }
+
+    Object.defineProperty(window, "__kenn_forgeControllableTerminalSockets", {
+      configurable: true,
+      value: [] as ControllableTerminalWebSocket[],
+    });
+    window.WebSocket = ControllableTerminalWebSocket as unknown as typeof WebSocket;
+  });
+}
+
+async function emitTerminalControl(
+  page: import("@playwright/test").Page,
+  sessionKey: string,
+  message: Record<string, unknown>,
+): Promise<void> {
+  await page.evaluate(
+    ({ sessionKey, message }) => {
+      const sockets = (
+        window as unknown as {
+          __kenn_forgeControllableTerminalSockets: Array<{
+            url: string;
+            emitControl: (message: Record<string, unknown>) => void;
+          }>;
+        }
+      ).__kenn_forgeControllableTerminalSockets;
+      const socket = sockets.find(({ url }) => url.includes(encodeURIComponent(sessionKey)));
+      if (!socket) throw new Error(`Missing terminal socket for ${sessionKey}`);
+      socket.emitControl(message);
+    },
+    { sessionKey, message },
+  );
+}
+
 async function dragWorkflowTabToGroup(
   page: import("@playwright/test").Page,
   tabLabel: string,
@@ -877,6 +987,835 @@ test("provider-aware detail mocks enforce provider and host identity", async ({ 
     "/api/v1/issues/github/acme/widgets/7": 200,
     "/api/v1/issues/gitlab/acme/widgets/7": 404,
   });
+});
+
+test("phone workspace list keeps its selected terminal alive through linked PR navigation", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.addInitScript(() => {
+    type RecordedSocket = { url: string };
+    const recordedSockets: RecordedSocket[] = [];
+    Object.defineProperty(window, "__kenn_forgeMobileTerminalSockets", { value: recordedSockets });
+
+    class MockTerminalWebSocket extends EventTarget {
+      static CONNECTING = 0;
+      static OPEN = 1;
+      static CLOSING = 2;
+      static CLOSED = 3;
+
+      binaryType = "arraybuffer";
+      extensions = "";
+      onclose: ((event: CloseEvent) => void) | null = null;
+      onerror: ((event: Event) => void) | null = null;
+      onmessage: ((event: MessageEvent) => void) | null = null;
+      onopen: ((event: Event) => void) | null = null;
+      protocol = "";
+      readyState = MockTerminalWebSocket.OPEN;
+      readonly url: string;
+
+      constructor(url: string | URL) {
+        super();
+        this.url = String(url);
+        recordedSockets.push({ url: this.url });
+        queueMicrotask(() => {
+          const opened = new Event("open");
+          this.dispatchEvent(opened);
+          this.onopen?.(opened);
+          const replayReady = new MessageEvent("message", {
+            data: JSON.stringify({ type: "replay_ready" }),
+          });
+          this.dispatchEvent(replayReady);
+          this.onmessage?.(replayReady);
+        });
+      }
+
+      close(): void {
+        this.readyState = MockTerminalWebSocket.CLOSED;
+        const closed = new CloseEvent("close");
+        this.dispatchEvent(closed);
+        this.onclose?.(closed);
+      }
+
+      send(): void {}
+    }
+
+    window.WebSocket = MockTerminalWebSocket as unknown as typeof WebSocket;
+  });
+  await setupTerminalMocks(page, {
+    runtime: {
+      ...workspaceRuntime,
+      sessions: [
+        {
+          key: "ws-123:codex",
+          workspace_id: "ws-123",
+          target_key: "codex",
+          label: "Codex",
+          kind: "agent",
+          status: "running",
+          created_at: "2026-04-10T12:00:00Z",
+        },
+      ],
+    },
+  });
+
+  await page.goto("/m/workspaces");
+
+  await expect(page.getByRole("combobox", { name: /Phone mode/ })).toHaveText("Workspaces");
+  await expect(page.getByRole("searchbox", { name: "Filter workspaces" })).toBeVisible();
+  await page.getByRole("button", { name: "View workspace options" }).click();
+  await expect(page.getByRole("dialog", { name: "View workspace options" })).toBeVisible();
+  await expect(page.getByRole("radio", { name: /Org \/ repo/ })).toBeChecked();
+  await page.getByRole("button", { name: "Close View options" }).click();
+
+  await page.getByRole("searchbox", { name: "Filter workspaces" }).fill("feature/auth");
+  await expect(page.getByRole("button", { name: "Open workspace Add auth middleware" })).toBeVisible();
+  await page.getByRole("searchbox", { name: "Filter workspaces" }).fill("");
+  await page.getByRole("button", { name: "Open workspace Add auth middleware" }).click();
+
+  await expect(page).toHaveURL(/\/m\/workspaces\/local\/ws-123$/);
+  await expect(page.getByRole("combobox", { name: /Terminal session/ })).toHaveText("Codex");
+  await expect(page.locator(".mobile-workspace-terminal__stage")).toBeVisible();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (
+            window as unknown as {
+              __kenn_forgeMobileTerminalSockets: Array<{ url: string }>;
+            }
+          ).__kenn_forgeMobileTerminalSockets.filter(({ url }) => url.includes("/ws/v1/workspaces/")).length,
+      ),
+    )
+    .toBe(2);
+
+  await page.getByRole("button", { name: "Open linked PR #42" }).click();
+  await expect(page).toHaveURL(/\/m\/workspaces\/local\/ws-123\/item$/);
+  await expect(page.locator(".mobile-workspace-item .pull-detail .detail-title")).toContainText(
+    "Add browser regression coverage",
+  );
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (
+            window as unknown as {
+              __kenn_forgeMobileTerminalSockets: Array<{ url: string }>;
+            }
+          ).__kenn_forgeMobileTerminalSockets.filter(({ url }) => url.includes("/ws/v1/workspaces/")).length,
+      ),
+    )
+    .toBe(2);
+
+  await page.getByRole("button", { name: "Back to workspace terminal" }).click();
+  await expect(page).toHaveURL(/\/m\/workspaces\/local\/ws-123$/);
+  await expect(page.getByRole("combobox", { name: /Terminal session/ })).toHaveText("Codex");
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (
+            window as unknown as {
+              __kenn_forgeMobileTerminalSockets: Array<{ url: string }>;
+            }
+          ).__kenn_forgeMobileTerminalSockets.filter(({ url }) => url.includes("/ws/v1/workspaces/")).length,
+      ),
+    )
+    .toBe(2);
+});
+
+test("phone workspace terminal opens its linked issue and returns", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await setupTerminalMocks(page, { workspace: testIssueWorkspace });
+
+  await page.goto("/m/workspaces/local/ws-issue-7");
+
+  await expect(page.getByRole("button", { name: "Open linked issue #7" })).toBeVisible();
+  await page.getByRole("button", { name: "Open linked issue #7" }).click();
+  await expect(page).toHaveURL(/\/m\/workspaces\/local\/ws-issue-7\/item$/);
+  await expect(page.locator(".mobile-workspace-item .issue-detail .detail-title")).toContainText(
+    "Theme toggle does not stick",
+  );
+
+  await page.getByRole("button", { name: "Back to workspace terminal" }).click();
+  await expect(page).toHaveURL(/\/m\/workspaces\/local\/ws-issue-7$/);
+  await expect(page.getByRole("combobox", { name: /Terminal session/ })).toHaveText("Workspace");
+});
+
+test("phone offers the durable workspace terminal when no runtime session is launched", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await installControllableTerminalWebSockets(page);
+  await setupTerminalMocks(page);
+
+  await page.goto("/m/workspaces/local/ws-123");
+
+  await expect(page.getByRole("combobox", { name: /Terminal session/ })).toHaveText("Workspace");
+  await expect(page.locator(".mobile-workspace-terminal__stage")).toBeVisible();
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (
+          window as unknown as {
+            __kenn_forgeControllableTerminalSockets: Array<{ url: string }>;
+          }
+        ).__kenn_forgeControllableTerminalSockets.map(({ url }) => new URL(url).pathname),
+      ),
+    )
+    .toContain("/ws/v1/workspaces/ws-123/terminal");
+
+  await page.getByRole("button", { name: "Terminal options" }).click();
+  await expect(page.getByRole("button", { name: /Stop terminal/ })).toHaveCount(0);
+});
+
+test("phone keeps the durable workspace terminal available when runtime discovery fails", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await installControllableTerminalWebSockets(page);
+  await setupTerminalMocks(page);
+  await page.route("**/api/v1/workspaces/ws-123/runtime", async (route) => {
+    await route.fulfill({
+      status: 503,
+      contentType: "application/problem+json",
+      body: JSON.stringify(problem("serviceUnavailable", 503, "runtime discovery unavailable")),
+    });
+  });
+
+  await page.goto("/m/workspaces/local/ws-123");
+
+  await expect(page.getByRole("combobox", { name: /Terminal session/ })).toHaveText("Workspace");
+  await expect(page.locator(".mobile-workspace-terminal__stage")).toBeVisible();
+  await expect(page.getByText("Runtime sessions unavailable")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Retry runtime sessions" })).toBeVisible();
+});
+
+test("phone dismisses stop confirmation when the selected session generation changes", async ({ page }) => {
+  await page.clock.install();
+  await page.setViewportSize({ width: 390, height: 844 });
+  const runtimeEvents: RuntimeEvents = { launches: [], renames: [], deletes: [] };
+  const mocked = await setupTerminalMocks(page, {
+    runtimeEvents,
+    runtime: {
+      ...workspaceRuntime,
+      sessions: [
+        {
+          key: "ws-123:codex",
+          workspace_id: "ws-123",
+          target_key: "codex",
+          label: "Codex",
+          kind: "agent",
+          status: "running",
+          created_at: "2026-04-10T12:00:00Z",
+        },
+      ],
+    },
+  });
+
+  await page.goto("/m/workspaces/local/ws-123");
+  await page.getByRole("button", { name: "Terminal options" }).click();
+  await page.getByRole("button", { name: "Stop terminal Codex" }).click();
+  await expect(page.getByRole("dialog", { name: "Stop terminal?" })).toBeVisible();
+
+  mocked.runtime.sessions = mocked.runtime.sessions.map((session) => ({
+    ...session,
+    created_at: "2026-04-10T12:05:00Z",
+  }));
+  await page.clock.fastForward(5_100);
+
+  await expect(page.getByRole("dialog", { name: "Stop terminal?" })).toHaveCount(0);
+  expect(runtimeEvents.deletes).toEqual([]);
+});
+
+test("phone applies a launched session before the runtime reconcile finishes", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  const mocked = await setupTerminalMocks(page);
+  let runtimeReads = 0;
+  let releaseReconcile: () => void = () => {};
+  const reconcilePending = new Promise<void>((resolve) => {
+    releaseReconcile = resolve;
+  });
+  await page.route(
+    (url) => url.pathname === "/api/v1/workspaces/ws-123/runtime",
+    async (route) => {
+      if (route.request().method() !== "GET") {
+        await route.fallback();
+        return;
+      }
+      runtimeReads += 1;
+      if (runtimeReads > 2) await reconcilePending;
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(mocked.runtime),
+      });
+    },
+  );
+
+  try {
+    await page.goto("/m/workspaces/local/ws-123");
+    await page.getByRole("button", { name: "Terminal options" }).click();
+    await page.getByRole("button", { name: "New terminal" }).click();
+    await page.getByRole("dialog", { name: "Launch workspace session" }).getByRole("button", { name: "Codex" }).click();
+
+    await expect.poll(() => runtimeReads).toBe(3);
+    await expect(page.getByRole("combobox", { name: /Terminal session/ })).toHaveText("Codex");
+  } finally {
+    releaseReconcile();
+  }
+});
+
+test("phone removes a stopped session before the runtime reconcile finishes", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  const mocked = await setupTerminalMocks(page, {
+    runtime: {
+      ...workspaceRuntime,
+      sessions: [
+        {
+          key: "ws-123:codex",
+          workspace_id: "ws-123",
+          target_key: "codex",
+          label: "Codex",
+          kind: "agent",
+          status: "running",
+          created_at: "2026-04-10T12:00:00Z",
+        },
+      ],
+    },
+  });
+  let runtimeReads = 0;
+  let releaseReconcile: () => void = () => {};
+  const reconcilePending = new Promise<void>((resolve) => {
+    releaseReconcile = resolve;
+  });
+  await page.route(
+    (url) => url.pathname === "/api/v1/workspaces/ws-123/runtime",
+    async (route) => {
+      if (route.request().method() !== "GET") {
+        await route.fallback();
+        return;
+      }
+      runtimeReads += 1;
+      if (runtimeReads > 1) await reconcilePending;
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(mocked.runtime),
+      });
+    },
+  );
+
+  try {
+    await page.goto("/m/workspaces/local/ws-123");
+    await page.getByRole("button", { name: "Terminal options" }).click();
+    await page.getByRole("button", { name: "Stop terminal Codex" }).click();
+    await page.getByRole("dialog", { name: "Stop terminal?" }).getByRole("button", { name: "Stop terminal" }).click();
+
+    await expect.poll(() => runtimeReads).toBe(2);
+    await expect(page.getByRole("combobox", { name: /Terminal session/ })).toHaveText("Workspace");
+  } finally {
+    releaseReconcile();
+  }
+});
+
+test("phone runtime mutation failures remain visible with an existing session", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await setupTerminalMocks(page, {
+    runtime: {
+      ...workspaceRuntime,
+      sessions: [
+        {
+          key: "ws-123:codex",
+          workspace_id: "ws-123",
+          target_key: "codex",
+          label: "Codex",
+          kind: "agent",
+          status: "running",
+          created_at: "2026-04-10T12:00:00Z",
+        },
+      ],
+    },
+  });
+  await page.route(
+    (url) => url.pathname.startsWith("/api/v1/workspaces/ws-123/runtime/sessions"),
+    async (route) => {
+      const message = route.request().method() === "POST" ? "launch service unavailable" : "stop service unavailable";
+      await route.fulfill({
+        status: 500,
+        contentType: "application/problem+json",
+        body: JSON.stringify(problem("internalError", 500, message)),
+      });
+    },
+  );
+
+  await page.goto("/m/workspaces/local/ws-123");
+  await page.getByRole("button", { name: "Terminal options" }).click();
+  await page.getByRole("button", { name: "New terminal" }).click();
+  await page
+    .getByRole("dialog", { name: "Launch workspace session" })
+    .getByRole("button")
+    .filter({ hasText: "system" })
+    .click();
+  const launchFailure = page.locator(".kit-flash-banner").filter({ hasText: /launch/i });
+  await expect(launchFailure).toBeVisible();
+  await expect(launchFailure).toHaveAttribute("data-kit-tone", "danger");
+
+  await page.getByRole("button", { name: "Close launch session" }).click();
+  await page.getByRole("button", { name: "Terminal options" }).click();
+  await page.getByRole("button", { name: "Stop terminal Codex" }).click();
+  await page.getByRole("dialog", { name: "Stop terminal?" }).getByRole("button", { name: "Stop terminal" }).click();
+  const stopFailure = page.locator(".kit-flash-banner").filter({ hasText: /stop/i });
+  await expect(stopFailure).toBeVisible();
+  await expect(stopFailure).toHaveAttribute("data-kit-tone", "danger");
+});
+
+test("phone terminal sheets reserve global keyboard shortcuts", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await setupTerminalMocks(page, {
+    runtime: {
+      ...workspaceRuntime,
+      sessions: [
+        {
+          key: "ws-123:codex",
+          workspace_id: "ws-123",
+          target_key: "codex",
+          label: "Codex",
+          kind: "agent",
+          status: "running",
+          created_at: "2026-04-10T12:00:00Z",
+        },
+      ],
+    },
+  });
+
+  await page.goto("/m/workspaces/local/ws-123");
+  await page.getByRole("button", { name: "Terminal options" }).click();
+  await page.keyboard.press("Meta+K");
+  await expect(page.getByRole("dialog", { name: "Command palette" })).toHaveCount(0);
+
+  await page.getByRole("button", { name: "New terminal" }).click();
+  await page.keyboard.press("Meta+K");
+  await expect(page.getByRole("dialog", { name: "Command palette" })).toHaveCount(0);
+});
+
+for (const [status, heading] of [
+  ["deleting", "Deleting workspace…"],
+  ["deletion_failed", "Workspace deletion failed"],
+] as const) {
+  test(`phone labels the ${status} workspace state accurately`, async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await setupTerminalMocks(page, {
+      workspace: { ...testWorkspace, status } as WorkspaceFixture,
+    });
+
+    await page.goto("/m/workspaces/local/ws-123");
+
+    await expect(page.locator(".mobile-workspace-terminal__state strong")).toHaveText(heading);
+  });
+}
+
+test("phone terminal clears a draft before falling back to another session", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await installControllableTerminalWebSockets(page);
+  const mocked = await setupTerminalMocks(page, {
+    runtime: {
+      ...workspaceRuntime,
+      sessions: [
+        {
+          key: "ws-123:codex",
+          workspace_id: "ws-123",
+          target_key: "codex",
+          label: "Codex",
+          kind: "agent",
+          status: "running",
+          created_at: "2026-04-10T12:00:00Z",
+        },
+        {
+          key: "ws-123:plain_shell",
+          workspace_id: "ws-123",
+          target_key: "plain_shell",
+          label: "Shell",
+          kind: "shell",
+          status: "running",
+          created_at: "2026-04-10T12:01:00Z",
+        },
+      ],
+    },
+  });
+
+  await page.goto("/m/workspaces/local/ws-123");
+  await expect(page.getByRole("combobox", { name: /Terminal session/ })).toHaveText("Codex");
+  await page.getByRole("button", { name: "Open terminal composer" }).click();
+  await page.getByRole("textbox", { name: "Terminal command" }).fill("do not send elsewhere");
+
+  mocked.runtime.sessions = mocked.runtime.sessions.filter(({ key }) => key !== "ws-123:codex");
+  await emitTerminalControl(page, "ws-123:codex", { type: "exited", code: 0 });
+
+  await expect(page.getByRole("combobox", { name: /Terminal session/ })).toHaveText("Shell");
+  await expect(page.getByRole("textbox", { name: "Terminal command" })).toHaveCount(0);
+  await page.getByRole("button", { name: "Open terminal composer" }).click();
+  await expect(page.getByRole("textbox", { name: "Terminal command" })).toHaveValue("");
+});
+
+test("phone terminal clears a draft when the selected session is relaunched with the same key", async ({ page }) => {
+  await page.clock.install();
+  await page.setViewportSize({ width: 390, height: 844 });
+  await installControllableTerminalWebSockets(page);
+  const mocked = await setupTerminalMocks(page, {
+    runtime: {
+      ...workspaceRuntime,
+      sessions: [
+        {
+          key: "ws-123:codex",
+          workspace_id: "ws-123",
+          target_key: "codex",
+          label: "Codex",
+          kind: "agent",
+          status: "running",
+          created_at: "2026-04-10T12:00:00Z",
+        },
+      ],
+    },
+  });
+
+  await page.goto("/m/workspaces/local/ws-123");
+  await page.getByRole("button", { name: "Open terminal composer" }).click();
+  await page.getByRole("textbox", { name: "Terminal command" }).fill("belongs to the old session");
+
+  mocked.runtime.sessions = mocked.runtime.sessions.map((session) => ({
+    ...session,
+    created_at: "2026-04-10T12:05:00Z",
+  }));
+  await page.clock.fastForward(5_100);
+
+  await expect(page.getByRole("textbox", { name: "Terminal command" })).toHaveCount(0);
+  await page.getByRole("button", { name: "Open terminal composer" }).click();
+  await expect(page.getByRole("textbox", { name: "Terminal command" })).toHaveValue("");
+});
+
+test("phone workspace list opens a linked item and returns to the list", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await setupTerminalMocks(page);
+
+  await page.goto("/m/workspaces");
+  await page.getByRole("button", { name: "Open linked item #42" }).click();
+
+  await expect(page).toHaveURL(/\/m\/workspaces\/local\/ws-123\/item$/);
+  await expect(page.getByRole("button", { name: "Back to workspaces" })).toBeVisible();
+  await page.getByRole("button", { name: "Back to workspaces" }).click();
+  await expect(page).toHaveURL(/\/m\/workspaces$/);
+});
+
+test("phone item routes do not start terminal runtime work without a terminal origin", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await installControllableTerminalWebSockets(page);
+  const runtimeRequests: string[] = [];
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (request.method() === "GET" && url.pathname.endsWith("/runtime")) runtimeRequests.push(url.pathname);
+  });
+  await setupTerminalMocks(page, {
+    runtime: {
+      ...workspaceRuntime,
+      sessions: [
+        {
+          key: "ws-123:codex",
+          workspace_id: "ws-123",
+          target_key: "codex",
+          label: "Codex",
+          kind: "agent",
+          status: "running",
+          created_at: "2026-04-10T12:00:00Z",
+        },
+      ],
+    },
+  });
+
+  await page.goto("/m/workspaces");
+  await page.getByRole("button", { name: "Open linked item #42" }).click();
+  await expect(page).toHaveURL(/\/m\/workspaces\/local\/ws-123\/item$/);
+  await expect(page.locator(".mobile-workspace-item .pull-detail .detail-title")).toBeVisible();
+
+  await page.goto("/m/workspaces/local/ws-123/item");
+  await expect(page.locator(".mobile-workspace-item .pull-detail .detail-title")).toBeVisible();
+  expect(runtimeRequests).toEqual([]);
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (
+            window as unknown as {
+              __kenn_forgeControllableTerminalSockets: Array<{ url: string }>;
+            }
+          ).__kenn_forgeControllableTerminalSockets.filter(({ url }) => url.includes("/ws/v1/workspaces/")).length,
+      ),
+    )
+    .toBe(0);
+});
+
+test("phone pull request workspace action stays in the mobile workspace workflow", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await setupTerminalMocks(page);
+  await installLinkedItemWorkspaceDetail(page, "pull_request", testWorkspace);
+
+  await page.goto("/m/workspaces");
+  await page.getByRole("button", { name: "Open linked item #42" }).click();
+  await page.getByRole("button", { name: "Open Workspace" }).click();
+
+  await expect(page).toHaveURL(/\/m\/workspaces\/local\/ws-123$/);
+  await page.getByRole("button", { name: "Back to workspaces" }).click();
+  await expect(page).toHaveURL(/\/m\/workspaces$/);
+});
+
+test("phone list item tabs open a workspace that returns to the list", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await setupTerminalMocks(page);
+  await installLinkedItemWorkspaceDetail(page, "pull_request", testWorkspace);
+
+  await page.goto("/m/workspaces");
+  await page.getByRole("button", { name: "Open linked item #42" }).click();
+  await page.getByRole("tab", { name: "Files changed" }).click();
+  await page.getByRole("tab", { name: "Conversation" }).click();
+  await page.getByRole("button", { name: "Open Workspace" }).click();
+
+  await expect(page).toHaveURL(/\/m\/workspaces\/local\/ws-123$/);
+  await page.getByRole("button", { name: "Back to workspaces" }).click();
+  await expect(page).toHaveURL(/\/m\/workspaces$/);
+});
+
+test("phone issue workspace action returns to its mobile terminal", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await setupTerminalMocks(page, { workspace: testIssueWorkspace });
+  await installLinkedItemWorkspaceDetail(page, "issue", testIssueWorkspace);
+
+  await page.goto("/m/workspaces/local/ws-issue-7/item");
+  await page.getByRole("button", { name: "Open Workspace" }).click();
+
+  await expect(page).toHaveURL(/\/m\/workspaces\/local\/ws-issue-7$/);
+  await expect(page.getByRole("combobox", { name: /Terminal session/ })).toHaveText("Workspace");
+});
+
+test("direct phone workspace item tabs return to the workspace terminal", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await setupTerminalMocks(page);
+
+  await page.goto("/m/workspaces");
+  await page.goto("/m/workspaces/local/ws-123/item");
+  await page.getByRole("tab", { name: "Files changed" }).click();
+  await expect(page).toHaveURL(/\/m\/workspaces\/local\/ws-123\/item\/files$/);
+
+  await page.getByRole("button", { name: "Back to workspace terminal" }).click();
+  await expect(page).toHaveURL(/\/m\/workspaces\/local\/ws-123$/);
+
+  await page.evaluate(() => history.back());
+  await expect(page).toHaveURL(/\/m\/workspaces$/);
+});
+
+test("phone Fleet workspace keeps its linked item as passive metadata", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await setupTerminalMocks(page);
+  await page.route("**/api/v1/fleet/hosts/member/workspaces/ws-123", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(testWorkspace),
+    });
+  });
+  await page.route("**/api/v1/fleet/hosts/member/workspaces/ws-123/runtime", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(workspaceRuntime),
+    });
+  });
+
+  await page.goto("/m/workspaces/fleet/member/ws-123");
+
+  await expect(page.getByRole("combobox", { name: /Terminal session/ })).toHaveCount(0);
+  await expect(page.getByText("No terminal sessions")).toBeVisible();
+  await expect(page.locator(".mobile-workspace-terminal__item")).toContainText("#42");
+  await expect(page.getByRole("button", { name: "Open linked PR #42" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Linked PR #42 unavailable for Fleet workspace" })).toBeDisabled();
+});
+
+test("phone workspace setup failure retries through the shared workflow", async ({ page }) => {
+  let retryCalls = 0;
+  let releaseRetry: () => void = () => {};
+  const retryPending = new Promise<void>((resolve) => {
+    releaseRetry = resolve;
+  });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await setupTerminalMocks(page, {
+    workspace: {
+      ...testWorkspace,
+      status: "error",
+      error_message: "tmux bootstrap failed",
+    },
+    workspaceRetryResponse: {
+      status: 202,
+      body: { ...testWorkspace, status: "creating" },
+    },
+  });
+  await page.route("**/api/v1/workspaces/ws-123/retry", async (route) => {
+    retryCalls += 1;
+    await retryPending;
+    await route.fulfill({
+      status: 202,
+      contentType: "application/json",
+      body: JSON.stringify({ ...testWorkspace, status: "creating" }),
+    });
+  });
+
+  await page.goto("/m/workspaces/local/ws-123");
+  const state = page.locator(".mobile-workspace-terminal__state");
+  await expect(state).toContainText("tmux bootstrap failed");
+  await state.getByRole("button", { name: "Retry" }).click();
+
+  await expect.poll(() => retryCalls).toBe(1);
+  await expect(state.getByRole("button", { name: "Retry" })).toBeDisabled();
+  releaseRetry();
+  await expect(state).toContainText("Setting up workspace…");
+});
+
+test("typed workspace deletion returns the phone workflow to the workspace list", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await installControllableTerminalWebSockets(page);
+  await page.addInitScript(() => {
+    const instances: Array<{
+      listeners: Map<string, Set<(event: MessageEvent) => void>>;
+    }> = [];
+
+    class FakeEventSource {
+      listeners = new Map<string, Set<(event: MessageEvent) => void>>();
+
+      constructor() {
+        instances.push(this);
+      }
+
+      addEventListener(type: string, callback: (event: MessageEvent) => void): void {
+        const bucket = this.listeners.get(type) ?? new Set();
+        bucket.add(callback);
+        this.listeners.set(type, bucket);
+      }
+
+      close(): void {}
+    }
+
+    (window as typeof window & { EventSource: typeof EventSource }).EventSource =
+      FakeEventSource as unknown as typeof EventSource;
+    (
+      window as typeof window & {
+        __emitWorkspaceDeleted: (payload: Record<string, unknown>) => void;
+      }
+    ).__emitWorkspaceDeleted = (payload) => {
+      const event = new MessageEvent("workspace_deleted", { data: JSON.stringify(payload) });
+      for (const instance of instances) {
+        for (const listener of instance.listeners.get("workspace_deleted") ?? []) listener(event);
+      }
+    };
+  });
+  await setupTerminalMocks(page, {
+    runtime: {
+      ...workspaceRuntime,
+      sessions: [
+        {
+          key: "ws-123:codex",
+          workspace_id: "ws-123",
+          target_key: "codex",
+          label: "Codex",
+          kind: "agent",
+          status: "running",
+          created_at: "2026-04-10T12:00:00Z",
+        },
+        {
+          key: "ws-123:plain_shell",
+          workspace_id: "ws-123",
+          target_key: "plain_shell",
+          label: "Shell",
+          kind: "shell",
+          status: "running",
+          created_at: "2026-04-10T12:01:00Z",
+        },
+      ],
+    },
+  });
+
+  await page.goto("/m/workspaces/local/ws-123");
+  await expect(page.locator(".session-host-wrapper")).toHaveCount(3);
+  await page.evaluate(() => {
+    (
+      window as typeof window & {
+        __emitWorkspaceDeleted: (payload: Record<string, unknown>) => void;
+      }
+    ).__emitWorkspaceDeleted({
+      workspace_id: "ws-123",
+      provider: "github",
+      platform_host: "github.com",
+      owner: "acme",
+      name: "widgets",
+      repo_path: "acme/widgets",
+      number: 42,
+      item_type: "pull_request",
+    });
+  });
+
+  await expect(page).toHaveURL(/\/m\/workspaces$/);
+  await expect(page.locator(".session-host-wrapper")).toHaveCount(0);
+});
+
+test("missing phone workspace runtime returns to the workspace list", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await setupTerminalMocks(page);
+  await page.route("**/api/v1/workspaces/ws-123/runtime", async (route) => {
+    await route.fulfill({
+      status: 404,
+      contentType: "application/problem+json",
+      body: JSON.stringify({ status: 404, code: "workspaceNotFound", detail: "workspace not found" }),
+    });
+  });
+
+  await page.goto("/m/workspaces/local/ws-123");
+
+  await expect(page).toHaveURL(/\/m\/workspaces$/);
+});
+
+test("missing phone workspace item returns to the workspace list", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await setupTerminalMocks(page);
+  await page.route(
+    (url) => url.pathname === "/api/v1/workspaces/ws-123",
+    async (route) => {
+      await route.fulfill({
+        status: 404,
+        contentType: "application/problem+json",
+        body: JSON.stringify({ status: 404, code: "workspaceNotFound", detail: "workspace not found" }),
+      });
+    },
+  );
+
+  await page.goto("/m/workspaces/local/ws-123/item");
+
+  await expect(page).toHaveURL(/\/m\/workspaces$/);
+});
+
+test("unavailable Fleet runtime stays in context with Reconnect", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await setupTerminalMocks(page);
+  await page.route("**/api/v1/fleet/hosts/member/workspaces/ws-123", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(testWorkspace),
+    });
+  });
+  await page.route("**/api/v1/fleet/hosts/member/workspaces/ws-123/runtime", async (route) => {
+    await route.fulfill({
+      status: 404,
+      contentType: "application/problem+json",
+      body: JSON.stringify({ status: 404, code: "notFound", detail: "Fleet host unavailable" }),
+    });
+  });
+
+  await page.goto("/m/workspaces/fleet/member/ws-123");
+
+  await expect(page).toHaveURL(/\/m\/workspaces\/fleet\/member\/ws-123$/);
+  await expect(page.getByText("Terminal runtime unavailable")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Reconnect" })).toBeVisible();
 });
 
 test.describe("terminal state icons", () => {

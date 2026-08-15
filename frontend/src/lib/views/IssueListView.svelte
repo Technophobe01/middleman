@@ -9,7 +9,7 @@
   import KataLinksPanel from "../components/kata/KataLinksPanel.svelte";
   import DetailPaneLayout from "../components/shared/DetailPaneLayout.svelte";
   import type { TabbedPanelLeaf } from "../components/shared/tabbed-panel-layout.js";
-  import { getPaneLayoutStore, type PaneTabSpec } from "../stores/paneLayout.svelte.js";
+  import { getPaneLayoutStore, type PaneLayoutStore, type PaneTabSpec } from "../stores/paneLayout.svelte.js";
   import { isSessionPaneKey } from "../stores/session-pane-key.js";
   import type { IssueDetailSyncMode } from "../stores/issues.svelte.js";
   import type { IssueRouteRef } from "../routes.js";
@@ -22,6 +22,7 @@
 
   interface Props {
     selectedIssue?: IssueRouteRef | null;
+    detailPresentation?: "panes" | "focused";
     isSidebarCollapsed?: boolean;
     hideSidebar?: boolean;
     sidebarWidth?: number;
@@ -30,6 +31,8 @@
     autoSyncDetail?: IssueDetailSyncMode;
     hideStaleDetailWhileLoading?: boolean;
     onSidebarResize?: (width: number) => void;
+    onOpenWorkspace?: ((workspaceId: string) => void) | undefined;
+    onViewWorkspaces?: (() => void) | undefined;
     inlineWorkspace?: InlineWorkspaceController | null;
     /**
      * The workspace's own controls, rendered in the tab strip of the leaf holding
@@ -41,6 +44,7 @@
 
   let {
     selectedIssue = null,
+    detailPresentation = "panes",
     isSidebarCollapsed = false,
     hideSidebar = false,
     sidebarWidth = 340,
@@ -48,6 +52,8 @@
     autoSyncDetail = "background",
     hideStaleDetailWhileLoading = false,
     onSidebarResize,
+    onOpenWorkspace,
+    onViewWorkspaces,
     inlineWorkspace = null,
     workspacePaneControls = undefined,
   }: Props = $props();
@@ -77,7 +83,8 @@
       : null,
   );
 
-  const paneLayout = getPaneLayoutStore("issues");
+  const paneLayoutStore = getPaneLayoutStore("issues");
+  const paneLayout = $derived<PaneLayoutStore | null>(detailPresentation === "panes" ? paneLayoutStore : null);
 
   const workspaceClaim = useItemWorkspaceClaim({
     controller: () => inlineWorkspace,
@@ -98,7 +105,7 @@
     (inlineWorkspace?.promotableSessions() ?? []).map((session) => ({
       key: session.paneKey,
       label: session.label,
-      available: paneLayout.hasTab(session.paneKey),
+      available: paneLayout?.hasTab(session.paneKey) ?? false,
       hideable: true,
     })),
   );
@@ -137,6 +144,21 @@
 
   {#if selectedIssue !== null}
     <div class="detail-host">
+      {#if detailPresentation === "focused"}
+        <IssueDetail
+          owner={selectedIssue.owner}
+          name={selectedIssue.name}
+          number={selectedIssue.number}
+          provider={selectedIssue.provider}
+          platformHost={selectedIssue.platformHost}
+          repoPath={selectedIssue.repoPath}
+          autoSync={autoSyncDetail}
+          hideStaleWhileLoading={hideStaleDetailWhileLoading}
+          {onOpenWorkspace}
+          {onViewWorkspaces}
+          {inlineWorkspace}
+        />
+      {:else if paneLayout !== null}
       <DetailPaneLayout
         layout={paneLayout}
         tabs={paneTabs}
@@ -156,6 +178,8 @@
               repoPath={selectedIssue.repoPath}
               autoSync={autoSyncDetail}
               hideStaleWhileLoading={hideStaleDetailWhileLoading}
+              {onOpenWorkspace}
+              {onViewWorkspaces}
               {inlineWorkspace}
             />
           {:else if tabKey === "kata"}
@@ -189,10 +213,11 @@
           {/if}
         {/snippet}
       </DetailPaneLayout>
+      {/if}
       <!-- The terminal dock, anchored at this surface's bottom edge while the
            container pane has retired because it is empty or row-only. The dock
            normally lives inside that pane, and must remain reachable outside it. -->
-      {@render inlineWorkspace?.dockRow()?.()}
+      {#if detailPresentation === "panes"}{@render inlineWorkspace?.dockRow()?.()}{/if}
     </div>
   {:else}
     <div class="placeholder-content">

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from "vite-plus/test";
+import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import {
   consumeSessionFocus,
   discardSessionsWithPrefix,
@@ -14,11 +14,14 @@ import {
   noteSessionReleased,
   onSessionExited,
   registerSessionSlot,
+  registerSessionInput,
   requestSessionFocus,
   releaseSessionSlot,
   resetSessionHostForTest,
   sessionHostKey,
   sessionHostPrefix,
+  sendSessionInput,
+  sendSessionPastedInput,
   setRetainedSessionLimit,
   setSessionSlotVisible,
 } from "./session-host.svelte.ts";
@@ -47,6 +50,32 @@ describe("session host registry", () => {
     // closed socket.
     expect(agentOnA).not.toBe(sessionHostKey("ws-1", undefined, "agent", "2026-02-02T00:00:00Z"));
     expect(agentOnA).toBe(sessionHostKey("ws-1", undefined, "agent", "2026-01-01T00:00:00Z"));
+  });
+
+  it("routes composed input to the current pooled terminal", () => {
+    const first = {
+      send: vi.fn(() => true),
+      sendPasted: vi.fn(() => true),
+    };
+    const unregisterFirst = registerSessionInput(agentOnA, first);
+
+    expect(sendSessionInput(agentOnA, "status\r")).toBe(true);
+    expect(first.send).toHaveBeenCalledWith("status\r");
+    expect(sendSessionPastedInput(agentOnA, "one\ntwo", "\r")).toBe(true);
+    expect(first.sendPasted).toHaveBeenCalledWith("one\ntwo", "\r");
+
+    const second = {
+      send: vi.fn(() => true),
+      sendPasted: vi.fn(() => true),
+    };
+    const unregisterSecond = registerSessionInput(agentOnA, second);
+    unregisterFirst();
+    expect(sendSessionInput(agentOnA, "next\r")).toBe(true);
+    expect(second.send).toHaveBeenCalledWith("next\r");
+
+    unregisterSecond();
+    expect(sendSessionInput(agentOnA, "ignored\r")).toBe(false);
+    expect(sendSessionPastedInput(agentOnA, "ignored", "\r")).toBe(false);
   });
 
   it("keeps parts that contain the separator distinct", () => {

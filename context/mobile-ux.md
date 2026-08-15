@@ -95,6 +95,22 @@ Avoid by default:
 - Automatic responsive redirects should be rare. Prefer presentation selection over URL replacement for canonical routes; when redirects are truly needed, preserve user intent for deep links and do not bounce focused/detail routes back to a landing page.
 - Desktop opt-out links are acceptable, but they should be explicit and test-covered.
 
+## Mobile workspace workflow
+
+- Workspaces is a first-class phone mode selected from the shared mobile mode picker; `/m/workspaces` uses a dedicated card list and never mounts the desktop workspace layout.
+- Keep search and workspace creation inline. Put the existing sort, grouping, organization-name, and diff-stat controls in a touch-sized View sheet backed by the same persisted settings as desktop.
+- Phone workspace rows show hook-reported Working, Approval, Input, and Done states as visible compact badges; color-only status dots are insufficient for agent state (`frontend/src/lib/components/mobile/MobileWorkspaceList.svelte::agentStatePresentation`).
+- Opening a workspace shows exactly one terminal. Repository, branch, and Fleet host identity get a full-width context row above the controls; the switcher selects base, agent, or shell sessions without destroying background sessions (`frontend/src/lib/components/mobile/MobileWorkspaceTerminal.svelte`).
+- Phone terminals keep direct xterm interaction available for hardware keyboards and terminal-native controls. The optional auto-growing composer stays above the software keyboard, routes through xterm's sanitized paste path, appends Enter in the same write, and clears only after xterm accepts it (`frontend/src/lib/components/mobile/MobileWorkspaceTerminal.svelte::sendComposedInput`).
+- Keep xterm's built-in renderer on Android and Firefox; Android WebGL can accept terminal output while presenting a blank surface (`frontend/src/lib/components/terminal/XtermTerminalPane.svelte::shouldUseBuiltinRenderer`).
+- Remember the selected session per workspace. A ready local workspace always offers its base terminal, even while runtime-session discovery is pending or unavailable; Fleet exposes only runtime-reported sessions. When a runtime session exits, fall back to another live session or the local base terminal (`frontend/src/lib/components/mobile/MobileWorkspaceTerminal.svelte`).
+- An accepted queued launch reconciles the exact workspace, Fleet host, session key, and acceptance time for 15 seconds. Transient reads retry; the matching session completes the claim, while only that exact claim may expire and report a danger flash (`frontend/src/lib/components/terminal/workspace-runtime-workflow.ts::reconcileAcceptedLaunch`).
+- A local linked item opened from the workspace list returns to the list without mounting terminal runtime work; one opened from a terminal keeps that exact workspace and selected session mounted. Direct item tabs replace their direct-origin history entry before Back falls through to the terminal. Fleet linked-item numbers stay passive until detail routing can retain Fleet host identity (`frontend/src/App.svelte::leaveMobileWorkspaceItem`).
+- Keep launch and Stop out of the phone terminal header. Its touch-sized ellipsis opens a bottom Terminal options tray backed by the existing persisted terminal settings; New terminal opens the launcher, while Stop remains immediately discoverable in the tray and requires explicit confirmation before the runtime mutation begins (`frontend/src/lib/components/mobile/MobileWorkspaceTerminal.svelte::stopSelectedSession`).
+- Routes retain local or Fleet identity. Only authoritative deletion events invalidate shared workspace state. A `workspaceNotFound` response replaces matching phone routes with the list without publishing deletion or invalidating shared state. Unavailable Fleet hosts and generic connection failures remain in context with Retry or reconnect affordances (`frontend/src/lib/stores/workspace-host.svelte.ts::notifyWorkspaceDeleted`).
+- Mobile workspace screens may share data, persistence, runtime, and focused-item primitives with desktop, but must not depend on its pane tree, dock, sidebar, or resize coordinator.
+- Verify phone routing, overflow, filters, touch input, session switching and exit, Fleet failures, item round trips, retained workspace actions, and desktop workspace regressions.
+
 ## Verification expectations
 
 For mobile-visible changes, verify behavior with a real phone profile, not only a resized desktop viewport.

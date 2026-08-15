@@ -37,6 +37,14 @@
   export function focus(): void {
     xtermPane?.focus();
   }
+
+  export function sendInput(data: string): boolean {
+    return xtermPane?.sendInput(data) ?? false;
+  }
+
+  export function sendPastedInput(data: string, suffix = ""): boolean {
+    return xtermPane?.sendPastedInput(data, suffix) ?? false;
+  }
 </script>
 
 <XtermTerminalPane

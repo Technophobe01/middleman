@@ -44,6 +44,7 @@
   } from "./terminal-session.js";
   import { terminalAttachment } from "./terminal-attachment.js";
   import { currentTerminalGeometryIntent } from "./terminalGeometryIntent.js";
+  import { decodeTerminalControlMessage } from "./terminal-control-message.js";
 
   interface TerminalPaneProps {
     workspaceId?: string | undefined;
@@ -133,6 +134,21 @@
       return;
     }
     explicitFocusRequested = true;
+  }
+
+  export function sendInput(data: string): boolean {
+    if (disabled || !terminal || !terminalSession?.isConnected()) return false;
+    terminal.input(data, true);
+    return true;
+  }
+
+  export function sendPastedInput(data: string, suffix = ""): boolean {
+    if (disabled || !terminal || !terminalSession?.isConnected()) return false;
+    claimTerminalResize();
+    terminalSession.send(
+      encoder.encode(`${createTerminalPastePayload(data, terminal.modes.bracketedPasteMode)}${suffix}`),
+    );
+    return true;
   }
 
   const TERMINAL_SMOOTH_SCROLL_DURATION = 0;
@@ -574,8 +590,9 @@
     terminal.refresh(0, Math.max(0, terminal.rows - 1));
   }
 
-  function isFirefox(): boolean {
-    return navigator.userAgent.toLowerCase().includes("firefox/");
+  function shouldUseBuiltinRenderer(): boolean {
+    const userAgent = navigator.userAgent.toLowerCase();
+    return userAgent.includes("firefox/") || userAgent.includes("android");
   }
 
   function recreateWebglAddon(): void {
@@ -583,7 +600,7 @@
     webglAddon?.dispose();
     webglAddon = null;
     if (rendererParked) return;
-    if (isFirefox()) {
+    if (shouldUseBuiltinRenderer()) {
       scheduleTerminalResize();
       return;
     }
@@ -598,7 +615,7 @@
       webglAddon = wgl;
       scheduleTerminalResize();
     } catch {
-      // WebGL unavailable; canvas renderer used as fallback.
+      // WebGL unavailable; xterm's built-in renderer remains active.
     }
   }
 
@@ -714,32 +731,9 @@
       "";
     if (pastedText === "") return;
 
+    if (!sendPastedInput(pastedText)) return;
     event.preventDefault();
     event.stopImmediatePropagation();
-    claimTerminalResize();
-    terminalSession.send(
-      encoder.encode(
-        createTerminalPastePayload(
-          pastedText,
-          terminal?.modes.bracketedPasteMode ?? false,
-        ),
-      ),
-    );
-  }
-
-  function decodeTerminalControlMessage(data: string): { type: string; code?: number } | null {
-    try {
-      const value: unknown = JSON.parse(data);
-      if (typeof value !== "object" || value === null || !("type" in value) || typeof value.type !== "string") {
-        return null;
-      }
-      if ("code" in value && typeof value.code === "number") {
-        return { type: value.type, code: value.code };
-      }
-      return { type: value.type };
-    } catch {
-      return null;
-    }
   }
 
   function handleTerminalMessage(data: string | Uint8Array): TerminalMessageDecision {

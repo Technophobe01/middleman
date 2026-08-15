@@ -10,6 +10,10 @@
   import IssueListView from "./lib/views/IssueListView.svelte";
   import ActivityFeedView from "./lib/views/ActivityFeedView.svelte";
   import MobileActivityView from "./lib/views/MobileActivityView.svelte";
+  import MobileModePicker from "./lib/components/mobile/MobileModePicker.svelte";
+  import MobileWorkspaceList from "./lib/components/mobile/MobileWorkspaceList.svelte";
+  import MobileWorkspaceTerminal from "./lib/components/mobile/MobileWorkspaceTerminal.svelte";
+  import MobileWorkspaceItem from "./lib/components/mobile/MobileWorkspaceItem.svelte";
   import ReviewsView from "./lib/views/ReviewsView.svelte";
   import FocusListView from "./lib/views/FocusListView.svelte";
   import { normalizeGlobalRepoSelection } from "./lib/utils/repo-filter-values.js";
@@ -51,6 +55,7 @@
   import RepoSummaryPage from "./lib/components/repositories/RepoSummaryPage.svelte";
   import SettingsPage from "./lib/components/settings/SettingsPage.svelte";
   import WorkspaceHost from "./lib/components/terminal/WorkspaceHost.svelte";
+  import SessionTerminalPool from "./lib/components/terminal/SessionTerminalPool.svelte";
   import WorkspacePaneControls from "./lib/components/terminal/WorkspacePaneControls.svelte";
   import WorkspaceEmbedShell from "./lib/components/terminal/WorkspaceEmbedShell.svelte";
   import WorkspaceFirstRunPanel from "./lib/components/terminal/WorkspaceFirstRunPanel.svelte";
@@ -98,6 +103,8 @@
     isMobilePage,
     getDetailTab,
     getSelectedPRFromRoute,
+    buildMobileWorkspaceRoute,
+    buildMobileWorkspaceItemRoute,
     type RoutableItemRef,
   } from "./lib/stores/router.svelte.ts";
   import { getInlineWorkspaceController, tabSlotAttachment } from "./lib/stores/workspace-host.svelte.ts";
@@ -635,11 +642,84 @@
     const page = getPage();
     if (page === "mobile-pulls") return "/pulls";
     if (page === "mobile-issues") return "/issues";
+    if (page === "mobile-workspaces") return "/workspaces";
+    const route = getRoute();
+    if (
+      route.page === "mobile-workspace-terminal" ||
+      route.page === "mobile-workspace-item"
+    ) {
+      return route.hostKey
+        ? `/terminal/fleet/${encodeURIComponent(route.hostKey)}/${encodeURIComponent(route.workspaceId)}`
+        : `/terminal/${encodeURIComponent(route.workspaceId)}`;
+    }
     return "/";
   }
 
   function navigateMobile(path: string): void {
-    navigate(`${path}${window.location.search}`);
+    navigate(path === "/m/workspaces" ? path : `${path}${window.location.search}`);
+  }
+
+  type MobileWorkspaceOrigin = "list" | "terminal" | "direct";
+  const mobileWorkspaceOriginKey = "kennForgeMobileWorkspaceOrigin";
+  const mobileWorkspaceBackDepthKey = "kennForgeMobileWorkspaceBackDepth";
+
+  function mobileWorkspaceHistory(): { origin: MobileWorkspaceOrigin; backDepth: number } | undefined {
+    const state: unknown = history.state;
+    if (typeof state !== "object" || state === null) return undefined;
+    const origin = Reflect.get(state, mobileWorkspaceOriginKey);
+    const backDepth = Reflect.get(state, mobileWorkspaceBackDepthKey);
+    if (origin !== "list" && origin !== "terminal" && origin !== "direct") return undefined;
+    return {
+      origin,
+      backDepth: origin === "direct" ? 0 : typeof backDepth === "number" && backDepth > 0 ? backDepth : 1,
+    };
+  }
+
+  function mobileWorkspaceHistoryState(
+    origin: MobileWorkspaceOrigin,
+    backDepth = origin === "direct" ? 0 : 1,
+  ): Record<string, unknown> {
+    return {
+      [mobileWorkspaceOriginKey]: origin,
+      [mobileWorkspaceBackDepthKey]: backDepth,
+    };
+  }
+
+  function openMobileWorkspaceFromList(workspaceId: string, hostKey?: string): void {
+    navigate(buildMobileWorkspaceRoute(workspaceId, hostKey), mobileWorkspaceHistoryState("list"));
+  }
+
+  function openCreatedMobileWorkspace(workspaceId: string): void {
+    navigate(buildMobileWorkspaceRoute(workspaceId));
+  }
+
+  function openMobileWorkspaceItemFromList(workspaceId: string, hostKey?: string): void {
+    navigate(buildMobileWorkspaceItemRoute(workspaceId, hostKey), mobileWorkspaceHistoryState("list"));
+  }
+
+  function openMobileWorkspaceItemFromTerminal(workspaceId: string, hostKey?: string): void {
+    navigate(buildMobileWorkspaceItemRoute(workspaceId, hostKey), mobileWorkspaceHistoryState("terminal"));
+  }
+
+  function openMobileWorkspaceFromItem(workspaceId: string, hostKey?: string): void {
+    const mobileHistory = mobileWorkspaceHistory() ?? { origin: "direct" as const, backDepth: 0 };
+    replaceUrl(
+      buildMobileWorkspaceRoute(workspaceId, hostKey),
+      mobileWorkspaceHistoryState(mobileHistory.origin, mobileHistory.backDepth),
+    );
+  }
+
+  function leaveMobileWorkspaceTerminal(): void {
+    const mobileHistory = mobileWorkspaceHistory();
+    if (mobileHistory?.origin === "list") history.go(-mobileHistory.backDepth);
+    else replaceUrl("/m/workspaces");
+  }
+
+  function leaveMobileWorkspaceItem(workspaceId: string, hostKey?: string): void {
+    const mobileHistory = mobileWorkspaceHistory();
+    if (mobileHistory?.origin === "direct") replaceUrl(buildMobileWorkspaceRoute(workspaceId, hostKey));
+    else if (mobileHistory) history.go(-mobileHistory.backDepth);
+    else replaceUrl(buildMobileWorkspaceRoute(workspaceId, hostKey));
   }
 
   function useDesktopView(): void {
@@ -1081,38 +1161,11 @@
           <span class="mobile-title">kenn-forge</span>
         </span>
 
-        <nav class="mobile-tabs" aria-label="Phone navigation">
-          {#if isModeVisible("activity")}
-            <a
-              class:mobile-tab--active={getPage() === "mobile-activity" || getPage() === "activity"}
-              href="/m"
-              onclick={(e) => {
-                e.preventDefault();
-                navigateMobile("/m");
-              }}
-            >Activity</a>
-          {/if}
-          {#if isModeVisible("pulls")}
-            <a
-              class:mobile-tab--active={getPage() === "mobile-pulls"}
-              href="/m/pulls"
-              onclick={(e) => {
-                e.preventDefault();
-                navigateMobile("/m/pulls");
-              }}
-            >PRs</a>
-          {/if}
-          {#if isModeVisible("issues")}
-            <a
-              class:mobile-tab--active={getPage() === "mobile-issues"}
-              href="/m/issues"
-              onclick={(e) => {
-                e.preventDefault();
-                navigateMobile("/m/issues");
-              }}
-            >Issues</a>
-          {/if}
-        </nav>
+        <MobileModePicker
+          page={getPage()}
+          {isModeVisible}
+          onNavigate={navigateMobile}
+        />
 
         <button
           class="mobile-desktop-link"
@@ -1131,6 +1184,54 @@
             <Spinner size={18} />
             Loading
           </div>
+        {:else if getPage() === "mobile-workspaces"}
+          <MobileWorkspaceList
+            onOpen={openMobileWorkspaceFromList}
+            onOpenItem={openMobileWorkspaceItemFromList}
+          />
+        {:else if getPage() === "mobile-workspace-terminal" || getPage() === "mobile-workspace-item"}
+          {@const route = getRoute()}
+          {#if route.page === "mobile-workspace-terminal" || route.page === "mobile-workspace-item"}
+            <div class="mobile-workspace-route focus-layout--phone">
+              {#if route.page === "mobile-workspace-terminal" || mobileWorkspaceHistory()?.origin === "terminal"}
+                <div class="mobile-workspace-route__terminal" hidden={route.page === "mobile-workspace-item"}>
+                  <MobileWorkspaceTerminal
+                    workspaceId={route.workspaceId}
+                    hostKey={route.hostKey}
+                    visible={route.page === "mobile-workspace-terminal"}
+                    onBack={leaveMobileWorkspaceTerminal}
+                    onMissing={() => replaceUrl("/m/workspaces")}
+                    onOpenItem={() => openMobileWorkspaceItemFromTerminal(route.workspaceId, route.hostKey)}
+                  />
+                </div>
+              {/if}
+              {#if route.page === "mobile-workspace-item"}
+                <MobileWorkspaceItem
+                  workspaceId={route.workspaceId}
+                  hostKey={route.hostKey}
+                  tab={route.tab}
+                  backDestination={mobileWorkspaceHistory()?.origin === "list" ? "list" : "terminal"}
+                  onBack={() => leaveMobileWorkspaceItem(route.workspaceId, route.hostKey)}
+                  onMissing={() => replaceUrl("/m/workspaces")}
+                  onOpenWorkspace={(workspaceId) => openMobileWorkspaceFromItem(workspaceId, route.hostKey)}
+                  onViewWorkspaces={() => replaceUrl("/m/workspaces")}
+                  onTabChange={(tab, options) => {
+                    const path = buildMobileWorkspaceItemRoute(
+                      route.workspaceId,
+                      route.hostKey,
+                      tab === "files" ? "files" : undefined,
+                    );
+                    const mobileHistory = mobileWorkspaceHistory() ?? { origin: "direct" as const, backDepth: 0 };
+                    if (options?.replace || mobileHistory.origin === "direct") {
+                      replaceUrl(path, mobileWorkspaceHistoryState(mobileHistory.origin, mobileHistory.backDepth));
+                    } else {
+                      navigate(path, mobileWorkspaceHistoryState(mobileHistory.origin, mobileHistory.backDepth + 1));
+                    }
+                  }}
+                />
+              {/if}
+            </div>
+          {/if}
         {:else if getPage() === "mobile-pulls"}
           <FocusListView listType="mrs" />
         {:else if getPage() === "mobile-issues"}
@@ -1143,6 +1244,7 @@
           />
         {/if}
       </main>
+      <SessionTerminalPool />
     </section>
   {:else}
     {#if !isHeaderHidden()}
@@ -1308,6 +1410,10 @@
         seedRepo={getNewWorkspaceSeedRepo()}
         initialSource={getNewWorkspaceSource()}
         onClose={closeNewWorkspaceDialog}
+        onCreated={(workspaceId) => {
+          if (isMobilePage(getPage())) openCreatedMobileWorkspace(workspaceId);
+          else navigate(`/terminal/${encodeURIComponent(workspaceId)}`);
+        }}
       />
     {/if}
   {/if}
@@ -1390,41 +1496,24 @@
     background: var(--bg-surface);
   }
 
-  .mobile-tabs {
-    min-width: 0;
-    display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: var(--mobile-chrome-space-xs);
-    padding: 2px;
-    border: thin solid var(--border-default);
-    border-radius: var(--radius-md);
-    background: var(--bg-inset);
-  }
-
-  .mobile-tabs a {
-    min-height: calc(var(--mobile-chrome-hit-target) - 6px);
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    border-radius: calc(var(--radius-md) - 2px);
-    color: var(--text-secondary);
-    font-size: var(--font-size-md);
-    font-weight: 650;
-    text-decoration: none;
-  }
-
-  .mobile-tabs a.mobile-tab--active {
-    color: var(--text-primary);
-    background: var(--bg-surface);
-    box-shadow: var(--shadow-sm);
-  }
-
   .mobile-main {
     flex: 1;
     min-height: 0;
     display: flex;
     flex-direction: column;
     overflow: hidden;
+  }
+
+  .mobile-workspace-route,
+  .mobile-workspace-route__terminal {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .mobile-workspace-route__terminal[hidden] {
+    display: none;
   }
 
   .mobile-main :global(.controls-bar) {
