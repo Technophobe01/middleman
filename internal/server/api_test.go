@@ -9092,7 +9092,11 @@ func TestOpenAPIEndpointReflectsHumaContract(t *testing.T) {
 	require.Contains(body, `"name":"since"`)
 	require.Contains(body, `"capped"`)
 	require.Contains(body, `"item_activity_capped"`)
-	require.NotContains(body, `"name":"before"`)
+	require.Contains(body, `"name":"projection"`)
+	require.Contains(body, `"name":"before"`)
+	require.Contains(body, `"name":"at_or_before"`)
+	require.Contains(body, `"event_cursor"`)
+	require.Contains(body, `"/activity/thread-events"`)
 	require.NotContains(body, `"has_more"`)
 }
 
@@ -15559,10 +15563,10 @@ func TestAPIGitLabProviderCapabilitiesExposeOnResponses(t *testing.T) {
 	activityItems := activity["items"].([]any)
 	require.NotEmpty(activityItems)
 	activityRepo := activityItems[0].(map[string]any)["repo"].(map[string]any)
-	activityCaps := activityRepo["capabilities"].(map[string]any)
 	assert.Equal("gitlab", activityRepo["provider"])
-	assert.Equal(true, activityCaps["read_merge_requests"])
-	assert.Equal(false, activityCaps["comment_mutation"])
+	assert.Equal("gitlab.example.com", activityRepo["platform_host"])
+	assert.Equal("group/project", activityRepo["repo_path"])
+	assert.NotContains(activityRepo, "capabilities")
 
 	require.NoError(database.InsertWorkspace(ctx, &db.Workspace{
 		ID:           "gitlabcap0000001",
@@ -23786,6 +23790,75 @@ func TestAPIListActivity(t *testing.T) {
 		"activity feed should contain PR and comment items")
 	assert.Equal("github.com", (*resp.JSON200.Items)[0].PlatformHost)
 
+	collapsed := doJSON(
+		t,
+		srv,
+		http.MethodGet,
+		"/api/v1/activity?since="+url.QueryEscape(since)+"&projection=collapsed",
+		nil,
+	)
+	require.Equal(http.StatusOK, collapsed.Code)
+	var collapsedBody struct {
+		Items        []activityItemResponse    `json:"items"`
+		ItemActivity []activitySubjectResponse `json:"item_activity"`
+		EventCursor  string                    `json:"event_cursor"`
+	}
+	require.NoError(json.NewDecoder(collapsed.Body).Decode(&collapsedBody))
+	assert.Empty(collapsedBody.Items, "collapsed projection must omit pull request child events")
+	require.Len(collapsedBody.ItemActivity, 1)
+	assert.NotEmpty(collapsedBody.ItemActivity[0].EventLedgerRevision,
+		"collapsed parents must identify the exact child ledger snapshot")
+	assert.NotEmpty(collapsedBody.EventCursor, "cursor must cover omitted child events")
+
+	delta := doJSON(
+		t,
+		srv,
+		http.MethodGet,
+		"/api/v1/activity?since="+url.QueryEscape(since)+"&projection=events&after="+
+			url.QueryEscape(collapsedBody.EventCursor),
+		nil,
+	)
+	require.Equal(http.StatusOK, delta.Code)
+	var deltaBody struct {
+		Items        []activityItemResponse    `json:"items"`
+		ItemActivity []activitySubjectResponse `json:"item_activity"`
+		EventCursor  string                    `json:"event_cursor"`
+	}
+	require.NoError(json.NewDecoder(delta.Body).Decode(&deltaBody))
+	assert.Empty(deltaBody.Items)
+	assert.Empty(deltaBody.ItemActivity, "event deltas must not resend parent summaries")
+	assert.Equal(collapsedBody.EventCursor, deltaBody.EventCursor)
+
+	thread := doJSON(
+		t,
+		srv,
+		http.MethodGet,
+		"/api/v1/activity/thread-events?provider=github&platform_host=github.com"+
+			"&platform_repo_id=repo-acme-widget&item_type=pr&item_number=1&since="+
+			url.QueryEscape(since),
+		nil,
+	)
+	require.Equal(http.StatusOK, thread.Code)
+	var threadBody activityResponse
+	require.NoError(json.NewDecoder(thread.Body).Decode(&threadBody))
+	require.Len(threadBody.Items, 2)
+	assert.Empty(threadBody.ItemActivity)
+
+	filteredThread := doJSON(
+		t,
+		srv,
+		http.MethodGet,
+		"/api/v1/activity/thread-events?provider=github&platform_host=github.com"+
+			"&platform_repo_id=repo-acme-widget&item_type=pr&item_number=1&since="+
+			url.QueryEscape(since)+"&types=comment&search="+url.QueryEscape("Looks good"),
+		nil,
+	)
+	require.Equal(http.StatusOK, filteredThread.Code)
+	var filteredThreadBody activityResponse
+	require.NoError(json.NewDecoder(filteredThread.Body).Decode(&filteredThreadBody))
+	require.Len(filteredThreadBody.Items, 1)
+	assert.Equal("comment", filteredThreadBody.Items[0].ActivityType)
+
 	search := "reviewer"
 	filtered, err := client.HTTP.ListActivityWithResponse(
 		ctx, &generated.ListActivityParams{Since: &since, Search: &search},
@@ -23820,6 +23893,151 @@ func TestAPIListActivity(t *testing.T) {
 	require.NotNil(unfiltered.JSON200)
 	require.NotNil(unfiltered.JSON200.Items)
 	assert.Len(*unfiltered.JSON200.Items, len(*resp.JSON200.Items))
+}
+
+func TestAPIListCollapsedActivityIncludesParentRecentOnlyByNotification(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	srv, database := setupNotificationsEnabledTestServer(t)
+	ctx := t.Context()
+	now := time.Now().UTC().Truncate(time.Second)
+	oldActivity := now.Add(-30 * 24 * time.Hour)
+	seedPR(
+		t, database, "acme", "widget", 71,
+		withSeedPRTitle("Old pull with recent notification"),
+		withSeedPRTimes(oldActivity, oldActivity, oldActivity),
+	)
+	number := 71
+	notificationAt := now.Add(-time.Hour)
+	require.NoError(database.UpsertNotifications(ctx, []db.Notification{{
+		Platform: "github", PlatformHost: "github.com",
+		PlatformNotificationID: "api-recent-old-pull",
+		RepoOwner:              "acme", RepoName: "widget",
+		SubjectType: "PullRequest", SubjectTitle: "Old pull with recent notification",
+		WebURL:     "https://github.com/acme/widget/pull/71",
+		ItemNumber: &number, ItemType: "pr", ItemAuthor: "contributor",
+		Reason: "mention", Unread: true,
+		SourceUpdatedAt: notificationAt, SyncedAt: notificationAt,
+	}}))
+
+	since := url.QueryEscape(now.Add(-7 * 24 * time.Hour).Format(time.RFC3339))
+	rr := doJSON(
+		t,
+		srv,
+		http.MethodGet,
+		"/api/v1/activity?since="+since+"&projection=collapsed",
+		nil,
+	)
+	require.Equal(http.StatusOK, rr.Code)
+	var body struct {
+		Items        []activityItemResponse    `json:"items"`
+		ItemActivity []activitySubjectResponse `json:"item_activity"`
+	}
+	require.NoError(json.NewDecoder(rr.Body).Decode(&body))
+	assert.Empty(body.Items)
+	require.Len(body.ItemActivity, 1)
+	assert.Equal(71, body.ItemActivity[0].ItemNumber)
+	assert.Equal(formatUTCRFC3339(notificationAt), body.ItemActivity[0].ActivityAt)
+
+	filtered := doJSON(
+		t,
+		srv,
+		http.MethodGet,
+		"/api/v1/activity?since="+since+"&projection=collapsed&types=comment",
+		nil,
+	)
+	require.Equal(http.StatusOK, filtered.Code)
+	var filteredBody struct {
+		Items        []activityItemResponse    `json:"items"`
+		ItemActivity []activitySubjectResponse `json:"item_activity"`
+	}
+	require.NoError(json.NewDecoder(filtered.Body).Decode(&filteredBody))
+	assert.Empty(filteredBody.Items)
+	assert.Empty(filteredBody.ItemActivity,
+		"hidden notifications must not pull otherwise-old parents into the window")
+}
+
+func TestAPIListCollapsedActivityRetainsVisibleEventsForBotParents(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	srv, database := setupTestServer(t)
+	ctx := t.Context()
+	now := time.Now().UTC().Truncate(time.Second)
+	prID := seedPR(
+		t, database, "acme", "widget", 81,
+		withSeedPRTitle("Bot-authored pull request"),
+		withSeedPRAuthor("dependabot[bot]"),
+		withSeedPRTimes(now.Add(-time.Hour), now.Add(-time.Hour), now.Add(-time.Hour)),
+	)
+	require.NoError(database.UpsertMREvents(ctx, []db.MREvent{{
+		MergeRequestID: prID,
+		EventType:      "issue_comment",
+		Author:         "human-reviewer",
+		Body:           "Visible human comment",
+		CreatedAt:      now,
+		DedupeKey:      "api-human-comment-on-bot-parent",
+	}}))
+
+	since := url.QueryEscape(now.Add(-7 * 24 * time.Hour).Format(time.RFC3339))
+	rr := doJSON(
+		t,
+		srv,
+		http.MethodGet,
+		"/api/v1/activity?since="+since+"&projection=collapsed&hide_bots=true",
+		nil,
+	)
+	require.Equal(http.StatusOK, rr.Code)
+	var body struct {
+		Items        []activityItemResponse    `json:"items"`
+		ItemActivity []activitySubjectResponse `json:"item_activity"`
+	}
+	require.NoError(json.NewDecoder(rr.Body).Decode(&body))
+	require.Len(body.Items, 1)
+	assert.Equal("comment", body.Items[0].ActivityType)
+	assert.Equal(81, body.Items[0].ItemNumber)
+	assert.Equal("human-reviewer", body.Items[0].Author)
+	assert.Empty(body.ItemActivity)
+}
+
+func TestAPIListActivitySearchEventDeltaDoesNotReadBeforeCursor(t *testing.T) {
+	require := require.New(t)
+	srv, database := setupTestServer(t)
+	client := setupTestClient(t, srv)
+	ctx := t.Context()
+	now := time.Now().UTC().Truncate(time.Second)
+	prID := seedPR(t, database, "acme", "widget", 1)
+	malformedCreatedAt := now.Add(-time.Hour).Format("2006-01-02 15:04:05") + " invalid"
+	_, err := database.WriteDB().ExecContext(ctx, `
+		INSERT INTO forge_mr_events (
+			merge_request_id, event_type, author, body, created_at, dedupe_key
+		) VALUES (?, 'issue_comment', 'search-reviewer', 'needle', ?, 'malformed-before-cursor')`,
+		prID, malformedCreatedAt)
+	require.NoError(err)
+
+	search := "needle"
+	sinceTime := now.Add(-2 * time.Hour)
+	deltaRows, err := database.ListActivity(ctx, db.ListActivityOpts{
+		Search: search, Since: &sinceTime, AfterTime: &now, Limit: 11,
+	})
+	require.NoError(err, "the cursor-bounded event query must exclude the malformed older row")
+	require.Empty(deltaRows)
+
+	projection := generated.ListActivityParamsProjectionEvents
+	since := sinceTime.Format(time.RFC3339)
+	after := db.EncodeCursor(now, "pre", 0)
+	limit := int64(10)
+	resp, err := client.HTTP.ListActivityWithResponse(ctx, &generated.ListActivityParams{
+		Search: &search, Since: &since, After: &after, Projection: &projection, Limit: &limit,
+	})
+	require.NoError(err)
+	require.Equal(http.StatusOK, resp.StatusCode())
+	require.NotNil(resp.JSON200)
+	require.NotNil(resp.JSON200.Items)
+	require.Empty(*resp.JSON200.Items)
+	require.NotNil(resp.JSON200.ItemActivity)
+	require.Empty(*resp.JSON200.ItemActivity)
+	require.NotNil(resp.JSON200.WorkspaceActivity)
+	require.Empty(*resp.JSON200.WorkspaceActivity)
 }
 
 func TestAPIListActivityReturnsRecentParentWhenItsVisibleEventsAreFiltered(t *testing.T) {

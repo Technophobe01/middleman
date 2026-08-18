@@ -1122,8 +1122,9 @@ type ActivityItem struct {
 // ActivitySubject is the authoritative parent projection for one pull request
 // or issue in the Activity time range. It is independent of event visibility.
 type ActivitySubject struct {
-	Subject    WorkspaceSubjectMetadata
-	ActivityAt time.Time
+	Subject             WorkspaceSubjectMetadata
+	ActivityAt          time.Time
+	EventLedgerRevision string
 }
 
 // Stack represents a detected chain of dependent PRs.
@@ -1342,6 +1343,16 @@ type ListActivityOpts struct {
 	// nil-safety), so the safety-capped window is never spent on rows the
 	// caller will not serve.
 	ExcludeNotifications bool
+	HideClosedMerged     bool
+	HideBots             bool
+	HideDefaultBranch    bool
+	ParentRepoID         int64
+	ParentItemType       string
+	ParentItemNumber     int
+	// DirectProjectionOnly selects rows that cannot be represented by the
+	// filtered parent projection, including repository/unparented rows and
+	// visible human events whose bot-authored parent is hidden.
+	DirectProjectionOnly bool
 	// NotificationRepoFilters limits notification rows to the caller's
 	// current monitored repo set before ordering/limit. nil means no
 	// additional notification scope; an empty/non-matching set means no
@@ -1350,12 +1361,15 @@ type ListActivityOpts struct {
 	Limit                   int        // page size (default 50, max 200)
 	Since                   *time.Time // only return events created at or after this time
 	// Cursor fields -- decoded from opaque token by the handler.
-	BeforeTime     *time.Time
-	BeforeSource   string
-	BeforeSourceID int64
-	AfterTime      *time.Time
-	AfterSource    string
-	AfterSourceID  int64
+	BeforeTime         *time.Time
+	BeforeSource       string
+	BeforeSourceID     int64
+	AfterTime          *time.Time
+	AfterSource        string
+	AfterSourceID      int64
+	AtOrBeforeTime     *time.Time
+	AtOrBeforeSource   string
+	AtOrBeforeSourceID int64
 }
 
 // ListActivitySubjectsOpts holds parent-level filters for the Activity feed.
@@ -1365,14 +1379,30 @@ type ListActivitySubjectsOpts struct {
 	RepoFilters    []RepoFilter
 	AllowedRepoIDs []int64
 	ItemTypes      []string
-	Search         string
+	// ExcludeNotificationRecency prevents hidden notification rows from
+	// admitting or reordering otherwise-old parents.
+	ExcludeNotificationRecency bool
+	Search                     string
 	// SearchMatchedSubjectKeys identifies parents whose provider events matched
 	// Search. The parent title and author do not necessarily contain that term.
 	SearchMatchedSubjectKeys []WorkspaceSubjectKey
 	Author                   string
 	ViewerLogins             []RepoViewerLogin
+	HideClosedMerged         bool
+	HideBots                 bool
 	Limit                    int
 	Since                    *time.Time
+}
+
+type ActivityProjection struct {
+	DirectRows  []ActivityItem
+	Subjects    []ActivitySubject
+	EventCursor string
+}
+
+type ListActivityProjectionOpts struct {
+	ListActivityOpts
+	SubjectLimit int
 }
 
 // ListActivityAuthorsOpts holds the repository and time scopes used to build

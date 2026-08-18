@@ -120,6 +120,9 @@ const activityCapped = vi.hoisted(() => ({ value: false }));
 const itemActivityCapped = vi.hoisted(() => ({ value: false }));
 const involvesMe = vi.hoisted(() => ({ value: false }));
 const markNotificationSeen = vi.hoisted(() => vi.fn(async () => undefined));
+const loadActivity = vi.hoisted(() => vi.fn(async () => undefined));
+const threadLoadError = vi.hoisted(() => ({ value: null as string | null }));
+const retryFailedThreadLoads = vi.hoisted(() => vi.fn());
 const selectedAuthor = vi.hoisted(() => ({ value: undefined as string | undefined }));
 const setActivityAuthor = vi.hoisted(() =>
   vi.fn((author: string | undefined) => {
@@ -133,7 +136,7 @@ vi.mock("../context.js", () => ({
   getStores: () => ({
     activity: {
       initializeFromMount: vi.fn(),
-      loadActivity: vi.fn(async () => undefined),
+      loadActivity,
       startActivityPolling: vi.fn(),
       stopActivityPolling: vi.fn(),
       getActivitySearch: () => "",
@@ -153,6 +156,7 @@ vi.mock("../context.js", () => ({
       getItemActivity: () => itemActivity.value,
       getWorkspaceActivity: () => workspaceActivity.value,
       getActivityError: () => null,
+      getThreadLoadError: () => threadLoadError.value,
       getViewMode: () => viewMode.value,
       getTimeRange: () => "7d",
       isActivityLoading: () => false,
@@ -167,6 +171,7 @@ vi.mock("../context.js", () => ({
       }),
       isThreadItemExpanded: () => true,
       toggleThreadItem: vi.fn(),
+      retryFailedThreadLoads,
       setActivityFilterTypes,
       setEnabledItemTypes: vi.fn((itemTypes: Set<"pr" | "issue">) => {
         enabledItemTypes.value = itemTypes;
@@ -226,6 +231,9 @@ describe("ActivityFeed compact mode", () => {
     selectedAuthor.value = undefined;
     setActivityAuthor.mockClear();
     setActivityFilterTypes.mockClear();
+    loadActivity.mockClear();
+    threadLoadError.value = null;
+    retryFailedThreadLoads.mockClear();
     items.value = [
       activityItem("selected"),
       activityItem("other", {
@@ -266,6 +274,16 @@ describe("ActivityFeed compact mode", () => {
 
     expect(screen.getByText(/5,000 most recently active pull requests and issues/)).toBeTruthy();
     expect(screen.queryByText(/most recent 5,000 events/)).toBeNull();
+  });
+
+  it("offers to retry a failed thread history load", async () => {
+    threadLoadError.value = "thread history unavailable";
+
+    render(ActivityFeed, { props: { compact: true } });
+
+    expect(screen.getByText("thread history unavailable")).toBeTruthy();
+    await fireEvent.click(screen.getByRole("button", { name: "Retry thread history" }));
+    expect(retryFailedThreadLoads).toHaveBeenCalledOnce();
   });
 
   it("shows workspace-only subjects only in threaded mode", () => {
@@ -382,6 +400,18 @@ describe("ActivityFeed compact mode", () => {
 
     expect(screen.getByRole("button", { name: "Roll up commits" }).getAttribute("aria-pressed")).toBe("false");
     expect(screen.getByRole("button", { name: "Comments" }).getAttribute("aria-pressed")).toBe("true");
+  });
+
+  it("reloads server-filtered activity when closed or bot visibility changes", async () => {
+    render(ActivityFeed, { props: { compact: false } });
+    const mountedReads = loadActivity.mock.calls.length;
+
+    await fireEvent.click(screen.getByRole("button", { name: /^Filters/ }));
+    await fireEvent.click(screen.getByRole("button", { name: "Hide closed/merged" }));
+    expect(loadActivity).toHaveBeenCalledTimes(mountedReads + 1);
+
+    await fireEvent.click(screen.getByRole("button", { name: "Hide bots" }));
+    expect(loadActivity).toHaveBeenCalledTimes(mountedReads + 2);
   });
 
   it("keeps the filter popover open and focus on the selected radio during keyboard navigation", async () => {

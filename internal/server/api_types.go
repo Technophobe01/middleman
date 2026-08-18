@@ -220,25 +220,40 @@ type activityResponse struct {
 	WorkspaceActivity  []workspaceActivitySubjectResponse `json:"workspace_activity"`
 	Capped             bool                               `json:"capped"`
 	ItemActivityCapped bool                               `json:"item_activity_capped"`
+	EventCursor        string                             `json:"event_cursor"`
+	NextCursor         string                             `json:"next_cursor,omitempty"`
+}
+
+// activityRepoRefResponse carries only stable identity and current route
+// metadata. Repeating provider capabilities on every Activity row made the
+// parent-only projection several times larger without serving a consumer.
+type activityRepoRefResponse struct {
+	Provider       string `json:"provider"`
+	PlatformHost   string `json:"platform_host"`
+	PlatformRepoID string `json:"platform_repo_id,omitempty"`
+	RepoPath       string `json:"repo_path"`
+	Owner          string `json:"owner"`
+	Name           string `json:"name"`
 }
 
 type activitySubjectResponse struct {
-	Repo         httpapi.RepoRefResponse    `json:"repo"`
-	PlatformHost string                     `json:"platform_host"`
-	RepoOwner    string                     `json:"repo_owner"`
-	RepoName     string                     `json:"repo_name"`
-	ItemType     string                     `json:"item_type"`
-	ItemNumber   int                        `json:"item_number"`
-	ItemTitle    string                     `json:"item_title"`
-	ItemURL      string                     `json:"item_url"`
-	ItemState    string                     `json:"item_state"`
-	ItemAuthor   string                     `json:"item_author,omitempty"`
-	Workspace    *workspaceapi.WorkspaceRef `json:"workspace,omitempty"`
-	ActivityAt   string                     `json:"activity_at" format:"date-time"`
+	Repo                activityRepoRefResponse    `json:"repo"`
+	PlatformHost        string                     `json:"platform_host"`
+	RepoOwner           string                     `json:"repo_owner"`
+	RepoName            string                     `json:"repo_name"`
+	ItemType            string                     `json:"item_type"`
+	ItemNumber          int                        `json:"item_number"`
+	ItemTitle           string                     `json:"item_title"`
+	ItemURL             string                     `json:"item_url"`
+	ItemState           string                     `json:"item_state"`
+	ItemAuthor          string                     `json:"item_author,omitempty"`
+	Workspace           *workspaceapi.WorkspaceRef `json:"workspace,omitempty"`
+	ActivityAt          string                     `json:"activity_at" format:"date-time"`
+	EventLedgerRevision string                     `json:"event_ledger_revision"`
 }
 
 type workspaceActivitySubjectResponse struct {
-	Repo         httpapi.RepoRefResponse    `json:"repo"`
+	Repo         activityRepoRefResponse    `json:"repo"`
 	PlatformHost string                     `json:"platform_host"`
 	RepoOwner    string                     `json:"repo_owner"`
 	RepoName     string                     `json:"repo_name"`
@@ -260,7 +275,7 @@ type activityItemResponse struct {
 	ID                 string                     `json:"id"`
 	Cursor             string                     `json:"cursor"`
 	ActivityType       string                     `json:"activity_type"`
-	Repo               httpapi.RepoRefResponse    `json:"repo"`
+	Repo               activityRepoRefResponse    `json:"repo"`
 	PlatformHost       string                     `json:"platform_host"`
 	RepoOwner          string                     `json:"repo_owner"`
 	RepoName           string                     `json:"repo_name"`

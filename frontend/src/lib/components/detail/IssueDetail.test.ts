@@ -260,6 +260,7 @@ function renderIssueDetail(
           detailActivityView: createDetailActivityViewStore(),
           settings: {
             getLaunchTargets: () => launchTargets,
+            getDetailSettings: () => ({ initial_timeline_entry_limit: 250 }),
           },
         },
       ],
@@ -446,7 +447,10 @@ describe("IssueDetail activity view", () => {
             issues: issuesStore,
             activity: { loadActivity: vi.fn() },
             detailActivityView: createDetailActivityViewStore(),
-            settings: { getLaunchTargets: () => launchTargets },
+            settings: {
+              getLaunchTargets: () => launchTargets,
+              getDetailSettings: () => ({ initial_timeline_entry_limit: 250 }),
+            },
           },
         ],
         [ACTIONS_KEY, { issue: [] }],

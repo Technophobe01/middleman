@@ -383,6 +383,7 @@ function renderPullDetail(
           detailActivityView: createDetailActivityViewStore(),
           settings: {
             getLaunchTargets: () => launchTargets,
+            getDetailSettings: () => ({ initial_timeline_entry_limit: 250 }),
           },
         },
       ],
@@ -683,7 +684,10 @@ describe("PullDetail activity refresh", () => {
             pulls: { loadPulls: vi.fn() },
             activity: { loadActivity: vi.fn() },
             detailActivityView: createDetailActivityViewStore(),
-            settings: { getLaunchTargets: () => launchTargets },
+            settings: {
+              getLaunchTargets: () => launchTargets,
+              getDetailSettings: () => ({ initial_timeline_entry_limit: 250 }),
+            },
           },
         ],
         [ACTIONS_KEY, { pull: [] }],
@@ -1603,6 +1607,10 @@ describe("PullDetail approvals", () => {
               isSubmitting: () => false,
             },
             detailActivityView: createDetailActivityViewStore(),
+            settings: {
+              getLaunchTargets: () => [],
+              getDetailSettings: () => ({ initial_timeline_entry_limit: 250 }),
+            },
           },
         ],
         [ACTIONS_KEY, { pull: [] }],

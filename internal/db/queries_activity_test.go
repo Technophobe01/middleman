@@ -760,6 +760,463 @@ func TestListActivity(t *testing.T) {
 	_ = prID2
 }
 
+func TestListActivityAtOrBeforeCursorBeyondUnixNanoRange(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	d := openTestDB(t)
+	ctx := t.Context()
+	future := time.Date(2500, time.December, 30, 20, 19, 18, 987654321, time.UTC)
+	repoID := insertTestRepo(t, d, "example", "future")
+	prID := insertTestMR(t, d, repoID, 1, "Future activity", future.Add(-time.Hour))
+	require.NoError(d.UpsertMREvents(ctx, []MREvent{{
+		MergeRequestID: prID,
+		EventType:      "issue_comment",
+		Author:         "reviewer",
+		Body:           "Cursor boundary",
+		CreatedAt:      future,
+		DedupeKey:      "future-cursor-boundary",
+	}}))
+
+	items, err := d.ListActivity(ctx, ListActivityOpts{Limit: 10})
+	require.NoError(err)
+	require.NotEmpty(items)
+	boundary := items[0]
+	createdAt, source, sourceID, err := DecodeCursor(
+		EncodeCursor(boundary.CreatedAt, boundary.Source, boundary.SourceID),
+	)
+	require.NoError(err)
+
+	bounded, err := d.ListActivity(ctx, ListActivityOpts{
+		Limit:              10,
+		AtOrBeforeTime:     &createdAt,
+		AtOrBeforeSource:   source,
+		AtOrBeforeSourceID: sourceID,
+	})
+	require.NoError(err)
+	require.NotEmpty(bounded)
+	assert.Equal(boundary.Source, bounded[0].Source)
+	assert.Equal(boundary.SourceID, bounded[0].SourceID)
+}
+
+func TestListActivityVisibilityFiltersApplyBeforeLimit(t *testing.T) {
+	t.Run("hide closed merged uses notification subject state and keeps unknown state", func(t *testing.T) {
+		require := require.New(t)
+		assert := assert.New(t)
+		d := openTestDB(t)
+		ctx := t.Context()
+		base := baseTime()
+		repoID := insertTestRepo(t, d, "example", "visibility")
+
+		insertTestMRWithOptions(t, d, testMR(repoID, 1,
+			withMRState(MergeRequestStateClosed),
+			withMRActivity(base.Add(6*time.Minute))))
+		insertTestMRWithOptions(t, d, testMR(repoID, 2,
+			withMRState(MergeRequestStateMerged),
+			withMRActivity(base)))
+		insertTestMRWithOptions(t, d, testMR(repoID, 4,
+			withMRActivity(base.Add(time.Minute))))
+
+		mergedNumber := 2
+		unknownNumber := 3
+		openNumber := 4
+		require.NoError(d.UpsertNotifications(ctx, []Notification{
+			{
+				Platform: "github", PlatformHost: "github.com",
+				PlatformNotificationID: "ntf-merged-limit",
+				RepoOwner:              "example", RepoName: "visibility",
+				SubjectType: "PullRequest", SubjectTitle: "Merged notification",
+				WebURL:     "https://github.com/example/visibility/pull/2",
+				ItemNumber: &mergedNumber, ItemType: "pr", ItemAuthor: "human-author",
+				Reason: "mention", Unread: true,
+				SourceUpdatedAt: base.Add(5 * time.Minute), SyncedAt: base.Add(5 * time.Minute),
+			},
+			{
+				Platform: "github", PlatformHost: "github.com",
+				PlatformNotificationID: "ntf-unknown-limit",
+				RepoOwner:              "example", RepoName: "visibility",
+				SubjectType: "PullRequest", SubjectTitle: "Unknown notification",
+				WebURL:     "https://github.com/example/visibility/pull/3",
+				ItemNumber: &unknownNumber, ItemType: "pr", ItemAuthor: "human-author",
+				Reason: "mention", Unread: true,
+				SourceUpdatedAt: base.Add(4 * time.Minute), SyncedAt: base.Add(4 * time.Minute),
+			},
+			{
+				Platform: "github", PlatformHost: "github.com",
+				PlatformNotificationID: "ntf-open-limit",
+				RepoOwner:              "example", RepoName: "visibility",
+				SubjectType: "PullRequest", SubjectTitle: "Open notification",
+				WebURL:     "https://github.com/example/visibility/pull/4",
+				ItemNumber: &openNumber, ItemType: "pr", ItemAuthor: "human-author",
+				Reason: "mention", Unread: true,
+				SourceUpdatedAt: base.Add(3 * time.Minute), SyncedAt: base.Add(3 * time.Minute),
+			},
+		}))
+
+		items, err := d.ListActivity(ctx, ListActivityOpts{
+			HideClosedMerged: true,
+			Limit:            2,
+		})
+		require.NoError(err)
+		require.Len(items, 2)
+		assert.Equal([]int{3, 4}, []int{items[0].ItemNumber, items[1].ItemNumber})
+		assert.Equal([]string{"", "open"}, []string{items[0].SubjectState, items[1].SubjectState})
+	})
+
+	t.Run("hide bots tests event actors and parent authors", func(t *testing.T) {
+		require := require.New(t)
+		assert := assert.New(t)
+		d := openTestDB(t)
+		ctx := t.Context()
+		base := baseTime()
+		repoID := insertTestRepo(t, d, "example", "actors")
+
+		botParentID := insertTestMRWithOptions(t, d, testMR(repoID, 1,
+			withMRAuthor("dependabot[bot]"),
+			withMRActivity(base.Add(4*time.Minute))))
+		humanParentWithBotEventID := insertTestMRWithOptions(t, d, testMR(repoID, 2,
+			withMRAuthor("human-author"),
+			withMRActivity(base.Add(2*time.Minute))))
+		insertTestMRWithOptions(t, d, testMR(repoID, 3,
+			withMRAuthor("human-author"),
+			withMRActivity(base.Add(3*time.Minute))))
+		require.NoError(d.UpsertMREvents(ctx, []MREvent{
+			{
+				MergeRequestID: humanParentWithBotEventID,
+				EventType:      "issue_comment", Author: "review-bot",
+				CreatedAt: base.Add(6 * time.Minute), DedupeKey: "bot-comment",
+			},
+			{
+				MergeRequestID: botParentID,
+				EventType:      "issue_comment", Author: "human-reviewer",
+				CreatedAt: base.Add(5 * time.Minute), DedupeKey: "human-comment",
+			},
+		}))
+
+		items, err := d.ListActivity(ctx, ListActivityOpts{HideBots: true, Limit: 2})
+		require.NoError(err)
+		require.Len(items, 2)
+		assert.Equal([]string{"comment", "new_pr"}, activityTypes(items))
+		assert.Equal([]int{1, 3}, []int{items[0].ItemNumber, items[1].ItemNumber})
+		assert.Equal("human-reviewer", items[0].Author)
+		assert.Equal("human-author", items[1].ItemAuthor)
+	})
+}
+
+func TestListCollapsedActivityProjection(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	d := openTestDB(t)
+	ctx := t.Context()
+	base := baseTime()
+	repoID := insertTestRepo(t, d, "alice", "alpha")
+	prID := insertTestMR(t, d, repoID, 1, "Fix projection", base)
+	require.NoError(d.UpsertMREvents(ctx, []MREvent{{
+		MergeRequestID: prID,
+		EventType:      "issue_comment",
+		Author:         "reviewer",
+		Body:           "original comment",
+		CreatedAt:      base.Add(time.Minute),
+		DedupeKey:      "projection-comment",
+	}}))
+	unsyncedNumber := 2
+	require.NoError(d.UpsertNotifications(ctx, []Notification{{
+		Platform:               "github",
+		PlatformHost:           "github.com",
+		PlatformNotificationID: "projection-unsynced",
+		RepoOwner:              "alice",
+		RepoName:               "alpha",
+		SubjectType:            "PullRequest",
+		SubjectTitle:           "Unsynced projection",
+		WebURL:                 "https://github.com/alice/alpha/pull/2",
+		ItemNumber:             &unsyncedNumber,
+		ItemType:               "pr",
+		ItemAuthor:             "contributor",
+		Reason:                 "mention",
+		Unread:                 true,
+		SourceUpdatedAt:        base.Add(30 * time.Second),
+		SyncedAt:               base.Add(30 * time.Second),
+	}}))
+
+	projection, err := d.ListCollapsedActivityProjection(ctx, ListActivityProjectionOpts{
+		ListActivityOpts: ListActivityOpts{Limit: 50},
+		SubjectLimit:     50,
+	})
+	require.NoError(err)
+	require.Len(projection.DirectRows, 1)
+	assert.Equal("notification", projection.DirectRows[0].ActivityType)
+	assert.Equal("pr", projection.DirectRows[0].ItemType)
+	assert.Equal(2, projection.DirectRows[0].ItemNumber)
+	require.Len(projection.Subjects, 1)
+	assert.Equal(1, projection.Subjects[0].Subject.Key.ItemNumber)
+	assert.Equal(EncodeCursor(base.Add(time.Minute), "pre", 1), projection.EventCursor)
+	initialLedgerRevision := projection.Subjects[0].EventLedgerRevision
+	assert.NotEmpty(initialLedgerRevision)
+
+	require.NoError(d.UpsertMREvents(ctx, []MREvent{{
+		MergeRequestID: prID,
+		EventType:      "issue_comment",
+		Author:         "late-sync",
+		CreatedAt:      base.Add(30 * time.Second),
+		DedupeKey:      "projection-backfilled-comment",
+	}}))
+
+	refreshed, err := d.ListCollapsedActivityProjection(ctx, ListActivityProjectionOpts{
+		ListActivityOpts: ListActivityOpts{Limit: 50},
+		SubjectLimit:     50,
+	})
+	require.NoError(err)
+	require.Len(refreshed.Subjects, 1)
+	assert.Equal(projection.Subjects[0].ActivityAt, refreshed.Subjects[0].ActivityAt,
+		"an older backfill must not change display recency")
+	assert.NotEqual(initialLedgerRevision, refreshed.Subjects[0].EventLedgerRevision,
+		"the per-parent ledger revision must detect an older backfill")
+
+	backfilledLedgerRevision := refreshed.Subjects[0].EventLedgerRevision
+	require.NoError(d.UpsertMREvents(ctx, []MREvent{{
+		MergeRequestID: prID,
+		EventType:      "issue_comment",
+		Author:         "reviewer",
+		Body:           "edited comment",
+		CreatedAt:      base.Add(time.Minute),
+		DedupeKey:      "projection-comment",
+	}}))
+
+	edited, err := d.ListCollapsedActivityProjection(ctx, ListActivityProjectionOpts{
+		ListActivityOpts: ListActivityOpts{Limit: 50},
+		SubjectLimit:     50,
+	})
+	require.NoError(err)
+	require.Len(edited.Subjects, 1)
+	assert.Equal(refreshed.Subjects[0].ActivityAt, edited.Subjects[0].ActivityAt,
+		"editing an existing event must not change display recency")
+	assert.NotEqual(backfilledLedgerRevision, edited.Subjects[0].EventLedgerRevision,
+		"the per-parent ledger revision must detect edits to existing events")
+
+	editedLedgerRevision := edited.Subjects[0].EventLedgerRevision
+	require.NoError(d.UpsertMREvents(ctx, []MREvent{{
+		MergeRequestID: prID,
+		EventType:      "issue_comment",
+		Author:         "reviewer",
+		Body:           "edited comment",
+		CreatedAt:      base.Add(time.Minute),
+		DedupeKey:      "projection-comment",
+	}}))
+	unchanged, err := d.ListCollapsedActivityProjection(ctx, ListActivityProjectionOpts{
+		ListActivityOpts: ListActivityOpts{Limit: 50},
+		SubjectLimit:     50,
+	})
+	require.NoError(err)
+	require.Len(unchanged.Subjects, 1)
+	assert.Equal(editedLedgerRevision, unchanged.Subjects[0].EventLedgerRevision,
+		"an unchanged event upsert must not invalidate the thread cache")
+}
+
+func TestListCollapsedActivityProjectionRetainsVisibleEventsForBotParents(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	d := openTestDB(t)
+	ctx := t.Context()
+	base := baseTime()
+	repoID := insertTestRepo(t, d, "example", "actors")
+	botParentID := insertTestMRWithOptions(t, d, testMR(repoID, 1,
+		withMRAuthor("dependabot[bot]"),
+		withMRActivity(base)))
+	humanParentID := insertTestMRWithOptions(t, d, testMR(repoID, 2,
+		withMRAuthor("human-author"),
+		withMRActivity(base)))
+	require.NoError(d.UpsertMREvents(ctx, []MREvent{
+		{
+			MergeRequestID: botParentID,
+			EventType:      "issue_comment", Author: "human-reviewer",
+			CreatedAt: base.Add(2 * time.Minute), DedupeKey: "human-comment-on-bot-parent",
+		},
+		{
+			MergeRequestID: humanParentID,
+			EventType:      "issue_comment", Author: "other-reviewer",
+			CreatedAt: base.Add(time.Minute), DedupeKey: "human-comment-on-human-parent",
+		},
+	}))
+
+	projection, err := d.ListCollapsedActivityProjection(ctx, ListActivityProjectionOpts{
+		ListActivityOpts: ListActivityOpts{HideBots: true, Limit: 50},
+		SubjectLimit:     50,
+	})
+	require.NoError(err)
+	require.Len(projection.DirectRows, 1)
+	assert.Equal("comment", projection.DirectRows[0].ActivityType)
+	assert.Equal(1, projection.DirectRows[0].ItemNumber)
+	assert.Equal("human-reviewer", projection.DirectRows[0].Author)
+	require.Len(projection.Subjects, 1)
+	assert.Equal(2, projection.Subjects[0].Subject.Key.ItemNumber,
+		"ordinary human-authored parents must remain collapsed")
+}
+
+func TestListCollapsedActivityProjectionIncludesParentsRecentOnlyByNotification(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	d := openTestDB(t)
+	ctx := t.Context()
+	now := baseTime()
+	since := now.Add(-7 * 24 * time.Hour)
+	oldActivity := now.Add(-30 * 24 * time.Hour)
+	repoID := insertTestRepo(t, d, "alice", "alpha")
+	insertTestMR(t, d, repoID, 7, "Old pull request", oldActivity)
+	insertTestIssueWithOptions(t, d, testIssue(repoID, 8,
+		withIssueTitle("Old issue"),
+		withIssueActivity(oldActivity)))
+	pullNumber := 7
+	issueNumber := 8
+	pullNotificationAt := now.Add(-time.Hour)
+	issueNotificationAt := now.Add(-2 * time.Hour)
+	require.NoError(d.UpsertNotifications(ctx, []Notification{
+		{
+			Platform: "github", PlatformHost: "github.com",
+			PlatformNotificationID: "recent-old-pull",
+			RepoOwner:              "alice", RepoName: "alpha",
+			SubjectType: "PullRequest", SubjectTitle: "Old pull request",
+			WebURL:     "https://github.com/alice/alpha/pull/7",
+			ItemNumber: &pullNumber, ItemType: "pr", ItemAuthor: "contributor",
+			Reason: "mention", Unread: true,
+			SourceUpdatedAt: pullNotificationAt, SyncedAt: pullNotificationAt,
+		},
+		{
+			Platform: "github", PlatformHost: "github.com",
+			PlatformNotificationID: "recent-old-issue",
+			RepoOwner:              "alice", RepoName: "alpha",
+			SubjectType: "Issue", SubjectTitle: "Old issue",
+			WebURL:     "https://github.com/alice/alpha/issues/8",
+			ItemNumber: &issueNumber, ItemType: "issue", ItemAuthor: "reporter",
+			Reason: "subscribed", Unread: true,
+			SourceUpdatedAt: issueNotificationAt, SyncedAt: issueNotificationAt,
+		},
+	}))
+
+	projection, err := d.ListCollapsedActivityProjection(ctx, ListActivityProjectionOpts{
+		ListActivityOpts: ListActivityOpts{Since: &since, Limit: 50},
+		SubjectLimit:     50,
+	})
+	require.NoError(err)
+	assert.Empty(projection.DirectRows, "anchored notifications must collapse into their parent summaries")
+	require.Len(projection.Subjects, 2)
+	assert.Equal(7, projection.Subjects[0].Subject.Key.ItemNumber)
+	assert.Equal(pullNotificationAt, projection.Subjects[0].ActivityAt)
+	assert.Equal(8, projection.Subjects[1].Subject.Key.ItemNumber)
+	assert.Equal(issueNotificationAt, projection.Subjects[1].ActivityAt)
+
+	withoutNotifications, err := d.ListCollapsedActivityProjection(ctx, ListActivityProjectionOpts{
+		ListActivityOpts: ListActivityOpts{Since: &since, Limit: 50, Types: []string{"comment"}},
+		SubjectLimit:     50,
+	})
+	require.NoError(err)
+	assert.Empty(withoutNotifications.DirectRows)
+	assert.Empty(withoutNotifications.Subjects,
+		"hidden notifications must not pull otherwise-old parents into the window")
+}
+
+func TestListCollapsedActivityProjectionDetectsIssueCommentEdit(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	d := openTestDB(t)
+	ctx := t.Context()
+	base := baseTime()
+	repoID := insertTestRepo(t, d, "alice", "alpha")
+	issueID := insertTestIssueWithOptions(t, d, testIssue(repoID, 9,
+		withIssueTitle("Fix issue projection"),
+		withIssueActivity(base)))
+	require.NoError(d.UpsertIssueEvents(ctx, []IssueEvent{{
+		IssueID:   issueID,
+		EventType: "issue_comment",
+		Author:    "reporter",
+		Body:      "original issue comment",
+		CreatedAt: base.Add(time.Minute),
+		DedupeKey: "projection-issue-comment",
+	}}))
+
+	projection, err := d.ListCollapsedActivityProjection(ctx, ListActivityProjectionOpts{
+		ListActivityOpts: ListActivityOpts{Limit: 50},
+		SubjectLimit:     50,
+	})
+	require.NoError(err)
+	require.Len(projection.Subjects, 1)
+	initialLedgerRevision := projection.Subjects[0].EventLedgerRevision
+
+	require.NoError(d.UpsertIssueEvents(ctx, []IssueEvent{{
+		IssueID:   issueID,
+		EventType: "issue_comment",
+		Author:    "reporter",
+		Body:      "edited issue comment",
+		CreatedAt: base.Add(time.Minute),
+		DedupeKey: "projection-issue-comment",
+	}}))
+
+	edited, err := d.ListCollapsedActivityProjection(ctx, ListActivityProjectionOpts{
+		ListActivityOpts: ListActivityOpts{Limit: 50},
+		SubjectLimit:     50,
+	})
+	require.NoError(err)
+	require.Len(edited.Subjects, 1)
+	assert.Equal(projection.Subjects[0].ActivityAt, edited.Subjects[0].ActivityAt)
+	assert.NotEqual(initialLedgerRevision, edited.Subjects[0].EventLedgerRevision,
+		"the issue ledger revision must detect edits to existing comments")
+}
+
+func TestListCollapsedActivityProjectionDetectsNonNewestNotificationMutation(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	d := openTestDB(t)
+	ctx := t.Context()
+	base := baseTime()
+	repoID := insertTestRepo(t, d, "alice", "alpha")
+	insertTestMR(t, d, repoID, 7, "Fix notification projection", base)
+	number := 7
+	older := Notification{
+		Platform:               "github",
+		PlatformHost:           "github.com",
+		PlatformNotificationID: "projection-older-notification",
+		RepoOwner:              "alice",
+		RepoName:               "alpha",
+		SubjectType:            "PullRequest",
+		SubjectTitle:           "Original notification",
+		WebURL:                 "https://github.com/alice/alpha/pull/7",
+		ItemNumber:             &number,
+		ItemType:               "pr",
+		ItemAuthor:             "contributor",
+		Reason:                 "mention",
+		Unread:                 true,
+		SourceUpdatedAt:        base.Add(time.Minute),
+		SyncedAt:               base.Add(time.Minute),
+	}
+	newer := older
+	newer.PlatformNotificationID = "projection-newer-notification"
+	newer.SubjectTitle = "Newer notification"
+	newer.SourceUpdatedAt = base.Add(4 * time.Minute)
+	newer.SyncedAt = base.Add(4 * time.Minute)
+	require.NoError(d.UpsertNotifications(ctx, []Notification{older, newer}))
+
+	projection, err := d.ListCollapsedActivityProjection(ctx, ListActivityProjectionOpts{
+		ListActivityOpts: ListActivityOpts{Limit: 50},
+		SubjectLimit:     50,
+	})
+	require.NoError(err)
+	require.Len(projection.Subjects, 1)
+	initialLedgerRevision := projection.Subjects[0].EventLedgerRevision
+
+	older.SubjectTitle = "Edited notification"
+	older.Reason = "review_requested"
+	older.SourceUpdatedAt = base.Add(2 * time.Minute)
+	older.SyncedAt = base.Add(5 * time.Minute)
+	require.NoError(d.UpsertNotifications(ctx, []Notification{older}))
+
+	edited, err := d.ListCollapsedActivityProjection(ctx, ListActivityProjectionOpts{
+		ListActivityOpts: ListActivityOpts{Limit: 50},
+		SubjectLimit:     50,
+	})
+	require.NoError(err)
+	require.Len(edited.Subjects, 1)
+	assert.NotEqual(initialLedgerRevision, edited.Subjects[0].EventLedgerRevision,
+		"the parent revision must detect mutation of a non-newest notification")
+}
+
 func insertOversizedBranchCommitRow(
 	ctx context.Context,
 	d *DB,

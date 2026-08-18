@@ -290,6 +290,7 @@
   const hasActiveTimelineFilters = $derived(
     activePRTimelineFilterCount(timelineFilter) > 0,
   );
+  const timelineFilterScope = $derived(JSON.stringify(timelineFilter));
 
   function ciChecksHavePending(checksJSON: string): boolean {
     if (!checksJSON) return false;
@@ -3071,9 +3072,12 @@
             canResolveReviewThreads={capabilities.review_thread_resolution && !resolveThreadGate.unavailable}
             canReplyToThreads={capabilities.thread_reply && !stalePR && !replyThreadGate.unavailable}
             filtered={hasActiveTimelineFilters}
+            filterScope={timelineFilterScope}
             showCommitDetails={timelineFilter.showCommitDetails}
             activityViewMode={detailActivityView.getMode()}
             timelineOrder={detailActivityView.getOrder()}
+            initialEntryLimit={settings.getDetailSettings().initial_timeline_entry_limit}
+            itemIdentity={`${provider}:${platformHost ?? ""}:${repoPath}:${number}`}
             onEditComment={capabilities.comment_mutation && !stalePR && !editCommentGate.unavailable
               ? editTimelineComment
               : undefined}

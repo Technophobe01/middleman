@@ -10,9 +10,9 @@ import (
 	"time"
 )
 
-// prActivityAtExpr is a pull request's Activity recency: opening, the newest
-// ledger event the feed can render, reopen, merge, or close, whichever is
-// latest.
+// prActivityAtExpr is a pull request's provider-event recency: opening, the
+// newest ledger event the feed can render, reopen, merge, or close, whichever
+// is latest. Parent summaries layer visible notification recency on top.
 // Provider updated_at is not activity: GitHub bumps it for mergeability
 // recomputation after base pushes, head-branch deletion after merge, and other
 // invisible bookkeeping, which surfaced phantom recency in the feed. The
@@ -28,8 +28,9 @@ func prActivityAtExpr(pr string) string {
 		pr)
 }
 
-// issueActivityAtExpr is an issue's Activity recency: opening, the newest
-// rendered ledger event, reopen, or close, whichever is latest.
+// issueActivityAtExpr is an issue's provider-event recency: opening, the newest
+// rendered ledger event, reopen, or close, whichever is latest. Parent
+// summaries layer visible notification recency on top.
 func issueActivityAtExpr(issue string) string {
 	return fmt.Sprintf(
 		"MAX(%[1]s.created_at, COALESCE((SELECT e.created_at FROM forge_issue_events e "+
@@ -39,6 +40,49 @@ func issueActivityAtExpr(issue string) string {
 		issue)
 }
 
+// activityNotificationAtExpr returns the newest visible notification for one
+// parent. The canonical repo ID survives renames; legacy null IDs fall back to
+// the current normalized route.
+func activityNotificationAtExpr(parent, itemType string) string {
+	return fmt.Sprintf(
+		"COALESCE((SELECT MAX(n.source_updated_at) FROM forge_notification_items n "+
+			"JOIN forge_repos nr ON nr.id = %[1]s.repo_id "+
+			"WHERE n.item_type = '%[2]s' AND n.item_number = %[1]s.number "+
+			"AND n.reason != 'author' AND (n.repo_id = nr.id OR (n.repo_id IS NULL "+
+			"AND n.platform = nr.platform AND n.platform_host = nr.platform_host "+
+			"AND n.repo_owner = nr.owner_key AND n.repo_name = nr.name_key))), %[1]s.created_at)",
+		parent, itemType,
+	)
+}
+
+func prActivitySubjectAtExpr(pr string, excludeNotificationRecency bool) string {
+	if excludeNotificationRecency {
+		return prActivityAtExpr(pr)
+	}
+	return fmt.Sprintf("MAX(%s, %s)", prActivityAtExpr(pr), activityNotificationAtExpr(pr, "pr"))
+}
+
+func issueActivitySubjectAtExpr(issue string, excludeNotificationRecency bool) string {
+	if excludeNotificationRecency {
+		return issueActivityAtExpr(issue)
+	}
+	return fmt.Sprintf("MAX(%s, %s)", issueActivityAtExpr(issue), activityNotificationAtExpr(issue, "issue"))
+}
+
+// prEventLedgerRevisionExpr and issueEventLedgerRevisionExpr identify every
+// child row a thread-events request can render. The parent mutation revision
+// advances for inserts, edits, and deletes, including older backfills that do
+// not change activity_at. Migration-owned triggers advance the same revision
+// for visible notification mutations, avoiding a correlated notification scan
+// for every projected parent.
+func prEventLedgerRevisionExpr(pr string) string {
+	return fmt.Sprintf("printf('pre:%%d', %s.activity_event_revision)", pr)
+}
+
+func issueEventLedgerRevisionExpr(issue string) string {
+	return fmt.Sprintf("printf('ise:%%d', %s.activity_event_revision)", issue)
+}
+
 // ListActivity returns a unified, reverse-chronological feed of
 // activity across all repos. It merges new PRs, new issues, PR
 // events, issue events, default-branch commits/force-pushes, and
@@ -46,6 +90,16 @@ func issueActivityAtExpr(issue string) string {
 // pagination.
 func (d *DB) ListActivity(
 	ctx context.Context, opts ListActivityOpts,
+) ([]ActivityItem, error) {
+	return listActivityWithQueryer(ctx, d.ro, opts)
+}
+
+type activityQueryer interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
+func listActivityWithQueryer(
+	ctx context.Context, queryer activityQueryer, opts ListActivityOpts,
 ) ([]ActivityItem, error) {
 	limit := opts.Limit
 	if limit <= 0 {
@@ -120,6 +174,39 @@ func (d *DB) ListActivity(
 		whereClauses = append(whereClauses, "LOWER(item_author) = LOWER(?)")
 		args = append(args, opts.Author)
 	}
+	if opts.HideClosedMerged {
+		whereClauses = append(whereClauses,
+			"((source = 'ntf' AND (subject_state = '' OR subject_state NOT IN ('closed', 'merged'))) OR "+
+				"(source != 'ntf' AND item_state NOT IN ('closed', 'merged')))")
+	}
+	if opts.HideBots {
+		whereClauses = append(whereClauses, activityNotBotCondition("author"))
+	}
+	if opts.HideDefaultBranch {
+		whereClauses = append(whereClauses,
+			"activity_type NOT IN ('default_branch_commit', 'default_branch_force_push')")
+	}
+	if opts.ParentRepoID != 0 {
+		whereClauses = append(whereClauses, "repo_id = ?")
+		args = append(args, opts.ParentRepoID)
+	}
+	if opts.ParentItemType != "" {
+		whereClauses = append(whereClauses, "item_type = ?")
+		args = append(args, opts.ParentItemType)
+	}
+	if opts.ParentItemNumber != 0 {
+		whereClauses = append(whereClauses, "item_number = ?")
+		args = append(args, opts.ParentItemNumber)
+	}
+	if opts.DirectProjectionOnly {
+		directConditions := []string{"parent_id IS NULL"}
+		if opts.HideBots {
+			directConditions = append(directConditions,
+				"NOT "+activityNotBotCondition("item_author"))
+		}
+		whereClauses = append(whereClauses,
+			"("+strings.Join(directConditions, " OR ")+")")
+	}
 	if opts.ViewerLogins != nil {
 		whereClauses = append(whereClauses, activityInvolvementCondition(opts.ViewerLogins, &args))
 	}
@@ -148,6 +235,15 @@ func (d *DB) ListActivity(
 			*opts.AfterTime, *opts.AfterTime,
 			opts.AfterSource, opts.AfterSource,
 			opts.AfterSourceID)
+	}
+	if opts.AtOrBeforeTime != nil {
+		whereClauses = append(whereClauses,
+			"(created_at < ? OR (created_at = ? AND "+
+				"(source < ? OR (source = ? AND source_id <= ?))))")
+		args = append(args,
+			*opts.AtOrBeforeTime, *opts.AtOrBeforeTime,
+			opts.AtOrBeforeSource, opts.AtOrBeforeSource,
+			opts.AtOrBeforeSourceID)
 	}
 
 	where := ""
@@ -409,7 +505,7 @@ func (d *DB) ListActivity(
 	queryArgs = append(queryArgs, args...)
 	queryArgs = append(queryArgs, limit)
 
-	rows, err := d.ro.QueryContext(ctx, query, queryArgs...)
+	rows, err := queryer.QueryContext(ctx, query, queryArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("list activity: %w", err)
 	}
@@ -478,11 +574,17 @@ func (d *DB) ListActivity(
 }
 
 // ListActivitySubjects returns a full parent snapshot ordered and filtered by
-// ledger-derived pull-request and issue recency (see prActivityAtExpr). Event
-// filters and cursors do not participate because a hidden or behind-cursor
-// event can still advance a parent's visible timestamp and position.
+// ledger-derived pull-request and issue recency, including visible notification
+// timestamps. Event filters and cursors do not participate because a hidden or
+// behind-cursor event can still advance a parent's visible timestamp and position.
 func (d *DB) ListActivitySubjects(
 	ctx context.Context, opts ListActivitySubjectsOpts,
+) ([]ActivitySubject, error) {
+	return listActivitySubjectsWithQueryer(ctx, d.ro, opts)
+}
+
+func listActivitySubjectsWithQueryer(
+	ctx context.Context, queryer activityQueryer, opts ListActivitySubjectsOpts,
 ) ([]ActivitySubject, error) {
 	limit := opts.Limit
 	if limit <= 0 {
@@ -561,6 +663,12 @@ func (d *DB) ListActivitySubjects(
 		whereClauses = append(whereClauses, "LOWER(item_author) = LOWER(?)")
 		args = append(args, opts.Author)
 	}
+	if opts.HideClosedMerged {
+		whereClauses = append(whereClauses, "item_state NOT IN ('closed', 'merged')")
+	}
+	if opts.HideBots {
+		whereClauses = append(whereClauses, activityNotBotCondition("item_author"))
+	}
 	if opts.ViewerLogins != nil {
 		whereClauses = append(whereClauses, activityInvolvementCondition(opts.ViewerLogins, &args))
 	}
@@ -577,14 +685,15 @@ func (d *DB) ListActivitySubjects(
 		SELECT repo_id, platform, platform_host, platform_repo_id, repo_path,
 		       repo_owner, repo_name,
 		       item_type, item_number, item_title, item_url, item_state,
-		       item_author, activity_at
+		       item_author, activity_at, event_ledger_revision
 		FROM (
 			SELECT r.id AS repo_id, r.platform, r.platform_host,
 			       r.platform_repo_id, r.repo_path,
 			       r.owner AS repo_owner, r.name AS repo_name, r.repo_path_key,
 			       'pr' AS item_type, p.number AS item_number, p.title AS item_title,
 			       p.url AS item_url, p.state AS item_state, p.author AS item_author,
-			       ` + prActivityAtExpr("p") + ` AS activity_at
+			       ` + prActivitySubjectAtExpr("p", opts.ExcludeNotificationRecency) + ` AS activity_at,
+			       ` + prEventLedgerRevisionExpr("p") + ` AS event_ledger_revision
 			FROM forge_merge_requests p
 			JOIN forge_repos r ON p.repo_id = r.id AND r.lifecycle_state = 'active'
 			WHERE NOT EXISTS (
@@ -598,7 +707,8 @@ func (d *DB) ListActivitySubjects(
 			SELECT r.id, r.platform, r.platform_host, r.platform_repo_id, r.repo_path,
 			       r.owner, r.name, r.repo_path_key,
 			       'issue', i.number, i.title, i.url, i.state, i.author,
-			       ` + issueActivityAtExpr("i") + `
+			       ` + issueActivitySubjectAtExpr("i", opts.ExcludeNotificationRecency) + `,
+			       ` + issueEventLedgerRevisionExpr("i") + `
 			FROM forge_issues i
 			JOIN forge_repos r ON i.repo_id = r.id AND r.lifecycle_state = 'active'
 			WHERE NOT EXISTS (
@@ -614,7 +724,7 @@ func (d *DB) ListActivitySubjects(
 		LIMIT ?`
 	args = append(args, limit)
 
-	rows, err := d.ro.QueryContext(ctx, query, args...)
+	rows, err := queryer.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list activity subjects: %w", err)
 	}
@@ -639,6 +749,7 @@ func (d *DB) ListActivitySubjects(
 			&subject.Subject.State,
 			&subject.Subject.Author,
 			&activityAt,
+			&subject.EventLedgerRevision,
 		); err != nil {
 			return nil, fmt.Errorf("scan activity subject: %w", err)
 		}
@@ -969,8 +1080,8 @@ func parseDBTime(s string) (time.Time, error) {
 func EncodeCursor(
 	createdAt time.Time, source string, sourceID int64,
 ) string {
-	raw := fmt.Sprintf("%d:%s:%d",
-		createdAt.UnixMilli(), source, sourceID)
+	raw := fmt.Sprintf("%d:%d:%s:%d",
+		createdAt.Unix(), createdAt.Nanosecond(), source, sourceID)
 	return base64.RawURLEncoding.EncodeToString([]byte(raw))
 }
 
@@ -983,21 +1094,26 @@ func DecodeCursor(cursor string) (
 		return time.Time{}, "", 0,
 			fmt.Errorf("decode cursor base64: %w", err)
 	}
-	parts := strings.SplitN(string(raw), ":", 3)
-	if len(parts) != 3 {
+	parts := strings.SplitN(string(raw), ":", 4)
+	if len(parts) != 4 {
 		return time.Time{}, "", 0,
-			fmt.Errorf("invalid cursor: expected 3 parts, got %d",
+			fmt.Errorf("invalid cursor: expected 4 parts, got %d",
 				len(parts))
 	}
-	ms, err := strconv.ParseInt(parts[0], 10, 64)
+	seconds, err := strconv.ParseInt(parts[0], 10, 64)
 	if err != nil {
 		return time.Time{}, "", 0,
 			fmt.Errorf("invalid cursor timestamp: %w", err)
 	}
-	sourceID, err := strconv.ParseInt(parts[2], 10, 64)
+	nanoseconds, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil || nanoseconds < 0 || nanoseconds >= int64(time.Second) {
+		return time.Time{}, "", 0,
+			fmt.Errorf("invalid cursor nanoseconds")
+	}
+	sourceID, err := strconv.ParseInt(parts[3], 10, 64)
 	if err != nil {
 		return time.Time{}, "", 0,
 			fmt.Errorf("invalid cursor source_id: %w", err)
 	}
-	return time.UnixMilli(ms).UTC(), parts[1], sourceID, nil
+	return time.Unix(seconds, nanoseconds).UTC(), parts[2], sourceID, nil
 }
