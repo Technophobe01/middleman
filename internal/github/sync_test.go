@@ -14785,6 +14785,41 @@ func TestScopedRunDrainsDetailsOnlyForSelectedRepos(t *testing.T) {
 	assert.Equal(t, []string{"selected"}, detailRepos)
 }
 
+// If queued repo intents follow only a mutable route, a rename drops the
+// intended repository and route reuse can select an unrelated successor.
+func TestRepoIntentMatchingUsesStableProviderIdentity(t *testing.T) {
+	renamed := RepoRef{
+		Platform:           platform.KindGitHub,
+		Owner:              "new-owner",
+		Name:               "new-name",
+		PlatformHost:       "github.com",
+		PlatformExternalID: "stable-repo-id",
+	}
+	successor := RepoRef{
+		Platform:           platform.KindGitHub,
+		Owner:              "old-owner",
+		Name:               "old-name",
+		PlatformHost:       "github.com",
+		PlatformExternalID: "successor-repo-id",
+	}
+	requestedBeforeRename := RepoRef{
+		Platform:           platform.KindGitHub,
+		Owner:              "old-owner",
+		Name:               "old-name",
+		PlatformHost:       "github.com",
+		PlatformExternalID: "stable-repo-id",
+	}
+
+	assert.Equal(t,
+		[]RepoRef{renamed},
+		selectRepos([]RepoRef{successor, renamed}, []RepoRef{requestedBeforeRename}),
+	)
+	assert.Equal(t,
+		[]RepoRef{renamed, successor},
+		prioritizeRepos([]RepoRef{successor, renamed}, []RepoRef{requestedBeforeRename}),
+	)
+}
+
 func TestScopedRunDoesNotDelayNextFullRunOnSameHost(t *testing.T) {
 	ctx := t.Context()
 	d := openTestDB(t)
@@ -14909,6 +14944,424 @@ func TestScheduledFullRunRetriesAfterOverlappingScopedRun(t *testing.T) {
 			<-scopedDone
 		})
 	}
+}
+
+// If an asynchronous trigger returns before taking the admission lock, the
+// server can return 202 before the request is retained by the active run.
+func TestTriggerRunForReposReturnsOnlyAfterAdmission(t *testing.T) {
+	require := require.New(t)
+	repo := RepoRef{
+		Owner: "owner", Name: "selected", PlatformHost: "github.com",
+	}
+	syncer := NewSyncer(
+		nil, openTestDB(t), nil, []RepoRef{repo}, time.Hour, nil, nil,
+	)
+	t.Cleanup(syncer.Stop)
+
+	// Model an active scoped pass with cadence-respecting full work
+	// already retained behind it.
+	syncer.runMu.Lock()
+	syncer.running.Store(true)
+	syncer.exclusiveRun = true
+	syncer.pendingRun = &pendingSyncRun{full: true}
+	syncer.runMu.Unlock()
+
+	accepted := syncer.TriggerRunForRepos(context.Background(), []RepoRef{repo})
+	require.True(accepted)
+
+	syncer.runMu.Lock()
+	bypassRepos := slices.Clone(syncer.pendingRun.bypassRepos)
+	syncer.runMu.Unlock()
+	require.Equal([]RepoRef{repo}, bypassRepos)
+}
+
+// If a scoped refresh turns a queued cadence-respecting full pass into a
+// global bypass, the provider is called for unrelated repositories too.
+func TestQueuedScopedRefreshDoesNotBypassFullRunCadence(t *testing.T) {
+	require := require.New(t)
+	ctx := t.Context()
+	bucket := RateBucketKey("github", "github.com", "host")
+	database := openTestDB(t)
+	repos := []RepoRef{
+		{Owner: "owner", Name: "selected", PlatformHost: "github.com"},
+		{Owner: "owner", Name: "unrelated", PlatformHost: "github.com"},
+	}
+	disabledErr := platform.RepositoryFeatureDisabled(
+		platform.KindGitHub,
+		"github.com",
+		platform.RepositoryFeatureMergeRequests,
+		errors.New("repository pull requests disabled"),
+	)
+	firstSelectedEntered := make(chan struct{})
+	releaseFirstSelected := make(chan struct{})
+	completions := make(chan struct{}, 2)
+	var (
+		selectedCalls    atomic.Int32
+		unrelatedCalls   atomic.Int32
+		releaseFirstOnce sync.Once
+	)
+	mc := &mockClient{
+		listOpenPRsFn: func(ctx context.Context, _, repo string) ([]*gh.PullRequest, error) {
+			switch repo {
+			case "selected":
+				if selectedCalls.Add(1) == 1 {
+					close(firstSelectedEntered)
+					select {
+					case <-releaseFirstSelected:
+					case <-ctx.Done():
+						return nil, ctx.Err()
+					}
+					return nil, disabledErr
+				}
+			case "unrelated":
+				unrelatedCalls.Add(1)
+			}
+			return []*gh.PullRequest{}, nil
+		},
+	}
+	syncer := NewSyncer(
+		map[string]Client{"github.com": mc}, database, nil, repos,
+		time.Hour,
+		map[string]*RateTracker{
+			bucket: NewRateTracker(database, "github.com", "host", "rest"),
+		},
+		nil,
+	)
+	syncer.SetParallelism(1)
+	syncer.nextSyncAfter[bucket] = time.Now().Add(time.Hour)
+	require.True(syncer.recordRepositoryFeatureDisabled(
+		repos[0], platform.RepositoryFeatureMergeRequests, disabledErr,
+	))
+	require.True(syncer.recordRepositoryFeatureDisabled(
+		repos[1], platform.RepositoryFeatureMergeRequests, disabledErr,
+	))
+	syncer.SetOnSyncCompleted(func([]RepoSyncResult) {
+		completions <- struct{}{}
+	})
+	t.Cleanup(func() {
+		releaseFirstOnce.Do(func() { close(releaseFirstSelected) })
+		syncer.Stop()
+	})
+
+	syncer.TriggerRunForRepos(ctx, repos[:1])
+	select {
+	case <-firstSelectedEntered:
+	case <-time.After(5 * time.Second):
+		require.FailNow("initial scoped refresh did not reach the provider")
+	}
+
+	// Retain a cadence-respecting full pass, then merge a user refresh for
+	// only the selected repository while the first pass still owns the slot.
+	syncer.RunOnce(ctx)
+	syncer.TriggerRunForRepos(ctx, repos[:1])
+	releaseFirstOnce.Do(func() { close(releaseFirstSelected) })
+
+	for range 2 {
+		select {
+		case <-completions:
+		case <-time.After(5 * time.Second):
+			require.FailNow("queued sync passes did not complete")
+		}
+	}
+	syncer.Stop()
+
+	require.Equal(int32(2), selectedCalls.Load())
+	require.Zero(unrelatedCalls.Load())
+}
+
+// If the run slot is released before its terminal status is ordered, a new
+// run can publish Running:true before the completed run overwrites it with
+// Running:false.
+func TestTerminalStatusPublicationKeepsRunSlotUntilOrdered(t *testing.T) {
+	require := require.New(t)
+	ctx := t.Context()
+	providerEntered := make(chan struct{})
+	releaseProvider := make(chan struct{})
+	firstCompleted := make(chan struct{})
+	var (
+		providerCalls   atomic.Int32
+		completionCalls atomic.Int32
+		releaseOnce     sync.Once
+	)
+	mock := &mockClient{
+		listOpenPRsFn: func(ctx context.Context, _, _ string) ([]*gh.PullRequest, error) {
+			if providerCalls.Add(1) == 1 {
+				close(providerEntered)
+				select {
+				case <-releaseProvider:
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			}
+			return []*gh.PullRequest{}, nil
+		},
+	}
+	syncer := NewSyncer(
+		map[string]Client{"github.com": mock}, openTestDB(t), nil,
+		[]RepoRef{{Owner: "owner", Name: "repo", PlatformHost: "github.com"}},
+		time.Hour, nil, nil,
+	)
+	syncer.SetOnSyncCompleted(func([]RepoSyncResult) {
+		if completionCalls.Add(1) == 1 {
+			close(firstCompleted)
+		}
+	})
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(releaseProvider) })
+		syncer.Stop()
+	})
+
+	initialDone := make(chan struct{})
+	go func() {
+		defer close(initialDone)
+		syncer.RunOnce(ctx)
+	}()
+	select {
+	case <-providerEntered:
+	case <-time.After(5 * time.Second):
+		require.FailNow("initial sync did not reach the provider")
+	}
+
+	// Widen the terminal-publication boundary without replacing it: the
+	// provider pass is real, and publishStatus still owns statusMu.
+	syncer.statusMu.Lock()
+	statusLocked := true
+	t.Cleanup(func() {
+		if statusLocked {
+			syncer.statusMu.Unlock()
+		}
+	})
+	releaseOnce.Do(func() { close(releaseProvider) })
+	select {
+	case <-firstCompleted:
+	case <-time.After(5 * time.Second):
+		require.FailNow("initial sync did not reach completion")
+	}
+	require.Never(
+		func() bool { return !syncer.running.Load() },
+		100*time.Millisecond,
+		time.Millisecond,
+		"run slot was released while terminal status publication was blocked",
+	)
+
+	require.True(syncer.TriggerRun(ctx))
+	syncer.statusMu.Unlock()
+	statusLocked = false
+	require.Eventually(
+		func() bool {
+			return completionCalls.Load() == 2 &&
+				providerCalls.Load() == 2 && !syncer.Status().Running
+		},
+		5*time.Second,
+		time.Millisecond,
+		"coalesced follow-up did not reach terminal status",
+	)
+	select {
+	case <-initialDone:
+	case <-time.After(5 * time.Second):
+		require.FailNow("initial sync did not finish its handoff")
+	}
+}
+
+// If a queued pass loses the single-flight handoff to another run, the
+// accepted work is dropped and provider data can remain stale.
+func TestQueuedRunSurvivesSingleFlightHandoff(t *testing.T) {
+	require := require.New(t)
+	ctx := t.Context()
+	repos := []RepoRef{{
+		Owner: "owner", Name: "repo", PlatformHost: "github.com",
+	}}
+	firstEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	firstCompleted := make(chan struct{})
+	releaseFirstCompletion := make(chan struct{})
+	secondEntered := make(chan struct{})
+	releaseSecond := make(chan struct{})
+	thirdEntered := make(chan struct{})
+	var (
+		listCalls                  atomic.Int32
+		completionCalls            atomic.Int32
+		releaseFirstOnce           sync.Once
+		releaseFirstCompletionOnce sync.Once
+		releaseSecondOnce          sync.Once
+		unlockLifecycleOnce        sync.Once
+	)
+	mc := &mockClient{
+		listOpenPRsFn: func(ctx context.Context, _, _ string) ([]*gh.PullRequest, error) {
+			switch listCalls.Add(1) {
+			case 1:
+				close(firstEntered)
+				select {
+				case <-releaseFirst:
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			case 2:
+				close(secondEntered)
+				select {
+				case <-releaseSecond:
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			case 3:
+				close(thirdEntered)
+			}
+			return []*gh.PullRequest{}, nil
+		},
+	}
+	syncer := NewSyncer(
+		map[string]Client{"github.com": mc}, openTestDB(t), nil, repos,
+		time.Hour, nil, nil,
+	)
+	syncer.SetParallelism(1)
+	syncer.SetOnSyncCompleted(func([]RepoSyncResult) {
+		if completionCalls.Add(1) != 1 {
+			return
+		}
+		close(firstCompleted)
+		select {
+		case <-releaseFirstCompletion:
+		case <-ctx.Done():
+		}
+	})
+	t.Cleanup(func() {
+		releaseFirstOnce.Do(func() { close(releaseFirst) })
+		releaseFirstCompletionOnce.Do(func() { close(releaseFirstCompletion) })
+		releaseSecondOnce.Do(func() { close(releaseSecond) })
+		syncer.Stop()
+	})
+
+	initialDone := make(chan struct{})
+	go func() {
+		defer close(initialDone)
+		syncer.runOnce(ctx, true, nil, repos)
+	}()
+	select {
+	case <-firstEntered:
+	case <-time.After(5 * time.Second):
+		require.FailNow("initial scoped run did not start within 5s")
+	}
+
+	// Queue a cadence-respecting full pass while the scoped pass owns the slot.
+	syncer.RunOnce(ctx)
+	releaseFirstOnce.Do(func() { close(releaseFirst) })
+	select {
+	case <-firstCompleted:
+	case <-time.After(5 * time.Second):
+		require.FailNow("initial scoped run did not reach completion within 5s")
+	}
+
+	competingDone := make(chan struct{})
+	// Once the first run drops the single-flight slot, hold its asynchronous
+	// replay registration long enough for the competing run to claim the slot.
+	syncer.lifecycleMu.Lock()
+	t.Cleanup(func() { unlockLifecycleOnce.Do(syncer.lifecycleMu.Unlock) })
+	releaseFirstCompletionOnce.Do(func() { close(releaseFirstCompletion) })
+	require.Eventually(func() bool {
+		syncer.runMu.Lock()
+		defer syncer.runMu.Unlock()
+		return !syncer.exclusiveRun
+	}, 5*time.Second, time.Millisecond, "initial run did not reach the handoff")
+	go func() {
+		defer close(competingDone)
+		// This user-triggered run can claim the slot during the old handoff gap.
+		syncer.runOnce(ctx, true, nil, nil)
+	}()
+	select {
+	case <-competingDone:
+		// The atomic handoff kept the slot, so this run coalesced behind it.
+	case <-secondEntered:
+		// The old handoff exposed the slot and this run claimed it.
+	case <-time.After(5 * time.Second):
+		require.FailNow("competing run did not reach the single-flight slot")
+	}
+	unlockLifecycleOnce.Do(syncer.lifecycleMu.Unlock)
+
+	select {
+	case <-secondEntered:
+	case <-time.After(5 * time.Second):
+		require.FailNow("second run did not start within 5s")
+	}
+	releaseSecondOnce.Do(func() { close(releaseSecond) })
+	select {
+	case <-thirdEntered:
+	case <-time.After(5 * time.Second):
+		require.FailNow("queued run was dropped during the single-flight handoff")
+	}
+	<-initialDone
+	<-competingDone
+	assert.Equal(t, int32(3), listCalls.Load())
+}
+
+// If an explicit empty scope is widened to a full pass while queued, every
+// configured provider repository is fetched unexpectedly.
+func TestQueuedEmptyRepoScopeRemainsEmpty(t *testing.T) {
+	require := require.New(t)
+	ctx := t.Context()
+	repos := []RepoRef{{
+		Owner: "owner", Name: "repo", PlatformHost: "github.com",
+	}}
+	firstEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	completions := make(chan []RepoSyncResult, 2)
+	var (
+		listCalls        atomic.Int32
+		releaseFirstOnce sync.Once
+	)
+	mc := &mockClient{
+		listOpenPRsFn: func(ctx context.Context, _, _ string) ([]*gh.PullRequest, error) {
+			if listCalls.Add(1) == 1 {
+				close(firstEntered)
+				select {
+				case <-releaseFirst:
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			}
+			return []*gh.PullRequest{}, nil
+		},
+	}
+	syncer := NewSyncer(
+		map[string]Client{"github.com": mc}, openTestDB(t), nil, repos,
+		time.Hour, nil, nil,
+	)
+	syncer.SetParallelism(1)
+	syncer.SetOnSyncCompleted(func(results []RepoSyncResult) {
+		completions <- slices.Clone(results)
+	})
+	t.Cleanup(func() {
+		releaseFirstOnce.Do(func() { close(releaseFirst) })
+		syncer.Stop()
+	})
+
+	initialDone := make(chan struct{})
+	go func() {
+		defer close(initialDone)
+		syncer.runOnce(ctx, true, nil, repos)
+	}()
+	select {
+	case <-firstEntered:
+	case <-time.After(5 * time.Second):
+		require.FailNow("initial scoped run did not start within 5s")
+	}
+
+	// An empty non-nil scope means there is intentionally no provider work.
+	syncer.runOnce(ctx, true, nil, []RepoRef{})
+	releaseFirstOnce.Do(func() { close(releaseFirst) })
+
+	var got [][]RepoSyncResult
+	for range 2 {
+		select {
+		case results := <-completions:
+			got = append(got, results)
+		case <-time.After(5 * time.Second):
+			require.FailNow("queued empty-scope run did not complete within 5s")
+		}
+	}
+	<-initialDone
+	require.Len(got[0], 1)
+	assert.Empty(t, got[1])
+	assert.Equal(t, int32(1), listCalls.Load())
 }
 
 func TestBudgetResetOnRateWindowReset(t *testing.T) {
