@@ -1,4 +1,4 @@
-# Quick Start
+# Quick start
 
 Install kenn-forge, connect a code forge, and open your first workspace.
 
@@ -75,26 +75,6 @@ gh auth login
 kenn-forge daemon start
 ```
 
-You can also provide a GitHub token directly:
-
-```sh
-export KENN_FORGE_GITHUB_TOKEN=ghp_your_token_here
-kenn-forge daemon start
-```
-
-In PowerShell:
-
-```powershell
-$env:KENN_FORGE_GITHUB_TOKEN = 'ghp_your_token_here'
-kenn-forge.exe daemon start
-```
-
-For another provider or host, set its token environment variable before
-starting. To use `token_env` or `token_file`, start once to create
-`~/.kenn/forge/config.toml`, edit it, then restart. Settings chooses provider
-hosts and repository patterns, but it does not store credentials. See
-[Configuration](configuration.md#credentials).
-
 Use `kenn-forge serve` instead when you want foreground logs for development or
 diagnosis.
 
@@ -134,27 +114,66 @@ Unix-like kenn-forge host for that step.
 
 ## Use the main views
 
-- **Activity**: scan recent cross-repository changes.
-- **Pulls**: review discussion, diffs, CI, and merge state.
-- **Issues**: triage, comment, change state, or create a workspace.
-- **Repos**: browse configured source and branches.
-- **Workspaces**: open local shells and configured agents.
-- **Settings**: manage repositories, agents, and app preferences.
+- [**Activity**](workflows/activity.md): scan recent cross-repository changes.
+- [**Pulls**](workflows/code-reviewer.md): review discussion, diffs, CI, and merge state.
+- [**Issues**](workflows/issue-triager.md): triage, comment, change state, or create a workspace.
+- [**Repos**](workflows/repositories.md): browse configured source, refs, and file history.
+- [**Workspaces**](workflows/workspaces.md): open local shells and configured agents.
+- [**Docs**](workflows/docs.md): read and edit registered Markdown folders.
+- [**Settings**](settings.md): manage repositories, agents, modes, and app preferences.
 
 Press `?` to see shortcuts for the current view.
 
-## Enable Docs
+On a phone, open `/m` for Activity, Pulls, Issues, and Workspaces in a
+touch-first layout. Docs and Kata-linked task detail remain desktop-first.
 
-Docs is hidden by default:
+## Advanced credential setup
+
+Most GitHub users do not need this section. Use it when the GitHub CLI is not
+available, or when you connect another provider or host.
+
+To provide a GitHub token directly:
+
+```sh
+export KENN_FORGE_GITHUB_TOKEN=ghp_your_token_here
+kenn-forge daemon start
+```
+
+In PowerShell:
+
+```powershell
+$env:KENN_FORGE_GITHUB_TOKEN = 'ghp_your_token_here'
+kenn-forge.exe daemon start
+```
+
+For another provider or host, set its token environment variable before
+starting. To use `token_env` or `token_file`, start once to create
+`~/.kenn/forge/config.toml`, edit it, then restart. Settings chooses provider
+hosts and repository patterns, but it does not store credentials. See
+[Configuration](configuration.md#credentials).
+
+## Connect optional integrations
+
+Docs is hidden until you register a local Markdown folder:
 
 ```toml
 [modes]
 docs = true
 ```
 
-Kata issues appear inline when linked to provider items or workspaces, and are
-available as a source in the New Workspace dialog. Docs uses folders registered
-with `kenn-forge docs add-folder`.
+```sh
+kenn-forge docs add-folder --name Notes ~/notes
+```
+
+The **Reviews** page connects to a Roborev daemon. The default endpoint is
+`http://127.0.0.1:7373`. Kata has no top-level mode. Once kenn-forge finds a
+Kata daemon in `$KATA_HOME/config.toml` or `~/.kata/config.toml`, you can link
+Kata issues from pull requests, provider issues, and local workspaces. Remote
+fleet workspaces do not show Kata controls. You can also choose a Kata issue in
+the **New workspace** dialog.
+
+See [Integrations](integrations.md) for Roborev endpoints, Kata repository
+mappings, and Docs folder bindings.
 
 Continue with [daily workflows](workflows.md) or the
 [configuration reference](configuration.md).

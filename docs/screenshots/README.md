@@ -32,8 +32,20 @@ The generated files are:
 - `first-run-dark.svg`
 - `code-reviewer-agent-launch-light.svg`
 - `code-reviewer-agent-launch-dark.svg`
+- `roborev-reviews-light.svg`
+- `roborev-reviews-dark.svg`
+- `repository-source-light.svg`
+- `repository-source-dark.svg`
+- `docs-workspace-light.svg`
+- `docs-workspace-dark.svg`
 - `workspace-codex-session-light.svg`
 - `workspace-codex-session-dark.svg`
+- `workspace-pr-details-light.svg`
+- `workspace-pr-details-dark.svg`
+- `mobile-workspace-session-light.svg`
+- `mobile-workspace-session-dark.svg`
+- `settings-overview-light.svg`
+- `settings-overview-dark.svg`
 
 Workflow captures use a configured seeded server. First-run captures use a
 second isolated server with its repositories removed and a synthetic tooling
@@ -45,6 +57,23 @@ credentials.
 The maintainer overview opens the seeded pull request from Activity, hosts its
 ready workspace in the detail layout, and selects the running Codex session
 before export.
+
+The pull request workspace capture keeps that Codex session selected and opens
+the linked PR in the workspace's right sidebar. The Settings capture opens the
+seeded repository controls and the complete category menu.
+
+The mobile workspace capture opens the same synthetic Codex session at a
+390-by-844 viewport and opens the terminal composer. It uses the isolated
+workspace and sanitized transcript from the desktop capture.
+
+The Roborev capture starts a synthetic daemon on a free loopback port, then
+opens its seeded job through kenn-forge's real status and proxy routes. It does
+not contact an installed Roborev daemon or read a Roborev database.
+
+The repository source capture reads the seeded repository clone through the
+real source-browser routes. The Docs capture registers a temporary synthetic
+Markdown folder with the isolated server. Neither capture reads a developer
+worktree or personal notes folder.
 
 The visible Codex pane contains a short static transcript derived from a
 one-time real Codex run in a synthetic widget-cache repository. The capture

@@ -11,6 +11,9 @@ event order. Select a row to open its detail without leaving the queue.
 Use **Sync current repository** when one repository needs fresh data. This
 avoids scheduling a global refresh.
 
+See [Follow activity across repositories](workflows/activity.md) for saved
+filter URLs, local workspace activity, commit diffs, and detail panes.
+
 ## Follow a role-based guide
 
 - [Triage an issue](workflows/issue-triager.md)
@@ -93,14 +96,28 @@ Use `--agent NAME` to limit installation. Active work, approval requests, and
 input requests update while the sidebar is open. Hook reports expire after 30
 minutes without another event, then fall back to tmux activity.
 
+See [Work in local sessions](workflows/workspaces.md) for workspace types,
+session layouts, tmux attachment, phone use, deletion, and recovery.
+
 ## Use Kata tasks
 
 Link a Kata issue from a pull request, provider issue, or workspace to view its
 read-only detail inline. Use **New workspace → Kata issue** to search a selected
-daemon and create or reopen a mapped workspace. Open the task in Kata for its
-full workflow.
+daemon and create or reopen a mapped workspace. If kenn-forge cannot match the
+Kata project to a configured repository, open **Settings → Kata mappings** and
+add an override. Open the task in Kata when you need to edit it.
 
-Kata remains the source of truth for task data; Forge owns only its associations.
+Kata remains the source of truth for task data. kenn-forge owns only the links
+to pull requests, issues, and workspaces. There is no separate Kata mode.
+
+## Review Roborev jobs
+
+Start the Roborev daemon, then open **Reviews**. Filter the queue by repository,
+branch, status, or Git ref. Select a job to read the review, inspect its log and
+prompt, add a comment, or use the actions available for its current state.
+
+See [Integrations](integrations.md#review-roborev-jobs) for endpoint setup and a
+walkthrough of the Reviews page.
 
 ## Browse and edit Docs
 
@@ -109,6 +126,9 @@ pull, and publish files from the console. Task references can open a Kata task
 through the folder's daemon binding.
 
 Files remain on disk inside the configured folders.
+
+See [Read and edit local Docs](workflows/docs.md) for search, file editing, Git
+pull and publish, and Kata reference behavior.
 
 ## Use a fleet
 

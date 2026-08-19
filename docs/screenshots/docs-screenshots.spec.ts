@@ -1,6 +1,9 @@
 import { expect, test, type Locator, type Page } from "@playwright/test";
 import { execFile } from "node:child_process";
+import { once } from "node:events";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createServer, type ServerResponse } from "node:http";
+import type { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -12,6 +15,130 @@ import {
 
 const outputDir = process.env.KENN_FORGE_DOCS_SCREENSHOT_DIR;
 const execFileAsync = promisify(execFile);
+let syntheticDocsRoot: string | null = null;
+let syntheticDocsRegistered = false;
+
+const syntheticRoborevJob = {
+  id: 501,
+  repo_id: 1,
+  repo_name: "widget-cache",
+  repo_path: "/repos/widget-cache",
+  git_ref: "feedfacecafebeef",
+  branch: "main",
+  agent: "codex",
+  model: "gpt-5.6-sol",
+  status: "done",
+  job_type: "review",
+  enqueued_at: "2026-08-18T14:00:00Z",
+  started_at: "2026-08-18T14:01:00Z",
+  finished_at: "2026-08-18T14:03:12Z",
+  agentic: false,
+  prompt_prebuilt: false,
+  retry_count: 0,
+  closed: false,
+  verdict: "P",
+  commit_subject: "Share concurrent cache loads",
+  review_type: "commit",
+  token_usage: JSON.stringify({
+    input_tokens: 18_420,
+    cached_input_tokens: 7_900,
+    total_output_tokens: 1_260,
+    peak_context_tokens: 31_800,
+    has_cost: true,
+    cost_usd: 0.42,
+  }),
+};
+
+function writeRoborevJSON(response: ServerResponse, body: unknown, status = 200): void {
+  response.writeHead(status, { "Content-Type": "application/json" });
+  response.end(JSON.stringify(body));
+}
+
+async function startSyntheticRoborevDaemon(): Promise<{ url: string; close: () => Promise<void> }> {
+  const server = createServer((request, response) => {
+    const url = new URL(request.url ?? "/", "http://127.0.0.1");
+    switch (url.pathname) {
+      case "/api/status":
+        writeRoborevJSON(response, {
+          version: "docs-fixture",
+          queued_jobs: 1,
+          running_jobs: 1,
+          completed_jobs: 24,
+          failed_jobs: 2,
+          canceled_jobs: 1,
+          active_workers: 1,
+          max_workers: 2,
+        });
+        return;
+      case "/api/jobs":
+        writeRoborevJSON(response, {
+          jobs: [syntheticRoborevJob],
+          has_more: false,
+          stats: { done: 24, closed: 8, open: 16 },
+        });
+        return;
+      case "/api/review":
+        writeRoborevJSON(response, {
+          id: 601,
+          job_id: syntheticRoborevJob.id,
+          agent: syntheticRoborevJob.agent,
+          prompt: "Review the cache coalescing change for correctness and failure handling.",
+          output:
+            "## Review\n\nNo blocking findings. Concurrent loads share one request, and a failed request clears the in-flight entry so the next call can retry.",
+          created_at: "2026-08-18T14:03:20Z",
+          closed: false,
+          verdict_bool: 1,
+          job: syntheticRoborevJob,
+        });
+        return;
+      case "/api/comments":
+        writeRoborevJSON(response, {
+          responses: [
+            {
+              id: 701,
+              job_id: syntheticRoborevJob.id,
+              responder: "maintainer",
+              response: "Checked the retry path locally. This is ready to merge.",
+              created_at: "2026-08-18T14:10:00Z",
+            },
+          ],
+        });
+        return;
+      case "/api/repos":
+        writeRoborevJSON(response, {
+          repos: [
+            {
+              id: 1,
+              root_path: syntheticRoborevJob.repo_path,
+              name: syntheticRoborevJob.repo_name,
+              count: 1,
+            },
+          ],
+          total_count: 1,
+        });
+        return;
+      case "/api/stream/events":
+        response.writeHead(204);
+        response.end();
+        return;
+      default:
+        writeRoborevJSON(response, { error: `unexpected ${url.pathname}` }, 404);
+    }
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const { port } = server.address() as AddressInfo;
+  return {
+    url: `http://127.0.0.1:${port}`,
+    close: () =>
+      new Promise<void>((resolve, reject) => {
+        server.close((error) => {
+          if (error) reject(error);
+          else resolve();
+        });
+      }),
+  };
+}
 
 type ThemeName = "light" | "dark";
 
@@ -56,14 +183,21 @@ const syntheticCodexPalettes = {
 
 type CaptureCase = {
   name:
+    | "docs-workspace"
     | "maintainer-overview"
     | "issue-triager"
     | "code-reviewer"
     | "code-reviewer-agent-launch"
+    | "repository-source"
+    | "roborev-reviews"
     | "workspace-codex-session"
+    | "workspace-pr-details"
+    | "mobile-workspace-session"
+    | "settings-overview"
     | "first-run";
   theme: ThemeName;
   path: string;
+  viewport?: { width: number; height: number };
   readySelector: string;
   readyText: string;
   requiredSelector?: string;
@@ -78,6 +212,20 @@ type CaptureCase = {
 async function openCodexLaunchMenu(page: Page): Promise<void> {
   await page.getByRole("button", { name: "Create Workspace options" }).click();
   await expect(page.getByRole("menuitem", { name: "Codex" })).toBeVisible();
+}
+
+async function registerSyntheticDocsFolder(page: Page, baseURL: string): Promise<void> {
+  if (syntheticDocsRegistered) return;
+  if (!syntheticDocsRoot) throw new Error("synthetic Docs root was not created");
+  const response = await page.request.post(`${baseURL}/api/v1/docs/folders`, {
+    data: {
+      id: "engineering",
+      name: "Engineering",
+      path: syntheticDocsRoot,
+    },
+  });
+  expect(response.status()).toBe(201);
+  syntheticDocsRegistered = true;
 }
 
 async function embedSyntheticCodexTranscript(workspace: Locator, theme: ThemeName): Promise<void> {
@@ -194,6 +342,63 @@ async function showCodexWorkspace(page: Page, theme: ThemeName): Promise<void> {
   }, syntheticPath);
 }
 
+async function showWorkspacePRDetails(page: Page, theme: ThemeName): Promise<void> {
+  await showCodexWorkspace(page, theme);
+
+  const prButton = page.locator(".terminal-view").getByRole("button", { name: "PR", exact: true });
+  await prButton.click();
+  await expect(prButton).toHaveClass(/\bactive\b/);
+  await expect(page.locator(".right-sidebar .pull-detail .detail-title")).toContainText("Add widget caching layer");
+  await expect(page.getByText(/Loading discussion/i)).toHaveCount(0);
+  await waitForIdleSync(page);
+}
+
+async function showMobileCodexWorkspace(page: Page, theme: ThemeName): Promise<void> {
+  await page.getByRole("button", { name: /^Open workspace Add widget caching layer/ }).click();
+  await expect(page).toHaveURL(/\/m\/workspaces\/local\//);
+
+  const workspace = page.getByRole("region", { name: "Workspace terminal" });
+  await expect(workspace).toBeVisible();
+  const sessionSwitcher = workspace.getByRole("combobox", { name: /Terminal session/ });
+  await expect(sessionSwitcher).toContainText("Codex");
+
+  const terminal = workspace.locator(".terminal-container:visible").first();
+  await expect(terminal).toBeVisible();
+  await terminal.evaluate(
+    (element, { transcript, palette }) => {
+      const existing = element.querySelector(".docs-mobile-codex-transcript");
+      if (existing) existing.remove();
+
+      const output = document.createElement("pre");
+      output.className = "docs-mobile-codex-transcript";
+      output.setAttribute("aria-label", "Synthetic Codex session transcript");
+      output.textContent = transcript;
+      output.style.cssText = [
+        "position: absolute",
+        "inset: 0",
+        "z-index: 3",
+        "box-sizing: border-box",
+        "margin: 0",
+        "padding: 16px 14px",
+        "overflow: hidden",
+        `background: ${palette.background}`,
+        `color: ${palette.foreground}`,
+        'font-family: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace',
+        "font-size: 11.5px",
+        "line-height: 1.45",
+        "white-space: pre-wrap",
+      ].join("; ");
+      element.appendChild(output);
+    },
+    { transcript: syntheticCodexTranscript, palette: syntheticCodexPalettes[theme] },
+  );
+
+  await workspace.getByRole("button", { name: "Open terminal composer" }).click();
+  const composer = workspace.getByRole("textbox", { name: "Terminal command" });
+  await composer.fill("Summarize recent commits");
+  await expect(composer).toHaveValue("Summarize recent commits");
+}
+
 async function showActivityCodexWorkspace(page: Page, theme: ThemeName): Promise<void> {
   const prRow = page
     .locator(".activity-row")
@@ -292,6 +497,72 @@ const cases: CaptureCase[] = [
       "Code review view in dark mode with the Create Workspace menu open to launch a configured Codex agent.",
   },
   {
+    name: "roborev-reviews",
+    theme: "light",
+    path: "/reviews/501",
+    readySelector: ".review-drawer",
+    readyText: "widget-cache",
+    requiredSelector: ".review-content",
+    loadingText: /Loading review|Loading\.\.\./i,
+    description:
+      "Roborev review queue with a completed review selected beside its status, usage, and response controls.",
+  },
+  {
+    name: "roborev-reviews",
+    theme: "dark",
+    path: "/reviews/501",
+    readySelector: ".review-drawer",
+    readyText: "widget-cache",
+    requiredSelector: ".review-content",
+    loadingText: /Loading review|Loading\.\.\./i,
+    description:
+      "Roborev review queue in dark mode with a completed review selected beside its status, usage, and response controls.",
+  },
+  {
+    name: "repository-source",
+    theme: "light",
+    path: "/repo/browser?provider=github&repo_path=acme%2Fwidgets&ref_type=branch&ref_name=main&path=README.md&mode=preview",
+    readySelector: ".repo-browser__path",
+    readyText: "README.md",
+    requiredSelector: ".repo-browser__markdown",
+    loadingText: /Loading repository|Loading file|Loading history/i,
+    description: "Repository source browser with the selected branch, file tree, rendered Markdown, and file history.",
+  },
+  {
+    name: "repository-source",
+    theme: "dark",
+    path: "/repo/browser?provider=github&repo_path=acme%2Fwidgets&ref_type=branch&ref_name=main&path=README.md&mode=preview",
+    readySelector: ".repo-browser__path",
+    readyText: "README.md",
+    requiredSelector: ".repo-browser__markdown",
+    loadingText: /Loading repository|Loading file|Loading history/i,
+    description:
+      "Repository source browser in dark mode with the selected branch, file tree, rendered Markdown, and file history.",
+  },
+  {
+    name: "docs-workspace",
+    theme: "light",
+    path: "/docs?folder=engineering&doc=README.md",
+    readySelector: ".docs-detail",
+    readyText: "Engineering notes",
+    requiredButtonName: "Edit",
+    loadingText: /Loading folders|Loading document|Loading tree/i,
+    prepare: registerSyntheticDocsFolder,
+    description: "Docs workspace with a registered folder, Markdown file tree, rendered document, and outline.",
+  },
+  {
+    name: "docs-workspace",
+    theme: "dark",
+    path: "/docs?folder=engineering&doc=README.md",
+    readySelector: ".docs-detail",
+    readyText: "Engineering notes",
+    requiredButtonName: "Edit",
+    loadingText: /Loading folders|Loading document|Loading tree/i,
+    prepare: registerSyntheticDocsFolder,
+    description:
+      "Docs workspace in dark mode with a registered folder, Markdown file tree, rendered document, and outline.",
+  },
+  {
     name: "workspace-codex-session",
     theme: "light",
     path: "/workspaces",
@@ -313,6 +584,53 @@ const cases: CaptureCase[] = [
     afterReady: showCodexWorkspace,
     description:
       "Workspaces view in dark mode with the pull request worktree selected and its Codex session available.",
+  },
+  {
+    name: "workspace-pr-details",
+    theme: "light",
+    path: "/workspaces",
+    readySelector: ".workspace-list-sidebar",
+    readyText: "Add widget caching layer",
+    waitForSync: true,
+    prepare: ensureSyntheticCodexWorkspace,
+    afterReady: showWorkspacePRDetails,
+    description:
+      "Workspaces view with a pull request worktree, its Codex session, and the linked PR open in the right sidebar.",
+  },
+  {
+    name: "workspace-pr-details",
+    theme: "dark",
+    path: "/workspaces",
+    readySelector: ".workspace-list-sidebar",
+    readyText: "Add widget caching layer",
+    waitForSync: true,
+    prepare: ensureSyntheticCodexWorkspace,
+    afterReady: showWorkspacePRDetails,
+    description:
+      "Workspaces view in dark mode with a pull request worktree, its Codex session, and the linked PR open in the right sidebar.",
+  },
+  {
+    name: "mobile-workspace-session",
+    theme: "light",
+    path: "/m/workspaces",
+    viewport: { width: 390, height: 844 },
+    readySelector: ".mobile-workspace-list",
+    readyText: "Add widget caching layer",
+    prepare: ensureSyntheticCodexWorkspace,
+    afterReady: showMobileCodexWorkspace,
+    description: "Phone workspace with Codex selected, terminal output visible, and the touch composer open.",
+  },
+  {
+    name: "mobile-workspace-session",
+    theme: "dark",
+    path: "/m/workspaces",
+    viewport: { width: 390, height: 844 },
+    readySelector: ".mobile-workspace-list",
+    readyText: "Add widget caching layer",
+    prepare: ensureSyntheticCodexWorkspace,
+    afterReady: showMobileCodexWorkspace,
+    description:
+      "Phone workspace in dark mode with Codex selected, terminal output visible, and the touch composer open.",
   },
   {
     name: "maintainer-overview",
@@ -339,6 +657,28 @@ const cases: CaptureCase[] = [
     afterReady: showActivityCodexWorkspace,
     description:
       "Activity in dark mode with a selected pull request, its live workspace, and the workspace's selected Codex session.",
+  },
+  {
+    name: "settings-overview",
+    theme: "light",
+    path: "/settings",
+    readySelector: ".settings-page",
+    readyText: "Repositories",
+    requiredSelector: ".settings-panel:not([hidden])",
+    requiredButtonName: "Add repositories…",
+    loadingText: /Loading settings/i,
+    description: "Settings with its searchable category menu and configured repository controls.",
+  },
+  {
+    name: "settings-overview",
+    theme: "dark",
+    path: "/settings",
+    readySelector: ".settings-page",
+    readyText: "Repositories",
+    requiredSelector: ".settings-panel:not([hidden])",
+    requiredButtonName: "Add repositories…",
+    loadingText: /Loading settings/i,
+    description: "Settings in dark mode with its searchable category menu and configured repository controls.",
   },
 ];
 
@@ -681,6 +1021,9 @@ test.describe("docs screenshot export safety", () => {
 });
 
 async function captureCase(page: Page, baseURL: string, capture: CaptureCase): Promise<void> {
+  if (capture.viewport) {
+    await page.setViewportSize(capture.viewport);
+  }
   await preparePage(page, capture.theme);
   await capture.prepare?.(page, baseURL);
   if (capture.waitForSync) {
@@ -706,7 +1049,11 @@ async function captureCase(page: Page, baseURL: string, capture: CaptureCase): P
     .poll(() => page.evaluate(() => document.documentElement.classList.contains("dark")))
     .toBe(capture.theme === "dark");
 
-  if (capture.name === "workspace-codex-session" || capture.name === "maintainer-overview") {
+  if (
+    capture.name === "workspace-codex-session" ||
+    capture.name === "workspace-pr-details" ||
+    capture.name === "maintainer-overview"
+  ) {
     const terminal = page.locator(".docs-codex-transcript:visible").first();
     const composer = terminal.getByLabel("Codex prompt composer");
     const status = terminal.getByLabel("Codex model and workspace status");
@@ -750,6 +1097,27 @@ async function captureCase(page: Page, baseURL: string, capture: CaptureCase): P
     }
   }
 
+  if (capture.name === "mobile-workspace-session") {
+    const workspace = page.getByRole("region", { name: "Workspace terminal" });
+    await expect(workspace.getByRole("combobox", { name: /Terminal session/ })).toContainText("Codex");
+    await expect(workspace.getByRole("textbox", { name: "Terminal command" })).toHaveValue("Summarize recent commits");
+    await expect(workspace.locator(".docs-mobile-codex-transcript")).toContainText("3 passed, 0 failed");
+  }
+
+  if (capture.name === "workspace-pr-details") {
+    await expect(page.locator(".terminal-view").getByRole("button", { name: "PR", exact: true })).toHaveClass(
+      /\bactive\b/,
+    );
+    await expect(page.locator(".right-sidebar .pull-detail .detail-title")).toContainText("Add widget caching layer");
+  }
+
+  if (capture.name === "settings-overview") {
+    const navigation = page.getByRole("navigation", { name: "Settings" });
+    await expect(navigation).toBeVisible();
+    await expect(navigation.getByRole("button", { name: /^Repositories\b/ })).toBeVisible();
+    await expect(navigation.getByRole("button", { name: /^Workspace agents\b/ })).toBeVisible();
+  }
+
   const svg = await nativeSVGSnapshot(page, {
     title: `${capture.name} ${capture.theme}`,
     description: capture.description,
@@ -769,17 +1137,57 @@ async function captureCase(page: Page, baseURL: string, capture: CaptureCase): P
 
 test.describe("docs workflow screenshots", () => {
   let server: Awaited<ReturnType<typeof startIsolatedWorkspaceE2EServer>> | null = null;
+  let roborevDaemon: Awaited<ReturnType<typeof startSyntheticRoborevDaemon>> | null = null;
 
   test.beforeAll(async () => {
     if (!outputDir) {
       throw new Error("KENN_FORGE_DOCS_SCREENSHOT_DIR must point to the staged docs asset directory");
     }
-    server = await startIsolatedWorkspaceE2EServer();
+    roborevDaemon = await startSyntheticRoborevDaemon();
+    const previousEndpoint = process.env.ROBOREV_ENDPOINT;
+    process.env.ROBOREV_ENDPOINT = roborevDaemon.url;
+    try {
+      server = await startIsolatedWorkspaceE2EServer();
+    } finally {
+      if (previousEndpoint === undefined) delete process.env.ROBOREV_ENDPOINT;
+      else process.env.ROBOREV_ENDPOINT = previousEndpoint;
+    }
+    syntheticDocsRoot = await mkdtemp(path.join(os.tmpdir(), "kenn-forge-docs-capture-"));
+    await mkdir(path.join(syntheticDocsRoot, "guides"), { recursive: true });
+    await writeFile(
+      path.join(syntheticDocsRoot, "README.md"),
+      [
+        "# Engineering notes",
+        "",
+        "Use this folder for decisions that need to stay close to the code.",
+        "",
+        "## Working agreements",
+        "",
+        "- Keep examples small and runnable.",
+        "- Link the pull request that changed a decision.",
+        "- Remove instructions that no longer match the product.",
+        "",
+        "## Guides",
+        "",
+        "Start with [[guides/reviewing]].",
+        "",
+      ].join("\n"),
+    );
+    await writeFile(
+      path.join(syntheticDocsRoot, "guides", "reviewing.md"),
+      ["# Reviewing changes", "", "Read the current behavior before changing the guide.", ""].join("\n"),
+    );
     await mkdir(outputDir, { recursive: true });
   });
 
   test.afterAll(async () => {
     await server?.stop();
+    await roborevDaemon?.close();
+    if (syntheticDocsRoot) {
+      await rm(syntheticDocsRoot, { recursive: true, force: true });
+      syntheticDocsRoot = null;
+      syntheticDocsRegistered = false;
+    }
   });
 
   for (const capture of cases) {

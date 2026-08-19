@@ -14,12 +14,18 @@ const publishedFiles = new Set([
   "configuration.md",
   "federated-fleet.md",
   "index.md",
+  "integrations.md",
   "quickstart.md",
+  "settings.md",
   path.join("overrides", "main.html"),
   path.join("stylesheets", "extra.css"),
   "troubleshooting.md",
+  path.join("workflows", "activity.md"),
   path.join("workflows", "code-reviewer.md"),
+  path.join("workflows", "docs.md"),
   path.join("workflows", "issue-triager.md"),
+  path.join("workflows", "repositories.md"),
+  path.join("workflows", "workspaces.md"),
   "workflows.md",
 ]);
 const publishedDirectoryEntries = new Set(["overrides", "stylesheets", "workflows"]);
