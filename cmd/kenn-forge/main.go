@@ -638,19 +638,26 @@ func run(opts serve.Options) error {
 	if opts.DisableSync {
 		providerSources, err = registerProviderTokenSources(cfg, tokenSources)
 	} else {
-		providerSources, err = collectProviderTokenSources(ctx, cfg, tokenSources)
+		providerSources, err = collectProviderTokenSourcesDegraded(ctx, cfg, tokenSources)
+		if err != nil {
+			slog.Warn(
+				"provider credentials unavailable; serving cached data without provider sync",
+				"err", err,
+			)
+			providerSources = nil
+		}
 	}
-	if err != nil {
+	if err != nil && opts.DisableSync {
 		return err
 	}
 	var identityResolver ghclient.IdentityResolver
-	if !opts.DisableSync {
+	if !opts.DisableSync && providerSources != nil {
 		identityResolver = ghclient.HTTPIdentityResolver{}
 	}
 
-	startup, err := buildProviderStartup(
+	startup, err := buildProviderStartupForServe(
 		ctx, database, cfg, tokenSources, providerSources,
-		defaultProviderFactories(), identityResolver,
+		defaultProviderFactories(), identityResolver, opts.DisableSync,
 	)
 	if err != nil {
 		if ctx.Err() != nil && errors.Is(err, context.Canceled) {
