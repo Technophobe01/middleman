@@ -1,0 +1,74 @@
+package mcpserver
+
+import (
+	"context"
+	"encoding/json"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestListAgentTargetsFiltersSupportedHookAgentsWithoutCommands(t *testing.T) {
+	backend := &fakeBackend{listLaunchTargetsFn: func(context.Context) ([]LaunchTarget, error) {
+		return []LaunchTarget{
+			{Key: "gemini", Label: "Gemini", Kind: "agent", Source: "builtin", Available: true},
+			{Key: "opencode", Label: "OpenCode", Kind: "agent", Source: "builtin", Available: true},
+			{Key: "claude", Label: "Claude", Kind: "shell", Source: "config", Available: true},
+			{Key: "codex", Label: "Codex", Kind: "agent", Source: "config", DisabledReason: "disabled by config"},
+			{Key: "custom", Label: "Custom", Kind: "agent", Source: "config", Available: true},
+		}, nil
+	}}
+	s := newMCPTestServer(t, backend)
+
+	out, err := s.listAgentTargets(t.Context(), listAgentTargetsInput{})
+
+	require.NoError(t, err)
+	require.Len(t, out.Targets, 2)
+	assert.Equal(t, "codex", out.Targets[0].Key)
+	assert.False(t, out.Targets[0].Available)
+	assert.Equal(t, "gemini", out.Targets[1].Key)
+	raw, err := json.Marshal(out)
+	require.NoError(t, err)
+	assert.NotContains(t, string(raw), "command")
+}
+
+func TestListWorkspaceAgentSessionsMapsLiveProjectionDeterministically(t *testing.T) {
+	deliveredAt := time.Date(2026, 8, 7, 14, 59, 1, 0, time.UTC)
+	var workspaceID string
+	backend := &fakeBackend{listWorkspaceAgentSessionsFn: func(
+		_ context.Context, id string,
+	) ([]WorkspaceAgentSession, error) {
+		workspaceID = id
+		return []WorkspaceAgentSession{
+			{
+				Agent: "codex", SessionID: "session-b", RuntimeSessionKey: "runtime-b",
+				TargetKey: "codex", State: "done",
+				UpdatedAt: time.Date(2026, 8, 7, 14, 0, 0, 0, time.UTC),
+			},
+			{
+				Agent: "claude", SessionID: "session-a", RuntimeSessionKey: "runtime-a",
+				TargetKey: "claude", State: "working",
+				UpdatedAt: time.Date(2026, 8, 7, 15, 0, 0, 0, time.UTC),
+				InitialMessage: &InitialMessageStatus{
+					State: "delivered", MessageBytes: 12, DeliveredAt: &deliveredAt,
+				},
+			},
+		}, nil
+	}}
+	s := newMCPTestServer(t, backend)
+
+	out, err := s.listWorkspaceAgentSessions(
+		t.Context(), listWorkspaceAgentSessionsInput{WorkspaceID: "ws-1"},
+	)
+
+	require.NoError(t, err)
+	assert.Equal(t, "ws-1", workspaceID)
+	require.Len(t, out.Sessions, 2)
+	assert.Equal(t, "claude", out.Sessions[0].Agent)
+	require.NotNil(t, out.Sessions[0].InitialMessage)
+	assert.Equal(t, "delivered", out.Sessions[0].InitialMessage.State)
+	assert.Equal(t, "2026-08-07T14:59:01Z", out.Sessions[0].InitialMessage.DeliveredAt)
+	assert.Equal(t, "codex", out.Sessions[1].Agent)
+}

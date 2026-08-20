@@ -37,11 +37,17 @@ const (
 	SessionStatusError    SessionStatus = "error"
 )
 
+const initialMessageWriteTimeout = 30 * time.Second
+
 var (
 	errManagerShutdown    = errors.New("runtime manager is shut down")
 	ErrSessionNotFound    = errors.New("runtime session not found")
 	ErrSessionUnavailable = errors.New(
 		"runtime session is temporarily unavailable",
+	)
+	ErrBracketedPasteInactive   = errors.New("bracketed paste mode is not active")
+	ErrInitialMessageNotWritten = errors.New(
+		"initial message was not written",
 	)
 	errWorkspaceStopping = errors.New(
 		"workspace is being stopped",
@@ -238,14 +244,15 @@ type Attachment struct {
 	Output <-chan []byte
 	Done   <-chan struct{}
 
-	info            func() SessionInfo
-	write           func([]byte) error
-	resize          func(cols, rows int) error
-	claimResize     func(cols, rows int) (bool, error)
-	resizeSettled   func()
-	refresh         func(context.Context) error
-	setResizeActive func(active bool)
-	close           func()
+	info                 func() SessionInfo
+	write                func([]byte) error
+	submitInitialMessage func(context.Context, string) error
+	resize               func(cols, rows int) error
+	claimResize          func(cols, rows int) (bool, error)
+	resizeSettled        func()
+	refresh              func(context.Context) error
+	setResizeActive      func(active bool)
+	close                func()
 
 	// sessionOutputClosed reports whether the underlying session's
 	// PTY EOF has been observed by drainOutput (s.outputClosed=true).
@@ -1301,6 +1308,29 @@ func (m *Manager) AttachSessionWithOptions(
 	return attachment, nil
 }
 
+// SubmitInitialMessage writes one bounded, already-normalized initial prompt
+// through a live agent runtime. It requires observed bracketed-paste mode and
+// sends the complete paste frame and Enter in one terminal write.
+func (m *Manager) SubmitInitialMessage(
+	ctx context.Context,
+	workspaceID string,
+	sessionKey string,
+	message string,
+) error {
+	if err := context.Cause(ctx); err != nil {
+		return fmt.Errorf("%w: %w", ErrInitialMessageNotWritten, err)
+	}
+	attachment, err := m.AttachSession(workspaceID, sessionKey)
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrInitialMessageNotWritten, err)
+	}
+	defer attachment.Close()
+	if attachment.Info().Kind != LaunchTargetAgent {
+		return fmt.Errorf("%w: runtime session is not an agent", ErrInitialMessageNotWritten)
+	}
+	return attachment.submitInitialMessage(ctx, message)
+}
+
 func (a *Attachment) Write(data []byte) error {
 	if a == nil || a.write == nil {
 		return errors.New("attachment is closed")
@@ -2153,44 +2183,49 @@ func trailingBytes(data []byte, maxLen int) []byte {
 }
 
 func (s *session) subscribe() (<-chan []byte, func()) {
-	return s.subscribeInternal(false)
+	return s.subscribeInternal(true, false)
 }
 
 func (s *session) subscribeWithReplayBoundary() (<-chan []byte, func()) {
-	return s.subscribeInternal(true)
+	return s.subscribeInternal(true, true)
 }
 
-func (s *session) subscribeInternal(replayBoundary bool) (<-chan []byte, func()) {
+func (s *session) subscribeInternal(
+	includeReplay bool,
+	replayBoundary bool,
+) (<-chan []byte, func()) {
 	ch := make(chan []byte, 64)
 
 	s.mu.Lock()
 	info := s.info
-	replay := make([]byte, 0)
-	if !s.alternateScreenActive {
-		replay = append(replay, s.outputBuffer...)
-	}
-	var replayModes terminalInputModeState
-	replayModes.observe(replay)
-	if pendingLen := trailingIncompleteTerminalDataLen(replay); pendingLen > 0 {
-		stableLen := len(replay) - pendingLen
-		pending := slices.Clone(replay[stableLen:])
-		replay = slices.Clone(replay[:stableLen])
-		replay = s.inputModes.appendTransitions(replay, replayModes)
-		replay = append(replay, pending...)
-	} else {
-		replay = s.inputModes.appendTransitions(replay, replayModes)
-	}
-	if s.alternateScreenActive {
-		replay = append(replay, s.terminalSequenceTail...)
-	}
-	if len(replay) > 0 {
-		ch <- replay
-		slog.Debug(
-			"runtime terminal replay queued",
-			"workspace_id", info.WorkspaceID,
-			"session_key", info.Key,
-			"bytes", len(replay),
-		)
+	if includeReplay {
+		replay := make([]byte, 0)
+		if !s.alternateScreenActive {
+			replay = append(replay, s.outputBuffer...)
+		}
+		var replayModes terminalInputModeState
+		replayModes.observe(replay)
+		if pendingLen := trailingIncompleteTerminalDataLen(replay); pendingLen > 0 {
+			stableLen := len(replay) - pendingLen
+			pending := slices.Clone(replay[stableLen:])
+			replay = slices.Clone(replay[:stableLen])
+			replay = s.inputModes.appendTransitions(replay, replayModes)
+			replay = append(replay, pending...)
+		} else {
+			replay = s.inputModes.appendTransitions(replay, replayModes)
+		}
+		if s.alternateScreenActive {
+			replay = append(replay, s.terminalSequenceTail...)
+		}
+		if len(replay) > 0 {
+			ch <- replay
+			slog.Debug(
+				"runtime terminal replay queued",
+				"workspace_id", info.WorkspaceID,
+				"session_key", info.Key,
+				"bytes", len(replay),
+			)
+		}
 	}
 	if replayBoundary {
 		if s.outputClosed || len(s.terminalSequenceTail) == 0 {
@@ -2756,6 +2791,7 @@ func attachToSession(
 			_, err := s.ptmx.Write(data)
 			return err
 		},
+		submitInitialMessage: s.submitInitialMessage,
 		resize: func(cols, rows int) error {
 			_, err := s.resizeAttachment(resizeAttachmentID, cols, rows, false)
 			return err
@@ -2800,4 +2836,49 @@ func attachToSession(
 			return s.detachedForServerRestart
 		},
 	}, nil
+}
+
+func (s *session) submitInitialMessage(ctx context.Context, message string) error {
+	s.mu.Lock()
+	if !s.inputModes.observed[2004] {
+		s.mu.Unlock()
+		return ErrBracketedPasteInactive
+	}
+	data := make([]byte, 0, len(message)+13)
+	data = append(data, "\x1b[200~"...)
+	data = append(data, message...)
+	data = append(data, "\x1b[201~\r"...)
+	pty := s.pty
+	ptmx := s.ptmx
+	s.mu.Unlock()
+
+	if err := context.Cause(ctx); err != nil {
+		return fmt.Errorf("%w: %w", ErrInitialMessageNotWritten, err)
+	}
+	writeTimeout := initialMessageWriteTimeout
+	if deadline, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(deadline); remaining < writeTimeout {
+			writeTimeout = remaining
+		}
+	}
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), writeTimeout)
+	defer cancel()
+	if err := context.Cause(writeCtx); err != nil {
+		return fmt.Errorf("%w: %w", ErrInitialMessageNotWritten, err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		if pty != nil {
+			result <- pty.Write(data)
+			return
+		}
+		_, err := ptmx.Write(data)
+		result <- err
+	}()
+	select {
+	case err := <-result:
+		return err
+	case <-writeCtx.Done():
+		return context.Cause(writeCtx)
+	}
 }

@@ -342,6 +342,38 @@ components:
         - hookEventName
         - additionalContext
       type: object
+    AgentInitialMessageStatusResponse:
+      additionalProperties: false
+      properties:
+        $schema:
+          description: A URL to the JSON Schema for this object.
+          examples:
+            - /api/v1/schemas/AgentInitialMessageStatusResponse.json
+          format: uri
+          readOnly: true
+          type: string
+        agent:
+          type: string
+        delivered_at:
+          format: date-time
+          type: string
+        message_bytes:
+          format: int64
+          type: integer
+        reserved_at:
+          format: date-time
+          type: string
+        session_id:
+          type: string
+        state:
+          type: string
+      required:
+        - agent
+        - session_id
+        - state
+        - message_bytes
+        - reserved_at
+      type: object
     ApplyReviewSuggestionHostInputBody:
       additionalProperties: false
       properties:
@@ -1367,6 +1399,8 @@ components:
           type: boolean
         reuse_existing_directory:
           type: boolean
+        suppress_auto_assign:
+          type: boolean
       type: object
     CreateIssueWorkspaceInputBody:
       additionalProperties: false
@@ -1383,6 +1417,8 @@ components:
         reuse_existing_branch:
           type: boolean
         reuse_existing_directory:
+          type: boolean
+        suppress_auto_assign:
           type: boolean
       type: object
     CreateWorkspaceInputBody:
@@ -1406,6 +1442,8 @@ components:
           type: string
         provider:
           type: string
+        suppress_auto_assign:
+          type: boolean
       required:
         - provider
         - platform_host
@@ -3726,6 +3764,25 @@ components:
       required:
         - repositories
       type: object
+    ListWorkspaceAgentSessionsOutputBody:
+      additionalProperties: false
+      properties:
+        $schema:
+          description: A URL to the JSON Schema for this object.
+          examples:
+            - /api/v1/schemas/ListWorkspaceAgentSessionsOutputBody.json
+          format: uri
+          readOnly: true
+          type: string
+        sessions:
+          items:
+            $ref: "#/components/schemas/WorkspaceAgentSessionResponse"
+          type:
+            - array
+            - "null"
+      required:
+        - sessions
+      type: object
     ListWorkspacesOutputBody:
       additionalProperties: false
       properties:
@@ -4810,6 +4867,7 @@ components:
             - unsupportedCapability
             - upstreamError
             - validationError
+            - workspaceAlreadyExists
             - workspaceDeletionInProgress
             - workspaceDirectoryNotReusable
             - workspaceNotFound
@@ -7200,6 +7258,27 @@ components:
         - number
         - platform_host
       type: object
+    SubmitInitialMessageInputBody:
+      additionalProperties: false
+      properties:
+        $schema:
+          description: A URL to the JSON Schema for this object.
+          examples:
+            - /api/v1/schemas/SubmitInitialMessageInputBody.json
+          format: uri
+          readOnly: true
+          type: string
+        agent:
+          type: string
+        message:
+          type: string
+        session_id:
+          type: string
+      required:
+        - agent
+        - session_id
+        - message
+      type: object
     SyncStatus:
       additionalProperties: false
       properties:
@@ -7619,6 +7698,32 @@ components:
         - item_url
         - item_state
         - activity_at
+      type: object
+    WorkspaceAgentSessionResponse:
+      additionalProperties: false
+      properties:
+        agent:
+          type: string
+        initial_message:
+          $ref: "#/components/schemas/AgentInitialMessageStatusResponse"
+        runtime_session_key:
+          type: string
+        session_id:
+          type: string
+        state:
+          type: string
+        target_key:
+          type: string
+        updated_at:
+          format: date-time
+          type: string
+      required:
+        - agent
+        - session_id
+        - runtime_session_key
+        - target_key
+        - state
+        - updated_at
       type: object
     WorkspaceDiffWatchResponse:
       additionalProperties: false
@@ -19823,6 +19928,31 @@ paths:
       summary: Get workspace
       tags:
         - Workspaces
+  /workspaces/{id}/agent-sessions:
+    get:
+      operationId: list-workspace-agent-sessions
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListWorkspaceAgentSessionsOutputBody"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemError"
+          description: Error
+      summary: List live coding sessions
+      tags:
+        - Workspaces
   /workspaces/{id}/commits:
     get:
       operationId: get-workspace-commits
@@ -20453,6 +20583,71 @@ paths:
                 $ref: "#/components/schemas/ProblemError"
           description: Error
       summary: Get workspace runtime session attach spec
+      tags:
+        - Workspaces
+  /workspaces/{id}/runtime/sessions/{session_key}/initial-message:
+    get:
+      operationId: get-workspace-runtime-session-initial-message
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: session_key
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentInitialMessageStatusResponse"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemError"
+          description: Error
+      summary: Get initial agent message status
+      tags:
+        - Workspaces
+    post:
+      operationId: submit-workspace-runtime-session-initial-message
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: session_key
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SubmitInitialMessageInputBody"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentInitialMessageStatusResponse"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemError"
+          description: Error
+      summary: Submit initial agent message
       tags:
         - Workspaces
   /worktrees/remove-stale:

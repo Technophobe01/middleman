@@ -140,6 +140,8 @@ type Handler struct {
 	workspaceSetupMu               sync.Mutex
 	workspaceSetupDone             map[string]chan struct{}
 	workspaceDeleting              map[string]*workspaceDeletion
+	initialMessagesMu              sync.Mutex
+	initialMessages                map[initialMessageKey]initialMessageAttempt
 	worktreeShellTransactions      sync.Map
 	workspaceTmuxPrunedAt          time.Time
 	workspaceTmuxPrunePending      bool
@@ -193,6 +195,7 @@ func New(deps Deps) *Handler {
 		workspaceEnrichmentDisabled:    deps.EnrichmentDisabled,
 		workspaceSetupDone:             make(map[string]chan struct{}),
 		workspaceDeleting:              make(map[string]*workspaceDeletion),
+		initialMessages:                make(map[initialMessageKey]initialMessageAttempt),
 		tmuxActivity:                   newTmuxActivityTracker(now),
 		lifecycleCtx:                   lifecycleCtx,
 		lifecycleCancel:                lifecycleCancel,
@@ -261,6 +264,8 @@ func (s *Handler) Register(api huma.API) {
 		httpapi.DocumentOperation("list-workspaces", "List workspaces", "Workspaces"))
 	huma.Get(api, "/workspaces/{id}", s.getWorkspace,
 		httpapi.DocumentOperation("get-workspace", "Get workspace", "Workspaces"))
+	huma.Get(api, "/workspaces/{id}/agent-sessions", s.listWorkspaceAgentSessions,
+		httpapi.DocumentOperation("list-workspace-agent-sessions", "List live coding sessions", "Workspaces"))
 	huma.Get(api, "/workspaces/{id}/commits", s.getWorkspaceCommits,
 		httpapi.DocumentOperation("get-workspace-commits", "Get workspace commits", "Workspaces"))
 	huma.Get(api, "/workspaces/{id}/diff", s.getWorkspaceDiff,
@@ -337,6 +342,16 @@ func (s *Handler) Register(api huma.API) {
 		Summary:     "Get workspace runtime session attach spec",
 		Tags:        []string{"Workspaces"},
 	}, s.getWorkspaceRuntimeSessionAttachSpec)
+	huma.Get(api, "/workspaces/{id}/runtime/sessions/{session_key}/initial-message",
+		s.getInitialMessageStatus,
+		httpapi.DocumentOperation("get-workspace-runtime-session-initial-message", "Get initial agent message status", "Workspaces"))
+	huma.Register(api, huma.Operation{
+		OperationID: "submit-workspace-runtime-session-initial-message",
+		Method:      http.MethodPost,
+		Path:        "/workspaces/{id}/runtime/sessions/{session_key}/initial-message",
+		Summary:     "Submit initial agent message",
+		Tags:        []string{"Workspaces"},
+	}, s.submitInitialMessage)
 	huma.Register(api, huma.Operation{
 		OperationID: "rename-workspace-runtime-session",
 		Method:      http.MethodPatch,

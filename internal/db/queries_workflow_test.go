@@ -27,7 +27,7 @@ func TestItemWorkflowStateCRUD(t *testing.T) {
 	require.NotNil(st)
 	assert.Equal("new", st.Status)
 
-	prev, err := d.SetItemWorkflowState(ctx, SetItemWorkflowStateParams{
+	result, err := d.SetItemWorkflowState(ctx, SetItemWorkflowStateParams{
 		RepoID:     repoID,
 		ItemType:   ItemTypePR,
 		ItemNumber: 1,
@@ -37,7 +37,12 @@ func TestItemWorkflowStateCRUD(t *testing.T) {
 		Reason:     "recent force push",
 	})
 	require.NoError(err)
-	assert.Equal("new", prev)
+	assert.Equal("new", result.PreviousStatus)
+	assert.Equal("reviewing", result.State.Status)
+	assert.Equal("mcp", result.State.UpdatedSource)
+	assert.Equal("agent-a", result.State.UpdatedActor)
+	assert.Equal("recent force push", result.State.UpdatedReason)
+	assert.False(result.State.UpdatedAt.IsZero())
 
 	st, err = d.GetItemWorkflowState(ctx, repoID, ItemTypePR, 1)
 	require.NoError(err)
@@ -63,7 +68,7 @@ func TestSetItemWorkflowStateExpectedStatus(t *testing.T) {
 	repoID := insertTestRepo(t, d, "owner", "repo")
 	insertTestMR(t, d, repoID, 1, "pr 1", baseTime())
 
-	prev, err := d.SetItemWorkflowState(ctx, SetItemWorkflowStateParams{
+	result, err := d.SetItemWorkflowState(ctx, SetItemWorkflowStateParams{
 		RepoID:         repoID,
 		ItemType:       ItemTypePR,
 		ItemNumber:     1,
@@ -72,7 +77,7 @@ func TestSetItemWorkflowStateExpectedStatus(t *testing.T) {
 		Source:         "mcp",
 	})
 	require.NoError(err)
-	assert.Equal("new", prev)
+	assert.Equal("new", result.PreviousStatus)
 
 	_, err = d.SetItemWorkflowState(ctx, SetItemWorkflowStateParams{
 		RepoID:         repoID,
@@ -92,7 +97,7 @@ func TestSetItemWorkflowStateExpectedStatus(t *testing.T) {
 	require.NotNil(st)
 	assert.Equal("reviewing", st.Status)
 
-	prev, err = d.SetItemWorkflowState(ctx, SetItemWorkflowStateParams{
+	result, err = d.SetItemWorkflowState(ctx, SetItemWorkflowStateParams{
 		RepoID:         repoID,
 		ItemType:       ItemTypePR,
 		ItemNumber:     1,
@@ -101,7 +106,7 @@ func TestSetItemWorkflowStateExpectedStatus(t *testing.T) {
 		Source:         "api",
 	})
 	require.NoError(err)
-	assert.Equal("reviewing", prev)
+	assert.Equal("reviewing", result.PreviousStatus)
 }
 
 func TestItemWorkflowStateIssueType(t *testing.T) {
@@ -112,7 +117,7 @@ func TestItemWorkflowStateIssueType(t *testing.T) {
 	ctx := t.Context()
 	repoID := insertTestRepo(t, d, "owner", "repo")
 
-	prev, err := d.SetItemWorkflowState(ctx, SetItemWorkflowStateParams{
+	result, err := d.SetItemWorkflowState(ctx, SetItemWorkflowStateParams{
 		RepoID:     repoID,
 		ItemType:   ItemTypeIssue,
 		ItemNumber: 9,
@@ -120,7 +125,7 @@ func TestItemWorkflowStateIssueType(t *testing.T) {
 		Source:     "mcp",
 	})
 	require.NoError(err)
-	assert.Equal("new", prev)
+	assert.Equal("new", result.PreviousStatus)
 
 	st, err := d.GetItemWorkflowState(ctx, repoID, ItemTypeIssue, 9)
 	require.NoError(err)
@@ -299,7 +304,7 @@ func TestListItemWorkflowStatesCursorPagination(t *testing.T) {
 	assert.Equal(3, pages)
 
 	_, _, err := d.ListItemWorkflowStates(ctx, ListWorkflowStatesOpts{Cursor: "not-base64!!"})
-	require.Error(err)
+	require.ErrorIs(err, ErrInvalidWorkflowCursor)
 }
 
 func TestListItemWorkflowStatesRepoFiltersUseCasefoldKeys(t *testing.T) {
@@ -385,4 +390,36 @@ func TestIssueQueriesExposeWorkflowStatus(t *testing.T) {
 	require.NoError(err)
 	require.NotNil(iss)
 	assert.Equal(KanbanStatus(""), iss.WorkflowStatus)
+}
+
+func TestListItemWorkflowStatesCanExcludeRemovedUpstreamItems(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	assert := assert.New(t)
+	d := openTestDB(t)
+	ctx := t.Context()
+	now := baseTime()
+	repoID := insertTestRepo(t, d, "owner", "repo")
+	insertTestMR(t, d, repoID, 1, "visible pull", now)
+	insertTestMR(t, d, repoID, 2, "removed pull", now.Add(time.Minute))
+	insertTestIssue(t, d, repoID, 3, "visible issue", now.Add(2*time.Minute))
+	insertTestIssue(t, d, repoID, 4, "removed issue", now.Add(3*time.Minute))
+	_, err := d.WriteDB().ExecContext(ctx, `
+		INSERT INTO forge_archive_items (
+			repo_id, item_type, item_number, provider_item_id,
+			provider_created_at, provider_updated_at, lifecycle_state
+		) VALUES
+			(?, 'merge_request', 2, 'pull-2', ?, ?, 'removed_upstream'),
+			(?, 'issue', 4, 'issue-4', ?, ?, 'removed_upstream')`,
+		repoID, now, now, repoID, now, now,
+	)
+	require.NoError(err)
+
+	rows, _, err := d.ListItemWorkflowStates(ctx, ListWorkflowStatesOpts{
+		IncludeClosed: true, ExcludeRemovedUpstream: true,
+	})
+
+	require.NoError(err)
+	require.Len(rows, 2)
+	assert.ElementsMatch([]int{1, 3}, []int{rows[0].Number, rows[1].Number})
 }

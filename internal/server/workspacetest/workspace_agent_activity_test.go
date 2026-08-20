@@ -1,17 +1,14 @@
 package workspacetest
 
 import (
-	"encoding/json"
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.kenn.io/forge/internal/agentactivity"
 	"go.kenn.io/forge/internal/apiclient/generated"
 	"go.kenn.io/forge/internal/config"
 )
@@ -19,10 +16,17 @@ import (
 func TestWorkspaceAgentActivityFlowsThroughHTTPResponsesE2E(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
-	cfg := &config.Config{Agents: []config.Agent{{
-		Key: "hook-agent", Label: "Hook agent",
-		Command: []string{"/bin/sh", "-c", "while :; do sleep 1; done"},
-	}}}
+	disableTmuxAgentSessions := false
+	cfg := &config.Config{
+		Agents: []config.Agent{{
+			Key: "hook-agent", Label: "Hook agent",
+			Command: []string{
+				"/bin/sh", "-c",
+				"printf '\033[?2004h'; while IFS= read -r _; do :; done",
+			},
+		}},
+		Tmux: config.Tmux{AgentSessions: &disableTmuxAgentSessions},
+	}
 	fixture := setupWorkspaceServerFixture(t, cfg)
 	ctx := t.Context()
 	ws := createReadyWorkspace(t, ctx, fixture.client)
@@ -35,7 +39,20 @@ func TestWorkspaceAgentActivityFlowsThroughHTTPResponsesE2E(t *testing.T) {
 	require.Equal(http.StatusOK, launch.StatusCode())
 	require.NotNil(launch.JSON200)
 
-	store := agentactivity.NewStore(fixture.agentActivityDir)
+	reportHook := func(agent, sessionID, runtimeKey, cwd, event string) {
+		t.Helper()
+		response, hookErr := fixture.client.HTTP.ReceiveAgentHookWithResponse(
+			ctx, agent,
+			&generated.ReceiveAgentHookParams{
+				XKennForgeRuntimeSessionKey: &runtimeKey,
+			},
+			generated.HookEvent{
+				SessionId: sessionID, Cwd: cwd, HookEventName: event,
+			},
+		)
+		require.NoError(hookErr)
+		require.Equal(http.StatusOK, response.StatusCode(), string(response.Body))
+	}
 	for _, report := range []struct {
 		sessionID  string
 		runtimeKey string
@@ -49,16 +66,43 @@ func TestWorkspaceAgentActivityFlowsThroughHTTPResponsesE2E(t *testing.T) {
 		if report.sessionID == "wrong-worktree" {
 			cwd = t.TempDir()
 		}
-		payload, marshalErr := json.Marshal(map[string]string{
-			"session_id":      report.sessionID,
-			"cwd":             cwd,
-			"hook_event_name": report.event,
-		})
-		require.NoError(marshalErr)
-		require.NoError(store.HandleHook(
-			strings.NewReader(string(payload)), report.runtimeKey,
-		))
+		reportHook("CoDeX", report.sessionID, report.runtimeKey, cwd, report.event)
 	}
+
+	sessionsResponse, err := fixture.client.HTTP.ListWorkspaceAgentSessionsWithResponse(ctx, ws.Id)
+	require.NoError(err)
+	require.Equal(http.StatusOK, sessionsResponse.StatusCode(), string(sessionsResponse.Body))
+	require.NotNil(sessionsResponse.JSON200)
+	require.NotNil(sessionsResponse.JSON200.Sessions)
+	require.Len(*sessionsResponse.JSON200.Sessions, 1)
+	assert.Equal("codex", (*sessionsResponse.JSON200.Sessions)[0].Agent)
+	assert.Equal("live-agent", (*sessionsResponse.JSON200.Sessions)[0].SessionId)
+	assert.Equal(launch.JSON200.Key, (*sessionsResponse.JSON200.Sessions)[0].RuntimeSessionKey)
+
+	messageResponse, err := fixture.client.HTTP.SubmitWorkspaceRuntimeSessionInitialMessageWithResponse(
+		ctx, ws.Id, launch.JSON200.Key,
+		generated.SubmitInitialMessageInputBody{
+			Agent: "codex", SessionId: "live-agent", Message: "review this",
+		},
+	)
+	require.NoError(err)
+	require.Equal(http.StatusOK, messageResponse.StatusCode(), string(messageResponse.Body))
+	require.NotNil(messageResponse.JSON200)
+	assert.Equal("delivered", messageResponse.JSON200.State)
+	assert.Equal(int64(11), messageResponse.JSON200.MessageBytes)
+	assert.Equal(time.UTC, messageResponse.JSON200.ReservedAt.Location())
+	require.NotNil(messageResponse.JSON200.DeliveredAt)
+	assert.Equal(time.UTC, messageResponse.JSON200.DeliveredAt.Location())
+
+	sessionsResponse, err = fixture.client.HTTP.ListWorkspaceAgentSessionsWithResponse(ctx, ws.Id)
+	require.NoError(err)
+	require.Equal(http.StatusOK, sessionsResponse.StatusCode(), string(sessionsResponse.Body))
+	require.NotNil(sessionsResponse.JSON200)
+	require.NotNil(sessionsResponse.JSON200.Sessions)
+	require.Len(*sessionsResponse.JSON200.Sessions, 1)
+	require.NotNil((*sessionsResponse.JSON200.Sessions)[0].InitialMessage)
+	assert.Equal("delivered", (*sessionsResponse.JSON200.Sessions)[0].InitialMessage.State)
+	assert.Equal(int64(11), (*sessionsResponse.JSON200.Sessions)[0].InitialMessage.MessageBytes)
 
 	getResponse, err := fixture.client.HTTP.GetWorkspaceWithResponse(ctx, ws.Id)
 	require.NoError(err)
@@ -83,15 +127,7 @@ func TestWorkspaceAgentActivityFlowsThroughHTTPResponsesE2E(t *testing.T) {
 	require.NotNil(pushResponse.JSON200.AgentState)
 	assert.Equal(generated.Working, *pushResponse.JSON200.AgentState)
 
-	payload, err := json.Marshal(map[string]string{
-		"session_id":      "live-agent",
-		"cwd":             ws.WorktreePath,
-		"hook_event_name": "Stop",
-	})
-	require.NoError(err)
-	require.NoError(store.HandleHook(
-		strings.NewReader(string(payload)), launch.JSON200.Key,
-	))
+	reportHook("codex", "live-agent", launch.JSON200.Key, ws.WorktreePath, "Stop")
 	getResponse, err = fixture.client.HTTP.GetWorkspaceWithResponse(ctx, ws.Id)
 	require.NoError(err)
 	require.Equal(http.StatusOK, getResponse.StatusCode())
@@ -104,8 +140,12 @@ func TestWorkspaceAgentActivityFlowsThroughHTTPResponsesE2E(t *testing.T) {
 	)
 	require.NoError(err)
 	require.Equal(http.StatusNoContent, stopResponse.StatusCode())
-	_, ok := store.SnapshotForWorkspace(ws.WorktreePath, []string{launch.JSON200.Key})
-	assert.False(ok)
+	sessionsResponse, err = fixture.client.HTTP.ListWorkspaceAgentSessionsWithResponse(ctx, ws.Id)
+	require.NoError(err)
+	require.Equal(http.StatusOK, sessionsResponse.StatusCode(), string(sessionsResponse.Body))
+	require.NotNil(sessionsResponse.JSON200)
+	require.NotNil(sessionsResponse.JSON200.Sessions)
+	assert.Empty(*sessionsResponse.JSON200.Sessions)
 
 	getResponse, err = fixture.client.HTTP.GetWorkspaceWithResponse(ctx, ws.Id)
 	require.NoError(err)

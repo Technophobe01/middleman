@@ -30,6 +30,9 @@ Rules:
 - The shell drawer is a singleton per workspace, but a tmux-backed shell should
   survive kenn-forge server restarts until the shell exits or the workspace is
   deleted.
+- Coding-agent session IDs are hook-authoritative and live-only: expose only fresh,
+  supported reports joined by canonical worktree and runtime key to a live `agent`
+  runtime (`internal/server/workspaceapi/agent_sessions.go::Handler.listWorkspaceAgentSessions`).
 
 ## Terminal Transport
 
@@ -196,6 +199,10 @@ still exists.
 - Local-runtime reconnects restore browser-generated cursor-key, mouse, focus,
   and paste DEC modes from session-wide PTY state, not bounded screen replay
   (`internal/workspace/localruntime/manager.go::session.subscribe`).
+- Initial agent handoff requires observed bracketed-paste mode, then sends the
+  opening frame, prompt, closing frame, and Enter in one bounded terminal write.
+  Do not gate Enter on terminal echo: Claude renders pasted input only after the
+  Enter event (`internal/workspace/localruntime/manager.go::session.submitInitialMessage`).
 - Mode transitions precede one session-wide UTF-8-aware VT tail even in the
   alternate screen; retain split-rune introducers and decoded C1 controls/ST
   (`internal/workspace/localruntime/terminal_sequence_tail.go::trailingIncompleteTerminalDataLen`).

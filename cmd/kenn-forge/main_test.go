@@ -145,6 +145,10 @@ func TestRunMainShutdownStopsSignalsBeforeLongCleanup(t *testing.T) {
 			record("notifications")
 			return nil
 		},
+		ShutdownMCPHTTP: func(context.Context) error {
+			record("mcp-http")
+			return nil
+		},
 		ShutdownPrimaryHTTP: func(context.Context) error {
 			record("primary-http")
 			return nil
@@ -160,6 +164,10 @@ func TestRunMainShutdownStopsSignalsBeforeLongCleanup(t *testing.T) {
 			record("telemetry")
 			return nil
 		},
+		CloseMCP: func() error {
+			record("mcp")
+			return nil
+		},
 		CloseDatabase: func() error {
 			record("database")
 			return nil
@@ -170,12 +178,61 @@ func TestRunMainShutdownStopsSignalsBeforeLongCleanup(t *testing.T) {
 	assert.Equal(t, []string{
 		"signals",
 		"notifications",
+		"mcp-http",
 		"primary-http",
 		"syncer",
 		"profiler",
 		"telemetry",
+		"mcp",
 		"database",
 	}, order)
+}
+
+func TestRunMainShutdownBoundsMCPStoreCleanup(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	release := make(chan struct{})
+	databaseClosed := make(chan struct{})
+	done := make(chan []mainShutdownError, 1)
+	go func() {
+		done <- runMainShutdown(ctx, mainShutdownCallbacks{
+			CloseMCP: func() error {
+				<-release
+				return nil
+			},
+			CloseDatabase: func() error {
+				close(databaseClosed)
+				return nil
+			},
+		})
+	}()
+
+	select {
+	case errs := <-done:
+		// The canceled parent context may also record a canceled database
+		// bound even though the database callback ran; only the MCP entry is
+		// required.
+		require.NotEmpty(t, errs)
+		assert.Equal(t, "close MCP temp store", errs[0].message)
+		require.ErrorIs(t, errs[0].err, context.Canceled)
+		for _, shutdownErr := range errs[1:] {
+			assert.Equal(t, "close database", shutdownErr.message)
+			require.ErrorIs(t, shutdownErr.err, context.Canceled)
+		}
+	case <-time.After(100 * time.Millisecond):
+		close(release)
+		<-done
+		require.Fail(t, "MCP temp-store cleanup ignored the shutdown context")
+	}
+
+	// Later cleanup must still run after the MCP cleanup budget expires:
+	// the database closes while the abandoned MCP cleanup stays blocked.
+	select {
+	case <-databaseClosed:
+	case <-time.After(100 * time.Millisecond):
+		require.Fail(t, "database cleanup did not run after MCP cleanup timed out")
+	}
+	close(release)
 }
 
 func TestRunBoundedShutdownHonorsDeadline(t *testing.T) {
@@ -188,6 +245,107 @@ func TestRunBoundedShutdownHonorsDeadline(t *testing.T) {
 	})
 
 	require.ErrorIs(t, err, context.DeadlineExceeded)
+}
+
+func TestMCPStartupHandlerStaysUnavailableUntilFullServerSwap(t *testing.T) {
+	switcher := server.NewSwitchHandler(newMCPStartupHandler())
+	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8092/mcp", nil)
+	startup := httptest.NewRecorder()
+
+	switcher.ServeHTTP(startup, request)
+
+	assert.Equal(t, http.StatusServiceUnavailable, startup.Code)
+	switcher.Swap(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	ready := httptest.NewRecorder()
+	switcher.ServeHTTP(ready, request)
+	assert.Equal(t, http.StatusNoContent, ready.Code)
+}
+
+func TestBindDaemonListenersOwnsOptionalMCPPortAndClosesPrimaryOnFailure(t *testing.T) {
+	primaryPort, defaultMCPPort := reserveAdjacentPorts(t)
+	explicitMCPPort := reserveFreePort(t)
+	for explicitMCPPort == primaryPort || explicitMCPPort == defaultMCPPort {
+		explicitMCPPort = reserveFreePort(t)
+	}
+
+	tests := []struct {
+		name        string
+		mcp         config.MCP
+		occupiedMCP bool
+		wantMCPPort int
+		wantErr     string
+	}{
+		{name: "disabled"},
+		{
+			name: "default next port", mcp: config.MCP{Enabled: true},
+			wantMCPPort: defaultMCPPort,
+		},
+		{
+			name: "explicit port", mcp: config.MCP{Enabled: true, Port: explicitMCPPort},
+			wantMCPPort: explicitMCPPort,
+		},
+		{
+			name: "occupied port", mcp: config.MCP{Enabled: true, Port: explicitMCPPort},
+			occupiedMCP: true, wantErr: "MCP",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var occupied net.Listener
+			if tt.occupiedMCP {
+				var err error
+				occupied, err = net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(explicitMCPPort)))
+				require.NoError(t, err)
+				defer occupied.Close()
+			}
+			cfg := &config.Config{Host: "127.0.0.1", Port: primaryPort, MCP: tt.mcp}
+
+			primary, mcpListener, err := bindDaemonListeners(cfg)
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+				probe, listenErr := net.Listen("tcp", cfg.ListenAddr())
+				require.NoError(t, listenErr, "primary listener must close after MCP bind failure")
+				require.NoError(t, probe.Close())
+				return
+			}
+			require.NoError(t, err)
+			t.Cleanup(func() {
+				require.NoError(t, primary.Close())
+				if mcpListener != nil {
+					require.NoError(t, mcpListener.Close())
+				}
+			})
+			if tt.wantMCPPort == 0 {
+				assert.Nil(t, mcpListener)
+				return
+			}
+			require.NotNil(t, mcpListener)
+			_, portText, splitErr := net.SplitHostPort(mcpListener.Addr().String())
+			require.NoError(t, splitErr)
+			assert.Equal(t, strconv.Itoa(tt.wantMCPPort), portText)
+		})
+	}
+}
+
+func reserveAdjacentPorts(t *testing.T) (int, int) {
+	t.Helper()
+	for range 100 {
+		primary := reserveFreePort(t)
+		if primary >= 65535 {
+			continue
+		}
+		next, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(primary+1)))
+		if err != nil {
+			continue
+		}
+		require.NoError(t, next.Close())
+		return primary, primary + 1
+	}
+	require.FailNow(t, "could not reserve adjacent loopback ports")
+	return 0, 0
 }
 
 func TestRunClosesPrimaryListenerWhenProfilerStartFails(t *testing.T) {
@@ -907,6 +1065,7 @@ func TestRootHelpListsEveryPublicCommandWithoutStartingServer(t *testing.T) {
 	} {
 		assert.Contains(stdout.String(), name)
 	}
+	assert.NotContains(stdout.String(), "mcp")
 	assert.NotContains(stdout.String(), "pty-owner")
 	assert.NotContains(stdout.String(), "completion")
 	assert.False(started)

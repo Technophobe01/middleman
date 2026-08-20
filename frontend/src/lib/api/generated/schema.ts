@@ -4334,6 +4334,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/workspaces/{id}/agent-sessions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List live coding sessions */
+        get: operations["list-workspace-agent-sessions"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/workspaces/{id}/commits": {
         parameters: {
             query?: never;
@@ -4608,6 +4625,24 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/workspaces/{id}/runtime/sessions/{session_key}/initial-message": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get initial agent message status */
+        get: operations["get-workspace-runtime-session-initial-message"];
+        put?: never;
+        /** Submit initial agent message */
+        post: operations["submit-workspace-runtime-session-initial-message"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/worktrees/remove-stale": {
         parameters: {
             query?: never;
@@ -4771,6 +4806,23 @@ export interface components {
         AgentHookSpecificOutput: {
             additionalContext: string;
             hookEventName: string;
+        };
+        AgentInitialMessageStatusResponse: {
+            /**
+             * Format: uri
+             * @description A URL to the JSON Schema for this object.
+             * @example /api/v1/schemas/AgentInitialMessageStatusResponse.json
+             */
+            readonly $schema?: string;
+            agent: string;
+            /** Format: date-time */
+            delivered_at?: string;
+            /** Format: int64 */
+            message_bytes: number;
+            /** Format: date-time */
+            reserved_at: string;
+            session_id: string;
+            state: string;
         };
         ApplyReviewSuggestionHostInputBody: {
             /**
@@ -5229,6 +5281,7 @@ export interface components {
             git_head_ref?: string;
             reuse_existing_branch?: boolean;
             reuse_existing_directory?: boolean;
+            suppress_auto_assign?: boolean;
         };
         CreateIssueWorkspaceInputBody: {
             /**
@@ -5240,6 +5293,7 @@ export interface components {
             git_head_ref?: string;
             reuse_existing_branch?: boolean;
             reuse_existing_directory?: boolean;
+            suppress_auto_assign?: boolean;
         };
         CreateWorkspaceInputBody: {
             /**
@@ -5254,6 +5308,7 @@ export interface components {
             owner: string;
             platform_host: string;
             provider: string;
+            suppress_auto_assign?: boolean;
         };
         CreateWorktreeFromMergeRequestInputBody: {
             /**
@@ -6336,6 +6391,15 @@ export interface components {
             readonly $schema?: string;
             repositories: components["schemas"]["UserRepository"][] | null;
         };
+        ListWorkspaceAgentSessionsOutputBody: {
+            /**
+             * Format: uri
+             * @description A URL to the JSON Schema for this object.
+             * @example /api/v1/schemas/ListWorkspaceAgentSessionsOutputBody.json
+             */
+            readonly $schema?: string;
+            sessions: components["schemas"]["WorkspaceAgentSessionResponse"][] | null;
+        };
         ListWorkspacesOutputBody: {
             /**
              * Format: uri
@@ -6772,7 +6836,7 @@ export interface components {
              * @example badRequest
              * @enum {string}
              */
-            code: "badRequest" | "branchConflict" | "branchInUse" | "branchProtected" | "commentNotFound" | "conflict" | "destinationExists" | "forbidden" | "hookFailed" | "internalError" | "issueNotFound" | "mutationOutcomeUnknown" | "notFound" | "payloadTooLarge" | "projectNotFound" | "pullNotFound" | "rateLimited" | "repoNotFound" | "resyncRequired" | "serviceUnavailable" | "settingsUnavailable" | "toolMissing" | "toolUnauthenticated" | "unauthorized" | "unsupportedCapability" | "upstreamError" | "validationError" | "workspaceDeletionInProgress" | "workspaceDirectoryNotReusable" | "workspaceNotFound" | "workspaceSetupInProgress" | "worktreeDirty";
+            code: "badRequest" | "branchConflict" | "branchInUse" | "branchProtected" | "commentNotFound" | "conflict" | "destinationExists" | "forbidden" | "hookFailed" | "internalError" | "issueNotFound" | "mutationOutcomeUnknown" | "notFound" | "payloadTooLarge" | "projectNotFound" | "pullNotFound" | "rateLimited" | "repoNotFound" | "resyncRequired" | "serviceUnavailable" | "settingsUnavailable" | "toolMissing" | "toolUnauthenticated" | "unauthorized" | "unsupportedCapability" | "upstreamError" | "validationError" | "workspaceAlreadyExists" | "workspaceDeletionInProgress" | "workspaceDirectoryNotReusable" | "workspaceNotFound" | "workspaceSetupInProgress" | "worktreeDirty";
             /**
              * @description A human-readable explanation specific to this occurrence of the problem.
              * @example Property foo is required but is missing.
@@ -7854,6 +7918,17 @@ export interface components {
             platform_host: string;
             provider: string;
         };
+        SubmitInitialMessageInputBody: {
+            /**
+             * Format: uri
+             * @description A URL to the JSON Schema for this object.
+             * @example /api/v1/schemas/SubmitInitialMessageInputBody.json
+             */
+            readonly $schema?: string;
+            agent: string;
+            message: string;
+            session_id: string;
+        };
         SyncStatus: {
             /**
              * Format: uri
@@ -8053,6 +8128,16 @@ export interface components {
             repo_name: string;
             repo_owner: string;
             workspace?: components["schemas"]["WorkspaceRef"];
+        };
+        WorkspaceAgentSessionResponse: {
+            agent: string;
+            initial_message?: components["schemas"]["AgentInitialMessageStatusResponse"];
+            runtime_session_key: string;
+            session_id: string;
+            state: string;
+            target_key: string;
+            /** Format: date-time */
+            updated_at: string;
         };
         WorkspaceDiffWatchResponse: {
             /**
@@ -18278,6 +18363,37 @@ export interface operations {
             };
         };
     };
+    "list-workspace-agent-sessions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ListWorkspaceAgentSessionsOutputBody"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemError"];
+                };
+            };
+        };
+    };
     "get-workspace-commits": {
         parameters: {
             query?: never;
@@ -18892,6 +19008,74 @@ export interface operations {
             };
         };
     };
+    "get-workspace-runtime-session-initial-message": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+                session_key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentInitialMessageStatusResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemError"];
+                };
+            };
+        };
+    };
+    "submit-workspace-runtime-session-initial-message": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+                session_key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SubmitInitialMessageInputBody"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentInitialMessageStatusResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemError"];
+                };
+            };
+        };
+    };
     "remove-stale-worktree": {
         parameters: {
             query?: never;
@@ -18972,7 +19156,7 @@ export const mergeRequestKanbanStatusValues: ReadonlyArray<FlattenedDeepRequired
 export const mergeRequestStateValues: ReadonlyArray<FlattenedDeepRequired<components>["schemas"]["MergeRequest"]["State"]> = ["open", "closed", "merged"];
 export const mergeRequestResponseKanbanStatusValues: ReadonlyArray<FlattenedDeepRequired<components>["schemas"]["MergeRequestResponse"]["KanbanStatus"]> = ["new", "reviewing", "waiting", "awaiting_merge"];
 export const mergeRequestResponseStateValues: ReadonlyArray<FlattenedDeepRequired<components>["schemas"]["MergeRequestResponse"]["State"]> = ["open", "closed", "merged"];
-export const problemErrorCodeValues: ReadonlyArray<FlattenedDeepRequired<components>["schemas"]["ProblemError"]["code"]> = ["badRequest", "branchConflict", "branchInUse", "branchProtected", "commentNotFound", "conflict", "destinationExists", "forbidden", "hookFailed", "internalError", "issueNotFound", "mutationOutcomeUnknown", "notFound", "payloadTooLarge", "projectNotFound", "pullNotFound", "rateLimited", "repoNotFound", "resyncRequired", "serviceUnavailable", "settingsUnavailable", "toolMissing", "toolUnauthenticated", "unauthorized", "unsupportedCapability", "upstreamError", "validationError", "workspaceDeletionInProgress", "workspaceDirectoryNotReusable", "workspaceNotFound", "workspaceSetupInProgress", "worktreeDirty"];
+export const problemErrorCodeValues: ReadonlyArray<FlattenedDeepRequired<components>["schemas"]["ProblemError"]["code"]> = ["badRequest", "branchConflict", "branchInUse", "branchProtected", "commentNotFound", "conflict", "destinationExists", "forbidden", "hookFailed", "internalError", "issueNotFound", "mutationOutcomeUnknown", "notFound", "payloadTooLarge", "projectNotFound", "pullNotFound", "rateLimited", "repoNotFound", "resyncRequired", "serviceUnavailable", "settingsUnavailable", "toolMissing", "toolUnauthenticated", "unauthorized", "unsupportedCapability", "upstreamError", "validationError", "workspaceAlreadyExists", "workspaceDeletionInProgress", "workspaceDirectoryNotReusable", "workspaceNotFound", "workspaceSetupInProgress", "worktreeDirty"];
 export const syncStatusLast_error_codeValues: ReadonlyArray<FlattenedDeepRequired<components>["schemas"]["SyncStatus"]["last_error_code"]> = ["localSyncCeilingExhausted"];
 export const workflowStateMetaResponseStatusValues: ReadonlyArray<FlattenedDeepRequired<components>["schemas"]["WorkflowStateMetaResponse"]["status"]> = ["new", "reviewing", "waiting", "awaiting_merge"];
 export const workspaceResponseAgent_stateValues: ReadonlyArray<FlattenedDeepRequired<components>["schemas"]["WorkspaceResponse"]["agent_state"]> = ["idle", "working", "input", "approval", "done"];

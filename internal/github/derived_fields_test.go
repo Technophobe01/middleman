@@ -84,8 +84,9 @@ func TestCarryMergeRequestDerivedFieldsPersistence(t *testing.T) {
 	}
 
 	t.Run("missing stored row is a no-op", func(t *testing.T) {
+		assert := assert.New(t)
 		normalized := db.MergeRequest{State: db.MergeRequestStateClosed}
 		CarryMergeRequestDerivedFields(&normalized, nil)
-		assert.Zero(t, normalized.CommentCount)
+		assert.Zero(normalized.CommentCount)
 	})
 }

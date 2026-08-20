@@ -15,6 +15,8 @@ const (
 	ItemTypeIssue = "issue"
 )
 
+var ErrInvalidWorkflowCursor = errors.New("invalid workflow cursor")
+
 func validateItemWorkflowType(itemType string) error {
 	switch itemType {
 	case ItemTypePR, ItemTypeIssue:
@@ -92,22 +94,22 @@ func (d *DB) EnsureItemWorkflowState(
 func (d *DB) SetItemWorkflowState(
 	ctx context.Context,
 	p SetItemWorkflowStateParams,
-) (string, error) {
+) (SetItemWorkflowStateResult, error) {
 	if err := validateItemWorkflowType(p.ItemType); err != nil {
-		return "", err
+		return SetItemWorkflowStateResult{}, err
 	}
 	if err := validateItemWorkflowStatus(p.Status); err != nil {
-		return "", err
+		return SetItemWorkflowStateResult{}, err
 	}
 	if p.ExpectedStatus != "" {
 		if err := validateItemWorkflowStatus(p.ExpectedStatus); err != nil {
-			return "", err
+			return SetItemWorkflowStateResult{}, err
 		}
 	}
 
 	tx, err := d.rw.BeginTx(ctx, nil)
 	if err != nil {
-		return "", fmt.Errorf("set item workflow state: begin: %w", err)
+		return SetItemWorkflowStateResult{}, fmt.Errorf("set item workflow state: begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
@@ -119,16 +121,17 @@ func (d *DB) SetItemWorkflowState(
 		p.RepoID, p.ItemType, p.ItemNumber,
 	).Scan(&current)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return "", fmt.Errorf("set item workflow state: read current: %w", err)
+		return SetItemWorkflowStateResult{}, fmt.Errorf("set item workflow state: read current: %w", err)
 	}
 	if p.ExpectedStatus != "" && p.ExpectedStatus != current {
-		return "", &WorkflowStateConflictError{
+		return SetItemWorkflowStateResult{}, &WorkflowStateConflictError{
 			Expected: p.ExpectedStatus,
 			Current:  current,
 		}
 	}
 
-	_, err = tx.ExecContext(ctx,
+	var stored ItemWorkflowState
+	err = tx.QueryRowContext(ctx,
 		`INSERT INTO forge_item_workflow_state (
 		     repo_id, item_type, item_number, status, updated_at,
 		     updated_source, updated_actor, updated_reason
@@ -139,7 +142,9 @@ func (d *DB) SetItemWorkflowState(
 		     updated_at = excluded.updated_at,
 		     updated_source = excluded.updated_source,
 		     updated_actor = excluded.updated_actor,
-		     updated_reason = excluded.updated_reason`,
+		     updated_reason = excluded.updated_reason
+		 RETURNING repo_id, item_type, item_number, status, updated_at,
+		           updated_source, updated_actor, updated_reason`,
 		p.RepoID,
 		p.ItemType,
 		p.ItemNumber,
@@ -147,14 +152,23 @@ func (d *DB) SetItemWorkflowState(
 		p.Source,
 		p.Actor,
 		p.Reason,
+	).Scan(
+		&stored.RepoID,
+		&stored.ItemType,
+		&stored.ItemNumber,
+		&stored.Status,
+		&stored.UpdatedAt,
+		&stored.UpdatedSource,
+		&stored.UpdatedActor,
+		&stored.UpdatedReason,
 	)
 	if err != nil {
-		return "", fmt.Errorf("set item workflow state: upsert: %w", err)
+		return SetItemWorkflowStateResult{}, fmt.Errorf("set item workflow state: upsert: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
-		return "", fmt.Errorf("set item workflow state: commit: %w", err)
+		return SetItemWorkflowStateResult{}, fmt.Errorf("set item workflow state: commit: %w", err)
 	}
-	return current, nil
+	return SetItemWorkflowStateResult{PreviousStatus: current, State: stored}, nil
 }
 
 type workflowCursor struct {
@@ -185,15 +199,15 @@ func encodeWorkflowCursor(row WorkflowStateListRow, sortKey, activityKey string)
 func decodeWorkflowCursor(cursor string) (workflowCursor, error) {
 	raw, err := base64.RawURLEncoding.DecodeString(cursor)
 	if err != nil {
-		return workflowCursor{}, fmt.Errorf("invalid cursor: %w", err)
+		return workflowCursor{}, fmt.Errorf("%w: base64: %v", ErrInvalidWorkflowCursor, err)
 	}
 	parts := strings.Split(string(raw), "\x1f")
 	if len(parts) != 8 {
-		return workflowCursor{}, errors.New("invalid cursor")
+		return workflowCursor{}, ErrInvalidWorkflowCursor
 	}
 	number, err := strconv.Atoi(parts[7])
 	if err != nil {
-		return workflowCursor{}, fmt.Errorf("invalid cursor number: %w", err)
+		return workflowCursor{}, fmt.Errorf("%w: number: %v", ErrInvalidWorkflowCursor, err)
 	}
 	return workflowCursor{
 		sortKey:     parts[0],
@@ -225,6 +239,13 @@ func workflowListLimit(limit int) int {
 	}
 }
 
+func workflowWhereClause(conditions []string) string {
+	if len(conditions) == 0 {
+		return ""
+	}
+	return "WHERE " + strings.Join(conditions, " AND ")
+}
+
 func (d *DB) ListItemWorkflowStates(
 	ctx context.Context,
 	opts ListWorkflowStatesOpts,
@@ -232,15 +253,33 @@ func (d *DB) ListItemWorkflowStates(
 	limit := workflowListLimit(opts.Limit)
 
 	prArgs := []any{}
-	prWhere := ""
+	var prConds []string
 	if cond := repoListFilterCondition("r", opts.RepoFilters, &prArgs); cond != "" {
-		prWhere = "WHERE " + cond
+		prConds = append(prConds, cond)
 	}
 	issueArgs := []any{}
-	issueWhere := ""
+	var issueConds []string
 	if cond := repoListFilterCondition("r", opts.RepoFilters, &issueArgs); cond != "" {
-		issueWhere = "WHERE " + cond
+		issueConds = append(issueConds, cond)
 	}
+	if opts.ExcludeRemovedUpstream {
+		prConds = append(prConds, `NOT EXISTS (
+			SELECT 1 FROM forge_archive_items ai
+			WHERE ai.repo_id = p.repo_id
+			  AND ai.item_type = 'merge_request'
+			  AND ai.item_number = p.number
+			  AND ai.lifecycle_state = 'removed_upstream'
+		)`)
+		issueConds = append(issueConds, `NOT EXISTS (
+			SELECT 1 FROM forge_archive_items ai
+			WHERE ai.repo_id = i.repo_id
+			  AND ai.item_type = 'issue'
+			  AND ai.item_number = i.number
+			  AND ai.lifecycle_state = 'removed_upstream'
+		)`)
+	}
+	prWhere := workflowWhereClause(prConds)
+	issueWhere := workflowWhereClause(issueConds)
 
 	args := make([]any, 0, len(prArgs)+len(issueArgs)+len(opts.ItemTypes)+len(opts.States)+16)
 	args = append(args, prArgs...)
@@ -298,13 +337,13 @@ func (d *DB) ListItemWorkflowStates(
 	args = append(args, limit+1)
 
 	query := fmt.Sprintf(`
-		SELECT t.platform, t.platform_host, t.owner, t.name, t.repo_path,
+		SELECT t.platform, t.platform_host, t.platform_repo_id, t.owner, t.name, t.repo_path,
 		       t.item_type, t.number, t.title, t.state, t.url, t.author,
 		       t.is_draft, t.last_activity_at, t.status, t.has_row,
 		       t.updated_at, t.updated_source, t.updated_actor,
 		       t.updated_reason, t.sort_key, t.activity_key
 		FROM (
-		    SELECT r.platform, r.platform_host, r.owner, r.name,
+		    SELECT r.platform, r.platform_host, r.platform_repo_id, r.owner, r.name,
 		           COALESCE(NULLIF(r.repo_path, ''), r.owner || '/' || r.name) AS repo_path,
 		           'pr' AS item_type, p.number, p.title, p.state, p.url, p.author,
 		           p.is_draft, p.last_activity_at,
@@ -321,7 +360,7 @@ func (d *DB) ListItemWorkflowStates(
 		        ON w.repo_id = p.repo_id AND w.item_type = 'pr' AND w.item_number = p.number
 		    %s
 		    UNION ALL
-		    SELECT r.platform, r.platform_host, r.owner, r.name,
+		    SELECT r.platform, r.platform_host, r.platform_repo_id, r.owner, r.name,
 		           COALESCE(NULLIF(r.repo_path, ''), r.owner || '/' || r.name) AS repo_path,
 		           'issue' AS item_type, i.number, i.title, i.state, i.url, i.author,
 		           0 AS is_draft, i.last_activity_at,
@@ -364,6 +403,7 @@ func (d *DB) ListItemWorkflowStates(
 		if err := rows.Scan(
 			&row.Platform,
 			&row.PlatformHost,
+			&row.PlatformRepoID,
 			&row.Owner,
 			&row.Name,
 			&row.RepoPath,

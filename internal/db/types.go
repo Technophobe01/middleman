@@ -781,6 +781,11 @@ type ItemWorkflowState struct {
 	UpdatedReason string
 }
 
+type SetItemWorkflowStateResult struct {
+	PreviousStatus string
+	State          ItemWorkflowState
+}
+
 // WorkflowStateConflictError reports an expected-status mismatch on a
 // conditional workflow-state write. Current is the effective status at
 // write time; a missing row reads as "new".
@@ -805,17 +810,19 @@ type SetItemWorkflowStateParams struct {
 }
 
 type ListWorkflowStatesOpts struct {
-	RepoFilters   []RepoFilter
-	ItemTypes     []string
-	States        []string
-	IncludeClosed bool
-	Limit         int
-	Cursor        string
+	RepoFilters            []RepoFilter
+	ItemTypes              []string
+	States                 []string
+	IncludeClosed          bool
+	ExcludeRemovedUpstream bool
+	Limit                  int
+	Cursor                 string
 }
 
 type WorkflowStateListRow struct {
 	Platform       string
 	PlatformHost   string
+	PlatformRepoID string
 	Owner          string
 	Name           string
 	RepoPath       string
@@ -889,11 +896,12 @@ type RepoViewerLogin struct {
 }
 
 type RepoFilter struct {
-	Platform     string
-	PlatformHost string
-	RepoOwner    string
-	RepoName     string
-	RepoPath     string
+	Platform       string
+	PlatformHost   string
+	PlatformRepoID string
+	RepoOwner      string
+	RepoName       string
+	RepoPath       string
 }
 
 type Issue struct {

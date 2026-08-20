@@ -35,7 +35,6 @@ func newRootCommand(opts cliOptions) *cobra.Command {
 	if opts.DaemonRunner == nil {
 		opts.DaemonRunner = newDaemonLifecycle(defaultDaemonLifecycleDeps())
 	}
-
 	root := &cobra.Command{
 		Use:               "kenn-forge",
 		Short:             "Local-first maintainer console",

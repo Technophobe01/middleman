@@ -57,6 +57,77 @@ func roundTripConfigString(t *testing.T, content string) (*Config, *Config) {
 	return cfg, cfg2
 }
 
+func TestMCPConfigDefaultsToBackendPortPlusOne(t *testing.T) {
+	cfg, err := Load(writeConfig(t, "host = \"127.0.0.1\"\nport = 8091\n[mcp]\nenabled = true\n"))
+	require.NoError(t, err)
+	assert.Equal(t, 8092, cfg.MCPPort())
+	assert.Equal(t, "127.0.0.1:8092", cfg.MCPListenAddr())
+	assert.Equal(t, int64(128<<20), cfg.MCPDiffCacheBytes())
+}
+
+func TestMCPConfigRoundTrip(t *testing.T) {
+	cfg, err := Load(writeConfig(t, ""))
+	require.NoError(t, err)
+	cfg.MCP = MCP{Enabled: true, Port: 9192, DiffCacheMB: 256}
+	path := filepath.Join(t.TempDir(), "config.toml")
+	require.NoError(t, cfg.Save(path))
+	reloaded, err := Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, MCP{Enabled: true, Port: 9192, DiffCacheMB: 256}, reloaded.MCP)
+}
+
+func TestMCPConfigValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		wantErr string
+	}{
+		{
+			name:    "default port overflows",
+			content: "host = \"127.0.0.1\"\nport = 65535\n[mcp]\nenabled = true\n",
+			wantErr: "MCP port",
+		},
+		{
+			name:    "matches backend port",
+			content: "host = \"127.0.0.1\"\nport = 8091\n[mcp]\nenabled = true\nport = 8091\n",
+			wantErr: "MCP port",
+		},
+		{
+			name:    "explicit port below range",
+			content: "host = \"127.0.0.1\"\nport = 8091\n[mcp]\nenabled = true\nport = -1\n",
+			wantErr: "MCP port",
+		},
+		{
+			name:    "explicit port above range",
+			content: "host = \"127.0.0.1\"\nport = 8091\n[mcp]\nenabled = true\nport = 65536\n",
+			wantErr: "MCP port",
+		},
+		{
+			name:    "non-loopback host",
+			content: "host = \"192.0.2.10\"\nport = 8091\n[mcp]\nenabled = true\n",
+			wantErr: "loopback",
+		},
+		{
+			name:    "negative diff cache",
+			content: "host = \"127.0.0.1\"\nport = 8091\n[mcp]\nenabled = true\ndiff_cache_mb = -1\n",
+			wantErr: "diff cache",
+		},
+		{
+			name:    "diff cache byte conversion overflows",
+			content: "host = \"127.0.0.1\"\nport = 8091\n[mcp]\nenabled = true\ndiff_cache_mb = 8796093022208\n",
+			wantErr: "diff cache",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, tt.content))
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.wantErr)
+		})
+	}
+}
+
 func setFakeGHCLI(t *testing.T, stdout string) {
 	t.Helper()
 	setFakeGHCLIScript(t, fakeGHCLIOptions{Stdout: stdout})
