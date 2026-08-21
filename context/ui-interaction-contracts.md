@@ -203,6 +203,18 @@ Persisted controls must state their scope clearly.
 - `Involves me` is three independent browser-local preferences for Pulls, Issues, and
   Activity; each enabled view sends the server query so filtering happens before limits,
   never through URL or config state (`frontend/src/lib/stores/involves-me-filter.ts`, `internal/db/queries_involvement.go`).
+- `Referenced by PR` is a browser-local Issues preference. Every issue-filter
+  presentation exposes the same control, and the server combines it with state,
+  repository, search, starred, and involvement filters before limits.
+  (`frontend/src/lib/stores/issues.svelte.ts::createIssuesStore`)
+- `Referenced by PR` defaults off. Issue visibility reset clears it, and the
+  compact `Reset view` action restores it with the other menu defaults.
+  (`frontend/src/lib/components/sidebar/IssueList.svelte::resetVisibility`)
+- `Referenced by PR` is available when any configured provider-host can supply
+  reference edges. Active repository selections do not hide it. Issues with no
+  edge do not match, and edges never cross provider-host boundaries. The graph
+  has no separate badge or detail UI.
+  (`frontend/src/lib/app-stores.svelte.ts::createAppStores`)
 - Named repository preset definitions follow server settings, while the active
   repository selection and preset affinity remain browser-local; `Global` clears both
   (`frontend/src/lib/stores/filter.svelte.ts::setGlobalRepoPresetSelection`).
