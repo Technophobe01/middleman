@@ -8216,7 +8216,7 @@ export interface components {
             /** @description Oldest successful refresh time across the populated enrichment components. */
             enrichment_refreshed_at?: string;
             /**
-             * @description Aggregate git-divergence and tmux-activity reconciliation status. Failed responses retain last-known-good component fields when available.
+             * @description Aggregate git-state and tmux-activity reconciliation status. Failed responses retain last-known-good component fields when available.
              * @enum {string}
              */
             enrichment_status: "not_applicable" | "pending" | "fresh" | "stale" | "failed";
@@ -8253,6 +8253,8 @@ export interface components {
             tmux_pane_title?: string;
             tmux_session: string;
             tmux_working: boolean;
+            /** @description True when the worktree has staged, unstaged, or untracked changes; false when clean; omitted until git-state enrichment completes. */
+            worktree_dirty?: boolean;
             worktree_path: string;
         };
         WorkspaceRuntimeResponse: {

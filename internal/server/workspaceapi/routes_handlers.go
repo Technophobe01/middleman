@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"slices"
@@ -19,6 +20,7 @@ import (
 	"go.kenn.io/forge/internal/tokenauth"
 	"go.kenn.io/forge/internal/workspace"
 	"go.kenn.io/forge/internal/workspace/localruntime"
+	gitcmd "go.kenn.io/kit/git/cmd"
 )
 
 type createWorkspaceInput struct {
@@ -1888,6 +1890,8 @@ func (s *Handler) workspaceResponseWithEnrichment(
 	}
 
 	divergenceErr := applyWorktreeDivergence(ctx, &resp, summary.WorktreePath)
+	dirtyErr := applyWorktreeDirty(ctx, &resp, summary.WorktreePath)
+	gitStateErr := errors.Join(divergenceErr, dirtyErr)
 	sessions, sessionsErr := s.workspaceTmuxActivitySessions(ctx, summary)
 	activity, hasActivity, activityErr := s.probeWorkspaceTmuxActivity(
 		ctx, summary, sessions,
@@ -1895,12 +1899,12 @@ func (s *Handler) workspaceResponseWithEnrichment(
 	if hasActivity {
 		applyTmuxActivity(&resp, activity)
 	}
-	err := errors.Join(divergenceErr, sessionsErr, activityErr)
+	err := errors.Join(gitStateErr, sessionsErr, activityErr)
 	result := workspaceEnrichmentProbeResult{
 		response:           resp,
-		divergenceComplete: divergenceErr == nil,
+		divergenceComplete: gitStateErr == nil,
 		tmuxComplete:       sessionsErr == nil && activityErr == nil,
-		divergenceErr:      divergenceErr,
+		divergenceErr:      gitStateErr,
 		tmuxErr:            errors.Join(sessionsErr, activityErr),
 		err:                err,
 	}
@@ -2133,6 +2137,53 @@ func applyWorktreeDivergence(
 	resp.CommitsAhead = &ahead
 	resp.CommitsBehind = &behind
 	return nil
+}
+
+func applyWorktreeDirty(
+	ctx context.Context,
+	resp *workspaceResponse,
+	worktreePath string,
+) error {
+	if worktreePath == "" {
+		return nil
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, worktreeDivergenceTimeout)
+	defer cancel()
+
+	dirty, err := readOnlyWorktreeIsDirty(probeCtx, worktreePath)
+	if err != nil {
+		slog.Debug(
+			"worktree dirty-state probe failed",
+			"workspace_id", resp.ID,
+			"path", worktreePath,
+			"err", err,
+		)
+		return err
+	}
+	resp.WorktreeDirty = &dirty
+	return nil
+}
+
+func readOnlyWorktreeIsDirty(ctx context.Context, worktreePath string) (bool, error) {
+	stdout, stderr, err := gitcmd.New().Run(
+		ctx,
+		worktreePath,
+		nil,
+		"--no-optional-locks",
+		"status",
+		"--porcelain",
+		"--untracked-files=all",
+		"--ignore-submodules=none",
+	)
+	if err != nil {
+		out := append(stdout, stderr...)
+		return false, fmt.Errorf(
+			"check worktree dirty state: %w: %s",
+			err,
+			strings.TrimSpace(string(out)),
+		)
+	}
+	return strings.TrimSpace(string(stdout)) != "", nil
 }
 
 func isWorkingTmuxTitle(title string) bool {

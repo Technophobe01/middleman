@@ -50,6 +50,32 @@ func runGit(t *testing.T, dir string, args ...string) {
 	require.NoError(t, err, "git %v failed: %s", args, stderr)
 }
 
+func TestApplyWorktreeDirtyDoesNotWriteTheGitIndex(t *testing.T) {
+	require := require.New(t)
+	dir := t.TempDir()
+
+	runGit(t, dir, "init", "--initial-branch=main", ".")
+	runGit(t, dir, "config", "user.email", "test@example.com")
+	runGit(t, dir, "config", "user.name", "Test")
+	trackedPath := filepath.Join(dir, "tracked.txt")
+	require.NoError(os.WriteFile(trackedPath, []byte("base\n"), 0o644))
+	runGit(t, dir, "add", "tracked.txt")
+	runGit(t, dir, "commit", "-m", "base")
+	indexPath := filepath.Join(dir, ".git", "index")
+	indexBefore, err := os.ReadFile(indexPath)
+	require.NoError(err)
+	future := time.Now().Add(2 * time.Hour)
+	require.NoError(os.Chtimes(trackedPath, future, future))
+
+	var resp workspaceResponse
+	require.NoError(applyWorktreeDirty(t.Context(), &resp, dir))
+	require.NotNil(resp.WorktreeDirty)
+	require.False(*resp.WorktreeDirty)
+	indexAfter, err := os.ReadFile(indexPath)
+	require.NoError(err)
+	require.Equal(indexBefore, indexAfter)
+}
+
 func TestFormatAgentActivityUpdatedAtPreservesSubsecondPrecision(t *testing.T) {
 	t.Parallel()
 	updatedAt := time.Date(2026, 7, 28, 12, 0, 0, 123456789, time.UTC)
@@ -796,6 +822,8 @@ func TestWorkspaceEnrichmentBroadcastsOnlyDurableChanges(t *testing.T) {
 	}
 	ahead := 1
 	behind := 0
+	clean := false
+	dirty := true
 	title := "pane"
 	record := func(result workspaceEnrichmentProbeResult) bool {
 		_, recorded, changed := srv.recordWorkspaceEnrichmentResult("ws-1", 1, result)
@@ -805,7 +833,7 @@ func TestWorkspaceEnrichmentBroadcastsOnlyDurableChanges(t *testing.T) {
 
 	// First completion is the pending -> fresh transition clients wait on.
 	assert.True(record(workspaceEnrichmentProbeResult{
-		response:           workspaceResponse{CommitsAhead: &ahead, CommitsBehind: &behind, TmuxPaneTitle: &title},
+		response:           workspaceResponse{CommitsAhead: &ahead, CommitsBehind: &behind, WorktreeDirty: &clean, TmuxPaneTitle: &title},
 		divergenceComplete: true,
 		tmuxComplete:       true,
 	}))
@@ -817,6 +845,7 @@ func TestWorkspaceEnrichmentBroadcastsOnlyDurableChanges(t *testing.T) {
 		response: workspaceResponse{
 			CommitsAhead:  &ahead,
 			CommitsBehind: &behind,
+			WorktreeDirty: &clean,
 			TmuxPaneTitle: &spinnerTitle,
 			TmuxWorking:   true,
 		},
@@ -827,7 +856,14 @@ func TestWorkspaceEnrichmentBroadcastsOnlyDurableChanges(t *testing.T) {
 	// Divergence movement notifies.
 	newBehind := 3
 	assert.True(record(workspaceEnrichmentProbeResult{
-		response:           workspaceResponse{CommitsAhead: &ahead, CommitsBehind: &newBehind, TmuxPaneTitle: &spinnerTitle},
+		response:           workspaceResponse{CommitsAhead: &ahead, CommitsBehind: &newBehind, WorktreeDirty: &clean, TmuxPaneTitle: &spinnerTitle},
+		divergenceComplete: true,
+		tmuxComplete:       true,
+	}))
+
+	// Worktree cleanliness movement notifies.
+	assert.True(record(workspaceEnrichmentProbeResult{
+		response:           workspaceResponse{CommitsAhead: &ahead, CommitsBehind: &newBehind, WorktreeDirty: &dirty, TmuxPaneTitle: &spinnerTitle},
 		divergenceComplete: true,
 		tmuxComplete:       true,
 	}))
@@ -844,7 +880,7 @@ func TestWorkspaceEnrichmentBroadcastsOnlyDurableChanges(t *testing.T) {
 
 	// Recovery notifies.
 	assert.True(record(workspaceEnrichmentProbeResult{
-		response:           workspaceResponse{CommitsAhead: &ahead, CommitsBehind: &newBehind, TmuxPaneTitle: &spinnerTitle},
+		response:           workspaceResponse{CommitsAhead: &ahead, CommitsBehind: &newBehind, WorktreeDirty: &dirty, TmuxPaneTitle: &spinnerTitle},
 		divergenceComplete: true,
 		tmuxComplete:       true,
 	}))
