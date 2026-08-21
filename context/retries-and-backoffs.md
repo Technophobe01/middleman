@@ -137,6 +137,14 @@ Reach for a shared slot whenever multiple in-process call sites
 hit the same upstream resource. Prefer dedup over retry — it removes
 the cause, retry just absorbs the effect.
 
+GitHub App token mints share one in-flight result per credential. Only errors matching the minting
+caller's context failure bypass caching and waiters; internal timeouts cool down normally. Headerless
+failures cool down for five seconds; server-directed retry deadlines stop at one hour.
+(`internal/tokenauth/source.go::githubAppTokenStore.resolve`)
+Unauthorized retries evict only the exact rejected token; in-flight mints, active failure cooldowns,
+and newer completed tokens survive stale responses.
+(`internal/tokenauth/source.go::githubAppTokenStore.invalidateToken`)
+
 Roborev configured-repository discovery retains successful inventory and
 definitive hook results for the process lifetime; only transient failures retry
 after cooldown. Shared refresh work is lifecycle-bound and independently
