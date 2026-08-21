@@ -61,6 +61,7 @@
     selectedRanges?: SelectedLineRange[];
     enableLineSelection?: boolean;
     onLineSelected?: (selection: SelectedLineRange | null) => void;
+    onGutterUtilityClick?: (selection: SelectedLineRange) => void;
     renderAnnotation?: (annotation: DiffLineAnnotation<unknown>) => HTMLElement | undefined;
     virtualizer?: Virtualizer | undefined;
   }
@@ -115,6 +116,7 @@
     selectedRanges = [],
     enableLineSelection = false,
     onLineSelected = undefined,
+    onGutterUtilityClick = undefined,
     renderAnnotation = undefined,
     virtualizer = undefined,
   }: Props = $props();
@@ -158,8 +160,6 @@
   let lineAnnotationWrappers = new Map<string, HTMLElement>();
   let transientAnnotationRow: TransientAnnotationRow | undefined;
   let pendingContextExpansion: PendingContextExpansion | undefined;
-  let lineCommentButtonHasPointerSnapshot = false;
-  let lineCommentButtonWasSelectedOnPointerDown = false;
   let syntaxHighlightWorkerActive = false;
   let syntaxHighlightWorkerPool: WorkerPoolManager | undefined;
   let appWorkerPool = $state.raw<WorkerPoolManager | undefined>();
@@ -193,10 +193,13 @@
     diffStyle: viewMode,
     diffIndicators: "bars",
     disableFileHeader: true,
-    enableLineSelection: false,
+    enableLineSelection,
+    enableGutterUtility: enableLineSelection,
     hunkSeparators: "line-info",
     lineDiffType: "word",
-    lineHoverHighlight: "disabled",
+    lineHoverHighlight: enableLineSelection ? "number" : "disabled",
+    ...(onGutterUtilityClick && { onGutterUtilityClick }),
+    ...(onLineSelected && { onLineSelected }),
     ...(renderAnnotation && { renderAnnotation }),
     overflow: wordWrap ? "wrap" : "scroll",
     theme: { dark: "pierre-dark", light: "pierre-light" },
@@ -259,38 +262,9 @@
       [data-expand-button] {
         cursor: pointer;
       }
-      [data-kenn-forge-line-comment-cell] {
-        position: relative;
-      }
-      [data-kenn-forge-line-comment-cell] > [data-line-number-content] {
-        pointer-events: none;
-      }
-      [data-kenn-forge-line-comment-button] {
-        position: absolute;
-        top: 50%;
-        right: 2px;
-        z-index: 1;
-        display: grid;
-        place-items: center;
-        width: 18px;
-        height: 18px;
-        padding: 0;
-        transform: translateY(-50%);
-        border: 1px solid var(--border-muted);
-        border-radius: 4px;
-        background: var(--bg-surface);
-        color: var(--text-secondary);
-        cursor: pointer;
-        font: inherit;
-        line-height: 1;
-        opacity: 0;
-      }
-      [data-line-type]:hover > [data-kenn-forge-line-comment-button],
-      [data-kenn-forge-line-comment-button]:focus-visible {
-        opacity: 1;
-      }
-      [data-kenn-forge-line-comment-button]::before {
-        content: "+";
+      [data-kenn-forge-review-line-number]:focus-visible {
+        outline: 2px solid var(--accent-blue);
+        outline-offset: -2px;
       }
     `,
   }));
@@ -492,6 +466,7 @@
 
   $effect(() => {
     pierreDiff?.setSelectedLines(selectedRange);
+    labelGutterUtility();
     scheduleSelectedRangesApplication();
   });
 
@@ -519,6 +494,8 @@
     removeDemandContextHandler();
     demandContextHandlerRoot = root;
     root.addEventListener("click", handleDemandContextClick, { capture: true });
+    root.addEventListener("click", handleGutterUtilityKeyboardClick, { capture: true });
+    root.addEventListener("keydown", handleLineNumberKeyboardSelection, { capture: true });
     root.addEventListener("slotchange", handleAnnotationSlotChange);
   }
 
@@ -596,6 +573,12 @@
 
   function removeDemandContextHandler(): void {
     demandContextHandlerRoot?.removeEventListener("click", handleDemandContextClick, {
+      capture: true,
+    });
+    demandContextHandlerRoot?.removeEventListener("click", handleGutterUtilityKeyboardClick, {
+      capture: true,
+    });
+    demandContextHandlerRoot?.removeEventListener("keydown", handleLineNumberKeyboardSelection, {
       capture: true,
     });
     demandContextHandlerRoot?.removeEventListener("slotchange", handleAnnotationSlotChange);
@@ -852,7 +835,7 @@
     removeStalePlaceholderPres();
     applyLineTargetAttributes();
     applyHunkHeaderLabels();
-    applyLineCommentButtons();
+    labelGutterUtility();
     syncLineAnnotationWrappers();
     installDemandContextHandler();
     scheduleSelectedRangesApplication();
@@ -972,7 +955,7 @@
     removeStalePlaceholderPres();
     applyLineTargetAttributes();
     applyHunkHeaderLabels();
-    applyLineCommentButtons();
+    labelGutterUtility();
     syncLineAnnotationWrappers();
 
     // Latch visibility: scroll-driven virtualized re-renders fire onPostRender
@@ -1225,6 +1208,9 @@
     const root = host?.shadowRoot;
     const pre = renderedDiffPre(root);
     if (!root || !pre || !pierreDiff) return;
+    for (const target of root.querySelectorAll<HTMLElement>("[data-kenn-forge-review-line-number]")) {
+      resetLineNumberKeyboardTarget(target);
+    }
     for (const line of root.querySelectorAll<HTMLElement>("[data-diff-path]")) {
       line.removeAttribute("data-diff-path");
       line.removeAttribute("data-diff-old-line");
@@ -1262,132 +1248,94 @@
     }
   }
 
-  function applyLineCommentButtons(): void {
-    const root = host?.shadowRoot;
-    const pre = renderedDiffPre(root);
-    if (!root || !pre) return;
-    for (const button of root.querySelectorAll("[data-kenn-forge-line-comment-button]")) {
-      button.remove();
+  function configureLineNumberKeyboardTarget(
+    gutter: HTMLElement,
+    side: PierreSide,
+    attributes: Record<string, string>,
+  ): void {
+    gutter.tabIndex = -1;
+    const target = gutter.querySelector<HTMLElement>("[data-line-number-content]");
+    if (!target) return;
+    if (!enableLineSelection || !onLineSelected) {
+      resetLineNumberKeyboardTarget(target);
+      return;
     }
-    for (const cell of root.querySelectorAll("[data-kenn-forge-line-comment-cell]")) {
-      cell.removeAttribute("data-kenn-forge-line-comment-cell");
-    }
-    if (!enableLineSelection || !onLineSelected) return;
-
-    for (const code of Array.from(pre.children)) {
-      const [gutter, content] = Array.from(code.children);
-      if (!gutter || !content) continue;
-      const contentRows = Array.from(content.children);
-      const gutterRows = Array.from(gutter.children);
-      for (let index = 0; index < contentRows.length; index += 1) {
-        const contentElement = contentRows[index];
-        const gutterElement = gutterRows[index];
-        if (!(contentElement instanceof HTMLElement) || !(gutterElement instanceof HTMLElement)) {
-          continue;
-        }
-        const target = lineCommentTarget(contentElement);
-        if (!target) continue;
-        gutterElement.setAttribute("data-kenn-forge-line-comment-cell", "");
-        gutterElement.appendChild(lineCommentButton(target));
-      }
-    }
+    const lineNumber = attributes[side === "additions" ? "data-diff-new-line" : "data-diff-old-line"];
+    if (!lineNumber) return;
+    target.tabIndex = 0;
+    target.setAttribute("role", "button");
+    target.setAttribute("data-kenn-forge-review-line-number", "");
+    target.setAttribute(
+      "aria-label",
+      `Select ${side === "additions" ? "new" : "old"} line ${lineNumber} for review`,
+    );
   }
 
-  function lineCommentTarget(
-    element: HTMLElement,
-  ): { lineNumber: number; side: PierreSide } | undefined {
-    const newLine = parseLineAttribute(element, "data-diff-new-line");
-    if (newLine != null) return { lineNumber: newLine, side: "additions" };
-    const oldLine = parseLineAttribute(element, "data-diff-old-line");
-    if (oldLine != null) return { lineNumber: oldLine, side: "deletions" };
+  function resetLineNumberKeyboardTarget(target: HTMLElement): void {
+    target.tabIndex = -1;
+    target.removeAttribute("aria-label");
+    target.removeAttribute("data-kenn-forge-review-line-number");
+    target.removeAttribute("role");
+  }
+
+  function handleLineNumberKeyboardSelection(event: Event): void {
+    if (
+      !(event instanceof KeyboardEvent) ||
+      (event.key !== "Enter" && event.key !== " ") ||
+      closestFromEvent(event, "[data-utility-button]")
+    ) return;
+    const target = closestFromEvent(event, "[data-kenn-forge-review-line-number]");
+    if (!(target instanceof HTMLElement)) return;
+    const selection = keyboardLineSelection(target);
+    if (!selection) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    onLineSelected?.(
+      event.shiftKey && selectedRange
+        ? {
+            start: selectedRange.start,
+            side: selectedRange.side ?? selection.side,
+            end: selection.end,
+            endSide: selection.side,
+          }
+        : selection,
+    );
+  }
+
+  function keyboardLineSelection(
+    target: HTMLElement,
+  ): { start: number; end: number; side: PierreSide } | undefined {
+    const gutter = target.closest<HTMLElement>("[data-column-number]");
+    if (!gutter) return undefined;
+    const newLine = Number.parseInt(gutter.getAttribute("data-diff-new-line") ?? "", 10);
+    if (Number.isFinite(newLine)) {
+      return { start: newLine, end: newLine, side: "additions" };
+    }
+    const oldLine = Number.parseInt(gutter.getAttribute("data-diff-old-line") ?? "", 10);
+    if (Number.isFinite(oldLine)) {
+      return { start: oldLine, end: oldLine, side: "deletions" };
+    }
     return undefined;
   }
 
-  function parseLineAttribute(element: HTMLElement, name: string): number | undefined {
-    const value = Number.parseInt(element.getAttribute(name) ?? "", 10);
-    return Number.isFinite(value) ? value : undefined;
+  function labelGutterUtility(): void {
+    const button = host?.shadowRoot?.querySelector("[data-utility-button]");
+    if (!(button instanceof HTMLButtonElement)) return;
+    button.setAttribute("aria-label", "Add comment to selected lines");
+    button.title = "Add comment to selected lines";
   }
 
-  function lineCommentButton(target: { lineNumber: number; side: PierreSide }): HTMLButtonElement {
-    const button = document.createElement("button");
-    const sideLabel = target.side === "additions" ? "new" : "old";
-    const label = `Comment on ${sideLabel} line ${target.lineNumber}`;
-    button.type = "button";
-    button.title = label;
-    button.setAttribute("aria-label", label);
-    button.setAttribute("data-kenn-forge-line-comment-button", "");
-    button.addEventListener("pointerdown", (event) => {
-      event.stopPropagation();
-      lineCommentButtonHasPointerSnapshot = true;
-      lineCommentButtonWasSelectedOnPointerDown = lineCommentTargetIsSelected(target, event);
-    });
-    button.addEventListener("mousedown", (event) => {
-      event.stopPropagation();
-      lineCommentButtonHasPointerSnapshot = true;
-      lineCommentButtonWasSelectedOnPointerDown = lineCommentTargetIsSelected(target, event);
-    });
-    button.addEventListener("click", (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      const collapse = lineCommentButtonHasPointerSnapshot
-        ? lineCommentButtonWasSelectedOnPointerDown
-        : lineCommentTargetIsSelected(target, event);
-      lineCommentButtonHasPointerSnapshot = false;
-      lineCommentButtonWasSelectedOnPointerDown = false;
-      onLineSelected?.(
-        collapse
-          ? null
-          : lineCommentSelection(target, event),
-      );
-    });
-    return button;
-  }
-
-  function selectedRangeMatchesLineCommentTarget(
-    target: { lineNumber: number; side: PierreSide },
-    event: MouseEvent,
-  ): boolean {
-    if (event.shiftKey || !selectedRange) return false;
-    const selectedSide = selectedRange.side ?? target.side;
-    const selectedEndSide = selectedRange.endSide ?? selectedSide;
-    return selectedSide === target.side &&
-      selectedEndSide === target.side &&
-      selectedRange.start === target.lineNumber &&
-      selectedRange.end === target.lineNumber;
-  }
-
-  function lineCommentTargetIsSelected(
-    target: { lineNumber: number; side: PierreSide },
-    event: MouseEvent,
-  ): boolean {
-    return selectedRangeMatchesLineCommentTarget(target, event) ||
-      (!event.shiftKey && selectedLineTargetExists(target));
-  }
-
-  function selectedLineTargetExists(target: { lineNumber: number; side: PierreSide }): boolean {
-    const attr = target.side === "additions" ? "data-diff-new-line" : "data-diff-old-line";
-    return host?.shadowRoot?.querySelector(
-      `[data-active-review-range-line][${attr}="${target.lineNumber}"]`,
-    ) != null;
-  }
-
-  function lineCommentSelection(
-    target: { lineNumber: number; side: PierreSide },
-    event: MouseEvent,
-  ): SelectedLineRange {
-    if (event.shiftKey && selectedRange) {
-      return {
-        start: selectedRange.start,
-        side: selectedRange.side ?? target.side,
-        end: target.lineNumber,
-        endSide: target.side,
-      };
-    }
-    return {
-      start: target.lineNumber,
-      side: target.side,
-      end: target.lineNumber,
-    };
+  function handleGutterUtilityKeyboardClick(event: Event): void {
+    // Pierre handles pointer activation itself. Native keyboard activation
+    // emits a click with no detail, so bridge that path to the same callback.
+    if (
+      !(event instanceof MouseEvent) ||
+      event.detail !== 0 ||
+      !closestFromEvent(event, "[data-utility-button]") ||
+      !selectedRange
+    ) return;
+    onGutterUtilityClick?.(selectedRange);
+    onLineSelected?.(selectedRange);
   }
 
   function applyTransientLineAnnotation(): void {
@@ -1641,7 +1589,7 @@
     const pair = renderedLinePair(pre, lineIndex, split, side);
     if (!pair) return;
     pair.content.tabIndex = -1;
-    pair.gutter.tabIndex = -1;
+    configureLineNumberKeyboardTarget(pair.gutter, side, attributes);
     pair.content.setAttribute("data-diff-path", renderFile.path);
     pair.gutter.setAttribute("data-diff-path", renderFile.path);
     for (const [name, value] of Object.entries(attributes)) {
