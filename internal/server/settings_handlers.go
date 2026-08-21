@@ -34,10 +34,20 @@ type settingsResponse struct {
 	KataProjects  []config.KataProjectRepoMapping `json:"kata_projects" nullable:"false"`
 	LaunchTargets []localruntime.LaunchTarget     `json:"launch_targets,omitempty"`
 	Fleet         fleetSettingsResponse           `json:"fleet"`
+	MCP           mcpSettingsResponse             `json:"mcp"`
 }
 
 type notificationsSettingsResponse struct {
 	Enabled bool `json:"enabled"`
+}
+
+type mcpSettingsResponse struct {
+	Enabled            bool   `json:"enabled"`
+	Port               int    `json:"port,omitempty"`
+	DiffCacheMB        int    `json:"diff_cache_mb,omitempty"`
+	RestartRequired    bool   `json:"restart_required"`
+	ActiveURL          string `json:"active_url,omitempty"`
+	ActiveRequiresAuth bool   `json:"active_requires_auth"`
 }
 
 type updateSettingsRequest struct {
@@ -50,11 +60,18 @@ type updateSettingsRequest struct {
 	Modes        *config.ModeVisibility           `json:"modes,omitempty"`
 	Agents       *[]config.Agent                  `json:"agents,omitempty"`
 	KataProjects *[]config.KataProjectRepoMapping `json:"kata_projects,omitempty"`
+	MCP          *mcpSettingsUpdate               `json:"mcp,omitempty"`
 }
 
 type workspaceSettingsUpdate struct {
 	AutoAssignOnCreate *bool   `json:"auto_assign_on_create,omitempty"`
 	DefaultSidebarView *string `json:"default_sidebar_view,omitempty" enum:"diff,item"`
+}
+
+type mcpSettingsUpdate struct {
+	Enabled     *bool `json:"enabled,omitempty"`
+	Port        *int  `json:"port,omitempty"`
+	DiffCacheMB *int  `json:"diff_cache_mb,omitempty"`
 }
 
 func (s *Server) configuredClients(
@@ -96,6 +113,7 @@ func (s *Server) buildLocalSettingsResponse(
 	modes := cloneModeVisibility(s.cfg.Modes).WithDefaults()
 	agents := cloneConfigAgents(s.cfg.Agents)
 	kataProjects := slices.Clone(s.cfg.KataProjects)
+	mcp := s.cfg.MCP
 	if kataProjects == nil {
 		// kata_projects is a required non-null array in the API schema, so a
 		// nil clone (the default, no-mappings case) must serialize as [] rather
@@ -161,6 +179,14 @@ func (s *Server) buildLocalSettingsResponse(
 		KataProjects:  kataProjects,
 		LaunchTargets: launchTargets,
 		Fleet:         fleetSettings,
+		MCP: mcpSettingsResponse{
+			Enabled:            mcp.Enabled,
+			Port:               mcp.Port,
+			DiffCacheMB:        mcp.DiffCacheMB,
+			RestartRequired:    mcp != s.bootCfgSnapshot.MCP,
+			ActiveURL:          s.options.MCPURL,
+			ActiveRequiresAuth: s.bootCfgSnapshot.RequireAuth,
+		},
 	}, nil
 }
 
@@ -840,6 +866,7 @@ func (s *Server) updateSettings(
 	prevModes := cloneModeVisibility(s.cfg.Modes)
 	prevAgents := cloneConfigAgents(s.cfg.Agents)
 	prevKataProjects := slices.Clone(s.cfg.KataProjects)
+	prevMCP := s.cfg.MCP
 	if input.Body.Activity != nil {
 		candidate := *input.Body.Activity
 		if candidate.ViewMode == "" {
@@ -879,6 +906,17 @@ func (s *Server) updateSettings(
 	if input.Body.KataProjects != nil {
 		s.cfg.KataProjects = slices.Clone(*input.Body.KataProjects)
 	}
+	if input.Body.MCP != nil {
+		if input.Body.MCP.Enabled != nil {
+			s.cfg.MCP.Enabled = *input.Body.MCP.Enabled
+		}
+		if input.Body.MCP.Port != nil {
+			s.cfg.MCP.Port = *input.Body.MCP.Port
+		}
+		if input.Body.MCP.DiffCacheMB != nil {
+			s.cfg.MCP.DiffCacheMB = *input.Body.MCP.DiffCacheMB
+		}
+	}
 	if err := s.cfg.Validate(); err != nil {
 		s.cfg.Activity = prevActivity
 		s.cfg.Detail = prevDetail
@@ -889,6 +927,7 @@ func (s *Server) updateSettings(
 		s.cfg.Modes = prevModes
 		s.cfg.Agents = prevAgents
 		s.cfg.KataProjects = prevKataProjects
+		s.cfg.MCP = prevMCP
 		s.cfgMu.Unlock()
 		return nil, httpapi.BadRequest(httpapi.CodeBadRequest, err.Error(), nil)
 	}
@@ -902,6 +941,7 @@ func (s *Server) updateSettings(
 		s.cfg.Modes = prevModes
 		s.cfg.Agents = prevAgents
 		s.cfg.KataProjects = prevKataProjects
+		s.cfg.MCP = prevMCP
 		s.cfgMu.Unlock()
 		return nil, httpapi.Internal("save config: " + err.Error())
 	}

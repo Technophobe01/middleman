@@ -2912,6 +2912,23 @@ type LocalSyncCeilingStatus struct {
 	Spent           int64  `json:"spent"`
 }
 
+// McpSettingsResponse defines model for McpSettingsResponse.
+type McpSettingsResponse struct {
+	ActiveRequiresAuth bool    `json:"active_requires_auth"`
+	ActiveUrl          *string `json:"active_url,omitempty"`
+	DiffCacheMb        *int64  `json:"diff_cache_mb,omitempty"`
+	Enabled            bool    `json:"enabled"`
+	Port               *int64  `json:"port,omitempty"`
+	RestartRequired    bool    `json:"restart_required"`
+}
+
+// McpSettingsUpdate defines model for McpSettingsUpdate.
+type McpSettingsUpdate struct {
+	DiffCacheMb *int64 `json:"diff_cache_mb,omitempty"`
+	Enabled     *bool  `json:"enabled,omitempty"`
+	Port        *int64 `json:"port,omitempty"`
+}
+
 // MergePRBody defines model for MergePRBody.
 type MergePRBody struct {
 	// Schema A URL to the JSON Schema for this object.
@@ -4295,6 +4312,7 @@ type SettingsResponse struct {
 	Issues        Issues                        `json:"issues"`
 	KataProjects  []KataProjectRepoMapping      `json:"kata_projects"`
 	LaunchTargets *[]LaunchTarget               `json:"launch_targets,omitempty"`
+	Mcp           McpSettingsResponse           `json:"mcp"`
 	Modes         *ModeVisibility               `json:"modes,omitempty"`
 	Notifications NotificationsSettingsResponse `json:"notifications"`
 	PullRequests  PullRequests                  `json:"pull_requests"`
@@ -4537,6 +4555,7 @@ type UpdateSettingsRequest struct {
 	Detail       *Detail                   `json:"detail,omitempty"`
 	Issues       *Issues                   `json:"issues,omitempty"`
 	KataProjects *[]KataProjectRepoMapping `json:"kata_projects,omitempty"`
+	Mcp          *McpSettingsUpdate        `json:"mcp,omitempty"`
 	Modes        *ModeVisibility           `json:"modes,omitempty"`
 	PullRequests *PullRequests             `json:"pull_requests,omitempty"`
 	Terminal     *Terminal                 `json:"terminal,omitempty"`

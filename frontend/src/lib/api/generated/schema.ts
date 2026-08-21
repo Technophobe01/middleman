@@ -6434,6 +6434,23 @@ export interface components {
             /** Format: int64 */
             spent: number;
         };
+        McpSettingsResponse: {
+            active_requires_auth: boolean;
+            active_url?: string;
+            /** Format: int64 */
+            diff_cache_mb?: number;
+            enabled: boolean;
+            /** Format: int64 */
+            port?: number;
+            restart_required: boolean;
+        };
+        McpSettingsUpdate: {
+            /** Format: int64 */
+            diff_cache_mb?: number;
+            enabled?: boolean;
+            /** Format: int64 */
+            port?: number;
+        };
         MergePRBody: {
             /**
              * Format: uri
@@ -7829,6 +7846,7 @@ export interface components {
             issues: components["schemas"]["Issues"];
             kata_projects: components["schemas"]["KataProjectRepoMapping"][];
             launch_targets?: components["schemas"]["LaunchTarget"][] | null;
+            mcp: components["schemas"]["McpSettingsResponse"];
             modes?: components["schemas"]["ModeVisibility"];
             notifications: components["schemas"]["NotificationsSettingsResponse"];
             pull_requests: components["schemas"]["PullRequests"];
@@ -8078,6 +8096,7 @@ export interface components {
             detail?: components["schemas"]["Detail"];
             issues?: components["schemas"]["Issues"];
             kata_projects?: components["schemas"]["KataProjectRepoMapping"][];
+            mcp?: components["schemas"]["McpSettingsUpdate"];
             modes?: components["schemas"]["ModeVisibility"];
             pull_requests?: components["schemas"]["PullRequests"];
             terminal?: components["schemas"]["Terminal"];
