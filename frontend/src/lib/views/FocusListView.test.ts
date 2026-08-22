@@ -15,6 +15,7 @@ import {
   setPullInvolvesMe,
   setPullSearch,
 } from "../../test/focusListViewState.svelte.js";
+import { getGlobalRepo, setGlobalRepo } from "../stores/filter.svelte.js";
 
 const pullSearch = vi.hoisted(() => vi.fn());
 const issueSearch = vi.hoisted(() => vi.fn());
@@ -25,6 +26,8 @@ const setIssuesInvolvesMe = vi.hoisted(() => vi.fn());
 const setIssuesReferencedByPR = vi.hoisted(() => vi.fn());
 const unsubscribeSync = vi.hoisted(() => vi.fn());
 const subscribeSyncComplete = vi.hoisted(() => vi.fn(() => unsubscribeSync));
+const pullListCapped = vi.hoisted(() => ({ value: false }));
+const issueListCapped = vi.hoisted(() => ({ value: false }));
 vi.mock("../context.js", () => ({
   getActions: () => ({ importItem: vi.fn() }),
   getNavigate: () => vi.fn(),
@@ -44,6 +47,7 @@ vi.mock("../context.js", () => ({
       getIssues: () => [],
       getIssuesError: () => null,
       isIssuesLoading: () => false,
+      isIssueListCapped: () => issueListCapped.value,
       loadIssues,
       setHideBots: vi.fn(),
       setInvolvesMe: (value: boolean) => {
@@ -67,6 +71,7 @@ vi.mock("../context.js", () => ({
       getFilterState: () => "open",
       getPulls: () => [],
       isLoading: () => false,
+      isListCapped: () => pullListCapped.value,
       loadPulls,
       setFilterState: vi.fn(),
       setInvolvesMe: (value: boolean) => {
@@ -79,6 +84,32 @@ vi.mock("../context.js", () => ({
       },
     },
     settings: {
+      getConfiguredRepos: () => [
+        {
+          provider: "github",
+          platform_host: "github.com",
+          owner: "acme",
+          name: "api",
+          repo_path: "acme/api",
+          platform_repo_id: "R_api",
+          is_glob: false,
+          matched_repo_count: 1,
+          hidden_from_ui: false,
+        },
+      ],
+      getRepoPresets: () => [
+        {
+          name: "Backend",
+          repos: [
+            {
+              provider: "github",
+              platform_host: "github.com",
+              platform_repo_id: "R_api",
+              repo_path: "acme/api",
+            },
+          ],
+        },
+      ],
       hasConfiguredRepos: () => true,
       isSettingsLoaded: () => true,
     },
@@ -102,6 +133,9 @@ describe("FocusListView search", () => {
     unsubscribeSync.mockClear();
     subscribeSyncComplete.mockClear();
     resetFocusListViewState();
+    pullListCapped.value = false;
+    issueListCapped.value = false;
+    setGlobalRepo(undefined);
   });
 
   afterEach(() => {
@@ -148,6 +182,74 @@ describe("FocusListView search", () => {
     expect(subscribeSyncComplete).toHaveBeenCalledTimes(1);
     expect(unsubscribeSync).not.toHaveBeenCalled();
     view.unmount();
+  });
+
+  it.each([
+    ["mrs" as const, loadPulls, pullListCapped],
+    ["issues" as const, loadIssues, issueListCapped],
+  ])("loads mobile %s results in bounded chunks and autoloads the next chunk", async (listType, loadList, capped) => {
+    const observed = new Map<Element, IntersectionObserverCallback>();
+    class IntersectionObserverStub {
+      constructor(private readonly callback: IntersectionObserverCallback) {}
+      observe(target: Element): void {
+        observed.set(target, this.callback);
+      }
+      disconnect(): void {}
+      unobserve(): void {}
+      takeRecords(): IntersectionObserverEntry[] {
+        return [];
+      }
+      readonly root = null;
+      readonly rootMargin = "0px";
+      readonly thresholds = [0];
+    }
+    vi.stubGlobal("IntersectionObserver", IntersectionObserverStub);
+    capped.value = true;
+
+    const { container } = render(FocusListView, {
+      props: { listType, repo: "acme/one", chunked: true },
+    });
+
+    expect(loadList).toHaveBeenCalledWith({ repo: "acme/one", limit: 30 });
+    const sentinel = container.querySelector(".focus-list-loading-sentinel");
+    expect(sentinel).toBeTruthy();
+    const notify = observed.get(sentinel!);
+    expect(notify).toBeTruthy();
+
+    notify!([{ isIntersecting: true } as IntersectionObserverEntry], {} as IntersectionObserver);
+
+    expect(loadList).toHaveBeenLastCalledWith({ repo: "acme/one", limit: 60 });
+  });
+
+  it.each(["mrs", "issues"] as const)("discloses %s filters from an icon-only control", async (listType) => {
+    const { container } = render(FocusListView, { props: { listType, repo: "acme/one" } });
+
+    const filters = screen.getByRole("button", { name: "Filters" });
+    expect(filters.textContent?.trim()).toBe("");
+    expect(filters.getAttribute("aria-expanded")).toBe("false");
+    expect(container.querySelector(".filter-bar")?.classList.contains("filter-bar--expanded")).toBe(false);
+
+    await fireEvent.click(filters);
+
+    expect(filters.getAttribute("aria-expanded")).toBe("true");
+    expect(container.querySelector(".filter-bar")?.classList.contains("filter-bar--expanded")).toBe(true);
+  });
+
+  it.each([
+    ["mrs" as const, loadPulls],
+    ["issues" as const, loadIssues],
+  ])("applies saved repository presets to the mobile %s query", async (listType, loadList) => {
+    render(FocusListView, { props: { listType, showRepoSelector: true } });
+
+    expect(screen.queryByRole("button", { name: "Select repository: Global" })).toBeNull();
+    await fireEvent.click(screen.getByRole("button", { name: "Filters" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Select repository: Global" }));
+    await fireEvent.mouseDown(screen.getByRole("option", { name: "Backend" }));
+
+    expect(getGlobalRepo()).toBe("github|github.com/acme/api");
+    expect(loadList).toHaveBeenLastCalledWith({ repo: "github|github.com/acme/api" });
+    expect(screen.queryByRole("button", { name: "Save preset" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Delete preset Backend" })).toBeNull();
   });
 
   it.each([

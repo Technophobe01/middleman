@@ -12,6 +12,34 @@ async function expectPathname(page: Page, pathname: string): Promise<void> {
   await expect.poll(() => new URL(page.url()).pathname).toBe(pathname);
 }
 
+async function mobileSearchBarMetrics(page: Page) {
+  return await page.evaluate(() => {
+    const bar = document.querySelector(".mobile-triage-search-bar");
+    const search = bar?.querySelector(".kit-search-input");
+    const filter = bar?.querySelector(".kit-icon-button");
+    const barStyle = bar ? getComputedStyle(bar) : null;
+    const searchStyle = search ? getComputedStyle(search) : null;
+    const filterStyle = filter ? getComputedStyle(filter) : null;
+    const rect = (element: Element | null | undefined) => {
+      const bounds = element?.getBoundingClientRect();
+      return bounds ? { width: bounds.width, height: bounds.height } : null;
+    };
+    return {
+      bar: rect(bar),
+      search: rect(search),
+      filter: rect(filter),
+      gap: barStyle?.gap,
+      padding: barStyle
+        ? [barStyle.paddingTop, barStyle.paddingRight, barStyle.paddingBottom, barStyle.paddingLeft]
+        : null,
+      searchRadius: searchStyle?.borderRadius,
+      filterRadius: filterStyle?.borderRadius,
+      searchBackground: searchStyle?.backgroundColor,
+      filterBackground: filterStyle?.backgroundColor,
+    };
+  });
+}
+
 async function expectReadableFocusList(page: Page, itemSelector: string): Promise<void> {
   await expect(page.locator(itemSelector).first()).toBeVisible();
 
@@ -152,15 +180,34 @@ test.describe("phone routes", () => {
 
     await expect(page.locator(".mobile-shell")).toBeVisible();
     await expect(page.locator(".mobile-activity-inbox")).toBeVisible();
-    await expect(page.getByRole("heading", { name: "What needs attention?" })).toBeVisible();
+    await expect(page.locator(".mobile-triage-search-bar")).toBeVisible();
     await expect(page.getByText("Readable threads first")).toHaveCount(0);
+    const search = page.getByPlaceholder("Search activity");
     const filters = page.getByRole("button", { name: /^Filters/ });
+    const activityFilters = page.locator("#mobile-activity-filters");
+    await expect(filters).toHaveText("");
     await expect(filters).toHaveAttribute("aria-expanded", "false");
-    await filters.click();
+    await expect(activityFilters).toBeAttached();
+    await expect(activityFilters).toBeHidden();
+    const [searchBounds, filterBounds] = await Promise.all([search.boundingBox(), filters.boundingBox()]);
+    expect(searchBounds).not.toBeNull();
+    expect(filterBounds).not.toBeNull();
+    expect(Math.abs(searchBounds!.y - filterBounds!.y)).toBeLessThan(2);
+    expect(filterBounds!.height).toBeGreaterThanOrEqual(44);
+    await filters.locator("svg").click();
+    await expect(filters).toHaveAttribute("aria-expanded", "true");
+    await expect(activityFilters).toBeVisible();
+    expect((await activityFilters.boundingBox())?.height ?? 0).toBeGreaterThan(0);
     await expect(page.getByRole("switch", { name: "PRs" })).toBeVisible();
     await expect(page.getByRole("switch", { name: "Issues" })).toBeVisible();
+    await expect(page.getByRole("switch", { name: "Comments" })).toBeVisible();
+    await expect(page.getByRole("switch", { name: "Reviews" })).toBeVisible();
+    await expect(page.getByRole("switch", { name: "Commits" })).toBeVisible();
+    await expect(page.getByRole("switch", { name: "Force pushes" })).toBeVisible();
+    await expect(page.getByRole("switch", { name: "Notifications" })).toBeVisible();
+    await expect(page.getByRole("switch", { name: "Hide closed/merged" })).toBeVisible();
     await expect(page.getByLabel("Time range")).toBeVisible();
-    await expect(page.getByLabel("Repository")).toBeVisible();
+    await expect(page.getByRole("button", { name: /^Select repository:/ })).toBeVisible();
     await expect(page.locator(".threaded-view")).toHaveCount(0);
 
     const metrics = await page.evaluate(() => {
@@ -181,7 +228,12 @@ test.describe("phone routes", () => {
       const appIcon = document.querySelector(".mobile-app-icon");
       const itemTypeToggle = document.querySelector(".mobile-item-type-toggle .kit-toggle");
       const rangeSelect = document.querySelector(".mobile-filter-dropdown button[aria-label^='Time range']");
-      const repoSelect = document.querySelector(".mobile-filter-dropdown button[aria-label^='Repository']");
+      const repoSelect = document.querySelector(".mobile-filter-select--repo .typeahead-trigger");
+      const repoChevron = repoSelect?.querySelector(".typeahead-chevron") ?? null;
+      const toolbar = document.querySelector(".mobile-triage-search-bar");
+      const filterPanel = document.querySelector(".mobile-activity-filter-grid");
+      const authorFilter = document.querySelector(".mobile-author-filter");
+      const authorChevron = authorFilter?.querySelector(".kit-typeahead__chevron") ?? null;
       const search = document.querySelector(".kit-search-input");
       const cardRect = firstCard?.getBoundingClientRect();
       const buttonRect = firstButton?.getBoundingClientRect();
@@ -209,19 +261,9 @@ test.describe("phone routes", () => {
         "border-radius:var(--radius-lg)",
       ].join(";");
       document.body.append(surfaceSample);
-      const insetSample = document.createElement("div");
-      insetSample.style.cssText = [
-        "position:absolute",
-        "left:-9999px",
-        "top:0",
-        "width:1px",
-        "height:1px",
-        "background:var(--bg-inset)",
-      ].join(";");
-      document.body.append(insetSample);
       const compactRect = (node: Element | null) => {
         const r = node?.getBoundingClientRect();
-        return r ? { left: r.left, right: r.right, height: r.height } : null;
+        return r ? { top: r.top, left: r.left, right: r.right, width: r.width, height: r.height } : null;
       };
       const fontSize = (node: Element | null): number =>
         node ? Number.parseFloat(getComputedStyle(node).fontSize) : 0;
@@ -255,11 +297,12 @@ test.describe("phone routes", () => {
         cardBackground: styleFor(firstCard)?.backgroundColor ?? "",
         cardBorderColor: styleFor(firstCard)?.borderColor ?? "",
         cardRadius: styleFor(firstCard)?.borderRadius ?? "",
-        searchBackground:
-          styleFor(document.querySelector(".mobile-activity-search .kit-search-input"))?.backgroundColor ?? "",
+        toolbarBackground: styleFor(toolbar)?.backgroundColor ?? "",
+        toolbarBorderBottom: styleFor(toolbar)?.borderBottomColor ?? "",
+        toolbarRect: compactRect(toolbar),
+        filterPanelBackground: styleFor(filterPanel)?.backgroundColor ?? "",
         themeBgPrimary: getComputedStyle(themeSample).backgroundColor,
         themeBgSurface: getComputedStyle(surfaceSample).backgroundColor,
-        themeBgInset: getComputedStyle(insetSample).backgroundColor,
         themeBorder: getComputedStyle(themeSample).borderColor,
         themeRadiusLg: getComputedStyle(surfaceSample).borderRadius,
         itemTypeToggleFontSize: fontSize(document.querySelector(".mobile-item-type-toggle .kit-toggle__label")),
@@ -268,6 +311,9 @@ test.describe("phone routes", () => {
         itemTypeToggleRect: compactRect(itemTypeToggle),
         rangeSelectRect: compactRect(rangeSelect),
         repoSelectRect: compactRect(repoSelect),
+        repoChevronRect: compactRect(repoChevron),
+        authorFilterRect: compactRect(authorFilter),
+        authorChevronRect: compactRect(authorChevron),
         searchLeft: searchRect?.left ?? 0,
         searchRight: searchRect?.right ?? 0,
       };
@@ -298,10 +344,24 @@ test.describe("phone routes", () => {
     expect(metrics.cardBackground).toBe(metrics.themeBgSurface);
     expect(metrics.cardBorderColor).toBe(metrics.themeBorder);
     expect(metrics.cardRadius).toBe(metrics.themeRadiusLg);
-    expect(metrics.searchBackground).toBe(metrics.themeBgInset);
+    expect(metrics.toolbarBackground).toBe(metrics.themeBgSurface);
+    expect(metrics.toolbarBorderBottom).toBe(metrics.themeBorder);
+    expect(metrics.toolbarRect?.left ?? -1).toBe(0);
+    expect(metrics.toolbarRect?.right ?? Infinity).toBe(metrics.viewportWidth);
+    expect(metrics.toolbarRect?.height ?? 0).toBeGreaterThanOrEqual(64);
+    expect(metrics.toolbarRect?.height ?? Infinity).toBeLessThanOrEqual(66);
+    expect(metrics.filterPanelBackground).toBe(metrics.themeBgSurface);
     expect(metrics.itemTypeToggleFontSize).toBeGreaterThanOrEqual(15);
     expect(metrics.rangeSelectFontSize).toBeGreaterThanOrEqual(15);
     expect(metrics.repoSelectFontSize).toBeGreaterThanOrEqual(15);
+    expect(metrics.repoSelectRect?.top ?? Infinity).toBeLessThan(metrics.authorFilterRect?.top ?? 0);
+    expect(
+      (metrics.authorFilterRect?.top ?? Infinity) -
+        (metrics.repoSelectRect?.top ?? 0) -
+        (metrics.repoSelectRect?.height ?? 0),
+    ).toBeLessThanOrEqual(1);
+    expect(metrics.authorChevronRect?.width).toBe(metrics.repoChevronRect?.width);
+    expect(metrics.authorChevronRect?.height).toBe(metrics.repoChevronRect?.height);
     for (const bounds of [metrics.itemTypeToggleRect, metrics.rangeSelectRect, metrics.repoSelectRect]) {
       expect(bounds?.left ?? 0).toBeGreaterThanOrEqual(0);
       expect(bounds?.right ?? 0).toBeLessThanOrEqual(metrics.viewportWidth);
@@ -326,9 +386,10 @@ test.describe("phone routes", () => {
       const url = new URL(response.url());
       return url.pathname === "/api/v1/activity" && url.searchParams.get("repo") === "github|github.com/acme/widgets";
     });
-    await page.getByRole("combobox", { name: /Repository/ }).click();
-    await page.getByRole("option", { name: "github/github.com/acme/widgets" }).click();
-    await expect(page.getByRole("combobox", { name: "Repository: acme/widgets" })).toHaveText("acme/widgets");
+    await page.getByRole("button", { name: /^Select repository:/ }).click();
+    await page.getByRole("option", { name: "github/github.com/acme/widgets", exact: true }).dispatchEvent("mousedown");
+    await page.getByRole("textbox", { name: "Filter repos" }).press("Escape");
+    await expect(page.getByRole("button", { name: /^Select repository:/ })).toContainText("acme/widgets");
     expect((await activityForRepo).ok()).toBe(true);
 
     const repoLabels = page.locator(".mobile-activity-card__meta > span:first-child");
@@ -370,16 +431,16 @@ test.describe("phone routes", () => {
     const response = await filteredResponse;
     expect(response.status()).toBe(200);
     const payload = await response.json();
-    expect(payload.items.length).toBeGreaterThan(0);
-    expect(payload.items.every((item: { item_author: string }) => item.item_author.toLowerCase() === "carol")).toBe(
-      true,
-    );
+    expect(payload.item_activity.length).toBeGreaterThan(0);
+    expect(
+      payload.item_activity.every((item: { item_author: string }) => item.item_author.toLowerCase() === "carol"),
+    ).toBe(true);
 
     await expect(page).toHaveURL(/author=carol/);
     await expect(page.getByRole("button", { name: "Filters · carol" })).toBeVisible();
     await expect(page.getByRole("button", { name: "Clear author filter carol" })).toHaveCount(0);
 
-    const summaryMetrics = await page.locator(".mobile-filter-summary").evaluate((summary) => {
+    const summaryMetrics = await page.locator(".mobile-triage-search-bar__filter").evaluate((summary) => {
       const bounds = summary.getBoundingClientRect();
       return {
         viewportWidth: window.innerWidth,
@@ -432,15 +493,15 @@ test.describe("phone routes", () => {
     await expect(card).toBeVisible({ timeout: 10_000 });
 
     const repoLabel = card.locator(".mobile-activity-card__meta span").first();
-    const hideOrgToggle = page.getByRole("button", {
+    const hideOrgToggle = page.getByRole("switch", {
       name: "Hide org",
     });
-    await expect(hideOrgToggle).toHaveAttribute("aria-pressed", "false");
+    await expect(hideOrgToggle).not.toBeChecked();
     await expect(repoLabel).toHaveText("acme/widgets");
 
     await hideOrgToggle.click();
 
-    await expect(hideOrgToggle).toHaveAttribute("aria-pressed", "true");
+    await expect(hideOrgToggle).toBeChecked();
     await expect(repoLabel).toHaveText("widgets");
     await expect(repoLabel).not.toHaveText("acme/widgets");
 
@@ -448,7 +509,7 @@ test.describe("phone routes", () => {
 
     await expect(card).toBeVisible({ timeout: 10_000 });
     await page.getByRole("button", { name: /^Filters/ }).click();
-    await expect(hideOrgToggle).toHaveAttribute("aria-pressed", "true");
+    await expect(hideOrgToggle).toBeChecked();
     await expect(repoLabel).toHaveText("widgets");
   });
 
@@ -563,6 +624,18 @@ test.describe("phone routes", () => {
     const modePicker = page.getByRole("combobox", { name: /Phone mode/ });
     await expect(modePicker).toHaveText("PRs");
     await expect(page.locator(".focus-list")).toBeVisible();
+    const pullSearch = page.getByRole("searchbox", { name: "Search PRs" });
+    const pullFilters = page.getByRole("button", { name: "Filters" });
+    await expect(pullFilters).toHaveText("");
+    await expect(pullFilters).toHaveAttribute("aria-expanded", "false");
+    await expect(page.locator(".filter-bar")).toBeHidden();
+    const [pullSearchBounds, pullFilterBounds] = await Promise.all([
+      pullSearch.boundingBox(),
+      pullFilters.boundingBox(),
+    ]);
+    expect(Math.abs(pullSearchBounds!.y - pullFilterBounds!.y)).toBeLessThan(2);
+    await pullFilters.click();
+    await expect(page.locator(".filter-bar")).toBeVisible();
     await expectReadableFocusList(page, ".pull-item");
 
     await modePicker.click();
@@ -570,7 +643,35 @@ test.describe("phone routes", () => {
     await expect(page).toHaveURL(/\/m\/issues(?:\?|$)/);
     await expect(modePicker).toHaveText("Issues");
     await expect(page.locator(".focus-list")).toBeVisible();
+    const issueSearch = page.getByRole("searchbox", { name: "Search issues" });
+    const issueFilters = page.getByRole("button", { name: "Filters" });
+    await expect(issueFilters).toHaveAttribute("aria-expanded", "false");
+    await expect(page.locator(".filter-bar")).toBeHidden();
+    const [issueSearchBounds, issueFilterBounds] = await Promise.all([
+      issueSearch.boundingBox(),
+      issueFilters.boundingBox(),
+    ]);
+    expect(Math.abs(issueSearchBounds!.y - issueFilterBounds!.y)).toBeLessThan(2);
+    await issueFilters.click();
+    await expect(page.locator(".filter-bar")).toBeVisible();
     await expectReadableFocusList(page, ".issue-item");
+  });
+
+  test("mobile activity, pull, and issue lists share one search bar geometry", async ({ page }) => {
+    await page.goto("/m/pulls");
+    await expect(page.getByRole("searchbox", { name: "Search PRs" })).toBeVisible();
+    const pullMetrics = await mobileSearchBarMetrics(page);
+
+    await page.goto("/m?view=threaded");
+    await expect(page.getByRole("searchbox", { name: "Search activity" })).toBeVisible();
+    const activityMetrics = await mobileSearchBarMetrics(page);
+
+    await page.goto("/m/issues");
+    await expect(page.getByRole("searchbox", { name: "Search issues" })).toBeVisible();
+    const issueMetrics = await mobileSearchBarMetrics(page);
+
+    expect(activityMetrics).toEqual(pullMetrics);
+    expect(issueMetrics).toEqual(pullMetrics);
   });
 
   test("mobile issue bot visibility can be toggled and persists through the real settings API", async ({ page }) => {
@@ -583,6 +684,7 @@ test.describe("phone routes", () => {
       await expect(botIssue).toBeVisible();
       await expect(humanIssue).toBeVisible();
 
+      await page.getByRole("button", { name: "Filters" }).click();
       const hideBots = page.getByRole("button", { name: "Hide bot-authored issues" });
       await expect(hideBots).toHaveAttribute("aria-pressed", "false");
       const settingsUpdate = page.waitForResponse(
@@ -601,6 +703,7 @@ test.describe("phone routes", () => {
 
       await page.reload();
       await expect(page.locator(".issue-item").first()).toBeVisible();
+      await page.getByRole("button", { name: "Filters" }).click();
       await expect(hideBots).toHaveAttribute("aria-pressed", "true");
       await expect(botIssue).toHaveCount(0);
       await expect(humanIssue).toBeVisible();
@@ -674,7 +777,7 @@ test.describe("high-density phone routes", () => {
         node ? getComputedStyle(node).getPropertyValue(name).trim() : "";
       const filterControls = [
         ...document.querySelectorAll(
-          ".mobile-activity-filter-grid .kit-select-dropdown__trigger, .mobile-item-type-toggle .kit-toggle, .mobile-filter-toggle",
+          ".mobile-activity-filter-grid .kit-select-dropdown__trigger, .mobile-item-type-toggle .kit-toggle, .mobile-boolean-toggle .kit-toggle",
         ),
       ]
         .map((control) => control.getBoundingClientRect())

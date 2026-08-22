@@ -210,6 +210,96 @@ function mockClient(overrides: Partial<GeneratedClient> = {}): GeneratedClient {
 }
 
 describe("createIssuesStore", () => {
+  it("reports when a bounded list filled the requested chunk", async () => {
+    const get = vi.fn(async () => ({
+      data: Array.from({ length: 30 }, (_, index) => issue(index + 1, "alice")),
+      error: undefined,
+    }));
+    const store = createIssuesStore({
+      client: mockClient({ GET: get }),
+    });
+
+    store.loadIssues({ limit: 30 });
+    await vi.waitFor(() => expect(store.isIssuesLoading()).toBe(false));
+
+    expect(store.isIssueListCapped()).toBe(true);
+
+    get.mockClear();
+    const refresh = runtime!.runCommand(store.reconcileIssuesEffect(), {
+      operation: "reconcile bounded issues",
+      safeContext: {},
+      onFailure: () => {},
+    });
+    await refresh.exit;
+
+    expect(get).toHaveBeenCalledWith(
+      "/issues",
+      expect.objectContaining({ params: { query: expect.objectContaining({ limit: 30 }) } }),
+    );
+  });
+
+  it("preserves the bounded list request after starring an issue", async () => {
+    const listed = issue(7, "alice");
+    const get = vi.fn(async () => ({ data: [listed], error: undefined }));
+    const store = createIssuesStore({
+      client: mockClient({
+        GET: get,
+        PUT: vi.fn(async () => ({ data: undefined, error: undefined })),
+      }),
+    });
+    const ref = {
+      provider: "github",
+      platformHost: "github.com",
+      owner: "acme",
+      name: "widgets",
+      repoPath: "acme/widgets",
+    };
+    store.loadIssues({ limit: 30 });
+    await vi.waitFor(() => expect(store.isIssuesLoading()).toBe(false));
+    get.mockClear();
+
+    store.toggleIssueStar(ref, 7, false);
+
+    await vi.waitFor(() => expect(get).toHaveBeenCalledTimes(1));
+    expect(get).toHaveBeenCalledWith(
+      "/issues",
+      expect.objectContaining({ params: { query: expect.objectContaining({ limit: 30 }) } }),
+    );
+  });
+
+  it("preserves the bounded list request after changing issue state", async () => {
+    const listed = issue(7, "alice");
+    const detail = issueDetail();
+    const get = vi.fn(async (path: string) =>
+      path === "/issues" ? { data: [listed], error: undefined } : { data: detail, error: undefined },
+    );
+    const store = createIssuesStore({
+      client: mockClient({
+        GET: get,
+        POST: vi.fn(async () => ({ data: undefined, error: undefined })),
+      }),
+    });
+    const ref = {
+      provider: "github",
+      platformHost: "github.com",
+      owner: "acme",
+      name: "widget",
+      repoPath: "acme/widget",
+    };
+    store.loadIssues({ limit: 30 });
+    await vi.waitFor(() => expect(store.isIssuesLoading()).toBe(false));
+    await loadIssueDetail(store, "acme", "widget", 7, { ...ref, sync: false });
+    get.mockClear();
+
+    store.setIssueState(ref, 7, "closed");
+
+    await vi.waitFor(() => expect(get.mock.calls.some(([path]) => path === "/issues")).toBe(true));
+    const listCall = get.mock.calls.find(([path]) => path === "/issues");
+    expect(listCall?.[1]).toEqual(
+      expect.objectContaining({ params: { query: expect.objectContaining({ limit: 30 }) } }),
+    );
+  });
+
   it("persists and sends the Involves me filter", async () => {
     const get = vi.fn(async () => ({ data: [], error: undefined }));
     const store = createIssuesStore({ client: { GET: get } as unknown as GeneratedClient });

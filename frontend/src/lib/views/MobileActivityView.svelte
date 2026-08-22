@@ -1,13 +1,16 @@
 <script lang="ts">
   import { Effect } from "effect";
   import { onDestroy, onMount } from "svelte";
+  import type { Attachment } from "svelte/attachments";
   import { SvelteMap, SvelteSet } from "svelte/reactivity";
   import { getAppRuntime } from "../app/runtime-context.js";
+  import { observeIntersection } from "../browser/observers.js";
   import type { AppExecution } from "../app/runtime.js";
   import type { ActivityItem, ActivitySubject, WorkspaceActivitySubject } from "../api/types.js";
   import { getStores } from "../context.js";
   import {
     buildActivityFilterTypes,
+    DEFAULT_EVENT_TYPES,
     isActivityItemTypeEnabled,
     type ActivityItemType,
     type TimeRange,
@@ -16,7 +19,6 @@
     Card,
     Chip,
     ScrollBox,
-    SearchInput,
     Timeline,
     TimelineItem,
     Toggle,
@@ -24,13 +26,17 @@
     type TypeaheadOption,
     type TimelineTone,
   } from "@kenn-io/kit-ui";
+  import { showFlash } from "../stores/flash.svelte.js";
   import { parseAPITimestamp } from "../utils/time.js";
   import { latestActivityAt } from "../utils/effective-activity.js";
   import ItemKindChip from "../components/shared/ItemKindChip.svelte";
   import ItemStateChip from "../components/shared/ItemStateChip.svelte";
+  import RepoTypeahead from "../components/RepoTypeahead.svelte";
+  import MobileTriageSearchBar from "../components/mobile/MobileTriageSearchBar.svelte";
   import { SelectDropdown } from "@kenn-io/kit-ui";
   import WorkspaceIndicator from "../components/shared/WorkspaceIndicator.svelte";
   import CheckIcon from "@lucide/svelte/icons/check";
+  import UserRoundIcon from "@lucide/svelte/icons/user-round";
   import {
     activityBranchKey,
     activityItemKey,
@@ -40,9 +46,6 @@
     notificationReasonLabel,
     shortSha,
   } from "../components/activityRows.js";
-  import {
-    buildMobileActivityRepoOptions,
-  } from "./mobileActivityRepoOptions.js";
   import {
     createRepoLabelFormatter,
     type RepoLabelIdentity,
@@ -65,30 +68,38 @@
     events: ActivityItem[];
     eventCount: number;
     latestTime: string;
+    previewRevision: string;
     workspaceActivityAt?: string;
   };
 
   const BOT_SUFFIXES = ["[bot]", "-bot", "bot"];
+  const EVENT_TYPES = DEFAULT_EVENT_TYPES;
+  type EventType = (typeof EVENT_TYPES)[number];
+  const EVENT_LABELS: Record<EventType, string> = {
+    comment: "Comments",
+    review: "Reviews",
+    commit: "Commits",
+    force_push: "Force pushes",
+  };
   const timeRanges: TimeRange[] = ["24h", "7d", "30d", "90d"];
   const timeRangeOptions = timeRanges.map((range) => ({
     value: range,
     label: range,
   }));
   let searchInput = $state("");
+  let activityPageLimit = $state(30);
   let filtersExpanded = $state(false);
+  let flashedActivityError: string | null = null;
+  let paginationArmed = true;
+  let paginationIntersecting = false;
   let searchExecution: AppExecution<void, never> | null = null;
   let unsubSync: (() => void) | undefined;
 
-  const repoOptions = $derived.by(() =>
-    [
-      { value: "", label: "All repos" },
-      ...buildMobileActivityRepoOptions(settings.getConfiguredRepos()),
-    ],
-  );
   onMount(() => {
     activity.initializeFromMount();
     searchInput = activity.getActivitySearch() ?? "";
-    activity.setFullEventProjectionRequired(true);
+    activityPageLimit = 30;
+    activity.setActivityPageLimit(activityPageLimit);
     activity.loadActivity(true);
     activity.startActivityPolling();
     unsubSync = sync.subscribeSyncComplete(() => {
@@ -97,8 +108,19 @@
     });
   });
 
+  $effect(() => {
+    const error = activity.getActivityError();
+    if (!error) {
+      flashedActivityError = null;
+      return;
+    }
+    if (error === flashedActivityError) return;
+    flashedActivityError = error;
+    showFlash(error, { tone: "warning", durationMs: 8_000 });
+  });
+
   onDestroy(() => {
-    activity.setFullEventProjectionRequired(false);
+    activity.setActivityPageLimit(undefined);
     activity.stopActivityPolling();
     unsubSync?.();
     searchExecution?.interrupt();
@@ -208,6 +230,7 @@
           representative.created_at,
           representative.item_last_activity_at,
         ),
+        previewRevision: "",
       });
     }
 
@@ -242,6 +265,7 @@
           repo: subject.repo,
           ...(subject.workspace ? { workspace: subject.workspace } : {}),
         };
+        existing.previewRevision = subject.event_ledger_revision ?? subject.activity_at;
         continue;
       }
       groupsByKey.set(key, {
@@ -250,6 +274,7 @@
         events: [],
         eventCount: 0,
         latestTime: subject.activity_at,
+        previewRevision: subject.event_ledger_revision ?? subject.activity_at,
       });
     }
 
@@ -289,6 +314,7 @@
         events: [],
         eventCount: 0,
         latestTime: subject.activity_at,
+        previewRevision: subject.activity_at,
         workspaceActivityAt: subject.activity_at,
       });
     }
@@ -303,7 +329,7 @@
     return result;
   });
 
-  const visibleGroups = $derived(groups.slice(0, 30));
+  const visibleGroups = $derived(groups.slice(0, activityPageLimit));
 
   const authorOptions = $derived.by<TypeaheadOption[]>(() =>
     activity.getActivityAuthors().map((author) => ({
@@ -317,7 +343,9 @@
     + (selectedRepo ? 1 : 0)
     + (activity.getEnabledItemTypes().has("pr") ? 0 : 1)
     + (activity.getEnabledItemTypes().has("issue") ? 0 : 1)
+    + (EVENT_TYPES.length - activity.getEnabledEvents().size)
     + (activity.getHideBots() ? 1 : 0)
+    + (activity.getHideClosedMerged() ? 1 : 0)
     + (activity.getHideDefaultBranchActivity() ? 1 : 0)
     + (grouping.getHideOrgName() ? 1 : 0)
     + (activity.getShowNotifications() ? 0 : 1)
@@ -354,6 +382,14 @@
     applyFilters();
   }
 
+  function toggleEvent(eventType: EventType): void {
+    const next = new SvelteSet(activity.getEnabledEvents());
+    if (next.has(eventType)) next.delete(eventType);
+    else next.add(eventType);
+    activity.setEnabledEvents(next);
+    applyFilters();
+  }
+
   function setTimeRange(range: TimeRange): void {
     activity.setTimeRange(range);
     activity.syncToURL();
@@ -364,8 +400,8 @@
     setTimeRange(value as TimeRange);
   }
 
-  function handleRepoChange(value: string): void {
-    onRepoChange?.(value || undefined);
+  function handleRepoChange(value: string | undefined): void {
+    onRepoChange?.(value);
     activity.loadActivity();
   }
 
@@ -378,6 +414,11 @@
   function toggleHideBots(): void {
     activity.setHideBots(!activity.getHideBots());
     applyFilters();
+  }
+
+  function toggleHideClosedMerged(): void {
+    activity.setHideClosedMerged(!activity.getHideClosedMerged());
+    activity.loadActivity();
   }
 
   function toggleHideNotifications(): void {
@@ -428,6 +469,98 @@
     }
     onSelectItem?.(group.representative);
   }
+
+  function loadPreviewWhenVisible(key: string, previewRevision: string): Attachment<HTMLElement> {
+    return (node) => {
+      void previewRevision;
+      const load = () => activity.loadThreadPreview(key);
+
+      if (typeof IntersectionObserver === "undefined") {
+        load();
+        return;
+      }
+
+      const root = node.closest(".kit-scrollbox__viewport");
+      const execution = runtime.runCommand(
+        Effect.scoped(
+          observeIntersection(
+            node,
+            (entries) => {
+              if (entries[0]?.isIntersecting) load();
+            },
+            { root, rootMargin: "240px 0px" },
+          ).pipe(Effect.andThen(Effect.never)),
+        ),
+        {
+          operation: "observe mobile activity preview",
+          safeContext: {},
+          onFailure: () => {},
+        },
+      );
+
+      return () => execution.interrupt();
+    };
+  }
+
+  function loadMoreActivity(): void {
+    activityPageLimit = Math.min(activityPageLimit + 30, 500);
+    activity.setActivityPageLimit(activityPageLimit);
+    activity.loadActivity();
+  }
+
+  const autoloadMoreActivity: Attachment<HTMLElement> = (node) => {
+    if (typeof IntersectionObserver === "undefined") {
+      if (paginationArmed) {
+        paginationArmed = false;
+        loadMoreActivity();
+      }
+      return;
+    }
+
+    const root = node.closest<HTMLElement>(".kit-scrollbox__viewport");
+    const armPagination = () => {
+      if (paginationArmed || activity.isActivityLoading()) return;
+      paginationArmed = true;
+      if (!paginationIntersecting) return;
+      paginationArmed = false;
+      loadMoreActivity();
+    };
+    root?.addEventListener("touchstart", armPagination, { passive: true });
+    root?.addEventListener("wheel", armPagination, { passive: true });
+    root?.addEventListener("pointerdown", armPagination, { passive: true });
+    root?.addEventListener("keydown", armPagination);
+
+    const execution = runtime.runCommand(
+      Effect.scoped(
+        observeIntersection(
+          node,
+          (entries) => {
+            const nextIntersecting = entries[0]?.isIntersecting === true;
+            paginationIntersecting = nextIntersecting;
+            if (nextIntersecting && paginationArmed) {
+              paginationArmed = false;
+              loadMoreActivity();
+            }
+          },
+          { root, rootMargin: "240px 0px" },
+        ).pipe(Effect.andThen(Effect.never)),
+      ),
+      {
+        operation: "observe mobile activity pagination",
+        safeContext: {},
+        onFailure: () => {},
+      },
+    );
+
+    return () => {
+      paginationIntersecting = false;
+      root?.removeEventListener("touchstart", armPagination);
+      root?.removeEventListener("wheel", armPagination);
+      root?.removeEventListener("pointerdown", armPagination);
+      root?.removeEventListener("keydown", armPagination);
+      execution.interrupt();
+    };
+  };
 
   function subjectSelectionItem(
     subject: ActivitySubject | WorkspaceActivitySubject,
@@ -587,64 +720,64 @@
 <section class="mobile-activity-inbox" aria-label="Mobile activity inbox">
   <ScrollBox label="Activity inbox">
   <div class="mobile-activity-scroll">
-    <header class="mobile-activity-hero">
-      <p class="mobile-activity-eyebrow">
-        Activity inbox · {activity.getTimeRange()}
-      </p>
-      <h1>What needs attention?</h1>
-    </header>
-
-    <div class="mobile-activity-search">
-      <SearchInput
+    <div
+      class="mobile-activity-search-strip"
+      class:mobile-activity-search-strip--expanded={filtersExpanded}
+    >
+      <MobileTriageSearchBar
         bind:value={searchInput}
-        block
         placeholder="Search activity"
-        ariaLabel="Search activity"
+        searchAriaLabel="Search activity"
+        filterAriaLabel={activity.getActivityAuthor()
+          ? `Filters · ${activity.getActivityAuthor()}`
+          : "Filters"}
+        filterControls="mobile-activity-filters"
+        {filtersExpanded}
+        filtersActive={filtersExpanded || activeFilterCount > 0}
         oninput={handleSearchInput}
+        ontoggle={() => filtersExpanded = !filtersExpanded}
       />
     </div>
 
-    <div class="mobile-filter-summary">
-      <button
-        type="button"
-        class="mobile-filter-disclosure"
-        aria-label={activity.getActivityAuthor()
-          ? `Filters · ${activity.getActivityAuthor()}`
-          : "Filters"}
-        aria-expanded={filtersExpanded}
-        aria-controls="mobile-activity-filters"
-        onclick={() => filtersExpanded = !filtersExpanded}
-      >
-        <span>Filters</span>
-        {#if activity.getActivityAuthor()}
-          <span class="mobile-filter-author">· {activity.getActivityAuthor()}</span>
-        {/if}
-        {#if activeFilterCount > 0}
-          <span class="mobile-filter-count" aria-label={`${activeFilterCount} active filters`}>
-            {activeFilterCount}
+    <div
+      id="mobile-activity-filters"
+      class="mobile-activity-filter-grid"
+      class:mobile-activity-filter-grid--expanded={filtersExpanded}
+      aria-label="Activity filters"
+      hidden={!filtersExpanded}
+    >
+      <div class="mobile-identity-filters">
+        <div class="mobile-filter-select mobile-filter-select--repo">
+          <RepoTypeahead
+            selected={selectedRepo}
+            onchange={handleRepoChange}
+            allowPresetManagement={false}
+            mobile
+          />
+        </div>
+
+        <div class="mobile-author-filter">
+          <span class="mobile-author-icon">
+            <UserRoundIcon size="16" strokeWidth="2" aria-hidden="true" />
           </span>
-        {/if}
-        <span aria-hidden="true">{filtersExpanded ? "−" : "+"}</span>
-      </button>
-
-    </div>
-
-    {#if filtersExpanded}
-    <div id="mobile-activity-filters" class="mobile-activity-filter-grid" aria-label="Activity filters">
-      <div class="mobile-author-filter">
-        <span>Author</span>
-        <Typeahead
-          options={authorOptions}
-          value={activity.getActivityAuthor() ?? ""}
-          fallbackLabel="Anyone"
-          placeholder="Filter authors"
-          title="Filter by PR or issue author"
-          allowClear
-          clearLabel="Anyone"
-          loading={activity.isActivityAuthorsLoading()}
-          error={activity.getActivityAuthorsError() ?? ""}
-          onselect={handleAuthorSelect}
-        />
+          <div class="mobile-author-picker">
+            <Typeahead
+              options={authorOptions}
+              value={activity.getActivityAuthor() ?? ""}
+              fallbackLabel="Anyone"
+              placeholder="Filter authors"
+              title="Filter by PR or issue author"
+              allowClear
+              clearLabel="Anyone"
+              loading={activity.isActivityAuthorsLoading()}
+              error={activity.getActivityAuthorsError() ?? ""}
+              onselect={handleAuthorSelect}
+            />
+            <span class="mobile-author-summary">
+              {activity.getActivityAuthor() ? "Selected author" : "All authors"}
+            </span>
+          </div>
+        </div>
       </div>
 
       <div class="mobile-item-type-toggle">
@@ -663,6 +796,24 @@
         />
       </div>
 
+      {#each EVENT_TYPES as eventType (eventType)}
+        <div class="mobile-event-type-toggle">
+          <Toggle
+            checked={activity.getEnabledEvents().has(eventType)}
+            label={EVENT_LABELS[eventType]}
+            onchange={() => toggleEvent(eventType)}
+          />
+        </div>
+      {/each}
+
+      <div class="mobile-event-type-toggle">
+        <Toggle
+          checked={activity.getShowNotifications()}
+          label="Notifications"
+          onchange={toggleHideNotifications}
+        />
+      </div>
+
       <div class="mobile-filter-select">
         <span>Range</span>
         <SelectDropdown
@@ -674,63 +825,46 @@
         />
       </div>
 
-      <div class="mobile-filter-select mobile-filter-select--repo">
-        <span>Repo</span>
-        <SelectDropdown
-          class="mobile-filter-dropdown"
-          title="Repository"
-          value={selectedRepo ?? ""}
-          options={repoOptions}
-          onchange={handleRepoChange}
+      <div class="mobile-boolean-toggle">
+        <Toggle
+          checked={activity.getInvolvesMe()}
+          label="Involves me"
+          onchange={() => toggleInvolvesMe()}
         />
       </div>
 
-      <button
-        type="button"
-        class="mobile-filter-toggle"
-        class:active={activity.getInvolvesMe()}
-        aria-pressed={activity.getInvolvesMe()}
-        onclick={toggleInvolvesMe}
-      >Involves me</button>
+      <div class="mobile-boolean-toggle">
+        <Toggle
+          checked={activity.getHideClosedMerged()}
+          label="Hide closed/merged"
+          onchange={() => toggleHideClosedMerged()}
+        />
+      </div>
 
-      <button
-        type="button"
-        class="mobile-filter-toggle"
-        class:active={activity.getHideBots()}
-        aria-pressed={activity.getHideBots()}
-        onclick={toggleHideBots}
-      >Hide bots</button>
+      <div class="mobile-boolean-toggle">
+        <Toggle
+          checked={activity.getHideBots()}
+          label="Hide bots"
+          onchange={() => toggleHideBots()}
+        />
+      </div>
 
-      <button
-        type="button"
-        class="mobile-filter-toggle"
-        class:active={activity.getHideDefaultBranchActivity()}
-        aria-pressed={activity.getHideDefaultBranchActivity()}
-        onclick={toggleHideDefaultBranchActivity}
-      >Hide branch</button>
+      <div class="mobile-boolean-toggle">
+        <Toggle
+          checked={activity.getHideDefaultBranchActivity()}
+          label="Hide branch"
+          onchange={() => toggleHideDefaultBranchActivity()}
+        />
+      </div>
 
-      <button
-        type="button"
-        class="mobile-filter-toggle"
-        class:active={grouping.getHideOrgName()}
-        aria-pressed={grouping.getHideOrgName()}
-        onclick={toggleHideOrgName}
-      >Hide org</button>
-
-      <button
-        type="button"
-        class="mobile-filter-toggle"
-        class:active={!activity.getShowNotifications()}
-        aria-pressed={!activity.getShowNotifications()}
-        onclick={toggleHideNotifications}
-      >Hide notifications</button>
+      <div class="mobile-boolean-toggle">
+        <Toggle
+          checked={grouping.getHideOrgName()}
+          label="Hide org"
+          onchange={() => toggleHideOrgName()}
+        />
+      </div>
     </div>
-    {/if}
-
-
-    {#if activity.getActivityError()}
-      <div class="mobile-activity-error">{activity.getActivityError()}</div>
-    {/if}
 
     {#if settings.isSettingsLoaded() && !settings.hasConfiguredRepos()}
       <div class="mobile-activity-empty">No repositories configured.</div>
@@ -742,7 +876,7 @@
       <div class="mobile-activity-card-list">
         {#each visibleGroups as group (group.key)}
           {@const item = group.representative}
-          <article>
+          <article {@attach loadPreviewWhenVisible(group.key, group.previewRevision)}>
             <Card level="raised" padding="none" class="mobile-activity-card">
               <button
                 type="button"
@@ -777,7 +911,7 @@
                 </span>
                 <span class="mobile-activity-card__meta">
                   <span>{repoLabel(item)}</span>
-                  <span>{group.eventCount} {group.eventCount === 1 ? "event" : "events"}</span>
+                  <span>Recent activity</span>
                 </span>
               </button>
 
@@ -824,16 +958,13 @@
       </div>
     {/if}
 
-    {#if activity.isActivityCapped()}
-      <div class="mobile-activity-capped event-capped-notice">
-        Showing most recent 5,000 events. Narrow the range or filters to see more.
-      </div>
-    {/if}
-
-    {#if activity.isItemActivityCapped()}
-      <div class="mobile-activity-capped item-activity-capped-notice">
-        Showing the 5,000 most recently active pull requests and issues. Item totals may be incomplete; narrow the
-        range or item filters to see fewer results.
+    {#if (activity.isActivityCapped() || activity.isItemActivityCapped()) && activityPageLimit < 500}
+      <div
+        class="mobile-activity-loading-sentinel"
+        aria-live="polite"
+        {@attach autoloadMoreActivity}
+      >
+        {#if activity.isActivityLoading()}Loading more…{/if}
       </div>
     {/if}
   </div>
@@ -874,118 +1005,122 @@
     font-size: var(--font-size-md);
   }
 
-  .mobile-activity-hero {
-    margin: var(--mobile-space-2xs) var(--mobile-space-2xs) var(--mobile-space-sm);
+  .mobile-activity-search-strip {
+    margin:
+      calc(-1 * var(--mobile-space-md))
+      calc(-1 * var(--mobile-space-sm))
+      var(--mobile-space-sm);
   }
 
-  .mobile-activity-eyebrow {
-    margin: 0 0 var(--mobile-space-2xs);
-    color: var(--text-secondary);
-    font-size: var(--font-size-sm);
-    font-weight: 700;
-    letter-spacing: 0.02em;
-  }
-
-  .mobile-activity-hero h1 {
-    margin: 0;
-    color: var(--text-primary);
-    font-size: var(--font-size-xl);
-    line-height: 1.16;
-    letter-spacing: 0;
-  }
-
-  .mobile-activity-search {
-    margin-bottom: var(--mobile-space-sm);
-  }
-
-  .mobile-activity-search :global(.kit-search-input) {
-    min-height: calc(var(--mobile-hit-target) + var(--mobile-space-xs));
-    border-radius: var(--radius-lg);
-    font-size: var(--font-size-md);
-    /* The phone inbox keeps the inset field look of the original
-       hand-rolled search (mobile-routes e2e pins this against
-       --bg-inset). */
-    background: var(--bg-inset);
-  }
-
-  .mobile-filter-summary {
-    display: flex;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: var(--mobile-space-xs);
-    margin-bottom: var(--mobile-space-sm);
-  }
-
-  .mobile-filter-disclosure {
-    max-width: 100%;
-    min-height: var(--mobile-hit-target);
-    display: inline-flex;
-    align-items: center;
-    gap: var(--mobile-space-xs);
-    padding: 0 var(--mobile-space-md);
-    border: thin solid var(--border-default);
-    border-radius: var(--radius-md);
-    color: var(--text-primary);
-    background: var(--bg-inset);
-    font: inherit;
-    font-weight: 750;
-  }
-
-  .mobile-filter-author {
-    min-width: 0;
-    max-width: 12rem;
-    overflow: hidden;
-    color: var(--text-secondary);
-    font-weight: var(--font-weight-medium, 500);
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .mobile-filter-count {
-    min-width: 20px;
-    padding: 1px 6px;
-    border-radius: 999px;
-    color: var(--accent-blue);
-    background: color-mix(in srgb, var(--accent-blue) 14%, transparent);
-    font-size: var(--font-size-xs);
-    text-align: center;
+  .mobile-activity-search-strip--expanded {
+    margin-bottom: 0;
   }
 
   .mobile-activity-filter-grid {
-    display: grid;
+    display: none;
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: var(--mobile-space-xs);
-    margin-bottom: var(--mobile-space-sm);
+    margin:
+      0
+      calc(-1 * var(--mobile-space-sm))
+      var(--mobile-space-sm);
+    padding: var(--mobile-space-sm);
+    border-bottom: thin solid var(--border-muted);
+    background: var(--bg-surface);
+  }
+
+  .mobile-activity-filter-grid--expanded {
+    display: grid;
+  }
+
+  .mobile-identity-filters {
+    grid-column: 1 / -1;
+    min-width: 0;
+    display: grid;
+    gap: 0;
   }
 
   .mobile-author-filter {
     grid-column: 1 / -1;
     min-width: 0;
     display: grid;
-    grid-template-columns: auto minmax(0, 1fr);
+    grid-template-columns: 28px minmax(0, 1fr);
     align-items: center;
-    gap: var(--mobile-space-xs);
-    min-height: var(--mobile-hit-target);
-    padding: 0 var(--mobile-space-sm);
-    border: thin solid var(--border-default);
-    border-radius: var(--radius-md);
+    gap: var(--mobile-space-sm);
+    min-height: 48px;
+    padding: var(--mobile-space-2xs) var(--mobile-space-xs);
+    border: 0;
+    border-top: 0;
+    border-bottom: thin solid var(--border-muted);
+    border-radius: 0;
     color: var(--text-secondary);
-    background: var(--bg-inset);
+    background: transparent;
   }
 
-  .mobile-author-filter > span {
-    color: var(--text-muted);
-    font-size: var(--font-size-xs);
-    font-weight: 750;
+  .mobile-author-icon {
+    width: 28px;
+    height: 28px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: var(--radius-sm);
+    color: var(--accent-blue);
+    background: color-mix(in srgb, var(--accent-blue) 13%, transparent);
   }
 
-  .mobile-author-filter :global(.kit-typeahead) {
+  .mobile-author-picker {
+    min-width: 0;
+    display: grid;
+    gap: var(--mobile-space-2xs);
+  }
+
+  .mobile-author-picker :global(.kit-typeahead) {
     width: 100%;
     min-width: 0;
+    max-width: none;
+  }
+
+  .mobile-author-picker :global(.kit-typeahead__trigger) {
+    height: auto;
+    min-height: 20px;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: var(--text-primary);
+    font-size: var(--font-size-md);
+    font-weight: 700;
+  }
+
+  .mobile-author-picker :global(.kit-typeahead__trigger:hover),
+  .mobile-author-picker :global(.kit-typeahead__trigger:focus) {
+    border: 0;
+  }
+
+  .mobile-author-picker :global(.kit-typeahead__chevron) {
+    width: 16px;
+    height: 16px;
+    transform: rotate(-90deg);
+    opacity: 0.5;
+  }
+
+  .mobile-author-picker :global(.kit-typeahead__input) {
+    min-height: 24px;
+    font-size: var(--font-size-sm);
+  }
+
+  .mobile-author-summary {
+    overflow: hidden;
+    color: var(--text-muted);
+    font-size: var(--font-size-xs);
+    line-height: 1.15;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .mobile-filter-select,
-  .mobile-item-type-toggle {
+  .mobile-item-type-toggle,
+  .mobile-event-type-toggle,
+  .mobile-boolean-toggle {
     min-width: 0;
     min-height: var(--mobile-hit-target);
     display: grid;
@@ -999,17 +1134,36 @@
     background: var(--bg-inset);
   }
 
-  .mobile-item-type-toggle {
+  .mobile-item-type-toggle,
+  .mobile-event-type-toggle,
+  .mobile-boolean-toggle {
     display: flex;
+    padding: 0 var(--mobile-space-2xs);
+    border: 0;
+    border-radius: 0;
+    background: transparent;
   }
 
-  .mobile-item-type-toggle :global(.kit-toggle) {
+  .mobile-item-type-toggle :global(.kit-toggle),
+  .mobile-event-type-toggle :global(.kit-toggle),
+  .mobile-boolean-toggle :global(.kit-toggle) {
     width: 100%;
     min-height: var(--mobile-hit-target);
   }
 
   .mobile-filter-select--repo {
     grid-column: 1 / -1;
+    display: block;
+    min-height: 0;
+    padding: 0;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+  }
+
+  .mobile-filter-select--repo :global(.typeahead-popover) {
+    left: auto;
+    right: 0;
   }
 
   .mobile-filter-select span {
@@ -1055,25 +1209,6 @@
   .mobile-filter-select :global(.mobile-filter-dropdown .kit-select-dropdown__check) {
     width: 13px;
   }
-
-  .mobile-filter-toggle {
-    min-height: var(--mobile-hit-target);
-    flex: 0 0 auto;
-    padding: var(--mobile-space-sm) var(--mobile-space-md);
-    border: thin solid var(--border-default);
-    border-radius: var(--radius-md);
-    color: var(--text-secondary);
-    background: var(--bg-inset);
-    font-size: var(--font-size-sm);
-    font-weight: 750;
-  }
-
-  .mobile-filter-toggle.active {
-    color: var(--accent-blue);
-    background: color-mix(in srgb, var(--accent-blue) 12%, transparent);
-    border-color: color-mix(in srgb, var(--accent-blue) 34%, transparent);
-  }
-
 
   .mobile-activity-card-list {
     display: grid;
@@ -1263,9 +1398,7 @@
     font-weight: 750;
   }
 
-  .mobile-activity-empty,
-  .mobile-activity-error,
-  .mobile-activity-capped {
+  .mobile-activity-empty {
     padding: var(--mobile-space-lg);
     border: thin solid var(--border-default);
     border-radius: var(--radius-lg);
@@ -1275,12 +1408,12 @@
     text-align: center;
   }
 
-  .mobile-activity-error {
-    color: var(--accent-red);
-  }
-
-  .mobile-activity-capped {
-    margin-top: var(--mobile-space-md);
-    color: var(--accent-amber);
+  .mobile-activity-loading-sentinel {
+    display: grid;
+    min-height: var(--mobile-space-lg);
+    place-items: center;
+    overflow-anchor: none;
+    color: var(--text-muted);
+    font-size: var(--font-size-xs);
   }
 </style>

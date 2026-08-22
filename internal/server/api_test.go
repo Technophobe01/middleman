@@ -23965,6 +23965,89 @@ func TestAPIListActivity(t *testing.T) {
 	assert.Len(*unfiltered.JSON200.Items, len(*resp.JSON200.Items))
 }
 
+func TestAPIListCollapsedActivityHonorsLimit(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	srv, database := setupTestServer(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	for number := 1; number <= 11; number++ {
+		activityAt := now.Add(-time.Duration(number) * time.Minute)
+		seedPR(
+			t, database, "acme", "widget", number,
+			withSeedPRTimes(activityAt, activityAt, activityAt),
+		)
+	}
+
+	since := url.QueryEscape(now.Add(-7 * 24 * time.Hour).Format(time.RFC3339))
+	rr := doJSON(
+		t,
+		srv,
+		http.MethodGet,
+		"/api/v1/activity?since="+since+"&projection=collapsed&limit=10",
+		nil,
+	)
+	require.Equal(http.StatusOK, rr.Code)
+	var body activityResponse
+	require.NoError(json.NewDecoder(rr.Body).Decode(&body))
+	require.Len(body.ItemActivity, 10)
+	assert.True(body.ItemActivityCapped)
+	assert.Equal(1, body.ItemActivity[0].ItemNumber)
+}
+
+func TestAPIListCollapsedActivitySearchLimitCountsDistinctParents(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	srv, database := setupTestServer(t)
+	ctx := t.Context()
+	base := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Second)
+
+	olderPRID := seedPR(
+		t, database, "acme", "widget", 1,
+		withSeedPRTitle("Unrelated older parent"),
+		withSeedPRTimes(base, base, base),
+	)
+	require.NoError(database.UpsertMREvents(ctx, []db.MREvent{{
+		MergeRequestID: olderPRID,
+		EventType:      "issue_comment",
+		Author:         "reviewer",
+		Body:           "needle in an older event",
+		CreatedAt:      base.Add(time.Minute),
+		DedupeKey:      "older-search-match",
+	}}))
+	newerPRID := seedPR(
+		t, database, "acme", "widget", 2,
+		withSeedPRTitle("Unrelated newer parent"),
+		withSeedPRTimes(base, base, base),
+	)
+	newerEvents := make([]db.MREvent, 31)
+	for i := range newerEvents {
+		newerEvents[i] = db.MREvent{
+			MergeRequestID: newerPRID,
+			EventType:      "issue_comment",
+			Author:         "reviewer",
+			Body:           "needle repeated",
+			CreatedAt:      base.Add(2*time.Minute + time.Duration(i)*time.Second),
+			DedupeKey:      fmt.Sprintf("newer-search-match-%d", i),
+		}
+	}
+	require.NoError(database.UpsertMREvents(ctx, newerEvents))
+
+	since := url.QueryEscape(base.Add(-time.Minute).Format(time.RFC3339))
+	rr := doJSON(
+		t,
+		srv,
+		http.MethodGet,
+		"/api/v1/activity?since="+since+"&projection=collapsed&limit=30&search=needle",
+		nil,
+	)
+	require.Equal(http.StatusOK, rr.Code)
+	var body activityResponse
+	require.NoError(json.NewDecoder(rr.Body).Decode(&body))
+	require.Len(body.ItemActivity, 2)
+	assert.Equal([]int{2, 1}, []int{body.ItemActivity[0].ItemNumber, body.ItemActivity[1].ItemNumber})
+	assert.False(body.ItemActivityCapped)
+}
+
 func TestAPIListCollapsedActivityIncludesParentRecentOnlyByNotification(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)

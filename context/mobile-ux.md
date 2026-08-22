@@ -87,9 +87,22 @@ Avoid by default:
 - Tiny icon-only actions without accessible names and visible context.
 - Routing mobile taps into desktop drawer/query state with no visible phone result.
 
-Mobile Activity requires a full event projection because its cards expose event actions
-without desktop thread expansion; a collapsed desktop projection is not a valid mobile
-data source (`frontend/src/lib/views/MobileActivityView.svelte`).
+- Mobile Activity starts with 30 collapsed parents and autoloads one 30-parent chunk per
+  end-of-list scroll gesture. The response limit counts distinct parents after event
+  matching, while event scans remain separately bounded (`internal/server/huma_routes.go::Server.listActivityRouteCore`).
+- Phone PR and issue lists start with 30 items and autoload one 30-item chunk per
+  end-of-list scroll gesture. Mutation reloads retain the active chunk size
+  (`frontend/src/lib/stores/pulls.svelte.ts::createPullsStore`, `frontend/src/lib/stores/issues.svelte.ts::createIssuesStore`).
+- Phone startup and repository changes defer list loading to the current phone view
+  (`frontend/src/App.svelte::shouldDeferInitialListsToActiveView`).
+- Config and provider events refresh only the current list
+  (`frontend/src/lib/app-stores.svelte.ts::refreshVisibleData`).
+- Phone Activity, PR, and issue filters use the shared repository selector for Global,
+  saved presets, and custom selections; preset management remains outside the phone
+  workflow (`frontend/src/lib/components/RepoTypeahead.svelte`).
+- Phone Activity, PR, and issue lists share one full-width search/filter trigger; each
+  view owns its filter content. Repository selection comes first, hierarchical selectors
+  use divider rows, and booleans use unframed kit switches (`frontend/src/lib/components/mobile/MobileTriageSearchBar.svelte`).
 
 ## Routing expectations
 
