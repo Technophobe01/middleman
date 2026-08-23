@@ -2,6 +2,7 @@ package workspace
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -1606,6 +1607,13 @@ func TestSetupUsesConfiguredWorktreeBasePath(t *testing.T) {
 	localRepo, _, platformHost := setupHTTPWorktreeBaseForWorkspaceGitTest(
 		t, "feature/thing",
 	)
+	hooksDir, err := effectiveHooksDir(t.Context(), localRepo)
+	require.NoError(err)
+	binDir := t.TempDir()
+	require.NoError(os.WriteFile(
+		filepath.Join(binDir, "roborev"), []byte("#!/bin/sh\nexit 99\n"), 0o755,
+	))
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	repoID := seedRepo(t, d, platformHost, "acme", "widget")
 	seedMR(t, d, repoID, 42, "feature/thing")
 
@@ -1617,7 +1625,11 @@ func TestSetupUsesConfiguredWorktreeBasePath(t *testing.T) {
 
 	ws, err := mgr.Create(t.Context(), "github", platformHost, "acme", "widget", 42)
 	require.NoError(err)
-	require.NoError(mgr.Setup(t.Context(), ws))
+	require.NoError(mgr.SetupWithOptions(
+		t.Context(), ws, SetupOptions{RoborevInitManagedClones: true},
+	))
+	assert.NoFileExists(filepath.Join(hooksDir, "post-commit"))
+	assert.NoFileExists(filepath.Join(hooksDir, "post-rewrite"))
 
 	got, err := d.GetWorkspace(t.Context(), ws.ID)
 	require.NoError(err)
@@ -1642,6 +1654,242 @@ func TestSetupUsesConfiguredWorktreeBasePath(t *testing.T) {
 	assert.NoFileExists(filepath.Join(ws.WorktreePath, "CLAUDE.local.md"))
 	status := strings.TrimSpace(string(runWorkspaceTestGit(t, ws.WorktreePath, "status", "--porcelain")))
 	assert.Empty(status)
+}
+
+func TestSetupWithOptionsConfirmsRoborevBeforeTerminal(t *testing.T) {
+	tests := []struct {
+		name     string
+		response string
+		wantErr  string
+	}{
+		{name: "registered", response: "registered"},
+		{name: "malformed inventory", response: "malformed", wantErr: "invalid daemon response"},
+		{name: "absent registration", response: "absent", wantErr: "workspace is absent"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			t.Setenv("XDG_CONFIG_HOME", "")
+			assert := assert.New(t)
+			require := require.New(t)
+			ctx := t.Context()
+			d := openTestDB(t)
+			_, _, platformHost := setupHTTPWorktreeBaseForWorkspaceGitTest(
+				t, "feature/source",
+			)
+			remote := "http://" + platformHost + "/acme/widget.git"
+			repoID := seedRepo(t, d, platformHost, "acme", "widget")
+			require.NoError(d.UpdateRepoProviderMetadata(
+				ctx, repoID, db.RepoProviderMetadata{
+					CloneURL:      remote,
+					DefaultBranch: "main",
+				},
+			))
+
+			clones := gitclone.New(t.TempDir(), nil)
+			require.NoError(clones.EnsureCloneInNamespace(
+				ctx, workspaceCloneNamespace("github"), "github", platformHost,
+				"acme", "widget", remote,
+			))
+			cloneDir, cloneErr := clones.ClonePathInNamespace(
+				workspaceCloneNamespace("github"), platformHost, "acme", "widget",
+			)
+			require.NoError(cloneErr)
+			originalHook := []byte("#!/bin/sh\n# existing security hook\n")
+			postCommitPath := filepath.Join(cloneDir, "hooks", "post-commit")
+			require.NoError(os.WriteFile(postCommitPath, originalHook, 0o755))
+			siblingPath := filepath.Join(t.TempDir(), "sibling")
+			runWorkspaceTestGit(
+				t, cloneDir, "worktree", "add", "-b", "sibling", siblingPath, "main",
+			)
+
+			mgr := NewManager(d, t.TempDir())
+			mgr.SetClones(clones)
+			tmuxScript, tmuxRecord := writeRecorderScript(t)
+			mgr.SetTmuxCommand([]string{tmuxScript})
+
+			binDir := t.TempDir()
+			roborevInvocations := filepath.Join(t.TempDir(), "roborev-invocations")
+			t.Setenv("ROBOREV_INVOCATIONS", roborevInvocations)
+			require.NoError(os.WriteFile(filepath.Join(binDir, "roborev"), []byte(`#!/bin/sh
+set -eu
+printf 'run\n' >> "$ROBOREV_INVOCATIONS"
+hooks="$(git -C "$PWD" rev-parse --path-format=absolute --git-path hooks)"
+mkdir -p "$hooks"
+printf '\n# roborev post-commit hook\n' >> "$hooks/post-commit"
+printf '#!/bin/sh\n# roborev post-rewrite hook\n' > "$hooks/post-rewrite"
+chmod +x "$hooks/post-commit" "$hooks/post-rewrite"
+`), 0o755))
+			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+			var ws *Workspace
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				switch tt.response {
+				case "registered":
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"repos":       []map[string]string{{"root_path": ws.WorktreePath}},
+						"total_count": 1,
+					})
+				case "malformed":
+					_, _ = w.Write([]byte("{"))
+				case "absent":
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"repos":       []map[string]string{},
+						"total_count": 0,
+					})
+				}
+			}))
+			t.Cleanup(server.Close)
+			mgr.SetRoborevEndpoint(server.URL)
+			var invalidations atomic.Int32
+			mgr.SetRoborevRepositoryInvalidator(func() { invalidations.Add(1) })
+
+			var err error
+			ws, err = mgr.CreateAdHoc(
+				ctx, "github", platformHost, "acme", "widget",
+				CreateAdHocOptions{BranchName: "feature/hook-test"},
+			)
+			require.NoError(err)
+			require.NotNil(ws)
+
+			err = mgr.SetupWithOptions(ctx, ws, SetupOptions{RoborevInitManagedClones: true})
+			stored, getErr := d.GetWorkspace(ctx, ws.ID)
+			require.NoError(getErr)
+			require.NotNil(stored)
+			if tt.wantErr != "" {
+				require.ErrorContains(err, tt.wantErr)
+				assert.Equal("error", stored.Status)
+				assert.NoFileExists(tmuxRecord)
+				assert.Zero(invalidations.Load())
+				content, readErr := os.ReadFile(postCommitPath)
+				require.NoError(readErr)
+				assert.Equal(originalHook, content)
+				assert.NoFileExists(filepath.Join(cloneDir, "hooks", "post-rewrite"))
+				_, _, configErr := gitcmd.New().Run(
+					ctx, cloneDir, nil,
+					"config", "--local", "--get-all", "core.hooksPath",
+				)
+				require.Error(configErr)
+				resolved, resolveErr := effectiveHooksDir(ctx, siblingPath)
+				require.NoError(resolveErr)
+				canonicalHooks, canonicalErr := canonicalFilesystemPath(
+					filepath.Join(cloneDir, "hooks"),
+				)
+				require.NoError(canonicalErr)
+				assert.Equal(canonicalHooks, resolved)
+				return
+			}
+
+			require.NoError(err)
+			assert.Equal("ready", stored.Status)
+			assert.FileExists(tmuxRecord)
+			assert.Equal(int32(1), invalidations.Load())
+			content, readErr := os.ReadFile(postCommitPath)
+			require.NoError(readErr)
+			assert.Contains(string(content), "existing security hook")
+			assert.Contains(string(content), "roborev post-commit hook")
+
+			require.NoError(mgr.SetupWithOptions(
+				ctx, stored, SetupOptions{RoborevInitManagedClones: true},
+			))
+			invocations, readErr := os.ReadFile(roborevInvocations)
+			require.NoError(readErr)
+			assert.Len(strings.Fields(string(invocations)), 2)
+		})
+	}
+}
+
+func TestManagedRepositoryHookSetupSerializesRegistration(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", "")
+	require := require.New(t)
+	ctx := t.Context()
+	_, remote := setupLocalWorktreeBaseWithRemoteForWorkspaceGitTest(
+		t, "feature/source",
+	)
+	clones := gitclone.New(t.TempDir(), nil)
+	require.NoError(clones.EnsureCloneInNamespace(
+		ctx, workspaceCloneNamespace("github"), "github", "github.com",
+		"acme", "widget", remote,
+	))
+	cloneDir, err := clones.ClonePathInNamespace(
+		workspaceCloneNamespace("github"), "github.com", "acme", "widget",
+	)
+	require.NoError(err)
+	worktreePath := filepath.Join(t.TempDir(), "worktree")
+	runWorkspaceTestGit(
+		t, cloneDir, "worktree", "add", "-b", "serialization", worktreePath, "main",
+	)
+
+	d := openTestDB(t)
+	mgr := NewManager(d, t.TempDir())
+	mgr.SetClones(clones)
+	ws := &Workspace{
+		Platform:     "github",
+		PlatformHost: "github.com",
+		RepoOwner:    "acme",
+		RepoName:     "widget",
+		WorktreePath: worktreePath,
+	}
+	binDir := t.TempDir()
+	require.NoError(os.WriteFile(filepath.Join(binDir, "roborev"), []byte(`#!/bin/sh
+set -eu
+hooks="$(git -C "$PWD" rev-parse --path-format=absolute --git-path hooks)"
+printf '#!/bin/sh\n# roborev post-commit hook\n' > "$hooks/post-commit"
+printf '#!/bin/sh\n# roborev post-rewrite hook\n' > "$hooks/post-rewrite"
+chmod +x "$hooks/post-commit" "$hooks/post-rewrite"
+`), 0o755))
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	confirmationStarted := make(chan struct{})
+	releaseConfirmation := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseConfirmation) }) }
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if requests.Add(1) == 1 {
+			close(confirmationStarted)
+			<-releaseConfirmation
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"repos":       []map[string]string{{"root_path": worktreePath}},
+			"total_count": 1,
+		})
+	}))
+	t.Cleanup(server.Close)
+	t.Cleanup(release)
+	mgr.SetRoborevEndpoint(server.URL)
+
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- mgr.setupManagedRepositoryHooks(ctx, cloneDir, ws)
+	}()
+	select {
+	case <-confirmationStarted:
+	case <-time.After(5 * time.Second):
+		require.FailNow("first setup did not begin registration confirmation")
+	}
+
+	secondCtx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
+	defer cancel()
+	err = mgr.setupManagedRepositoryHooks(secondCtx, cloneDir, ws)
+	require.ErrorIs(err, context.DeadlineExceeded)
+	require.Equal(int32(1), requests.Load())
+	observedAt := time.Date(2026, 8, 23, 0, 0, 0, 0, time.UTC)
+	_, _, err = d.ReconcileRepositoryObservation(ctx, db.RepoIdentity{
+		Platform: "github", PlatformHost: "github.com", PlatformRepoID: "repo-old",
+		Owner: "acme", Name: "widget",
+	}, observedAt)
+	require.NoError(err)
+	_, _, err = d.ReconcileRepositoryObservation(ctx, db.RepoIdentity{
+		Platform: "github", PlatformHost: "github.com", PlatformRepoID: "repo-new",
+		Owner: "acme", Name: "widget",
+	}, observedAt.Add(time.Hour))
+	require.NoError(err)
+	release()
+	require.ErrorContains(<-firstDone, "historical occupants")
+	require.NoFileExists(filepath.Join(cloneDir, "hooks", "post-commit"))
+	require.NoFileExists(filepath.Join(cloneDir, "hooks", "post-rewrite"))
 }
 
 func TestSetupReusesExistingWorkspaceWorktree(t *testing.T) {

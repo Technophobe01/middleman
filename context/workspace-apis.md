@@ -27,6 +27,9 @@ embedder protocol for arbitrary host state.
 - Fleet consumes Workspace-owned summary and runtime snapshots, never the
   Workspace manager or root server receiver
   (`internal/server/workspaceapi/fleet_snapshot.go::FleetSnapshot`).
+- Managed clones keep `core.bare=true` in shared config and override it per
+  linked worktree; repository tools use the shared value to identify this layout
+  (`internal/workspace/manager.go::configureBareLinkedWorktree`).
 
 ## Endpoint Intent
 
@@ -266,6 +269,21 @@ Persisted workspace `worktree_path` values should be absolute. Workspace setup
 runs `git worktree add` from the managed clone or configured base checkout, so
 relative paths would be interpreted relative to that Git directory while later
 API reads interpret them relative to the kenn-forge server process.
+
+Managed-clone hooks must carry the exact common Git directory and ownership flag
+through new and reused worktrees; never infer ownership from paths or run them for
+`worktree_base_path` repositories (`internal/workspace/manager.go::SetupWithOptions`).
+After branch persistence, `repository_hooks` holds a fresh repository lock while
+requiring Roborev to use common-directory hooks, resolving the trusted default only
+from fetched remote refs, and configuring a worktree-specific snapshot exclude
+without replacing explicit or implicit user exclusion rules. A custom effective
+hooks directory is a setup error; shared hook changes roll back unless
+registration succeeds.
+Only regular root config files on that commit are trusted; a workspace Roborev
+snapshot path must match it or use `.roborev`. Registration confirmation, final
+route validation, and rollback stay under the repository lock; cache invalidation
+follows lock release
+(`internal/workspace/repository_hooks.go::Manager.setupManagedRepositoryHooks`).
 
 Keep Git worktree and merge-request lifecycle semantics in
 `go.kenn.io/kit/git/managed`; kenn-forge supplies application policy instead of
