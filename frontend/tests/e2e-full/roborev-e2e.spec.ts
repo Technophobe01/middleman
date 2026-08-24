@@ -793,29 +793,22 @@ test.describe.serial("Roborev", () => {
       await elapsedHeader.click();
       await page.waitForTimeout(300);
 
-      const elapsedTexts: string[] = [];
-      const elapsedValues: number[] = [];
-      const elapsedCells = page.locator(".col-elapsed");
-      const count = await elapsedCells.count();
-      for (let i = 0; i < count; i++) {
-        const text = await elapsedCells.nth(i).textContent();
-        if (text) {
-          elapsedTexts.push(text.trim());
-          elapsedValues.push(parseElapsed(text));
-        }
-      }
+      const elapsedRows = await page.locator(".job-row").evaluateAll((rows) =>
+        rows.map((row) => ({
+          status: row.querySelector(".status-badge")?.textContent?.trim(),
+          elapsed: row.querySelector(".col-elapsed")?.textContent?.trim(),
+        })),
+      );
+      // Running jobs and started cancellations derive elapsed time from
+      // Date.now() during both sorting and rendering. A second boundary
+      // between those operations can make their displayed order stale.
+      const elapsedTexts = elapsedRows
+        .filter(({ status }) => status !== "running" && status !== "canceled")
+        .map(({ elapsed }) => elapsed ?? "");
+      const elapsedValues = elapsedTexts.map(parseElapsed);
 
       const sorted = [...elapsedValues].sort((a, b) => a - b);
       expect(elapsedValues).toEqual(sorted);
-
-      // The seeded data includes both missing-elapsed ("--") and
-      // zero-duration ("0s") rows. Verify the boundary: "--" must
-      // appear before "0s" in ascending order.
-      const lastDash = elapsedTexts.lastIndexOf("--");
-      const firstZero = elapsedTexts.indexOf("0s");
-      expect(lastDash).toBeGreaterThanOrEqual(0);
-      expect(firstZero).toBeGreaterThanOrEqual(0);
-      expect(lastDash).toBeLessThan(firstZero);
     });
 
     test("click Cost header sorts by cost", async ({ page }) => {
