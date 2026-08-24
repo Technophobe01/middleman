@@ -379,6 +379,7 @@
   // briefly outlives the workspace it was fetched for).
   let runtimeForId = $state<string>("");
   let runtimeForHostKey = $state<string | undefined>(undefined);
+  let runtimeSnapshotAuthoritative = $state(false);
   let loadError = $state<string | null>(null);
   let retryingSetup = $state(false);
   let refreshingWorkspace = $state(false);
@@ -1181,20 +1182,33 @@
   );
 
   function upsertRuntimeSession(session: RuntimeSession): RuntimeSession[] {
+    const currentRuntime =
+      runtime !== null &&
+      runtimeForId === workspaceId &&
+      runtimeForHostKey === workspaceHostKey
+        ? runtime
+        : null;
+    if (currentRuntime === null) runtimeSnapshotAuthoritative = false;
     const sessions = [
-      ...runtimeSessions.filter((candidate) => candidate.key !== session.key),
+      ...(currentRuntime?.sessions ?? []).filter(
+        (candidate) =>
+          candidate.key !== session.key &&
+          !closedSessions.some((closed) =>
+            sessionGenerationMatches(closed, candidate),
+          ),
+      ),
       session,
     ];
-    if (runtimeLive && runtime) {
-      invalidateRuntimeSnapshot();
-      runtime = {
-        ...runtime,
-        sessions: [
-          ...runtime.sessions.filter((candidate) => candidate.key !== session.key),
-          session,
-        ],
-      };
-    }
+    invalidateRuntimeSnapshot();
+    runtime = {
+      launch_targets: currentRuntime?.launch_targets ?? [],
+      sessions: [
+        ...(currentRuntime?.sessions ?? []).filter((candidate) => candidate.key !== session.key),
+        session,
+      ],
+    };
+    runtimeForId = workspaceId;
+    runtimeForHostKey = workspaceHostKey;
     return sessions;
   }
   const currentTerminalGroup = $derived(activeTerminalGroup(terminalLayout));
@@ -1713,11 +1727,11 @@
         disabled: actionsBlocked,
       });
     }
-    // An empty list is authoritative only after this workspace's runtime
-    // snapshot is live. During a route switch `runtimeSessions` is deliberately
-    // empty while the fetch is pending; treating that transient state as a
-    // tombstone would discard the retained terminal just before it is reused.
-    const liveGenerationKeys = runtimeLive
+    // Absences are authoritative only after a server runtime read. During a
+    // route switch `runtimeSessions` is empty, and launch replay can publish a
+    // live snapshot containing only its confirmed session. Neither may tombstone
+    // retained peers before hydration reconciles the complete session list.
+    const liveGenerationKeys = runtimeLive && runtimeSnapshotAuthoritative
       ? new Set(runtimeSessions.map(sessionHostKeyFor))
       : null;
     untrack(() => {
@@ -2241,6 +2255,7 @@
         ) {
           completeAcceptedWorkspaceLaunch(id, hostKey, acceptedLaunch.sessionKey);
         }
+        runtimeSnapshotAuthoritative = true;
         if (
           hasAppliedRuntimeFor(id, hostKey) &&
           appliedRuntimeState?.fingerprint === fingerprint
@@ -2453,42 +2468,46 @@
             return true;
           });
         }
+        if (state.request.placement._tag === "Workflow") {
+          // A successful launch response names the session the server already
+          // recorded. Publish it now; the runtime reload only reconciles peers.
+          return Effect.sync(() => {
+            if (!isCurrentWorkspace(id, hostKey)) return false;
+            const session = state.session;
+            clearClosedSession(session);
+            applySessionToWorkflow(session.key, upsertRuntimeSession(session));
+            closeLauncher();
+            requestSessionFocus(sessionHostKeyFor(session));
+            clearRuntimeMutationPending(state);
+            requestRuntime({ force: true });
+            return true;
+          });
+        }
+        const placement = state.request.placement;
         return Effect.gen(function* () {
-          const refreshed = yield* fetchRuntimeProgram({ force: true });
+          yield* fetchRuntimeProgram({ force: true });
           if (!isCurrentWorkspace(id, hostKey)) return false;
           yield* Effect.sync(() => {
             const session = state.session;
             clearClosedSession(session);
-            if (state.request.placement._tag === "Workflow") {
-              moveSessionToWorkflow(session.key);
-              mountSessionTerminal(session.key);
-              selectWorkspaceTab(workflowTabKeyForSession(session.key));
-              if (refreshed?.sessions.some((candidate) => candidate.key === session.key) === true) {
-                closeLauncher();
-                requestSessionFocus(sessionHostKeyFor(session));
-              } else {
-                showFlash("Session launched, but the workspace could not be reloaded", { tone: "danger" });
-              }
-            } else if (state.request.placement._tag === "Terminal") {
-              if (state.request.placement.insertIntoTree) {
-                const sessionsWithLaunch = upsertRuntimeSession(session);
-                const groups = addTerminalGroup(terminalLayout.terminalGroups, session.key);
-                const activeGroupID = groups.at(-1)?.id ?? terminalLayout.activeTerminalGroupID;
-                terminalLayout = normalizeLayoutForSessions(
-                  sessionsWithLaunch,
-                  layoutWithTerminalGroups(
-                    {
-                      ...terminalLayout,
-                      open: true,
-                      sessionRegions: { ...terminalLayout.sessionRegions, [session.key]: "terminal" },
-                    },
-                    groups,
-                    activeGroupID,
-                  ),
-                );
-              }
-              if (terminalLayout.dock === "top") selectWorkspaceTab("terminal");
+            if (placement.insertIntoTree) {
+              const sessionsWithLaunch = upsertRuntimeSession(session);
+              const groups = addTerminalGroup(terminalLayout.terminalGroups, session.key);
+              const activeGroupID = groups.at(-1)?.id ?? terminalLayout.activeTerminalGroupID;
+              terminalLayout = normalizeLayoutForSessions(
+                sessionsWithLaunch,
+                layoutWithTerminalGroups(
+                  {
+                    ...terminalLayout,
+                    open: true,
+                    sessionRegions: { ...terminalLayout.sessionRegions, [session.key]: "terminal" },
+                  },
+                  groups,
+                  activeGroupID,
+                ),
+              );
             }
+            if (terminalLayout.dock === "top") selectWorkspaceTab("terminal");
             clearRuntimeMutationPending(state);
           });
           return true;
@@ -2872,16 +2891,23 @@
     }
   }
 
-  function moveSessionToWorkflow(sessionKey: string): void {
+  function moveSessionToWorkflow(
+    sessionKey: string,
+    sessions: RuntimeSession[] = runtimeSessions,
+  ): void {
     if (actionsBlocked) return;
-    const session = runtimeSessions.find((candidate) => candidate.key === sessionKey);
+    applySessionToWorkflow(sessionKey, sessions);
+  }
+
+  function applySessionToWorkflow(sessionKey: string, sessions: RuntimeSession[]): void {
+    const session = sessions.find((candidate) => candidate.key === sessionKey);
     if (!session) return;
     if (isPromoted(session)) surfaceLayout?.demoteTab(sessionPaneKeyFor(session));
     const terminalGroups = closeSessionInTerminalGroups(
       terminalLayout.terminalGroups,
       sessionKey,
     );
-    terminalLayout = normalizeLayoutForSessions(runtimeSessions, {
+    terminalLayout = normalizeLayoutForSessions(sessions, {
       ...layoutWithTerminalGroups(
         {
           ...terminalLayout,
@@ -3762,6 +3788,7 @@
     const id = workspaceId;
     const hostKey = workspaceHostKey;
     workspacePresentationGeneration += 1;
+    runtimeSnapshotAuthoritative = false;
     if (
       appliedRuntimeState?.workspaceId !== id ||
       appliedRuntimeState.hostKey !== hostKey
