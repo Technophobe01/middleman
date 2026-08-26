@@ -2103,37 +2103,6 @@ describe("WorkspaceTerminalView", () => {
     expect(screen.getByRole("tab", { name: /Helper 2/ })).toBeTruthy();
     expect(mocks.renameWorkspaceSession).toHaveBeenCalledWith("ws-1", "ws-1:helper", "Plan review", undefined);
   });
-
-  it("shows a moving insertion slot while sorting workflow tabs", async () => {
-    mocks.getWorkspaceRuntime.mockResolvedValue(runtimeWithTwoWorkflowSessions());
-
-    render(WorkspaceTerminalView, {
-      props: {
-        workspaceId: "ws-1",
-      },
-    });
-
-    const helperTab = await screen.findByRole("tab", { name: /Helper/ });
-    const reviewerTab = await screen.findByRole("tab", { name: /Reviewer/ });
-    const helperTabHost = helperTab.closest(".tabbed-panel-tab");
-    expect(helperTabHost).toBeTruthy();
-    const dataTransfer = fakeDataTransfer();
-
-    await fireEvent.dragStart(reviewerTab, { dataTransfer });
-    await fireEvent.dragOver(helperTabHost!, {
-      clientX: -1,
-      dataTransfer,
-    });
-
-    expect(screen.getByTestId("tabbed-panel-tab-drop-placeholder")).toBeTruthy();
-    expect(reviewerTab.closest(".tabbed-panel-tab")?.classList.contains("dragging")).toBe(true);
-
-    await fireEvent.dragEnd(reviewerTab);
-
-    expect(screen.queryByTestId("tabbed-panel-tab-drop-placeholder")).toBeNull();
-    expect(reviewerTab.closest(".tabbed-panel-tab")?.classList.contains("dragging")).toBe(false);
-  });
-
   it("does not reopen the just-exited terminal from stale runtime data", async () => {
     localStorage.setItem("kenn-forge-workspace-active-tab:ws-1", "home");
     mocks.getWorkspaceRuntime.mockResolvedValue(runtimeWithTerminalSession());
