@@ -92,13 +92,16 @@ func (missingRouteTokenSource) Descriptor() tokenauth.Descriptor {
 }
 
 type githubCredentialRoute struct {
-	key            tokenauth.Key
-	source         tokenauth.Source
-	client         github.Client
-	fetcher        *github.GraphQLFetcher
-	discoveryOwner string
-	readIdentity   github.IdentityKey
-	writeIdentity  github.IdentityKey
+	key                 tokenauth.Key
+	source              tokenauth.Source
+	client              github.Client
+	fetcher             *github.GraphQLFetcher
+	discoveryOwner      string
+	readIdentity        github.IdentityKey
+	writeIdentity       github.IdentityKey
+	archiveKey          tokenauth.Key
+	archiveSource       tokenauth.Source
+	archiveReadIdentity github.IdentityKey
 }
 
 type providerStartup struct {
@@ -279,13 +282,54 @@ func providerTokenSources(
 			continue
 		}
 		_, seen := providerSources[key]
+		tokenCtx := ctx
+		if plan.GitHubOwner != "" {
+			tokenCtx = tokenauth.WithGitHubOwner(tokenCtx, plan.GitHubOwner)
+		}
+		if plan.ArchiveDescriptor.Key.Host != "" {
+			archiveDesc := plan.ArchiveDescriptor
+			archiveSrc := set.Upsert(archiveDesc)
+			if resolve {
+				if _, err := archiveSrc.Token(tokenCtx); err != nil {
+					if degradeFailedHosts {
+						// Archive capacity is independent of ordinary sync.
+						// Keep processing the ordinary descriptor so a broken
+						// archive App cannot take the whole host offline.
+						slog.Warn(
+							"provider archive credentials unavailable; serving cached data for it without sync",
+							"platform", archiveDesc.Key.Platform,
+							"host", archiveDesc.Key.Host,
+							"err", err,
+						)
+					} else {
+						label := fmt.Sprintf(
+							"%s host %s archive", archiveDesc.Key.Platform,
+							archiveDesc.Key.Host,
+						)
+						if plan.GitHubOwner != "" {
+							label = fmt.Sprintf("%s owner %s", label, plan.GitHubOwner)
+						}
+						return nil, fmt.Errorf(
+							"no token for %s via %s: %w",
+							label, archiveDesc.SafeString(), err,
+						)
+					}
+				}
+			}
+		}
 		src := set.Upsert(desc)
 		if resolve {
-			tokenCtx := ctx
-			if plan.GitHubOwner != "" {
-				tokenCtx = tokenauth.WithGitHubOwner(tokenCtx, plan.GitHubOwner)
-			}
 			if _, err := src.Token(tokenCtx); err != nil {
+				if plan.ArchiveOnly && errors.Is(err, tokenauth.ErrMissingToken) {
+					// An archive-only App is intentionally independent of the
+					// ordinary PAT chain. Keep the host provider present so its
+					// routed client can serve archive requests, while the route
+					// builder omits the unusable ordinary client.
+					if !seen {
+						providerSources[key] = src
+					}
+					continue
+				}
 				if !plan.Required && errors.Is(err, tokenauth.ErrMissingToken) {
 					continue
 				}
@@ -613,26 +657,21 @@ func buildGitHubIdentityRuntimes(
 		// failing startup. Explicit host fallbacks still fail hard.
 		bestEffort := !plan.Required && desc.Key.Scope == "" &&
 			len(requiredHosts) > 0 && !hasExplicitGitHubFallback(cfg, desc.Key.Host)
-		var source tokenauth.Source = set.Upsert(desc)
+		var source tokenauth.Source
 		app, hasApp := activeGitHubAppCandidate(desc, plan.GitHubOwner)
-		resolvedWrite, err := resolveGitHubPATIdentity(
-			ctx, resolver, desc.Key.Host, source, resolvedPATs,
-		)
-		writeIdentity := resolvedWrite.identity
-		if err != nil {
-			if errors.Is(err, tokenauth.ErrMissingToken) && hasApp {
-				writeIdentity = github.GitHubIdentity{}
-			} else if !plan.Required && errors.Is(err, tokenauth.ErrMissingToken) {
-				continue
-			} else if bestEffort {
-				slog.Warn(
-					"skipping implicit GitHub host fallback; ownerless APIs stay unrouted until it resolves",
-					"host", desc.Key.Host,
-					"source", desc.SafeString(),
-					"error", err,
-				)
-				continue
-			} else {
+		var writeIdentity, readIdentity github.GitHubIdentity
+		ordinaryUnavailable := false
+		if plan.ArchiveOnly {
+			// Archive-only routes are allowed to have no ordinary PAT. Keep
+			// building the route so the independent archive client remains
+			// available; ordinary operations fail closed through the router.
+			source = set.Upsert(desc)
+			resolvedWrite, err := resolveGitHubPATIdentity(
+				ctx, resolver, desc.Key.Host, source, resolvedPATs,
+			)
+			if err != nil && errors.Is(err, tokenauth.ErrMissingToken) {
+				ordinaryUnavailable = true
+			} else if err != nil {
 				return &providerHostStartupError{
 					platformName: desc.Key.Platform,
 					host:         desc.Key.Host,
@@ -641,43 +680,148 @@ func buildGitHubIdentityRuntimes(
 						desc.Key.Scope, desc.SafeString(), err,
 					),
 				}
+			} else {
+				writeIdentity = resolvedWrite.identity
+				if writeIdentity.Key.Principal != "" {
+					source = github.BindSourceIdentity(
+						source, desc.Key.Host, writeIdentity.Key,
+						resolvedWrite.token, resolver,
+					)
+				}
 			}
 		}
-		readIdentity := writeIdentity
-		if hasApp {
-			if app.InstallationID <= 0 {
-				return fmt.Errorf(
-					"resolve GitHub identity for %s via %s: invalid installation id %d",
-					desc.Key.Scope, desc.SafeString(), app.InstallationID,
+		if !ordinaryUnavailable {
+			if !plan.ArchiveOnly {
+				source = set.Upsert(desc)
+				resolvedWrite, err := resolveGitHubPATIdentity(
+					ctx, resolver, desc.Key.Host, source, resolvedPATs,
+				)
+				writeIdentity = resolvedWrite.identity
+				if err != nil {
+					if errors.Is(err, tokenauth.ErrMissingToken) && hasApp {
+						writeIdentity = github.GitHubIdentity{}
+					} else if !plan.Required && errors.Is(err, tokenauth.ErrMissingToken) {
+						continue
+					} else if bestEffort {
+						slog.Warn(
+							"skipping implicit GitHub host fallback; ownerless APIs stay unrouted until it resolves",
+							"host", desc.Key.Host,
+							"source", desc.SafeString(),
+							"error", err,
+						)
+						continue
+					} else {
+						return &providerHostStartupError{
+							platformName: desc.Key.Platform,
+							host:         desc.Key.Host,
+							err: fmt.Errorf(
+								"resolve GitHub identity for %s via %s: %w",
+								desc.Key.Scope, desc.SafeString(), err,
+							),
+						}
+					}
+				}
+				if writeIdentity.Key.Principal != "" {
+					source = github.BindSourceIdentity(
+						source, desc.Key.Host, writeIdentity.Key,
+						resolvedWrite.token, resolver,
+					)
+				}
+			}
+			if hasApp {
+				if app.InstallationID <= 0 {
+					return fmt.Errorf(
+						"resolve GitHub identity for %s via %s: invalid installation id %d",
+						desc.Key.Scope, desc.SafeString(), app.InstallationID,
+					)
+				}
+				readIdentity = github.InstallationIdentity(
+					desc.Key.Host, app.InstallationID,
+				)
+			} else {
+				readIdentity = writeIdentity
+			}
+			ensureGitHubIdentityRuntime(
+				database, budgetPerHour, readIdentity, startup,
+			)
+			if writeIdentity.Key.Principal != "" {
+				ensureGitHubIdentityRuntime(
+					database, budgetPerHour, writeIdentity, startup,
 				)
 			}
-			readIdentity = github.InstallationIdentity(
-				desc.Key.Host, app.InstallationID,
-			)
-		}
-		ensureGitHubIdentityRuntime(
-			database, budgetPerHour, readIdentity, startup,
-		)
-		if writeIdentity.Key.Principal != "" {
+		} else {
+			// Keep the ordinary side of the route present but unusable. The
+			// host provider and router still need a route object for archive
+			// requests; ordinary calls fail closed without borrowing the
+			// archive App's identity.
+			source = missingRouteTokenSource{
+				host:  desc.Key.Host,
+				owner: strings.TrimPrefix(desc.Key.Scope, "owner:"),
+			}
+			readIdentity = github.GitHubIdentity{
+				Key: github.HostIdentity(desc.Key.Host),
+			}
 			ensureGitHubIdentityRuntime(
-				database, budgetPerHour, writeIdentity, startup,
+				database, budgetPerHour, readIdentity, startup,
 			)
 		}
-		if writeIdentity.Key.Principal != "" {
-			source = github.BindSourceIdentity(
-				source, desc.Key.Host, writeIdentity.Key, resolvedWrite.token, resolver,
+		var archiveSource tokenauth.Source
+		var archiveIdentity github.IdentityKey
+		var archiveKey tokenauth.Key
+		if plan.ArchiveDescriptor.Key.Host != "" {
+			archiveSource = set.Upsert(plan.ArchiveDescriptor)
+			archiveCtx := ctx
+			if plan.GitHubOwner != "" {
+				archiveCtx = tokenauth.WithGitHubOwner(archiveCtx, plan.GitHubOwner)
+			}
+			if _, err := archiveSource.Token(archiveCtx); err != nil {
+				// Archive capacity is independent from ordinary sync. A
+				// degraded startup may keep the ordinary route while leaving
+				// this route absent until the next restart or reload.
+				slog.Warn(
+					"GitHub archive credentials unavailable; disabling archive route",
+					"host", plan.ArchiveDescriptor.Key.Host,
+					"scope", plan.ArchiveDescriptor.Key.Scope,
+					"err", err,
+				)
+				archiveSource = nil
+			}
+		}
+		if archiveSource != nil {
+			archiveApp, archiveOK := activeGitHubAppCandidate(
+				plan.ArchiveDescriptor, plan.GitHubOwner,
 			)
+			if archiveOK {
+				if archiveApp.InstallationID <= 0 {
+					return fmt.Errorf(
+						"resolve GitHub archive identity for %s via %s: invalid installation id %d",
+						plan.ArchiveDescriptor.Key.Scope,
+						plan.ArchiveDescriptor.SafeString(), archiveApp.InstallationID,
+					)
+				}
+				archiveIdentity = github.InstallationIdentity(
+					plan.ArchiveDescriptor.Key.Host, archiveApp.InstallationID,
+				).Key
+				archiveKey = plan.ArchiveDescriptor.Key
+				ensureGitHubIdentityRuntime(
+					database, budgetPerHour,
+					github.GitHubIdentity{Key: archiveIdentity}, startup,
+				)
+			}
 		}
 		discoveryOwner := ""
 		if hasApp && strings.HasPrefix(desc.Key.Scope, "repo:") {
 			discoveryOwner = app.InstallationAccount
 		}
 		startup.githubRoutes[desc.Key] = githubCredentialRoute{
-			key:            desc.Key,
-			source:         source,
-			discoveryOwner: discoveryOwner,
-			readIdentity:   readIdentity.Key,
-			writeIdentity:  writeIdentity.Key,
+			key:                 desc.Key,
+			source:              source,
+			discoveryOwner:      discoveryOwner,
+			readIdentity:        readIdentity.Key,
+			writeIdentity:       writeIdentity.Key,
+			archiveKey:          archiveKey,
+			archiveSource:       archiveSource,
+			archiveReadIdentity: archiveIdentity,
 		}
 	}
 	return nil
@@ -780,6 +924,36 @@ func buildGitHubRouteClients(startup *providerStartup) error {
 				startup.quotaRegistry, configured.readIdentity,
 			),
 		)
+		var archiveClient github.Client
+		var archiveFetcher *github.GraphQLFetcher
+		if configured.archiveSource != nil && configured.archiveReadIdentity.Principal != "" {
+			archiveRuntime := startup.githubIdentities[configured.archiveReadIdentity.String()]
+			if archiveRuntime == nil {
+				return fmt.Errorf("create GitHub route %s archive client: missing identity runtime", key.Scope)
+			}
+			archiveClient, err = github.NewClient(
+				configured.archiveSource, key.Host, archiveRuntime.rest,
+				archiveRuntime.budget,
+				github.WithMutationsDisabled(),
+				github.WithQuotaAccounting(
+					startup.quotaRegistry,
+					configured.archiveReadIdentity, configured.archiveReadIdentity,
+				),
+			)
+			if err != nil {
+				return fmt.Errorf("create GitHub route %s archive client: %w", key.Scope, err)
+			}
+			if setter, ok := archiveClient.(graphQLRateTrackerSetter); ok {
+				setter.SetGraphQLRateTracker(archiveRuntime.graphql)
+			}
+			archiveFetcher = github.NewGraphQLFetcher(
+				configured.archiveSource, key.Host, archiveRuntime.graphql,
+				archiveRuntime.budget,
+				github.WithGraphQLQuotaAccounting(
+					startup.quotaRegistry, configured.archiveReadIdentity,
+				),
+			)
+		}
 		var writeSnapshotClient github.Client
 		if writeRuntime != nil && configured.writeIdentity != configured.readIdentity {
 			writeSnapshotClient, err = github.NewClient(
@@ -820,6 +994,10 @@ func buildGitHubRouteClients(startup *providerStartup) error {
 			WriteSnapshotClient: writeSnapshotClient,
 			Fetcher:             fetcher, ReadIdentity: configured.readIdentity,
 			WriteIdentity: configured.writeIdentity,
+			ArchiveKey:    archiveRouteKey(configured.archiveKey, key.Host),
+			ArchiveClient: archiveClient, ArchiveFetcher: archiveFetcher,
+			ArchiveCredentialKey: archiveCredentialKey(configured.archiveSource),
+			ArchiveReadIdentity:  configured.archiveReadIdentity,
 		})
 	}
 	for host, routes := range byHost {
@@ -847,6 +1025,22 @@ func githubRouteOwnerAndName(scope string) (string, string) {
 	default:
 		return "", ""
 	}
+}
+
+func archiveRouteOwnerAndName(scope string) (string, string) {
+	return githubRouteOwnerAndName(strings.TrimPrefix(scope, "archive:"))
+}
+
+func archiveRouteKey(key tokenauth.Key, host string) github.RouteKey {
+	owner, name := archiveRouteOwnerAndName(key.Scope)
+	return github.RouteKey{Host: host, Owner: owner, Name: name}
+}
+
+func archiveCredentialKey(source tokenauth.Source) string {
+	if source == nil {
+		return ""
+	}
+	return source.Descriptor().CanonicalSourceString()
 }
 
 func githubCredentialPlans(cfg *config.Config) []config.ProviderTokenSource {

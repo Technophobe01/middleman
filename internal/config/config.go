@@ -53,6 +53,23 @@ const (
 	maxSSEBufferSize                       = 16384
 )
 
+func githubAppRole(app GitHubAppConfig) string {
+	role := strings.ToLower(strings.TrimSpace(app.Role))
+	if role == "" {
+		return GitHubAppRoleSync
+	}
+	return role
+}
+
+const (
+	// GitHubAppRoleSync is the default GitHub App role for ordinary sync and
+	// user-facing reads.
+	GitHubAppRoleSync = "sync"
+	// GitHubAppRoleArchive reserves an installation for historical archive
+	// work. Archive requests use this App's independent GitHub quota.
+	GitHubAppRoleArchive = "archive"
+)
+
 const (
 	// IssueWorkspaceBranchStyleSlug appends a slug derived from the
 	// issue title onto kenn-forge/issue-<n>, producing recognizable
@@ -218,15 +235,18 @@ type GitHubOwnerTokenConfig struct {
 // private key carry their own rate-limit budget, taking sync traffic
 // off the host's PAT.
 //
-// Scope decision: one app per GitHub host with one recorded
-// installation, and one active credential chain per host. An
-// installation token only reaches repos the installation covers. "All
-// repositories" installations build owner routes; "Only select repositories"
-// installations build exact routes for the recorded selected set, while
-// uncovered repos fall through to the owner or host PAT chain. An entry without
-// an installation_id is dormant and the PAT chain stays in effect.
+// Scope decision: one sync app and one archive app may serve each GitHub host
+// and installation account. An installation token only reaches repos the
+// installation covers. "All repositories" installations build owner routes;
+// "Only select repositories" installations build exact routes for the recorded
+// selected set, while uncovered repos fall through to the owner or host PAT
+// chain. An entry without an installation_id is dormant and the PAT chain
+// stays in effect.
 type GitHubAppConfig struct {
-	Host                string `toml:"host" json:"host"`
+	Host string `toml:"host" json:"host"`
+	// Role selects which Forge workload uses this App. Empty values retain
+	// the normal sync role for backwards-compatible configuration files.
+	Role                string `toml:"role,omitempty" json:"role,omitempty"`
 	AppID               int64  `toml:"app_id" json:"app_id"`
 	Slug                string `toml:"slug,omitempty" json:"slug,omitempty"`
 	Owner               string `toml:"owner,omitempty" json:"owner,omitempty"`
@@ -1962,9 +1982,20 @@ func (c *Config) validateGitHubOwnerTokens() error {
 func (c *Config) validateGitHubApps() error {
 	seenOwners := make(map[string]struct{}, len(c.GitHubApps))
 	seenInstallations := make(map[string]struct{}, len(c.GitHubApps))
+	seenInstallationIdentities := make(map[string]string, len(c.GitHubApps))
 	for i := range c.GitHubApps {
 		app := &c.GitHubApps[i]
 		app.Host = strings.TrimSpace(app.Host)
+		app.Role = strings.ToLower(strings.TrimSpace(app.Role))
+		if app.Role == "" {
+			app.Role = GitHubAppRoleSync
+		}
+		if app.Role != GitHubAppRoleSync && app.Role != GitHubAppRoleArchive {
+			return fmt.Errorf(
+				"config: github_apps[%d]: role must be %q or %q (got %q)",
+				i, GitHubAppRoleSync, GitHubAppRoleArchive, app.Role,
+			)
+		}
 		app.Slug = strings.TrimSpace(app.Slug)
 		app.Owner = strings.TrimSpace(app.Owner)
 		app.PrivateKeyPath = strings.TrimSpace(app.PrivateKeyPath)
@@ -2014,7 +2045,7 @@ func (c *Config) validateGitHubApps() error {
 		if owner == "" {
 			owner = fmt.Sprintf("app:%d", app.AppID)
 		}
-		ownerKey := host + "\x00" + owner
+		ownerKey := host + "\x00" + app.Role + "\x00" + owner
 		if _, ok := seenOwners[ownerKey]; ok {
 			label := app.Owner
 			if label == "" {
@@ -2027,7 +2058,7 @@ func (c *Config) validateGitHubApps() error {
 		}
 		seenOwners[ownerKey] = struct{}{}
 		if app.InstallationAccount != "" {
-			installKey := host + "\x00" + strings.ToLower(app.InstallationAccount)
+			installKey := host + "\x00" + app.Role + "\x00" + strings.ToLower(app.InstallationAccount)
 			if _, ok := seenInstallations[installKey]; ok {
 				return fmt.Errorf(
 					"config: github_apps[%d]: duplicate github app installation for host %q and account %q",
@@ -2035,6 +2066,18 @@ func (c *Config) validateGitHubApps() error {
 				)
 			}
 			seenInstallations[installKey] = struct{}{}
+			identityKey := host + "\x00" + strconv.FormatInt(app.AppID, 10) +
+				"\x00" + strconv.FormatInt(app.InstallationID, 10) +
+				"\x00" + strings.ToLower(app.InstallationAccount)
+			if previousRole, ok := seenInstallationIdentities[identityKey]; ok &&
+				previousRole != app.Role {
+				return fmt.Errorf(
+					"config: github_apps[%d]: installation for host %q, app id %d, and account %q cannot be configured for both %q and %q roles",
+					i, host, app.AppID, app.InstallationAccount,
+					previousRole, app.Role,
+				)
+			}
+			seenInstallationIdentities[identityKey] = app.Role
 		}
 	}
 	return nil
@@ -2362,6 +2405,7 @@ func (c *Config) globServedBySelectedApp(repo Repo) bool {
 	for _, app := range c.GitHubAppsForHost(host) {
 		if app.AppID <= 0 || app.InstallationID <= 0 ||
 			app.PrivateKeyPath == "" ||
+			githubAppRole(app) != GitHubAppRoleSync ||
 			!strings.EqualFold(app.InstallationAccount, repo.Owner) ||
 			!strings.EqualFold(strings.TrimSpace(app.RepositorySelection), "selected") {
 			continue
@@ -2495,12 +2539,72 @@ func (c *Config) ResolveGitHubRepoTokenSource(r Repo) tokenauth.Descriptor {
 	return desc
 }
 
+// ResolveGitHubArchiveTokenSource builds the optional, App-only credential
+// route for archive reads of one GitHub repository. It deliberately has no
+// PAT or gh fallback: when configured, archive work either uses the dedicated
+// installation budget or fails closed instead of spending ordinary capacity.
+func (c *Config) ResolveGitHubArchiveTokenSource(r Repo) tokenauth.Descriptor {
+	if c == nil || r.PlatformOrDefault() != defaultPlatform {
+		return tokenauth.Descriptor{}
+	}
+	host := r.PlatformHostOrDefault()
+	app, covered := c.gitHubArchiveAppForRepo(host, r.Owner, r.Name)
+	if !covered {
+		return tokenauth.Descriptor{}
+	}
+	exact := strings.EqualFold(app.RepositorySelection, "selected")
+	desc := tokenauth.Descriptor{Key: tokenauth.Key{
+		Platform: defaultPlatform,
+		Host:     host,
+		Scope:    "archive:" + githubCredentialScope(r.Owner, r.Name, exact),
+	}}
+	desc.Candidates = append(desc.Candidates, tokenauth.Candidate{
+		Kind:                tokenauth.SourceKindGitHubApp,
+		Host:                host,
+		FilePath:            app.PrivateKeyPath,
+		AppID:               app.AppID,
+		InstallationID:      app.InstallationID,
+		InstallationAccount: app.InstallationAccount,
+	})
+	return desc
+}
+
 func (c *Config) gitHubAppForRepo(
 	host, owner, name string,
 ) (GitHubAppConfig, bool) {
 	for _, app := range c.GitHubAppsForHost(host) {
 		if app.AppID <= 0 || app.InstallationID <= 0 ||
 			app.PrivateKeyPath == "" ||
+			githubAppRole(app) != GitHubAppRoleSync ||
+			!strings.EqualFold(app.InstallationAccount, owner) {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(app.RepositorySelection)) {
+		case "all":
+			return app, true
+		case "selected":
+			fullName := strings.ToLower(strings.TrimSpace(owner)) + "/" +
+				strings.ToLower(strings.TrimSpace(name))
+			if strings.TrimSpace(name) == "" {
+				continue
+			}
+			for _, selected := range app.SelectedRepos {
+				if strings.EqualFold(strings.TrimSpace(selected), fullName) {
+					return app, true
+				}
+			}
+		}
+	}
+	return GitHubAppConfig{}, false
+}
+
+func (c *Config) gitHubArchiveAppForRepo(
+	host, owner, name string,
+) (GitHubAppConfig, bool) {
+	for _, app := range c.GitHubAppsForHost(host) {
+		if app.AppID <= 0 || app.InstallationID <= 0 ||
+			app.PrivateKeyPath == "" ||
+			githubAppRole(app) != GitHubAppRoleArchive ||
 			!strings.EqualFold(app.InstallationAccount, owner) {
 			continue
 		}
@@ -2571,8 +2675,14 @@ func (c *Config) appendGitHubDefaultCandidates(
 }
 
 type ProviderTokenSource struct {
-	Descriptor  tokenauth.Descriptor
-	Required    bool
+	Descriptor        tokenauth.Descriptor
+	ArchiveDescriptor tokenauth.Descriptor
+	Required          bool
+	// ArchiveOnly marks a route whose ordinary credential chain is not
+	// required for archive work. The startup path still registers the ordinary
+	// source so the host provider exists, but it must not make an absent PAT
+	// disable the independent archive App route.
+	ArchiveOnly bool
 	GitHubOwner string
 }
 
@@ -2601,9 +2711,21 @@ func (c *Config) ProviderTokenSources() []ProviderTokenSource {
 		})
 	}
 	for _, repo := range c.Repos {
+		desc := c.ResolveRepoTokenSource(repo)
+		archiveDesc := c.ResolveGitHubArchiveTokenSource(repo)
+		// A selected archive installation is repository-exact. Keep the
+		// ordinary route exact too, so several selected archive repositories
+		// cannot collapse onto one owner route while startup builds the paired
+		// archive routes.
+		if strings.HasPrefix(archiveDesc.Key.Scope, "archive:repo:") &&
+			!strings.HasPrefix(desc.Key.Scope, "repo:") {
+			desc.Key.Scope = strings.TrimPrefix(archiveDesc.Key.Scope, "archive:")
+		}
 		plan := ProviderTokenSource{
-			Descriptor: c.ResolveRepoTokenSource(repo),
-			Required:   !c.globServedBySelectedApp(repo),
+			Descriptor:        desc,
+			ArchiveDescriptor: archiveDesc,
+			Required:          !c.globServedBySelectedApp(repo),
+			ArchiveOnly:       archiveDesc.Key.Host != "" && !desc.HasActiveGitHubApp(),
 		}
 		if repo.PlatformOrDefault() == defaultPlatform {
 			plan.GitHubOwner = repo.Owner
@@ -2640,12 +2762,25 @@ func (c *Config) ProviderTokenSources() []ProviderTokenSource {
 					Owner: owner, Name: name,
 				}
 				desc := c.ResolveGitHubRepoTokenSource(repo)
+				archiveDesc := c.ResolveGitHubArchiveTokenSource(repo)
+				if githubAppRole(app) == GitHubAppRoleArchive &&
+					archiveDesc.Key.Host == "" {
+					continue
+				}
+				if strings.HasPrefix(archiveDesc.Key.Scope, "archive:repo:") &&
+					!strings.HasPrefix(desc.Key.Scope, "repo:") {
+					desc.Key.Scope = strings.TrimPrefix(archiveDesc.Key.Scope, "archive:")
+				}
 				if _, ok := seen[desc.Key]; ok {
 					continue
 				}
 				seen[desc.Key] = struct{}{}
 				out = append(out, ProviderTokenSource{
-					Descriptor: desc, Required: true, GitHubOwner: owner,
+					Descriptor:        desc,
+					ArchiveDescriptor: archiveDesc,
+					Required:          true,
+					ArchiveOnly:       archiveDesc.Key.Host != "" && !desc.HasActiveGitHubApp(),
+					GitHubOwner:       owner,
 				})
 			}
 			continue
@@ -2656,14 +2791,20 @@ func (c *Config) ProviderTokenSources() []ProviderTokenSource {
 			Owner:        app.InstallationAccount,
 		}
 		desc := c.ResolveGitHubRepoTokenSource(repo)
+		archiveDesc := c.ResolveGitHubArchiveTokenSource(repo)
+		if githubAppRole(app) == GitHubAppRoleArchive && archiveDesc.Key.Host == "" {
+			continue
+		}
 		if _, ok := seen[desc.Key]; ok {
 			continue
 		}
 		seen[desc.Key] = struct{}{}
 		out = append(out, ProviderTokenSource{
-			Descriptor:  desc,
-			Required:    true,
-			GitHubOwner: app.InstallationAccount,
+			Descriptor:        desc,
+			ArchiveDescriptor: archiveDesc,
+			Required:          true,
+			ArchiveOnly:       archiveDesc.Key.Host != "" && !desc.HasActiveGitHubApp(),
+			GitHubOwner:       app.InstallationAccount,
 		})
 	}
 	for _, ownerToken := range c.GitHubOwnerTokens {
