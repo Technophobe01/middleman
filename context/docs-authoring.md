@@ -26,8 +26,22 @@ screenshots, or the Zensical site.
 - Keep user guidance concise and workflow-oriented: describe UI capabilities
   and maintainer workflows without overexplaining internals. Treat the HTTP API
   as an internal or thin-client concern rather than regular user guidance.
-- Always write the product name as `kenn-forge` in documentation and prose;
-  never title-case it.
+- In published docs and marketing prose, introduce the product by its full
+  title-cased name once per page, then say Forge; reserve `kenn-forge` for the
+  binary, CLI, config, and path references inside code spans. Internal docs
+  (`context/`, ADRs, reports, README) keep using `kenn-forge`.
+  (`scripts/check-docs-branding.mjs`)
+- The public site is tiered: hand-written static marketing pages in `website/`
+  (`/` pitch page, `/guide/` visual tour; dark-only, JetBrains Mono headings,
+  ember accent) lead into the Zensical docs under `/docs/`. Position the
+  product as an integrated agent workspace with local-first code forge sync,
+  not a maintainer-only console.
+- Every published docs page ships as a rendered/markdown pair (`/docs/<page>/`
+  plus `/docs/<page>.md`; index as `/docs/index.md`, so relative links resolve
+  from the page's own directory) listed in the hand-maintained
+  `docs/llms.txt`, and the build fails when any half or listing is missing —
+  a new page must be added to the file, nav, allowlist, and `llms.txt`.
+  (`scripts/build-docs.mjs::verifySiteRoot`)
 - User-facing workflow screenshots are generated into a staged docs tree by the
   docs build and must not be tracked in Git. Playwright captures in
   `docs/screenshots/` use the real seeded e2e backend, not mocked API fixtures
