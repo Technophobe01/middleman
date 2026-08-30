@@ -55,6 +55,8 @@ Do not collapse these concepts:
 - **Compact/narrow presentation**: a desktop window, split pane, or embedded surface that is too narrow for sidebars or dense desktop chrome. It can use focus presentation, but it should retain desktop-scale typography and desktop action geometry.
 - **Phone-like presentation**: a touch/mobile-user-agent context where larger mobile tokens, hit targets, and phone-specific action layouts are appropriate.
 
+A phone stays phone-like in landscape: a coarse-pointer, mobile-user-agent device keeps phone presentation up to the handheld landscape bound, while wider or single-signal devices stay desktop-narrow (`frontend/src/lib/utils/phone-presentation.ts::isPhoneLikeViewport`).
+
 In code and tests, name predicates so this distinction is visible. Avoid generic helpers such as `isPhoneViewport()` when the real question is either "should this route use the compact focus presentation?" or "should this surface use phone-only sizing?"
 
 ## Typography and sizing
@@ -117,6 +119,7 @@ Avoid by default:
 - Workspaces is a first-class phone mode selected from the shared mobile mode picker; `/m/workspaces` uses a dedicated card list and never mounts the desktop workspace layout.
 - Keep search and workspace creation inline. Put the existing sort, grouping, organization-name, and diff-stat controls in a touch-sized View sheet backed by the same persisted settings as desktop.
 - Phone workspace rows show hook-reported Working, Approval, Input, and Done states as visible compact badges; color-only status dots are insufficient for agent state (`frontend/src/lib/components/mobile/MobileWorkspaceList.svelte::agentStatePresentation`).
+- Phone-like PR detail routes have no inline workspace controller; creating or opening a workspace from them must land in the `/m/workspaces` shell, never the desktop `/terminal/{id}` route. Desktop-narrow focus presentation keeps desktop destinations (`frontend/src/App.svelte::phoneWorkspaceCallbacks`).
 - Opening a workspace shows exactly one terminal. Repository, branch, and Fleet host identity get a full-width context row above the controls; the switcher selects base, agent, or shell sessions without destroying background sessions (`frontend/src/lib/components/mobile/MobileWorkspaceTerminal.svelte`).
 - Phone terminals keep direct xterm interaction available for hardware keyboards and terminal-native controls, but touching xterm must not summon the software keyboard. The optional auto-growing composer owns software-keyboard input, stays above the keyboard, routes through xterm's sanitized paste path, appends Enter in the same write, and clears only after xterm accepts it (`frontend/src/lib/components/mobile/MobileWorkspaceTerminal.svelte::sendComposedInput`, `frontend/src/lib/components/terminal/XtermTerminalPane.svelte::handleTerminalPointerDown`).
 - Keep xterm's built-in renderer on Android and Firefox; Android WebGL can accept terminal output while presenting a blank surface (`frontend/src/lib/components/terminal/XtermTerminalPane.svelte::shouldUseBuiltinRenderer`).

@@ -74,6 +74,7 @@
   import { showFlash } from "./lib/stores/flash.svelte.js";
   import { isSafeExternalHTTPURL } from "./lib/utils/safe-external-url.js";
   import { initItemRefHandler } from "./lib/utils/itemRefHandler.js";
+  import { isPhoneLikeViewport as isPhoneLikePresentation } from "./lib/utils/phone-presentation.js";
   import { globalRepoForSelectedRoute } from "./lib/utils/repoSelectionSync.js";
   import { runAppStartup } from "./lib/utils/appStartup.js";
   import {
@@ -555,8 +556,11 @@
   }
 
   function isPhoneLikeViewport(): boolean {
-    return viewportWidth <= 640
-      && (hasCoarsePointer || hasMobileUserAgent());
+    return isPhoneLikePresentation({
+      viewportWidth,
+      hasCoarsePointer,
+      hasMobileUserAgent: hasMobileUserAgent(),
+    });
   }
 
   function isCompactViewport(): boolean {
@@ -727,6 +731,21 @@
     if (mobileHistory?.origin === "direct") replaceUrl(buildMobileWorkspaceRoute(workspaceId, hostKey));
     else if (mobileHistory) history.go(-mobileHistory.backDepth);
     else replaceUrl(buildMobileWorkspaceRoute(workspaceId, hostKey));
+  }
+
+  // Phone-like PR detail routes have no inline workspace controller, so a
+  // created or opened workspace must land in the /m workspace shell rather
+  // than the desktop /terminal route. Desktop-narrow focus presentation
+  // keeps the desktop destinations.
+  function phoneWorkspaceCallbacks(): {
+    onOpenWorkspace?: (workspaceId: string) => void;
+    onViewWorkspaces?: () => void;
+  } {
+    if (!useFocusLayoutClass()) return {};
+    return {
+      onOpenWorkspace: (workspaceId) => navigate(buildMobileWorkspaceRoute(workspaceId)),
+      onViewWorkspaces: () => navigate("/m/workspaces"),
+    };
   }
 
   function useDesktopView(): void {
@@ -1123,6 +1142,7 @@
           isSidebarCollapsed={true}
           hideSidebar={true}
           routeFamily="focus"
+          {...phoneWorkspaceCallbacks()}
         />
       {:else if r.page === "focus"}
         <IssueListView
@@ -1144,6 +1164,7 @@
           isSidebarCollapsed={true}
           hideSidebar={true}
           onStackMemberNavigate={handleResponsiveStackMemberNavigate}
+          {...phoneWorkspaceCallbacks()}
         />
       {:else if r.page === "pulls"}
         <FocusListView
