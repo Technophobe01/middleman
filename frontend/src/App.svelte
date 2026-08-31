@@ -735,16 +735,19 @@
 
   // Phone-like PR detail routes have no inline workspace controller, so a
   // created or opened workspace must land in the /m workspace shell rather
-  // than the desktop /terminal route. Desktop-narrow focus presentation
-  // keeps the desktop destinations.
-  function phoneWorkspaceCallbacks(): {
+  // than the desktop /terminal route, and the PR actions render as one kit
+  // action grid. Desktop-narrow focus presentation keeps the desktop
+  // destinations and layout.
+  function phoneDetailProps(): {
     onOpenWorkspace?: (workspaceId: string) => void;
     onViewWorkspaces?: () => void;
+    phonePresentation?: boolean;
   } {
     if (!useFocusLayoutClass()) return {};
     return {
       onOpenWorkspace: (workspaceId) => navigate(buildMobileWorkspaceRoute(workspaceId)),
       onViewWorkspaces: () => navigate("/m/workspaces"),
+      phonePresentation: true,
     };
   }
 
@@ -1142,7 +1145,7 @@
           isSidebarCollapsed={true}
           hideSidebar={true}
           routeFamily="focus"
-          {...phoneWorkspaceCallbacks()}
+          {...phoneDetailProps()}
         />
       {:else if r.page === "focus"}
         <IssueListView
@@ -1164,7 +1167,7 @@
           isSidebarCollapsed={true}
           hideSidebar={true}
           onStackMemberNavigate={handleResponsiveStackMemberNavigate}
-          {...phoneWorkspaceCallbacks()}
+          {...phoneDetailProps()}
         />
       {:else if r.page === "pulls"}
         <FocusListView
@@ -1697,11 +1700,10 @@
     word-break: break-word;
   }
 
+  .focus-layout--phone :global(.edit-title-btn),
   .focus-layout--phone :global(.star-btn),
   .focus-layout--phone :global(.gh-link),
   .focus-layout--phone :global(.copy-icon-btn),
-  .focus-layout--phone :global(.copy-number-btn),
-  .focus-layout--phone :global(.pull-detail-content .meta-row .copy-number-btn),
   .focus-layout--phone :global(.detail-description__toggle),
   .focus-layout--phone :global(.kit-button),
   .focus-layout--phone :global(.detail-tab),
@@ -1709,6 +1711,28 @@
     min-width: var(--focus-detail-hit-target);
     min-height: var(--focus-detail-hit-target);
     font-size: var(--font-size-sm);
+  }
+
+  /* The header's title actions are bare icons on desktop; on a phone they
+   * become bordered, equal squares so the tap targets are visible. The
+   * inline number copy button stays text-sized: it sits in a text row. */
+  .focus-layout--phone :global(.edit-title-btn),
+  .focus-layout--phone :global(.star-btn),
+  .focus-layout--phone :global(.gh-link) {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    margin-top: 0;
+    border: var(--border-width) solid var(--border-default);
+    border-radius: var(--radius-sm);
+    background: var(--bg-surface);
+  }
+
+  .focus-layout--phone :global(.meta-row .copy-number-btn) {
+    /* WCAG 2.5.8 target minimum; the full phone hit target belongs to
+     * standalone controls, not to a number sitting inside a text row. */
+    min-width: 24px;
+    min-height: 24px;
   }
 
   .focus-layout--phone :global(.actions-row) {
