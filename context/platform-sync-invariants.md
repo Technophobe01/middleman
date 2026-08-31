@@ -23,6 +23,9 @@ combining repository-owned history
 - `repo_path` carries the full provider path when `owner/name` is not enough.
 - `platform_repo_id` / provider external IDs are stable provider identities;
   preserve human-readable route history across renames and replacements.
+- Exact configured repositories with a stable provider ID never adopt a new
+  occupant of their saved route; startup recovers that ID's current catalog
+  route or fails closed (`cmd/kenn-forge/main.go::fallbackExactFromDB`).
 - Rows without a verified provider ID remain inactive legacy records. Never
   infer their identity from a matching route.
 - Timestamp provider observations before the identity lookup starts; a delayed
@@ -32,6 +35,15 @@ combining repository-owned history
   exact ownership generation before snapshot, notification, or cache commits;
   same-identity freshness observations do not advance that generation
   (`internal/db/repository_catalog.go::RepositoryRouteFence`).
+- Hub descriptors are provider observations and use the same
+  reconciliation path as sync, enrollment, and project discovery. Spokes must
+  preserve stable provider identity and A-to-B-to-A route generations; they may
+  not create a catalog row from owner/name alone. Descriptor metadata writes
+  remain fenced to the descriptor's observation time
+  (`internal/server/provider_sources.go::hubProviderSource.observeRepositoryDescriptor`).
+- Parallel reads may receive same-identity, same-route descriptors out of order;
+  superseded metadata is skipped but the read remains usable. Identity or route
+  changes still fail closed (`internal/server/provider_sources.go::observeRepositoryDescriptor`).
 - Repository provider metadata and merge settings have a single sync-path
   writer: commits go through the observation watermark so a delayed snapshot
   never overwrites a newer same-route observation, and reconciled direct item
@@ -177,6 +189,14 @@ Pre-stable-ID clone adoption stays offline and requires a catalog-verified stabl
 no other route history plus a matching stored origin (`internal/db/repository_catalog.go::DB.AdoptLegacyClonesIfSafe`).
 Stable main storage is an independent copy while the workspace path-scoped main clone remains
 (`internal/gitclone/repo_browser.go::Manager.AdoptLegacyClones`).
+Federation-spoke clone work first validates the descriptor remote against that
+exact identity, then requires the executing spoke's exact credential route.
+Credential-required contexts never fall back to anonymous Git if the route or
+token disappears; public standalone clone behavior remains unchanged. Missing
+spoke credentials return the typed `gitCredentialUnavailable` problem
+(`internal/gitclone/clone.go::WithRequiredCredential`,
+`internal/workspace/manager.go::Manager.SetRequireProviderCredential`,
+`internal/server/httpapi/problems.go::GitCredentialUnavailable`).
 Repository-browser refreshes fetch only into unpublished same-filesystem staging and publish with a
 route-generation guard plus reader-exclusive rename swap; failures retain the prior clone. Current
 waiters retry only after stale staging cleanup (`internal/gitclone/repo_browser.go::refreshRepoBrowserClone`).
