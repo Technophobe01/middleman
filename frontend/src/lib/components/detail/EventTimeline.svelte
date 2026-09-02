@@ -130,6 +130,13 @@
   const stores = getStores() as StoreInstances | undefined;
   const runtime = getAppRuntime();
   const detailStore = stores?.detail;
+  const collapseSingleLineBreaks = $derived(
+    stores?.settings?.getDetailSettings().collapse_single_line_breaks ?? false,
+  );
+  const markdownOptions = $derived({ collapseSingleLineBreaks });
+  const renderCommitMessagesAsMarkdown = $derived(
+    stores?.settings?.getDetailSettings().render_commit_messages_as_markdown ?? false,
+  );
   const diffStore = stores?.diff;
   const diffReviewDraft = stores?.diffReviewDraft;
   const diff = $derived(diffStore?.getDiff() ?? null);
@@ -1589,6 +1596,29 @@
   </div>
 {/snippet}
 
+{#snippet commitBody(body: string, animated: boolean)}
+  {#if animated}
+    <div
+      class={["event-body", "commit-body-details", { "markdown-body": renderCommitMessagesAsMarkdown }]}
+      transition:slide={{ duration: 100 }}
+    >
+      {#if renderCommitMessagesAsMarkdown}
+        <MarkdownHtml raw={body} repo={markdownRepo} options={markdownOptions} />
+      {:else}
+        {body}
+      {/if}
+    </div>
+  {:else}
+    <div class={["event-body", "commit-body-details", { "markdown-body": renderCommitMessagesAsMarkdown }]}>
+      {#if renderCommitMessagesAsMarkdown}
+        <MarkdownHtml raw={body} repo={markdownRepo} options={markdownOptions} />
+      {:else}
+        {body}
+      {/if}
+    </div>
+  {/if}
+{/snippet}
+
 {#snippet eventBody(
   event: PREvent | IssueEvent,
   nested = false,
@@ -1676,7 +1706,7 @@
                   {#if block.type === "markdown"}
                     {#if block.text.trim().length > 0}
                       <div class="event-body-segment">
-                        <MarkdownHtml raw={block.text} repo={markdownRepo} />
+                        <MarkdownHtml raw={block.text} repo={markdownRepo} options={markdownOptions} />
                       </div>
                     {/if}
                   {:else if reviewThread}
@@ -1700,7 +1730,7 @@
                   {:else}
                     {@const fallback = "```suggestion\n" + block.replacement + "\n```"}
                     <div class="event-body-segment">
-                      <MarkdownHtml raw={fallback} repo={markdownRepo} />
+                      <MarkdownHtml raw={fallback} repo={markdownRepo} options={markdownOptions} />
                     </div>
                   {/if}
                 {/each}
@@ -1721,6 +1751,7 @@
               <MarkdownHtml
                 raw={event.Body}
                 repo={markdownRepo}
+                options={markdownOptions}
                 transformHtml={inlineReplyEntry
                   ? (html) => withInlineReplyButton(html, inlineReplyEntry)
                   : undefined}
@@ -1983,9 +2014,7 @@
             {#if (canExpandCompact && compactExpanded) || editingId === event.ID}
               <div class="compact-expanded-content">
                 {#if event.EventType === "commit"}
-                  <div class="event-body commit-body-details">
-                    {commitDetailsBody(event.Body)}
-                  </div>
+                  {@render commitBody(commitDetailsBody(event.Body), false)}
                 {:else}
                   {@render eventBody(event, false, entry.reviewThread, hasReplyOnlyAction ? entry : undefined)}
                 {/if}
@@ -2029,9 +2058,7 @@
                 <span class="event-time">{formatRelativeTime(event.CreatedAt)}</span>
               </div>
               {#if showCommitDetails && commitDetails}
-                <div class="event-body commit-body-details" transition:slide={{ duration: 100 }}>
-                  {commitDetails}
-                </div>
+                {@render commitBody(commitDetails, true)}
               {/if}
             </Card>
           {:else if event.EventType === "cross_referenced"}

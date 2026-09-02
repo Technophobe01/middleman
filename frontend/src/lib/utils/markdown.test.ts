@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vite-plus/test";
 import { buildCanonicalProviderItemURL } from "./item-reference.js";
-import { renderMarkdown, renderMarkdownBlocks } from "./markdown.js";
+import { renderMarkdown, renderMarkdownBlocks, renderMarkdownSync } from "./markdown.js";
 
 describe("renderMarkdown task lists", () => {
   it("proxies private GitHub attachment images through the repo-scoped API", async () => {
@@ -491,5 +491,32 @@ describe("renderMarkdown details blocks", () => {
     expect(blocks[0]?.html).toContain("</details>");
     expect(blocks[0]?.html).not.toContain("Afterwards.");
     expect(blocks[1]?.html).toContain("<p>Afterwards.</p>");
+  });
+});
+
+describe("renderMarkdown line breaks", () => {
+  it("renders single newlines as hard breaks by default", async () => {
+    const html = await renderMarkdown("first line\nsecond line\n\nnext paragraph");
+    expect(html).toContain("first line<br>second line");
+    expect(html.match(/<p>/g)).toHaveLength(2);
+  });
+
+  it("joins single newlines into the paragraph when collapsing soft breaks", async () => {
+    const html = await renderMarkdown("first line\nsecond line\n\nnext paragraph", undefined, {
+      collapseSingleLineBreaks: true,
+    });
+    expect(html).not.toContain("<br>");
+    expect(html).toContain("first line\nsecond line");
+    expect(html.match(/<p>/g)).toHaveLength(2);
+  });
+
+  it("keeps collapsed and hard-break renders in separate caches", async () => {
+    const raw = "cache me\nplease";
+    const hard = await renderMarkdown(raw);
+    const soft = await renderMarkdown(raw, undefined, { collapseSingleLineBreaks: true });
+    expect(hard).toContain("<br>");
+    expect(soft).not.toContain("<br>");
+    expect(renderMarkdownSync(raw)).toContain("<br>");
+    expect(renderMarkdownSync(raw, undefined, { collapseSingleLineBreaks: true })).not.toContain("<br>");
   });
 });
