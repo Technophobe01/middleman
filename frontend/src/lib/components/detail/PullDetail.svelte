@@ -2223,7 +2223,7 @@
       </div>
 
       <div class="chips-row">
-        {#if true}
+        {#if !(pr.IsLocked && lockedSupported)}
           {@const stateLabel = visiblePRStateLabel(pr)}
           {@const markDraftGate = operationGate(repoOperations?.mark_draft)}
           {@const canOpenStateMenu = pr.State === "open" && !pr.IsDraft && capabilities.draft_mutation}
