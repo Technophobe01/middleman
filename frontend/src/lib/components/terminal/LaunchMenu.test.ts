@@ -58,4 +58,32 @@ describe("LaunchMenu", () => {
     await fireEvent.click(codexOption);
     expect(onLaunch).toHaveBeenCalledWith("codex");
   });
+
+  it("draws a harness glyph for agents whose key matches one and keeps the generic icon otherwise", async () => {
+    render(LaunchMenu, {
+      props: {
+        launchTargets: [
+          { key: "claude", label: "Claude", kind: "agent", source: "builtin", available: true },
+          { key: "codex-review", label: "Review Agent", kind: "agent", source: "config", available: true },
+          { key: "mystery", label: "mystery", kind: "agent", source: "config", available: true },
+        ],
+        onLaunch: vi.fn(),
+      },
+    });
+
+    await fireEvent.click(screen.getByRole("button", { name: "Launch" }));
+
+    const claude = screen.getByRole("button", { name: "Claude" });
+    expect(claude.querySelector(".kit-harness-icon--claude svg")).not.toBeNull();
+    expect(claude.querySelector(".launch-target-label")?.textContent).toBe("Claude");
+
+    // The glyph comes from the key's leading segment; the configured label is untouched.
+    const review = screen.getByRole("button", { name: "Review Agent" });
+    expect(review.querySelector(".kit-harness-icon--openai")).not.toBeNull();
+    expect(review.querySelector(".launch-target-label")?.textContent).toBe("Review Agent");
+
+    const mystery = screen.getByRole("button", { name: "mystery" });
+    expect(mystery.querySelector(".kit-harness-icon")).toBeNull();
+    expect(mystery.querySelector(".launch-target-icon svg")).not.toBeNull();
+  });
 });

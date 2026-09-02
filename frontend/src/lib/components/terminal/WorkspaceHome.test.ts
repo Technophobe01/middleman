@@ -94,6 +94,7 @@ describe("WorkspaceHome", () => {
     }) as HTMLButtonElement;
     expect(codexLaunchButton.disabled).toBe(false);
     expect(codexLaunchButton.textContent?.trim()).toBe("Codex");
+    expect(codexLaunchButton.querySelector(".kit-harness-icon--openai")).not.toBeNull();
     expect(
       (
         screen.getByRole("button", {
@@ -109,6 +110,8 @@ describe("WorkspaceHome", () => {
       name: "Shell",
     }) as HTMLButtonElement;
     expect(shellLaunchButton.textContent?.trim()).toBe("Shell");
+    expect(shellLaunchButton.querySelector(".kit-harness-icon")).toBeNull();
+    expect(shellLaunchButton.querySelector(".launch-target-icon svg")).not.toBeNull();
 
     await fireEvent.click(codexLaunchButton);
     expect(onLaunch).toHaveBeenCalledWith("codex");
