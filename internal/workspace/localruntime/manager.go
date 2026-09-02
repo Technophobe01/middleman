@@ -38,6 +38,12 @@ const (
 
 const initialMessageWriteTimeout = 30 * time.Second
 
+// initialMessageEnterDelay separates the bracketed paste from the Enter
+// keystroke that submits it. Terminal UIs that collapse a multi-line paste
+// treat bytes arriving in the same chunk as the paste-end marker as part of
+// the paste, so a carriage return in that chunk never submits the prompt.
+const initialMessageEnterDelay = 150 * time.Millisecond
+
 var (
 	errManagerShutdown    = errors.New("runtime manager is shut down")
 	ErrSessionNotFound    = errors.New("runtime session not found")
@@ -193,7 +199,10 @@ var (
 )
 
 type session struct {
-	mu                        sync.Mutex
+	mu sync.Mutex
+	// inputMu serializes terminal input so an initial-message handoff owns
+	// the PTY from its paste through its Enter keystroke.
+	inputMu                   sync.Mutex
 	info                      SessionInfo
 	cmd                       *exec.Cmd
 	ptmx                      *os.File
@@ -2893,11 +2902,9 @@ func attachToSession(
 		Done:   s.done,
 		info:   s.snapshot,
 		write: func(data []byte) error {
-			if s.pty != nil {
-				return s.pty.Write(data)
-			}
-			_, err := s.ptmx.Write(data)
-			return err
+			s.inputMu.Lock()
+			defer s.inputMu.Unlock()
+			return s.writeInput(data)
 		},
 		submitInitialMessage: s.submitInitialMessage,
 		resize: func(geometry ptysize.Geometry) error {
@@ -2952,12 +2959,10 @@ func (s *session) submitInitialMessage(ctx context.Context, message string) erro
 		s.mu.Unlock()
 		return ErrBracketedPasteInactive
 	}
-	data := make([]byte, 0, len(message)+13)
-	data = append(data, "\x1b[200~"...)
-	data = append(data, message...)
-	data = append(data, "\x1b[201~\r"...)
-	pty := s.pty
-	ptmx := s.ptmx
+	paste := make([]byte, 0, len(message)+12)
+	paste = append(paste, "\x1b[200~"...)
+	paste = append(paste, message...)
+	paste = append(paste, "\x1b[201~"...)
 	s.mu.Unlock()
 
 	if err := context.Cause(ctx); err != nil {
@@ -2974,14 +2979,19 @@ func (s *session) submitInitialMessage(ctx context.Context, message string) erro
 	if err := context.Cause(writeCtx); err != nil {
 		return fmt.Errorf("%w: %w", ErrInitialMessageNotWritten, err)
 	}
+	// The paste, settle delay, and Enter run as one operation that outlives
+	// a caller which stops waiting: a paste that lands after the deadline
+	// without its Enter would leave the prompt sitting in the input box.
 	result := make(chan error, 1)
 	go func() {
-		if pty != nil {
-			result <- pty.Write(data)
+		s.inputMu.Lock()
+		defer s.inputMu.Unlock()
+		if err := s.writeInput(paste); err != nil {
+			result <- err
 			return
 		}
-		_, err := ptmx.Write(data)
-		result <- err
+		time.Sleep(initialMessageEnterDelay)
+		result <- s.writeInput([]byte("\r"))
 	}()
 	select {
 	case err := <-result:
@@ -2989,4 +2999,13 @@ func (s *session) submitInitialMessage(ctx context.Context, message string) erro
 	case <-writeCtx.Done():
 		return context.Cause(writeCtx)
 	}
+}
+
+// writeInput writes terminal input to the session PTY. Callers hold inputMu.
+func (s *session) writeInput(data []byte) error {
+	if s.pty != nil {
+		return s.pty.Write(data)
+	}
+	_, err := s.ptmx.Write(data)
+	return err
 }
