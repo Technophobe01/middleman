@@ -678,6 +678,11 @@ provider head still differs (`LastRefreshSucceededAt >= LastRefreshEnqueuedAt`)
 — otherwise the visible PR is re-synced and re-rendered forever. A tracking-ref
 move restarts the cycle.
 
+The observer's read path spawns no processes: it reads branch, upstream, and
+remote-tracking state in process through go-git, and only upstream repair runs
+git. Do not reintroduce per-pass git subprocesses there
+(`internal/workspace/pushed_head_gitdir.go::gitdirRemoteHeadReader`).
+
 ## Sidebar Ordering
 
 The workspace sidebar has two separate activity concepts:
