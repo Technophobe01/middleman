@@ -14,6 +14,7 @@
   import MobileWorkspaceList from "./lib/components/mobile/MobileWorkspaceList.svelte";
   import MobileWorkspaceTerminal from "./lib/components/mobile/MobileWorkspaceTerminal.svelte";
   import MobileWorkspaceItem from "./lib/components/mobile/MobileWorkspaceItem.svelte";
+  import MobileDetailHeader from "./lib/components/mobile/MobileDetailHeader.svelte";
   import ReviewsView from "./lib/views/ReviewsView.svelte";
   import FocusListView from "./lib/views/FocusListView.svelte";
   import { normalizeGlobalRepoSelection } from "./lib/utils/repo-filter-values.js";
@@ -22,6 +23,9 @@
   import {
     buildFocusPullRequestFilesRoute,
     buildFocusPullRequestRoute,
+    buildIssueRoute,
+    buildPullRequestFilesRoute,
+    buildPullRequestRoute,
     buildRepoBrowserRoute,
     buildRoutedItemRoute,
     type PullRequestRouteRef,
@@ -107,8 +111,18 @@
     getSelectedPRFromRoute,
     buildMobileWorkspaceRoute,
     buildMobileWorkspaceItemRoute,
+    type Page,
     type RoutableItemRef,
   } from "./lib/stores/router.svelte.ts";
+  import {
+    carryMobileListOrigin,
+    mobileListBackLabel,
+    mobileListOriginState,
+    mobileListRoute,
+    readMobileListBackDepth,
+    readMobileListOrigin,
+    type MobileListOrigin,
+  } from "./lib/stores/mobile-list-return.js";
   import { getInlineWorkspaceController, tabSlotAttachment } from "./lib/stores/workspace-host.svelte.ts";
   import {
     buildActivitySelectionSearch,
@@ -194,8 +208,8 @@
   };
   const appNavigate: NavigateCallback = (event, options) => {
     const path = typeof event === "string" ? event : event.path;
-    if (options?.replace) replaceUrl(path);
-    else navigate(path);
+    if (options?.replace) replaceUrl(path, options.state);
+    else navigate(path, options?.state);
   };
   const appComposition = createAppStores({
     runtime: appRuntime,
@@ -646,25 +660,74 @@
 
   function flashTopOffset(): string {
     if (onboardingActive) return "0";
-    if (shouldUseFocusPresentation() || isHeaderHidden()) return "0";
-    if (isMobilePage(getPage()) || shouldUseResponsiveMobileActivityPresentation()) {
+    if (shouldUseFocusPresentation() && !useFocusLayoutClass()) return "0";
+    if (isHeaderHidden()) return "0";
+    if (
+      isMobilePage(getPage())
+      || shouldUseResponsiveMobileActivityPresentation()
+      || shouldUseFocusPresentation()
+    ) {
       return renderedMobileHeaderHeight > 0 ? `${renderedMobileHeaderHeight}px` : "0";
     }
     return renderedHeaderHeight > 0 ? `${renderedHeaderHeight}px` : "var(--header-height)";
   }
 
-  function navigateFocusPRDetailTab(
+  function navigatePhonePRDetailTab(
     ref: Parameters<typeof buildFocusPullRequestRoute>[0],
     tab: "conversation" | "files",
-    options?: { replace?: boolean },
+    options: { replace?: boolean } | undefined,
+    family: "focus" | "canonical",
   ): void {
     const path =
-      tab === "files" ? buildFocusPullRequestFilesRoute(ref) : buildFocusPullRequestRoute(ref);
+      family === "focus"
+        ? tab === "files" ? buildFocusPullRequestFilesRoute(ref) : buildFocusPullRequestRoute(ref)
+        : tab === "files" ? buildPullRequestFilesRoute(ref) : buildPullRequestRoute(ref);
     // Replace when the view says this only records which of two simultaneously
     // visible panes the user is in, so moving between them does not fill the
-    // Back stack.
-    if (options?.replace) replaceUrl(path);
-    else navigate(path);
+    // Back stack. Either way the entry keeps the phone list origin, so Back
+    // from the new tab still returns to the list that opened the item.
+    if (options?.replace) replaceUrl(path, carryMobileListOrigin(history.state, "replace"));
+    else navigate(path, carryMobileListOrigin(history.state, "push"));
+  }
+
+  // A stack member opened from a phone PR detail is one more entry above the
+  // list, so it carries the origin forward the same way a tab switch does.
+  function navigatePhoneStackMember(ref: PullRequestRouteRef): boolean {
+    navigate(buildFocusPullRequestRoute(ref), carryMobileListOrigin(history.state, "push"));
+    return true;
+  }
+
+  // Phone-like PR and issue detail routes live inside the phone shell. The
+  // header names the item, and Back returns to the list that opened it: the
+  // history entry recorded by that list when it navigated, or the matching
+  // phone list for a deep link that has no such entry.
+  function phoneDetailItem(): { itemType: "pr" | "issue"; number: number } | null {
+    const route = getRoute();
+    if (route.page === "focus" && route.itemType === "pr") return { itemType: "pr", number: route.number };
+    if (route.page === "focus" && route.itemType === "issue") return { itemType: "issue", number: route.number };
+    if (route.page === "pulls" && route.selected) return { itemType: "pr", number: route.selected.number };
+    if (route.page === "issues" && route.selected) return { itemType: "issue", number: route.selected.number };
+    return null;
+  }
+
+  function phoneDetailOrigin(): MobileListOrigin {
+    const item = phoneDetailItem();
+    return readMobileListOrigin(history.state) ?? (item?.itemType === "issue" ? "issues" : "pulls");
+  }
+
+  function leavePhoneDetail(): void {
+    if (readMobileListOrigin(history.state)) history.go(-readMobileListBackDepth(history.state));
+    else replaceUrl(mobileListRoute(phoneDetailOrigin()));
+  }
+
+  function mobileModePickerPage(): Page {
+    const route = getRoute();
+    if (route.page === "focus") {
+      return route.itemType === "issue" || route.itemType === "issues" ? "mobile-issues" : "mobile-pulls";
+    }
+    if (route.page === "pulls") return "mobile-pulls";
+    if (route.page === "issues") return "mobile-issues";
+    return getPage();
   }
 
   function desktopPathForMobileRoute(): string {
@@ -673,6 +736,10 @@
     if (page === "mobile-issues") return "/issues";
     if (page === "mobile-workspaces") return "/workspaces";
     const route = getRoute();
+    if (route.page === "focus" && route.itemType === "pr") return buildPullRequestRoute(route);
+    if (route.page === "focus" && route.itemType === "issue") return buildIssueRoute(route);
+    if (route.page === "focus") return route.itemType === "issues" ? "/issues" : "/pulls";
+    if (route.page === "pulls" || route.page === "issues") return window.location.pathname;
     if (
       route.page === "mobile-workspace-terminal" ||
       route.page === "mobile-workspace-item"
@@ -767,6 +834,16 @@
       onViewWorkspaces: () => navigate("/m/workspaces"),
       phonePresentation: true,
     };
+  }
+
+  // The issue list view takes the same workspace callbacks but has no
+  // phone-presentation switch of its own.
+  function phoneIssueDetailProps(): {
+    onOpenWorkspace?: (workspaceId: string) => void;
+    onViewWorkspaces?: () => void;
+  } {
+    const { onOpenWorkspace, onViewWorkspaces } = phoneDetailProps();
+    return onOpenWorkspace && onViewWorkspaces ? { onOpenWorkspace, onViewWorkspaces } : {};
   }
 
   function useDesktopView(): void {
@@ -932,7 +1009,7 @@
     } satisfies RoutedItemRef;
 
     if (isMobilePage(getPage()) || shouldUseResponsiveMobileActivityPresentation()) {
-      navigate(buildRoutedItemRoute(selectedItem, { focus: true }));
+      navigate(buildRoutedItemRoute(selectedItem, { focus: true }), mobileListOriginState("activity"));
       return;
     }
 
@@ -962,7 +1039,9 @@
     ref: PullRequestRouteRef,
   ): boolean | void {
     if (shouldUseResponsiveFocusPresentation()) {
-      navigate(buildFocusPullRequestRoute(ref));
+      // Stay in the canonical route family the list opened, as the tab
+      // switch does; the phone shell renders both families the same way.
+      navigate(buildPullRequestRoute(ref), carryMobileListOrigin(history.state, "push"));
       return true;
     }
     return undefined;
@@ -1117,27 +1196,18 @@
 {#if !shouldUseFullAppShell(getPage())}
   <WorkspaceEmbedShell />
 {:else}
-  <!-- Mounted once above the focus/full-shell branching so flashes raised
-       through the shared store stay visible in every presentation, not just
-       the desktop shell. -->
-  <FlashBanner top={flashTopOffset()} />
-  {#if onboardingActive && stores}
-    <OnboardingFlow
-      {stores}
-      iconSrc={appIconSrc}
-      onStart={startOnboarding}
-      onDismiss={dismissOnboarding}
-      onComplete={completeOnboarding}
-    />
-  {:else if shouldUseFocusPresentation()}
-    {@const r = getRoute()}
-    <main
-      class="focus-layout"
-      class:focus-layout--phone={useFocusLayoutClass()}
-    >
-      {#if providerUnavailable()}
-        {@render providerUnavailableState()}
-      {/if}
+  {#snippet focusPresentation(phone: boolean)}
+  {@const r = getRoute()}
+  <!-- The phone shell's mobile-main is the page's only main landmark, so the
+       phone presentation renders as a plain container inside it. -->
+  <svelte:element
+    this={phone ? "div" : "main"}
+    class="focus-layout"
+    class:focus-layout--phone={phone}
+  >
+    {#if providerUnavailable()}
+      {@render providerUnavailableState()}
+    {/if}
       {#if r.page === "focus" && r.itemType === "mrs"}
         <FocusListView
           listType="mrs"
@@ -1162,7 +1232,8 @@
         <PRListView
           {selectedPR}
           detailTab={r.tab === "files" ? "files" : "conversation"}
-          onDetailTabChange={(tab, options) => navigateFocusPRDetailTab(selectedPR, tab, options)}
+          onDetailTabChange={(tab, options) => navigatePhonePRDetailTab(selectedPR, tab, options, "focus")}
+          onStackMemberNavigate={navigatePhoneStackMember}
           isSidebarCollapsed={true}
           hideSidebar={true}
           routeFamily="focus"
@@ -1180,11 +1251,14 @@
           }}
           isSidebarCollapsed={true}
           hideSidebar={true}
+          {...phoneIssueDetailProps()}
         />
       {:else if r.page === "pulls" && r.selected}
+        {@const canonicalPR = r.selected}
         <PRListView
-          selectedPR={r.selected}
+          selectedPR={canonicalPR}
           detailTab={r.tab === "files" ? "files" : "conversation"}
+          onDetailTabChange={(tab, options) => navigatePhonePRDetailTab(canonicalPR, tab, options, "canonical")}
           isSidebarCollapsed={true}
           hideSidebar={true}
           onStackMemberNavigate={handleResponsiveStackMemberNavigate}
@@ -1201,6 +1275,7 @@
           selectedIssue={r.selected}
           isSidebarCollapsed={true}
           hideSidebar={true}
+          {...phoneIssueDetailProps()}
         />
       {:else if r.page === "issues"}
         <FocusListView
@@ -1209,9 +1284,10 @@
           chunked={useFocusLayoutClass()}
         />
       {/if}
-    </main>
-  {:else if isMobilePage(getPage()) || shouldUseResponsiveMobileActivityPresentation()}
-    <section class="mobile-shell" aria-label="Phone view">
+  </svelte:element>
+{/snippet}
+
+{#snippet mobileTopBar(pickerPage: Page)}
       <header class="mobile-topbar" {@attach trackMobileHeaderHeight}>
         <span class="mobile-brand">
           <img class="mobile-app-icon" src={appIconSrc} alt="" aria-hidden="true" />
@@ -1219,7 +1295,7 @@
         </span>
 
         <MobileModePicker
-          page={getPage()}
+          page={pickerPage}
           {isModeVisible}
           onNavigate={navigateMobile}
         />
@@ -1234,6 +1310,41 @@
           <MonitorIcon size="18" strokeWidth="1.75" aria-hidden="true" />
         </button>
       </header>
+{/snippet}
+
+<!-- Mounted once above the focus/full-shell branching so flashes raised
+       through the shared store stay visible in every presentation, not just
+       the desktop shell. -->
+  <FlashBanner top={flashTopOffset()} />
+  {#if onboardingActive && stores}
+    <OnboardingFlow
+      {stores}
+      iconSrc={appIconSrc}
+      onStart={startOnboarding}
+      onDismiss={dismissOnboarding}
+      onComplete={completeOnboarding}
+    />
+  {:else if shouldUseFocusPresentation() && useFocusLayoutClass()}
+    {@const detailItem = phoneDetailItem()}
+    <section class="mobile-shell" aria-label="Phone view">
+      {@render mobileTopBar(mobileModePickerPage())}
+      <main class="mobile-main">
+        {#if detailItem}
+          <MobileDetailHeader
+            itemType={detailItem.itemType}
+            number={detailItem.number}
+            backLabel={mobileListBackLabel(phoneDetailOrigin())}
+            onBack={leavePhoneDetail}
+          />
+        {/if}
+        {@render focusPresentation(true)}
+      </main>
+    </section>
+  {:else if shouldUseFocusPresentation()}
+    {@render focusPresentation(false)}
+  {:else if isMobilePage(getPage()) || shouldUseResponsiveMobileActivityPresentation()}
+    <section class="mobile-shell" aria-label="Phone view">
+      {@render mobileTopBar(getPage())}
 
       <main class="mobile-main">
         {#if !appReady}
@@ -1575,6 +1686,10 @@
     overflow: hidden;
   }
 
+  .mobile-main > .focus-layout--phone {
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+
   .mobile-workspace-route,
   .mobile-workspace-route__terminal {
     flex: 1;
@@ -1761,6 +1876,39 @@
     border: var(--border-width) solid var(--border-default);
     border-radius: var(--radius-sm);
     background: var(--bg-surface);
+  }
+
+  /* One control family for the phone status row. State, CI, diff stat,
+   * review decision, labels, assignees, and reviewers all render as the same
+   * rounded-rectangle control at the action-grid height, one size, one
+   * weight, plain case. Tone tints still carry status; the pill shape and
+   * uppercase label treatment are desktop density devices that read as
+   * mismatched badges next to phone buttons. */
+  .focus-layout--phone :global(.chips-row .kit-chip),
+  .focus-layout--phone :global(.chips-row .kit-button),
+  .focus-layout--phone :global(.chips-row .diff-summary-trigger) {
+    min-height: var(--detail-mobile-hit-target, 37px);
+    min-width: 0;
+    padding: 0 12px;
+    border-radius: var(--radius-sm);
+    font-size: var(--font-size-sm);
+    font-weight: var(--font-weight-medium, 500);
+    letter-spacing: normal;
+    line-height: normal;
+    text-transform: none;
+  }
+
+  .focus-layout--phone :global(.chips-row .btn--labels svg) {
+    width: 16px;
+    height: 16px;
+  }
+
+  /* Branch names are identifiers, so they keep the app mono face, at the
+   * inline-code ratio the markdown body already uses so the mono line reads
+   * the same size as the sans repository line above it. */
+  .focus-layout--phone :global(.branch-name-btn) {
+    font-family: var(--font-mono);
+    font-size: 0.9em;
   }
 
   .focus-layout--phone :global(.meta-row .copy-number-btn) {

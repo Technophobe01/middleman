@@ -104,6 +104,20 @@ otherwise fails only in the Vitest/Playwright transform tier, not in
   the lightbox's `restoreFocusTo`): close restores focus synchronously
   before the picked action runs, so an action's own focus move wins. kit
   `trapFocus` restores at unmount teardown, which would undo it.
+- Focus signals: kit text fields show keyboard focus as the wrapper's
+  accent border only; `app.css` drops the kit `TextInput` outline ring
+  that would otherwise stack on the same wrapper (every tap or Tab into a
+  text field is `:focus-visible`). Hover-only controls nested inside a
+  list row button (`.star-btn`, `.import-btn`) carry `tabindex="-1"` so
+  Tab moves row to row instead of stopping on an invisible target.
+- Tab strips are one tab stop: only the selected tab has `tabindex="0"`,
+  Left/Right/Home/End move focus and selection via
+  `shared/tablist-keyboard.ts` (`TabbedPanelTree`, `MobileWorkspaceItem`,
+  the `PullDetail` fallback strip), and Tab continues into the panel.
+  In `TabbedPanelTree` a focused tab button reports its own tab (an
+  arrow-key switch must not lag one render behind); any other focus in the
+  leaf reports the active tab, so landing on a tab's "Hide" tool does not
+  activate that pane.
 - jsdom lacks `offsetParent` / `scrollIntoView` / `ResizeObserver`:
   `test/setup.ts` stubs the latter two, focus-trap tests install
   `stubOffsetParent.ts`, and synthetic Tab only exercises kit's trap at

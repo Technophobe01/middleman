@@ -122,6 +122,22 @@ describe("TabbedPanelTree", () => {
     expect(activeLeaves()[0]?.contains(screen.getByTestId("panel-files"))).toBe(true);
   });
 
+  it("reports a focused tab button as its own tab and strip tools as the active tab", async () => {
+    const onFocusPane = vi.fn();
+    render(TabbedPanelTreeTestHarness, {
+      props: { node: leafNode(), onFocusPane, withLeafActions: true },
+    });
+
+    await fireEvent.focusIn(screen.getByRole("tab", { name: "Feed, Feed updating" }));
+    expect(onFocusPane).toHaveBeenLastCalledWith("feed", "leaf-1");
+
+    const strip = screen.getByRole("tablist");
+    const tool = strip.querySelector<HTMLElement>(".tabbed-panel-leaf-actions button");
+    expect(tool).not.toBeNull();
+    await fireEvent.focusIn(tool!);
+    expect(onFocusPane).toHaveBeenLastCalledWith("detail", "leaf-1");
+  });
+
   it("keeps nested tab focus scoped to the outer leaf", async () => {
     const onFocusPane = vi.fn();
     render(TabbedPanelTreeTestHarness, {
@@ -564,5 +580,32 @@ describe("zoom and leaf actions", () => {
 
     expect(screen.getByTestId("leaf-action-leaf-b").hasAttribute("disabled")).toBe(true);
     expect(screen.getByTestId("leaf-action-leaf-a").hasAttribute("disabled")).toBe(false);
+  });
+});
+
+describe("TabbedPanelTree keyboard", () => {
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it("keeps one tab stop per strip and moves selection with the arrow keys", async () => {
+    const onSelectTab = vi.fn();
+    render(TabbedPanelTreeTestHarness, { node: leafNode(), onSelectTab });
+
+    const tabs = screen.getAllByRole("tab");
+    expect(tabs.map((tab) => tab.tabIndex)).toEqual([-1, 0]);
+
+    const detailTab = screen.getByRole("tab", { name: "Detail" });
+    detailTab.focus();
+    await fireEvent.keyDown(detailTab, { key: "ArrowLeft" });
+    expect(onSelectTab).toHaveBeenCalledWith("feed");
+    expect(document.activeElement).toBe(screen.getByRole("tab", { name: "Feed, Feed updating" }));
+
+    await fireEvent.keyDown(document.activeElement as HTMLElement, { key: "ArrowLeft" });
+    expect(onSelectTab).toHaveBeenLastCalledWith("detail");
+
+    await fireEvent.keyDown(detailTab, { key: "Tab" });
+    expect(onSelectTab).toHaveBeenCalledTimes(2);
   });
 });
