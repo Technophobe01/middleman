@@ -509,7 +509,9 @@ func TestRemovedFleetMemberCredentialFailsOnNextRequest(t *testing.T) {
 		HubCredential:   "hub-credential",
 	})
 	require.NoError(err)
-	require.NoError(enrollments.Activate(t.Context(), enrollmentID))
+	require.NoError(enrollments.Activate(
+		t.Context(), enrollmentID, time.Now().Add(time.Hour),
+	))
 
 	credentials, err := federationauth.Open(
 		filepath.Join(t.TempDir(), "credentials.json"),
@@ -731,6 +733,101 @@ func TestPendingSpokeCredentialCannotRevokeSiblingEnrollment(t *testing.T) {
 	assert.Equal(t, federation.EnrollmentPending, sibling.State)
 }
 
+func TestLeaseUnawareHubEnrollmentCredentialIsInactive(t *testing.T) {
+	require := require.New(t)
+	const (
+		hubID        = "0123456789abcdef0123456789abcdef"
+		nodeID       = "fedcba9876543210fedcba9876543210"
+		enrollmentID = "11111111111111111111111111111111"
+	)
+	path := filepath.Join(t.TempDir(), "enrollments.json")
+	contents, err := json.Marshal(map[string]any{
+		"version": 1, "tokens": []any{},
+		"enrollments": []federation.Enrollment{{
+			ID: enrollmentID, NodeID: nodeID,
+			SpokePlatform: "linux", SpokeBaseURL: "https://spoke.example",
+			HubID: hubID, HubURL: "https://hub.example",
+			ProtocolVersion: federation.ProtocolVersion,
+			State:           federation.EnrollmentActive,
+			ExpiresAt:       time.Now().Add(time.Hour),
+		}},
+	})
+	require.NoError(err)
+	require.NoError(os.WriteFile(path, contents, 0o600))
+	enrollments, err := federation.Open(path, federation.StoreOptions{})
+	require.NoError(err)
+	credentials, err := federationauth.Open(filepath.Join(t.TempDir(), "credentials.json"))
+	require.NoError(err)
+	token, err := credentials.MintInbound(
+		nodeID, []federationauth.Scope{
+			federationauth.ScopeSnapshotRead,
+			federationauth.ScopeEnrollmentActivate,
+		},
+	)
+	require.NoError(err)
+	cfg := &config.Config{Fleet: config.Fleet{
+		Enabled: true, Role: config.FleetRoleHub,
+		Members: []config.FleetMember{{
+			NodeID: nodeID, BaseURL: "https://spoke.example",
+			State: federation.EnrollmentActive,
+		}},
+	}}
+	srv := New(dbtest.Open(t), nil, nil, "/", cfg, ServerOptions{
+		DaemonAccess:          DaemonAccessOptions{Token: "local-secret", RequireAPIAuth: true},
+		FederationCredentials: credentials, FederationEnrollments: enrollments,
+		FederationSpokeID: hubID,
+	})
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+	t.Cleanup(func() { gracefulShutdown(t, srv) })
+
+	requestIdentity := func() *http.Response {
+		return authGet(t, ts, "/api/v1/federation/identity", func(r *http.Request) {
+			r.Header.Set("Authorization", "Bearer "+token)
+			r.Header.Set(federationauth.NodeIDHeader, nodeID)
+		})
+	}
+	requestActivation := func() *http.Response {
+		request, requestErr := http.NewRequest(
+			http.MethodPost,
+			ts.URL+"/api/v1/federation/enrollments/"+enrollmentID+"/activate",
+			strings.NewReader(`{"protocol_version":3,"preparation_seal":"legacy"}`),
+		)
+		require.NoError(requestErr)
+		request.Header.Set("Authorization", "Bearer "+token)
+		request.Header.Set("Content-Type", "application/json")
+		response, requestErr := ts.Client().Do(request)
+		require.NoError(requestErr)
+		return response
+	}
+
+	identityResponse := requestIdentity()
+	identityResponse.Body.Close()
+	require.Equal(http.StatusOK, identityResponse.StatusCode,
+		"lease-unaware peers need identity preflight access before activation")
+
+	response := authGet(t, ts, "/api/v1/snapshot/raw", func(r *http.Request) {
+		r.Header.Set("Authorization", "Bearer "+token)
+	})
+	defer response.Body.Close()
+	require.Equal(http.StatusForbidden, response.StatusCode)
+
+	activationResponse := requestActivation()
+	activationResponse.Body.Close()
+	require.Equal(http.StatusUnprocessableEntity, activationResponse.StatusCode,
+		"lease-unaware peers may reach only the activation handshake")
+
+	srv.cfgMu.Lock()
+	srv.cfg.Fleet.Enabled = false
+	srv.cfgMu.Unlock()
+	identityResponse = requestIdentity()
+	identityResponse.Body.Close()
+	require.Equal(http.StatusForbidden, identityResponse.StatusCode)
+	activationResponse = requestActivation()
+	activationResponse.Body.Close()
+	require.Equal(http.StatusForbidden, activationResponse.StatusCode)
+}
+
 func TestActiveHubCredentialRequiresActiveSpokeStartup(t *testing.T) {
 	const (
 		hubID        = "0123456789abcdef0123456789abcdef"
@@ -738,12 +835,31 @@ func TestActiveHubCredentialRequiresActiveSpokeStartup(t *testing.T) {
 		enrollmentID = "11111111111111111111111111111111"
 	)
 	for _, test := range []struct {
-		name       string
-		nodeActive bool
-		wantDenied bool
+		name            string
+		nodeActive      bool
+		leaseVersion    int
+		leaseValidUntil time.Time
+		wantDenied      bool
 	}{
-		{name: "validated startup", nodeActive: true},
-		{name: "local-only startup", wantDenied: true},
+		{
+			name: "validated startup with current lease", nodeActive: true,
+			leaseVersion:    federation.ActivationLeaseVersion,
+			leaseValidUntil: time.Now().Add(time.Hour),
+		},
+		{
+			name: "validated startup with expired lease", nodeActive: true,
+			leaseVersion:    federation.ActivationLeaseVersion,
+			leaseValidUntil: time.Now().Add(-time.Hour), wantDenied: true,
+		},
+		{
+			name: "local-only startup", leaseValidUntil: time.Now().Add(time.Hour),
+			leaseVersion: federation.ActivationLeaseVersion,
+			wantDenied:   true,
+		},
+		{
+			name: "lease-unaware enrollment", nodeActive: true,
+			leaseValidUntil: time.Time{}, wantDenied: true,
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			assert := assert.New(t)
@@ -757,7 +873,9 @@ func TestActiveHubCredentialRequiresActiveSpokeStartup(t *testing.T) {
 				SpokePlatform: "linux", SpokeBaseURL: "https://spoke.example",
 				HubID: hubID, HubURL: "https://hub.example",
 				ProtocolVersion: federation.ProtocolVersion, State: federation.EnrollmentActive,
-				ExpiresAt: time.Now().Add(time.Hour),
+				ActivationLeaseVersion: test.leaseVersion,
+				ExpiresAt:              time.Now().Add(time.Hour),
+				ActivationValidUntil:   test.leaseValidUntil,
 			}))
 			credentials, err := federationauth.Open(filepath.Join(t.TempDir(), "credentials.json"))
 			require.NoError(err)
@@ -817,7 +935,9 @@ func TestFederationAuthenticationKeepsBootTopologyUntilRestart(t *testing.T) {
 		SpokePlatform: "linux", SpokeBaseURL: "https://spoke.example",
 		HubID: hubID, HubURL: "https://hub.example",
 		ProtocolVersion: federation.ProtocolVersion, State: federation.EnrollmentActive,
-		ExpiresAt: time.Now().Add(time.Hour),
+		ActivationLeaseVersion: federation.ActivationLeaseVersion,
+		ExpiresAt:              time.Now().Add(time.Hour),
+		ActivationValidUntil:   time.Now().Add(time.Hour),
 	}))
 	credentials, err := federationauth.Open(filepath.Join(t.TempDir(), "credentials.json"))
 	require.NoError(err)

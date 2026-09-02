@@ -204,7 +204,9 @@ func TestEnrollmentRevocationClosesExistingFederationEventStream(t *testing.T) {
 		HubCredential:   "hub-credential",
 	})
 	require.NoError(err)
-	require.NoError(enrollments.Activate(t.Context(), enrollmentID))
+	require.NoError(enrollments.Activate(
+		t.Context(), enrollmentID, time.Now().Add(time.Hour),
+	))
 
 	credentials, err := federationauth.Open(filepath.Join(dir, "credentials.json"))
 	require.NoError(err)
@@ -338,6 +340,17 @@ func TestHubEventLifecyclePausesUntilFleetIsEnabled(t *testing.T) {
 			return false
 		}
 	}, time.Second, time.Millisecond)
+}
+
+func TestHubEventLifecycleCanStopAfterCleanReturn(t *testing.T) {
+	runs := 0
+	lifecycle := newHubEventLifecycleStoppingOnCleanReturn(true, func(context.Context) {
+		runs++
+	})
+
+	lifecycle.Run(t.Context())
+
+	assert.Equal(t, 1, runs)
 }
 
 func TestDisabledFederationSpokeSeedsDisconnectedStateForFreshSubscriber(t *testing.T) {

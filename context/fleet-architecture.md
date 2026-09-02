@@ -64,6 +64,9 @@ or remote workspace and session operations.
 - A failed, incompatible, or unauthenticated member degrades only that member to
   an unreachable summary; it must not fail local or other member results
   (`internal/server/fleetapi/fleet_hub.go::Handler.fetchMemberRaw`).
+- Structured peer rejections must retain an operator-actionable cause; do not
+  collapse enrollment or identity failures to an HTTP status alone
+  (`internal/server/fleetapi/fleet_hub.go::federationPeerResponseError`).
 - A spoke supplies its aggregate member budget; the hub uses the smaller local
   or requested timeout, while the spoke reserves twice that budget for the full
   response (`internal/server/fleetapi/fleet_routes.go::Handler.getSnapshotAggregate`).
@@ -75,9 +78,9 @@ or remote workspace and session operations.
   Explicitly incomplete aggregates retain absent-host rows; authoritative views
   retain only explicitly degraded hosts and remove absent membership
   (`frontend/src/lib/components/terminal/workspace-list-schema.ts::retainDegradedHostWorkspaces`).
-- Workspaces does not repeat host labels or healthy fleet inventory in its list;
-  host navigation belongs to the global Forge selector, while fleet chrome is
-  reserved for actionable degradation (`frontend/src/lib/components/terminal/WorkspaceListSidebar.svelte`).
+- Hub workspace rows show a compact execution-host badge; spoke rows remain
+  unlabeled because their actionable workspace surface is local-only. Fleet
+  chrome remains reserved for actionable degradation (`frontend/src/lib/components/terminal/WorkspaceListSidebar.svelte`).
 - The reserved `self` alias and stable node ID address local. An active spoke routes
   only when config matches its enrollment; that enrollment supplies the credential-bound destination
   (`internal/server/fleetapi/fleet_proxy.go::Handler.resolveEnrolledSpoke`).
@@ -113,9 +116,13 @@ or remote workspace and session operations.
   Activation upgrades both directions
   (`internal/federationauth/scope.go::HubToSpokeScopes`,
   `internal/server/api_auth.go::Server.federationPrincipalEnrollmentState`).
-- An active hub bearer is accepted by a spoke only when that daemon's
-  startup activation succeeded. This is a local lifecycle gate inside the
-  trusted fleet, not isolation from a malicious activated hub.
+- Active peer bearers are accepted only after the versioned activation-lease
+  handshake and while the hub and spoke copies of the renewable 24-hour lease
+  are current and federation remains enabled. Lease-unaware or expired peers
+  may reach only the identity preflight and activation handshake, or revocation;
+  explicit hub rejection never falls back to a cached lease
+  (`internal/server/api_auth.go::Server.federationPrincipalEnrollmentState`,
+  `internal/server/api_auth.go::Server.allowsActivationLeaseHandshake`).
 - The credential store persists inbound bearers only as SHA-256 digests and
   keeps outbound bearers readable for request construction. Atomic 0600 writes
   publish immutable in-memory snapshots only after persistence, so revocation
@@ -196,10 +203,9 @@ or remote workspace and session operations.
   credential route, rejects a historically occupied mutable route, and records
   only repository routing metadata in its spoke catalog (`internal/providerplane/client.go::ValidateFederationWorkspaceLaunchSpecResponse`,
   `internal/server/provider_sources.go::hubProviderSource.ResolveWorkspaceLaunchSpec`).
-- Federated MCP workspace creation resolves a hub repository descriptor
-  before capturing the spoke-local route fence, so repositories discovered after
-  activation become locally executable without a prior settings refresh
-  (`internal/server/mcp_backend.go::mcpBackend.resolveWorkspaceRepositoryFence`).
+- Federated ad-hoc and MCP workspace creation resolve a hub repository descriptor
+  before local lookup or route fencing, so newly discovered repositories do not
+  require a settings refresh (`internal/server/provider_sources.go::hubProviderSource.ResolveRepositoryRoute`).
 - Registered spoke projects resolve stable hub repository identity during
   preparation and future registration; raw fleet snapshots remain read-only
   (`internal/server/spoke_preparation.go::Server.reconcileSpokePreparationProjects`).
@@ -271,6 +277,12 @@ or remote workspace and session operations.
 - Federation protocol version 3 requires an exact match; there is no
   translation or compatibility fallback
   (`internal/federation/protocol.go::ProtocolVersion`).
+- Activation leases negotiate their own version 1 inside protocol 3. This
+  keeps snapshot compatibility separate from the authorization handshake:
+  upgraded hubs isolate lease-unaware active spokes until they upgrade and
+  activate again, without rewriting enrollment storage or requiring
+  re-enrollment (`internal/federation/protocol.go::ActivationLeaseVersion`,
+  `internal/server/fleetapi/fleet_enrollment.go::Handler.activateEnrollment`).
 - Enrollment accepts only canonical HTTPS origins. Each token is consumed by
   its first accepted request; retry or rekey requires a new token
   (`internal/federation/enrollment_store.go::Store.Begin`).
@@ -318,8 +330,11 @@ or remote workspace and session operations.
   (`internal/server/spoke_preparation.go::Server.persistPreparedSpokeRole`).
 - Activation retries are bounded and reuse the sealed enrollment; the
   hub validates its issued seal, and already-active retries never
-  duplicate membership. Invalid state is `action_required`, protocol mismatch
-  is `incompatible`, and both preserve local execution while suppressing routes
+  duplicate membership. Renewal is conditional on the enrollment remaining
+  active, so a response that races revocation cannot restore the lease.
+  Retryable failures back off for one minute; definitive rejection clears the
+  lease and stops renewal until restart. Invalid state is `action_required`,
+  protocol mismatch is `incompatible`, and both preserve local execution while suppressing routes
   (`cmd/kenn-forge/spoke_startup.go::activateFederationSpokeAtStartup`,
   `internal/server/fleetapi/fleet_enrollment.go::Handler.activateEnrollment`).
 - Hub-initiated revocation makes each side retry-safe. The spoke marks its local
