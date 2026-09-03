@@ -350,7 +350,8 @@ registry helpers return typed errors for missing providers or capabilities.
   boundary; using the later promotion time can skip items updated after inventory
   completed. (`internal/db/queries_archive.go::StartFullArchives`)
 - Configuration reconciliation pauses omitted repositories with a durable `configuration_removed` reason while retaining archive content and progress. Re-adding the same full identity clears only that automatic pause; an operator pause stays paused. (`internal/db/queries_archive.go::ReconcileDiscoveryArchives`, `internal/db/queries_archive.go::EnsureDiscoveryArchives`)
-- Reconcile configured repositories only at startup or configuration reload; idle scheduler polls must remain read-only unless they claim actual work. (`internal/github/sync.go::SetReposWithContext`, `internal/archive/scheduler.go::RunEligible`)
+- Reconcile configured repositories only at startup or configuration reload; idle scheduler passes must remain read-only unless they claim actual work. (`internal/github/sync.go::SetReposWithContext`, `internal/archive/scheduler.go::RunPass`)
+- The worker caches resolved repositories keyed on configured refs plus the store's repository reconciliation generation, which every catalog write advances, so an unchanged pass runs no resolution queries. (`internal/archive/service.go::workerRepositories`)
 - Startup reconciliation reopens completed legacy known-item lookups once when
   lifecycle details are missing, independent of historical inventory coverage;
   a close actor is current only when the latest authored close event matches

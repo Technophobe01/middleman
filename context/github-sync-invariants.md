@@ -427,15 +427,31 @@ fallback repository listing.
   While an unresolvable ref persists in config, genuinely removed repos keep
   collecting; the recurring deferral warning is the operator signal.
   (`internal/archive/service.go::EnsureConfigured`)
-- The archive worker poll resolves configured repositories tolerantly: a ref
+- The archive worker pass resolves configured repositories tolerantly: a ref
   that seeding skipped stays in the syncer's tracked set, so an all-or-nothing
-  resolve would fail every one-second pass and starve archive work for all
+  resolve would fail every pass and starve archive work for all
   healthy repositories. Only provider-classified failures (invalid ref,
   provider not configured, missing capability) are dropped as
   repository-scoped (debug-logged; seeding already warned); a broken store or
   any other infrastructure error still surfaces — an empty pass reported as
-  success would hide a dead worker. (`internal/archive/scheduler.go::RunEligible`,
+  success would hide a dead worker. (`internal/archive/scheduler.go::RunPass`,
   `internal/archive/service.go::resolveRepositoriesTolerant`)
+- The archive worker backs off while idle instead of ticking every second: after a pass
+  that attempted no work the wait doubles from the pacing interval to a five-minute cap,
+  and a pass that worked or failed, or a wake, returns it to the pacing interval. Every
+  completed sync run wakes it, since a sync can clear a feature cooldown and make archive
+  work eligible. (`internal/github/sync.go::runArchiveLoop`, `internal/github/sync.go::runOnceWithSlot`)
+- A pass "worked" when a unit reached the provider, including a provider-answered feature
+  deferral or a preempted request, or failed; only an admission denial before any provider
+  request is idle, so a long live sync backs the worker off instead of writing a one-second
+  deferral every second. (`internal/archive/scheduler.go::finishWork`)
+- Releasing the last live provider operation on a host wakes the archive worker only when
+  that host denied or preempted an archive request; a normal sync's stream of releases
+  must not trigger denied passes and deferral writes. (`internal/github/sync.go::beginProviderWork`)
+- Archive scheduling is eventually consistent by maintainer decision: a missed or late wake
+  that only delays eligible archive work until the next backoff pass (five minutes at most)
+  is accepted behavior, not a defect. Do not add wake bookkeeping or atomicity for it.
+  (`internal/github/sync.go::runArchiveLoop`)
 - Initial issue and pull-request inventory includes all states in stable created-time ascending order; issue enumeration excludes PR-shaped rows. (`internal/github/pages.go::ListIssuesPage`, `internal/github/pages.go::ListMergeRequestsPage`)
 - GitHub issue-only repositories return pulls API 404; normal and archive paths
   classify it as feature-disabled only for explicit `has_pull_requests=false`;

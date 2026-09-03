@@ -36,7 +36,7 @@ type reloadArchiveLifecycleRecorder struct {
 	retried []platform.RepoRef
 }
 
-func (*reloadArchiveLifecycleRecorder) RunEligible(context.Context) error { return nil }
+func (*reloadArchiveLifecycleRecorder) RunPass(context.Context) (bool, error) { return false, nil }
 
 func (r *reloadArchiveLifecycleRecorder) EnsureConfigured(_ context.Context, refs []platform.RepoRef) ([]platform.RepoRef, error) {
 	r.ensured = append([]platform.RepoRef(nil), refs...)
