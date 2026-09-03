@@ -33,6 +33,26 @@ Rules:
 - Coding-agent session IDs are hook-authoritative and live-only: expose only fresh,
   supported reports joined by canonical worktree and runtime key to a live `agent`
   runtime (`internal/server/workspaceapi/agent_sessions.go::Handler.listWorkspaceAgentSessions`).
+- Hook reports own workspace activity where they exist: a workspace with a
+  hook report for a live agent runtime is never probed through tmux pane
+  capture, its last-activity time is the report's timestamp, and the tmux
+  probe returns only when the session ends or its runtime is removed. Reports
+  have no time-based expiry; a launched agent keeps reporting until teardown
+  (`internal/server/workspaceapi/routes_handlers.go::Handler.applyWorkspaceTmuxEnrichment`,
+  `internal/agentactivity/store.go::Store.LiveReportsForWorkspace`).
+- A completion keeps its first timestamp: `done` written over `done` for the
+  same session preserves `UpdatedAt`, so the sidebar's acknowledged Done badge
+  does not reappear when Claude Code's `idle_prompt` follows Stop
+  (`internal/agentactivity/store.go::Store.HandleEvent`).
+- Claude Code's `idle_prompt` notification fires after a minute of waiting
+  whatever the agent waits for. It leaves a pending `input` or `approval`
+  state untouched and otherwise maps to `done`; only `elicitation_dialog` and
+  user-input tools put a session into `input`
+  (`internal/agentactivity/store.go::Store.HandleEvent`).
+- Reports are reconciled against persisted and live runtime session keys
+  after startup restoration and after every missing-tmux prune, so a report
+  whose runtime row was pruned does not outlive it
+  (`internal/server/workspaceapi/lifecycle.go::Handler.reconcileAgentActivityReports`).
 
 ## Provider-Backed Lifecycle Facts
 
