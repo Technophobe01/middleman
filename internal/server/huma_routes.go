@@ -132,6 +132,7 @@ type listActivityInput struct {
 	Search               string   `query:"search"`
 	Author               string   `query:"author" doc:"Exact, case-insensitive pull request or issue author filter."`
 	InvolvesMe           bool     `query:"involves_me" doc:"Only include activity for pull requests and issues involving the authenticated viewer."`
+	Unassigned           bool     `query:"unassigned" doc:"Only include activity for pull requests and issues with no assignees."`
 	After                string   `query:"after"`
 	Before               string   `query:"before"`
 	AtOrBefore           string   `query:"at_or_before"`
@@ -156,6 +157,7 @@ type listActivityThreadEventsInput struct {
 	ItemNumber        int      `query:"item_number" minimum:"1"`
 	Types             []string `query:"types"`
 	Search            string   `query:"search"`
+	Unassigned        bool     `query:"unassigned" doc:"Only include activity for pull requests and issues with no assignees."`
 	Since             string   `query:"since"`
 	Before            string   `query:"before"`
 	AtOrBefore        string   `query:"at_or_before"`
@@ -1413,15 +1415,34 @@ func providerActivityResponse(response activityResponse) activityResponse {
 func (s *Server) overlayLocalActivityWorkspaces(
 	ctx context.Context, input *listActivityInput, response activityResponse,
 ) (activityResponse, error) {
-	response = providerActivityResponse(response)
 	if s.workspaceAPI == nil {
-		return response, nil
+		return providerActivityResponse(response), nil
 	}
 	snapshot, err := s.workspaceAPI.WorkspaceSubjectSnapshot(ctx)
 	if err != nil {
 		return activityResponse{}, httpapi.Internal("list workspace activity failed")
 	}
-	overlays := activityWorkspaceOverlays(snapshot)
+	return s.overlayLocalActivityWorkspaceSnapshot(ctx, input, response, snapshot)
+}
+
+func (s *Server) overlayLocalActivityWorkspaceSnapshot(
+	ctx context.Context,
+	input *listActivityInput,
+	response activityResponse,
+	snapshot workspaceapi.WorkspaceSubjectSnapshot,
+) (activityResponse, error) {
+	response = providerActivityResponse(response)
+	if input.Unassigned {
+		if err := s.retainUnassignedWorkspaceSubjects(ctx, &snapshot); err != nil {
+			slog.Error("list unassigned workspace subjects failed", "err", err)
+			return activityResponse{}, httpapi.Internal("list workspace activity failed")
+		}
+	}
+	repositories, err := s.workspaceActivityRepositoryIdentities(ctx, snapshot)
+	if err != nil {
+		return activityResponse{}, httpapi.Internal("list workspace activity failed")
+	}
+	overlays := activityWorkspaceOverlays(snapshot, repositories)
 	for i := range response.Items {
 		if workspace, ok := overlays[activityItemIdentity(response.Items[i])]; ok {
 			copy := workspace
@@ -1452,6 +1473,7 @@ func localWorkspaceActivityOptions(input *listActivityInput, now time.Time) (db.
 		ItemTypes:   input.ItemTypes,
 		Search:      strings.ToLower(strings.TrimSpace(input.Search)),
 		Author:      strings.TrimSpace(input.Author),
+		Unassigned:  input.Unassigned,
 	}
 	if input.Since == "" {
 		defaultSince := now.UTC().AddDate(0, 0, -7)
@@ -1468,6 +1490,7 @@ func localWorkspaceActivityOptions(input *listActivityInput, now time.Time) (db.
 
 func activityWorkspaceOverlays(
 	snapshot workspaceapi.WorkspaceSubjectSnapshot,
+	repositories map[int64]providerplane.RepositoryIdentity,
 ) map[providerplane.ItemIdentity]workspaceapi.WorkspaceRef {
 	overlays := make(map[providerplane.ItemIdentity]workspaceapi.WorkspaceRef)
 	for key, activity := range snapshot.Subjects {
@@ -1493,6 +1516,28 @@ func activityWorkspaceOverlays(
 				PlatformRepoID: activity.Subject.PlatformRepoID,
 			},
 			ItemType: itemType, ItemNumber: key.ItemNumber,
+		}.Canonical()
+		if identity.Valid() {
+			overlays[identity] = workspace
+		}
+	}
+	for key, workspace := range snapshot.OwnReferences {
+		if _, ok := snapshot.Subjects[key]; ok {
+			continue
+		}
+		itemType := ""
+		switch key.ItemType {
+		case db.WorkspaceItemTypePullRequest:
+			itemType = "pr"
+		case db.WorkspaceItemTypeIssue:
+			itemType = "issue"
+		default:
+			continue
+		}
+		identity := providerplane.ItemIdentity{
+			Repository: repositories[key.RepoID],
+			ItemType:   itemType,
+			ItemNumber: key.ItemNumber,
 		}.Canonical()
 		if identity.Valid() {
 			overlays[identity] = workspace
@@ -1533,6 +1578,7 @@ func (s *Server) listActivityRouteCore(ctx context.Context, input *listActivityI
 		ItemTypes:   input.ItemTypes,
 		Search:      strings.ToLower(strings.TrimSpace(input.Search)),
 		Author:      strings.TrimSpace(input.Author),
+		Unassigned:  input.Unassigned,
 		// Notifications are always on; this only drops notification rows in
 		// SQL when no config is loaded (the nil-config safety guard), so the
 		// safety-cap window is filled by real activity, not stale notifications.
@@ -1698,6 +1744,7 @@ func (s *Server) listActivityRouteCore(ctx context.Context, input *listActivityI
 			Search:                   opts.Search,
 			SearchMatchedSubjectKeys: searchMatchedSubjectKeys,
 			Author:                   opts.Author,
+			Unassigned:               opts.Unassigned,
 			ViewerLogins:             opts.ViewerLogins,
 			HideClosedMerged:         opts.HideClosedMerged,
 			HideBots:                 opts.HideBots,
@@ -1717,15 +1764,14 @@ func (s *Server) listActivityRouteCore(ctx context.Context, input *listActivityI
 		slog.Error("list workspace activity failed", "err", err)
 		return nil, httpapi.Internal("list workspace activity failed")
 	}
+	if opts.Unassigned {
+		if err := s.retainUnassignedWorkspaceSubjects(ctx, &workspaceSnapshot); err != nil {
+			slog.Error("list unassigned workspace subjects failed", "err", err)
+			return nil, httpapi.Internal("list workspace activity failed")
+		}
+	}
 	if opts.ViewerLogins != nil {
-		workspaceSubjectKeys := make([]db.WorkspaceSubjectKey, 0,
-			len(workspaceSnapshot.Subjects)+len(workspaceSnapshot.OwnReferences))
-		for key := range workspaceSnapshot.Subjects {
-			workspaceSubjectKeys = append(workspaceSubjectKeys, key)
-		}
-		for key := range workspaceSnapshot.OwnReferences {
-			workspaceSubjectKeys = append(workspaceSubjectKeys, key)
-		}
+		workspaceSubjectKeys := workspaceSnapshotSubjectKeys(workspaceSnapshot)
 		involvedSubjects, err := s.db.ListInvolvedWorkspaceSubjectKeys(
 			ctx, opts.ViewerLogins, workspaceSubjectKeys,
 		)
@@ -1871,6 +1917,54 @@ func (s *Server) listActivityRouteCore(ctx context.Context, input *listActivityI
 	}, nil
 }
 
+func workspaceSnapshotSubjectKeys(
+	snapshot workspaceapi.WorkspaceSubjectSnapshot,
+) []db.WorkspaceSubjectKey {
+	keys := make([]db.WorkspaceSubjectKey, 0, len(snapshot.Subjects)+len(snapshot.OwnReferences))
+	for key := range snapshot.Subjects {
+		keys = append(keys, key)
+	}
+	for key := range snapshot.OwnReferences {
+		keys = append(keys, key)
+	}
+	return keys
+}
+
+func (s *Server) retainUnassignedWorkspaceSubjects(
+	ctx context.Context, snapshot *workspaceapi.WorkspaceSubjectSnapshot,
+) error {
+	if s.providerSource != nil {
+		repositories, err := s.workspaceActivityRepositoryIdentities(ctx, *snapshot)
+		if err != nil {
+			return err
+		}
+		identitiesByKey, candidates := workspaceActivitySubjectIdentities(*snapshot, repositories)
+		unassigned, err := s.providerSource.FilterUnassignedActivitySubjects(ctx, candidates)
+		if err != nil {
+			return err
+		}
+		retainActivitySubjectsByIdentity(snapshot, identitiesByKey, unassigned)
+		return nil
+	}
+	unassignedSubjects, err := s.db.ListUnassignedWorkspaceSubjectKeys(
+		ctx, workspaceSnapshotSubjectKeys(*snapshot),
+	)
+	if err != nil {
+		return err
+	}
+	for key := range snapshot.Subjects {
+		if _, ok := unassignedSubjects[key]; !ok {
+			delete(snapshot.Subjects, key)
+		}
+	}
+	for key := range snapshot.OwnReferences {
+		if _, ok := unassignedSubjects[key]; !ok {
+			delete(snapshot.OwnReferences, key)
+		}
+	}
+	return nil
+}
+
 func activityRepoIDAllowed(repoID int64, allowed []int64) bool {
 	if allowed == nil {
 		return true
@@ -1911,6 +2005,7 @@ func (s *Server) listActivityThreadEvents(
 	return s.listActivity(ctx, &listActivityInput{
 		Types:                input.Types,
 		Search:               input.Search,
+		Unassigned:           input.Unassigned,
 		Since:                input.Since,
 		Before:               input.Before,
 		AtOrBefore:           input.AtOrBefore,

@@ -1212,12 +1212,14 @@
         <FocusListView
           listType="mrs"
           {...r.repo ? { repo: r.repo } : {}}
+          phonePresentation={phone}
           chunked={useFocusLayoutClass()}
         />
       {:else if r.page === "focus" && r.itemType === "issues"}
         <FocusListView
           listType="issues"
           {...r.repo ? { repo: r.repo } : {}}
+          phonePresentation={phone}
           chunked={useFocusLayoutClass()}
         />
       {:else if r.page === "focus" && r.itemType === "pr"}
@@ -1268,6 +1270,7 @@
         <FocusListView
           listType="mrs"
           routeFamily="canonical"
+          phonePresentation={phone}
           chunked={useFocusLayoutClass()}
         />
       {:else if r.page === "issues" && r.selected}
@@ -1281,6 +1284,7 @@
         <FocusListView
           listType="issues"
           routeFamily="canonical"
+          phonePresentation={phone}
           chunked={useFocusLayoutClass()}
         />
       {/if}

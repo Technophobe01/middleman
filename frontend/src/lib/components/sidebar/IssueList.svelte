@@ -101,12 +101,14 @@
   function resetCompactView(): void {
     const reloadIssues = issues.getIssueFilterState() !== "open"
       || issues.getInvolvesMe()
+      || issues.getUnassigned()
       || issues.getReferencedByPR();
     if (issues.getIssueFilterState() !== "open") issues.setIssueFilterState("open");
     grouping.setGroupByRepo(true);
     grouping.setHideOrgName(false);
     if (issues.getHideBots()) void issues.setHideBots(false);
     issues.setInvolvesMe(false);
+    issues.setUnassigned(false);
     issues.setReferencedByPR(false);
     if (reloadIssues) issues.loadIssues();
   }
@@ -114,8 +116,9 @@
   function resetVisibility(): void {
     grouping.setHideOrgName(false);
     if (issues.getHideBots()) void issues.setHideBots(false);
-    const reloadIssues = issues.getInvolvesMe() || issues.getReferencedByPR();
+    const reloadIssues = issues.getInvolvesMe() || issues.getUnassigned() || issues.getReferencedByPR();
     issues.setInvolvesMe(false);
+    issues.setUnassigned(false);
     issues.setReferencedByPR(false);
     if (reloadIssues) {
       issues.loadIssues();
@@ -131,6 +134,15 @@
         active: issues.getInvolvesMe(),
         onSelect: () => {
           issues.setInvolvesMe(!issues.getInvolvesMe());
+          issues.loadIssues();
+        },
+      },
+      {
+        id: "unassigned",
+        label: "Unassigned",
+        active: issues.getUnassigned(),
+        onSelect: () => {
+          issues.setUnassigned(!issues.getUnassigned());
           issues.loadIssues();
         },
       },
@@ -186,6 +198,7 @@
       || grouping.getHideOrgName()
       || issues.getHideBots()
       || issues.getInvolvesMe()
+      || issues.getUnassigned()
       || issues.getReferencedByPR(),
   );
   const useCompactFilters = $derived(
@@ -269,6 +282,7 @@
         active={grouping.getHideOrgName()
           || issues.getHideBots()
           || issues.getInvolvesMe()
+          || issues.getUnassigned()
           || issues.getReferencedByPR()}
         showBadge={false}
         sections={[visibilityFilterSection]}

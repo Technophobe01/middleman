@@ -2004,6 +2004,53 @@ func TestAPIInvolvesMeFiltersPullsIssuesAndActivity(t *testing.T) {
 		"viewer identity should be shared by concurrent view requests during the cache TTL")
 }
 
+func TestAPIUnassignedFiltersPullsIssuesAndActivity(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	srv, database := setupTestServer(t)
+	ctx := t.Context()
+	now := time.Now().UTC().Truncate(time.Second)
+
+	unassignedPRID := seedPR(t, database, "acme", "widget", 1, withSeedPRTimes(now, now, now))
+	assignedPRID := seedPR(t, database, "acme", "widget", 2, withSeedPRTimes(now, now, now))
+	seedPR(t, database, "acme", "widget", 5, withSeedPRTimes(now, now, now))
+	repo, err := database.GetRepoByIdentity(ctx, verifiedGitHubRepoIdentity("github.com", "acme", "widget"))
+	require.NoError(err)
+	require.NotNil(repo)
+	require.NoError(database.UpdateMergeRequestAssignees(ctx, repo.ID, unassignedPRID, nil))
+	require.NoError(database.UpdateMergeRequestAssignees(ctx, repo.ID, assignedPRID, []string{"alice"}))
+
+	seedIssue(t, database, "acme", "widget", 3, "open")
+	assignedIssueID := seedIssue(t, database, "acme", "widget", 4, "open")
+	require.NoError(database.UpdateIssueAssignees(ctx, repo.ID, assignedIssueID, []string{"bob"}))
+
+	pullsRR := doJSON(t, srv, http.MethodGet, "/api/v1/pulls?state=all&unassigned=true", nil)
+	require.Equal(http.StatusOK, pullsRR.Code, pullsRR.Body.String())
+	var pulls []pullapi.MergeRequestResponse
+	require.NoError(json.Unmarshal(pullsRR.Body.Bytes(), &pulls))
+	require.Len(pulls, 1)
+	assert.Equal(1, pulls[0].Number)
+
+	issuesRR := doJSON(t, srv, http.MethodGet, "/api/v1/issues?state=all&unassigned=true", nil)
+	require.Equal(http.StatusOK, issuesRR.Code, issuesRR.Body.String())
+	var issues []issueapi.IssueResponse
+	require.NoError(json.Unmarshal(issuesRR.Body.Bytes(), &issues))
+	require.Len(issues, 1)
+	assert.Equal(3, issues[0].Number)
+
+	activityRR := doJSON(t, srv, http.MethodGet, "/api/v1/activity?unassigned=true", nil)
+	require.Equal(http.StatusOK, activityRR.Code, activityRR.Body.String())
+	var activity activityResponse
+	require.NoError(json.Unmarshal(activityRR.Body.Bytes(), &activity))
+	require.Len(activity.Items, 2)
+	assert.ElementsMatch([]int{1, 3}, []int{activity.Items[0].ItemNumber, activity.Items[1].ItemNumber})
+	require.Len(activity.ItemActivity, 2)
+	assert.ElementsMatch([]int{1, 3}, []int{
+		activity.ItemActivity[0].ItemNumber,
+		activity.ItemActivity[1].ItemNumber,
+	})
+}
+
 func TestAPIListIssuesFiltersPullRequestReferences(t *testing.T) {
 	require := require.New(t)
 	srv, database := setupTestServer(t)
@@ -23077,6 +23124,10 @@ func TestAPIListActivity(t *testing.T) {
 
 	prID := seedPR(t, database, "acme", "widget", 1)
 	ctx := t.Context()
+	repo, err := database.GetRepoByIdentity(ctx, verifiedGitHubRepoIdentity("github.com", "acme", "widget"))
+	require.NoError(err)
+	require.NotNil(repo)
+	require.NoError(database.UpdateMergeRequestAssignees(ctx, repo.ID, prID, nil))
 
 	require.NoError(database.UpsertMREvents(ctx, []db.MREvent{
 		{
@@ -23105,7 +23156,7 @@ func TestAPIListActivity(t *testing.T) {
 		t,
 		srv,
 		http.MethodGet,
-		"/api/v1/activity?since="+url.QueryEscape(since)+"&projection=collapsed",
+		"/api/v1/activity?since="+url.QueryEscape(since)+"&projection=collapsed&unassigned=true",
 		nil,
 	)
 	require.Equal(http.StatusOK, collapsed.Code)
@@ -23154,6 +23205,21 @@ func TestAPIListActivity(t *testing.T) {
 	require.NoError(json.NewDecoder(thread.Body).Decode(&threadBody))
 	require.Len(threadBody.Items, 2)
 	assert.Empty(threadBody.ItemActivity)
+
+	require.NoError(database.UpdateMergeRequestAssignees(ctx, repo.ID, prID, []string{"alice"}))
+	assignedThread := doJSON(
+		t,
+		srv,
+		http.MethodGet,
+		"/api/v1/activity/thread-events?provider=github&platform_host=github.com"+
+			"&platform_repo_id=repo-acme-widget&item_type=pr&item_number=1&since="+
+			url.QueryEscape(since)+"&unassigned=true",
+		nil,
+	)
+	require.Equal(http.StatusOK, assignedThread.Code)
+	var assignedThreadBody activityResponse
+	require.NoError(json.NewDecoder(assignedThread.Body).Decode(&assignedThreadBody))
+	assert.Empty(assignedThreadBody.Items)
 
 	filteredThread := doJSON(
 		t,

@@ -16,6 +16,7 @@ import {
 } from "./activity.svelte.js";
 import { dismissFlash, getFlash, getFlashes } from "./flash.svelte.js";
 import { involvesMeFilterStorageKey } from "./involves-me-filter.js";
+import { unassignedFilterStorageKey } from "./unassigned-filter.js";
 
 let runtime: OwnedAppRuntime | undefined;
 
@@ -107,6 +108,23 @@ describe("activity store workspace activity", () => {
       "/activity",
       expect.objectContaining({
         params: { query: expect.objectContaining({ involves_me: true }) },
+      }),
+    );
+  });
+
+  it("persists and sends the Unassigned filter", async () => {
+    const get = vi.fn(async () => ({ data: { items: [], capped: false }, error: null }));
+    const store = createActivityStore({ client: { GET: get } as unknown as GeneratedClient });
+
+    store.setUnassigned(true);
+    store.loadActivity();
+    await vi.waitFor(() => expect(store.isActivityLoading()).toBe(false));
+
+    expect(localStorage.getItem(unassignedFilterStorageKey("activity"))).toBe("1");
+    expect(get).toHaveBeenCalledWith(
+      "/activity",
+      expect.objectContaining({
+        params: { query: expect.objectContaining({ unassigned: true }) },
       }),
     );
   });
@@ -387,6 +405,7 @@ describe("activity store collapse state", () => {
     });
     const store = createActivityStore({ client: { GET: get } as unknown as GeneratedClient });
     store.hydrateDefaults(settings(true));
+    store.setUnassigned(true);
     store.loadActivity();
     await vi.waitFor(() => expect(store.isActivityLoading()).toBe(false));
 
@@ -403,9 +422,10 @@ describe("activity store collapse state", () => {
         platform_repo_id: "repo-7",
         item_type: "pr",
         item_number: 7,
+        unassigned: true,
         at_or_before: "hidden:9",
       }),
-      expect.objectContaining({ before: "thread-page-2", at_or_before: "hidden:9" }),
+      expect.objectContaining({ before: "thread-page-2", at_or_before: "hidden:9", unassigned: true }),
     ]);
   });
 
