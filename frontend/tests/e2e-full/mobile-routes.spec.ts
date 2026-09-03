@@ -580,6 +580,61 @@ test.describe("phone routes", () => {
     await expect(page.locator(".mobile-shell .mobile-detail-header__badge")).toHaveText("PR #1");
   });
 
+  test("long PR branch relationships stay inline with the wrapped head branch", async ({ page }) => {
+    await page.route("**/api/v1/pulls/github/acme/widgets/1", async (route) => {
+      const response = await route.fetch();
+      const detail = await response.json();
+      detail.merge_request.HeadBranch = "feature/keep-branch-icon-attached-to-long-wrapped-branch-name";
+      await route.fulfill({ response, json: detail });
+    });
+
+    await page.goto("/pulls/github/acme/widgets/1");
+
+    const headBranch = page.locator(".meta-branch .branch-name-btn").first();
+    const branchIcon = page.locator(".meta-branch .branch-icon");
+    await expect(headBranch).toBeVisible();
+    await expect(branchIcon).toBeVisible();
+
+    const alignment = await page.locator(".meta-branch").evaluate((metaBranch) => {
+      const icon = metaBranch.querySelector(".branch-icon");
+      const head = metaBranch.querySelector(".branch-name-btn--head");
+      const target = metaBranch.querySelector(".branch-target");
+      if (!icon || !head || !target) throw new Error("branch metadata is incomplete");
+
+      const iconBounds = icon.getBoundingClientRect();
+      const headText = [...head.childNodes].find(
+        (node) => node.nodeType === Node.TEXT_NODE && node.textContent?.trim(),
+      );
+      if (!headText) throw new Error("head branch text did not render");
+      const headTextRange = document.createRange();
+      headTextRange.selectNodeContents(headText);
+      const headLines = [...headTextRange.getClientRects()];
+      const firstHeadLine = headLines.at(0);
+      const lastHeadLine = headLines.at(-1);
+      const targetBounds = target.getBoundingClientRect();
+      if (!firstHeadLine || !lastHeadLine) throw new Error("head branch did not render");
+
+      return {
+        headLineCount: headLines.length,
+        iconTop: iconBounds.top,
+        iconBottom: iconBounds.bottom,
+        firstLineTop: firstHeadLine.top,
+        firstLineBottom: firstHeadLine.bottom,
+        lastLineTop: lastHeadLine.top,
+        lastLineRight: lastHeadLine.right,
+        targetTop: targetBounds.top,
+        targetLeft: targetBounds.left,
+      };
+    });
+
+    expect(alignment.headLineCount).toBeGreaterThan(1);
+    expect(alignment.iconTop).toBeGreaterThanOrEqual(alignment.firstLineTop - 1);
+    expect(alignment.iconBottom).toBeLessThanOrEqual(alignment.firstLineBottom + 1);
+    expect(Math.abs(alignment.targetTop - alignment.lastLineTop)).toBeLessThan(5);
+    expect(alignment.targetLeft).toBeGreaterThanOrEqual(alignment.lastLineRight - 1);
+    expect(alignment.targetLeft - alignment.lastLineRight).toBeLessThan(16);
+  });
+
   test("long description collapse toggle has a phone-sized hit target", async ({ page }) => {
     const server = await startIsolatedE2EServerWithOptions();
     try {

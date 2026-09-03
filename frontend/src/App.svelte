@@ -1800,11 +1800,10 @@
   }
 
   .focus-layout--phone :global(.meta-branch) {
-    display: inline-flex;
+    display: block;
     flex: 1 1 100%;
     min-width: 0;
     max-width: 100%;
-    flex-wrap: wrap;
     overflow-wrap: anywhere;
     white-space: normal;
   }
@@ -1815,6 +1814,15 @@
     overflow-wrap: anywhere;
     word-break: break-word;
     text-align: left;
+  }
+
+  .focus-layout--phone :global(.branch-name-btn--head) {
+    display: inline;
+    max-width: none;
+  }
+
+  .focus-layout--phone :global(.branch-target) {
+    margin-left: var(--space-1);
   }
 
   .focus-layout--phone :global(.meta-item),
