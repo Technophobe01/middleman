@@ -1953,9 +1953,81 @@ func (s *Handler) Response(
 	return s.toWorkspaceResponse(ctx, summary)
 }
 
+// workspaceEnrichmentProbePlan selects which enrichment components a probe
+// runs. gitFingerprint carries the git-directory fingerprint captured before
+// the probe so a change during the probe is noticed on the next refresh.
+type workspaceEnrichmentProbePlan struct {
+	git            bool
+	tmux           bool
+	gitFingerprint string
+}
+
+// workspaceResponseWithEnrichment runs every enrichment component
+// unconditionally. Explicit refreshes use it; background refreshes go through
+// workspaceResponseWithChangeAwareEnrichment.
 func (s *Handler) workspaceResponseWithEnrichment(
 	ctx context.Context,
 	summary *db.WorkspaceSummary,
+) workspaceEnrichmentProbeResult {
+	plan := workspaceEnrichmentProbePlan{git: true, tmux: true}
+	if summary.Status == "ready" {
+		plan.gitFingerprint = s.workspaceGitFingerprint(summary)
+	}
+	return s.probeWorkspaceEnrichment(ctx, summary, plan)
+}
+
+// workspaceResponseWithChangeAwareEnrichment is the background full-refresh
+// probe. It spawns git only when the git-directory fingerprint moved since
+// the cached probe or the forced interval elapsed, and probes tmux only when
+// the tmux component is past its own cadence.
+func (s *Handler) workspaceResponseWithChangeAwareEnrichment(
+	ctx context.Context,
+	summary *db.WorkspaceSummary,
+) workspaceEnrichmentProbeResult {
+	plan := workspaceEnrichmentProbePlan{git: true, tmux: true}
+	if s.workspaces == nil || summary.Status != "ready" {
+		return s.probeWorkspaceEnrichment(ctx, summary, plan)
+	}
+	entry, _ := s.cachedWorkspaceEnrichment(summary.ID, workspaceEnrichmentFull)
+	if entry == nil {
+		plan.gitFingerprint = s.workspaceGitFingerprint(summary)
+		return s.probeWorkspaceEnrichment(ctx, summary, plan)
+	}
+	now := s.now()
+	tmuxDue, divergenceDue := entry.componentsDue(now)
+	plan.tmux = tmuxDue
+	if !divergenceDue {
+		// A full job that was upgraded from tmux-only work must not touch
+		// the divergence component before its own cadence elapses.
+		plan.git = false
+		result := s.probeWorkspaceEnrichment(ctx, summary, plan)
+		result.divergenceUnchanged = false
+		result.divergenceSkipped = true
+		return result
+	}
+	plan.gitFingerprint = s.workspaceGitFingerprint(summary)
+	plan.git = !entry.gitProbeSkippable(plan.gitFingerprint, now)
+	return s.probeWorkspaceEnrichment(ctx, summary, plan)
+}
+
+func (s *Handler) workspaceGitFingerprint(summary *db.WorkspaceSummary) string {
+	fingerprint, err := workspace.WorktreeGitFingerprint(summary.WorktreePath)
+	if err != nil {
+		slog.Debug(
+			"worktree git fingerprint failed",
+			"workspace_id", summary.ID,
+			"path", summary.WorktreePath,
+			"err", err,
+		)
+		return ""
+	}
+	return fingerprint
+}
+
+func (s *Handler) probeWorkspaceEnrichment(
+	ctx context.Context,
+	summary *db.WorkspaceSummary,
+	plan workspaceEnrichmentProbePlan,
 ) workspaceEnrichmentProbeResult {
 	resp := toWorkspaceResponse(summary)
 	resp.Repo = s.repoRefFromParts(
@@ -1966,25 +2038,34 @@ func (s *Handler) workspaceResponseWithEnrichment(
 		return workspaceEnrichmentProbeResult{response: resp}
 	}
 
-	divergenceErr := applyWorktreeDivergence(ctx, &resp, summary.WorktreePath)
-	dirtyErr := applyWorktreeDirty(ctx, &resp, summary.WorktreePath)
-	gitStateErr := errors.Join(divergenceErr, dirtyErr)
-	sessions, sessionsErr := s.workspaceTmuxActivitySessions(ctx, summary)
-	activity, hasActivity, activityErr := s.probeWorkspaceTmuxActivity(
-		ctx, summary, sessions,
-	)
-	if hasActivity {
-		applyTmuxActivity(&resp, activity)
-	}
-	err := errors.Join(gitStateErr, sessionsErr, activityErr)
 	result := workspaceEnrichmentProbeResult{
-		response:           resp,
-		divergenceComplete: gitStateErr == nil,
-		tmuxComplete:       sessionsErr == nil && activityErr == nil,
-		divergenceErr:      gitStateErr,
-		tmuxErr:            errors.Join(sessionsErr, activityErr),
-		err:                err,
+		gitFingerprint:      plan.gitFingerprint,
+		divergenceUnchanged: !plan.git,
+		tmuxSkipped:         !plan.tmux,
 	}
+	var gitStateErr error
+	if plan.git {
+		divergenceErr := applyWorktreeDivergence(ctx, &resp, summary.WorktreePath)
+		dirtyErr := applyWorktreeDirty(ctx, &resp, summary.WorktreePath)
+		gitStateErr = errors.Join(divergenceErr, dirtyErr)
+		result.divergenceComplete = gitStateErr == nil
+		result.divergenceErr = gitStateErr
+	}
+	var tmuxErr error
+	if plan.tmux {
+		sessions, sessionsErr := s.workspaceTmuxActivitySessions(ctx, summary)
+		activity, hasActivity, activityErr := s.probeWorkspaceTmuxActivity(
+			ctx, summary, sessions,
+		)
+		if hasActivity {
+			applyTmuxActivity(&resp, activity)
+		}
+		tmuxErr = errors.Join(sessionsErr, activityErr)
+		result.tmuxComplete = tmuxErr == nil
+		result.tmuxErr = tmuxErr
+	}
+	err := errors.Join(gitStateErr, tmuxErr)
+	result.err = err
 	if err != nil {
 		resp.EnrichmentStatus = workspaceEnrichmentFailed
 		message := err.Error()
